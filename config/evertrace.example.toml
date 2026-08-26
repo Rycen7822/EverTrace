@@ -1,0 +1,58 @@
+config_version = 1
+
+[runtime]
+data_dir = "~/.local/share/evertrace"
+log_level = "info"
+background_workers = 2
+
+[dreaming]
+idle_enabled = true
+idle_after = "30m"
+integrity_sweep_interval = "24h"
+max_llm_tasks_per_run = 4
+max_wall_time = "10m"
+
+[procedure]
+auto_publish_full = true
+include_probationary = true
+stable_min_outcome_supported = 3
+
+[global_promotion]
+atom = "semi_auto"
+procedure = "semi_auto"
+core_membership = "manual"
+
+[search]
+search_token_budget = 600
+get_token_budget = 1200
+
+[session_import]
+historical_metadata_backfill = true
+max_concurrent_body_imports = 1
+max_body_import_mib_per_run = 256
+
+[capture]
+preview_bytes = 8192
+inline_payload_bytes = 32768
+
+[recovery]
+capture_timeout = "10s"
+max_bundle_mib = 256
+max_untracked_file_mib = 16
+max_untracked_total_mib = 128
+
+[llm]
+enabled = true
+provider = "openai_compatible"
+base_url = "https://provider.example/v1"
+model = "provider-model-name"
+api_key_env = "EVERTRACE_LLM_API_KEY"
+timeout = "90s"
+max_concurrency = 1
+episode_enrichment = "adaptive"
+max_episode_enrichments = 2
+daily_input_token_budget = 500000
+daily_output_token_budget = 100000
+daily_call_budget = 200
+daily_wall_time_budget = "2h"
+unlimited_token_budget = false

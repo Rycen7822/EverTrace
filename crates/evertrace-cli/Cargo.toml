@@ -1,0 +1,23 @@
+[package]
+name = "evertrace-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+evertrace-codex = { path = "../evertrace-codex" }
+evertrace-domain = { path = "../evertrace-domain" }
+evertrace-protocol = { path = "../evertrace-protocol" }
+evertrace-store = { path = "../evertrace-store" }
+evertrace-tui = { path = "../evertrace-tui" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "evertrace"
+path = "src/main.rs"

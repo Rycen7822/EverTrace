@@ -1,0 +1,13 @@
+[Unit]
+Description=EverTrace local daemon
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/evertraced
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target

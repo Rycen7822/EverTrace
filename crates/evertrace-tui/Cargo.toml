@@ -1,0 +1,17 @@
+[package]
+name = "evertrace-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+evertrace-domain = { path = "../evertrace-domain" }
+evertrace-protocol = { path = "../evertrace-protocol" }
+ratatui.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

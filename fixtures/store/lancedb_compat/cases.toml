@@ -1,0 +1,15 @@
+fixture_version = 1
+probe_schema = "probe_row_v1"
+cases = [
+  "local_create_open",
+  "merge_insert_insert_only",
+  "mixed_language_fts",
+  "indexed_unindexed_visibility",
+  "version_restore_prune",
+  "handles_closed_snapshot",
+  "crash_reopen",
+  "concurrent_readers_writer",
+  "second_process",
+  "schema_mismatch",
+  "corrupt_derived_table",
+]
