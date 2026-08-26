@@ -1,0 +1,17 @@
+[
+  {
+    "name": "ordinary_discussion",
+    "input": "This document discusses token and secret handling without assigning a credential.",
+    "redacted": false
+  },
+  {
+    "name": "api_key_assignment",
+    "input": "api_key = \"S04_CANARY_SECRET_123456\"",
+    "redacted": true
+  },
+  {
+    "name": "bearer_header",
+    "input": "Authorization: Bearer S04_CANARY_SECRET_abcdef",
+    "redacted": true
+  }
+]

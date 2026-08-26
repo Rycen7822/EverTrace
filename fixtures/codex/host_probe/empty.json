@@ -1,0 +1,10 @@
+{
+  "context": {
+    "adapter_kind": "codex_hook",
+    "adapter_revision": "codex-hook-probe-v1",
+    "observed_host_version_range": "unobserved",
+    "eligible_event_manifest_ref": "codex_host_events_v1",
+    "evidence_source": "no_host_evidence"
+  },
+  "evidence": {}
+}

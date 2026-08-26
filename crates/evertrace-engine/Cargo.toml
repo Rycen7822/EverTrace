@@ -1,0 +1,22 @@
+[package]
+name = "evertrace-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+evertrace-capture = { path = "../evertrace-capture" }
+evertrace-codex = { path = "../evertrace-codex" }
+evertrace-domain = { path = "../evertrace-domain" }
+evertrace-store = { path = "../evertrace-store" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

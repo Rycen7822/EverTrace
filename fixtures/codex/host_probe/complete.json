@@ -1,0 +1,145 @@
+{
+  "context": {
+    "adapter_kind": "codex_hook",
+    "adapter_revision": "synthetic-codex-probe-v1",
+    "observed_host_version_range": "synthetic",
+    "eligible_event_manifest_ref": "codex_host_events_v1",
+    "evidence_source": "synthetic_fixture"
+  },
+  "evidence": {
+  "hook": {
+    "wiring_detected": true,
+    "trusted": true,
+    "enabled": true,
+    "expected_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "observed_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "canary": "passed",
+    "evidence_refs": ["hook:canary:1"],
+    "protected_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "capture": {
+    "evidence_refs": ["capture:close:1", "capture:pairing:1", "capture:subagent:1"],
+    "source_identity": "source:codex-session-a:revision-1",
+    "source_revision_refs": ["source-revision:1"],
+    "eligible_event_manifest_refs": ["codex_host_events_v1"],
+    "close_watermark": 40,
+    "close_reconciled": true,
+    "gap_count": 0,
+    "outage_count": 0,
+    "observed": ["child_session_id", "child_tool_call", "child_tool_result", "child_final_result"],
+    "tool_calls": 2,
+    "tool_results": 2,
+    "subagent_starts": 1,
+    "subagent_terminals": 1,
+    "unresolved_liveness": 0,
+    "first_sequence": 1,
+    "last_sequence": 40,
+    "event_count": 40,
+    "protected_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "recovery": {
+    "evidence_refs": ["recovery:fence:1", "recovery:retry:1"],
+    "source_identity": "source:codex-session-a:recovery-1",
+    "mutation_domain_complete": true,
+    "race_canary": "passed",
+    "pairs": [
+      {
+        "native_request_id": "tool-call-1",
+        "pre_sequence": 10,
+        "post_sequence": 11,
+        "physical_execution_ordinal": 0,
+        "fence_completed": true,
+        "replayed": false
+      },
+      {
+        "native_request_id": "tool-call-1",
+        "pre_sequence": 12,
+        "post_sequence": 13,
+        "physical_execution_ordinal": 1,
+        "fence_completed": true,
+        "replayed": false
+      }
+    ],
+    "first_sequence": 10,
+    "last_sequence": 13,
+    "protected_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "cue": {
+    "evidence_refs": ["cue:compact:1", "cue:isolation:1"],
+    "compact_boundary": "passed",
+    "model_visible": true,
+    "same_cwd_session_ids": ["session-a", "session-b"],
+    "sessions_isolated": true,
+    "protected_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "mcp": {
+    "kind": "hook_stamped_claim",
+    "claim_id": "claim-1",
+    "session_id": "session-a",
+    "issued_at": 100,
+    "expires_at": 200,
+    "observed_at": 150,
+    "call_hash_matches": true,
+    "parameter_matches": true,
+    "atomically_consumed": true,
+    "replayed": false,
+    "tampered": false,
+    "rewrite_conflict": false,
+    "daemon_generation_matches": true,
+    "evidence_refs": ["mcp:claim:1"],
+    "protected_digest": "5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "normalization": {
+    "evidence_refs": ["normalization:hook:1", "normalization:session:1", "normalization:retry:1"],
+    "observations": [
+      {
+        "source_ref": "hook:record:1",
+        "host_trace_lineage_id": "lineage-resume-1",
+        "host_lane_key": "parent",
+        "canonical_event_family": "tool_execution",
+        "native_request_id": "tool-call-1",
+        "physical_execution_ordinal": 0,
+        "similarity_label": "synthetic-similarity-a",
+        "replayed": false
+      },
+      {
+        "source_ref": "session:record:1",
+        "host_trace_lineage_id": "lineage-resume-1",
+        "host_lane_key": "parent",
+        "canonical_event_family": "tool_execution",
+        "native_request_id": "tool-call-1",
+        "physical_execution_ordinal": 0,
+        "similarity_label": "synthetic-similarity-a",
+        "replayed": false
+      },
+      {
+        "source_ref": "session:record:2",
+        "host_trace_lineage_id": "lineage-resume-1",
+        "host_lane_key": "parent",
+        "canonical_event_family": "tool_execution",
+        "native_request_id": "tool-call-1",
+        "physical_execution_ordinal": 1,
+        "similarity_label": "synthetic-similarity-a",
+        "replayed": false
+      }
+    ],
+    "fork_resume_retry_unique": true,
+    "replay_rejected": true,
+    "protected_digest": "6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "policy": {
+    "policy_source_kind": "synthetic_host_project_policy_v1",
+    "origin": "host_policy_surface",
+    "host_loaded": true,
+    "readback_supported": true,
+    "readback_matches": true,
+    "source_revision": "policy-revision-1",
+    "content_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "resolved_scope": "repository",
+    "current_trust": true,
+    "current": true,
+    "revoked": false,
+    "evidence_refs": ["policy:load:1", "policy:readback:1"]
+  }
+  }
+}

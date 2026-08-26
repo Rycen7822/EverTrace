@@ -1,0 +1,23 @@
+[package]
+name = "evertrace-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+evertrace-capture = { path = "../evertrace-capture" }
+evertrace-codex = { path = "../evertrace-codex" }
+evertrace-domain = { path = "../evertrace-domain" }
+evertrace-engine = { path = "../evertrace-engine" }
+evertrace-protocol = { path = "../evertrace-protocol" }
+evertrace-store = { path = "../evertrace-store" }
+evertrace-tui = { path = "../evertrace-tui" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

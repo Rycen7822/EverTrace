@@ -1,0 +1,101 @@
+profile_version = 1
+status = "passed"
+observed_on = "2026-08-26"
+rust_release = "1.97.1"
+rust_commit = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+target = "x86_64-unknown-linux-gnu"
+lancedb_version = "0.37.1"
+lancedb_tag = "v0.37.1"
+lancedb_commit = "b89f87f206abd79a069833cee01f0c029ddb1397"
+database_kind = "local_embedded_lancedb"
+cross_table_atomicity = false
+production_schema_created = false
+
+[dependencies]
+arrow = "58.3.0"
+arrow_array = "58.3.0"
+arrow_schema = "58.3.0"
+arrow_buffer = "58.4.0"
+datafusion = "54.1.0"
+lance = "10.0.0"
+lance_index = "10.0.0"
+lance_tokenizer = "10.0.0"
+
+[probe_schema]
+name = "probe_row_v1"
+canonical_fingerprint = "b273bef6d4cfde3e6c9b069fa185964bb9ebd6e70ce9a2eb3ec42f6f42e72e03"
+fields = ["id:int64:not_null", "command_id:utf8:not_null", "text:utf8:not_null", "generation:int64:not_null"]
+
+[fts]
+index_kind = "lance_fts"
+column = "text"
+base_tokenizer = "icu"
+lower_case = true
+stem = false
+remove_stop_words = false
+ascii_folding = true
+with_position = false
+mixed_chinese_english = true
+default_query_includes_latest_unindexed_rows = true
+fast_search_excludes_latest_unindexed_rows_until_index_optimize = true
+delta_fallback_required = false
+
+[scalar_index]
+approved = false
+kind = "none"
+columns = []
+decision = "no S06 benchmark proved a scalar index necessary"
+
+[concurrency]
+lancedb_enforces_evertrace_single_writer = false
+evertrace_sibling_writer_lock_required = true
+
+[verified]
+local_connect_create_open = true
+record_batch_add = true
+filter_select_count = true
+handle_close_reopen = true
+single_table_commit = true
+merge_insert_insert_if_absent = true
+merge_insert_matched_update_disabled = true
+exact_command_retry_query = true
+fts_create_query = true
+fts_indexed_and_unindexed_visibility = true
+table_version_list_checkout_restore = true
+delete = true
+compact = true
+index_optimize = true
+conservative_prune = true
+exclusive_aggressive_prune = true
+handles_closed_directory_snapshot = true
+snapshot_independent_reopen = true
+crash_reopen = true
+concurrent_reads_one_writer = true
+second_process_commit_visibility = true
+schema_mismatch_rejected = true
+missing_manifest_rejected = true
+malformed_manifest_isolated = true
+
+[characterization]
+environment = "Linux 6.18.33.2-microsoft-standard-WSL2 x86_64"
+cpu = "Intel Core Ultra 7 265K"
+build_profile = "cargo test dev profile"
+core_probe_latency_ms = 15
+process_rss_kib = 159136
+fixed_cross_machine_threshold = false
+
+[[unsupported_behavior]]
+key = "cross_table_atomic_commit"
+result = "unsupported_and_not_assumed"
+
+[[unsupported_behavior]]
+key = "fast_search_unindexed_visibility"
+result = "latest_unindexed_rows_are_hidden_until_index_optimize"
+
+[[unsupported_behavior]]
+key = "malformed_short_manifest_direct_open"
+result = "upstream_lance_10_debug_build_panics; probe_isolated_in_child_process; missing_manifest_returns_error"
+
+[[unsupported_behavior]]
+key = "aggressive_prune_with_other_handles"
+result = "unsupported; delete_unverified_true_is_exclusive_only"

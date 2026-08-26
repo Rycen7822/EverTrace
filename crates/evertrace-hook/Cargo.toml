@@ -1,0 +1,15 @@
+[package]
+name = "evertrace-hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+evertrace-capture = { path = "../evertrace-capture" }
+evertrace-codex = { path = "../evertrace-codex" }
+evertrace-domain = { path = "../evertrace-domain" }
+evertrace-protocol = { path = "../evertrace-protocol", default-features = false }
+
+[lints]
+workspace = true
