@@ -8,9 +8,14 @@ use crate::{
     ids::{CaptureOutageIntervalId, CaptureReceiptId, ExecutionLaneId, OperationId},
 };
 
+pub mod binding;
 pub mod task;
 pub mod workstream;
 
+pub use binding::{
+    ActiveWorkContext, AssignmentStatus, PrimaryWorkBinding, SecondaryBindingRole,
+    SecondaryBindingTarget, SecondaryWorkBinding, WorkBindingRevision,
+};
 pub use task::{Task, TaskIdentityConfidence, TaskLifecycle, TaskScopeMembership};
 pub use workstream::{
     ActiveLineageFoundation, CorrelationEvidence, CorrelationEvidenceKind, CorrelationResult,

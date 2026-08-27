@@ -4,7 +4,10 @@ use evertrace_domain::evidence::{HostOccurrence, Operation, ScopeEffect};
 use evertrace_domain::repository::{
     IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
 };
-use evertrace_domain::work::{CaptureReceipt, ExecutionLane, Task, Workstream};
+use evertrace_domain::work::{
+    AssignmentStatus, CaptureReceipt, ExecutionLane, SecondaryBindingTarget, Task,
+    TaskIdentityConfidence, WorkBindingRevision, Workstream,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::StoreError;
@@ -75,6 +78,170 @@ pub fn build_physical_relation_rows(
             source_id: effect.operation_id.to_string(),
             target_id: effect.scope_effect_id.to_string(),
         });
+    }
+    Ok(rows.into_iter().collect())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum WorkBindingRelationKind {
+    OperationToBindingRevision,
+    BindingToScopeEffect,
+    BindingToPrimaryTask,
+    BindingToPrimaryWorkstream,
+    BindingToCandidateTask,
+    BindingToCandidateWorkstream,
+    BindingToSecondaryTarget,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct WorkBindingRelationRow {
+    pub kind: WorkBindingRelationKind,
+    pub source_id: String,
+    pub target_id: String,
+}
+
+pub fn build_work_binding_relation_rows(
+    bindings: &[WorkBindingRevision],
+    operations: &[Operation],
+    scope_effects: &[ScopeEffect],
+    tasks: &[Task],
+    workstreams: &[Workstream],
+) -> Result<Vec<WorkBindingRelationRow>, StoreError> {
+    let operation_by_id = operations
+        .iter()
+        .map(|value| (value.operation_id, value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let effects = scope_effects
+        .iter()
+        .map(|value| (value.scope_effect_id, value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let tasks_by_id = tasks
+        .iter()
+        .map(|value| (value.task_id, value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let streams = workstreams
+        .iter()
+        .map(|value| (value.workstream_id, value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if operation_by_id.len() != operations.len()
+        || effects.len() != scope_effects.len()
+        || tasks_by_id.len() != tasks.len()
+        || streams.len() != workstreams.len()
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    for task in tasks {
+        task.validate().map_err(|_| StoreError::InvalidInput)?;
+    }
+    for workstream in workstreams {
+        workstream
+            .validate()
+            .map_err(|_| StoreError::InvalidInput)?;
+    }
+    let mut rows = BTreeSet::new();
+    for binding in bindings {
+        binding.validate().map_err(|_| StoreError::InvalidInput)?;
+        let operation = operation_by_id
+            .get(&binding.operation_id)
+            .ok_or(StoreError::InvalidInput)?;
+        let source = binding.work_binding_revision_id.to_string();
+        rows.insert(WorkBindingRelationRow {
+            kind: WorkBindingRelationKind::OperationToBindingRevision,
+            source_id: binding.operation_id.to_string(),
+            target_id: source.clone(),
+        });
+        for effect_id in &binding.scope_effect_refs {
+            if effects.get(effect_id).is_none_or(|effect| {
+                effect.operation_id != binding.operation_id
+                    || !operation.scope_effect_ids.contains(effect_id)
+            }) {
+                return Err(StoreError::InvalidInput);
+            }
+            rows.insert(WorkBindingRelationRow {
+                kind: WorkBindingRelationKind::BindingToScopeEffect,
+                source_id: source.clone(),
+                target_id: effect_id.to_string(),
+            });
+        }
+        match (
+            binding.primary_binding.task_id,
+            binding.primary_binding.workstream_id,
+        ) {
+            (Some(task_id), Some(workstream_id)) => {
+                let task = tasks_by_id.get(&task_id).ok_or(StoreError::InvalidInput)?;
+                let workstream = streams
+                    .get(&workstream_id)
+                    .ok_or(StoreError::InvalidInput)?;
+                if workstream.task_id != task_id {
+                    return Err(StoreError::InvalidInput);
+                }
+                for effect_id in &binding.scope_effect_refs {
+                    let effect = effects[effect_id];
+                    if effect.repository_instance_id.is_some_and(|repository_id| {
+                        workstream.repository_instance_id != Some(repository_id)
+                            || !task.scope_memberships.iter().any(|membership| {
+                                membership.repository_instance_id == Some(repository_id)
+                                    && effect.worktree_instance_id.is_none_or(|worktree_id| {
+                                        membership.worktree_instance_ids.contains(&worktree_id)
+                                    })
+                            })
+                    }) || effect.worktree_instance_id.is_some_and(|worktree_id| {
+                        !workstream.worktree_instance_ids.contains(&worktree_id)
+                    }) {
+                        return Err(StoreError::InvalidInput);
+                    }
+                }
+                let (task_kind, stream_kind) = match binding.assignment_status {
+                    AssignmentStatus::Resolved
+                        if task.identity_confidence != TaskIdentityConfidence::Provisional =>
+                    {
+                        (
+                            WorkBindingRelationKind::BindingToPrimaryTask,
+                            WorkBindingRelationKind::BindingToPrimaryWorkstream,
+                        )
+                    }
+                    AssignmentStatus::Provisional => (
+                        WorkBindingRelationKind::BindingToCandidateTask,
+                        WorkBindingRelationKind::BindingToCandidateWorkstream,
+                    ),
+                    _ => return Err(StoreError::InvalidInput),
+                };
+                rows.insert(WorkBindingRelationRow {
+                    kind: task_kind,
+                    source_id: source.clone(),
+                    target_id: task_id.to_string(),
+                });
+                rows.insert(WorkBindingRelationRow {
+                    kind: stream_kind,
+                    source_id: source.clone(),
+                    target_id: workstream_id.to_string(),
+                });
+            }
+            (None, None)
+                if matches!(
+                    binding.assignment_status,
+                    AssignmentStatus::Provisional
+                        | AssignmentStatus::Conflicted
+                        | AssignmentStatus::Unresolved
+                ) => {}
+            _ => return Err(StoreError::InvalidInput),
+        }
+        for secondary in &binding.secondary_bindings {
+            let target_id = match secondary.target_ref {
+                SecondaryBindingTarget::Task(id) => id.to_string(),
+                SecondaryBindingTarget::Workstream(id) => id.to_string(),
+                SecondaryBindingTarget::Episode(id) => id.to_string(),
+                SecondaryBindingTarget::Attempt(id) => id.to_string(),
+                SecondaryBindingTarget::ExperimentRun(id) => id.to_string(),
+                SecondaryBindingTarget::CompetingGroup(id) => id.to_string(),
+                SecondaryBindingTarget::Artifact(id) => id.to_string(),
+            };
+            rows.insert(WorkBindingRelationRow {
+                kind: WorkBindingRelationKind::BindingToSecondaryTarget,
+                source_id: source.clone(),
+                target_id,
+            });
+        }
     }
     Ok(rows.into_iter().collect())
 }

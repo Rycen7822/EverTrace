@@ -9,13 +9,16 @@ use evertrace_domain::{
     ids::{
         CaptureOutageIntervalId, ExecutionLaneId, HostOccurrenceId, IntegrationEventId, JobId,
         OperationId, RepositoryId, ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId,
-        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
+        WorkBindingRevisionId, WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
     repository::{
         IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
         WorktreeTransition,
     },
-    work::{CaptureReceipt, ExecutionLane, SourceCoverage, Task, Workstream},
+    work::{
+        ActiveWorkContext, AssignmentStatus, CaptureReceipt, ExecutionLane, SourceCoverage, Task,
+        TaskIdentityConfidence, WorkBindingRevision, Workstream,
+    },
 };
 use lancedb::Table;
 
@@ -174,6 +177,88 @@ impl WorkIdentityCurrentView {
             }
         }
         Ok(view)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkBindingCurrentView {
+    pub frontier: u64,
+    pub bindings: BTreeMap<OperationId, WorkBindingRevision>,
+}
+
+fn current_binding_lineage<'a>(
+    bindings: impl IntoIterator<Item = &'a WorkBindingRevision>,
+) -> Result<BTreeMap<OperationId, &'a WorkBindingRevision>, StoreError> {
+    let mut by_operation = BTreeMap::<OperationId, Vec<&WorkBindingRevision>>::new();
+    for binding in bindings {
+        binding.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        by_operation
+            .entry(binding.operation_id)
+            .or_default()
+            .push(binding);
+    }
+    let mut current = BTreeMap::new();
+    for (operation_id, revisions) in &mut by_operation {
+        revisions.sort_by_key(|value| value.revision_generation);
+        for (index, revision) in revisions.iter().enumerate() {
+            let generation = u64::try_from(index + 1).map_err(|_| StoreError::StoreCorrupt)?;
+            let predecessor = index
+                .checked_sub(1)
+                .map(|previous| revisions[previous].work_binding_revision_id);
+            if revision.revision_generation != generation
+                || revision.predecessor_revision_id != predecessor
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        let latest = revisions.last().copied().ok_or(StoreError::StoreCorrupt)?;
+        current.insert(*operation_id, latest);
+    }
+    Ok(current)
+}
+
+impl WorkBindingCurrentView {
+    pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let mut revisions = Vec::new();
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("work_binding"))
+        {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::WorkBindingRecorded(binding) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let binding = *binding;
+            if row.row_id
+                != format!(
+                    "object:work:work_binding:{}",
+                    binding.work_binding_revision_id
+                )
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            binding.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            revisions.push(binding);
+        }
+        let bindings = current_binding_lineage(revisions.iter())?
+            .into_iter()
+            .map(|(operation_id, binding)| (operation_id, binding.clone()))
+            .collect();
+        Ok(Self {
+            frontier: snapshot.frontier,
+            bindings,
+        })
+    }
+
+    pub fn active_context(&self, operation_id: OperationId) -> Option<ActiveWorkContext> {
+        self.bindings
+            .get(&operation_id)
+            .map(ActiveWorkContext::from_current)
     }
 }
 
@@ -862,6 +947,7 @@ struct ReducerState {
     integration_events: BTreeMap<IntegrationEventId, (IntegrationEvent, u64)>,
     tasks: BTreeMap<TaskId, (Task, u64)>,
     workstreams: BTreeMap<WorkstreamId, (Workstream, u64)>,
+    work_bindings: BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -915,7 +1001,8 @@ impl KnownSourceRange {
 #[derive(Clone, Default)]
 pub(crate) struct JournalAdmissionState {
     source_ranges: BTreeMap<String, KnownSourceRange>,
-    operation_ids: BTreeSet<OperationId>,
+    operations: BTreeMap<OperationId, (Operation, u64)>,
+    scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     execution_lanes: BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
     capture_receipts: BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
     capture_gaps: BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
@@ -928,6 +1015,7 @@ pub(crate) struct JournalAdmissionState {
     integration_events: BTreeMap<IntegrationEventId, (IntegrationEvent, u64)>,
     tasks: BTreeMap<TaskId, (Task, u64)>,
     workstreams: BTreeMap<WorkstreamId, (Workstream, u64)>,
+    work_bindings: BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
 }
 
 impl JournalAdmissionState {
@@ -1050,7 +1138,16 @@ impl JournalAdmissionState {
                 record_known_source(&mut self.source_ranges, &value)?;
             }
             JournalPayload::OperationDerived(value) => {
-                self.operation_ids.insert(value.operation_id);
+                replace_operation(&mut self.operations, *value, seq)?;
+            }
+            JournalPayload::ScopeEffectDerived(value) => {
+                if let Some((current, _)) = self.scope_effects.get(&value.scope_effect_id)
+                    && current != value.as_ref()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                self.scope_effects
+                    .insert(value.scope_effect_id, (*value, seq));
             }
             JournalPayload::ExecutionLaneRecorded(value) => {
                 replace_lane(&mut self.execution_lanes, *value, seq)?;
@@ -1094,6 +1191,9 @@ impl JournalAdmissionState {
             JournalPayload::WorkstreamRecorded(value) => {
                 replace_workstream(&mut self.workstreams, *value, seq)?;
             }
+            JournalPayload::WorkBindingRecorded(value) => {
+                replace_work_binding(&mut self.work_bindings, *value, seq)?;
+            }
             _ => {}
         }
         Ok(())
@@ -1107,7 +1207,7 @@ impl JournalAdmissionState {
             &self.capture_outages,
             &self.source_close_reconciliations,
             &self.source_ranges,
-            &self.operation_ids,
+            &self.operations.keys().copied().collect(),
         )?;
         crate::repository::validate_repository_relations(
             &self.repositories,
@@ -1121,6 +1221,13 @@ impl JournalAdmissionState {
             &self.workstreams,
             &self.repositories,
             &self.worktrees,
+        )?;
+        validate_work_binding_relations(
+            &self.work_bindings,
+            &self.operations,
+            &self.scope_effects,
+            &self.tasks,
+            &self.workstreams,
         )
     }
 }
@@ -1636,6 +1743,9 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         JournalPayload::WorkstreamRecorded(value) => {
             replace_workstream(&mut state.workstreams, *value, row.seq)?;
         }
+        JournalPayload::WorkBindingRecorded(value) => {
+            replace_work_binding(&mut state.work_bindings, *value, row.seq)?;
+        }
     }
     Ok(())
 }
@@ -1714,6 +1824,84 @@ fn replace_workstream(
         }
     }
     values.insert(value.workstream_id, (value, seq));
+    Ok(())
+}
+
+fn replace_work_binding(
+    values: &mut BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    value: WorkBindingRevision,
+    seq: u64,
+) -> Result<(), StoreError> {
+    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    if let Some((existing, _)) = values.get(&value.work_binding_revision_id) {
+        return if existing == &value {
+            Ok(())
+        } else {
+            Err(StoreError::StoreCorrupt)
+        };
+    }
+    values.insert(value.work_binding_revision_id, (value, seq));
+    Ok(())
+}
+
+fn validate_work_binding_relations(
+    bindings: &BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    operations: &BTreeMap<OperationId, (Operation, u64)>,
+    scope_effects: &BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
+    tasks: &BTreeMap<TaskId, (Task, u64)>,
+    workstreams: &BTreeMap<WorkstreamId, (Workstream, u64)>,
+) -> Result<(), StoreError> {
+    current_binding_lineage(bindings.values().map(|(binding, _)| binding))?;
+    for (binding, _) in bindings.values() {
+        binding.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        let (operation, _) = operations
+            .get(&binding.operation_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        for scope_id in &binding.scope_effect_refs {
+            let (effect, _) = scope_effects
+                .get(scope_id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if effect.operation_id != binding.operation_id
+                || !operation.scope_effect_ids.contains(scope_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+
+        match (
+            binding.primary_binding.task_id,
+            binding.primary_binding.workstream_id,
+        ) {
+            (Some(task_id), Some(workstream_id)) => {
+                let (task, _) = tasks.get(&task_id).ok_or(StoreError::StoreCorrupt)?;
+                let (workstream, _) = workstreams
+                    .get(&workstream_id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if workstream.task_id != task_id
+                    || (binding.assignment_status == AssignmentStatus::Resolved
+                        && task.identity_confidence == TaskIdentityConfidence::Provisional)
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                for scope_id in &binding.scope_effect_refs {
+                    let (effect, _) = &scope_effects[scope_id];
+                    if effect.repository_instance_id.is_some_and(|repository_id| {
+                        workstream.repository_instance_id != Some(repository_id)
+                    }) || effect.worktree_instance_id.is_some_and(|worktree_id| {
+                        !workstream.worktree_instance_ids.contains(&worktree_id)
+                    }) {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+            }
+            (None, None) => {
+                if binding.assignment_status == AssignmentStatus::Resolved {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            _ => return Err(StoreError::StoreCorrupt),
+        }
+    }
     Ok(())
 }
 
@@ -2005,6 +2193,34 @@ impl ReducerState {
                 )?;
                 self.workstreams
                     .insert(value.workstream_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorkBindingRecorded(value) => {
+                let value = *value;
+                require_work_identity_row(
+                    row,
+                    "work_binding",
+                    &value.work_binding_revision_id.to_string(),
+                    &value.work_binding_revision_id.to_string(),
+                    value
+                        .primary_binding
+                        .task_id
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    value
+                        .primary_binding
+                        .workstream_id
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    None,
+                    None,
+                    value.assignment_status.as_str(),
+                )?;
+                self.work_bindings
+                    .insert(
+                        value.work_binding_revision_id,
+                        (value, row.source_event_seq),
+                    )
                     .is_some()
             }
             JournalPayload::DirtyTarget(value) => {
@@ -2639,6 +2855,20 @@ impl ReducerState {
                 seq,
             )?);
         }
+        for (id, (value, seq)) in self.work_bindings {
+            rows.push(work_identity_row(
+                "work_binding",
+                id.to_string(),
+                id.to_string(),
+                value.assignment_status.as_str(),
+                value.primary_binding.task_id.map(|id| id.to_string()),
+                value.primary_binding.workstream_id.map(|id| id.to_string()),
+                None,
+                None,
+                &JournalPayload::WorkBindingRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
         Ok(rows)
     }
 
@@ -2736,13 +2966,21 @@ impl ReducerState {
             &self.repositories,
             &self.worktrees,
         )?;
+        validate_work_binding_relations(
+            &self.work_bindings,
+            &self.operations,
+            &self.scope_effects,
+            &self.tasks,
+            &self.workstreams,
+        )?;
         Ok(())
     }
 
     fn admission_state(&self) -> Result<JournalAdmissionState, StoreError> {
         Ok(JournalAdmissionState {
             source_ranges: current_source_ranges(&self.source_receipts)?,
-            operation_ids: self.operations.keys().copied().collect(),
+            operations: self.operations.clone(),
+            scope_effects: self.scope_effects.clone(),
             execution_lanes: self.execution_lanes.clone(),
             capture_receipts: self.capture_receipts.clone(),
             capture_gaps: self.capture_gaps.clone(),
@@ -2755,6 +2993,7 @@ impl ReducerState {
             integration_events: self.integration_events.clone(),
             tasks: self.tasks.clone(),
             workstreams: self.workstreams.clone(),
+            work_bindings: self.work_bindings.clone(),
         })
     }
 }
