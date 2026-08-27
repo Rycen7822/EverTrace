@@ -317,6 +317,12 @@ impl ScopeEffectId {
     }
 }
 
+impl WorkBindingRevisionId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
 impl DuplicateGroupId {
     pub fn new_v7() -> Self {
         Self(Uuid::now_v7())

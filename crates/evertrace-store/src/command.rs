@@ -12,7 +12,10 @@ use evertrace_domain::{
         IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
         WorktreeTransition,
     },
-    work::{AdmissionFailureObservability, CaptureReceipt, ExecutionLane, Task, Workstream},
+    work::{
+        AdmissionFailureObservability, CaptureReceipt, ExecutionLane, Task, WorkBindingRevision,
+        Workstream,
+    },
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -500,6 +503,7 @@ pub enum JournalPayload {
     IntegrationEventRecorded(Box<IntegrationEvent>),
     TaskRecorded(Box<Task>),
     WorkstreamRecorded(Box<Workstream>),
+    WorkBindingRecorded(Box<WorkBindingRevision>),
 }
 
 impl JournalPayload {
@@ -534,6 +538,7 @@ impl JournalPayload {
             Self::IntegrationEventRecorded(_) => "integration_event_recorded_v1",
             Self::TaskRecorded(_) => "task_recorded_v1",
             Self::WorkstreamRecorded(_) => "workstream_recorded_v1",
+            Self::WorkBindingRecorded(_) => "work_binding_recorded_v1",
         }
     }
 
@@ -557,7 +562,9 @@ impl JournalPayload {
             | Self::WorktreeSnapshotRecorded(_)
             | Self::WorktreeTransitionRecorded(_)
             | Self::IntegrationEventRecorded(_) => RecordClass::ObjectEvent,
-            Self::TaskRecorded(_) | Self::WorkstreamRecorded(_) => RecordClass::ObjectEvent,
+            Self::TaskRecorded(_) | Self::WorkstreamRecorded(_) | Self::WorkBindingRecorded(_) => {
+                RecordClass::ObjectEvent
+            }
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -665,6 +672,9 @@ impl JournalPayload {
             }
             Self::TaskRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
             Self::WorkstreamRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::WorkBindingRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
         }
@@ -793,6 +803,7 @@ impl JournalPayload {
             }
             Self::TaskRecorded(value) => tagged_json("task_recorded", value),
             Self::WorkstreamRecorded(value) => tagged_json("workstream_recorded", value),
+            Self::WorkBindingRecorded(value) => tagged_json("work_binding_recorded", value),
         }
     }
 

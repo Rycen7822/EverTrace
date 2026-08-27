@@ -26,7 +26,7 @@ pub use projections::{
     NamedCurrentDependency, ProjectionSnapshot, ProjectionWorker, ReconciliationArtifactContext,
     ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
     ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
-    WorkIdentityCurrentView, reduce_journal,
+    WorkBindingCurrentView, WorkIdentityCurrentView, reduce_journal,
 };
 pub use schema::{PROBE_SCHEMA_VERSION, ProbeRow, probe_batch, probe_schema, schema_fingerprint};
 pub use writer::{JournalWriter, SiblingWriterLock};

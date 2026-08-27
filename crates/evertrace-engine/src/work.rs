@@ -1,5 +1,6 @@
 //! S12 Task/Workstream command and derived-state facade.
 
+pub mod binding;
 pub mod task;
 pub mod workstream;
 
