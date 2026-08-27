@@ -2,8 +2,15 @@
 
 pub mod attempt;
 pub mod binding;
+pub mod episode;
 pub mod task;
 pub mod workstream;
+
+pub use episode::{
+    activate_episode, close_episode_and_optionally_open, confirm_episode_boundary,
+    link_attempt_to_episode, link_binding_to_episode, new_episode, next_episode,
+    record_episode_correction, save_checkpoint, save_segmentation_update,
+};
 
 use evertrace_domain::ids::CommandId;
 use thiserror::Error;

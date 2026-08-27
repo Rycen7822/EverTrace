@@ -8,9 +8,9 @@ use evertrace_domain::{
     },
     ids::{
         AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
-        HostOccurrenceId, IntegrationEventId, JobId, OperationId, RepositoryId, ScopeEffectId,
-        SourceObservationId, SourceReceiptId, TaskId, WorkBindingRevisionId, WorkstreamId,
-        WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
+        HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId, OperationId, RepositoryId,
+        ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId, WorkBindingRevisionId,
+        WorkEpisodeId, WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
     repository::{
         IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
@@ -20,8 +20,8 @@ use evertrace_domain::{
         ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus,
         AttemptExecutionStatus, AttemptOutcomeState, AttemptVerification, CaptureReceipt,
         CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, LaneStatus,
-        ResumeStateAssessment, SourceCoverage, Task, TaskIdentityConfidence, WorkBindingRevision,
-        Workstream,
+        OperationBurst, ResumeStateAssessment, SegmentationCorrection, SourceCoverage, Task,
+        TaskIdentityConfidence, WorkBindingRevision, WorkCheckpoint, WorkEpisode, Workstream,
     },
 };
 use lancedb::Table;
@@ -41,6 +41,16 @@ use crate::{
         OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind, objects_batch,
         validate_objects_table,
     },
+};
+
+mod segmentation;
+pub use segmentation::{
+    EpisodeCurrentView, OperationBurstCurrentView, SegmentationCurrentState,
+    SegmentationCurrentView,
+};
+use segmentation::{
+    record_checkpoint, record_correction, record_episode, record_operation_burst,
+    validate_episode_relations,
 };
 
 const PROJECTION_GENERATION: u64 = 1;
@@ -320,6 +330,11 @@ fn current_binding_lineage<'a>(
                 || revision.predecessor_revision_id != predecessor
             {
                 return Err(StoreError::StoreCorrupt);
+            }
+            if let Some(previous) = index.checked_sub(1) {
+                revisions[previous]
+                    .validate_successor(revision)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
             }
         }
         let latest = revisions.last().copied().ok_or(StoreError::StoreCorrupt)?;
@@ -1044,10 +1059,13 @@ struct ReducerState {
     evidence_surfaces: BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
+    operation_revisions: BTreeMap<(OperationId, u32), (Operation, u64)>,
     scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     normalization_watermarks: BTreeMap<SourceObservationId, (NormalizationWatermark, u64)>,
     execution_lanes: BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
     capture_receipts: BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
+    capture_receipt_revisions:
+        BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
     capture_gaps: BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
     capture_outages: BTreeMap<CaptureOutageIntervalId, (CaptureOutageInterval, u64)>,
     source_close_reconciliations: BTreeMap<String, (SourceCloseReconciliation, u64)>,
@@ -1064,6 +1082,13 @@ struct ReducerState {
     attempt_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Attempt, u64)>,
     competing_group_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (CompetingAttemptGroup, u64)>,
+    operation_bursts: BTreeMap<OperationBurstId, (OperationBurst, u64)>,
+    operation_burst_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (OperationBurst, u64)>,
+    episodes: BTreeMap<WorkEpisodeId, (WorkEpisode, u64)>,
+    episode_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
+    checkpoints: BTreeMap<String, (WorkCheckpoint, u64)>,
+    corrections: BTreeMap<evertrace_domain::revision::RevisionId, (SegmentationCorrection, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1117,10 +1142,15 @@ impl KnownSourceRange {
 #[derive(Clone, Default)]
 pub(crate) struct JournalAdmissionState {
     source_ranges: BTreeMap<String, KnownSourceRange>,
+    source_observations: BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
+    operation_revisions: BTreeMap<(OperationId, u32), (Operation, u64)>,
     scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     execution_lanes: BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
     capture_receipts: BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
+    capture_receipt_revisions:
+        BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
     capture_gaps: BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
     capture_outages: BTreeMap<CaptureOutageIntervalId, (CaptureOutageInterval, u64)>,
     source_close_reconciliations: BTreeMap<String, (SourceCloseReconciliation, u64)>,
@@ -1137,6 +1167,13 @@ pub(crate) struct JournalAdmissionState {
     attempt_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Attempt, u64)>,
     competing_group_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (CompetingAttemptGroup, u64)>,
+    operation_bursts: BTreeMap<OperationBurstId, (OperationBurst, u64)>,
+    operation_burst_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (OperationBurst, u64)>,
+    episodes: BTreeMap<WorkEpisodeId, (WorkEpisode, u64)>,
+    episode_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
+    checkpoints: BTreeMap<String, (WorkCheckpoint, u64)>,
+    corrections: BTreeMap<evertrace_domain::revision::RevisionId, (SegmentationCorrection, u64)>,
 }
 
 impl JournalAdmissionState {
@@ -1150,6 +1187,9 @@ impl JournalAdmissionState {
 
     pub(crate) fn apply_command(&self, command: &JournalCommand) -> Result<Self, StoreError> {
         self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
+        self.validate_episode_binding_activation(
+            command.events().iter().map(|event| &event.payload),
+        )?;
         crate::repository::validate_repository_payloads(
             command.events().iter().map(|event| &event.payload),
         )?;
@@ -1163,6 +1203,46 @@ impl JournalAdmissionState {
         Ok(next)
     }
 
+    fn validate_episode_binding_activation<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = &'a JournalPayload>,
+    ) -> Result<(), StoreError> {
+        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        let command_open = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                JournalPayload::WorkEpisodeRecorded(value)
+                    if value.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open =>
+                {
+                    Some(value.episode_id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let current =
+            current_binding_lineage(self.work_bindings.values().map(|(binding, _)| binding))?;
+        for binding in payloads.iter().filter_map(|payload| match payload {
+            JournalPayload::WorkBindingRecorded(value) => Some(value.as_ref()),
+            _ => None,
+        }) {
+            let Some(episode_id) = binding.primary_binding.episode_id else {
+                continue;
+            };
+            let first_link = current
+                .get(&binding.operation_id)
+                .is_none_or(|previous| previous.primary_binding.episode_id.is_none());
+            if first_link
+                && !command_open.contains(&episode_id)
+                && self.episodes.get(&episode_id).is_none_or(|(episode, _)| {
+                    episode.lifecycle_status != evertrace_domain::work::EpisodeLifecycle::Open
+                })
+            {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        Ok(())
+    }
+
     fn apply_row_batch(&self, rows: &[&JournalRow]) -> Result<Self, StoreError> {
         let parsed = rows
             .iter()
@@ -1173,6 +1253,8 @@ impl JournalAdmissionState {
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
         self.validate_transition_pairs(parsed.iter().map(|(payload, _)| payload))
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        self.validate_episode_binding_activation(parsed.iter().map(|(payload, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
         crate::repository::validate_repository_payloads(parsed.iter().map(|(payload, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
@@ -1258,8 +1340,28 @@ impl JournalAdmissionState {
             JournalPayload::SourceReceiptRecorded(value) => {
                 record_known_source(&mut self.source_ranges, &value)?;
             }
+            JournalPayload::SourceObservationRecorded(value) => {
+                if self
+                    .source_observations
+                    .insert(value.source_observation_id, (*value, seq))
+                    .is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            JournalPayload::HostOccurrenceNormalized(value) => {
+                replace_occurrence(&mut self.host_occurrences, *value, seq)?;
+            }
             JournalPayload::OperationDerived(value) => {
-                replace_operation(&mut self.operations, *value, seq)?;
+                let value = *value;
+                replace_operation(&mut self.operations, value.clone(), seq)?;
+                if self
+                    .operation_revisions
+                    .insert((value.operation_id, value.operation_revision), (value, seq))
+                    .is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
             JournalPayload::ScopeEffectDerived(value) => {
                 if let Some((current, _)) = self.scope_effects.get(&value.scope_effect_id)
@@ -1274,7 +1376,12 @@ impl JournalAdmissionState {
                 replace_lane(&mut self.execution_lanes, *value, seq)?;
             }
             JournalPayload::CaptureReceiptRecorded(value) => {
-                replace_capture_receipt(&mut self.capture_receipts, *value, seq)?;
+                record_capture_receipt(
+                    &mut self.capture_receipts,
+                    &mut self.capture_receipt_revisions,
+                    *value,
+                    seq,
+                )?;
             }
             JournalPayload::CaptureGapMarkerRecorded(value) => {
                 replace_gap(&mut self.capture_gaps, *value, seq)?;
@@ -1324,6 +1431,21 @@ impl JournalAdmissionState {
                 *value,
                 seq,
             )?,
+            JournalPayload::OperationBurstRecorded(value) => record_operation_burst(
+                &mut self.operation_bursts,
+                &mut self.operation_burst_revisions,
+                *value,
+                seq,
+            )?,
+            JournalPayload::WorkEpisodeRecorded(value) => {
+                record_episode(&mut self.episodes, &mut self.episode_revisions, *value, seq)?
+            }
+            JournalPayload::WorkCheckpointRecorded(value) => {
+                record_checkpoint(&mut self.checkpoints, *value, seq)?;
+            }
+            JournalPayload::SegmentationCorrectionRecorded(value) => {
+                record_correction(&mut self.corrections, *value, seq)?;
+            }
             _ => {}
         }
         Ok(())
@@ -1360,6 +1482,7 @@ impl JournalAdmissionState {
             &self.workstreams,
             &self.attempts,
             &self.competing_groups,
+            &self.episodes,
         )?;
         validate_attempt_relations(
             &self.attempts,
@@ -1372,6 +1495,30 @@ impl JournalAdmissionState {
             &self.worktree_transitions,
             &self.integration_events,
             &self.work_bindings,
+        )?;
+        validate_episode_relations(
+            &self.episodes,
+            &self.episode_revisions,
+            &self.checkpoints,
+            &self.corrections,
+            &self.tasks,
+            &self.workstreams,
+            &self.attempts,
+            &self.attempt_revisions,
+            &self.competing_groups,
+            &self.work_bindings,
+            &self.operation_bursts,
+            &self.operation_revisions,
+            &self.host_occurrences,
+            &self.source_observations,
+            &self.scope_effects,
+            &self.execution_lanes,
+            &self.capture_receipt_revisions,
+            &self.capture_gaps,
+            &self.capture_outages,
+            &self.worktree_snapshots,
+            &self.worktree_transitions,
+            &self.integration_events,
         )
     }
 }
@@ -1669,7 +1816,7 @@ pub fn reduce_journal(rows: &[JournalRow]) -> Result<ProjectionSnapshot, StoreEr
             apply_event(&mut state, row)?;
             frontier = frontier.max(row.seq);
         }
-        state.rebuild_attempt_currents()?;
+        state.rebuild_revision_currents()?;
         state.validate_evidence_relations()?;
     }
     state.into_snapshot(frontier)
@@ -1812,7 +1959,17 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         }
         JournalPayload::OperationDerived(value) => {
             let value = *value;
-            replace_operation(&mut state.operations, value, row.seq)?;
+            replace_operation(&mut state.operations, value.clone(), row.seq)?;
+            if state
+                .operation_revisions
+                .insert(
+                    (value.operation_id, value.operation_revision),
+                    (value, row.seq),
+                )
+                .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
         }
         JournalPayload::ScopeEffectDerived(value) => {
             let value = *value;
@@ -1844,7 +2001,12 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             replace_lane(&mut state.execution_lanes, *value, row.seq)?;
         }
         JournalPayload::CaptureReceiptRecorded(value) => {
-            replace_capture_receipt(&mut state.capture_receipts, *value, row.seq)?;
+            record_capture_receipt(
+                &mut state.capture_receipts,
+                &mut state.capture_receipt_revisions,
+                *value,
+                row.seq,
+            )?;
         }
         JournalPayload::CaptureGapMarkerRecorded(value) => {
             replace_gap(&mut state.capture_gaps, *value, row.seq)?;
@@ -1903,6 +2065,24 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             *value,
             row.seq,
         )?,
+        JournalPayload::OperationBurstRecorded(value) => record_operation_burst(
+            &mut state.operation_bursts,
+            &mut state.operation_burst_revisions,
+            *value,
+            row.seq,
+        )?,
+        JournalPayload::WorkEpisodeRecorded(value) => record_episode(
+            &mut state.episodes,
+            &mut state.episode_revisions,
+            *value,
+            row.seq,
+        )?,
+        JournalPayload::WorkCheckpointRecorded(value) => {
+            record_checkpoint(&mut state.checkpoints, *value, row.seq)?;
+        }
+        JournalPayload::SegmentationCorrectionRecorded(value) => {
+            record_correction(&mut state.corrections, *value, row.seq)?;
+        }
     }
     Ok(())
 }
@@ -2084,6 +2264,7 @@ fn record_competing_group(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_work_binding_relations(
     bindings: &BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
     operations: &BTreeMap<OperationId, (Operation, u64)>,
@@ -2092,6 +2273,7 @@ fn validate_work_binding_relations(
     workstreams: &BTreeMap<WorkstreamId, (Workstream, u64)>,
     attempts: &BTreeMap<AttemptId, (Attempt, u64)>,
     groups: &BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    episodes: &BTreeMap<WorkEpisodeId, (WorkEpisode, u64)>,
 ) -> Result<(), StoreError> {
     current_binding_lineage(bindings.values().map(|(binding, _)| binding))?;
     for (binding, _) in bindings.values() {
@@ -2161,9 +2343,16 @@ fn validate_work_binding_relations(
                         }
                     }
                 }
-                if binding.primary_binding.episode_id.is_some()
-                    || binding.primary_binding.experiment_run_id.is_some()
-                {
+                if let Some(episode_id) = binding.primary_binding.episode_id {
+                    let episode = &episodes.get(&episode_id).ok_or(StoreError::StoreCorrupt)?.0;
+                    if binding.assignment_status != AssignmentStatus::Resolved
+                        || episode.task_id != task_id
+                        || episode.workstream_id != workstream_id
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                if binding.primary_binding.experiment_run_id.is_some() {
                     return Err(StoreError::StoreCorrupt);
                 }
             }
@@ -2609,12 +2798,20 @@ fn replace_operation(
     value: Operation,
     seq: u64,
 ) -> Result<(), StoreError> {
-    if let Some((current, _)) = values.get(&value.operation_id)
-        && current != &value
-        && (value.operation_revision != current.operation_revision + 1
-            || value.previous_operation_revision != Some(current.operation_revision))
-    {
-        return Err(StoreError::StoreCorrupt);
+    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    match values.get(&value.operation_id) {
+        None if value.operation_revision != 1 || value.previous_operation_revision.is_some() => {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Some((current, _))
+            if current != &value
+                && (current.operation_revision.checked_add(1)
+                    != Some(value.operation_revision)
+                    || value.previous_operation_revision != Some(current.operation_revision)) =>
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        _ => {}
     }
     values.insert(value.operation_id, (value, seq));
     Ok(())
@@ -2656,6 +2853,24 @@ fn replace_capture_receipt(
     Ok(())
 }
 
+fn record_capture_receipt(
+    current: &mut BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
+    revisions: &mut BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
+    value: CaptureReceipt,
+    seq: u64,
+) -> Result<(), StoreError> {
+    if let Some((existing, _)) = revisions.get(&value.capture_receipt_revision_id) {
+        return if existing == &value {
+            Ok(())
+        } else {
+            Err(StoreError::StoreCorrupt)
+        };
+    }
+    replace_capture_receipt(current, value.clone(), seq)?;
+    revisions.insert(value.capture_receipt_revision_id, (value, seq));
+    Ok(())
+}
+
 fn replace_gap(
     values: &mut BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
     value: CaptureGapMarkerEvidence,
@@ -2687,7 +2902,17 @@ fn replace_outage(
 }
 
 impl ReducerState {
-    fn rebuild_attempt_currents(&mut self) -> Result<(), StoreError> {
+    fn rebuild_revision_currents(&mut self) -> Result<(), StoreError> {
+        self.operations.clear();
+        let mut operations = self
+            .operation_revisions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        operations.sort_by_key(|(value, _)| (value.operation_id, value.operation_revision));
+        for (value, seq) in operations {
+            replace_operation(&mut self.operations, value, seq)?;
+        }
         self.attempts.clear();
         let mut attempts = self.attempt_revisions.values().cloned().collect::<Vec<_>>();
         attempts.sort_by_key(|(value, _)| (value.attempt_id, value.revision_generation));
@@ -2703,6 +2928,40 @@ impl ReducerState {
         groups.sort_by_key(|(value, _)| (value.competing_group_id, value.revision_generation));
         for (value, seq) in groups {
             replace_competing_group(&mut self.competing_groups, value, seq)?;
+        }
+        self.operation_bursts.clear();
+        let mut bursts = self
+            .operation_burst_revisions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        bursts.sort_by_key(|(value, _)| (value.operation_burst_id, value.revision_generation));
+        for (value, seq) in bursts {
+            if let Some((current, _)) = self.operation_bursts.get(&value.operation_burst_id) {
+                current
+                    .validate_successor(&value)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+            } else {
+                value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            }
+            self.operation_bursts
+                .insert(value.operation_burst_id, (value, seq));
+        }
+        self.episodes.clear();
+        let mut episodes = self.episode_revisions.values().cloned().collect::<Vec<_>>();
+        episodes.sort_by_key(|(value, _)| (value.episode_id, value.revision_generation));
+        for (value, seq) in episodes {
+            match self.episodes.get(&value.episode_id) {
+                None => {
+                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                }
+                Some((current, _)) => {
+                    current
+                        .validate_successor(&value)
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                }
+            }
+            self.episodes.insert(value.episode_id, (value, seq));
         }
         Ok(())
     }
@@ -2747,6 +3006,7 @@ impl ReducerState {
             state.restore_row(row, payload)?;
         }
 
+        state.rebuild_revision_currents()?;
         state.validate_evidence_relations()?;
         let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
         if canonical.rows != rows {
@@ -2771,6 +3031,24 @@ impl ReducerState {
                             row.source_event_seq,
                         ),
                     )
+                    .is_some()
+            }
+            JournalPayload::SegmentationCorrectionRecorded(value) => {
+                let value = *value;
+                let id = value.correction_revision_id.to_string();
+                require_work_identity_row(
+                    row,
+                    "segmentation_correction",
+                    &id,
+                    &id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    value.kind.as_str(),
+                )?;
+                self.corrections
+                    .insert(value.correction_revision_id, (value, row.source_event_seq))
                     .is_some()
             }
             JournalPayload::AttemptRecorded(value) => {
@@ -2822,6 +3100,69 @@ impl ReducerState {
                 )?;
                 self.competing_group_revisions
                     .insert(value.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::OperationBurstRecorded(value) => {
+                let value = *value;
+                let mut normalized = row.clone();
+                normalized.row_id =
+                    format!("object:work:operation_burst:{}", value.operation_burst_id);
+                require_work_identity_row(
+                    &normalized,
+                    "operation_burst",
+                    &value.operation_burst_id.to_string(),
+                    &value.revision_id.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    value.lifecycle.as_str(),
+                )?;
+                self.operation_burst_revisions
+                    .insert(value.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorkEpisodeRecorded(value) => {
+                let value = *value;
+                let mut normalized = row.clone();
+                normalized.row_id = format!("object:work:work_episode:{}", value.episode_id);
+                require_work_identity_row(
+                    &normalized,
+                    "work_episode",
+                    &value.episode_id.to_string(),
+                    &value.revision_id.to_string(),
+                    Some(&value.task_id.to_string()),
+                    Some(&value.workstream_id.to_string()),
+                    value
+                        .repository_instance_id
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    value
+                        .worktree_instance_id
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    value.lifecycle_status.as_str(),
+                )?;
+                self.episode_revisions
+                    .insert(value.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorkCheckpointRecorded(value) => {
+                let value = *value;
+                let key = value.stable_key();
+                require_work_identity_row(
+                    row,
+                    "work_checkpoint",
+                    &key,
+                    &value.episode_revision_id.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "derived",
+                )?;
+                self.checkpoints
+                    .insert(key, (value, row.source_event_seq))
                     .is_some()
             }
             JournalPayload::TaskRecorded(value) => {
@@ -3054,15 +3395,28 @@ impl ReducerState {
             }
             JournalPayload::OperationDerived(value) => {
                 let value = *value;
+                if row.row_id
+                    != format!(
+                        "object:work:operation:{}@{}",
+                        value.operation_id, value.operation_revision
+                    )
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                let mut canonical = row.clone();
+                canonical.row_id = format!("object:work:operation:{}", value.operation_id);
                 require_physical_row(
-                    row,
+                    &canonical,
                     ObjectFamily::Work,
                     "operation",
                     &value.operation_id.to_string(),
                     &format!("{}@{}", value.operation_id, value.operation_revision),
                 )?;
-                self.operations
-                    .insert(value.operation_id, (value, row.source_event_seq))
+                self.operation_revisions
+                    .insert(
+                        (value.operation_id, value.operation_revision),
+                        (value, row.source_event_seq),
+                    )
                     .is_some()
             }
             JournalPayload::ScopeEffectDerived(value) => {
@@ -3106,16 +3460,38 @@ impl ReducerState {
             }
             JournalPayload::CaptureReceiptRecorded(value) => {
                 let value = *value;
-                require_physical_row(
-                    row,
-                    ObjectFamily::Evidence,
-                    "capture_receipt",
-                    &value.execution_lane_id.to_string(),
-                    &value.capture_receipt_revision_id.to_string(),
-                )?;
-                self.capture_receipts
-                    .insert(value.execution_lane_id, (value, row.source_event_seq))
-                    .is_some()
+                let revision_id = value.capture_receipt_revision_id;
+                let duplicate_revision = self
+                    .capture_receipt_revisions
+                    .insert(revision_id, (value.clone(), row.source_event_seq))
+                    .is_some();
+                match row.object_kind.as_deref() {
+                    Some("capture_receipt") => {
+                        require_physical_row(
+                            row,
+                            ObjectFamily::Evidence,
+                            "capture_receipt",
+                            &value.execution_lane_id.to_string(),
+                            &revision_id.to_string(),
+                        )?;
+                        duplicate_revision
+                            || self
+                                .capture_receipts
+                                .insert(value.execution_lane_id, (value, row.source_event_seq))
+                                .is_some()
+                    }
+                    Some("capture_receipt_revision") => {
+                        require_physical_row(
+                            row,
+                            ObjectFamily::Evidence,
+                            "capture_receipt_revision",
+                            &revision_id.to_string(),
+                            &revision_id.to_string(),
+                        )?;
+                        duplicate_revision
+                    }
+                    _ => return Err(StoreError::StoreCorrupt),
+                }
             }
             JournalPayload::CaptureGapMarkerRecorded(value) => {
                 let value = *value;
@@ -3372,15 +3748,17 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.operations {
-            rows.push(physical_object_row(
+        for ((id, revision), (value, seq)) in self.operation_revisions {
+            let mut row = physical_object_row(
                 ObjectFamily::Work,
                 "operation",
                 id.to_string(),
-                format!("{}@{}", id, value.operation_revision),
+                format!("{id}@{revision}"),
                 &JournalPayload::OperationDerived(Box::new(value)),
                 seq,
-            )?);
+            )?;
+            row.row_id = format!("object:work:operation:{id}@{revision}");
+            rows.push(row);
         }
         for (id, (value, seq)) in self.scope_effects {
             rows.push(physical_object_row(
@@ -3410,12 +3788,30 @@ impl ReducerState {
                 seq,
             )?);
         }
+        let current_capture_revision_ids = self
+            .capture_receipts
+            .values()
+            .map(|(value, _)| value.capture_receipt_revision_id)
+            .collect::<BTreeSet<_>>();
         for (lane_id, (value, seq)) in self.capture_receipts {
             rows.push(physical_object_row(
                 ObjectFamily::Evidence,
                 "capture_receipt",
                 lane_id.to_string(),
                 value.capture_receipt_revision_id.to_string(),
+                &JournalPayload::CaptureReceiptRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (revision_id, (value, seq)) in self.capture_receipt_revisions {
+            if current_capture_revision_ids.contains(&revision_id) {
+                continue;
+            }
+            rows.push(physical_object_row(
+                ObjectFamily::Evidence,
+                "capture_receipt_revision",
+                revision_id.to_string(),
+                revision_id.to_string(),
                 &JournalPayload::CaptureReceiptRecorded(Box::new(value)),
                 seq,
             )?);
@@ -3582,6 +3978,76 @@ impl ReducerState {
             );
             rows.push(row);
         }
+        for (_revision_id, (value, seq)) in self.operation_burst_revisions {
+            let mut row = work_identity_row(
+                "operation_burst",
+                value.operation_burst_id.to_string(),
+                value.revision_id.to_string(),
+                value.lifecycle.as_str(),
+                None,
+                None,
+                None,
+                None,
+                &JournalPayload::OperationBurstRecorded(Box::new(value)),
+                seq,
+            )?;
+            row.row_id = format!(
+                "object:work:operation_burst:{}",
+                row.current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+            );
+            rows.push(row);
+        }
+        for (_revision_id, (value, seq)) in self.episode_revisions {
+            let mut row = work_identity_row(
+                "work_episode",
+                value.episode_id.to_string(),
+                value.revision_id.to_string(),
+                value.lifecycle_status.as_str(),
+                Some(value.task_id.to_string()),
+                Some(value.workstream_id.to_string()),
+                value.repository_instance_id.map(|id| id.to_string()),
+                value.worktree_instance_id.map(|id| id.to_string()),
+                &JournalPayload::WorkEpisodeRecorded(Box::new(value)),
+                seq,
+            )?;
+            row.row_id = format!(
+                "object:work:work_episode:{}",
+                row.current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+            );
+            rows.push(row);
+        }
+        for (key, (value, seq)) in self.checkpoints {
+            rows.push(work_identity_row(
+                "work_checkpoint",
+                key,
+                value.episode_revision_id.to_string(),
+                "derived",
+                None,
+                None,
+                None,
+                None,
+                &JournalPayload::WorkCheckpointRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.corrections {
+            rows.push(work_identity_row(
+                "segmentation_correction",
+                id.to_string(),
+                id.to_string(),
+                value.kind.as_str(),
+                None,
+                None,
+                None,
+                None,
+                &JournalPayload::SegmentationCorrectionRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
         Ok(rows)
     }
 
@@ -3687,6 +4153,7 @@ impl ReducerState {
             &self.workstreams,
             &self.attempts,
             &self.competing_groups,
+            &self.episodes,
         )?;
         validate_attempt_relations(
             &self.attempts,
@@ -3700,16 +4167,44 @@ impl ReducerState {
             &self.integration_events,
             &self.work_bindings,
         )?;
+        validate_episode_relations(
+            &self.episodes,
+            &self.episode_revisions,
+            &self.checkpoints,
+            &self.corrections,
+            &self.tasks,
+            &self.workstreams,
+            &self.attempts,
+            &self.attempt_revisions,
+            &self.competing_groups,
+            &self.work_bindings,
+            &self.operation_bursts,
+            &self.operation_revisions,
+            &self.host_occurrences,
+            &self.source_observations,
+            &self.scope_effects,
+            &self.execution_lanes,
+            &self.capture_receipt_revisions,
+            &self.capture_gaps,
+            &self.capture_outages,
+            &self.worktree_snapshots,
+            &self.worktree_transitions,
+            &self.integration_events,
+        )?;
         Ok(())
     }
 
     fn admission_state(&self) -> Result<JournalAdmissionState, StoreError> {
         Ok(JournalAdmissionState {
             source_ranges: current_source_ranges(&self.source_receipts)?,
+            source_observations: self.source_observations.clone(),
+            host_occurrences: self.host_occurrences.clone(),
             operations: self.operations.clone(),
+            operation_revisions: self.operation_revisions.clone(),
             scope_effects: self.scope_effects.clone(),
             execution_lanes: self.execution_lanes.clone(),
             capture_receipts: self.capture_receipts.clone(),
+            capture_receipt_revisions: self.capture_receipt_revisions.clone(),
             capture_gaps: self.capture_gaps.clone(),
             capture_outages: self.capture_outages.clone(),
             source_close_reconciliations: self.source_close_reconciliations.clone(),
@@ -3725,6 +4220,12 @@ impl ReducerState {
             competing_groups: self.competing_groups.clone(),
             attempt_revisions: self.attempt_revisions.clone(),
             competing_group_revisions: self.competing_group_revisions.clone(),
+            operation_bursts: self.operation_bursts.clone(),
+            operation_burst_revisions: self.operation_burst_revisions.clone(),
+            episodes: self.episodes.clone(),
+            episode_revisions: self.episode_revisions.clone(),
+            checkpoints: self.checkpoints.clone(),
+            corrections: self.corrections.clone(),
         })
     }
 }
@@ -4227,9 +4728,13 @@ mod tests {
     use evertrace_domain::{
         evidence::{
             CaptureGapMarkerEvidence, CaptureOutageInterval, CaptureOutagePositiveSource,
-            ReconciliationProvenance, SourceInstanceId, SourceRevision,
+            OperationKind, PairingState, ReconciliationProvenance, SourceInstanceId,
+            SourceRevision,
         },
-        ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
+        ids::{
+            CaptureOutageIntervalId, CommandId, ExecutionLaneId, HostOccurrenceId, JobId,
+            OperationId, SourceObservationId,
+        },
         work::{AdmissionFailureObservability, LaneLifecycleEvidence, LivenessState},
     };
 
@@ -4280,6 +4785,70 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    fn operation(revision: u32, previous: Option<u32>) -> Operation {
+        Operation {
+            operation_id: OperationId::new_v7(),
+            host_occurrence_id: HostOccurrenceId::from_digest([0x71; 32]),
+            execution_lane_id: None,
+            operation_kind: OperationKind::Read,
+            input_source_observation_refs: vec![SourceObservationId::from_digest([0x72; 32])],
+            result_source_observation_refs: vec![],
+            pairing_state: PairingState::UnmatchedIntent,
+            scope_effect_ids: vec![],
+            artifact_refs: vec![],
+            operation_resolver_version: 1,
+            operation_revision: revision,
+            previous_operation_revision: previous,
+        }
+    }
+
+    #[test]
+    fn operation_revision_restore_rejects_invalid_gap_fork_and_overflow() {
+        let mut invalid = operation(1, None);
+        invalid.operation_resolver_version = 0;
+        let mut restored = ReducerState::default();
+        restored
+            .operation_revisions
+            .insert((invalid.operation_id, 1), (invalid, 1));
+        assert_eq!(
+            restored.rebuild_revision_currents(),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let first = operation(1, None);
+        let mut current = BTreeMap::new();
+        replace_operation(&mut current, first.clone(), 1).unwrap();
+        let mut gap = first.clone();
+        gap.operation_revision = 3;
+        gap.previous_operation_revision = Some(2);
+        assert_eq!(
+            replace_operation(&mut current, gap, 2),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let mut second = first.clone();
+        second.operation_revision = 2;
+        second.previous_operation_revision = Some(1);
+        replace_operation(&mut current, second.clone(), 2).unwrap();
+        let mut fork = second;
+        fork.operation_kind = OperationKind::Search;
+        assert_eq!(
+            replace_operation(&mut current, fork, 3),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let mut max = first.clone();
+        max.operation_revision = u32::MAX;
+        max.previous_operation_revision = Some(u32::MAX - 1);
+        current.insert(max.operation_id, (max.clone(), 4));
+        let mut overflow = max;
+        overflow.previous_operation_revision = Some(u32::MAX);
+        assert_eq!(
+            replace_operation(&mut current, overflow, 5),
+            Err(StoreError::StoreCorrupt)
+        );
     }
 
     #[test]

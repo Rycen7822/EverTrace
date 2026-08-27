@@ -6,12 +6,16 @@ use evertrace_domain::repository::{
 };
 use evertrace_domain::work::{
     AssignmentStatus, Attempt, AttemptAdoptionStatus, AttemptVerification, CaptureReceipt,
-    CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, SecondaryBindingTarget, Task,
-    TaskIdentityConfidence, WorkBindingRevision, Workstream,
+    CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, OperationBurst,
+    SecondaryBindingTarget, SegmentationCorrection, Task, TaskIdentityConfidence,
+    WorkBindingRevision, WorkCheckpoint, WorkEpisode, Workstream,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::StoreError;
+
+mod segmentation;
+pub use segmentation::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +29,7 @@ pub enum PhysicalRelationKind {
 pub enum AttemptRelationKind {
     AttemptToTask,
     AttemptToWorkstream,
+    AttemptToEpisode,
     AttemptToExecutionLane,
     AttemptToBindingRevision,
     AttemptToIntegrationEvidence,
@@ -128,6 +133,13 @@ pub fn build_attempt_relation_rows(
             source_id: source.clone(),
             target_id: attempt.workstream_id.to_string(),
         });
+        if let Some(id) = attempt.episode_id {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptToEpisode,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
         for id in &attempt.execution_lane_ids {
             rows.insert(AttemptRelationRow {
                 kind: AttemptRelationKind::AttemptToExecutionLane,
@@ -310,6 +322,7 @@ pub enum WorkBindingRelationKind {
     BindingToScopeEffect,
     BindingToPrimaryTask,
     BindingToPrimaryWorkstream,
+    BindingToPrimaryEpisode,
     BindingToCandidateTask,
     BindingToCandidateWorkstream,
     BindingToSecondaryTarget,
@@ -433,6 +446,16 @@ pub fn build_work_binding_relation_rows(
                     source_id: source.clone(),
                     target_id: task_id.to_string(),
                 });
+                if let Some(episode_id) = binding.primary_binding.episode_id {
+                    if binding.assignment_status != AssignmentStatus::Resolved {
+                        return Err(StoreError::InvalidInput);
+                    }
+                    rows.insert(WorkBindingRelationRow {
+                        kind: WorkBindingRelationKind::BindingToPrimaryEpisode,
+                        source_id: source.clone(),
+                        target_id: episode_id.to_string(),
+                    });
+                }
                 rows.insert(WorkBindingRelationRow {
                     kind: stream_kind,
                     source_id: source.clone(),
@@ -462,6 +485,85 @@ pub fn build_work_binding_relation_rows(
                 kind: WorkBindingRelationKind::BindingToSecondaryTarget,
                 source_id: source.clone(),
                 target_id,
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum EpisodeRelationKind {
+    EpisodeToTask,
+    EpisodeToWorkstream,
+    EpisodeToAttempt,
+    EpisodeToExecutionLane,
+    EpisodeToCheckpoint,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct EpisodeRelationRow {
+    pub kind: EpisodeRelationKind,
+    pub source_id: String,
+    pub target_id: String,
+}
+
+pub fn build_episode_relation_rows(
+    episodes: &[WorkEpisode],
+    checkpoints: &[WorkCheckpoint],
+) -> Result<Vec<EpisodeRelationRow>, StoreError> {
+    let episode_ids = episodes
+        .iter()
+        .map(|value| value.episode_id)
+        .collect::<BTreeSet<_>>();
+    if episode_ids.len() != episodes.len() {
+        return Err(StoreError::InvalidInput);
+    }
+    let checkpoint_by_key = checkpoints
+        .iter()
+        .map(|value| (value.stable_key(), value))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if checkpoint_by_key.len() != checkpoints.len() {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut rows = BTreeSet::new();
+    for episode in episodes {
+        episode.validate().map_err(|_| StoreError::InvalidInput)?;
+        let source = episode.episode_id.to_string();
+        rows.insert(EpisodeRelationRow {
+            kind: EpisodeRelationKind::EpisodeToTask,
+            source_id: source.clone(),
+            target_id: episode.task_id.to_string(),
+        });
+        rows.insert(EpisodeRelationRow {
+            kind: EpisodeRelationKind::EpisodeToWorkstream,
+            source_id: source.clone(),
+            target_id: episode.workstream_id.to_string(),
+        });
+        for id in &episode.attempt_ids {
+            rows.insert(EpisodeRelationRow {
+                kind: EpisodeRelationKind::EpisodeToAttempt,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        for id in &episode.execution_lane_ids {
+            rows.insert(EpisodeRelationRow {
+                kind: EpisodeRelationKind::EpisodeToExecutionLane,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        for key in &episode.checkpoint_refs {
+            if checkpoint_by_key
+                .get(key)
+                .is_none_or(|checkpoint| checkpoint.episode_id != episode.episode_id)
+            {
+                return Err(StoreError::InvalidInput);
+            }
+            rows.insert(EpisodeRelationRow {
+                kind: EpisodeRelationKind::EpisodeToCheckpoint,
+                source_id: source.clone(),
+                target_id: key.clone(),
             });
         }
     }

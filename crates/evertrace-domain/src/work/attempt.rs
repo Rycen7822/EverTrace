@@ -306,7 +306,7 @@ impl Attempt {
         if self.revision_generation == 0
             || self.source_watermark == 0
             || (self.revision_generation == 1) != self.predecessor_revision_id.is_none()
-            || self.episode_id.is_some()
+            || (self.revision_generation == 1 && self.episode_id.is_some())
             || !self.experiment_run_ids.is_empty()
             || !self.recovery_bundle_refs.is_empty()
             || !self.recovery_application_refs.is_empty()
@@ -451,7 +451,14 @@ impl Attempt {
             || successor.revision_id == self.revision_id
             || successor.task_id != self.task_id
             || successor.workstream_id != self.workstream_id
-            || successor.episode_id != self.episode_id
+            || !matches!(
+                (self.episode_id, successor.episode_id),
+                (None, None) | (None, Some(_)) | (Some(_), Some(_))
+            )
+            || self
+                .episode_id
+                .zip(successor.episode_id)
+                .is_some_and(|(old, new)| old != new)
             || successor.repository_instance_id != self.repository_instance_id
             || successor.strategy_contract != self.strategy_contract
             || successor.strategy_contract_fingerprint != self.strategy_contract_fingerprint

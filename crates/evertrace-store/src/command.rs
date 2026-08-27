@@ -14,7 +14,8 @@ use evertrace_domain::{
     },
     work::{
         AdmissionFailureObservability, Attempt, CaptureReceipt, CompetingAttemptGroup,
-        ExecutionLane, Task, WorkBindingRevision, Workstream,
+        ExecutionLane, OperationBurst, SegmentationCorrection, Task, WorkBindingRevision,
+        WorkCheckpoint, WorkEpisode, Workstream,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -506,6 +507,10 @@ pub enum JournalPayload {
     WorkBindingRecorded(Box<WorkBindingRevision>),
     AttemptRecorded(Box<Attempt>),
     CompetingAttemptGroupRecorded(Box<CompetingAttemptGroup>),
+    OperationBurstRecorded(Box<OperationBurst>),
+    WorkEpisodeRecorded(Box<WorkEpisode>),
+    WorkCheckpointRecorded(Box<WorkCheckpoint>),
+    SegmentationCorrectionRecorded(Box<SegmentationCorrection>),
 }
 
 impl JournalPayload {
@@ -543,6 +548,10 @@ impl JournalPayload {
             Self::WorkBindingRecorded(_) => "work_binding_recorded_v1",
             Self::AttemptRecorded(_) => "attempt_recorded_v1",
             Self::CompetingAttemptGroupRecorded(_) => "competing_attempt_group_recorded_v1",
+            Self::OperationBurstRecorded(_) => "operation_burst_recorded_v1",
+            Self::WorkEpisodeRecorded(_) => "work_episode_recorded_v1",
+            Self::WorkCheckpointRecorded(_) => "work_checkpoint_recorded_v1",
+            Self::SegmentationCorrectionRecorded(_) => "segmentation_correction_recorded_v1",
         }
     }
 
@@ -571,6 +580,10 @@ impl JournalPayload {
             | Self::WorkBindingRecorded(_)
             | Self::AttemptRecorded(_)
             | Self::CompetingAttemptGroupRecorded(_) => RecordClass::ObjectEvent,
+            Self::OperationBurstRecorded(_)
+            | Self::WorkEpisodeRecorded(_)
+            | Self::WorkCheckpointRecorded(_) => RecordClass::ObjectEvent,
+            Self::SegmentationCorrectionRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -685,6 +698,18 @@ impl JournalPayload {
             }
             Self::AttemptRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
             Self::CompetingAttemptGroupRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::OperationBurstRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::WorkEpisodeRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::WorkCheckpointRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::SegmentationCorrectionRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
         }
@@ -817,6 +842,12 @@ impl JournalPayload {
             Self::AttemptRecorded(value) => tagged_json("attempt_recorded", value),
             Self::CompetingAttemptGroupRecorded(value) => {
                 tagged_json("competing_attempt_group_recorded", value)
+            }
+            Self::OperationBurstRecorded(value) => tagged_json("operation_burst_recorded", value),
+            Self::WorkEpisodeRecorded(value) => tagged_json("work_episode_recorded", value),
+            Self::WorkCheckpointRecorded(value) => tagged_json("work_checkpoint_recorded", value),
+            Self::SegmentationCorrectionRecorded(value) => {
+                tagged_json("segmentation_correction_recorded", value)
             }
         }
     }

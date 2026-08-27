@@ -23,10 +23,11 @@ pub use objects::{
     OBJECTS_CHECKPOINT_ID, OBJECTS_TABLE, ObjectRow, ObjectRowClass, ObjectRowKind, objects_schema,
 };
 pub use projections::{
-    AttemptCurrentView, NamedCurrentDependency, ProjectionSnapshot, ProjectionWorker,
-    ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
-    ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
-    ReconciliationFrontier, ReconciliationWorkItem, WorkBindingCurrentView,
+    AttemptCurrentView, EpisodeCurrentView, NamedCurrentDependency, OperationBurstCurrentView,
+    ProjectionSnapshot, ProjectionWorker, ReconciliationArtifactContext,
+    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
+    ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
+    SegmentationCurrentState, SegmentationCurrentView, WorkBindingCurrentView,
     WorkIdentityCurrentView, reduce_journal,
 };
 pub use schema::{PROBE_SCHEMA_VERSION, ProbeRow, probe_batch, probe_schema, schema_fingerprint};

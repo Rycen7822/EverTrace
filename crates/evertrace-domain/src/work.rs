@@ -10,6 +10,8 @@ use crate::{
 
 pub mod attempt;
 pub mod binding;
+pub mod burst;
+pub mod episode;
 pub mod task;
 pub mod workstream;
 
@@ -18,6 +20,8 @@ pub use binding::{
     ActiveWorkContext, AssignmentStatus, PrimaryWorkBinding, SecondaryBindingRole,
     SecondaryBindingTarget, SecondaryWorkBinding, WorkBindingRevision,
 };
+pub use burst::*;
+pub use episode::*;
 pub use task::{Task, TaskIdentityConfidence, TaskLifecycle, TaskScopeMembership};
 pub use workstream::{
     ActiveLineageFoundation, CorrelationEvidence, CorrelationEvidenceKind, CorrelationResult,
@@ -26,7 +30,7 @@ pub use workstream::{
 
 pub const CAPTURE_RESOLVER_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaneStatus {
     Active,
@@ -63,7 +67,7 @@ pub enum CoverageLevel {
     Opaque,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceCoverage {
     Open,
@@ -72,7 +76,7 @@ pub enum SourceCoverage {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PairingIntegrity {
     Complete,
@@ -80,7 +84,7 @@ pub enum PairingIntegrity {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadIntegrity {
     Complete,
@@ -90,7 +94,7 @@ pub enum PayloadIntegrity {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderingIntegrity {
     Complete,
