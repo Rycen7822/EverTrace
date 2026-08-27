@@ -547,11 +547,7 @@ impl IntegrationEvent {
         if self.evidence_refs.is_empty() {
             return Err(RepositoryError::InvalidIntegration);
         }
-        // S11 contract: Attempt objects do not exist yet, so this list is
-        // always empty; it only reserves the schema position.
-        if !self.integrated_attempt_ids.is_empty() {
-            return Err(RepositoryError::InvalidIntegration);
-        }
+        require_unique(&self.integrated_attempt_ids)?;
         for reference in &self.commit_refs {
             valid_oid(reference)?;
         }

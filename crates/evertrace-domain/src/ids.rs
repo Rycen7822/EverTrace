@@ -371,6 +371,18 @@ impl WorkstreamId {
     }
 }
 
+impl AttemptId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl CompetingAttemptGroupId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnyPublicId {
     SourceObservation(SourceObservationId),

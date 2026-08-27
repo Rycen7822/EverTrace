@@ -5,7 +5,8 @@ use evertrace_domain::repository::{
     IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
 };
 use evertrace_domain::work::{
-    AssignmentStatus, CaptureReceipt, ExecutionLane, SecondaryBindingTarget, Task,
+    AssignmentStatus, Attempt, AttemptAdoptionStatus, AttemptVerification, CaptureReceipt,
+    CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, SecondaryBindingTarget, Task,
     TaskIdentityConfidence, WorkBindingRevision, Workstream,
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,227 @@ pub enum PhysicalRelationKind {
     SourceObservationToHostOccurrence,
     HostOccurrenceToOperation,
     OperationToScopeEffect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AttemptRelationKind {
+    AttemptToTask,
+    AttemptToWorkstream,
+    AttemptToExecutionLane,
+    AttemptToBindingRevision,
+    AttemptToIntegrationEvidence,
+    AttemptToOutcomeEvidence,
+    AttemptToVerifierEvidence,
+    AttemptResumesFromHistorical,
+    AttemptComposedFromHistorical,
+    GroupToCandidateMember,
+    GroupToComparisonSnapshot,
+    GroupToSelectedAttempt,
+    GroupToPartiallyIntegratedAttempt,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AttemptRelationRow {
+    pub kind: AttemptRelationKind,
+    pub source_id: String,
+    pub target_id: String,
+}
+
+pub fn build_attempt_relation_rows(
+    attempts: &[Attempt],
+    groups: &[CompetingAttemptGroup],
+) -> Result<Vec<AttemptRelationRow>, StoreError> {
+    let by_id = attempts
+        .iter()
+        .map(|attempt| (attempt.attempt_id, attempt))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let group_ids = groups
+        .iter()
+        .map(|group| group.competing_group_id)
+        .collect::<BTreeSet<_>>();
+    if by_id.len() != attempts.len() || group_ids.len() != groups.len() {
+        return Err(StoreError::InvalidInput);
+    }
+    fn composition_cycle(
+        id: evertrace_domain::ids::AttemptId,
+        attempts: &std::collections::BTreeMap<evertrace_domain::ids::AttemptId, &Attempt>,
+        visiting: &mut BTreeSet<evertrace_domain::ids::AttemptId>,
+        visited: &mut BTreeSet<evertrace_domain::ids::AttemptId>,
+    ) -> bool {
+        if visited.contains(&id) {
+            return false;
+        }
+        if !visiting.insert(id) {
+            return true;
+        }
+        let cyclic = attempts.get(&id).is_some_and(|attempt| {
+            attempt
+                .composed_from_attempt_ids
+                .iter()
+                .any(|source| composition_cycle(*source, attempts, visiting, visited))
+        });
+        visiting.remove(&id);
+        visited.insert(id);
+        cyclic
+    }
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    if by_id
+        .keys()
+        .copied()
+        .any(|id| composition_cycle(id, &by_id, &mut visiting, &mut visited))
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut rows = BTreeSet::new();
+    for attempt in attempts {
+        attempt.validate().map_err(|_| StoreError::InvalidInput)?;
+        for source_id in attempt
+            .composed_from_attempt_ids
+            .iter()
+            .chain(attempt.resumes_from_attempt_id.iter())
+        {
+            let source = by_id.get(source_id).ok_or(StoreError::InvalidInput)?;
+            if source.task_id != attempt.task_id
+                || (attempt.composed_from_attempt_ids.contains(source_id)
+                    && source.strategy_contract_fingerprint
+                        == attempt.strategy_contract_fingerprint)
+            {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        for group_id in &attempt.competing_group_ids {
+            let group = groups
+                .iter()
+                .find(|group| group.competing_group_id == *group_id)
+                .ok_or(StoreError::InvalidInput)?;
+            if !group.member_attempt_ids.contains(&attempt.attempt_id) {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let source = attempt.attempt_id.to_string();
+        rows.insert(AttemptRelationRow {
+            kind: AttemptRelationKind::AttemptToTask,
+            source_id: source.clone(),
+            target_id: attempt.task_id.to_string(),
+        });
+        rows.insert(AttemptRelationRow {
+            kind: AttemptRelationKind::AttemptToWorkstream,
+            source_id: source.clone(),
+            target_id: attempt.workstream_id.to_string(),
+        });
+        for id in &attempt.execution_lane_ids {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptToExecutionLane,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        for id in &attempt.work_binding_revision_refs {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptToBindingRevision,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        for id in &attempt.integration_event_refs {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptToIntegrationEvidence,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        for id in &attempt.outcome_refs {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptToOutcomeEvidence,
+                source_id: source.clone(),
+                target_id: id.clone(),
+            });
+        }
+        for id in &attempt.parent_verification_refs {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptToVerifierEvidence,
+                source_id: source.clone(),
+                target_id: id.clone(),
+            });
+        }
+        if let Some(id) = attempt.resumes_from_attempt_id {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptResumesFromHistorical,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        for id in &attempt.composed_from_attempt_ids {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::AttemptComposedFromHistorical,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+    }
+    for group in groups {
+        group.validate().map_err(|_| StoreError::InvalidInput)?;
+        let source = group.competing_group_id.to_string();
+        for id in &group.member_attempt_ids {
+            let attempt = by_id.get(id).ok_or(StoreError::InvalidInput)?;
+            if attempt.task_id != group.task_id
+                || !group.member_workstream_ids.contains(&attempt.workstream_id)
+                || !attempt
+                    .competing_group_ids
+                    .contains(&group.competing_group_id)
+            {
+                return Err(StoreError::InvalidInput);
+            }
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::GroupToCandidateMember,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        for snapshot in &group.candidate_snapshot_refs {
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::GroupToComparisonSnapshot,
+                source_id: source.clone(),
+                target_id: snapshot.snapshot_id.to_string(),
+            });
+        }
+        if group.resolution_status == CompetingResolutionStatus::Selected {
+            let id = group.selected_attempt_id.ok_or(StoreError::InvalidInput)?;
+            let selected = by_id.get(&id).ok_or(StoreError::InvalidInput)?;
+            if selected.adoption_status != AttemptAdoptionStatus::Integrated
+                || selected.verification != AttemptVerification::Passed
+                || !selected
+                    .parent_verification_refs
+                    .iter()
+                    .any(|evidence| group.resolution_evidence_refs.contains(evidence))
+            {
+                return Err(StoreError::InvalidInput);
+            }
+            rows.insert(AttemptRelationRow {
+                kind: AttemptRelationKind::GroupToSelectedAttempt,
+                source_id: source.clone(),
+                target_id: id.to_string(),
+            });
+        }
+        if group.resolution_status == CompetingResolutionStatus::PartiallyIntegrated {
+            for id in &group.partially_integrated_attempt_ids {
+                let attempt = by_id.get(id).ok_or(StoreError::InvalidInput)?;
+                if !matches!(
+                    attempt.adoption_status,
+                    AttemptAdoptionStatus::PartiallyIntegrated | AttemptAdoptionStatus::Integrated
+                ) {
+                    return Err(StoreError::InvalidInput);
+                }
+                rows.insert(AttemptRelationRow {
+                    kind: AttemptRelationKind::GroupToPartiallyIntegratedAttempt,
+                    source_id: source.clone(),
+                    target_id: id.to_string(),
+                });
+            }
+        }
+    }
+    Ok(rows.into_iter().collect())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
