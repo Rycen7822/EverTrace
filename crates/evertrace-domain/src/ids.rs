@@ -255,6 +255,7 @@ digest_id!(SourceObservationId, "obs");
 digest_id!(HostOccurrenceId, "occ");
 digest_id!(SourceReceiptId, "src");
 uuid_id!(CaptureReceiptId, "cap");
+uuid_id!(CaptureOutageIntervalId, "outage");
 uuid_id!(OperationId, "op");
 uuid_id!(ScopeEffectId, "se");
 uuid_id!(WorkBindingRevisionId, "wb");
@@ -292,6 +293,24 @@ impl OperationId {
     }
 }
 
+impl CaptureReceiptId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl CaptureOutageIntervalId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl ExecutionLaneId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
 impl ScopeEffectId {
     pub fn new_v7() -> Self {
         Self(Uuid::now_v7())
@@ -304,12 +323,55 @@ impl DuplicateGroupId {
     }
 }
 
+impl RepositoryId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl WorktreeId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl WorktreeSnapshotId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl WorktreeTransitionId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl IntegrationEventId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl TaskId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl WorkstreamId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnyPublicId {
     SourceObservation(SourceObservationId),
     HostOccurrence(HostOccurrenceId),
     SourceReceipt(SourceReceiptId),
     CaptureReceipt(CaptureReceiptId),
+    CaptureOutageInterval(CaptureOutageIntervalId),
     Operation(OperationId),
     ScopeEffect(ScopeEffectId),
     WorkBindingRevision(WorkBindingRevisionId),
@@ -346,6 +408,7 @@ impl AnyPublicId {
             Self::HostOccurrence(_) => "occ",
             Self::SourceReceipt(_) => "src",
             Self::CaptureReceipt(_) => "cap",
+            Self::CaptureOutageInterval(_) => "outage",
             Self::Operation(_) => "op",
             Self::ScopeEffect(_) => "se",
             Self::WorkBindingRevision(_) => "wb",
@@ -389,6 +452,7 @@ impl FromStr for AnyPublicId {
             "occ" => Ok(Self::HostOccurrence(value.parse()?)),
             "src" => Ok(Self::SourceReceipt(value.parse()?)),
             "cap" => Ok(Self::CaptureReceipt(value.parse()?)),
+            "outage" => Ok(Self::CaptureOutageInterval(value.parse()?)),
             "op" => Ok(Self::Operation(value.parse()?)),
             "se" => Ok(Self::ScopeEffect(value.parse()?)),
             "wb" => Ok(Self::WorkBindingRevision(value.parse()?)),

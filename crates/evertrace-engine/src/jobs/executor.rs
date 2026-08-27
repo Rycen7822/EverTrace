@@ -1,5 +1,7 @@
 use evertrace_store::{
-    CommitOutcome, JournalCommand, JournalWriter, ProjectionSnapshot, StoreError,
+    CommitOutcome, JournalCommand, JournalWriter, ProjectionSnapshot,
+    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
+    StoreError,
 };
 use std::path::Path;
 use thiserror::Error;
@@ -14,8 +16,23 @@ enum WriterRequest {
         ingested_at_us: i64,
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
+    CommitIfFrontier {
+        command: JournalCommand,
+        ingested_at_us: i64,
+        expected_frontier: u64,
+        reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
+    },
     Project {
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
+    },
+    ReconciliationFrontier {
+        limit: usize,
+        reply: oneshot::Sender<Result<ReconciliationFrontier, WriterActorError>>,
+    },
+    ReconciliationArtifactContext {
+        descriptors: Vec<ReconciliationArtifactDescriptor>,
+        limit: usize,
+        reply: oneshot::Sender<Result<ReconciliationArtifactFrontier, WriterActorError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -54,6 +71,54 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub async fn reconciliation_frontier(
+        &self,
+        limit: usize,
+    ) -> Result<ReconciliationFrontier, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReconciliationFrontier { limit, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn reconciliation_artifact_context(
+        &self,
+        descriptors: Vec<ReconciliationArtifactDescriptor>,
+        limit: usize,
+    ) -> Result<ReconciliationArtifactFrontier, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReconciliationArtifactContext {
+                descriptors,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn commit_if_frontier(
+        &self,
+        command: JournalCommand,
+        ingested_at_us: i64,
+        expected_frontier: u64,
+    ) -> Result<CommitOutcome, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CommitIfFrontier {
+                command,
+                ingested_at_us,
+                expected_frontier,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub async fn shutdown(self) -> Result<(), WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -72,6 +137,8 @@ pub enum WriterActorError {
     Stopped,
     #[error("journal command conflicts with an existing command")]
     IdempotencyConflict,
+    #[error("journal frontier changed before command append")]
+    StaleFrontier,
     #[error("writer actor detected corrupt store state")]
     StoreCorrupt,
     #[error("writer actor store operation failed")]
@@ -121,12 +188,69 @@ async fn run_writer(
                     return Err(error);
                 }
             }
+            WriterRequest::CommitIfFrontier {
+                command,
+                ingested_at_us,
+                expected_frontier,
+                reply,
+            } => {
+                let result = writer
+                    .commit_if_frontier(&command, ingested_at_us, expected_frontier)
+                    .await
+                    .map_err(map_store_error);
+                let fatal = result.as_ref().err().copied().filter(|error| {
+                    matches!(
+                        error,
+                        WriterActorError::Store | WriterActorError::StoreCorrupt
+                    )
+                });
+                let _ = reply.send(result);
+                if let Some(error) = fatal {
+                    return Err(error);
+                }
+            }
             WriterRequest::Project { reply } => {
                 let result = writer.project().await.map_err(map_store_error);
                 let fatal = result.is_err();
                 let _ = reply.send(result);
                 if fatal {
                     return Err(WriterActorError::Store);
+                }
+            }
+            WriterRequest::ReconciliationFrontier { limit, reply } => {
+                let result = writer
+                    .reconciliation_frontier(limit)
+                    .await
+                    .map_err(map_store_error);
+                let fatal = result.as_ref().err().copied().filter(|error| {
+                    matches!(
+                        error,
+                        WriterActorError::Store | WriterActorError::StoreCorrupt
+                    )
+                });
+                let _ = reply.send(result);
+                if let Some(error) = fatal {
+                    return Err(error);
+                }
+            }
+            WriterRequest::ReconciliationArtifactContext {
+                descriptors,
+                limit,
+                reply,
+            } => {
+                let result = writer
+                    .reconciliation_artifact_context(&descriptors, limit)
+                    .await
+                    .map_err(map_store_error);
+                let fatal = result.as_ref().err().copied().filter(|error| {
+                    matches!(
+                        error,
+                        WriterActorError::Store | WriterActorError::StoreCorrupt
+                    )
+                });
+                let _ = reply.send(result);
+                if let Some(error) = fatal {
+                    return Err(error);
                 }
             }
             WriterRequest::Shutdown { reply } => {
@@ -144,7 +268,9 @@ async fn run_writer(
 fn map_store_error(error: StoreError) -> WriterActorError {
     match error {
         StoreError::InvalidInput => WriterActorError::InvalidInput,
+        StoreError::ReconciliationDependencyOverflow => WriterActorError::InvalidInput,
         StoreError::IdempotencyConflict => WriterActorError::IdempotencyConflict,
+        StoreError::StaleFrontier => WriterActorError::StaleFrontier,
         StoreError::StoreCorrupt => WriterActorError::StoreCorrupt,
         _ => WriterActorError::Store,
     }

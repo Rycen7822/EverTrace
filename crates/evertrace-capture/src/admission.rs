@@ -48,6 +48,7 @@ pub struct CaptureRecordInput {
     pub turn_ref: Option<String>,
     pub tool_ref: Option<String>,
     pub source_sequence: u64,
+    pub source_sequence_origin: Option<u64>,
     pub task_id: Option<String>,
     pub repository_instance_id: Option<String>,
     pub worktree_instance_id: Option<String>,
@@ -58,6 +59,7 @@ pub struct CaptureRecordInput {
     pub observation_role: ObservationRole,
     pub correlation: HostCorrelationEvidence,
     pub scope_effect_claims: Vec<ScopeEffectClaim>,
+    pub lifecycle: Option<evertrace_domain::work::LaneLifecycleEvidence>,
     pub unsupported_record_classification: Option<UnsupportedRecordClassification>,
     pub source_role: SourceRole,
     pub content_trust: ContentTrust,
@@ -116,7 +118,10 @@ impl CaptureRuntime {
         let cas = CasStore::open(snapshot.cas_dir.clone())?;
         let (spool, recovery) =
             DurableSpool::open(snapshot.spool_dir.clone(), snapshot.spool_limits()?)?;
-        let state = if recovery.gaps.is_empty() && recovery.repaired_tail_bytes == 0 {
+        let state = if recovery.gaps.is_empty()
+            && recovery.repaired_tail_bytes == 0
+            && spool.below_low_watermark()?
+        {
             CaptureAdmissionState::Normal
         } else {
             CaptureAdmissionState::Recovering
@@ -232,6 +237,7 @@ impl CaptureRuntime {
             source_ref: input.source_ref.clone(),
             source_session_ref: input.session_ref.clone(),
             source_sequence: input.source_sequence,
+            source_sequence_origin: input.source_sequence_origin,
             task_id: input
                 .task_id
                 .as_deref()
@@ -262,6 +268,7 @@ impl CaptureRuntime {
             observation_role: input.observation_role,
             correlation: input.correlation.clone(),
             scope_effect_claims: input.scope_effect_claims.clone(),
+            lifecycle: input.lifecycle.clone(),
             unsupported_record_classification: input.unsupported_record_classification,
             source_role: input.source_role,
             content_trust: input.content_trust,
@@ -295,7 +302,9 @@ impl CaptureRuntime {
         };
         match self.spool.append(&record) {
             Ok(written) => {
-                self.state = CaptureAdmissionState::Normal;
+                if self.state != CaptureAdmissionState::Recovering {
+                    self.state = CaptureAdmissionState::Normal;
+                }
                 Ok(CaptureOutcome::Durable {
                     command_id,
                     spool_record_id,
@@ -444,6 +453,12 @@ fn validate_input(input: &CaptureRecordInput) -> Result<(), CaptureError> {
         || input.parser_revision == 0
         || input.canonicalization_revision == 0
         || input.event_time_us.is_some_and(|value| value < 0)
+        || input
+            .source_sequence_origin
+            .is_some_and(|origin| origin > input.source_sequence)
+        || input
+            .close_watermark
+            .is_some_and(|close| close < input.source_sequence)
         || (input.unsupported_record_classification.is_some() && input.surface_eligible)
         || (input.source_record_identity.is_none()
             && input.capture_completeness == CaptureCompleteness::Complete)
@@ -460,6 +475,18 @@ fn validate_input(input: &CaptureRecordInput) -> Result<(), CaptureError> {
         .map_err(|_| CaptureError::InvalidInput)?;
     for claim in &input.scope_effect_claims {
         claim.validate().map_err(|_| CaptureError::InvalidInput)?;
+    }
+    if let Some(lifecycle) = &input.lifecycle {
+        lifecycle
+            .validate()
+            .map_err(|_| CaptureError::InvalidInput)?;
+        if lifecycle.incarnation_ref.is_none()
+            || lifecycle.host_session_id != input.session_ref
+            || lifecycle.adapter_manifest_ref != input.adapter_manifest_ref
+            || lifecycle.eligible_event_manifest_ref != input.eligible_event_manifest_ref
+        {
+            return Err(CaptureError::InvalidInput);
+        }
     }
     Ok(())
 }

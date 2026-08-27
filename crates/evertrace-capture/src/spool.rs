@@ -94,6 +94,58 @@ pub struct SealedSegment {
     frames: Vec<SealedFrame>,
 }
 
+#[derive(Debug)]
+pub struct PendingGapMarker {
+    marker: CaptureGapMarker,
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+    length: u64,
+}
+
+impl PendingGapMarker {
+    pub const fn marker(&self) -> &CaptureGapMarker {
+        &self.marker
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug)]
+pub struct PendingQuarantine {
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+    length: u64,
+    fingerprint: String,
+}
+
+impl PendingQuarantine {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub const fn device(&self) -> u64 {
+        self.device
+    }
+
+    pub const fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
 impl SealedSegment {
     pub fn path(&self) -> &Path {
         &self.path
@@ -438,22 +490,149 @@ impl DurableSpool {
     }
 
     pub fn acknowledge_gap_marker(&self, marker_id: &str) -> Result<bool, SpoolError> {
+        if let Some(handle) = self
+            .pending_gap_marker_handles(self.limits.emergency_slots as usize)?
+            .into_iter()
+            .find(|handle| handle.marker.marker_id == marker_id)
+        {
+            self.acknowledge_gap_marker_handle(handle)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn pending_gap_marker_handles(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingGapMarker>, SpoolError> {
+        if limit == 0 || limit > self.limits.emergency_slots as usize {
+            return Err(SpoolError::InvalidConfiguration);
+        }
+        self.validate_directories()?;
+        let directory_lock = File::open(&self.emergency_dir).map_err(map_io)?;
+        FileExt::lock_shared(&directory_lock).map_err(map_io)?;
+        let mut handles = Vec::new();
         for slot in 0..self.limits.emergency_slots {
+            if handles.len() == limit {
+                break;
+            }
             let path = self.emergency_dir.join(format!("slot-{slot:02}.marker"));
-            let bytes = match fs::read(&path) {
+            let mut file = match File::open(&path) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(map_io(error)),
             };
-            if decode_marker(&bytes)?.marker_id == marker_id {
-                fs::remove_file(&path).map_err(map_io)?;
-                File::open(&self.emergency_dir)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(map_io)?;
-                return Ok(true);
-            }
+            validate_owned_file(&path, &file)?;
+            let metadata = file.metadata().map_err(map_io)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(map_io)?;
+            handles.push(PendingGapMarker {
+                marker: decode_marker(&bytes)?,
+                path,
+                file,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+            });
         }
-        Ok(false)
+        Ok(handles)
+    }
+
+    pub fn acknowledge_gap_marker_handle(
+        &self,
+        mut handle: PendingGapMarker,
+    ) -> Result<(), SpoolError> {
+        let directory_lock = File::open(&self.emergency_dir).map_err(map_io)?;
+        FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
+        validate_ack_identity(
+            &handle.path,
+            &handle.file,
+            handle.device,
+            handle.inode,
+            handle.length,
+        )?;
+        handle.file.seek(SeekFrom::Start(0)).map_err(map_io)?;
+        let mut bytes = Vec::new();
+        handle.file.read_to_end(&mut bytes).map_err(map_io)?;
+        if decode_marker(&bytes)? != handle.marker {
+            return Err(SpoolError::IdentityChanged);
+        }
+        fs::remove_file(&handle.path).map_err(map_io)?;
+        File::open(&self.emergency_dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(map_io)
+    }
+
+    pub fn pending_quarantine(&self, limit: usize) -> Result<Vec<PendingQuarantine>, SpoolError> {
+        self.pending_quarantine_from(limit, 0)
+    }
+
+    pub fn pending_quarantine_from(
+        &self,
+        limit: usize,
+        stable_start: u64,
+    ) -> Result<Vec<PendingQuarantine>, SpoolError> {
+        if limit == 0 || limit > 64 {
+            return Err(SpoolError::InvalidConfiguration);
+        }
+        self.validate_directories()?;
+        let directory_lock = File::open(&self.quarantine_dir).map_err(map_io)?;
+        FileExt::lock_shared(&directory_lock).map_err(map_io)?;
+        let mut paths = fs::read_dir(&self.quarantine_dir)
+            .map_err(map_io)?
+            .map(|entry| entry.map(|value| value.path()).map_err(map_io))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+        if !paths.is_empty() {
+            let path_count = u64::try_from(paths.len()).map_err(|_| SpoolError::Corrupt)?;
+            let start =
+                usize::try_from(stable_start % path_count).map_err(|_| SpoolError::Corrupt)?;
+            paths.rotate_left(start);
+        }
+        paths.truncate(limit);
+        let mut handles = Vec::new();
+        for path in paths {
+            if path.extension().is_none_or(|value| value != "spool") {
+                return Err(SpoolError::Corrupt);
+            }
+            let mut file = File::open(&path).map_err(map_io)?;
+            validate_owned_file(&path, &file)?;
+            let metadata = file.metadata().map_err(map_io)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(map_io)?;
+            let fingerprint = hex_digest(&bytes);
+            handles.push(PendingQuarantine {
+                path,
+                file,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+                fingerprint,
+            });
+        }
+        Ok(handles)
+    }
+
+    pub fn acknowledge_quarantine(&self, mut handle: PendingQuarantine) -> Result<(), SpoolError> {
+        let directory_lock = File::open(&self.quarantine_dir).map_err(map_io)?;
+        FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
+        validate_ack_identity(
+            &handle.path,
+            &handle.file,
+            handle.device,
+            handle.inode,
+            handle.length,
+        )?;
+        handle.file.seek(SeekFrom::Start(0)).map_err(map_io)?;
+        let mut bytes = Vec::new();
+        handle.file.read_to_end(&mut bytes).map_err(map_io)?;
+        if hex_digest(&bytes) != handle.fingerprint {
+            return Err(SpoolError::IdentityChanged);
+        }
+        fs::remove_file(&handle.path).map_err(map_io)?;
+        File::open(&self.quarantine_dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(map_io)
     }
 
     pub fn pending_gap_markers(&self) -> Result<Vec<CaptureGapMarker>, SpoolError> {
@@ -634,6 +813,34 @@ fn validate_owned_file_metadata(metadata: &fs::Metadata) -> Result<(), SpoolErro
         return Err(SpoolError::InvalidPermissions);
     }
     Ok(())
+}
+
+fn validate_ack_identity(
+    path: &Path,
+    file: &File,
+    device: u64,
+    inode: u64,
+    length: u64,
+) -> Result<(), SpoolError> {
+    let path_metadata = fs::symlink_metadata(path).map_err(map_io)?;
+    let opened = file.metadata().map_err(map_io)?;
+    validate_owned_file_metadata(&path_metadata)?;
+    validate_owned_file_metadata(&opened)?;
+    if path_metadata.dev() != device
+        || path_metadata.ino() != inode
+        || path_metadata.len() != length
+        || opened.dev() != device
+        || opened.ino() != inode
+        || opened.len() != length
+    {
+        return Err(SpoolError::IdentityChanged);
+    }
+    Ok(())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn owned_file_exists(path: &Path) -> Result<bool, SpoolError> {

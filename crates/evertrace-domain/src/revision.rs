@@ -1,5 +1,6 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::{Uuid, Variant};
 
@@ -17,6 +18,10 @@ pub enum RevisionIdError {
 pub struct RevisionId(Uuid);
 
 impl RevisionId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
     pub fn from_uuid(uuid: Uuid) -> Result<Self, RevisionIdError> {
         if uuid.get_version_num() != 7 {
             return Err(RevisionIdError::WrongUuidVersion);
@@ -29,6 +34,32 @@ impl RevisionId {
 
     pub const fn as_uuid(self) -> Uuid {
         self.0
+    }
+}
+
+impl fmt::Display for RevisionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0.hyphenated())
+    }
+}
+
+impl Serialize for RevisionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for RevisionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 

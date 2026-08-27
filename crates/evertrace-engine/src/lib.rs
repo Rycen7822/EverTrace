@@ -3,11 +3,13 @@
 
 //! Minimal engine service boundary for the local daemon.
 
-mod capture;
+pub mod capture;
 pub mod ingest;
 pub mod jobs;
 pub mod normalize;
+pub mod repository;
 mod service;
+pub mod work;
 
 pub use ingest::{DrainProgress, EvidenceIngestor, IngestError};
 pub use jobs::{

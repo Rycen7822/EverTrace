@@ -11,8 +11,11 @@ use evertrace_domain::evidence::{
     SourceInstanceId, SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole,
     UnsupportedRecordClassification, payload_fingerprint, source_observation_id,
 };
+use evertrace_domain::work::{LaneLifecycleEvidence, LivenessState};
 use evertrace_engine::{EvidenceIngestor, IngestError, open_writer, spawn_writer};
-use evertrace_store::{JournalPayload, JournalWriter, ObjectRowClass, ObjectRowKind};
+use evertrace_store::{
+    DirtyTargetKind, JournalPayload, JournalWriter, ObjectRowClass, ObjectRowKind,
+};
 use tempfile::TempDir;
 
 fn limits() -> SpoolLimits {
@@ -83,6 +86,7 @@ fn input(record: &str, payload: &[u8]) -> CaptureRecordInput {
         turn_ref: Some("turn-a".into()),
         tool_ref: Some("tool-a".into()),
         source_sequence: 1,
+        source_sequence_origin: None,
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,
@@ -93,6 +97,7 @@ fn input(record: &str, payload: &[u8]) -> CaptureRecordInput {
         observation_role: ObservationRole::Result,
         correlation: unavailable_correlation(),
         scope_effect_claims: Vec::new(),
+        lifecycle: None,
         unsupported_record_classification: None,
         source_role: SourceRole::Tool,
         content_trust: ContentTrust::Observed,
@@ -155,6 +160,99 @@ fn typed_body_is_closed_versioned_bounded_and_persists_uuidv7_command() {
         decode_record_body(&vec![0; evertrace_capture::frame::MAX_RECORD_BODY + 1]),
         Err(SpoolFrameError::Oversize)
     );
+}
+
+#[tokio::test]
+async fn lifecycle_keeps_source_and_lane_sequences_independent_and_marks_reconciliation_dirty() {
+    let temp = TempDir::new().unwrap();
+    let (snapshot, mut runtime) = prepare(temp.path());
+    let mut record = input("lifecycle-a", b"lifecycle evidence");
+    record.source_sequence = 11;
+    record.observation_role = ObservationRole::Lifecycle;
+    record.correlation.pairing_role = ObservationRole::Lifecycle;
+    record.source_role = SourceRole::Host;
+    record.surface_eligible = false;
+    record.lifecycle = Some(LaneLifecycleEvidence {
+        host_session_id: "session-a".into(),
+        agent_id: "agent-a".into(),
+        incarnation_ref: Some("incarnation-a".into()),
+        child_session_id: Some("child-session-a".into()),
+        host_lane_key: "lane-a".into(),
+        parent_host_lane_key: Some("parent-lane-a".into()),
+        spawn_event_ref: Some("spawn-a".into()),
+        terminal_event_ref: None,
+        terminal_kind: None,
+        host_final_return: false,
+        source_close_ref: None,
+        parent_session_end_ref: None,
+        liveness_probe_ref: None,
+        liveness_state: LivenessState::Live,
+        lane_sequence: 3,
+        adapter_manifest_ref: "adapter-manifest-a".into(),
+        eligible_event_manifest_ref: "eligible-events-a".into(),
+        delegated_goal_ref: None,
+        delegated_target_refs: Vec::new(),
+        delegated_acceptance_refs: Vec::new(),
+        reasoning_visibility: Vec::new(),
+    });
+    let mut missing_incarnation = record.clone();
+    missing_incarnation
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .incarnation_ref = None;
+    assert_eq!(
+        runtime.capture(missing_incarnation),
+        Err(CaptureError::InvalidInput)
+    );
+    runtime.capture(record).unwrap();
+    let frame = runtime.spool().read_active().unwrap().remove(0);
+    let body = decode_record_body(&frame.record.record_body).unwrap();
+    let mut invalid_current_body = body.clone();
+    invalid_current_body
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .incarnation_ref = None;
+    assert_eq!(
+        invalid_current_body.validate(),
+        Err(SpoolFrameError::Invalid)
+    );
+    let observation_id = body.observation_id().unwrap().to_string();
+    assert_eq!(body.source_sequence, 11);
+    assert_eq!(body.lifecycle.as_ref().unwrap().lane_sequence, 3);
+    assert_eq!(
+        body.lifecycle.as_ref().unwrap().child_session_id.as_deref(),
+        Some("child-session-a")
+    );
+    drop(runtime);
+
+    let store_dir = temp.path().join("store");
+    let writer = open_writer(&store_dir).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 8).unwrap();
+    let ingestor = EvidenceIngestor::new(snapshot, handle.clone(), [4; 32], "s10-v1").unwrap();
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 1);
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+
+    let writer = JournalWriter::open(&store_dir).await.unwrap();
+    let dirty_targets = writer
+        .journal_rows()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| match row.payload().ok()? {
+            JournalPayload::DirtyTarget(target)
+                if target.target_kind == DirtyTargetKind::CaptureReconciliation =>
+            {
+                Some(target)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dirty_targets.len(), 1);
+    assert_eq!(dirty_targets[0].target_id, observation_id);
+    assert_eq!(dirty_targets[0].source_watermark, 11);
 }
 
 #[test]

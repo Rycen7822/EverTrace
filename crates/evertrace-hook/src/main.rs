@@ -76,6 +76,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput) -> Result<(), ()> {
             turn_ref: input.turn_id,
             tool_ref: input.tool_use_id,
             source_sequence: input.source_sequence,
+            source_sequence_origin: input.source_sequence_origin,
             task_id: input.task_id,
             repository_instance_id: input.repository_instance_id,
             worktree_instance_id: input.worktree_instance_id,
@@ -87,6 +88,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput) -> Result<(), ()> {
             observation_role: observation_role(input.event_kind),
             correlation: input.correlation,
             scope_effect_claims: input.scope_effect_claims,
+            lifecycle: input.lifecycle,
             unsupported_record_classification: unsupported_classification(
                 input.event_kind,
                 input.payload.len(),
@@ -156,7 +158,9 @@ const fn observation_role(kind: HookEventKind) -> ObservationRole {
         HookEventKind::SubagentStart
         | HookEventKind::SubagentTerminal
         | HookEventKind::Compact
-        | HookEventKind::SourceClose => ObservationRole::Lifecycle,
+        | HookEventKind::SourceClose
+        | HookEventKind::ParentSessionEnd
+        | HookEventKind::LivenessProbe => ObservationRole::Lifecycle,
     }
 }
 
@@ -166,24 +170,18 @@ const fn source_role(kind: HookEventKind) -> SourceRole {
         HookEventKind::SubagentStart
         | HookEventKind::SubagentTerminal
         | HookEventKind::Compact
-        | HookEventKind::SourceClose => SourceRole::Host,
+        | HookEventKind::SourceClose
+        | HookEventKind::ParentSessionEnd
+        | HookEventKind::LivenessProbe => SourceRole::Host,
     }
 }
 
 const fn unsupported_classification(
-    kind: HookEventKind,
+    _kind: HookEventKind,
     payload_length: usize,
 ) -> Option<UnsupportedRecordClassification> {
     if payload_length > evertrace_domain::evidence::MAX_EVIDENCE_SURFACE_BYTES {
         Some(UnsupportedRecordClassification::UnboundedToolOutput)
-    } else if matches!(
-        kind,
-        HookEventKind::SubagentStart
-            | HookEventKind::SubagentTerminal
-            | HookEventKind::Compact
-            | HookEventKind::SourceClose
-    ) {
-        Some(UnsupportedRecordClassification::UnknownRecordType)
     } else {
         None
     }
