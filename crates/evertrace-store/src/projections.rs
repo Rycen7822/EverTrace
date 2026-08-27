@@ -7,17 +7,21 @@ use evertrace_domain::{
         Operation, ScopeEffect, SourceObservation, SourceReceipt,
     },
     ids::{
-        CaptureOutageIntervalId, ExecutionLaneId, HostOccurrenceId, IntegrationEventId, JobId,
-        OperationId, RepositoryId, ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId,
-        WorkBindingRevisionId, WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
+        AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
+        HostOccurrenceId, IntegrationEventId, JobId, OperationId, RepositoryId, ScopeEffectId,
+        SourceObservationId, SourceReceiptId, TaskId, WorkBindingRevisionId, WorkstreamId,
+        WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
     repository::{
         IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
         WorktreeTransition,
     },
     work::{
-        ActiveWorkContext, AssignmentStatus, CaptureReceipt, ExecutionLane, SourceCoverage, Task,
-        TaskIdentityConfidence, WorkBindingRevision, Workstream,
+        ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus,
+        AttemptExecutionStatus, AttemptOutcomeState, AttemptVerification, CaptureReceipt,
+        CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, LaneStatus,
+        ResumeStateAssessment, SourceCoverage, Task, TaskIdentityConfidence, WorkBindingRevision,
+        Workstream,
     },
 };
 use lancedb::Table;
@@ -184,6 +188,113 @@ impl WorkIdentityCurrentView {
 pub struct WorkBindingCurrentView {
     pub frontier: u64,
     pub bindings: BTreeMap<OperationId, WorkBindingRevision>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AttemptCurrentView {
+    pub frontier: u64,
+    pub attempts: BTreeMap<AttemptId, Attempt>,
+    pub competing_groups: BTreeMap<CompetingAttemptGroupId, CompetingAttemptGroup>,
+}
+
+impl AttemptCurrentView {
+    pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let mut view = Self {
+            frontier: snapshot.frontier,
+            ..Self::default()
+        };
+        let mut attempt_revisions = BTreeMap::<AttemptId, Vec<Attempt>>::new();
+        let mut group_revisions =
+            BTreeMap::<CompetingAttemptGroupId, Vec<CompetingAttemptGroup>>::new();
+        for row in snapshot.data_rows() {
+            match row.object_kind.as_deref() {
+                Some("attempt") => {
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                    let JournalPayload::AttemptRecorded(value) = payload else {
+                        return Err(StoreError::StoreCorrupt);
+                    };
+                    if row.row_id != format!("object:work:attempt:{}", value.revision_id) {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    attempt_revisions
+                        .entry(value.attempt_id)
+                        .or_default()
+                        .push(*value);
+                }
+                Some("competing_attempt_group") => {
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                    let JournalPayload::CompetingAttemptGroupRecorded(value) = payload else {
+                        return Err(StoreError::StoreCorrupt);
+                    };
+                    if row.row_id
+                        != format!("object:work:competing_attempt_group:{}", value.revision_id)
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    group_revisions
+                        .entry(value.competing_group_id)
+                        .or_default()
+                        .push(*value);
+                }
+                _ => {}
+            }
+        }
+        for (id, mut revisions) in attempt_revisions {
+            revisions.sort_by_key(|value| value.revision_generation);
+            for (index, revision) in revisions.iter().enumerate() {
+                revision.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                let generation = u64::try_from(index + 1).map_err(|_| StoreError::StoreCorrupt)?;
+                let predecessor = index
+                    .checked_sub(1)
+                    .map(|previous| revisions[previous].revision_id);
+                if revision.revision_generation != generation
+                    || revision.predecessor_revision_id != predecessor
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                if let Some(previous) = index.checked_sub(1) {
+                    revisions[previous]
+                        .validate_successor(revision)
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                }
+            }
+            view.attempts
+                .insert(id, revisions.pop().ok_or(StoreError::StoreCorrupt)?);
+        }
+        for (id, mut revisions) in group_revisions {
+            revisions.sort_by_key(|value| value.revision_generation);
+            for (index, revision) in revisions.iter().enumerate() {
+                revision.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                let generation = u64::try_from(index + 1).map_err(|_| StoreError::StoreCorrupt)?;
+                let predecessor = index
+                    .checked_sub(1)
+                    .map(|previous| revisions[previous].revision_id);
+                if revision.revision_generation != generation
+                    || revision.predecessor_revision_id != predecessor
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                if let Some(previous) = index.checked_sub(1) {
+                    revisions[previous]
+                        .validate_successor(revision)
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                }
+            }
+            view.competing_groups
+                .insert(id, revisions.pop().ok_or(StoreError::StoreCorrupt)?);
+        }
+        Ok(view)
+    }
 }
 
 fn current_binding_lineage<'a>(
@@ -948,6 +1059,11 @@ struct ReducerState {
     tasks: BTreeMap<TaskId, (Task, u64)>,
     workstreams: BTreeMap<WorkstreamId, (Workstream, u64)>,
     work_bindings: BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    attempts: BTreeMap<AttemptId, (Attempt, u64)>,
+    competing_groups: BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    attempt_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Attempt, u64)>,
+    competing_group_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (CompetingAttemptGroup, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1016,6 +1132,11 @@ pub(crate) struct JournalAdmissionState {
     tasks: BTreeMap<TaskId, (Task, u64)>,
     workstreams: BTreeMap<WorkstreamId, (Workstream, u64)>,
     work_bindings: BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    attempts: BTreeMap<AttemptId, (Attempt, u64)>,
+    competing_groups: BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    attempt_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Attempt, u64)>,
+    competing_group_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (CompetingAttemptGroup, u64)>,
 }
 
 impl JournalAdmissionState {
@@ -1194,6 +1315,15 @@ impl JournalAdmissionState {
             JournalPayload::WorkBindingRecorded(value) => {
                 replace_work_binding(&mut self.work_bindings, *value, seq)?;
             }
+            JournalPayload::AttemptRecorded(value) => {
+                record_attempt(&mut self.attempts, &mut self.attempt_revisions, *value, seq)?
+            }
+            JournalPayload::CompetingAttemptGroupRecorded(value) => record_competing_group(
+                &mut self.competing_groups,
+                &mut self.competing_group_revisions,
+                *value,
+                seq,
+            )?,
             _ => {}
         }
         Ok(())
@@ -1228,6 +1358,20 @@ impl JournalAdmissionState {
             &self.scope_effects,
             &self.tasks,
             &self.workstreams,
+            &self.attempts,
+            &self.competing_groups,
+        )?;
+        validate_attempt_relations(
+            &self.attempts,
+            &self.attempt_revisions,
+            &self.competing_groups,
+            &self.tasks,
+            &self.workstreams,
+            &self.execution_lanes,
+            &self.worktree_snapshots,
+            &self.worktree_transitions,
+            &self.integration_events,
+            &self.work_bindings,
         )
     }
 }
@@ -1525,6 +1669,7 @@ pub fn reduce_journal(rows: &[JournalRow]) -> Result<ProjectionSnapshot, StoreEr
             apply_event(&mut state, row)?;
             frontier = frontier.max(row.seq);
         }
+        state.rebuild_attempt_currents()?;
         state.validate_evidence_relations()?;
     }
     state.into_snapshot(frontier)
@@ -1746,6 +1891,18 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         JournalPayload::WorkBindingRecorded(value) => {
             replace_work_binding(&mut state.work_bindings, *value, row.seq)?;
         }
+        JournalPayload::AttemptRecorded(value) => record_attempt(
+            &mut state.attempts,
+            &mut state.attempt_revisions,
+            *value,
+            row.seq,
+        )?,
+        JournalPayload::CompetingAttemptGroupRecorded(value) => record_competing_group(
+            &mut state.competing_groups,
+            &mut state.competing_group_revisions,
+            *value,
+            row.seq,
+        )?,
     }
     Ok(())
 }
@@ -1844,12 +2001,97 @@ fn replace_work_binding(
     Ok(())
 }
 
+fn replace_attempt(
+    values: &mut BTreeMap<AttemptId, (Attempt, u64)>,
+    value: Attempt,
+    seq: u64,
+) -> Result<(), StoreError> {
+    match values.get(&value.attempt_id) {
+        None if value.validate().is_err()
+            || value.revision_generation != 1
+            || value.predecessor_revision_id.is_some() =>
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        None => {}
+        Some((current, _)) if current == &value => return Ok(()),
+        Some((current, _)) => {
+            current
+                .validate_successor(&value)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+        }
+    }
+    values.insert(value.attempt_id, (value, seq));
+    Ok(())
+}
+
+fn record_attempt(
+    current: &mut BTreeMap<AttemptId, (Attempt, u64)>,
+    revisions: &mut BTreeMap<evertrace_domain::revision::RevisionId, (Attempt, u64)>,
+    value: Attempt,
+    seq: u64,
+) -> Result<(), StoreError> {
+    if let Some((existing, _)) = revisions.get(&value.revision_id) {
+        return if existing == &value {
+            Ok(())
+        } else {
+            Err(StoreError::StoreCorrupt)
+        };
+    }
+    replace_attempt(current, value.clone(), seq)?;
+    revisions.insert(value.revision_id, (value, seq));
+    Ok(())
+}
+
+fn replace_competing_group(
+    values: &mut BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    value: CompetingAttemptGroup,
+    seq: u64,
+) -> Result<(), StoreError> {
+    match values.get(&value.competing_group_id) {
+        None if value.validate().is_err()
+            || value.revision_generation != 1
+            || value.predecessor_revision_id.is_some()
+            || value.resolution_status != CompetingResolutionStatus::Open =>
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        None => {}
+        Some((current, _)) if current == &value => return Ok(()),
+        Some((current, _)) => current
+            .validate_successor(&value)
+            .map_err(|_| StoreError::StoreCorrupt)?,
+    }
+    values.insert(value.competing_group_id, (value, seq));
+    Ok(())
+}
+
+fn record_competing_group(
+    current: &mut BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    revisions: &mut BTreeMap<evertrace_domain::revision::RevisionId, (CompetingAttemptGroup, u64)>,
+    value: CompetingAttemptGroup,
+    seq: u64,
+) -> Result<(), StoreError> {
+    if let Some((existing, _)) = revisions.get(&value.revision_id) {
+        return if existing == &value {
+            Ok(())
+        } else {
+            Err(StoreError::StoreCorrupt)
+        };
+    }
+    replace_competing_group(current, value.clone(), seq)?;
+    revisions.insert(value.revision_id, (value, seq));
+    Ok(())
+}
+
 fn validate_work_binding_relations(
     bindings: &BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
     operations: &BTreeMap<OperationId, (Operation, u64)>,
     scope_effects: &BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     tasks: &BTreeMap<TaskId, (Task, u64)>,
     workstreams: &BTreeMap<WorkstreamId, (Workstream, u64)>,
+    attempts: &BTreeMap<AttemptId, (Attempt, u64)>,
+    groups: &BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
 ) -> Result<(), StoreError> {
     current_binding_lineage(bindings.values().map(|(binding, _)| binding))?;
     for (binding, _) in bindings.values() {
@@ -1893,6 +2135,37 @@ fn validate_work_binding_relations(
                         return Err(StoreError::StoreCorrupt);
                     }
                 }
+                if binding.primary_binding.attempt_id.is_some()
+                    || binding.primary_binding.competing_group_id.is_some()
+                {
+                    if binding.assignment_status != AssignmentStatus::Resolved {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    if let Some(attempt_id) = binding.primary_binding.attempt_id {
+                        let attempt = &attempts.get(&attempt_id).ok_or(StoreError::StoreCorrupt)?.0;
+                        if attempt.task_id != task_id
+                            || attempt.workstream_id != workstream_id
+                            || !attempt
+                                .work_binding_revision_refs
+                                .contains(&binding.work_binding_revision_id)
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                    }
+                    if let Some(group_id) = binding.primary_binding.competing_group_id {
+                        let group = &groups.get(&group_id).ok_or(StoreError::StoreCorrupt)?.0;
+                        if group.task_id != task_id
+                            || !group.member_workstream_ids.contains(&workstream_id)
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                    }
+                }
+                if binding.primary_binding.episode_id.is_some()
+                    || binding.primary_binding.experiment_run_id.is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
             (None, None) => {
                 if binding.assignment_status == AssignmentStatus::Resolved {
@@ -1900,6 +2173,333 @@ fn validate_work_binding_relations(
                 }
             }
             _ => return Err(StoreError::StoreCorrupt),
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_attempt_relations(
+    attempts: &BTreeMap<AttemptId, (Attempt, u64)>,
+    attempt_revisions: &BTreeMap<evertrace_domain::revision::RevisionId, (Attempt, u64)>,
+    groups: &BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    _tasks: &BTreeMap<TaskId, (Task, u64)>,
+    workstreams: &BTreeMap<WorkstreamId, (Workstream, u64)>,
+    execution_lanes: &BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    worktree_snapshots: &BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktree_transitions: &BTreeMap<WorktreeTransitionId, (WorktreeTransition, u64)>,
+    integration_events: &BTreeMap<IntegrationEventId, (IntegrationEvent, u64)>,
+    work_bindings: &BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+) -> Result<(), StoreError> {
+    fn composition_cycle(
+        id: AttemptId,
+        attempts: &BTreeMap<AttemptId, (Attempt, u64)>,
+        visiting: &mut BTreeSet<AttemptId>,
+        visited: &mut BTreeSet<AttemptId>,
+    ) -> bool {
+        if visited.contains(&id) {
+            return false;
+        }
+        if !visiting.insert(id) {
+            return true;
+        }
+        let cyclic = attempts.get(&id).is_some_and(|value| {
+            value
+                .0
+                .composed_from_attempt_ids
+                .iter()
+                .any(|source| composition_cycle(*source, attempts, visiting, visited))
+        });
+        visiting.remove(&id);
+        visited.insert(id);
+        cyclic
+    }
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    if attempts
+        .keys()
+        .copied()
+        .any(|id| composition_cycle(id, attempts, &mut visiting, &mut visited))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    for (event, _) in integration_events.values() {
+        for attempt_id in &event.integrated_attempt_ids {
+            let attempt = &attempts.get(attempt_id).ok_or(StoreError::StoreCorrupt)?.0;
+            if !attempt
+                .integration_event_refs
+                .contains(&event.integration_event_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+    }
+    for (attempt, _) in attempts.values() {
+        let workstream = &workstreams
+            .get(&attempt.workstream_id)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0;
+        if workstream.task_id != attempt.task_id
+            || attempt.repository_instance_id != workstream.repository_instance_id
+            || attempt
+                .worktree_instance_ids
+                .iter()
+                .any(|id| !workstream.worktree_instance_ids.contains(id))
+            || attempt.execution_lane_ids.iter().any(|id| {
+                !execution_lanes.contains_key(id) || !workstream.execution_lane_ids.contains(id)
+            })
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let lanes = attempt
+            .execution_lane_ids
+            .iter()
+            .map(|id| &execution_lanes[id].0)
+            .collect::<Vec<_>>();
+        match attempt.execution_status {
+            AttemptExecutionStatus::Proposed | AttemptExecutionStatus::Abandoned => {}
+            AttemptExecutionStatus::Active => {
+                if !lanes.iter().any(|lane| lane.status == LaneStatus::Active) {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            AttemptExecutionStatus::Interrupted => {
+                if lanes.iter().any(|lane| {
+                    !matches!(
+                        lane.status,
+                        LaneStatus::Interrupted | LaneStatus::InterruptedUnconfirmed
+                    )
+                }) {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            AttemptExecutionStatus::Completed => {
+                let has_normal_terminal = lanes
+                    .iter()
+                    .any(|lane| matches!(lane.status, LaneStatus::Returned | LaneStatus::Stopped));
+                if lanes
+                    .iter()
+                    .any(|lane| matches!(lane.status, LaneStatus::Active | LaneStatus::Unresolved))
+                    || (!has_normal_terminal && attempt.outcome_state != AttemptOutcomeState::Known)
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+        }
+        if let Some(predecessor_id) = attempt.predecessor_revision_id {
+            let predecessor = &attempt_revisions
+                .get(&predecessor_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            if predecessor.execution_status == AttemptExecutionStatus::Interrupted
+                && attempt.execution_status == AttemptExecutionStatus::Active
+            {
+                let new_lanes = attempt
+                    .execution_lane_ids
+                    .iter()
+                    .filter(|id| !predecessor.execution_lane_ids.contains(id))
+                    .collect::<Vec<_>>();
+                if new_lanes.is_empty()
+                    || new_lanes
+                        .iter()
+                        .any(|id| execution_lanes[*id].0.status != LaneStatus::Active)
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                let target_id = attempt
+                    .resume_target_snapshot_id
+                    .ok_or(StoreError::StoreCorrupt)?;
+                let target = &worktree_snapshots
+                    .get(&target_id)
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .0;
+                if !attempt
+                    .worktree_instance_ids
+                    .contains(&target.worktree_instance_id)
+                    || !workstream
+                        .worktree_instance_ids
+                        .contains(&target.worktree_instance_id)
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                match attempt.resume_state_assessment {
+                    Some(ResumeStateAssessment::CompatibleSameInstance) => {
+                        if let Some(source_id) = attempt.resume_source_snapshot_id {
+                            let source = &worktree_snapshots
+                                .get(&source_id)
+                                .ok_or(StoreError::StoreCorrupt)?
+                                .0;
+                            if source.worktree_instance_id != target.worktree_instance_id {
+                                return Err(StoreError::StoreCorrupt);
+                            }
+                        } else if !predecessor
+                            .worktree_instance_ids
+                            .contains(&target.worktree_instance_id)
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                    }
+                    Some(ResumeStateAssessment::CompatibleLineageTransfer) => {
+                        let source_id = attempt
+                            .resume_source_snapshot_id
+                            .ok_or(StoreError::StoreCorrupt)?;
+                        let source = &worktree_snapshots
+                            .get(&source_id)
+                            .ok_or(StoreError::StoreCorrupt)?
+                            .0;
+                        let topology = attempt.worktree_transition_refs.iter().any(|id| {
+                            worktree_transitions.get(id).is_some_and(|value| {
+                                value.0.from_worktree_instance_id == source.worktree_instance_id
+                                    && value.0.from_snapshot_id == Some(source_id)
+                                    && value.0.to_worktree_instance_id
+                                        == target.worktree_instance_id
+                                    && value.0.to_snapshot_id == Some(target_id)
+                            })
+                        });
+                        if !predecessor
+                            .worktree_instance_ids
+                            .contains(&source.worktree_instance_id)
+                            || !topology
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                    }
+                    _ => return Err(StoreError::StoreCorrupt),
+                }
+            }
+        }
+        for snapshot_id in [
+            attempt.resume_source_snapshot_id,
+            attempt.resume_target_snapshot_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let snapshot = &worktree_snapshots
+                .get(&snapshot_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            if !attempt
+                .worktree_instance_ids
+                .contains(&snapshot.worktree_instance_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        if attempt
+            .worktree_transition_refs
+            .iter()
+            .any(|id| !worktree_transitions.contains_key(id))
+            || attempt.integration_event_refs.iter().any(|id| {
+                integration_events.get(id).is_none_or(|event| {
+                    !event.0.integrated_attempt_ids.contains(&attempt.attempt_id)
+                })
+            })
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        for binding_id in &attempt.work_binding_revision_refs {
+            let binding = &work_bindings
+                .get(binding_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            if binding.assignment_status != AssignmentStatus::Resolved
+                || binding.primary_binding.task_id != Some(attempt.task_id)
+                || binding.primary_binding.workstream_id != Some(attempt.workstream_id)
+                || binding.primary_binding.attempt_id != Some(attempt.attempt_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        for source in attempt
+            .composed_from_attempt_ids
+            .iter()
+            .chain(attempt.resumes_from_attempt_id.iter())
+        {
+            let source_attempt = &attempts.get(source).ok_or(StoreError::StoreCorrupt)?.0;
+            if source_attempt.task_id != attempt.task_id
+                || (attempt.composed_from_attempt_ids.contains(source)
+                    && source_attempt.strategy_contract_fingerprint
+                        == attempt.strategy_contract_fingerprint)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        for group_id in &attempt.competing_group_ids {
+            let group = &groups.get(group_id).ok_or(StoreError::StoreCorrupt)?.0;
+            if !group.member_attempt_ids.contains(&attempt.attempt_id) {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+    }
+    for (group, _) in groups.values() {
+        if group.origin_workstream_id.is_some_and(|id| {
+            workstreams
+                .get(&id)
+                .is_none_or(|value| value.0.task_id != group.task_id)
+        }) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        for member_id in &group.member_attempt_ids {
+            let attempt = &attempts.get(member_id).ok_or(StoreError::StoreCorrupt)?.0;
+            if attempt.task_id != group.task_id
+                || !group.member_workstream_ids.contains(&attempt.workstream_id)
+                || !attempt
+                    .competing_group_ids
+                    .contains(&group.competing_group_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        if group.member_workstream_ids.iter().any(|id| {
+            workstreams
+                .get(id)
+                .is_none_or(|value| value.0.task_id != group.task_id)
+        }) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        for candidate in &group.candidate_snapshot_refs {
+            let attempt = &attempts
+                .get(&candidate.attempt_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            let snapshot = &worktree_snapshots
+                .get(&candidate.snapshot_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .0;
+            if !group.member_attempt_ids.contains(&candidate.attempt_id)
+                || attempt.workstream_id != candidate.workstream_id
+                || !attempt
+                    .worktree_instance_ids
+                    .contains(&snapshot.worktree_instance_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        if let Some(selected) = group.selected_attempt_id {
+            let attempt = &attempts[&selected].0;
+            if attempt.adoption_status != AttemptAdoptionStatus::Integrated
+                || attempt.verification != AttemptVerification::Passed
+                || !attempt
+                    .parent_verification_refs
+                    .iter()
+                    .any(|evidence| group.resolution_evidence_refs.contains(evidence))
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        if group.resolution_status == CompetingResolutionStatus::PartiallyIntegrated
+            && group.partially_integrated_attempt_ids.iter().any(|id| {
+                attempts.get(id).is_none_or(|value| {
+                    !matches!(
+                        value.0.adoption_status,
+                        AttemptAdoptionStatus::PartiallyIntegrated
+                            | AttemptAdoptionStatus::Integrated
+                    )
+                })
+            })
+        {
+            return Err(StoreError::StoreCorrupt);
         }
     }
     Ok(())
@@ -2087,6 +2687,26 @@ fn replace_outage(
 }
 
 impl ReducerState {
+    fn rebuild_attempt_currents(&mut self) -> Result<(), StoreError> {
+        self.attempts.clear();
+        let mut attempts = self.attempt_revisions.values().cloned().collect::<Vec<_>>();
+        attempts.sort_by_key(|(value, _)| (value.attempt_id, value.revision_generation));
+        for (value, seq) in attempts {
+            replace_attempt(&mut self.attempts, value, seq)?;
+        }
+        self.competing_groups.clear();
+        let mut groups = self
+            .competing_group_revisions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        groups.sort_by_key(|(value, _)| (value.competing_group_id, value.revision_generation));
+        for (value, seq) in groups {
+            replace_competing_group(&mut self.competing_groups, value, seq)?;
+        }
+        Ok(())
+    }
+
     fn from_current_rows(rows: &[ObjectRow], checkpoint_frontier: u64) -> Result<Self, StoreError> {
         let checkpoints = rows
             .iter()
@@ -2151,6 +2771,57 @@ impl ReducerState {
                             row.source_event_seq,
                         ),
                     )
+                    .is_some()
+            }
+            JournalPayload::AttemptRecorded(value) => {
+                let value = *value;
+                let mut normalized = row.clone();
+                normalized.row_id = format!("object:work:attempt:{}", value.attempt_id);
+                require_work_identity_row(
+                    &normalized,
+                    "attempt",
+                    &value.attempt_id.to_string(),
+                    &value.revision_id.to_string(),
+                    Some(&value.task_id.to_string()),
+                    Some(&value.workstream_id.to_string()),
+                    value
+                        .repository_instance_id
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    value
+                        .worktree_instance_ids
+                        .first()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    value.lifecycle_status.as_str(),
+                )?;
+                self.attempt_revisions
+                    .insert(value.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::CompetingAttemptGroupRecorded(value) => {
+                let value = *value;
+                let mut normalized = row.clone();
+                normalized.row_id = format!(
+                    "object:work:competing_attempt_group:{}",
+                    value.competing_group_id
+                );
+                require_work_identity_row(
+                    &normalized,
+                    "competing_attempt_group",
+                    &value.competing_group_id.to_string(),
+                    &value.revision_id.to_string(),
+                    Some(&value.task_id.to_string()),
+                    value
+                        .origin_workstream_id
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    None,
+                    None,
+                    value.resolution_status.as_str(),
+                )?;
+                self.competing_group_revisions
+                    .insert(value.revision_id, (value, row.source_event_seq))
                     .is_some()
             }
             JournalPayload::TaskRecorded(value) => {
@@ -2869,6 +3540,48 @@ impl ReducerState {
                 seq,
             )?);
         }
+        for (_revision_id, (value, seq)) in self.attempt_revisions {
+            let mut row = work_identity_row(
+                "attempt",
+                value.attempt_id.to_string(),
+                value.revision_id.to_string(),
+                value.lifecycle_status.as_str(),
+                Some(value.task_id.to_string()),
+                Some(value.workstream_id.to_string()),
+                value.repository_instance_id.map(|id| id.to_string()),
+                value.worktree_instance_ids.first().map(ToString::to_string),
+                &JournalPayload::AttemptRecorded(Box::new(value)),
+                seq,
+            )?;
+            row.row_id = format!(
+                "object:work:attempt:{}",
+                row.current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+            );
+            rows.push(row);
+        }
+        for (_revision_id, (value, seq)) in self.competing_group_revisions {
+            let mut row = work_identity_row(
+                "competing_attempt_group",
+                value.competing_group_id.to_string(),
+                value.revision_id.to_string(),
+                value.resolution_status.as_str(),
+                Some(value.task_id.to_string()),
+                value.origin_workstream_id.map(|id| id.to_string()),
+                None,
+                None,
+                &JournalPayload::CompetingAttemptGroupRecorded(Box::new(value)),
+                seq,
+            )?;
+            row.row_id = format!(
+                "object:work:competing_attempt_group:{}",
+                row.current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+            );
+            rows.push(row);
+        }
         Ok(rows)
     }
 
@@ -2972,6 +3685,20 @@ impl ReducerState {
             &self.scope_effects,
             &self.tasks,
             &self.workstreams,
+            &self.attempts,
+            &self.competing_groups,
+        )?;
+        validate_attempt_relations(
+            &self.attempts,
+            &self.attempt_revisions,
+            &self.competing_groups,
+            &self.tasks,
+            &self.workstreams,
+            &self.execution_lanes,
+            &self.worktree_snapshots,
+            &self.worktree_transitions,
+            &self.integration_events,
+            &self.work_bindings,
         )?;
         Ok(())
     }
@@ -2994,6 +3721,10 @@ impl ReducerState {
             tasks: self.tasks.clone(),
             workstreams: self.workstreams.clone(),
             work_bindings: self.work_bindings.clone(),
+            attempts: self.attempts.clone(),
+            competing_groups: self.competing_groups.clone(),
+            attempt_revisions: self.attempt_revisions.clone(),
+            competing_group_revisions: self.competing_group_revisions.clone(),
         })
     }
 }

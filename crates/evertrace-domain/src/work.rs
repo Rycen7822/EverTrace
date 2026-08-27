@@ -8,10 +8,12 @@ use crate::{
     ids::{CaptureOutageIntervalId, CaptureReceiptId, ExecutionLaneId, OperationId},
 };
 
+pub mod attempt;
 pub mod binding;
 pub mod task;
 pub mod workstream;
 
+pub use attempt::*;
 pub use binding::{
     ActiveWorkContext, AssignmentStatus, PrimaryWorkBinding, SecondaryBindingRole,
     SecondaryBindingTarget, SecondaryWorkBinding, WorkBindingRevision,

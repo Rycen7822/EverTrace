@@ -13,8 +13,8 @@ use evertrace_domain::{
         WorktreeTransition,
     },
     work::{
-        AdmissionFailureObservability, CaptureReceipt, ExecutionLane, Task, WorkBindingRevision,
-        Workstream,
+        AdmissionFailureObservability, Attempt, CaptureReceipt, CompetingAttemptGroup,
+        ExecutionLane, Task, WorkBindingRevision, Workstream,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -504,6 +504,8 @@ pub enum JournalPayload {
     TaskRecorded(Box<Task>),
     WorkstreamRecorded(Box<Workstream>),
     WorkBindingRecorded(Box<WorkBindingRevision>),
+    AttemptRecorded(Box<Attempt>),
+    CompetingAttemptGroupRecorded(Box<CompetingAttemptGroup>),
 }
 
 impl JournalPayload {
@@ -539,6 +541,8 @@ impl JournalPayload {
             Self::TaskRecorded(_) => "task_recorded_v1",
             Self::WorkstreamRecorded(_) => "workstream_recorded_v1",
             Self::WorkBindingRecorded(_) => "work_binding_recorded_v1",
+            Self::AttemptRecorded(_) => "attempt_recorded_v1",
+            Self::CompetingAttemptGroupRecorded(_) => "competing_attempt_group_recorded_v1",
         }
     }
 
@@ -562,9 +566,11 @@ impl JournalPayload {
             | Self::WorktreeSnapshotRecorded(_)
             | Self::WorktreeTransitionRecorded(_)
             | Self::IntegrationEventRecorded(_) => RecordClass::ObjectEvent,
-            Self::TaskRecorded(_) | Self::WorkstreamRecorded(_) | Self::WorkBindingRecorded(_) => {
-                RecordClass::ObjectEvent
-            }
+            Self::TaskRecorded(_)
+            | Self::WorkstreamRecorded(_)
+            | Self::WorkBindingRecorded(_)
+            | Self::AttemptRecorded(_)
+            | Self::CompetingAttemptGroupRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -675,6 +681,10 @@ impl JournalPayload {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::WorkBindingRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::AttemptRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
+            Self::CompetingAttemptGroupRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
         }
@@ -804,6 +814,10 @@ impl JournalPayload {
             Self::TaskRecorded(value) => tagged_json("task_recorded", value),
             Self::WorkstreamRecorded(value) => tagged_json("workstream_recorded", value),
             Self::WorkBindingRecorded(value) => tagged_json("work_binding_recorded", value),
+            Self::AttemptRecorded(value) => tagged_json("attempt_recorded", value),
+            Self::CompetingAttemptGroupRecorded(value) => {
+                tagged_json("competing_attempt_group_recorded", value)
+            }
         }
     }
 
