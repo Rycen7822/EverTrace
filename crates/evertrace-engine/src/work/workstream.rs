@@ -65,6 +65,9 @@ pub fn create_workstream(
     repository_view: &RepositoryCurrentView,
     workstream: Workstream,
 ) -> Result<JournalCommand, WorkIdentityError> {
+    if workstream.active_episode_id.is_some() {
+        return Err(WorkIdentityError::InvalidInput);
+    }
     workstream
         .validate()
         .map_err(|_| WorkIdentityError::InvalidInput)?;
@@ -122,6 +125,7 @@ pub fn revise_workstream(
         || successor.predecessor_revision_id != Some(current.revision_id)
         || successor.revision_id == current.revision_id
         || successor.source_watermark <= current.source_watermark
+        || successor.active_episode_id != current.active_episode_id
         || current.status.is_terminal()
     {
         return Err(WorkIdentityError::InvalidInput);

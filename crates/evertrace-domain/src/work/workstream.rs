@@ -120,10 +120,10 @@ impl Workstream {
             || self
                 .active_worktree_instance_id
                 .is_some_and(|id| !self.worktree_instance_ids.contains(&id))
+            || (self.predecessor_revision_id.is_none() && self.active_episode_id.is_some())
             || (self.repository_instance_id.is_none() && !self.worktree_instance_ids.is_empty())
             || self.parent_workstream_id == Some(self.workstream_id)
             || self.dependency_workstream_ids.contains(&self.workstream_id)
-            || self.active_episode_id.is_some()
         {
             return Err(WorkError::InvalidWorkIdentity);
         }

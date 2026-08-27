@@ -271,6 +271,7 @@ uuid_id!(TaskId, "task");
 uuid_id!(WorkstreamId, "ws");
 uuid_id!(ExecutionLaneId, "lane");
 uuid_id!(WorkEpisodeId, "ep");
+uuid_id!(OperationBurstId, "burst");
 uuid_id!(AttemptId, "att");
 uuid_id!(CompetingAttemptGroupId, "cmp");
 uuid_id!(ExperimentRunId, "run");
@@ -371,6 +372,12 @@ impl WorkstreamId {
     }
 }
 
+impl WorkEpisodeId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
 impl AttemptId {
     pub fn new_v7() -> Self {
         Self(Uuid::now_v7())
@@ -378,6 +385,12 @@ impl AttemptId {
 }
 
 impl CompetingAttemptGroupId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl OperationBurstId {
     pub fn new_v7() -> Self {
         Self(Uuid::now_v7())
     }
@@ -405,6 +418,7 @@ pub enum AnyPublicId {
     Workstream(WorkstreamId),
     ExecutionLane(ExecutionLaneId),
     WorkEpisode(WorkEpisodeId),
+    OperationBurst(OperationBurstId),
     Attempt(AttemptId),
     CompetingAttemptGroup(CompetingAttemptGroupId),
     ExperimentRun(ExperimentRunId),
@@ -442,6 +456,7 @@ impl AnyPublicId {
             Self::Workstream(_) => "ws",
             Self::ExecutionLane(_) => "lane",
             Self::WorkEpisode(_) => "ep",
+            Self::OperationBurst(_) => "burst",
             Self::Attempt(_) => "att",
             Self::CompetingAttemptGroup(_) => "cmp",
             Self::ExperimentRun(_) => "run",
@@ -486,6 +501,7 @@ impl FromStr for AnyPublicId {
             "ws" => Ok(Self::Workstream(value.parse()?)),
             "lane" => Ok(Self::ExecutionLane(value.parse()?)),
             "ep" => Ok(Self::WorkEpisode(value.parse()?)),
+            "burst" => Ok(Self::OperationBurst(value.parse()?)),
             "att" => Ok(Self::Attempt(value.parse()?)),
             "cmp" => Ok(Self::CompetingAttemptGroup(value.parse()?)),
             "run" => Ok(Self::ExperimentRun(value.parse()?)),

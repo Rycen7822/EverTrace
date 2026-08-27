@@ -62,7 +62,10 @@ pub fn create_attempt(
     context: WorkCommandContext,
     attempt: Attempt,
 ) -> Result<JournalCommand, WorkIdentityError> {
-    if attempt.revision_generation != 1 || attempt.predecessor_revision_id.is_some() {
+    if attempt.revision_generation != 1
+        || attempt.predecessor_revision_id.is_some()
+        || attempt.episode_id.is_some()
+    {
         return Err(WorkIdentityError::InvalidInput);
     }
     attempt_command(context, attempt)

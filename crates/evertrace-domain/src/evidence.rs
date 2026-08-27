@@ -798,9 +798,9 @@ impl Operation {
     pub fn validate(&self) -> Result<(), EvidenceError> {
         if self.operation_resolver_version == 0
             || self.operation_revision == 0
-            || self
-                .previous_operation_revision
-                .is_some_and(|previous| previous == 0 || previous + 1 != self.operation_revision)
+            || self.previous_operation_revision.is_some_and(|previous| {
+                previous == 0 || previous.checked_add(1) != Some(self.operation_revision)
+            })
             || (self.operation_revision == 1 && self.previous_operation_revision.is_some())
         {
             return Err(EvidenceError::InvalidOperation);

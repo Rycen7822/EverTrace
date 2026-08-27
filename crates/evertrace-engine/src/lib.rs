@@ -8,6 +8,7 @@ pub mod ingest;
 pub mod jobs;
 pub mod normalize;
 pub mod repository;
+pub mod segmentation;
 mod service;
 pub mod work;
 

@@ -142,6 +142,31 @@ impl WorkBindingRevision {
         }
         Ok(())
     }
+
+    pub fn validate_successor(&self, next: &Self) -> Result<(), WorkError> {
+        self.validate()?;
+        next.validate()?;
+        let generation = self
+            .revision_generation
+            .checked_add(1)
+            .ok_or(WorkError::InvalidWorkIdentity)?;
+        let episode_ok = match (
+            self.primary_binding.episode_id,
+            next.primary_binding.episode_id,
+        ) {
+            (None, None | Some(_)) => true,
+            (Some(old), Some(new)) => old == new,
+            (Some(_), None) => false,
+        };
+        if next.operation_id != self.operation_id
+            || next.revision_generation != generation
+            || next.predecessor_revision_id != Some(self.work_binding_revision_id)
+            || !episode_ok
+        {
+            return Err(WorkError::InvalidWorkIdentity);
+        }
+        Ok(())
+    }
 }
 
 /// Deterministic, read-only current semantic context. Non-resolved bindings
