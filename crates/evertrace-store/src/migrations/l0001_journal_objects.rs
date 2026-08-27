@@ -18,6 +18,7 @@ use crate::{
 
 const MIGRATION_ID: &str = "L0001";
 const MIGRATION_COMMAND_ID: &str = "01890f47-6a4a-7cc1-98b9-01890f476a40";
+const L0002_RESERVED_TABLES: [&str; 2] = ["evertrace_relations", "evertrace_search"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationOutcome {
@@ -36,6 +37,12 @@ impl L0001 {
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
+        if names
+            .iter()
+            .any(|name| L0002_RESERVED_TABLES.contains(&name.as_str()))
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
         let journal_exists = names.iter().any(|name| name == JOURNAL_TABLE);
         let objects_exists = names.iter().any(|name| name == OBJECTS_TABLE);
 
@@ -242,6 +249,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_all_journal_rows(&journal).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn l0001_rejects_reserved_l0002_tables_without_touching_them() {
+        let (_temp, connection) = connection().await;
+        connection
+            .create_empty_table("evertrace_relations", objects_schema())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            L0001::apply(&connection).await,
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(
+            connection.table_names().execute().await.unwrap(),
+            vec!["evertrace_relations"]
+        );
     }
 
     #[tokio::test]

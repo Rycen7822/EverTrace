@@ -10,6 +10,7 @@ pub mod migrations;
 pub mod objects;
 pub mod projections;
 pub mod relations;
+pub mod repository;
 pub mod schema;
 pub mod search;
 pub mod writer;
@@ -21,6 +22,11 @@ pub use migrations::{L0001, MigrationOutcome};
 pub use objects::{
     OBJECTS_CHECKPOINT_ID, OBJECTS_TABLE, ObjectRow, ObjectRowClass, ObjectRowKind, objects_schema,
 };
-pub use projections::{ProjectionSnapshot, ProjectionWorker, reduce_journal};
+pub use projections::{
+    NamedCurrentDependency, ProjectionSnapshot, ProjectionWorker, ReconciliationArtifactContext,
+    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
+    ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
+    WorkIdentityCurrentView, reduce_journal,
+};
 pub use schema::{PROBE_SCHEMA_VERSION, ProbeRow, probe_batch, probe_schema, schema_fingerprint};
 pub use writer::{JournalWriter, SiblingWriterLock};

@@ -9,6 +9,7 @@ use evertrace_domain::{
         source_observation_id,
     },
     ids::{CommandId, RepositoryId, SourceObservationId, TaskId, WorktreeId},
+    work::LaneLifecycleEvidence,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,7 +18,7 @@ use thiserror::Error;
 const MAGIC: &[u8; 8] = b"ETSPL001";
 const COMMIT_TRAILER: &[u8; 8] = b"ETCOMMIT";
 pub const SPOOL_FRAME_VERSION: u16 = 1;
-pub const CAPTURE_RECORD_BODY_VERSION: u16 = 3;
+pub const CAPTURE_RECORD_BODY_VERSION: u16 = 5;
 pub const MAX_RECORD_BODY: usize = 1_048_576;
 const PREFIX_LENGTH: usize = 8 + 2 + 4 + 8 + 32;
 
@@ -59,6 +60,8 @@ pub struct CaptureRecordBody {
     pub source_ref: String,
     pub source_session_ref: String,
     pub source_sequence: u64,
+    #[serde(default)]
+    pub source_sequence_origin: Option<u64>,
     pub task_id: Option<TaskId>,
     pub repository_instance_id: Option<RepositoryId>,
     pub worktree_instance_id: Option<WorktreeId>,
@@ -69,6 +72,7 @@ pub struct CaptureRecordBody {
     pub observation_role: ObservationRole,
     pub correlation: HostCorrelationEvidence,
     pub scope_effect_claims: Vec<ScopeEffectClaim>,
+    pub lifecycle: Option<LaneLifecycleEvidence>,
     pub unsupported_record_classification: Option<UnsupportedRecordClassification>,
     pub source_role: SourceRole,
     pub content_trust: ContentTrust,
@@ -144,6 +148,12 @@ impl CaptureRecordBody {
             || self.event_time_us < 0
             || self.recorded_at_us < 0
             || self.event_time_us > self.recorded_at_us
+            || self
+                .source_sequence_origin
+                .is_some_and(|origin| origin > self.source_sequence)
+            || self
+                .close_watermark
+                .is_some_and(|close| close < self.source_sequence)
             || (self.identity_strength == IdentityStrength::SynthesizedBestEffort
                 && self.capture_completeness == CaptureCompleteness::Complete)
             || (self.unsupported_record_classification.is_some() && self.surface_eligible)
@@ -171,6 +181,16 @@ impl CaptureRecordBody {
             .map_err(|_| SpoolFrameError::Invalid)?;
         for claim in &self.scope_effect_claims {
             claim.validate().map_err(|_| SpoolFrameError::Invalid)?;
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.validate().map_err(|_| SpoolFrameError::Invalid)?;
+            if lifecycle.incarnation_ref.is_none()
+                || lifecycle.host_session_id != self.source_session_ref
+                || lifecycle.adapter_manifest_ref != self.adapter_manifest_ref
+                || lifecycle.eligible_event_manifest_ref != self.eligible_event_manifest_ref
+            {
+                return Err(SpoolFrameError::Invalid);
+            }
         }
         match self.archive_mode {
             SourceArchiveMode::Exact

@@ -101,6 +101,7 @@ fn observation(
         source_record_identity: record_identity.clone(),
         identity_strength: IdentityStrength::StableNative,
         source_sequence: 1,
+        source_sequence_origin: None,
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,
@@ -128,6 +129,7 @@ fn observation(
         protection_key_generation: 1,
         event_time_us: 1,
         recorded_at_us: 1,
+        lifecycle: None,
     };
     let fingerprint = payload_fingerprint(1, b"x", None).unwrap();
     let observation = SourceObservation {
@@ -205,7 +207,9 @@ fn hook_input_rejects_raw_exact_and_preserves_complete_nonexact_correlation() {
             scope_claim(repository, worktree_a),
             scope_claim(repository, worktree_b),
         ],
+        lifecycle: None,
         source_sequence: 7,
+        source_sequence_origin: None,
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,

@@ -1,20 +1,30 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
     evidence::{
-        EvidenceSurface, HostOccurrence, Operation, ScopeEffect, SourceObservation, SourceReceipt,
+        CaptureGapMarkerEvidence, CaptureOutageInterval, EvidenceSurface, HostOccurrence,
+        Operation, ScopeEffect, SourceObservation, SourceReceipt,
     },
     ids::{
-        HostOccurrenceId, JobId, OperationId, ScopeEffectId, SourceObservationId, SourceReceiptId,
+        CaptureOutageIntervalId, ExecutionLaneId, HostOccurrenceId, IntegrationEventId, JobId,
+        OperationId, RepositoryId, ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId,
+        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
+    repository::{
+        IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
+        WorktreeTransition,
+    },
+    work::{CaptureReceipt, ExecutionLane, SourceCoverage, Task, Workstream},
 };
 use lancedb::Table;
 
 use crate::{
     command::{
-        DirtyTarget, DurableJob, JobStatus, JournalPayload, NormalizationWatermark, ObjectFamily,
-        OutboxEntry, SourceIngestWatermark, SourceRevisionRecorded, StoreError, WatermarkAdvanced,
+        DirtyTarget, DurableJob, JobStatus, JournalCommand, JournalPayload, NormalizationWatermark,
+        ObjectFamily, OutboxEntry, SourceCloseDecision, SourceCloseReconciliation,
+        SourceIngestWatermark, SourceRevisionRecorded, StoreError, WatermarkAdvanced,
+        source_revision_ref,
     },
     journal::{
         JournalRow, read_all_journal_rows, read_journal_after, read_journal_frontier,
@@ -27,6 +37,8 @@ use crate::{
 };
 
 const PROJECTION_GENERATION: u64 = 1;
+// S10 fail-closed safety ceiling. Pagination/cursors belong to the later S23 owner.
+const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionSnapshot {
@@ -44,6 +56,780 @@ impl ProjectionSnapshot {
     pub fn row(&self, row_id: &str) -> Option<&ObjectRow> {
         self.rows.iter().find(|row| row.row_id == row_id)
     }
+
+    pub fn reconciliation_frontier(
+        &self,
+        limit: usize,
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut candidates = self
+            .data_rows()
+            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.source_event_seq
+                .cmp(&right.source_event_seq)
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+        let mut items = Vec::new();
+        for row in candidates {
+            let payload = current_payload(row)?;
+            let JournalPayload::DirtyTarget(target) = &payload.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let target = target.clone();
+            if !matches!(
+                target.target_kind,
+                crate::command::DirtyTargetKind::PhysicalNormalization
+                    | crate::command::DirtyTargetKind::CaptureReconciliation
+            ) {
+                continue;
+            }
+            if let Some(item) = reconciliation_item(self, payload, target)? {
+                items.push(item);
+                if items.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(ReconciliationFrontier {
+            frontier: self.frontier,
+            items,
+        })
+    }
+
+    pub fn reconciliation_artifact_context(
+        &self,
+        descriptors: &[ReconciliationArtifactDescriptor],
+        limit: usize,
+    ) -> Result<ReconciliationArtifactFrontier, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut ordered = descriptors.to_vec();
+        ordered.sort();
+        ordered.truncate(limit);
+        let mut contexts = Vec::with_capacity(ordered.len());
+        for descriptor in ordered {
+            descriptor.validate()?;
+            contexts.push(reconciliation_artifact_item(self, descriptor)?);
+        }
+        Ok(ReconciliationArtifactFrontier {
+            frontier: self.frontier,
+            contexts,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkIdentityCurrentView {
+    pub frontier: u64,
+    pub tasks: BTreeMap<TaskId, Task>,
+    pub workstreams: BTreeMap<WorkstreamId, Workstream>,
+}
+
+impl WorkIdentityCurrentView {
+    pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let mut view = Self {
+            frontier: snapshot.frontier,
+            ..Self::default()
+        };
+        for row in snapshot.data_rows() {
+            match row.object_kind.as_deref() {
+                Some("task") => {
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                    let JournalPayload::TaskRecorded(task) = payload else {
+                        return Err(StoreError::StoreCorrupt);
+                    };
+                    if row.row_id != format!("object:work:task:{}", task.task_id) {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    view.tasks.insert(task.task_id, *task);
+                }
+                Some("workstream") => {
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                    let JournalPayload::WorkstreamRecorded(workstream) = payload else {
+                        return Err(StoreError::StoreCorrupt);
+                    };
+                    if row.row_id != format!("object:work:workstream:{}", workstream.workstream_id)
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    view.workstreams
+                        .insert(workstream.workstream_id, *workstream);
+                }
+                _ => {}
+            }
+        }
+        Ok(view)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedCurrentDependency {
+    pub row_id: String,
+    pub source_event_seq: u64,
+    pub payload: JournalPayload,
+}
+
+#[derive(Default)]
+struct DependencyCollector {
+    by_row_id: BTreeMap<String, NamedCurrentDependency>,
+}
+
+impl DependencyCollector {
+    fn insert(&mut self, dependency: NamedCurrentDependency) -> Result<(), StoreError> {
+        if self.by_row_id.contains_key(&dependency.row_id) {
+            return Ok(());
+        }
+        if self.by_row_id.len() == MAX_S10_RECONCILIATION_DEPENDENCIES {
+            return Err(StoreError::ReconciliationDependencyOverflow);
+        }
+        self.by_row_id.insert(dependency.row_id.clone(), dependency);
+        Ok(())
+    }
+
+    fn into_dependencies(self) -> Vec<NamedCurrentDependency> {
+        self.by_row_id.into_values().collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationWorkItem {
+    pub row_id: String,
+    pub target_kind: crate::command::DirtyTargetKind,
+    pub target_id: String,
+    pub source_event_seq: u64,
+    pub dependencies: Vec<NamedCurrentDependency>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationFrontier {
+    pub frontier: u64,
+    pub items: Vec<ReconciliationWorkItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ReconciliationArtifactKind {
+    GapMarker,
+    Quarantine,
+    Outage,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReconciliationArtifactDescriptor {
+    pub kind: ReconciliationArtifactKind,
+    pub artifact_id: String,
+    pub marker_id: Option<String>,
+    pub redacted_fingerprint: Option<String>,
+    pub session_ref: Option<String>,
+    pub source_ref: Option<String>,
+}
+
+impl ReconciliationArtifactDescriptor {
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.artifact_id.is_empty()
+            || self.artifact_id.len() > 512
+            || self.redacted_fingerprint.as_ref().is_some_and(|value| {
+                value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            || self
+                .marker_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty())
+            || self
+                .session_ref
+                .as_ref()
+                .is_some_and(|value| value.is_empty())
+            || self
+                .source_ref
+                .as_ref()
+                .is_some_and(|value| value.is_empty())
+            || self.kind == ReconciliationArtifactKind::Outage
+                && (self.marker_id.is_some() || self.redacted_fingerprint.is_some())
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationArtifactOwnership {
+    Owned,
+    Unowned,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationArtifactContext {
+    pub descriptor: ReconciliationArtifactDescriptor,
+    pub ownership: ReconciliationArtifactOwnership,
+    pub dependencies: Vec<NamedCurrentDependency>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationArtifactFrontier {
+    pub frontier: u64,
+    pub contexts: Vec<ReconciliationArtifactContext>,
+}
+
+fn reconciliation_artifact_item(
+    snapshot: &ProjectionSnapshot,
+    descriptor: ReconciliationArtifactDescriptor,
+) -> Result<ReconciliationArtifactContext, StoreError> {
+    let unowned_quarantine = descriptor.kind == ReconciliationArtifactKind::Quarantine
+        && (descriptor.session_ref.is_none() || descriptor.source_ref.is_none());
+    let mut dependencies = DependencyCollector::default();
+    let mut identity = descriptor
+        .session_ref
+        .clone()
+        .zip(descriptor.source_ref.clone());
+    let mut conflict = false;
+    let mut gap_count = 0usize;
+    for row in matching_gap_rows(snapshot, &descriptor)? {
+        gap_count += 1;
+        if gap_count > 1 {
+            conflict = true;
+        }
+        let dependency = current_payload(row)?;
+        let JournalPayload::CaptureGapMarkerRecorded(gap) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if descriptor
+            .redacted_fingerprint
+            .as_ref()
+            .is_some_and(|value| value != &gap.redacted_fingerprint)
+            || descriptor
+                .session_ref
+                .as_ref()
+                .is_some_and(|value| value != &gap.session_ref)
+            || descriptor
+                .source_ref
+                .as_ref()
+                .is_some_and(|value| value != &gap.source_ref)
+        {
+            conflict = true;
+        } else if !unowned_quarantine {
+            identity = Some((gap.session_ref.clone(), gap.source_ref.clone()));
+        }
+        dependencies.insert(dependency)?;
+    }
+    if descriptor.kind == ReconciliationArtifactKind::Outage {
+        let row_id = format!(
+            "object:evidence:capture_outage_interval:{}",
+            descriptor.artifact_id
+        );
+        if let Some(row) = snapshot.row(&row_id) {
+            let dependency = current_payload(row)?;
+            let JournalPayload::CaptureOutageIntervalRecorded(outage) = &dependency.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            if descriptor
+                .session_ref
+                .as_ref()
+                .is_some_and(|value| value != &outage.session_ref)
+                || descriptor
+                    .source_ref
+                    .as_ref()
+                    .is_some_and(|value| value != &outage.source_ref)
+            {
+                conflict = true;
+            } else {
+                identity = Some((outage.session_ref.clone(), outage.source_ref.clone()));
+            }
+            dependencies.insert(dependency)?;
+        }
+    }
+    if unowned_quarantine {
+        return Ok(ReconciliationArtifactContext {
+            descriptor,
+            ownership: if conflict {
+                ReconciliationArtifactOwnership::Conflict
+            } else {
+                ReconciliationArtifactOwnership::Unowned
+            },
+            dependencies: dependencies.into_dependencies(),
+        });
+    }
+    let Some((session_ref, source_ref)) = identity else {
+        return Ok(ReconciliationArtifactContext {
+            descriptor,
+            ownership: if conflict {
+                ReconciliationArtifactOwnership::Conflict
+            } else {
+                ReconciliationArtifactOwnership::Unowned
+            },
+            dependencies: dependencies.into_dependencies(),
+        });
+    };
+    collect_artifact_outages(snapshot, &session_ref, &source_ref, &mut dependencies)?;
+    let mut affected_cohort = false;
+    let needles = [
+        json_field_fragment("source_session_ref", &session_ref)?,
+        serde_json::to_string(&source_ref).map_err(|_| StoreError::Serialization)?,
+    ];
+    for row in snapshot.data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("source_receipt")
+            && row
+                .payload_json
+                .as_deref()
+                .is_some_and(|json| needles.iter().all(|needle| json.contains(needle)))
+    }) {
+        let dependency = current_payload(row)?;
+        let JournalPayload::SourceReceiptRecorded(receipt) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if receipt.source_session_ref != session_ref
+            || receipt.source_ref != source_ref
+                && source_revision_ref(&receipt.source_instance_id, &receipt.source_revision)
+                    != source_ref
+        {
+            continue;
+        }
+        let observation_row_id = format!(
+            "object:evidence:source_observation:{}",
+            receipt.source_observation_id
+        );
+        if let Some(observation) = snapshot.row(&observation_row_id) {
+            dependencies.insert(current_payload(observation)?)?;
+        }
+        let (_, has_current_lane_receipt) =
+            collect_capture_dependencies(snapshot, &dependency, &mut dependencies)?;
+        affected_cohort |= has_current_lane_receipt;
+        dependencies.insert(dependency)?;
+    }
+    let ownership = if conflict {
+        ReconciliationArtifactOwnership::Conflict
+    } else if affected_cohort {
+        ReconciliationArtifactOwnership::Owned
+    } else {
+        ReconciliationArtifactOwnership::Unowned
+    };
+    Ok(ReconciliationArtifactContext {
+        descriptor,
+        ownership,
+        dependencies: dependencies.into_dependencies(),
+    })
+}
+
+fn matching_gap_rows<'a>(
+    snapshot: &'a ProjectionSnapshot,
+    descriptor: &ReconciliationArtifactDescriptor,
+) -> Result<Box<dyn Iterator<Item = &'a ObjectRow> + 'a>, StoreError> {
+    if let Some(marker_id) = descriptor.marker_id.as_ref().or_else(|| {
+        (descriptor.kind == ReconciliationArtifactKind::Quarantine)
+            .then_some(&descriptor.artifact_id)
+    }) {
+        let row_id = format!("object:evidence:capture_gap_marker:{marker_id}");
+        return Ok(Box::new(snapshot.row(&row_id).into_iter()));
+    }
+    let Some(fingerprint) = &descriptor.redacted_fingerprint else {
+        return Ok(Box::new(std::iter::empty()));
+    };
+    let needle = json_field_fragment("redacted_fingerprint", fingerprint)?;
+    Ok(Box::new(snapshot.data_rows().filter(move |row| {
+        row.object_kind.as_deref() == Some("capture_gap_marker")
+            && row
+                .payload_json
+                .as_deref()
+                .is_some_and(|json| json.contains(&needle))
+    })))
+}
+
+fn collect_artifact_outages(
+    snapshot: &ProjectionSnapshot,
+    session_ref: &str,
+    source_ref: &str,
+    dependencies: &mut DependencyCollector,
+) -> Result<(), StoreError> {
+    let needles = [
+        json_field_fragment("session_ref", session_ref)?,
+        json_field_fragment("source_ref", source_ref)?,
+    ];
+    for row in snapshot.data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("capture_outage_interval")
+            && row
+                .payload_json
+                .as_deref()
+                .is_some_and(|json| needles.iter().all(|needle| json.contains(needle)))
+    }) {
+        let dependency = current_payload(row)?;
+        let JournalPayload::CaptureOutageIntervalRecorded(outage) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if outage.session_ref == session_ref && outage.source_ref == source_ref {
+            dependencies.insert(dependency)?;
+        }
+    }
+    Ok(())
+}
+
+fn reconciliation_item(
+    snapshot: &ProjectionSnapshot,
+    dirty_row: NamedCurrentDependency,
+    target: DirtyTarget,
+) -> Result<Option<ReconciliationWorkItem>, StoreError> {
+    let observation_row_id = format!("object:evidence:source_observation:{}", target.target_id);
+    let observation = snapshot
+        .row(&observation_row_id)
+        .ok_or(StoreError::StoreCorrupt)
+        .and_then(current_payload)?;
+    let JournalPayload::SourceObservationRecorded(observation_value) = &observation.payload else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    let observation_value = observation_value.clone();
+    let receipt_row_id = format!(
+        "object:evidence:source_receipt:{}",
+        observation_value.source_receipt_ref
+    );
+    let source_receipt = snapshot
+        .row(&receipt_row_id)
+        .ok_or(StoreError::StoreCorrupt)
+        .and_then(current_payload)?;
+    let mut dependencies = DependencyCollector::default();
+    dependencies.insert(observation)?;
+    dependencies.insert(source_receipt.clone())?;
+    let active = match target.target_kind {
+        crate::command::DirtyTargetKind::PhysicalNormalization => {
+            let watermark = format!("runtime:watermark:normalization:{}", target.target_id);
+            if snapshot.row(&watermark).is_some() {
+                false
+            } else {
+                collect_normalization_dependencies(
+                    snapshot,
+                    &observation_value,
+                    &mut dependencies,
+                )?;
+                true
+            }
+        }
+        crate::command::DirtyTargetKind::CaptureReconciliation => {
+            collect_capture_dependencies(snapshot, &source_receipt, &mut dependencies)?.0
+                < dirty_row.source_event_seq
+        }
+        _ => false,
+    };
+    if !active {
+        return Ok(None);
+    }
+    Ok(Some(ReconciliationWorkItem {
+        row_id: dirty_row.row_id,
+        target_kind: target.target_kind,
+        target_id: target.target_id,
+        source_event_seq: dirty_row.source_event_seq,
+        dependencies: dependencies.into_dependencies(),
+    }))
+}
+
+fn current_payload(row: &ObjectRow) -> Result<NamedCurrentDependency, StoreError> {
+    let payload_json = row
+        .payload_json
+        .as_deref()
+        .ok_or(StoreError::StoreCorrupt)?;
+    let payload: JournalPayload =
+        serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+    payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    Ok(NamedCurrentDependency {
+        row_id: row.row_id.clone(),
+        source_event_seq: row.source_event_seq,
+        payload,
+    })
+}
+
+fn collect_normalization_dependencies(
+    snapshot: &ProjectionSnapshot,
+    selected: &SourceObservation,
+    dependencies: &mut DependencyCollector,
+) -> Result<(), StoreError> {
+    let exact_key = selected.correlation.exact_key();
+    let partial_ref = selected
+        .correlation
+        .partial_correlation_ref
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let correlation_needles = if let Some(key) = &exact_key {
+        vec![
+            json_field_fragment("host_instance_id", &key.host_instance_id)?,
+            json_field_fragment("host_trace_lineage_id", &key.host_trace_lineage_id)?,
+            json_field_fragment("host_lane_key", &key.host_lane_key)?,
+            json_field_fragment("native_request_id", &key.native_request_id)?,
+            json_field_fragment(
+                "physical_execution_ordinal",
+                &key.physical_execution_ordinal,
+            )?,
+        ]
+    } else if let Some(reference) = partial_ref {
+        vec![json_field_fragment("partial_correlation_ref", reference)?]
+    } else {
+        Vec::new()
+    };
+    let mut observation_ids = BTreeSet::from([selected.source_observation_id]);
+    for row in snapshot.data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("source_observation")
+            && !correlation_needles.is_empty()
+            && row.payload_json.as_deref().is_some_and(|json| {
+                correlation_needles
+                    .iter()
+                    .all(|needle| json.contains(needle))
+            })
+    }) {
+        let dependency = current_payload(row)?;
+        let JournalPayload::SourceObservationRecorded(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        let matches = exact_key
+            .as_ref()
+            .is_some_and(|key| value.correlation.exact_key().as_ref() == Some(key))
+            || partial_ref.is_some_and(|reference| {
+                value.correlation.partial_correlation_ref.as_deref() == Some(reference)
+            });
+        if matches {
+            observation_ids.insert(value.source_observation_id);
+            dependencies.insert(dependency)?;
+        }
+    }
+    collect_observation_relations(snapshot, &observation_ids, dependencies)
+}
+
+fn collect_observation_relations(
+    snapshot: &ProjectionSnapshot,
+    observation_ids: &BTreeSet<SourceObservationId>,
+    dependencies: &mut DependencyCollector,
+) -> Result<(), StoreError> {
+    let observation_needles = observation_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut occurrence_ids = BTreeSet::new();
+    for row in rows_referencing(snapshot, "host_occurrence", &observation_needles) {
+        let dependency = current_payload(row)?;
+        let JournalPayload::HostOccurrenceNormalized(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if value
+            .source_observation_refs
+            .iter()
+            .any(|id| observation_ids.contains(id))
+        {
+            occurrence_ids.insert(value.host_occurrence_id);
+            dependencies.insert(dependency)?;
+        }
+    }
+    let occurrence_needles = occurrence_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut operation_ids = BTreeSet::new();
+    for row in rows_referencing(snapshot, "operation", &occurrence_needles) {
+        let dependency = current_payload(row)?;
+        let JournalPayload::OperationDerived(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if occurrence_ids.contains(&value.host_occurrence_id) {
+            operation_ids.insert(value.operation_id);
+            dependencies.insert(dependency)?;
+        }
+    }
+    let operation_needles = operation_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    for row in rows_referencing(snapshot, "scope_effect", &operation_needles) {
+        let dependency = current_payload(row)?;
+        let JournalPayload::ScopeEffectDerived(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if operation_ids.contains(&value.operation_id) {
+            dependencies.insert(dependency)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_capture_dependencies(
+    snapshot: &ProjectionSnapshot,
+    selected_receipt: &NamedCurrentDependency,
+    dependencies: &mut DependencyCollector,
+) -> Result<(u64, bool), StoreError> {
+    let JournalPayload::SourceReceiptRecorded(selected) = &selected_receipt.payload else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    let Some(lifecycle) = selected.lifecycle.as_ref() else {
+        return Ok((0, false));
+    };
+    let incarnation_ref = source_incarnation_ref(selected).ok_or(StoreError::StoreCorrupt)?;
+    let mut source_needles = vec![
+        json_field_fragment("host_session_id", &lifecycle.host_session_id)?,
+        json_field_fragment("agent_id", &lifecycle.agent_id)?,
+        json_field_fragment("host_lane_key", &lifecycle.host_lane_key)?,
+    ];
+    if let Some(value) = lifecycle.incarnation_ref.as_deref() {
+        source_needles.push(json_field_fragment("incarnation_ref", value)?);
+    }
+    let source_rows: Box<dyn Iterator<Item = &ObjectRow>> = if lifecycle.incarnation_ref.is_none() {
+        Box::new(std::iter::once(
+            snapshot
+                .row(&selected_receipt.row_id)
+                .ok_or(StoreError::StoreCorrupt)?,
+        ))
+    } else {
+        Box::new(snapshot.data_rows().filter(|row| {
+            row.object_kind.as_deref() == Some("source_receipt")
+                && row
+                    .payload_json
+                    .as_deref()
+                    .is_some_and(|json| source_needles.iter().all(|needle| json.contains(needle)))
+        }))
+    };
+    let mut cohort_observation_ids = BTreeSet::from([selected.source_observation_id]);
+    for row in source_rows {
+        let dependency = current_payload(row)?;
+        let JournalPayload::SourceReceiptRecorded(value) = &dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if value.lifecycle.as_ref().is_some_and(|candidate| {
+            candidate.host_session_id == lifecycle.host_session_id
+                && candidate.agent_id == lifecycle.agent_id
+                && candidate.host_lane_key == lifecycle.host_lane_key
+                && source_incarnation_ref(value).as_ref() == Some(&incarnation_ref)
+        }) {
+            cohort_observation_ids.insert(value.source_observation_id);
+            let observation_row_id = format!(
+                "object:evidence:source_observation:{}",
+                value.source_observation_id
+            );
+            if let Some(observation) = snapshot.row(&observation_row_id) {
+                dependencies.insert(current_payload(observation)?)?;
+            }
+            dependencies.insert(dependency)?;
+        }
+    }
+    collect_observation_relations(snapshot, &cohort_observation_ids, dependencies)?;
+    let mut import_watermark = 0;
+    let mut has_current_lane_receipt = false;
+    let lane_needles = [
+        json_field_fragment("host_session_id", &lifecycle.host_session_id)?,
+        json_field_fragment("agent_id", &lifecycle.agent_id)?,
+        json_field_fragment("host_lane_key", &lifecycle.host_lane_key)?,
+        json_field_fragment("incarnation_ref", &incarnation_ref)?,
+    ];
+    for row in snapshot.data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("execution_lane")
+            && row
+                .payload_json
+                .as_deref()
+                .is_some_and(|json| lane_needles.iter().all(|needle| json.contains(needle)))
+    }) {
+        let lane_dependency = current_payload(row)?;
+        let JournalPayload::ExecutionLaneRecorded(lane) = &lane_dependency.payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if lane.host_session_id != lifecycle.host_session_id
+            || lane.agent_id != lifecycle.agent_id
+            || lane.host_lane_key != lifecycle.host_lane_key
+            || lane.incarnation_ref != incarnation_ref
+        {
+            continue;
+        }
+        let receipt_row_id = format!("object:evidence:capture_receipt:{}", lane.execution_lane_id);
+        if let Some(row) = snapshot.row(&receipt_row_id) {
+            let receipt_dependency = current_payload(row)?;
+            let JournalPayload::CaptureReceiptRecorded(receipt) = &receipt_dependency.payload
+            else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            import_watermark = import_watermark.max(receipt.import_watermark);
+            has_current_lane_receipt = true;
+            collect_receipt_references(snapshot, receipt, dependencies)?;
+            dependencies.insert(receipt_dependency)?;
+        }
+        dependencies.insert(lane_dependency)?;
+    }
+    Ok((import_watermark, has_current_lane_receipt))
+}
+
+fn source_incarnation_ref(receipt: &SourceReceipt) -> Option<String> {
+    let lifecycle = receipt.lifecycle.as_ref()?;
+    Some(lifecycle_incarnation_ref(
+        lifecycle,
+        receipt.source_observation_id,
+    ))
+}
+
+fn lifecycle_incarnation_ref(
+    lifecycle: &evertrace_domain::work::LaneLifecycleEvidence,
+    source_observation_id: SourceObservationId,
+) -> String {
+    lifecycle
+        .incarnation_ref
+        .clone()
+        .unwrap_or_else(|| format!("source-observation:{source_observation_id}"))
+}
+
+fn collect_receipt_references(
+    snapshot: &ProjectionSnapshot,
+    receipt: &CaptureReceipt,
+    dependencies: &mut DependencyCollector,
+) -> Result<(), StoreError> {
+    let rows = receipt
+        .capture_gap_marker_refs
+        .iter()
+        .map(|reference| format!("object:evidence:capture_gap_marker:{reference}"))
+        .chain(
+            receipt
+                .capture_outage_interval_refs
+                .iter()
+                .map(|id| format!("object:evidence:capture_outage_interval:{id}")),
+        )
+        .chain(
+            receipt
+                .source_close_reconciliation_refs
+                .iter()
+                .map(|reference| format!("runtime:reconciliation:{reference}")),
+        );
+    for row_id in rows {
+        let row = snapshot.row(&row_id).ok_or(StoreError::StoreCorrupt)?;
+        dependencies.insert(current_payload(row)?)?;
+    }
+    Ok(())
+}
+
+fn rows_referencing<'a>(
+    snapshot: &'a ProjectionSnapshot,
+    object_kind: &'static str,
+    needles: &'a [String],
+) -> impl Iterator<Item = &'a ObjectRow> {
+    snapshot.data_rows().filter(move |row| {
+        row.object_kind.as_deref() == Some(object_kind)
+            && !needles.is_empty()
+            && row
+                .payload_json
+                .as_deref()
+                .is_some_and(|json| needles.iter().any(|needle| json.contains(needle)))
+    })
+}
+
+fn json_field_fragment<T: serde::Serialize + ?Sized>(
+    key: &str,
+    value: &T,
+) -> Result<String, StoreError> {
+    Ok(format!(
+        "\"{key}\":{}",
+        serde_json::to_string(value).map_err(|_| StoreError::Serialization)?
+    ))
 }
 
 #[derive(Clone, Default)]
@@ -64,26 +850,582 @@ struct ReducerState {
     operations: BTreeMap<OperationId, (Operation, u64)>,
     scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     normalization_watermarks: BTreeMap<SourceObservationId, (NormalizationWatermark, u64)>,
+    execution_lanes: BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    capture_receipts: BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
+    capture_gaps: BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
+    capture_outages: BTreeMap<CaptureOutageIntervalId, (CaptureOutageInterval, u64)>,
+    source_close_reconciliations: BTreeMap<String, (SourceCloseReconciliation, u64)>,
+    repositories: BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    worktree_snapshots: BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktree_transitions: BTreeMap<WorktreeTransitionId, (WorktreeTransition, u64)>,
+    integration_events: BTreeMap<IntegrationEventId, (IntegrationEvent, u64)>,
+    tasks: BTreeMap<TaskId, (Task, u64)>,
+    workstreams: BTreeMap<WorkstreamId, (Workstream, u64)>,
+}
+
+#[derive(Clone, Debug)]
+struct KnownSourceRange {
+    sequences: BTreeSet<u64>,
+    sequence_origin: Option<u64>,
+    close_watermark: Option<u64>,
+    eligible_event_manifest_refs: BTreeSet<String>,
+}
+
+impl KnownSourceRange {
+    fn first_sequence(&self) -> Option<u64> {
+        self.sequence_origin
+            .or_else(|| self.sequences.first().copied())
+    }
+
+    fn last_sequence(&self) -> Option<u64> {
+        self.sequences.last().copied()
+    }
+
+    fn contiguous_through(&self) -> Option<u64> {
+        let first = self.first_sequence()?;
+        let mut expected = first;
+        for sequence in self.sequences.range(first..) {
+            if *sequence != expected {
+                break;
+            }
+            expected = expected.saturating_add(1);
+        }
+        Some(expected.saturating_sub(1))
+    }
+
+    fn covers(&self, first: u64, last: u64) -> bool {
+        if first > last {
+            return false;
+        }
+        let mut expected = first;
+        for sequence in self.sequences.range(first..=last) {
+            if *sequence != expected {
+                return false;
+            }
+            if expected == last {
+                return true;
+            }
+            expected = expected.saturating_add(1);
+        }
+        false
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct JournalAdmissionState {
+    source_ranges: BTreeMap<String, KnownSourceRange>,
+    operation_ids: BTreeSet<OperationId>,
+    execution_lanes: BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    capture_receipts: BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
+    capture_gaps: BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
+    capture_outages: BTreeMap<CaptureOutageIntervalId, (CaptureOutageInterval, u64)>,
+    source_close_reconciliations: BTreeMap<String, (SourceCloseReconciliation, u64)>,
+    repositories: BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    worktree_snapshots: BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktree_transitions: BTreeMap<WorktreeTransitionId, (WorktreeTransition, u64)>,
+    integration_events: BTreeMap<IntegrationEventId, (IntegrationEvent, u64)>,
+    tasks: BTreeMap<TaskId, (Task, u64)>,
+    workstreams: BTreeMap<WorkstreamId, (Workstream, u64)>,
+}
+
+impl JournalAdmissionState {
+    pub(crate) fn from_journal_rows(rows: &[JournalRow]) -> Result<Self, StoreError> {
+        let mut state = Self::default();
+        for batch in ordered_command_batches(rows)? {
+            state = state.apply_row_batch(&batch)?;
+        }
+        Ok(state)
+    }
+
+    pub(crate) fn apply_command(&self, command: &JournalCommand) -> Result<Self, StoreError> {
+        self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
+        crate::repository::validate_repository_payloads(
+            command.events().iter().map(|event| &event.payload),
+        )?;
+        let mut next = self.clone();
+        for event in command.events() {
+            next.apply_payload(event.payload.clone(), 0)
+                .map_err(|_| StoreError::InvalidInput)?;
+        }
+        next.validate_relations()
+            .map_err(|_| StoreError::InvalidInput)?;
+        Ok(next)
+    }
+
+    fn apply_row_batch(&self, rows: &[&JournalRow]) -> Result<Self, StoreError> {
+        let parsed = rows
+            .iter()
+            .map(|row| {
+                let payload = row.payload()?;
+                payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                Ok((payload, row.seq))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        self.validate_transition_pairs(parsed.iter().map(|(payload, _)| payload))
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        crate::repository::validate_repository_payloads(parsed.iter().map(|(payload, _)| payload))
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let mut next = self.clone();
+        for (payload, seq) in parsed {
+            next.apply_payload(payload, seq)?;
+        }
+        next.validate_relations()?;
+        Ok(next)
+    }
+
+    fn validate_transition_pairs<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = &'a JournalPayload>,
+    ) -> Result<(), StoreError> {
+        let mut lanes = BTreeMap::new();
+        let mut receipts = BTreeMap::new();
+        for payload in payloads {
+            match payload {
+                JournalPayload::ExecutionLaneRecorded(value) => {
+                    insert_unique_transition(&mut lanes, value.execution_lane_id, value.as_ref())?;
+                }
+                JournalPayload::CaptureReceiptRecorded(value) => {
+                    insert_unique_transition(
+                        &mut receipts,
+                        value.execution_lane_id,
+                        value.as_ref(),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        if lanes.keys().copied().collect::<BTreeSet<_>>()
+            != receipts.keys().copied().collect::<BTreeSet<_>>()
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        for (lane_id, lane) in lanes {
+            let receipt = receipts
+                .get(&lane_id)
+                .copied()
+                .ok_or(StoreError::InvalidInput)?;
+            if lane.active_capture_receipt_revision_id != receipt.capture_receipt_revision_id
+                || receipt.execution_lane_id != lane_id
+            {
+                return Err(StoreError::InvalidInput);
+            }
+            match (
+                self.execution_lanes.get(&lane_id),
+                self.capture_receipts.get(&lane_id),
+            ) {
+                (None, None) => {
+                    if lane.lane_revision != 1
+                        || lane.predecessor_revision.is_some()
+                        || receipt.predecessor_revision_id.is_some()
+                    {
+                        return Err(StoreError::InvalidInput);
+                    }
+                }
+                (Some((current_lane, _)), Some((current_receipt, _))) => {
+                    if lane.lane_revision != current_lane.lane_revision + 1
+                        || lane.predecessor_revision != Some(current_lane.lane_revision)
+                        || receipt.capture_receipt_revision_id
+                            == current_receipt.capture_receipt_revision_id
+                        || receipt.predecessor_revision_id
+                            != Some(current_receipt.capture_receipt_revision_id)
+                        || lane.host_session_id != current_lane.host_session_id
+                        || lane.agent_id != current_lane.agent_id
+                        || lane.host_lane_key != current_lane.host_lane_key
+                        || current_lane.finalized && !lane.finalized
+                    {
+                        return Err(StoreError::InvalidInput);
+                    }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_payload(&mut self, payload: JournalPayload, seq: u64) -> Result<(), StoreError> {
+        match payload {
+            JournalPayload::SourceReceiptRecorded(value) => {
+                record_known_source(&mut self.source_ranges, &value)?;
+            }
+            JournalPayload::OperationDerived(value) => {
+                self.operation_ids.insert(value.operation_id);
+            }
+            JournalPayload::ExecutionLaneRecorded(value) => {
+                replace_lane(&mut self.execution_lanes, *value, seq)?;
+            }
+            JournalPayload::CaptureReceiptRecorded(value) => {
+                replace_capture_receipt(&mut self.capture_receipts, *value, seq)?;
+            }
+            JournalPayload::CaptureGapMarkerRecorded(value) => {
+                replace_gap(&mut self.capture_gaps, *value, seq)?;
+            }
+            JournalPayload::CaptureOutageIntervalRecorded(value) => {
+                replace_outage(&mut self.capture_outages, *value, seq)?;
+            }
+            JournalPayload::SourceCloseReconciliation(value) => {
+                if self
+                    .source_close_reconciliations
+                    .insert(value.reconciliation_ref.clone(), (value, seq))
+                    .is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            JournalPayload::RepositoryInstanceRecorded(value) => {
+                crate::repository::replace_repository(&mut self.repositories, *value, seq)?;
+            }
+            JournalPayload::WorktreeInstanceRecorded(value) => {
+                crate::repository::replace_worktree(&mut self.worktrees, *value, seq)?;
+            }
+            JournalPayload::WorktreeSnapshotRecorded(value) => {
+                crate::repository::replace_snapshot(&mut self.worktree_snapshots, *value, seq)?;
+            }
+            JournalPayload::WorktreeTransitionRecorded(value) => {
+                crate::repository::replace_transition(&mut self.worktree_transitions, *value, seq)?;
+            }
+            JournalPayload::IntegrationEventRecorded(value) => {
+                crate::repository::replace_integration(&mut self.integration_events, *value, seq)?;
+            }
+            JournalPayload::TaskRecorded(value) => {
+                replace_task(&mut self.tasks, *value, seq)?;
+            }
+            JournalPayload::WorkstreamRecorded(value) => {
+                replace_workstream(&mut self.workstreams, *value, seq)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_relations(&self) -> Result<(), StoreError> {
+        validate_capture_relations(
+            &self.execution_lanes,
+            &self.capture_receipts,
+            &self.capture_gaps,
+            &self.capture_outages,
+            &self.source_close_reconciliations,
+            &self.source_ranges,
+            &self.operation_ids,
+        )?;
+        crate::repository::validate_repository_relations(
+            &self.repositories,
+            &self.worktrees,
+            &self.worktree_snapshots,
+            &self.worktree_transitions,
+            &self.integration_events,
+        )?;
+        validate_work_identity_relations(
+            &self.tasks,
+            &self.workstreams,
+            &self.repositories,
+            &self.worktrees,
+        )
+    }
+}
+
+fn ordered_command_batches(rows: &[JournalRow]) -> Result<Vec<Vec<&JournalRow>>, StoreError> {
+    validate_journal_rows(rows)?;
+    let mut by_command = BTreeMap::new();
+    for row in rows {
+        by_command
+            .entry(row.command_id)
+            .or_insert_with(Vec::new)
+            .push(row);
+    }
+    let mut batches = by_command
+        .into_values()
+        .map(|mut batch| {
+            batch.sort_by_key(|row| row.ordinal);
+            let first_seq = batch
+                .first()
+                .map(|row| row.seq)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if batch
+                .iter()
+                .enumerate()
+                .any(|(ordinal, row)| row.seq != first_seq.saturating_add(ordinal as u64))
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok((first_seq, batch))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    batches.sort_by_key(|(first_seq, _)| *first_seq);
+    Ok(batches.into_iter().map(|(_, batch)| batch).collect())
+}
+
+fn insert_unique_transition<K: Ord, V>(
+    values: &mut BTreeMap<K, V>,
+    key: K,
+    value: V,
+) -> Result<(), StoreError> {
+    if values.insert(key, value).is_some() {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn record_known_source(
+    ranges: &mut BTreeMap<String, KnownSourceRange>,
+    receipt: &SourceReceipt,
+) -> Result<(), StoreError> {
+    let source_ref = source_revision_ref(&receipt.source_instance_id, &receipt.source_revision);
+    let entry = ranges
+        .entry(source_ref)
+        .or_insert_with(|| KnownSourceRange {
+            sequences: BTreeSet::new(),
+            sequence_origin: receipt.source_sequence_origin,
+            close_watermark: receipt.close_watermark,
+            eligible_event_manifest_refs: BTreeSet::new(),
+        });
+    entry.sequences.insert(receipt.source_sequence);
+    if let Some(origin) = receipt.source_sequence_origin {
+        if entry
+            .sequence_origin
+            .is_some_and(|current| current != origin)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        entry.sequence_origin = Some(origin);
+    }
+    entry
+        .eligible_event_manifest_refs
+        .insert(receipt.eligible_event_manifest_ref.clone());
+    if let Some(close) = receipt.close_watermark {
+        if entry.last_sequence().is_some_and(|last| close < last)
+            || entry
+                .close_watermark
+                .is_some_and(|current| current != close)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        entry.close_watermark = Some(close);
+    }
+    if entry
+        .close_watermark
+        .is_some_and(|close| entry.last_sequence().is_some_and(|last| last > close))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
+fn current_source_ranges(
+    receipts: &BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+) -> Result<BTreeMap<String, KnownSourceRange>, StoreError> {
+    let mut ranges = BTreeMap::new();
+    for (receipt, _) in receipts.values() {
+        record_known_source(&mut ranges, receipt)?;
+    }
+    Ok(ranges)
+}
+
+fn validate_capture_relations(
+    lanes: &BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    receipts: &BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
+    gaps: &BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
+    outages: &BTreeMap<CaptureOutageIntervalId, (CaptureOutageInterval, u64)>,
+    reconciliations: &BTreeMap<String, (SourceCloseReconciliation, u64)>,
+    source_ranges: &BTreeMap<String, KnownSourceRange>,
+    operation_ids: &BTreeSet<OperationId>,
+) -> Result<(), StoreError> {
+    if lanes.len() != receipts.len() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let known_close_refs = source_ranges
+        .iter()
+        .filter_map(|(source_ref, range)| {
+            range
+                .close_watermark
+                .map(|close| format!("{source_ref}:{close}"))
+        })
+        .collect::<BTreeSet<_>>();
+    for (lane_id, (lane, _)) in lanes {
+        let receipt = receipts.get(lane_id).ok_or(StoreError::StoreCorrupt)?;
+        if receipt.0.capture_receipt_revision_id != lane.active_capture_receipt_revision_id
+            || receipt.0.execution_lane_id != *lane_id
+            || receipt.0.predecessor_revision_id == Some(receipt.0.capture_receipt_revision_id)
+            || lane
+                .operation_ids
+                .iter()
+                .any(|id| !operation_ids.contains(id))
+            || receipt
+                .0
+                .source_revision_refs
+                .iter()
+                .any(|reference| !source_ranges.contains_key(reference))
+            || receipt
+                .0
+                .source_close_watermark_refs
+                .iter()
+                .any(|reference| !known_close_refs.contains(reference))
+            || receipt
+                .0
+                .capture_gap_marker_refs
+                .iter()
+                .any(|reference| !gaps.contains_key(reference))
+            || receipt
+                .0
+                .capture_outage_interval_refs
+                .iter()
+                .any(|id| !outages.contains_key(id))
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if let Some(parent_id) = lane.parent_lane_id {
+            let parent = lanes.get(&parent_id).ok_or(StoreError::StoreCorrupt)?;
+            if parent.0.host_session_id != lane.host_session_id || parent_id == *lane_id {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        for reference in &receipt.0.source_close_reconciliation_refs {
+            let reconciliation = reconciliations
+                .get(reference)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if reconciliation.0.execution_lane_id != *lane_id {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        if receipt.0.source_coverage == SourceCoverage::Complete
+            && !receipt
+                .0
+                .source_close_reconciliation_refs
+                .iter()
+                .any(|reference| {
+                    reconciliations.get(reference).is_some_and(|(proof, _)| {
+                        proof_matches_complete_refs(
+                            proof,
+                            &receipt.0.source_revision_refs,
+                            &receipt.0.source_close_watermark_refs,
+                            &receipt.0.eligible_event_manifest_refs,
+                        )
+                    })
+                })
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    for reconciliation in reconciliations.values().map(|(value, _)| value) {
+        reconciliation
+            .validate()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        if !lanes.contains_key(&reconciliation.execution_lane_id)
+            || reconciliation
+                .unresolved_gap_refs
+                .iter()
+                .any(|reference| !gaps.contains_key(reference))
+            || reconciliation
+                .unresolved_outage_interval_refs
+                .iter()
+                .any(|id| !outages.contains_key(id))
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        for source in &reconciliation.sources {
+            let known = source_ranges
+                .get(&source.source_revision_ref())
+                .ok_or(StoreError::StoreCorrupt)?;
+            validate_reconciliation_source(source, known)?;
+            if let Some(independent) = &source.independent_reconciliation {
+                let independent_ref = source_revision_ref(
+                    &independent.source_instance_id,
+                    &independent.source_revision,
+                );
+                let known_independent = source_ranges
+                    .get(&independent_ref)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if !known_independent.covers(independent.first_sequence, independent.last_sequence)
+                    || known_independent.close_watermark != Some(independent.last_sequence)
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_reconciliation_source(
+    source: &crate::command::SourceCloseRange,
+    known: &KnownSourceRange,
+) -> Result<(), StoreError> {
+    if known.first_sequence() != Some(source.first_sequence)
+        || known
+            .contiguous_through()
+            .is_none_or(|frontier| frontier < source.observed_through_sequence)
+        || known.close_watermark != Some(source.close_watermark)
+        || known.eligible_event_manifest_refs
+            != source
+                .eligible_event_manifest_refs
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
+fn proof_matches_complete_refs(
+    proof: &SourceCloseReconciliation,
+    source_revision_refs: &[String],
+    source_close_watermark_refs: &[String],
+    eligible_event_manifest_refs: &[String],
+) -> bool {
+    if proof.decision() != SourceCloseDecision::Passed {
+        return false;
+    }
+    let proof_source_refs = proof
+        .source_revision_refs()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let receipt_source_refs = source_revision_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let proof_close_refs = proof
+        .close_watermark_refs()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let receipt_close_refs = source_close_watermark_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let proof_manifest_refs = proof
+        .sources
+        .iter()
+        .flat_map(|source| source.eligible_event_manifest_refs.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let receipt_manifest_refs = eligible_event_manifest_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    proof_source_refs == receipt_source_refs
+        && proof_close_refs == receipt_close_refs
+        && proof_manifest_refs == receipt_manifest_refs
 }
 
 pub fn reduce_journal(rows: &[JournalRow]) -> Result<ProjectionSnapshot, StoreError> {
-    validate_journal_rows(rows)?;
-    let mut ordered = rows.to_vec();
-    ordered.sort_by(|left, right| {
-        left.seq
-            .cmp(&right.seq)
-            .then_with(|| left.event_id.cmp(&right.event_id))
-    });
+    let batches = ordered_command_batches(rows)?;
     let mut state = ReducerState::default();
-    for row in &ordered {
-        apply_event(&mut state, row)?;
+    let mut admission = JournalAdmissionState::default();
+    let mut frontier = 0;
+    for batch in batches {
+        admission = admission.apply_row_batch(&batch)?;
+        for row in batch {
+            apply_event(&mut state, row)?;
+            frontier = frontier.max(row.seq);
+        }
+        state.validate_evidence_relations()?;
     }
-    let frontier = ordered.last().map_or(0, |row| row.seq);
     state.into_snapshot(frontier)
 }
 
 fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreError> {
     let payload = row.payload()?;
+    payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
     match payload {
         JournalPayload::MigrationApplied(value) => {
             state.migrations.insert(
@@ -183,13 +1525,6 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         }
         JournalPayload::SourceIngestWatermark(value) => {
             let key = value.stable_key();
-            if state
-                .source_watermarks
-                .get(&key)
-                .is_some_and(|(current, _)| value.source_sequence < current.source_sequence)
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
             let receipt_exists = state.source_receipts.values().any(|(receipt, _)| {
                 receipt.source_instance_id == value.source_instance_id
                     && receipt.source_revision == value.source_revision
@@ -198,7 +1533,13 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             if !receipt_exists {
                 return Err(StoreError::StoreCorrupt);
             }
-            state.source_watermarks.insert(key, (value, row.seq));
+            if state
+                .source_watermarks
+                .get(&key)
+                .is_none_or(|(current, _)| value.source_sequence >= current.source_sequence)
+            {
+                state.source_watermarks.insert(key, (value, row.seq));
+            }
         }
         JournalPayload::EvidenceSurfaceRecorded(value) => {
             let value = *value;
@@ -247,6 +1588,54 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
                 .normalization_watermarks
                 .insert(value.source_observation_id, (value, row.seq));
         }
+        JournalPayload::ExecutionLaneRecorded(value) => {
+            replace_lane(&mut state.execution_lanes, *value, row.seq)?;
+        }
+        JournalPayload::CaptureReceiptRecorded(value) => {
+            replace_capture_receipt(&mut state.capture_receipts, *value, row.seq)?;
+        }
+        JournalPayload::CaptureGapMarkerRecorded(value) => {
+            replace_gap(&mut state.capture_gaps, *value, row.seq)?;
+        }
+        JournalPayload::CaptureOutageIntervalRecorded(value) => {
+            replace_outage(&mut state.capture_outages, *value, row.seq)?;
+        }
+        JournalPayload::SourceCloseReconciliation(value) => {
+            if state
+                .source_close_reconciliations
+                .contains_key(&value.reconciliation_ref)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            state
+                .source_close_reconciliations
+                .insert(value.reconciliation_ref.clone(), (value, row.seq));
+        }
+        JournalPayload::RepositoryInstanceRecorded(value) => {
+            crate::repository::replace_repository(&mut state.repositories, *value, row.seq)?;
+        }
+        JournalPayload::WorktreeInstanceRecorded(value) => {
+            crate::repository::replace_worktree(&mut state.worktrees, *value, row.seq)?;
+        }
+        JournalPayload::WorktreeSnapshotRecorded(value) => {
+            crate::repository::replace_snapshot(&mut state.worktree_snapshots, *value, row.seq)?;
+        }
+        JournalPayload::WorktreeTransitionRecorded(value) => {
+            crate::repository::replace_transition(
+                &mut state.worktree_transitions,
+                *value,
+                row.seq,
+            )?;
+        }
+        JournalPayload::IntegrationEventRecorded(value) => {
+            crate::repository::replace_integration(&mut state.integration_events, *value, row.seq)?;
+        }
+        JournalPayload::TaskRecorded(value) => {
+            replace_task(&mut state.tasks, *value, row.seq)?;
+        }
+        JournalPayload::WorkstreamRecorded(value) => {
+            replace_workstream(&mut state.workstreams, *value, row.seq)?;
+        }
     }
     Ok(())
 }
@@ -267,6 +1656,166 @@ fn replace_occurrence(
     Ok(())
 }
 
+fn replace_task(
+    values: &mut BTreeMap<TaskId, (Task, u64)>,
+    value: Task,
+    seq: u64,
+) -> Result<(), StoreError> {
+    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    match values.get(&value.task_id) {
+        None => {
+            if value.predecessor_revision_id.is_some() {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Some((current, _)) if current == &value => {}
+        Some((current, _)) => {
+            if value.revision_id == current.revision_id
+                || value.predecessor_revision_id != Some(current.revision_id)
+                || value.created_at_us != current.created_at_us
+                || value.source_watermark <= current.source_watermark
+                || current.lifecycle.is_terminal()
+                || value.continuation_of_task_id != current.continuation_of_task_id
+                || value.split_from_task_id != current.split_from_task_id
+                || value.merged_from_task_ids != current.merged_from_task_ids
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+    }
+    values.insert(value.task_id, (value, seq));
+    Ok(())
+}
+
+fn replace_workstream(
+    values: &mut BTreeMap<WorkstreamId, (Workstream, u64)>,
+    value: Workstream,
+    seq: u64,
+) -> Result<(), StoreError> {
+    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    match values.get(&value.workstream_id) {
+        None => {
+            if value.predecessor_revision_id.is_some() {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Some((current, _)) if current == &value => {}
+        Some((current, _)) => {
+            if value.revision_id == current.revision_id
+                || value.predecessor_revision_id != Some(current.revision_id)
+                || value.task_id != current.task_id
+                || value.repository_instance_id != current.repository_instance_id
+                || value.root_goal != current.root_goal
+                || value.source_watermark <= current.source_watermark
+                || current.status.is_terminal()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+    }
+    values.insert(value.workstream_id, (value, seq));
+    Ok(())
+}
+
+fn validate_work_identity_relations(
+    tasks: &BTreeMap<TaskId, (Task, u64)>,
+    workstreams: &BTreeMap<WorkstreamId, (Workstream, u64)>,
+    repositories: &BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+) -> Result<(), StoreError> {
+    for (task, _) in tasks.values() {
+        for referenced in task
+            .continuation_of_task_id
+            .iter()
+            .chain(task.split_from_task_id.iter())
+            .chain(task.split_into_task_ids.iter())
+            .chain(task.merged_from_task_ids.iter())
+            .chain(task.merged_into_task_id.iter())
+        {
+            if !tasks.contains_key(referenced) {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        for membership in &task.scope_memberships {
+            if let Some(repository_id) = membership.repository_instance_id {
+                if !repositories.contains_key(&repository_id) {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                for worktree_id in &membership.worktree_instance_ids {
+                    let (worktree, _) =
+                        worktrees.get(worktree_id).ok_or(StoreError::StoreCorrupt)?;
+                    if worktree.repository_instance_id != repository_id {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+            }
+        }
+    }
+    for (workstream, _) in workstreams.values() {
+        let (task, _) = tasks
+            .get(&workstream.task_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if let Some(repository_id) = workstream.repository_instance_id {
+            let membership = task
+                .scope_memberships
+                .iter()
+                .find(|membership| membership.repository_instance_id == Some(repository_id))
+                .ok_or(StoreError::StoreCorrupt)?;
+            if workstream
+                .worktree_instance_ids
+                .iter()
+                .any(|id| !membership.worktree_instance_ids.contains(id))
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            for worktree_id in &workstream.worktree_instance_ids {
+                let (worktree, _) = worktrees.get(worktree_id).ok_or(StoreError::StoreCorrupt)?;
+                if worktree.repository_instance_id != repository_id {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+        }
+        for dependency_id in workstream
+            .dependency_workstream_ids
+            .iter()
+            .chain(workstream.parent_workstream_id.iter())
+        {
+            let (dependency, _) = workstreams
+                .get(dependency_id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if dependency.task_id != workstream.task_id {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+    }
+    fn visit(
+        id: WorkstreamId,
+        workstreams: &BTreeMap<WorkstreamId, (Workstream, u64)>,
+        visiting: &mut BTreeSet<WorkstreamId>,
+        visited: &mut BTreeSet<WorkstreamId>,
+    ) -> Result<(), StoreError> {
+        if visited.contains(&id) {
+            return Ok(());
+        }
+        if !visiting.insert(id) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let (workstream, _) = workstreams.get(&id).ok_or(StoreError::StoreCorrupt)?;
+        for dependency in &workstream.dependency_workstream_ids {
+            visit(*dependency, workstreams, visiting, visited)?;
+        }
+        visiting.remove(&id);
+        visited.insert(id);
+        Ok(())
+    }
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for id in workstreams.keys() {
+        visit(*id, workstreams, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
 fn replace_operation(
     values: &mut BTreeMap<OperationId, (Operation, u64)>,
     value: Operation,
@@ -280,6 +1829,72 @@ fn replace_operation(
         return Err(StoreError::StoreCorrupt);
     }
     values.insert(value.operation_id, (value, seq));
+    Ok(())
+}
+
+fn replace_lane(
+    values: &mut BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    value: ExecutionLane,
+    seq: u64,
+) -> Result<(), StoreError> {
+    if let Some((current, _)) = values.get(&value.execution_lane_id)
+        && (value.lane_revision != current.lane_revision + 1
+            || value.predecessor_revision != Some(current.lane_revision))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    values.insert(value.execution_lane_id, (value, seq));
+    Ok(())
+}
+
+fn replace_capture_receipt(
+    values: &mut BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
+    value: CaptureReceipt,
+    seq: u64,
+) -> Result<(), StoreError> {
+    match values.get(&value.execution_lane_id) {
+        None if value.predecessor_revision_id.is_some() => {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Some((current, _))
+            if value.capture_receipt_revision_id == current.capture_receipt_revision_id
+                || value.predecessor_revision_id != Some(current.capture_receipt_revision_id) =>
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        _ => {}
+    }
+    values.insert(value.execution_lane_id, (value, seq));
+    Ok(())
+}
+
+fn replace_gap(
+    values: &mut BTreeMap<String, (CaptureGapMarkerEvidence, u64)>,
+    value: CaptureGapMarkerEvidence,
+    seq: u64,
+) -> Result<(), StoreError> {
+    if let Some((current, _)) = values.get(&value.marker_id)
+        && (value.reconciliation_revision != current.reconciliation_revision + 1
+            || value.predecessor_revision != Some(current.reconciliation_revision))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    values.insert(value.marker_id.clone(), (value, seq));
+    Ok(())
+}
+
+fn replace_outage(
+    values: &mut BTreeMap<CaptureOutageIntervalId, (CaptureOutageInterval, u64)>,
+    value: CaptureOutageInterval,
+    seq: u64,
+) -> Result<(), StoreError> {
+    if let Some((current, _)) = values.get(&value.capture_outage_interval_id)
+        && (value.reconciliation_revision != current.reconciliation_revision + 1
+            || value.predecessor_revision != Some(current.reconciliation_revision))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    values.insert(value.capture_outage_interval_id, (value, seq));
     Ok(())
 }
 
@@ -313,6 +1928,7 @@ impl ReducerState {
                 .ok_or(StoreError::StoreCorrupt)?;
             let payload: JournalPayload =
                 serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
             if payload
                 .canonical_json()
                 .map_err(|_| StoreError::StoreCorrupt)?
@@ -347,6 +1963,48 @@ impl ReducerState {
                             row.source_event_seq,
                         ),
                     )
+                    .is_some()
+            }
+            JournalPayload::TaskRecorded(value) => {
+                let value = *value;
+                require_work_identity_row(
+                    row,
+                    "task",
+                    &value.task_id.to_string(),
+                    &value.revision_id.to_string(),
+                    Some(&value.task_id.to_string()),
+                    None,
+                    None,
+                    None,
+                    value.lifecycle.as_str(),
+                )?;
+                self.tasks
+                    .insert(value.task_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorkstreamRecorded(value) => {
+                let value = *value;
+                require_work_identity_row(
+                    row,
+                    "workstream",
+                    &value.workstream_id.to_string(),
+                    &value.revision_id.to_string(),
+                    Some(&value.task_id.to_string()),
+                    Some(&value.workstream_id.to_string()),
+                    value
+                        .repository_instance_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    value
+                        .active_worktree_instance_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    value.status.as_str(),
+                )?;
+                self.workstreams
+                    .insert(value.workstream_id, (value, row.source_event_seq))
                     .is_some()
             }
             JournalPayload::DirtyTarget(value) => {
@@ -546,6 +2204,145 @@ impl ReducerState {
                     .insert(value.source_observation_id, (value, row.source_event_seq))
                     .is_some()
             }
+            JournalPayload::ExecutionLaneRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Work,
+                    "execution_lane",
+                    &value.execution_lane_id.to_string(),
+                    &format!("{}@{}", value.execution_lane_id, value.lane_revision),
+                )?;
+                self.execution_lanes
+                    .insert(value.execution_lane_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::CaptureReceiptRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Evidence,
+                    "capture_receipt",
+                    &value.execution_lane_id.to_string(),
+                    &value.capture_receipt_revision_id.to_string(),
+                )?;
+                self.capture_receipts
+                    .insert(value.execution_lane_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::CaptureGapMarkerRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Evidence,
+                    "capture_gap_marker",
+                    &value.marker_id,
+                    &format!("{}@{}", value.marker_id, value.reconciliation_revision),
+                )?;
+                self.capture_gaps
+                    .insert(value.marker_id.clone(), (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::CaptureOutageIntervalRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Evidence,
+                    "capture_outage_interval",
+                    &value.capture_outage_interval_id.to_string(),
+                    &format!(
+                        "{}@{}",
+                        value.capture_outage_interval_id, value.reconciliation_revision
+                    ),
+                )?;
+                self.capture_outages
+                    .insert(
+                        value.capture_outage_interval_id,
+                        (value, row.source_event_seq),
+                    )
+                    .is_some()
+            }
+            JournalPayload::SourceCloseReconciliation(value) => {
+                require_row(
+                    row,
+                    ObjectRowClass::Runtime,
+                    &format!("runtime:reconciliation:{}", value.reconciliation_ref),
+                )?;
+                self.source_close_reconciliations
+                    .insert(
+                        value.reconciliation_ref.clone(),
+                        (value, row.source_event_seq),
+                    )
+                    .is_some()
+            }
+            JournalPayload::RepositoryInstanceRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Work,
+                    "repository",
+                    &value.repository_id.to_string(),
+                    &format!("{}@{}", value.repository_id, value.repository_revision),
+                )?;
+                self.repositories
+                    .insert(value.repository_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorktreeInstanceRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Work,
+                    "worktree",
+                    &value.worktree_instance_id.to_string(),
+                    &format!("{}@{}", value.worktree_instance_id, value.worktree_revision),
+                )?;
+                self.worktrees
+                    .insert(value.worktree_instance_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorktreeSnapshotRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Work,
+                    "worktree_snapshot",
+                    &value.worktree_snapshot_id.to_string(),
+                    &value.worktree_snapshot_id.to_string(),
+                )?;
+                self.worktree_snapshots
+                    .insert(value.worktree_snapshot_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorktreeTransitionRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Work,
+                    "worktree_transition",
+                    &value.worktree_transition_id.to_string(),
+                    &format!(
+                        "{}@{}",
+                        value.worktree_transition_id, value.transition_revision
+                    ),
+                )?;
+                self.worktree_transitions
+                    .insert(value.worktree_transition_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::IntegrationEventRecorded(value) => {
+                let value = *value;
+                require_physical_row(
+                    row,
+                    ObjectFamily::Work,
+                    "integration_event",
+                    &value.integration_event_id.to_string(),
+                    &value.integration_event_id.to_string(),
+                )?;
+                self.integration_events
+                    .insert(value.integration_event_id, (value, row.source_event_seq))
+                    .is_some()
+            }
         };
         if duplicate {
             return Err(StoreError::StoreCorrupt);
@@ -716,10 +2513,146 @@ impl ReducerState {
                 seq,
             )?);
         }
+        for (id, (value, seq)) in self.execution_lanes {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "execution_lane",
+                id.to_string(),
+                format!("{}@{}", id, value.lane_revision),
+                &JournalPayload::ExecutionLaneRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (lane_id, (value, seq)) in self.capture_receipts {
+            rows.push(physical_object_row(
+                ObjectFamily::Evidence,
+                "capture_receipt",
+                lane_id.to_string(),
+                value.capture_receipt_revision_id.to_string(),
+                &JournalPayload::CaptureReceiptRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (marker_id, (value, seq)) in self.capture_gaps {
+            rows.push(physical_object_row(
+                ObjectFamily::Evidence,
+                "capture_gap_marker",
+                marker_id.clone(),
+                format!("{}@{}", marker_id, value.reconciliation_revision),
+                &JournalPayload::CaptureGapMarkerRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.capture_outages {
+            rows.push(physical_object_row(
+                ObjectFamily::Evidence,
+                "capture_outage_interval",
+                id.to_string(),
+                format!("{}@{}", id, value.reconciliation_revision),
+                &JournalPayload::CaptureOutageIntervalRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (reference, (value, seq)) in self.source_close_reconciliations {
+            rows.push(runtime_row(
+                format!("runtime:reconciliation:{reference}"),
+                ObjectRowClass::Runtime,
+                &JournalPayload::SourceCloseReconciliation(value),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.repositories {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "repository",
+                id.to_string(),
+                format!("{}@{}", id, value.repository_revision),
+                &JournalPayload::RepositoryInstanceRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.worktrees {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "worktree",
+                id.to_string(),
+                format!("{}@{}", id, value.worktree_revision),
+                &JournalPayload::WorktreeInstanceRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.worktree_snapshots {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "worktree_snapshot",
+                id.to_string(),
+                id.to_string(),
+                &JournalPayload::WorktreeSnapshotRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.worktree_transitions {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "worktree_transition",
+                id.to_string(),
+                format!("{}@{}", id, value.transition_revision),
+                &JournalPayload::WorktreeTransitionRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.integration_events {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "integration_event",
+                id.to_string(),
+                id.to_string(),
+                &JournalPayload::IntegrationEventRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.tasks {
+            rows.push(work_identity_row(
+                "task",
+                id.to_string(),
+                value.revision_id.to_string(),
+                value.lifecycle.as_str(),
+                Some(value.task_id.to_string()),
+                None,
+                None,
+                None,
+                &JournalPayload::TaskRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
+        for (id, (value, seq)) in self.workstreams {
+            rows.push(work_identity_row(
+                "workstream",
+                id.to_string(),
+                value.revision_id.to_string(),
+                value.status.as_str(),
+                Some(value.task_id.to_string()),
+                Some(value.workstream_id.to_string()),
+                value.repository_instance_id.map(|id| id.to_string()),
+                value.active_worktree_instance_id.map(|id| id.to_string()),
+                &JournalPayload::WorkstreamRecorded(Box::new(value)),
+                seq,
+            )?);
+        }
         Ok(rows)
     }
 
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
+        let source_ranges = current_source_ranges(&self.source_receipts)?;
+        validate_capture_relations(
+            &self.execution_lanes,
+            &self.capture_receipts,
+            &self.capture_gaps,
+            &self.capture_outages,
+            &self.source_close_reconciliations,
+            &source_ranges,
+            &self.operations.keys().copied().collect(),
+        )?;
         for (observation, _) in self.source_observations.values() {
             let receipt = self
                 .source_receipts
@@ -790,7 +2723,39 @@ impl ReducerState {
                 return Err(StoreError::StoreCorrupt);
             }
         }
+        crate::repository::validate_repository_relations(
+            &self.repositories,
+            &self.worktrees,
+            &self.worktree_snapshots,
+            &self.worktree_transitions,
+            &self.integration_events,
+        )?;
+        validate_work_identity_relations(
+            &self.tasks,
+            &self.workstreams,
+            &self.repositories,
+            &self.worktrees,
+        )?;
         Ok(())
+    }
+
+    fn admission_state(&self) -> Result<JournalAdmissionState, StoreError> {
+        Ok(JournalAdmissionState {
+            source_ranges: current_source_ranges(&self.source_receipts)?,
+            operation_ids: self.operations.keys().copied().collect(),
+            execution_lanes: self.execution_lanes.clone(),
+            capture_receipts: self.capture_receipts.clone(),
+            capture_gaps: self.capture_gaps.clone(),
+            capture_outages: self.capture_outages.clone(),
+            source_close_reconciliations: self.source_close_reconciliations.clone(),
+            repositories: self.repositories.clone(),
+            worktrees: self.worktrees.clone(),
+            worktree_snapshots: self.worktree_snapshots.clone(),
+            worktree_transitions: self.worktree_transitions.clone(),
+            integration_events: self.integration_events.clone(),
+            tasks: self.tasks.clone(),
+            workstreams: self.workstreams.clone(),
+        })
     }
 }
 
@@ -879,6 +2844,38 @@ fn require_physical_row(
         || row.worktree_id.is_some()
         || row.task_id.is_some()
         || row.workstream_id.is_some()
+        || row.session_id.is_some()
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_work_identity_row(
+    row: &ObjectRow,
+    kind: &str,
+    object_id: &str,
+    revision_id: &str,
+    task_id: Option<&str>,
+    workstream_id: Option<&str>,
+    repository_id: Option<&str>,
+    worktree_id: Option<&str>,
+    lifecycle: &str,
+) -> Result<(), StoreError> {
+    if row.row_id != format!("object:work:{kind}:{object_id}")
+        || row.row_class != Some(ObjectRowClass::Object)
+        || row.object_family != Some(ObjectFamily::Work)
+        || row.object_kind.as_deref() != Some(kind)
+        || row.object_id.as_deref() != Some(object_id)
+        || row.current_revision_id.as_deref() != Some(revision_id)
+        || row.lifecycle.as_deref() != Some(lifecycle)
+        || row.authority.as_deref() != Some("none")
+        || row.task_id.as_deref() != task_id
+        || row.workstream_id.as_deref() != workstream_id
+        || row.repository_id.as_deref() != repository_id
+        || row.worktree_id.as_deref() != worktree_id
+        || row.project_id.is_some()
         || row.session_id.is_some()
     {
         return Err(StoreError::StoreCorrupt);
@@ -1015,6 +3012,44 @@ fn physical_object_row(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn work_identity_row(
+    kind: &str,
+    object_id: String,
+    revision_id: String,
+    lifecycle: &str,
+    task_id: Option<String>,
+    workstream_id: Option<String>,
+    repository_id: Option<String>,
+    worktree_id: Option<String>,
+    payload: &JournalPayload,
+    source_event_seq: u64,
+) -> Result<ObjectRow, StoreError> {
+    Ok(ObjectRow {
+        row_id: format!("object:work:{kind}:{object_id}"),
+        row_kind: ObjectRowKind::Data,
+        row_class: Some(ObjectRowClass::Object),
+        object_family: Some(ObjectFamily::Work),
+        object_kind: Some(kind.into()),
+        object_id: Some(object_id),
+        current_revision_id: Some(revision_id),
+        lifecycle: Some(lifecycle.into()),
+        epistemic: Some("current".into()),
+        authority: Some("none".into()),
+        publication_state: None,
+        support_state: None,
+        project_id: None,
+        repository_id,
+        worktree_id,
+        task_id,
+        workstream_id,
+        session_id: None,
+        payload_json: Some(payload.canonical_json()?),
+        source_event_seq,
+        projection_generation: PROJECTION_GENERATION,
+    })
+}
+
 fn surface_row(
     id: SourceObservationId,
     surface: EvidenceSurface,
@@ -1074,6 +3109,23 @@ impl ProjectionWorker {
         self.catch_up_inner(false).await
     }
 
+    pub async fn reconciliation_frontier(
+        &self,
+        limit: usize,
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        self.catch_up().await?.reconciliation_frontier(limit)
+    }
+
+    pub async fn reconciliation_artifact_context(
+        &self,
+        descriptors: &[ReconciliationArtifactDescriptor],
+        limit: usize,
+    ) -> Result<ReconciliationArtifactFrontier, StoreError> {
+        self.catch_up()
+            .await?
+            .reconciliation_artifact_context(descriptors, limit)
+    }
+
     async fn catch_up_inner(
         &self,
         inject_before_commit_failure: bool,
@@ -1112,8 +3164,13 @@ impl ProjectionWorker {
                 rows: current,
             });
         }
-        for row in &delta {
-            apply_event(&mut state, row)?;
+        let mut admission = state.admission_state()?;
+        for batch in ordered_command_batches(&delta)? {
+            admission = admission.apply_row_batch(&batch)?;
+            for row in batch {
+                apply_event(&mut state, row)?;
+            }
+            state.validate_evidence_relations()?;
         }
         let expected = state.into_snapshot(journal_frontier)?;
         let current_by_id = current
@@ -1197,13 +3254,20 @@ fn validate_delta(
 mod tests {
     use std::str::FromStr;
 
-    use evertrace_domain::ids::{CommandId, JobId};
+    use evertrace_domain::{
+        evidence::{
+            CaptureGapMarkerEvidence, CaptureOutageInterval, CaptureOutagePositiveSource,
+            ReconciliationProvenance, SourceInstanceId, SourceRevision,
+        },
+        ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
+        work::{AdmissionFailureObservability, LaneLifecycleEvidence, LivenessState},
+    };
 
     use super::*;
     use crate::{
         command::{
             DirtyTargetKind, JobLease, JournalCommand, JournalEventDraft, MigrationApplied,
-            PreparedCommand, prepare_command,
+            PreparedCommand, SourceCloseRange, prepare_command,
         },
         journal::rows_for_append,
         objects::read_object_rows,
@@ -1226,6 +3290,395 @@ mod tests {
         let prepared = prepare_command(&command).unwrap();
         rows.extend(rows_for_append(&prepared, first_seq, 0).unwrap());
         prepared
+    }
+
+    fn close_reconciliation() -> SourceCloseReconciliation {
+        SourceCloseReconciliation::new(
+            "close-proof-current",
+            ExecutionLaneId::new_v7(),
+            vec![SourceCloseRange {
+                source_instance_id: SourceInstanceId::parse("source-current").unwrap(),
+                source_revision: SourceRevision::parse("revision-current").unwrap(),
+                eligible_event_manifest_refs: vec!["eligible-current".into()],
+                first_sequence: 1,
+                close_watermark: 1,
+                observed_through_sequence: 1,
+                admission_failure_observability: AdmissionFailureObservability::Complete,
+                independent_reconciliation: None,
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn current_restore_revalidates_typed_payload_and_relation_closure() {
+        let reconciliation = close_reconciliation();
+        let payload = JournalPayload::SourceCloseReconciliation(reconciliation.clone());
+        let row = runtime_row(
+            format!(
+                "runtime:reconciliation:{}",
+                reconciliation.reconciliation_ref
+            ),
+            ObjectRowClass::Runtime,
+            &payload,
+            1,
+        )
+        .unwrap();
+        let orphan_rows = vec![ObjectRow::checkpoint(1, PROJECTION_GENERATION), row.clone()];
+        assert!(matches!(
+            ReducerState::from_current_rows(&orphan_rows, 1),
+            Err(StoreError::StoreCorrupt | StoreError::Projection)
+        ));
+
+        let mut invalid = row;
+        let mut encoded: serde_json::Value =
+            serde_json::from_str(invalid.payload_json.as_deref().unwrap()).unwrap();
+        encoded["value"]["decision"] = serde_json::Value::String("failed".into());
+        invalid.payload_json = Some(serde_json::to_string(&encoded).unwrap());
+        let invalid_rows = vec![ObjectRow::checkpoint(1, PROJECTION_GENERATION), invalid];
+        assert!(matches!(
+            ReducerState::from_current_rows(&invalid_rows, 1),
+            Err(StoreError::StoreCorrupt)
+        ));
+    }
+
+    #[test]
+    fn close_proof_rejects_sequence_holes_and_receipt_cohort_mismatch() {
+        let source = SourceCloseRange {
+            source_instance_id: SourceInstanceId::parse("source-hole").unwrap(),
+            source_revision: SourceRevision::parse("revision-hole").unwrap(),
+            eligible_event_manifest_refs: vec!["eligible-hole".into()],
+            first_sequence: 1,
+            close_watermark: 3,
+            observed_through_sequence: 3,
+            admission_failure_observability: AdmissionFailureObservability::Complete,
+            independent_reconciliation: None,
+        };
+        let known = KnownSourceRange {
+            sequences: [1, 3].into_iter().collect(),
+            sequence_origin: None,
+            close_watermark: Some(3),
+            eligible_event_manifest_refs: ["eligible-hole".into()].into_iter().collect(),
+        };
+        assert_eq!(
+            validate_reconciliation_source(&source, &known),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let proof = SourceCloseReconciliation::new(
+            "close-proof-hole",
+            ExecutionLaneId::new_v7(),
+            vec![source],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(proof_matches_complete_refs(
+            &proof,
+            &["source-hole@revision-hole".into()],
+            &["source-hole@revision-hole:3".into()],
+            &["eligible-hole".into()],
+        ));
+        assert!(!proof_matches_complete_refs(
+            &proof,
+            &["source-other@revision-other".into()],
+            &["source-other@revision-other:3".into()],
+            &["eligible-other".into()],
+        ));
+
+        let head_gap_known = KnownSourceRange {
+            sequences: [2, 3].into_iter().collect(),
+            sequence_origin: Some(1),
+            close_watermark: Some(3),
+            eligible_event_manifest_refs: ["eligible-hole".into()].into_iter().collect(),
+        };
+        let mut head_gap = proof.sources[0].clone();
+        head_gap.observed_through_sequence = 0;
+        assert_eq!(
+            validate_reconciliation_source(&head_gap, &head_gap_known),
+            Ok(())
+        );
+        head_gap.observed_through_sequence = 3;
+        assert_eq!(
+            validate_reconciliation_source(&head_gap, &head_gap_known),
+            Err(StoreError::StoreCorrupt)
+        );
+    }
+
+    #[test]
+    fn empty_reconciliation_frontier_is_bounded_and_validates_limit() {
+        let snapshot = ProjectionSnapshot {
+            frontier: 7,
+            rows: vec![ObjectRow::checkpoint(7, PROJECTION_GENERATION)],
+        };
+        assert_eq!(
+            snapshot.reconciliation_frontier(2).unwrap(),
+            ReconciliationFrontier {
+                frontier: 7,
+                items: Vec::new(),
+            }
+        );
+        assert_eq!(
+            snapshot.reconciliation_frontier(0),
+            Err(StoreError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn missing_incarnation_is_isolated_by_observation_not_child_or_spawn() {
+        let observation_id = SourceObservationId::from_digest([7; 32]);
+        let mut lifecycle = LaneLifecycleEvidence {
+            host_session_id: "session-a".into(),
+            agent_id: "agent-a".into(),
+            incarnation_ref: None,
+            child_session_id: Some("child-a".into()),
+            host_lane_key: "lane-a".into(),
+            parent_host_lane_key: None,
+            spawn_event_ref: Some("spawn-a".into()),
+            terminal_event_ref: None,
+            terminal_kind: None,
+            host_final_return: false,
+            source_close_ref: None,
+            parent_session_end_ref: None,
+            liveness_probe_ref: None,
+            liveness_state: LivenessState::Live,
+            lane_sequence: 1,
+            adapter_manifest_ref: "manifest-a".into(),
+            eligible_event_manifest_ref: "eligible-a".into(),
+            delegated_goal_ref: None,
+            delegated_target_refs: Vec::new(),
+            delegated_acceptance_refs: Vec::new(),
+            reasoning_visibility: Vec::new(),
+        };
+        assert_eq!(
+            lifecycle_incarnation_ref(&lifecycle, observation_id),
+            format!("source-observation:{observation_id}")
+        );
+        lifecycle.incarnation_ref = Some("explicit-a".into());
+        assert_eq!(
+            lifecycle_incarnation_ref(&lifecycle, observation_id),
+            "explicit-a"
+        );
+    }
+
+    #[test]
+    fn unowned_quarantine_still_returns_existing_gap_for_lost_ack() {
+        let gap = CaptureGapMarkerEvidence {
+            marker_id: "quarantine-a".into(),
+            reconciliation_revision: 1,
+            predecessor_revision: None,
+            source_ref: "unresolved-quarantine".into(),
+            session_ref: "unresolved-quarantine".into(),
+            turn_ref: None,
+            tool_ref: None,
+            failure_reason: "corrupt_segment".into(),
+            redacted_fingerprint: "a".repeat(64),
+            attempted_bytes: 0,
+            last_durable_watermark: 0,
+            provenance: ReconciliationProvenance::QuarantineRecovery,
+            import_ref: "quarantine-import-a".into(),
+            reconciled: false,
+            reconciliation_refs: Vec::new(),
+        };
+        let row = physical_object_row(
+            ObjectFamily::Evidence,
+            "capture_gap_marker",
+            gap.marker_id.clone(),
+            format!("{}@1", gap.marker_id),
+            &JournalPayload::CaptureGapMarkerRecorded(Box::new(gap)),
+            5,
+        )
+        .unwrap();
+        let snapshot = ProjectionSnapshot {
+            frontier: 5,
+            rows: vec![ObjectRow::checkpoint(5, PROJECTION_GENERATION), row],
+        };
+        let descriptor = ReconciliationArtifactDescriptor {
+            kind: ReconciliationArtifactKind::Quarantine,
+            artifact_id: "quarantine-a".into(),
+            marker_id: None,
+            redacted_fingerprint: Some("a".repeat(64)),
+            session_ref: None,
+            source_ref: None,
+        };
+        let result = snapshot
+            .reconciliation_artifact_context(std::slice::from_ref(&descriptor), 1)
+            .unwrap();
+        assert_eq!(result.contexts.len(), 1);
+        assert_eq!(result.contexts[0].descriptor, descriptor);
+        assert_eq!(
+            result.contexts[0].ownership,
+            ReconciliationArtifactOwnership::Unowned
+        );
+        assert_eq!(result.contexts[0].dependencies.len(), 1);
+        assert!(matches!(
+            result.contexts[0].dependencies[0].payload,
+            JournalPayload::CaptureGapMarkerRecorded(_)
+        ));
+
+        let generic = ReconciliationArtifactDescriptor {
+            kind: ReconciliationArtifactKind::GapMarker,
+            artifact_id: "artifact-a".into(),
+            marker_id: Some("quarantine-a".into()),
+            redacted_fingerprint: Some("a".repeat(64)),
+            session_ref: Some("unresolved-quarantine".into()),
+            source_ref: Some("unresolved-quarantine".into()),
+        };
+        let generic_result = snapshot
+            .reconciliation_artifact_context(std::slice::from_ref(&generic), 1)
+            .unwrap();
+        assert_eq!(
+            generic_result.contexts[0].ownership,
+            ReconciliationArtifactOwnership::Unowned
+        );
+        assert_eq!(generic_result.contexts[0].dependencies.len(), 1);
+    }
+
+    #[test]
+    fn outage_descriptor_returns_exact_current_outage_context() {
+        let outage_id = CaptureOutageIntervalId::new_v7();
+        let outage = CaptureOutageInterval {
+            capture_outage_interval_id: outage_id,
+            reconciliation_revision: 1,
+            predecessor_revision: None,
+            source_ref: "source-a@revision-a".into(),
+            session_ref: "session-a".into(),
+            first_missing_sequence: 2,
+            last_missing_sequence: 2,
+            positive_source: CaptureOutagePositiveSource::MonotonicSequenceGap,
+            positive_evidence_refs: vec!["sequence-gap-a".into()],
+            reconciled: false,
+            reconciliation_refs: Vec::new(),
+        };
+        let row = physical_object_row(
+            ObjectFamily::Evidence,
+            "capture_outage_interval",
+            outage_id.to_string(),
+            format!("{outage_id}@1"),
+            &JournalPayload::CaptureOutageIntervalRecorded(Box::new(outage)),
+            8,
+        )
+        .unwrap();
+        let snapshot = ProjectionSnapshot {
+            frontier: 8,
+            rows: vec![ObjectRow::checkpoint(8, PROJECTION_GENERATION), row],
+        };
+        let descriptor = ReconciliationArtifactDescriptor {
+            kind: ReconciliationArtifactKind::Outage,
+            artifact_id: outage_id.to_string(),
+            marker_id: None,
+            redacted_fingerprint: None,
+            session_ref: None,
+            source_ref: None,
+        };
+        let result = snapshot
+            .reconciliation_artifact_context(&[descriptor], 1)
+            .unwrap();
+        assert_eq!(
+            result.contexts[0].ownership,
+            ReconciliationArtifactOwnership::Unowned
+        );
+        assert_eq!(result.contexts[0].dependencies.len(), 1);
+        assert!(matches!(
+            result.contexts[0].dependencies[0].payload,
+            JournalPayload::CaptureOutageIntervalRecorded(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn artifact_dependency_closure_fails_closed_at_safety_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let outage_event = |id: CaptureOutageIntervalId, sequence: u64| {
+            JournalEventDraft::runtime(
+                i64::try_from(sequence).unwrap(),
+                [0; 32],
+                "capture-v1",
+                JournalPayload::CaptureOutageIntervalRecorded(Box::new(CaptureOutageInterval {
+                    capture_outage_interval_id: id,
+                    reconciliation_revision: 1,
+                    predecessor_revision: None,
+                    source_ref: "source-bounded@revision-a".into(),
+                    session_ref: "session-bounded".into(),
+                    first_missing_sequence: sequence,
+                    last_missing_sequence: sequence,
+                    positive_source: CaptureOutagePositiveSource::MonotonicSequenceGap,
+                    positive_evidence_refs: vec![format!("sequence-gap-{sequence}")],
+                    reconciled: false,
+                    reconciliation_refs: Vec::new(),
+                })),
+            )
+        };
+
+        let outage_ids = (1..=MAX_S10_RECONCILIATION_DEPENDENCIES)
+            .map(|_| CaptureOutageIntervalId::new_v7())
+            .collect::<Vec<_>>();
+        let events = outage_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, id)| outage_event(id, u64::try_from(index + 1).unwrap()))
+            .collect();
+        writer
+            .commit(
+                &JournalCommand::new(command_id("01890f47-6a4a-7cc1-98b9-01890f476a60"), events)
+                    .unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+        let descriptor = ReconciliationArtifactDescriptor {
+            kind: ReconciliationArtifactKind::Outage,
+            artifact_id: outage_ids[0].to_string(),
+            marker_id: None,
+            redacted_fingerprint: None,
+            session_ref: None,
+            source_ref: None,
+        };
+        let within_ceiling = writer
+            .reconciliation_artifact_context(std::slice::from_ref(&descriptor), 1)
+            .await
+            .unwrap();
+        assert_eq!(within_ceiling.contexts.len(), 1);
+        assert_eq!(
+            within_ceiling.contexts[0].dependencies.len(),
+            MAX_S10_RECONCILIATION_DEPENDENCIES
+        );
+        assert!(
+            within_ceiling.contexts[0]
+                .dependencies
+                .windows(2)
+                .all(|pair| pair[0].row_id < pair[1].row_id)
+        );
+
+        let overflow_id = CaptureOutageIntervalId::new_v7();
+        writer
+            .commit(
+                &JournalCommand::new(
+                    command_id("01890f47-6a4a-7cc1-98b9-01890f476a61"),
+                    vec![outage_event(
+                        overflow_id,
+                        u64::try_from(MAX_S10_RECONCILIATION_DEPENDENCIES + 1).unwrap(),
+                    )],
+                )
+                .unwrap(),
+                2,
+            )
+            .await
+            .unwrap();
+        let projected_before = writer.project().await.unwrap();
+        let journal_before = writer.journal_rows().await.unwrap();
+        assert_eq!(
+            writer
+                .reconciliation_artifact_context(std::slice::from_ref(&descriptor), 1)
+                .await,
+            Err(StoreError::ReconciliationDependencyOverflow)
+        );
+        assert_eq!(writer.journal_rows().await.unwrap(), journal_before);
+        assert_eq!(writer.project().await.unwrap(), projected_before);
     }
 
     #[test]

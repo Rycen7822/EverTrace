@@ -25,6 +25,6 @@ pub use protect::{
 };
 pub use runtime_snapshot::{RUNTIME_SNAPSHOT_VERSION, RuntimeSnapshot, RuntimeSnapshotError};
 pub use spool::{
-    CaptureGapMarker, DurableSpool, GapEvidence, GapReason, RecoveryReport, SealedFrame,
-    SealedSegment, SpoolError, SpoolLimits,
+    CaptureGapMarker, DurableSpool, GapEvidence, GapReason, PendingGapMarker, PendingQuarantine,
+    RecoveryReport, SealedFrame, SealedSegment, SpoolError, SpoolLimits,
 };

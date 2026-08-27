@@ -14,13 +14,14 @@ use evertrace_capture::{
 };
 use evertrace_codex::{
     HookDiagnostic,
-    hook_input::{CAPTURE_HOOK_INPUT_VERSION, CaptureHookInput, HookEventKind},
+    hook_input::{CAPTURE_HOOK_INPUT_VERSION, CaptureHookInput, HookEventKind, HookInputError},
     install::{HookGeneration, StableLauncher, shadow_canary_diagnostic},
 };
 use evertrace_domain::evidence::{
     CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
     HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceRevisionMode, SourceRole,
 };
+use evertrace_domain::work::{LaneLifecycleEvidence, LivenessState};
 use tempfile::TempDir;
 
 fn limits() -> SpoolLimits {
@@ -91,6 +92,7 @@ fn input(id: &str, payload: &str) -> CaptureRecordInput {
         turn_ref: Some("turn-a".into()),
         tool_ref: Some("tool-a".into()),
         source_sequence: 1,
+        source_sequence_origin: None,
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,
@@ -101,6 +103,7 @@ fn input(id: &str, payload: &str) -> CaptureRecordInput {
         observation_role: ObservationRole::Result,
         correlation: unavailable_correlation(),
         scope_effect_claims: Vec::new(),
+        lifecycle: None,
         unsupported_record_classification: None,
         source_role: SourceRole::Tool,
         content_trust: ContentTrust::Observed,
@@ -186,6 +189,11 @@ fn open_tail_repairs_only_incomplete_frame_and_corruption_becomes_gap_evidence()
         .unwrap();
     let mut runtime = CaptureRuntime::open(snapshot(temp.path(), limits())).unwrap();
     assert_eq!(runtime.state(), CaptureAdmissionState::Recovering);
+    let appended = runtime
+        .capture(input("recovery-append", "durable while recovering"))
+        .unwrap();
+    assert!(matches!(appended, CaptureOutcome::Durable { .. }));
+    assert_eq!(runtime.state(), CaptureAdmissionState::Recovering);
     assert!(runtime.complete_recovery().is_err());
     fs::remove_file(quarantined).unwrap();
     runtime.complete_recovery().unwrap();
@@ -260,7 +268,31 @@ fn hook_path_is_daemon_independent_secret_safe_and_shadow_only() {
         event_kind: HookEventKind::PostToolUse,
         correlation: unavailable_correlation(),
         scope_effect_claims: Vec::new(),
+        lifecycle: Some(LaneLifecycleEvidence {
+            host_session_id: "session-a".into(),
+            agent_id: "agent-a".into(),
+            incarnation_ref: Some("incarnation-a".into()),
+            child_session_id: Some("child-session-a".into()),
+            host_lane_key: "lane-a".into(),
+            parent_host_lane_key: None,
+            spawn_event_ref: Some("spawn-a".into()),
+            terminal_event_ref: None,
+            terminal_kind: None,
+            host_final_return: false,
+            source_close_ref: None,
+            parent_session_end_ref: None,
+            liveness_probe_ref: None,
+            liveness_state: LivenessState::Live,
+            lane_sequence: 9,
+            adapter_manifest_ref: "adapter-manifest-a".into(),
+            eligible_event_manifest_ref: "eligible-events-a".into(),
+            delegated_goal_ref: None,
+            delegated_target_refs: Vec::new(),
+            delegated_acceptance_refs: Vec::new(),
+            reasoning_visibility: Vec::new(),
+        }),
         source_sequence: 1,
+        source_sequence_origin: None,
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,
@@ -268,7 +300,28 @@ fn hook_path_is_daemon_independent_secret_safe_and_shadow_only() {
         payload: secret.into(),
     };
     assert!(!format!("{hook_input:?}").contains(secret));
+    let mut missing_incarnation = hook_input.clone();
+    missing_incarnation
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .incarnation_ref = None;
+    assert_eq!(
+        CaptureHookInput::from_json(&serde_json::to_vec(&missing_incarnation).unwrap()),
+        Err(HookInputError::Invalid)
+    );
     let parsed = CaptureHookInput::from_json(&hook_input.to_json().unwrap()).unwrap();
+    assert_eq!(parsed.source_sequence, 1);
+    assert_eq!(parsed.lifecycle.as_ref().unwrap().lane_sequence, 9);
+    assert_eq!(
+        parsed
+            .lifecycle
+            .as_ref()
+            .unwrap()
+            .child_session_id
+            .as_deref(),
+        Some("child-session-a")
+    );
     let outcome = runtime
         .capture(CaptureRecordInput {
             spool_record_id: parsed.spool_record_id,
@@ -284,6 +337,7 @@ fn hook_path_is_daemon_independent_secret_safe_and_shadow_only() {
             turn_ref: parsed.turn_id,
             tool_ref: parsed.tool_use_id,
             source_sequence: parsed.source_sequence,
+            source_sequence_origin: parsed.source_sequence_origin,
             task_id: parsed.task_id,
             repository_instance_id: parsed.repository_instance_id,
             worktree_instance_id: parsed.worktree_instance_id,
@@ -294,6 +348,7 @@ fn hook_path_is_daemon_independent_secret_safe_and_shadow_only() {
             observation_role: ObservationRole::Result,
             correlation: parsed.correlation,
             scope_effect_claims: parsed.scope_effect_claims,
+            lifecycle: parsed.lifecycle,
             unsupported_record_classification: None,
             source_role: SourceRole::Tool,
             content_trust: ContentTrust::Observed,
@@ -575,7 +630,9 @@ fn hook_input_is_closed_bounded_and_carries_explicit_identity() {
         event_kind: HookEventKind::PostToolUse,
         correlation: unavailable_correlation(),
         scope_effect_claims: Vec::new(),
+        lifecycle: None,
         source_sequence: 9,
+        source_sequence_origin: Some(7),
         task_id: None,
         repository_instance_id: None,
         worktree_instance_id: None,
@@ -584,6 +641,9 @@ fn hook_input_is_closed_bounded_and_carries_explicit_identity() {
     };
     let bytes = input.to_json().unwrap();
     assert_eq!(CaptureHookInput::from_json(&bytes).unwrap(), input);
+    let mut impossible_origin = input.clone();
+    impossible_origin.source_sequence_origin = Some(10);
+    assert_eq!(impossible_origin.validate(), Err(HookInputError::Invalid));
     let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     json["unknown"] = true.into();
     assert!(CaptureHookInput::from_json(&serde_json::to_vec(&json).unwrap()).is_err());

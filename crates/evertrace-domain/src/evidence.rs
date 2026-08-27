@@ -4,9 +4,9 @@ use thiserror::Error;
 use crate::{
     canonical::{CanonicalValue, sha256},
     ids::{
-        DuplicateGroupId, ExecutionLaneId, ExperimentRunId, HostOccurrenceId, OperationId,
-        RepositoryId, ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId,
-        WorktreeId, WorktreeSnapshotId,
+        CaptureOutageIntervalId, DuplicateGroupId, ExecutionLaneId, ExperimentRunId,
+        HostOccurrenceId, OperationId, RepositoryId, ScopeEffectId, SourceObservationId,
+        SourceReceiptId, TaskId, WorkArtifactId, WorktreeId, WorktreeSnapshotId,
     },
 };
 
@@ -375,6 +375,8 @@ pub struct SourceReceipt {
     pub source_record_identity: SourceRecordIdentity,
     pub identity_strength: IdentityStrength,
     pub source_sequence: u64,
+    #[serde(default)]
+    pub source_sequence_origin: Option<u64>,
     pub task_id: Option<TaskId>,
     pub repository_instance_id: Option<RepositoryId>,
     pub worktree_instance_id: Option<WorktreeId>,
@@ -402,6 +404,7 @@ pub struct SourceReceipt {
     pub protection_key_generation: u64,
     pub event_time_us: i64,
     pub recorded_at_us: i64,
+    pub lifecycle: Option<crate::work::LaneLifecycleEvidence>,
 }
 
 impl SourceReceipt {
@@ -435,6 +438,12 @@ impl SourceReceipt {
             || self.event_time_us < 0
             || self.recorded_at_us < 0
             || self.event_time_us > self.recorded_at_us
+            || self
+                .source_sequence_origin
+                .is_some_and(|origin| origin > self.source_sequence)
+            || self
+                .close_watermark
+                .is_some_and(|close| close < self.source_sequence)
         {
             return Err(EvidenceError::Invalid);
         }
@@ -464,7 +473,17 @@ impl SourceReceipt {
             self.original_length,
             self.protected_secret_digest.as_deref(),
             &self.redaction_spans,
-        )
+        )?;
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.validate().map_err(|_| EvidenceError::Invalid)?;
+            if lifecycle.adapter_manifest_ref != self.adapter_manifest_ref
+                || lifecycle.eligible_event_manifest_ref != self.eligible_event_manifest_ref
+                || lifecycle.host_session_id != self.source_session_ref
+            {
+                return Err(EvidenceError::Invalid);
+            }
+        }
+        Ok(())
     }
 
     pub const fn capture_completeness(&self) -> CaptureCompleteness {
@@ -838,6 +857,130 @@ pub struct ScopeEffect {
     pub experiment_run_ids: Vec<ExperimentRunId>,
     pub artifact_refs: Vec<WorkArtifactId>,
     pub evidence_refs: Vec<SourceObservationId>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationProvenance {
+    EmergencyMarker,
+    QuarantineRecovery,
+    AdmissionLedger,
+    SequenceReconciliation,
+    IndependentSource,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureGapMarkerEvidence {
+    pub marker_id: String,
+    pub reconciliation_revision: u32,
+    pub predecessor_revision: Option<u32>,
+    pub source_ref: String,
+    pub session_ref: String,
+    pub turn_ref: Option<String>,
+    pub tool_ref: Option<String>,
+    pub failure_reason: String,
+    pub redacted_fingerprint: String,
+    pub attempted_bytes: u64,
+    pub last_durable_watermark: u64,
+    pub provenance: ReconciliationProvenance,
+    pub import_ref: String,
+    pub reconciled: bool,
+    pub reconciliation_refs: Vec<String>,
+}
+
+impl CaptureGapMarkerEvidence {
+    pub fn validate(&self) -> Result<(), EvidenceError> {
+        if self.reconciliation_revision == 0
+            || self.predecessor_revision
+                != self
+                    .reconciliation_revision
+                    .checked_sub(1)
+                    .filter(|_| self.reconciliation_revision > 1)
+            || self.attempted_bytes == 0
+                && self.provenance != ReconciliationProvenance::QuarantineRecovery
+            || self.redacted_fingerprint.len() != 64
+            || !self
+                .redacted_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.reconciled != !self.reconciliation_refs.is_empty()
+        {
+            return Err(EvidenceError::Invalid);
+        }
+        for value in [
+            self.marker_id.as_str(),
+            self.source_ref.as_str(),
+            self.session_ref.as_str(),
+            self.failure_reason.as_str(),
+            self.import_ref.as_str(),
+        ] {
+            validate_identifier(value)?;
+        }
+        for value in self
+            .turn_ref
+            .iter()
+            .chain(&self.tool_ref)
+            .chain(&self.reconciliation_refs)
+        {
+            validate_identifier(value)?;
+        }
+        require_unique(&self.reconciliation_refs)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureOutagePositiveSource {
+    HostFailureLedger,
+    DaemonAdmission,
+    MonotonicSequenceGap,
+    IndependentSourceMismatch,
+    VerifiedGapMarker,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureOutageInterval {
+    pub capture_outage_interval_id: CaptureOutageIntervalId,
+    pub reconciliation_revision: u32,
+    pub predecessor_revision: Option<u32>,
+    pub source_ref: String,
+    pub session_ref: String,
+    pub first_missing_sequence: u64,
+    pub last_missing_sequence: u64,
+    pub positive_source: CaptureOutagePositiveSource,
+    pub positive_evidence_refs: Vec<String>,
+    pub reconciled: bool,
+    pub reconciliation_refs: Vec<String>,
+}
+
+impl CaptureOutageInterval {
+    pub fn validate(&self) -> Result<(), EvidenceError> {
+        if self.reconciliation_revision == 0
+            || self.predecessor_revision
+                != self
+                    .reconciliation_revision
+                    .checked_sub(1)
+                    .filter(|_| self.reconciliation_revision > 1)
+            || self.first_missing_sequence > self.last_missing_sequence
+            || self.positive_evidence_refs.is_empty()
+            || self.reconciled != !self.reconciliation_refs.is_empty()
+        {
+            return Err(EvidenceError::Invalid);
+        }
+        validate_identifier(&self.source_ref)?;
+        validate_identifier(&self.session_ref)?;
+        for value in self
+            .positive_evidence_refs
+            .iter()
+            .chain(&self.reconciliation_refs)
+        {
+            validate_identifier(value)?;
+        }
+        require_unique(&self.positive_evidence_refs)?;
+        require_unique(&self.reconciliation_refs)
+    }
 }
 
 impl ScopeEffect {

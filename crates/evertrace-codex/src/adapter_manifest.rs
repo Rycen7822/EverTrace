@@ -103,6 +103,23 @@ pub enum ObservableCapability {
     RawHiddenReasoning,
 }
 
+impl ObservableCapability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegationStart => "delegation_start",
+            Self::ChildSessionId => "child_session_id",
+            Self::ChildToolCall => "child_tool_call",
+            Self::ChildToolResult => "child_tool_result",
+            Self::ChildFileChange => "child_file_change",
+            Self::ChildPlan => "child_plan",
+            Self::ChildReasoningSummary => "child_reasoning_summary",
+            Self::ChildFinalResult => "child_final_result",
+            Self::DelegationEnd => "delegation_end",
+            Self::RawHiddenReasoning => "raw_hidden_reasoning",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterCapabilityManifest {
@@ -225,6 +242,11 @@ impl AdapterCapabilityManifest {
     pub(crate) fn bind_content_revision(&mut self) -> Result<(), ManifestError> {
         self.adapter_manifest_id = self.content_revision()?;
         Ok(())
+    }
+
+    pub fn finalize_content_revision(&mut self) -> Result<(), ManifestError> {
+        self.bind_content_revision()?;
+        self.validate()
     }
 
     pub fn from_json(input: &str) -> Result<Self, ManifestError> {

@@ -3,10 +3,16 @@ use std::fmt;
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{
-        EvidenceSurface, HostOccurrence, Operation, ScopeEffect, SourceInstanceId,
-        SourceObservation, SourceReceipt, SourceRevision, SourceRevisionMode,
+        CaptureGapMarkerEvidence, CaptureOutageInterval, EvidenceSurface, HostOccurrence,
+        Operation, ScopeEffect, SourceInstanceId, SourceObservation, SourceReceipt, SourceRevision,
+        SourceRevisionMode,
     },
-    ids::{CommandId, JobId, SourceObservationId},
+    ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
+    repository::{
+        IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
+        WorktreeTransition,
+    },
+    work::{AdmissionFailureObservability, CaptureReceipt, ExecutionLane, Task, Workstream},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -116,6 +122,8 @@ pub enum DirtyTargetKind {
     ObjectsProjection,
     EvidenceSurface,
     PhysicalNormalization,
+    CaptureReconciliation,
+    CaptureLiveness,
     RuntimeJob,
     RuntimeOutbox,
 }
@@ -126,6 +134,8 @@ impl DirtyTargetKind {
             Self::ObjectsProjection => "objects_projection",
             Self::EvidenceSurface => "evidence_surface",
             Self::PhysicalNormalization => "physical_normalization",
+            Self::CaptureReconciliation => "capture_reconciliation",
+            Self::CaptureLiveness => "capture_liveness",
             Self::RuntimeJob => "runtime_job",
             Self::RuntimeOutbox => "runtime_outbox",
         }
@@ -286,6 +296,173 @@ pub struct NormalizationWatermark {
     pub resolver_version: u32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCloseDecision {
+    Passed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentSourceReconciliation {
+    pub source_instance_id: SourceInstanceId,
+    pub source_revision: SourceRevision,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub evidence_refs: Vec<String>,
+}
+
+impl IndependentSourceReconciliation {
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.first_sequence > self.last_sequence || self.evidence_refs.is_empty() {
+            return Err(StoreError::InvalidInput);
+        }
+        for reference in &self.evidence_refs {
+            validate_identifier(reference)?;
+        }
+        require_unique_strings(&self.evidence_refs)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceCloseRange {
+    pub source_instance_id: SourceInstanceId,
+    pub source_revision: SourceRevision,
+    pub eligible_event_manifest_refs: Vec<String>,
+    pub first_sequence: u64,
+    pub close_watermark: u64,
+    pub observed_through_sequence: u64,
+    pub admission_failure_observability: AdmissionFailureObservability,
+    pub independent_reconciliation: Option<IndependentSourceReconciliation>,
+}
+
+impl SourceCloseRange {
+    pub fn source_revision_ref(&self) -> String {
+        source_revision_ref(&self.source_instance_id, &self.source_revision)
+    }
+
+    pub fn close_watermark_ref(&self) -> String {
+        format!("{}:{}", self.source_revision_ref(), self.close_watermark)
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.eligible_event_manifest_refs.is_empty()
+            || self.first_sequence > self.close_watermark
+            || self.observed_through_sequence > self.close_watermark
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        for reference in &self.eligible_event_manifest_refs {
+            validate_identifier(reference)?;
+        }
+        require_unique_strings(&self.eligible_event_manifest_refs)?;
+        if let Some(independent) = &self.independent_reconciliation {
+            independent.validate()?;
+            if independent.source_instance_id == self.source_instance_id
+                && independent.source_revision == self.source_revision
+            {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.observed_through_sequence == self.close_watermark
+            && matches!(
+                self.admission_failure_observability,
+                AdmissionFailureObservability::Complete
+                    | AdmissionFailureObservability::Reconcilable
+            )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceCloseReconciliation {
+    pub reconciliation_ref: String,
+    pub execution_lane_id: ExecutionLaneId,
+    pub sources: Vec<SourceCloseRange>,
+    pub unresolved_gap_refs: Vec<String>,
+    pub unresolved_outage_interval_refs: Vec<CaptureOutageIntervalId>,
+    decision: SourceCloseDecision,
+}
+
+impl SourceCloseReconciliation {
+    pub fn new(
+        reconciliation_ref: impl Into<String>,
+        execution_lane_id: ExecutionLaneId,
+        sources: Vec<SourceCloseRange>,
+        unresolved_gap_refs: Vec<String>,
+        unresolved_outage_interval_refs: Vec<CaptureOutageIntervalId>,
+    ) -> Result<Self, StoreError> {
+        let mut value = Self {
+            reconciliation_ref: reconciliation_ref.into(),
+            execution_lane_id,
+            sources,
+            unresolved_gap_refs,
+            unresolved_outage_interval_refs,
+            decision: SourceCloseDecision::Failed,
+        };
+        value.decision = value.derived_decision();
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub const fn decision(&self) -> SourceCloseDecision {
+        self.decision
+    }
+
+    pub const fn passed(&self) -> bool {
+        matches!(self.decision, SourceCloseDecision::Passed)
+    }
+
+    pub fn source_revision_refs(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(SourceCloseRange::source_revision_ref)
+            .collect()
+    }
+
+    pub fn close_watermark_refs(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(SourceCloseRange::close_watermark_ref)
+            .collect()
+    }
+
+    fn derived_decision(&self) -> SourceCloseDecision {
+        if !self.sources.is_empty()
+            && self.sources.iter().all(SourceCloseRange::is_complete)
+            && self.unresolved_gap_refs.is_empty()
+            && self.unresolved_outage_interval_refs.is_empty()
+        {
+            SourceCloseDecision::Passed
+        } else {
+            SourceCloseDecision::Failed
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_identifier(&self.reconciliation_ref)?;
+        if self.sources.is_empty() || self.decision != self.derived_decision() {
+            return Err(StoreError::InvalidInput);
+        }
+        for source in &self.sources {
+            source.validate()?;
+        }
+        let source_refs = self.source_revision_refs();
+        require_unique_strings(&source_refs)?;
+        for reference in &self.unresolved_gap_refs {
+            validate_identifier(reference)?;
+        }
+        require_unique_strings(&self.unresolved_gap_refs)?;
+        require_unique_values(&self.unresolved_outage_interval_refs)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -311,6 +488,18 @@ pub enum JournalPayload {
     OperationDerived(Box<Operation>),
     ScopeEffectDerived(Box<ScopeEffect>),
     NormalizationWatermark(NormalizationWatermark),
+    ExecutionLaneRecorded(Box<ExecutionLane>),
+    CaptureReceiptRecorded(Box<CaptureReceipt>),
+    CaptureGapMarkerRecorded(Box<CaptureGapMarkerEvidence>),
+    CaptureOutageIntervalRecorded(Box<CaptureOutageInterval>),
+    SourceCloseReconciliation(SourceCloseReconciliation),
+    RepositoryInstanceRecorded(Box<RepositoryInstance>),
+    WorktreeInstanceRecorded(Box<WorktreeInstance>),
+    WorktreeSnapshotRecorded(Box<WorktreeSnapshot>),
+    WorktreeTransitionRecorded(Box<WorktreeTransition>),
+    IntegrationEventRecorded(Box<IntegrationEvent>),
+    TaskRecorded(Box<Task>),
+    WorkstreamRecorded(Box<Workstream>),
 }
 
 impl JournalPayload {
@@ -333,6 +522,18 @@ impl JournalPayload {
             Self::OperationDerived(_) => "operation_derived_v1",
             Self::ScopeEffectDerived(_) => "scope_effect_derived_v1",
             Self::NormalizationWatermark(_) => "normalization_watermark_v1",
+            Self::ExecutionLaneRecorded(_) => "execution_lane_recorded_v1",
+            Self::CaptureReceiptRecorded(_) => "capture_receipt_recorded_v1",
+            Self::CaptureGapMarkerRecorded(_) => "capture_gap_marker_recorded_v1",
+            Self::CaptureOutageIntervalRecorded(_) => "capture_outage_interval_recorded_v1",
+            Self::SourceCloseReconciliation(_) => "source_close_reconciliation_v1",
+            Self::RepositoryInstanceRecorded(_) => "repository_instance_recorded_v1",
+            Self::WorktreeInstanceRecorded(_) => "worktree_instance_recorded_v1",
+            Self::WorktreeSnapshotRecorded(_) => "worktree_snapshot_recorded_v1",
+            Self::WorktreeTransitionRecorded(_) => "worktree_transition_recorded_v1",
+            Self::IntegrationEventRecorded(_) => "integration_event_recorded_v1",
+            Self::TaskRecorded(_) => "task_recorded_v1",
+            Self::WorkstreamRecorded(_) => "workstream_recorded_v1",
         }
     }
 
@@ -347,6 +548,16 @@ impl JournalPayload {
             | Self::HostOccurrenceNormalized(_)
             | Self::OperationDerived(_)
             | Self::ScopeEffectDerived(_) => RecordClass::ObjectEvent,
+            Self::ExecutionLaneRecorded(_)
+            | Self::CaptureReceiptRecorded(_)
+            | Self::CaptureGapMarkerRecorded(_)
+            | Self::CaptureOutageIntervalRecorded(_)
+            | Self::RepositoryInstanceRecorded(_)
+            | Self::WorktreeInstanceRecorded(_)
+            | Self::WorktreeSnapshotRecorded(_)
+            | Self::WorktreeTransitionRecorded(_)
+            | Self::IntegrationEventRecorded(_) => RecordClass::ObjectEvent,
+            Self::TaskRecorded(_) | Self::WorkstreamRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -423,6 +634,38 @@ impl JournalPayload {
                     return Err(StoreError::InvalidInput);
                 }
                 Ok(())
+            }
+            Self::ExecutionLaneRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::CaptureReceiptRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::CaptureGapMarkerRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::CaptureOutageIntervalRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::SourceCloseReconciliation(value) => value.validate(),
+            Self::RepositoryInstanceRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::WorktreeInstanceRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::WorktreeSnapshotRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::WorktreeTransitionRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::IntegrationEventRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::TaskRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
+            Self::WorkstreamRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
             }
         }
     }
@@ -522,6 +765,34 @@ impl JournalPayload {
             Self::OperationDerived(value) => tagged_json("operation_derived", value),
             Self::ScopeEffectDerived(value) => tagged_json("scope_effect_derived", value),
             Self::NormalizationWatermark(value) => tagged_json("normalization_watermark", value),
+            Self::ExecutionLaneRecorded(value) => tagged_json("execution_lane_recorded", value),
+            Self::CaptureReceiptRecorded(value) => tagged_json("capture_receipt_recorded", value),
+            Self::CaptureGapMarkerRecorded(value) => {
+                tagged_json("capture_gap_marker_recorded", value)
+            }
+            Self::CaptureOutageIntervalRecorded(value) => {
+                tagged_json("capture_outage_interval_recorded", value)
+            }
+            Self::SourceCloseReconciliation(value) => {
+                tagged_json("source_close_reconciliation", value)
+            }
+            Self::RepositoryInstanceRecorded(value) => {
+                tagged_json("repository_instance_recorded", value)
+            }
+            Self::WorktreeInstanceRecorded(value) => {
+                tagged_json("worktree_instance_recorded", value)
+            }
+            Self::WorktreeSnapshotRecorded(value) => {
+                tagged_json("worktree_snapshot_recorded", value)
+            }
+            Self::WorktreeTransitionRecorded(value) => {
+                tagged_json("worktree_transition_recorded", value)
+            }
+            Self::IntegrationEventRecorded(value) => {
+                tagged_json("integration_event_recorded", value)
+            }
+            Self::TaskRecorded(value) => tagged_json("task_recorded", value),
+            Self::WorkstreamRecorded(value) => tagged_json("workstream_recorded", value),
         }
     }
 
@@ -683,6 +954,8 @@ pub(crate) fn prepare_command(command: &JournalCommand) -> Result<PreparedComman
     }
     validate_evidence_command(&command.events)?;
     validate_normalization_command(&command.events)?;
+    crate::repository::validate_repository_command(&command.events)?;
+    validate_work_identity_command(&command.events)?;
     let command_value = CanonicalValue::Map(vec![
         ("command_id".into(), text(&command.command_id.to_string())),
         (
@@ -751,6 +1024,10 @@ pub enum StoreError {
     WriterAlreadyRunning,
     #[error("journal command conflicts with an existing command")]
     IdempotencyConflict,
+    #[error("journal frontier changed before command append")]
+    StaleFrontier,
+    #[error("S10 reconciliation dependency closure exceeds its safety ceiling")]
+    ReconciliationDependencyOverflow,
     #[error("store data is corrupt")]
     StoreCorrupt,
     #[error("store migration failed")]
@@ -810,6 +1087,96 @@ fn validate_identifier(value: &str) -> Result<(), StoreError> {
 
 fn validate_optional_identifier(value: Option<&str>) -> Result<(), StoreError> {
     value.map_or(Ok(()), validate_identifier)
+}
+
+pub fn source_revision_ref(
+    source_instance_id: &SourceInstanceId,
+    source_revision: &SourceRevision,
+) -> String {
+    format!(
+        "{}@{}",
+        source_instance_id.as_str(),
+        source_revision.as_str()
+    )
+}
+
+fn require_unique_strings(values: &[String]) -> Result<(), StoreError> {
+    if values
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != values.len()
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn require_unique_values<T: Ord>(values: &[T]) -> Result<(), StoreError> {
+    if values
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != values.len()
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_work_identity_command(events: &[JournalEventDraft]) -> Result<(), StoreError> {
+    let tasks = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            JournalPayload::TaskRecorded(value) => Some(value.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut by_id = std::collections::BTreeMap::new();
+    for task in &tasks {
+        if by_id.insert(task.task_id, *task).is_some() {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for task in &tasks {
+        if !task.split_into_task_ids.is_empty() {
+            if task.predecessor_revision_id.is_none() || !task.lifecycle.is_terminal() {
+                return Err(StoreError::InvalidInput);
+            }
+            for child_id in &task.split_into_task_ids {
+                let child = by_id.get(child_id).ok_or(StoreError::InvalidInput)?;
+                if child.split_from_task_id != Some(task.task_id)
+                    || child.predecessor_revision_id.is_some()
+                {
+                    return Err(StoreError::InvalidInput);
+                }
+            }
+        }
+        if let Some(source_id) = task.split_from_task_id {
+            let source = by_id.get(&source_id).ok_or(StoreError::InvalidInput)?;
+            if !source.split_into_task_ids.contains(&task.task_id) {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        if !task.merged_from_task_ids.is_empty() {
+            for source_id in &task.merged_from_task_ids {
+                let source = by_id.get(source_id).ok_or(StoreError::InvalidInput)?;
+                if source.merged_into_task_id != Some(task.task_id)
+                    || source.predecessor_revision_id.is_none()
+                    || !source.lifecycle.is_terminal()
+                {
+                    return Err(StoreError::InvalidInput);
+                }
+            }
+        }
+        if let Some(target_id) = task.merged_into_task_id {
+            let target = by_id.get(&target_id).ok_or(StoreError::InvalidInput)?;
+            if !target.merged_from_task_ids.contains(&task.task_id) {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_evidence_command(events: &[JournalEventDraft]) -> Result<(), StoreError> {
@@ -1112,4 +1479,93 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direct_range() -> SourceCloseRange {
+        SourceCloseRange {
+            source_instance_id: SourceInstanceId::parse("source-a").unwrap(),
+            source_revision: SourceRevision::parse("revision-a").unwrap(),
+            eligible_event_manifest_refs: vec!["eligible-a".into()],
+            first_sequence: 1,
+            close_watermark: 3,
+            observed_through_sequence: 3,
+            admission_failure_observability: AdmissionFailureObservability::Complete,
+            independent_reconciliation: None,
+        }
+    }
+
+    #[test]
+    fn source_close_decision_is_derived_and_tamper_evident() {
+        let lane_id = ExecutionLaneId::new_v7();
+        let passed = SourceCloseReconciliation::new(
+            "close-proof-a",
+            lane_id,
+            vec![direct_range()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(passed.decision(), SourceCloseDecision::Passed);
+
+        let failed = SourceCloseReconciliation::new(
+            "close-proof-b",
+            lane_id,
+            vec![direct_range()],
+            vec!["gap-a".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(failed.decision(), SourceCloseDecision::Failed);
+
+        let mut encoded = serde_json::to_value(&passed).unwrap();
+        encoded["decision"] = serde_json::Value::String("failed".into());
+        let forged: SourceCloseReconciliation = serde_json::from_value(encoded).unwrap();
+        assert_eq!(forged.validate(), Err(StoreError::InvalidInput));
+    }
+
+    #[test]
+    fn independent_source_must_be_distinct_and_cover_the_closed_range() {
+        let mut range = direct_range();
+        range.admission_failure_observability = AdmissionFailureObservability::Unavailable;
+        range.independent_reconciliation = Some(IndependentSourceReconciliation {
+            source_instance_id: range.source_instance_id.clone(),
+            source_revision: range.source_revision.clone(),
+            first_sequence: 1,
+            last_sequence: 3,
+            evidence_refs: vec!["independent-a".into()],
+        });
+        assert_eq!(
+            SourceCloseReconciliation::new(
+                "close-proof-c",
+                ExecutionLaneId::new_v7(),
+                vec![range],
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(StoreError::InvalidInput)
+        );
+
+        let mut distinct = direct_range();
+        distinct.admission_failure_observability = AdmissionFailureObservability::Unavailable;
+        distinct.independent_reconciliation = Some(IndependentSourceReconciliation {
+            source_instance_id: SourceInstanceId::parse("source-independent").unwrap(),
+            source_revision: SourceRevision::parse("revision-independent").unwrap(),
+            first_sequence: 100,
+            last_sequence: 102,
+            evidence_refs: vec!["mapping-not-proven".into()],
+        });
+        let reconciliation = SourceCloseReconciliation::new(
+            "close-proof-d",
+            ExecutionLaneId::new_v7(),
+            vec![distinct],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(reconciliation.decision(), SourceCloseDecision::Failed);
+    }
 }

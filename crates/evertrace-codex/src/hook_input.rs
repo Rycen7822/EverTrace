@@ -4,6 +4,7 @@ use evertrace_domain::evidence::{
     CorrelationAdmission, EvidenceSourceKind, HostCorrelationEvidence, IdentityStrength,
     ScopeEffectClaim, SourceRevisionMode,
 };
+use evertrace_domain::work::LaneLifecycleEvidence;
 
 use crate::capability::CanaryStatus;
 
@@ -16,6 +17,8 @@ pub enum HookEventKind {
     SubagentTerminal,
     Compact,
     SourceClose,
+    ParentSessionEnd,
+    LivenessProbe,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -44,7 +47,7 @@ pub struct HookActivationEvidence {
     pub protected_digest: Option<String>,
 }
 
-pub const CAPTURE_HOOK_INPUT_VERSION: u16 = 3;
+pub const CAPTURE_HOOK_INPUT_VERSION: u16 = 5;
 pub const MAX_CAPTURE_HOOK_INPUT: usize = 1_048_576;
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,7 +73,10 @@ pub struct CaptureHookInput {
     pub event_kind: HookEventKind,
     pub correlation: HostCorrelationEvidence,
     pub scope_effect_claims: Vec<ScopeEffectClaim>,
+    pub lifecycle: Option<LaneLifecycleEvidence>,
     pub source_sequence: u64,
+    #[serde(default)]
+    pub source_sequence_origin: Option<u64>,
     pub task_id: Option<String>,
     pub repository_instance_id: Option<String>,
     pub worktree_instance_id: Option<String>,
@@ -132,6 +138,9 @@ impl CaptureHookInput {
                 .as_deref()
                 .is_some_and(|value| !valid_ref(value))
             || self.event_time_us.is_some_and(|value| value < 0)
+            || self
+                .source_sequence_origin
+                .is_some_and(|origin| origin > self.source_sequence)
             || self.correlation.adapter_manifest_ref != self.adapter_manifest_ref
             || self.correlation.admission == CorrelationAdmission::ExactCapable
             || [
@@ -161,6 +170,16 @@ impl CaptureHookInput {
             .map_err(|_| HookInputError::Invalid)?;
         for claim in &self.scope_effect_claims {
             claim.validate().map_err(|_| HookInputError::Invalid)?;
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.validate().map_err(|_| HookInputError::Invalid)?;
+            if lifecycle.incarnation_ref.is_none()
+                || lifecycle.host_session_id != self.session_id
+                || lifecycle.adapter_manifest_ref != self.adapter_manifest_ref
+                || lifecycle.eligible_event_manifest_ref != self.eligible_event_manifest_ref
+            {
+                return Err(HookInputError::Invalid);
+            }
         }
         Ok(())
     }

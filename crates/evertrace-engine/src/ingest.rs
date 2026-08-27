@@ -154,6 +154,14 @@ impl EvidenceIngestor {
             algorithm_revision: self.algorithm_revision.clone(),
             source_watermark: verified.body.source_sequence,
         }));
+        if verified.body.lifecycle.is_some() {
+            payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
+                target_kind: DirtyTargetKind::CaptureReconciliation,
+                target_id: verified.observation.source_observation_id.to_string(),
+                algorithm_revision: self.algorithm_revision.clone(),
+                source_watermark: verified.body.source_sequence,
+            }));
+        }
         let events = payloads
             .into_iter()
             .map(|payload| JournalEventDraft {
