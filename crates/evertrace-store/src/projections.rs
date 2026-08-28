@@ -5481,7 +5481,7 @@ impl ProjectionWorker {
     }
 }
 
-fn validate_delta(
+pub(crate) fn validate_delta(
     checkpoint_frontier: u64,
     journal_frontier: u64,
     rows: &[JournalRow],
@@ -6316,7 +6316,7 @@ mod tests {
             .unwrap();
         let worker = ProjectionWorker::new(journal, objects);
         worker
-            .commit_rows(&[ObjectRow::checkpoint(2, PROJECTION_GENERATION)])
+            .commit_rows(&[ObjectRow::checkpoint(3, PROJECTION_GENERATION)])
             .await
             .unwrap();
         assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));

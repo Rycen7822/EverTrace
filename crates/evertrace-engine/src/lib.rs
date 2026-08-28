@@ -10,6 +10,7 @@ pub mod jobs;
 pub mod normalize;
 pub mod recovery;
 pub mod repository;
+pub mod search;
 pub mod segmentation;
 pub mod semantic;
 mod service;

@@ -188,7 +188,7 @@ async fn task_is_cross_session_and_session_events_create_no_delta() {
     assert_eq!(view.tasks.get(&root.task_id), Some(&root));
     let second = writer.project().await.unwrap();
     assert_eq!(first, second);
-    assert_eq!(writer.journal_rows().await.unwrap().len(), 2);
+    assert_eq!(writer.journal_rows().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -897,7 +897,7 @@ async fn replay_restart_full_rebuild_and_current_rows_are_stable() {
         row.object_kind.as_deref() == Some("workstream")
             && row.current_revision_id.as_deref() == Some(&stream.revision_id.to_string())
     }));
-    assert_eq!(writer.table_names().await.unwrap().len(), 2);
+    assert_eq!(writer.table_names().await.unwrap().len(), 4);
 }
 
 #[test]

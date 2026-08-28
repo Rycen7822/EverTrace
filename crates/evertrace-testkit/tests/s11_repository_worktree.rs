@@ -2712,17 +2712,22 @@ async fn replay_stale_frontier_no_delta_and_projection_are_closed() {
 }
 
 #[tokio::test]
-async fn production_tables_stay_at_journal_and_objects() {
+async fn production_tables_stay_at_the_four_l0002_tables() {
     let mut harness = Harness::open().await;
     let repo = harness.path("repo");
     init_repo(&repo);
     harness.refresh(&canonical(&repo)).await;
     assert_eq!(
         harness.writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search"
+        ]
     );
 
-    // A reserved L0002 table makes opening the store fail closed.
+    // A wrong-schema partial L0002 table makes opening the store fail closed.
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("store");
     let reader = CompatibilityStore::connect_local(&root).await.unwrap();

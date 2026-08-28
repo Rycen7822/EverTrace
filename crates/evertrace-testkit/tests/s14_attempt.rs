@@ -550,7 +550,12 @@ async fn create_successor_no_delta_replay_rebuild_and_restart_are_equivalent() {
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search"
+        ]
     );
     let mut gap = incremental.clone();
     gap.rows.retain(|row| {

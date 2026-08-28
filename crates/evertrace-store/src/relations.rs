@@ -12,7 +12,310 @@ use evertrace_domain::work::{
 };
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use lancedb::Table;
+
 use crate::StoreError;
+
+pub const RELATIONS_TABLE: &str = "evertrace_relations";
+pub const RELATIONS_CHECKPOINT_ID: &str = "checkpoint:evertrace_relations";
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RelationProjectionRow {
+    pub row_id: String,
+    pub relation_kind: Option<String>,
+    pub source_id: Option<String>,
+    pub target_id: Option<String>,
+    pub source_event_seq: u64,
+    pub projection_generation: u64,
+}
+
+impl RelationProjectionRow {
+    pub fn checkpoint(frontier: u64) -> Self {
+        Self {
+            row_id: RELATIONS_CHECKPOINT_ID.into(),
+            relation_kind: None,
+            source_id: None,
+            target_id: None,
+            source_event_seq: frontier,
+            projection_generation: 1,
+        }
+    }
+
+    pub fn edge(kind: &str, source_event_seq: u64, source: String, target: String) -> Self {
+        let row_id = relation_row_id(kind, &source, &target);
+        Self {
+            row_id,
+            relation_kind: Some(kind.into()),
+            source_id: Some(source),
+            target_id: Some(target),
+            source_event_seq,
+            projection_generation: 1,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.row_id.is_empty() || self.projection_generation != 1 {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if self.row_id == RELATIONS_CHECKPOINT_ID {
+            if self.relation_kind.is_some() || self.source_id.is_some() || self.target_id.is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        } else {
+            if self.source_event_seq == 0 {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let kind = self
+                .relation_kind
+                .as_deref()
+                .filter(|kind| is_persisted_relation_kind(kind))
+                .ok_or(StoreError::StoreCorrupt)?;
+            let source = self
+                .source_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or(StoreError::StoreCorrupt)?;
+            let target = self
+                .target_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or(StoreError::StoreCorrupt)?;
+            if self.row_id != relation_row_id(kind, source, target) {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn relation_row_id(kind: &str, source: &str, target: &str) -> String {
+    format!(
+        "edge:{}:{kind}{}:{source}{}:{target}",
+        kind.len(),
+        source.len(),
+        target.len()
+    )
+}
+
+pub fn is_persisted_relation_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "source_observation_to_host_occurrence"
+            | "host_occurrence_to_operation"
+            | "operation_to_scope_effect"
+            | "repository_to_worktree"
+            | "worktree_to_snapshot"
+            | "worktree_transition_from"
+            | "worktree_transition_to"
+            | "integration_event_source"
+            | "integration_event_destination"
+            | "repository_derived_from"
+            | "worktree_recreated_from"
+            | "task_continues"
+            | "task_split_from"
+            | "task_split_into"
+            | "task_merged_from"
+            | "task_merged_into"
+            | "task_contains_workstream"
+            | "workstream_parent"
+            | "workstream_dependency"
+            | "workstream_repository"
+            | "workstream_worktree"
+            | "attempt_to_task"
+            | "attempt_to_workstream"
+            | "attempt_to_episode"
+            | "attempt_to_execution_lane"
+            | "attempt_to_binding_revision"
+            | "attempt_to_integration_evidence"
+            | "attempt_to_outcome_evidence"
+            | "attempt_to_verifier_evidence"
+            | "attempt_resumes_from_historical"
+            | "attempt_composed_from_historical"
+            | "group_to_candidate_member"
+            | "group_to_comparison_snapshot"
+            | "group_to_selected_attempt"
+            | "group_to_partially_integrated_attempt"
+            | "operation_to_binding_revision"
+            | "binding_to_scope_effect"
+            | "binding_to_primary_task"
+            | "binding_to_primary_workstream"
+            | "binding_to_primary_episode"
+            | "binding_to_candidate_task"
+            | "binding_to_candidate_workstream"
+            | "binding_to_secondary_target"
+            | "episode_to_task"
+            | "episode_to_workstream"
+            | "episode_to_attempt"
+            | "episode_to_execution_lane"
+            | "episode_to_checkpoint"
+            | "execution_lane_to_capture_receipt"
+            | "execution_lane_to_operation"
+            | "capture_receipt_to_source_revision"
+            | "capture_receipt_to_gap_evidence"
+            | "capture_receipt_to_outage_evidence"
+            | "episode_to_burst"
+            | "burst_to_operation"
+            | "burst_to_host_occurrence"
+            | "burst_to_source_observation"
+            | "burst_to_scope_effect"
+            | "burst_to_binding_revision"
+            | "burst_to_execution_lane"
+            | "burst_to_attempt"
+            | "correction_from_episode"
+            | "correction_to_episode"
+            | "correction_successor"
+            | "request_to_worktree"
+            | "request_to_snapshot"
+            | "request_to_bundle"
+            | "bundle_to_worktree"
+            | "bundle_to_snapshot"
+            | "bundle_to_attempt_anchor"
+            | "application_to_bundle"
+            | "application_to_worktree"
+            | "application_to_pre_snapshot"
+            | "application_to_post_snapshot"
+            | "application_to_operation"
+            | "application_to_execution_lane"
+            | "application_to_capture_receipt"
+            | "application_to_scope_effect"
+            | "application_to_input_observation"
+            | "application_to_result_observation"
+            | "application_to_attempt_anchor"
+            | "run_to_workstream"
+            | "run_to_attempt"
+            | "run_to_artifact"
+            | "result_produced_by_run"
+            | "result_to_raw_artifact"
+            | "artifact_produced_by_operation"
+            | "artifact_produced_by_run"
+            | "artifact_produced_by_episode"
+            | "artifact_consumed_by_operation"
+            | "artifact_consumed_by_run"
+            | "artifact_consumed_by_episode"
+            | "artifact_revision_successor"
+            | "atom_revision_successor"
+            | "atom_supersedes"
+            | "atom_supports"
+            | "atom_contradicts"
+            | "atom_from_source_observation"
+            | "proposal_revision_successor"
+            | "proposal_reviewed_revision"
+            | "proposal_targets_atom"
+            | "proposal_accepted_atom_revision"
+    )
+}
+
+pub fn relations_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Utf8, false),
+        Field::new("relation_kind", DataType::Utf8, true),
+        Field::new("source_id", DataType::Utf8, true),
+        Field::new("target_id", DataType::Utf8, true),
+        Field::new("source_event_seq", DataType::UInt64, false),
+        Field::new("projection_generation", DataType::UInt64, false),
+    ]))
+}
+
+pub(crate) fn relations_batch(rows: &[RelationProjectionRow]) -> Result<RecordBatch, StoreError> {
+    for row in rows {
+        row.validate()?;
+    }
+    RecordBatch::try_new(
+        relations_schema(),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.row_id.as_str()),
+            )) as ArrayRef,
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.relation_kind.as_deref()),
+            )),
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.source_id.as_deref()),
+            )),
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.target_id.as_deref()),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.source_event_seq),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.projection_generation),
+            )),
+        ],
+    )
+    .map_err(|_| StoreError::StoreCorrupt)
+}
+
+pub async fn read_relation_rows(table: &Table) -> Result<Vec<RelationProjectionRow>, StoreError> {
+    let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
+    if schema.as_ref() != relations_schema().as_ref() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let batches = crate::collect_batches(&table.query())
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let kinds = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let sources = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let targets = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let frontiers = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let generations = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or(StoreError::StoreCorrupt)?;
+        for index in 0..batch.num_rows() {
+            let row = RelationProjectionRow {
+                row_id: ids.value(index).into(),
+                relation_kind: (!kinds.is_null(index)).then(|| kinds.value(index).into()),
+                source_id: (!sources.is_null(index)).then(|| sources.value(index).into()),
+                target_id: (!targets.is_null(index)).then(|| targets.value(index).into()),
+                source_event_seq: frontiers.value(index),
+                projection_generation: generations.value(index),
+            };
+            row.validate()?;
+            rows.push(row);
+        }
+    }
+    rows.sort();
+    if rows
+        .iter()
+        .filter(|row| row.row_id == RELATIONS_CHECKPOINT_ID)
+        .count()
+        != 1
+        || rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id)
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(rows)
+}
 
 mod segmentation;
 pub use segmentation::*;
