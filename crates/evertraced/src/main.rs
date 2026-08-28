@@ -4,9 +4,10 @@
 use std::{env, fs, path::PathBuf, sync::Arc};
 
 use evertrace_engine::{
-    EngineService, HealthDispatchError, RecoveryBarrierLocator as EngineRecoveryLocator,
-    RecoveryBarrierService, RecoveryError, RuntimeMode, open_writer, publish_recovery_runtime,
-    spawn_writer,
+    EngineService, HealthDispatchError, RecoveryActionOutcome, RecoveryActionService,
+    RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
+    RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason, RuntimeMode,
+    open_writer, publish_recovery_runtime, spawn_writer,
 };
 use evertrace_protocol::{
     LocalServer, ServerOptions,
@@ -14,7 +15,10 @@ use evertrace_protocol::{
     dto::{HealthMode, PROTOCOL_VERSION},
     error::ErrorCode,
     resolve_data_dir,
-    response::{HealthResponse, RecoveryTerminalResponse, Response},
+    response::{
+        HealthResponse, RecoveryActionResponse, RecoveryTerminalResponse,
+        RecoveryUnsupportedReason, Response,
+    },
 };
 use tokio::sync::watch;
 
@@ -41,8 +45,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_snapshot = publish_recovery_runtime(&data_dir, engine.effective_config(), None)?;
     let writer = open_writer(&data_dir).await?;
     let (writer_handle, mut writer_task) = spawn_writer(writer, 64)?;
-    let recovery_service = RecoveryBarrierService::new(runtime_snapshot, writer_handle.clone());
+    let recovery_service =
+        RecoveryBarrierService::new(runtime_snapshot.clone(), writer_handle.clone());
+    let recovery_action_service = RecoveryActionService::new(
+        runtime_snapshot,
+        writer_handle.clone(),
+        recovery_service.mutation_fence(),
+    );
     recovery_service.reconcile_pending_on_startup().await?;
+    recovery_action_service
+        .reconcile_pending_on_startup()
+        .await?;
     let mut writer_handle = Some(writer_handle);
     let server = match LocalServer::bind(&data_dir, ServerOptions::new(env!("CARGO_PKG_VERSION"))) {
         Ok(server) => server,
@@ -56,47 +69,82 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handler_engine = Arc::clone(&engine);
-    let mut task = tokio::spawn(server.run_dispatch(shutdown_rx, move |command| {
-        let handler_engine = Arc::clone(&handler_engine);
-        let recovery_service = recovery_service.clone();
-        async move {
-            match command {
-                ProtocolCommand::Health => {
-                    let snapshot = handler_engine.health().map_err(|error| match error {
-                        HealthDispatchError::MaintenanceMode => ErrorCode::MaintenanceMode,
-                    })?;
-                    Ok(Response::Health(HealthResponse {
-                        protocol_version: PROTOCOL_VERSION,
-                        mode: HealthMode::Normal,
-                        config_version: snapshot.config_version,
-                        effective_config_hash: hex(&snapshot.effective_config_hash),
-                        algorithm_revision: snapshot.algorithm_revision,
-                    }))
-                }
-                ProtocolCommand::RecoveryBarrier(locator) => {
-                    let result = recovery_service
-                        .handle(EngineRecoveryLocator {
-                            spool_record_id: locator.spool_record_id,
-                            recovery_capture_request_id: locator.recovery_capture_request_id,
-                            pending_revision_id: locator.pending_revision_id,
-                        })
-                        .await
-                        .map_err(map_recovery_error)?;
-                    Ok(Response::RecoveryTerminal(RecoveryTerminalResponse {
-                        recovery_capture_request_id: result.recovery_capture_request_id,
-                        pending_revision_id: result.pending_revision_id,
-                        terminal_revision_id: result.terminal_revision_id,
-                        status: result.status,
-                        recovery_bundle_id: result.recovery_bundle_id,
-                        durable_terminal_proven: true,
-                    }))
+    let handler_recovery_action_service = recovery_action_service.clone();
+    let mut task = tokio::spawn(
+        server.run_dispatch(shutdown_rx, move |request_id, command| {
+            let handler_engine = Arc::clone(&handler_engine);
+            let recovery_service = recovery_service.clone();
+            let recovery_action_service = handler_recovery_action_service.clone();
+            async move {
+                match command {
+                    ProtocolCommand::Health => {
+                        let snapshot = handler_engine.health().map_err(|error| match error {
+                            HealthDispatchError::MaintenanceMode => ErrorCode::MaintenanceMode,
+                        })?;
+                        Ok(Response::Health(HealthResponse {
+                            protocol_version: PROTOCOL_VERSION,
+                            mode: HealthMode::Normal,
+                            config_version: snapshot.config_version,
+                            effective_config_hash: hex(&snapshot.effective_config_hash),
+                            algorithm_revision: snapshot.algorithm_revision,
+                        }))
+                    }
+                    ProtocolCommand::RecoveryBarrier(locator) => {
+                        let result = recovery_service
+                            .handle(EngineRecoveryLocator {
+                                spool_record_id: locator.spool_record_id,
+                                recovery_capture_request_id: locator.recovery_capture_request_id,
+                                pending_revision_id: locator.pending_revision_id,
+                            })
+                            .await
+                            .map_err(map_recovery_error)?;
+                        Ok(Response::RecoveryTerminal(RecoveryTerminalResponse {
+                            recovery_capture_request_id: result.recovery_capture_request_id,
+                            pending_revision_id: result.pending_revision_id,
+                            terminal_revision_id: result.terminal_revision_id,
+                            status: result.status,
+                            recovery_bundle_id: result.recovery_bundle_id,
+                            durable_terminal_proven: true,
+                        }))
+                    }
+                    ProtocolCommand::RequestRecovery(request) => {
+                        let result = recovery_action_service
+                            .handle(RecoveryRequest {
+                                request_id,
+                                recovery_bundle_id: request.recovery_bundle_id,
+                                target_worktree_instance_id: request.target_worktree_instance_id,
+                                application_kind: request.application_kind,
+                            })
+                            .await
+                            .map_err(map_recovery_error)?;
+                        let response = match result {
+                            RecoveryActionOutcome::Application {
+                                recovery_application_id,
+                                application_status,
+                                replayed,
+                            } => RecoveryActionResponse {
+                                recovery_application_id: Some(recovery_application_id),
+                                application_status: Some(application_status),
+                                replayed,
+                                unsupported_reason: None,
+                            },
+                            RecoveryActionOutcome::Unsupported(reason) => RecoveryActionResponse {
+                                recovery_application_id: None,
+                                application_status: None,
+                                replayed: false,
+                                unsupported_reason: Some(map_unsupported_reason(reason)),
+                            },
+                        };
+                        Ok(Response::RecoveryAction(response))
+                    }
                 }
             }
-        }
-    }));
+        }),
+    );
     tokio::select! {
         result = &mut task => {
             let server_result = result;
+            recovery_action_service.shutdown_and_drain().await;
             if let Some(handle) = writer_handle.take() {
                 handle.shutdown().await?;
             }
@@ -106,6 +154,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         result = &mut writer_task => {
             let _ = shutdown_tx.send(true);
+            recovery_action_service.shutdown_and_drain().await;
             task.await??;
             result??;
             Err("writer stopped unexpectedly".into())
@@ -113,12 +162,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         signal = wait_for_signal() => {
             signal?;
             let _ = shutdown_tx.send(true);
+            recovery_action_service.shutdown_and_drain().await;
             task.await??;
             if let Some(handle) = writer_handle.take() {
                 handle.shutdown().await?;
             }
             writer_task.await??;
             Ok(())
+        }
+    }
+}
+
+const fn map_unsupported_reason(reason: EngineUnsupportedReason) -> RecoveryUnsupportedReason {
+    match reason {
+        EngineUnsupportedReason::UnsupportedApplicationKind => {
+            RecoveryUnsupportedReason::UnsupportedApplicationKind
+        }
+        EngineUnsupportedReason::AmbiguousPatchContent => {
+            RecoveryUnsupportedReason::AmbiguousPatchContent
+        }
+        EngineUnsupportedReason::UnsupportedPatchShape => {
+            RecoveryUnsupportedReason::UnsupportedPatchShape
+        }
+        EngineUnsupportedReason::RedactedContent => RecoveryUnsupportedReason::RedactedContent,
+        EngineUnsupportedReason::IncompleteBundle => RecoveryUnsupportedReason::IncompleteBundle,
+        EngineUnsupportedReason::TargetUnavailable => RecoveryUnsupportedReason::TargetUnavailable,
+        EngineUnsupportedReason::PatchPreflightFailed => {
+            RecoveryUnsupportedReason::PatchPreflightFailed
+        }
+        EngineUnsupportedReason::PhysicalPreflightUnavailable => {
+            RecoveryUnsupportedReason::PhysicalPreflightUnavailable
+        }
+        EngineUnsupportedReason::PhysicalPreflightRaced => {
+            RecoveryUnsupportedReason::PhysicalPreflightRaced
         }
     }
 }

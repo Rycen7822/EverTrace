@@ -71,6 +71,8 @@ pub enum ProtocolError {
     InvalidHealth,
     #[error("peer returned invalid recovery terminal data")]
     InvalidRecoveryTerminal,
+    #[error("peer returned invalid recovery action data")]
+    InvalidRecoveryAction,
     #[error("peer returned invalid frame negotiation")]
     InvalidNegotiation,
     #[error("runtime directory is not a private owned directory")]

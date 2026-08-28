@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
+    sync::{Condvar, Mutex},
     time::SystemTime,
 };
 
@@ -29,9 +30,12 @@ use evertrace_engine::{
     PhysicalNormalizer,
     repository::{
         GitOid, GitProbeEvidence, HostTrustDecision, IntegrationEvidence, ProbeField, ProbeLimits,
-        ProbeOmission, RepositoryResolution, RepositoryResolveError, RepositoryResolveInput,
-        ResolutionKind, correct_transition, probe_is_ancestor, probe_patch_equivalence,
-        probe_repository, remote_fingerprint, resolve_integration, resolve_repository,
+        ProbeOmission, RepositoryProbeError, RepositoryResolution, RepositoryResolveError,
+        RepositoryResolveInput, ResolutionKind, correct_transition,
+        probe_is_ancestor as engine_probe_is_ancestor,
+        probe_patch_equivalence as engine_probe_patch_equivalence,
+        probe_repository as engine_probe_repository, remote_fingerprint, resolve_integration,
+        resolve_repository,
     },
 };
 use evertrace_store::{
@@ -46,12 +50,79 @@ use tempfile::TempDir;
 const CONFIG_HASH: [u8; 32] = [0x42; 32];
 const ALGO: &str = "s11-repository-v1";
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+struct GitGateState {
+    active_children: usize,
+    reopening: bool,
+}
+
+static GIT_CHILD_GATE: (Mutex<GitGateState>, Condvar) = (
+    Mutex::new(GitGateState {
+        active_children: 0,
+        reopening: false,
+    }),
+    Condvar::new(),
+);
+
+struct GitChildGate;
+
+impl Drop for GitChildGate {
+    fn drop(&mut self) {
+        let (state, changed) = &GIT_CHILD_GATE;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_children -= 1;
+        changed.notify_all();
+    }
+}
+
+fn enter_git_child() -> GitChildGate {
+    let (state, changed) = &GIT_CHILD_GATE;
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while state.reopening {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    state.active_children += 1;
+    GitChildGate
+}
+
+struct GitReopenGate;
+
+impl Drop for GitReopenGate {
+    fn drop(&mut self) {
+        let (state, changed) = &GIT_CHILD_GATE;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.reopening = false;
+        changed.notify_all();
+    }
+}
+
+fn enter_reopen() -> GitReopenGate {
+    let (state, changed) = &GIT_CHILD_GATE;
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while state.reopening || state.active_children != 0 {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    state.reopening = true;
+    GitReopenGate
+}
 
 // ---------------------------------------------------------------------------
 // Git fixture helpers (the only place tests may mutate Git state)
 // ---------------------------------------------------------------------------
 
 fn git(dir: &Path, args: &[&str]) -> String {
+    let _child_gate = enter_git_child();
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -73,6 +144,49 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn probe_repository(
+    candidate_path: &Path,
+    trust: HostTrustDecision,
+    evidence_refs: &[String],
+    occurred_at_us: i64,
+    limits: &ProbeLimits,
+    known_admin_paths: &[String],
+    known_head_oids: &[GitOid],
+) -> Result<GitProbeEvidence, RepositoryProbeError> {
+    let _child_gate = enter_git_child();
+    engine_probe_repository(
+        candidate_path,
+        trust,
+        evidence_refs,
+        occurred_at_us,
+        limits,
+        known_admin_paths,
+        known_head_oids,
+    )
+}
+
+fn probe_is_ancestor(
+    repository_path: &Path,
+    ancestor: &GitOid,
+    descendant: &GitOid,
+    limits: &ProbeLimits,
+) -> Result<bool, RepositoryProbeError> {
+    let _child_gate = enter_git_child();
+    engine_probe_is_ancestor(repository_path, ancestor, descendant, limits)
+}
+
+fn probe_patch_equivalence(
+    repository_path: &Path,
+    base_a: &GitOid,
+    tip_a: &GitOid,
+    base_b: &GitOid,
+    tip_b: &GitOid,
+    limits: &ProbeLimits,
+) -> Result<Option<String>, RepositoryProbeError> {
+    let _child_gate = enter_git_child();
+    engine_probe_patch_equivalence(repository_path, base_a, tip_a, base_b, tip_b, limits)
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -758,8 +872,11 @@ async fn unborn_empty_repository_resolves_create_then_no_delta_across_restart() 
 
     // After a restart the rebuilt view resolves identically.
     let store_root = harness.temp.path().join("store");
-    drop(harness.writer);
-    harness.writer = JournalWriter::open(&store_root).await.unwrap();
+    harness.writer = {
+        let _reopen_gate = enter_reopen();
+        drop(harness.writer);
+        JournalWriter::open(&store_root).await.unwrap()
+    };
     let third = harness.refresh(&repo).await;
     assert_eq!(third.resolution.kind, Some(ResolutionKind::NoDelta));
     assert!(third.command.is_none());
@@ -1554,8 +1671,11 @@ async fn same_filesystem_identity_without_continuity_evidence_creates_new_instan
     // After a restart (writer reopened, projection rebuilt from the journal)
     // the same resolve against the rebuilt view yields the same outcome.
     let store_root = harness.temp.path().join("store");
-    drop(harness.writer);
-    harness.writer = JournalWriter::open(&store_root).await.unwrap();
+    harness.writer = {
+        let _reopen_gate = enter_reopen();
+        drop(harness.writer);
+        JournalWriter::open(&store_root).await.unwrap()
+    };
     let view = harness.view().await;
     assert_eq!(view.repositories.len(), 2);
     assert!(view.repositories.contains_key(&established.repository_id));

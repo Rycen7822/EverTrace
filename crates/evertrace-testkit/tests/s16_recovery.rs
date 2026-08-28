@@ -21,18 +21,28 @@ use evertrace_domain::{
         HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceRevisionMode, SourceRole,
     },
     ids::{
-        CommandId, RecoveryApplicationId, RecoveryCaptureRequestId, RepositoryId, WorktreeId,
-        WorktreeSnapshotId,
+        AttemptId, CaptureReceiptId, CasId, CommandId, CompetingAttemptGroupId, ExecutionLaneId,
+        IntegrationEventId, OperationId, RecoveryApplicationId, RecoveryCaptureRequestId,
+        RepositoryId, ScopeEffectId, SourceObservationId, WorktreeId, WorktreeSnapshotId,
     },
     repository::{
         DestructiveClass, DestructiveDetectionStatus, FilesystemIdentity, GitObjectFormat,
-        GitOperation, GitRegistrationState, OrderingIntegrity, PathObservation,
-        RecoveryApplication, RecoveryApplicationKind, RecoveryApplicationStatus,
-        RecoveryCaptureRequest, RecoveryCaptureStatus, RecoveryOmissionReason, RecoveryReasonCode,
-        RecoveryRequestStatus, RepositoryInstance, SnapshotCaptureStatus, UntrackedCaptureScope,
-        WorktreeInstance, WorktreeKind, WorktreeLifecycle, WorktreeSnapshot,
+        GitOperation, GitRegistrationState, IntegrationEvent, IntegrationKind, LineageAssessment,
+        OrderingIntegrity, PathObservation, RECOVERY_ANCHOR_VERIFIER_VERSION,
+        RecoveryAnchorVerifierReceipt, RecoveryApplication, RecoveryApplicationKind,
+        RecoveryApplicationStatus, RecoveryAttemptAnchorClaim, RecoveryCaptureRequest,
+        RecoveryCaptureStatus, RecoveryConfinedFileIdentity, RecoveryInputDeliveryKind,
+        RecoveryInputDeliveryState, RecoveryOmissionReason, RecoveryReasonCode,
+        RecoveryRequestStatus, RecoveryVerificationOutcome, RecoveryVerifierReceipt,
+        RepositoryInstance, SnapshotCaptureStatus, UntrackedCaptureScope, WorktreeInstance,
+        WorktreeKind, WorktreeLifecycle, WorktreeSnapshot,
     },
     revision::RevisionId,
+    work::{
+        AttemptAdoptionStatus, AttemptVerification, CompetingAttemptGroup, CompetingConflictKind,
+        CompetingResolutionStatus, PhaseContract, PhaseKind, StrategyContract, Task,
+        TaskIdentityConfidence, TaskLifecycle, TaskScopeMembership, Workstream, WorkstreamStatus,
+    },
 };
 use evertrace_engine::{
     RecoveryBarrierService, RecoveryBudget, RecoveryCaptureFacts, RecoveryCaptureItem,
@@ -40,6 +50,7 @@ use evertrace_engine::{
     pending_request_command, publish_recovery_runtime,
     repository::{ProbeLimits, probe_recovery_capture, probe_recovery_capture_scoped},
     spawn_writer, terminal_capture_command,
+    work::attempt::new_attempt,
 };
 use evertrace_protocol::{
     LocalServer, ServerOptions,
@@ -54,7 +65,11 @@ use evertrace_protocol::{
 };
 use evertrace_store::{
     EventScope, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter, SourceKind,
-    projections::{RecoveryCurrentState, RecoveryCurrentView},
+    projections::{AttemptCurrentView, RecoveryCurrentState, RecoveryCurrentView},
+    relations::{
+        RecoveryRelationKind, build_recovery_application_relation_rows,
+        build_recovery_relation_rows,
+    },
     repository::RepositoryCurrentView,
 };
 use tempfile::TempDir;
@@ -372,6 +387,158 @@ fn capture_input_for_git(
     input
 }
 
+fn active_attempt_seed_command(
+    request: &RecoveryCaptureRequest,
+) -> (AttemptId, CompetingAttemptGroupId, JournalCommand) {
+    let task = Task {
+        task_id: evertrace_domain::ids::TaskId::new_v7(),
+        revision_id: revision(),
+        predecessor_revision_id: None,
+        request_root_refs: vec!["request:s17-anchor".into()],
+        canonical_goal: "preserve active attempt state".into(),
+        scope_memberships: vec![TaskScopeMembership {
+            repository_instance_id: Some(request.repository_instance_id),
+            worktree_instance_ids: vec![request.worktree_instance_id],
+        }],
+        identity_confidence: TaskIdentityConfidence::Explicit,
+        lifecycle: TaskLifecycle::Active,
+        continuation_of_task_id: None,
+        split_from_task_id: None,
+        split_into_task_ids: vec![],
+        merged_from_task_ids: vec![],
+        merged_into_task_id: None,
+        created_at_us: 2,
+        closed_at_us: None,
+        source_watermark: 2,
+    };
+    let stream = Workstream {
+        workstream_id: evertrace_domain::ids::WorkstreamId::new_v7(),
+        revision_id: revision(),
+        predecessor_revision_id: None,
+        task_id: task.task_id,
+        repository_instance_id: Some(request.repository_instance_id),
+        worktree_instance_ids: vec![request.worktree_instance_id],
+        active_worktree_instance_id: Some(request.worktree_instance_id),
+        worktree_lineage_refs: vec!["lineage:s17-anchor".into()],
+        parent_workstream_id: None,
+        dependency_workstream_ids: vec![],
+        status: WorkstreamStatus::Active,
+        root_goal: "preserve active attempt state".into(),
+        workstream_goal: "capture one typed patch anchor".into(),
+        target_family: "recovery".into(),
+        hypothesis_or_failure_family: "patch".into(),
+        acceptance_boundary: "typed patch verifier".into(),
+        phase_contract: PhaseContract {
+            local_goal: "capture anchor".into(),
+            phase_kind: PhaseKind::Implement,
+            phase_label: "s17".into(),
+            primary_targets: vec!["tracked.txt".into()],
+            entry_conditions: vec!["active worktree".into()],
+            acceptance_boundary: "typed patch verifier".into(),
+            expected_state_transition: "recovery bundle".into(),
+        },
+        active_episode_id: None,
+        execution_lane_ids: vec![],
+        source_watermark: 3,
+    };
+    let contract = StrategyContract {
+        hypothesis: "preserve local patch".into(),
+        intervention: "apply exact patch".into(),
+        intervention_family: "recovery".into(),
+        search_policy_ref: None,
+        objective_ref: Some("objective:restore".into()),
+        expected_effect: "tracked state restored".into(),
+        target_refs: vec![],
+        acceptance_boundary_ref: "acceptance:fixed-patch-verifier".into(),
+    };
+    let group_id = CompetingAttemptGroupId::new_v7();
+    let mut attempt = new_attempt(
+        task.task_id,
+        stream.workstream_id,
+        Some(request.repository_instance_id),
+        vec![request.worktree_instance_id],
+        vec![],
+        contract.clone(),
+        4,
+    )
+    .unwrap();
+    attempt.local_outcome_refs = vec![format!(
+        "artifact:{}",
+        evertrace_domain::ids::WorkArtifactId::new_v7()
+    )];
+    attempt.competing_group_ids = vec![group_id];
+    attempt.validate().unwrap();
+    let attempt_id = attempt.attempt_id;
+    let mut abandoned = new_attempt(
+        task.task_id,
+        stream.workstream_id,
+        Some(request.repository_instance_id),
+        vec![request.worktree_instance_id],
+        vec![],
+        contract.clone(),
+        4,
+    )
+    .unwrap();
+    abandoned.execution_status = evertrace_domain::work::AttemptExecutionStatus::Abandoned;
+    abandoned.explicit_abandon_refs = vec!["typed:abandoned".into()];
+    abandoned.competing_group_ids = vec![group_id];
+    abandoned.validate().unwrap();
+    let abandoned_id = abandoned.attempt_id;
+    let mut superseded = new_attempt(
+        task.task_id,
+        stream.workstream_id,
+        Some(request.repository_instance_id),
+        vec![request.worktree_instance_id],
+        vec![],
+        contract,
+        4,
+    )
+    .unwrap();
+    superseded.lifecycle_status = evertrace_domain::work::AttemptLifecycleStatus::Superseded;
+    superseded.supersede_evidence_refs = vec!["typed:superseded".into()];
+    superseded.validate().unwrap();
+    let mut member_attempt_ids = vec![attempt_id, abandoned_id];
+    member_attempt_ids.sort();
+    let group = CompetingAttemptGroup {
+        competing_group_id: group_id,
+        revision_id: revision(),
+        predecessor_revision_id: None,
+        revision_generation: 1,
+        task_id: task.task_id,
+        decision_boundary_ref: "recovery-anchor-current-acceptance".into(),
+        comparison_contract_ref: None,
+        origin_workstream_id: Some(stream.workstream_id),
+        origin_episode_id: None,
+        member_workstream_ids: vec![stream.workstream_id],
+        member_attempt_ids,
+        candidate_snapshot_refs: vec![],
+        target_refs: vec![],
+        conflict_kind: CompetingConflictKind::AlternativeStrategy,
+        resolution_status: CompetingResolutionStatus::Open,
+        selected_attempt_id: None,
+        partially_integrated_attempt_ids: vec![],
+        resolution_evidence_refs: vec![],
+        source_watermark: 5,
+    };
+    group.validate().unwrap();
+    let command = JournalCommand::new(
+        CommandId::new_v7(),
+        [
+            JournalPayload::TaskRecorded(Box::new(task)),
+            JournalPayload::WorkstreamRecorded(Box::new(stream)),
+            JournalPayload::AttemptRecorded(Box::new(attempt)),
+            JournalPayload::AttemptRecorded(Box::new(abandoned)),
+            JournalPayload::AttemptRecorded(Box::new(superseded)),
+            JournalPayload::CompetingAttemptGroupRecorded(Box::new(group)),
+        ]
+        .into_iter()
+        .map(|payload| JournalEventDraft::runtime(2, [7; 32], "s17-anchor-v1", payload))
+        .collect(),
+    )
+    .unwrap();
+    (attempt_id, group_id, command)
+}
+
 #[tokio::test]
 async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
     let scenarios = [
@@ -487,6 +654,10 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
         assert_eq!(ack.status, RecoveryRequestStatus::Complete);
         let current = RecoveryCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
         let bundle = &current.state.bundles[&ack.recovery_bundle_id.unwrap()];
+        assert!(bundle.attempt_anchor_ids.is_empty());
+        assert!(bundle.untracked_work_artifact_refs.is_empty());
+        assert!(bundle.metadata_only_work_artifact_refs.is_empty());
+        assert!(bundle.config_and_run_refs.is_empty());
         assert!(!serde_json::to_string(bundle).unwrap().contains("/proc/"));
         assert!(
             !serde_json::to_string(current.terminal_request(locator.request_id).unwrap())
@@ -810,6 +981,583 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn active_attempt_anchor_is_produced_only_from_a_real_single_path_patch_capture() {
+    let root = TempDir::new().unwrap();
+    std::fs::set_permissions(root.path(), PermissionsExt::from_mode(0o700)).unwrap();
+    DeviceKeyStore::new(root.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let worktree = root.path().join("worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(worktree.join("tracked.txt"), b"before\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=EverTrace",
+                "-c",
+                "user.email=evertrace@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let target_path = root.path().join("target-worktree");
+    assert!(
+        std::process::Command::new("git")
+            .args(["branch", "recovery-target"])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--quiet",
+                target_path.to_str().unwrap(),
+                "recovery-target",
+            ])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(worktree.join("tracked.txt"), b"after\n").unwrap();
+    let limits = SpoolLimits {
+        high_watermark_bytes: 1 << 20,
+        low_watermark_bytes: 1,
+        max_main_files: 4,
+        emergency_slots: 1,
+    };
+    let snapshot = runtime_snapshot(root.path(), 1, limits, RecoveryGateMode::Active, 10_000);
+    let mut request = pending();
+    request.started_at_us = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros(),
+    )
+    .unwrap();
+    let input = capture_input_at(&request, &worktree);
+    let mut runtime = CaptureRuntime::open(snapshot.clone()).unwrap();
+    let CaptureOutcome::Durable {
+        spool_record_id,
+        recovery_preflight: Some(locator),
+        ..
+    } = runtime
+        .capture_with_recovery_preflight(input, preflight(&request, &worktree))
+        .unwrap()
+    else {
+        panic!("typed recovery preflight must be durable")
+    };
+    drop(runtime);
+    let mut writer = JournalWriter::open(root.path()).await.unwrap();
+    writer
+        .commit(&repository_seed_command(&request, &worktree), 1)
+        .await
+        .unwrap();
+    let target_worktree_id = WorktreeId::new_v7();
+    let target_snapshot_id = WorktreeSnapshotId::new_v7();
+    let target_root = std::fs::canonicalize(&target_path).unwrap();
+    let target_root_text = target_root.to_string_lossy().into_owned();
+    let target_git_file = std::fs::read_to_string(target_root.join(".git")).unwrap();
+    let target_git_dir = target_git_file
+        .trim()
+        .strip_prefix("gitdir: ")
+        .unwrap()
+        .to_owned();
+    let target_observation = PathObservation {
+        path: target_root_text.clone(),
+        first_observed_at_us: 1,
+        last_observed_at_us: 1,
+        evidence_refs: vec!["s17-anchor-target-path".into()],
+    };
+    let target_worktree = WorktreeInstance {
+        worktree_instance_id: target_worktree_id,
+        worktree_revision: 1,
+        predecessor_revision: None,
+        repository_instance_id: request.repository_instance_id,
+        kind: WorktreeKind::Linked,
+        lifecycle: WorktreeLifecycle::Active,
+        current_path: Some(target_root_text.clone()),
+        path_history: vec![target_observation.clone()],
+        git_admin_path_history: vec![PathObservation {
+            path: target_git_dir,
+            evidence_refs: vec!["s17-anchor-target-admin".into()],
+            ..target_observation
+        }],
+        git_registration_state: GitRegistrationState::Registered,
+        current_snapshot_id: Some(target_snapshot_id),
+        created_event_ref: "s17-anchor-target-created".into(),
+        terminal_event_ref: None,
+        recreated_from_worktree_instance_id: None,
+        recorded_at_us: 2,
+    };
+    let target_snapshot = WorktreeSnapshot {
+        worktree_snapshot_id: target_snapshot_id,
+        worktree_instance_id: target_worktree_id,
+        head_oid: Some(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&target_root)
+                .output()
+                .map(|output| String::from_utf8(output.stdout).unwrap().trim().to_owned())
+                .unwrap(),
+        ),
+        tree_oid: Some(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD^{tree}"])
+                .current_dir(&target_root)
+                .output()
+                .map(|output| String::from_utf8(output.stdout).unwrap().trim().to_owned())
+                .unwrap(),
+        ),
+        branch_ref: Some("refs/heads/recovery-target".into()),
+        detached_head: false,
+        tracked_diff_digest: None,
+        index_digest: None,
+        untracked_manifest_digest: None,
+        relevant_anchor_digests: vec![],
+        dependency_fingerprints: vec![],
+        toolchain_fingerprint: None,
+        git_operation: GitOperation::None,
+        captured_at_us: 2,
+        evidence_refs: vec!["s17-anchor-target-snapshot".into()],
+        capture_status: SnapshotCaptureStatus::Complete,
+        omission_reasons: vec![],
+    };
+    writer
+        .commit(
+            &JournalCommand::new(
+                CommandId::new_v7(),
+                [
+                    JournalPayload::WorktreeInstanceRecorded(Box::new(target_worktree)),
+                    JournalPayload::WorktreeSnapshotRecorded(Box::new(target_snapshot)),
+                ]
+                .into_iter()
+                .map(|payload| JournalEventDraft::runtime(2, [7; 32], "s17-anchor-v1", payload))
+                .collect(),
+            )
+            .unwrap(),
+            2,
+        )
+        .await
+        .unwrap();
+    let (attempt_id, group_id, attempt_command) = active_attempt_seed_command(&request);
+    writer.commit(&attempt_command, 2).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 8).unwrap();
+    let barrier = RecoveryBarrierService::new(snapshot.clone(), handle.clone());
+    let ack = barrier
+        .handle(evertrace_engine::RecoveryBarrierLocator {
+            spool_record_id,
+            recovery_capture_request_id: locator.request_id,
+            pending_revision_id: locator.pending_revision_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(ack.status, RecoveryRequestStatus::Complete);
+    let current = RecoveryCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    let bundle = &current.state.bundles[&ack.recovery_bundle_id.unwrap()];
+    assert_eq!(bundle.attempt_anchor_ids, vec![attempt_id]);
+    assert!(bundle.untracked_work_artifact_refs.is_empty());
+    assert!(bundle.metadata_only_work_artifact_refs.is_empty());
+    let [claim] = bundle.attempt_anchor_claims.as_slice() else {
+        panic!("single-path patch must produce one exact active Attempt anchor")
+    };
+    assert_eq!(claim.attempt_id, attempt_id);
+    assert_eq!(claim.source_snapshot_id, bundle.source_snapshot_id);
+    let cas = CasStore::open(root.path().join("cas")).unwrap();
+    assert_eq!(
+        cas.read(&CasDigest::from_str(&claim.affected_relative_path.cas_ref).unwrap())
+            .unwrap(),
+        b"tracked.txt"
+    );
+    let terminal_requests = current.state.requests.values().cloned().collect::<Vec<_>>();
+    let mut candidate_only = bundle.clone();
+    candidate_only.captured_bytes -= claim.affected_relative_path.protected_length;
+    candidate_only.attempt_anchor_claims.clear();
+    candidate_only.validate().unwrap();
+    assert!(
+        build_recovery_relation_rows(&terminal_requests, &[candidate_only])
+            .unwrap()
+            .iter()
+            .all(|row| row.kind != RecoveryRelationKind::BundleToAttemptAnchor)
+    );
+    let mut richer = bundle.clone();
+    richer.config_and_run_refs = vec!["run:non-authoritative-extra".into()];
+    assert!(richer.validate().is_err());
+    let mut impossible_identity = claim.clone();
+    impossible_identity.source_file_identity.device = 0;
+    assert!(impossible_identity.validate().is_err());
+    let action = evertrace_engine::RecoveryActionService::new(
+        snapshot.clone(),
+        handle.clone(),
+        barrier.mutation_fence(),
+    );
+    let action_request = evertrace_engine::RecoveryRequest {
+        request_id: evertrace_domain::ids::RequestId::new_v7(),
+        recovery_bundle_id: bundle.recovery_bundle_id,
+        target_worktree_instance_id: target_worktree_id,
+        application_kind: RecoveryApplicationKind::Patch,
+    };
+    let outcome = action.handle(action_request).await.unwrap();
+    let evertrace_engine::RecoveryActionOutcome::Application {
+        recovery_application_id,
+        application_status,
+        ..
+    } = outcome
+    else {
+        panic!("single-path typed anchor recovery must create an application")
+    };
+    assert_eq!(application_status, RecoveryApplicationStatus::Applied);
+    assert_eq!(
+        std::fs::read(target_root.join("tracked.txt")).unwrap(),
+        b"after\n"
+    );
+    assert!(
+        !action
+            .supports_compatible_lineage_transfer(recovery_application_id)
+            .await
+            .unwrap()
+    );
+    let unresolved_frontier = handle.project().await.unwrap().frontier;
+    action.handle(action_request).await.unwrap();
+    assert_eq!(
+        handle.project().await.unwrap().frontier,
+        unresolved_frontier
+    );
+
+    let attempts = AttemptCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    let current_attempt = attempts.attempts[&attempt_id].clone();
+    let current_group = attempts.competing_groups[&group_id].clone();
+    let verifier_ref = "typed:recovery-anchor-selected".to_owned();
+    let integration_id = IntegrationEventId::new_v7();
+    let post_snapshot_id = RecoveryCurrentView::from_snapshot(&handle.project().await.unwrap())
+        .unwrap()
+        .state
+        .applications[&recovery_application_id]
+        .post_application_snapshot_id
+        .unwrap();
+    let integration = IntegrationEvent {
+        integration_event_id: integration_id,
+        repository_instance_id: request.repository_instance_id,
+        source_worktree_instance_id: request.worktree_instance_id,
+        source_snapshot_id: claim.source_snapshot_id,
+        destination_worktree_instance_id: target_worktree_id,
+        destination_snapshot_id: post_snapshot_id,
+        kind: IntegrationKind::ManualPatch,
+        commit_refs: vec![],
+        patch_equivalence_refs: vec!["typed:recovery-anchor-patch".into()],
+        conflict_resolution_detected: false,
+        integrated_attempt_ids: vec![attempt_id],
+        revalidated_anchor_refs: vec![],
+        evidence_refs: vec![verifier_ref.clone()],
+        assessment: LineageAssessment::Proven,
+    };
+    integration.validate().unwrap();
+    let mut selected_attempt_revision = current_attempt.clone();
+    selected_attempt_revision.revision_id = revision();
+    selected_attempt_revision.predecessor_revision_id = Some(current_attempt.revision_id);
+    selected_attempt_revision.revision_generation += 1;
+    selected_attempt_revision.adoption_status = AttemptAdoptionStatus::Selected;
+    selected_attempt_revision.source_watermark += 1;
+    current_attempt
+        .validate_successor(&selected_attempt_revision)
+        .unwrap();
+    let mut accepted_attempt = selected_attempt_revision.clone();
+    accepted_attempt.revision_id = revision();
+    accepted_attempt.predecessor_revision_id = Some(selected_attempt_revision.revision_id);
+    accepted_attempt.revision_generation += 1;
+    accepted_attempt.adoption_status = AttemptAdoptionStatus::Integrated;
+    accepted_attempt.integration_event_refs = vec![integration_id];
+    accepted_attempt.verification = AttemptVerification::Passed;
+    accepted_attempt.parent_verification_refs = vec![verifier_ref.clone()];
+    accepted_attempt.source_watermark += 1;
+    selected_attempt_revision
+        .validate_successor(&accepted_attempt)
+        .unwrap();
+    let mut selected_group = current_group.clone();
+    selected_group.revision_id = revision();
+    selected_group.predecessor_revision_id = Some(current_group.revision_id);
+    selected_group.revision_generation = 2;
+    selected_group.resolution_status = CompetingResolutionStatus::Selected;
+    selected_group.selected_attempt_id = Some(attempt_id);
+    selected_group.resolution_evidence_refs = vec![verifier_ref];
+    selected_group.source_watermark += 1;
+    current_group.validate_successor(&selected_group).unwrap();
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                [JournalPayload::AttemptRecorded(Box::new(
+                    selected_attempt_revision,
+                ))]
+                .into_iter()
+                .map(|payload| {
+                    JournalEventDraft::runtime(41, [7; 32], "s17-anchor-revalidation", payload)
+                })
+                .collect(),
+            )
+            .unwrap(),
+            41,
+        )
+        .await
+        .unwrap();
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                [
+                    JournalPayload::IntegrationEventRecorded(Box::new(integration)),
+                    JournalPayload::AttemptRecorded(Box::new(accepted_attempt)),
+                    JournalPayload::CompetingAttemptGroupRecorded(Box::new(selected_group)),
+                ]
+                .into_iter()
+                .map(|payload| {
+                    JournalEventDraft::runtime(42, [7; 32], "s17-anchor-revalidation", payload)
+                })
+                .collect(),
+            )
+            .unwrap(),
+            42,
+        )
+        .await
+        .unwrap();
+    let before_revalidation = handle.project().await.unwrap();
+    action.handle(action_request).await.unwrap();
+    let after_revalidation = handle.project().await.unwrap();
+    assert_eq!(
+        after_revalidation.frontier,
+        before_revalidation.frontier + 1
+    );
+    assert!(
+        action
+            .supports_compatible_lineage_transfer(recovery_application_id)
+            .await
+            .unwrap()
+    );
+    let revalidated_frontier = after_revalidation.frontier;
+    action.handle(action_request).await.unwrap();
+    assert_eq!(
+        handle.project().await.unwrap().frontier,
+        revalidated_frontier
+    );
+
+    let projected = handle.project().await.unwrap();
+    let attempts = AttemptCurrentView::from_snapshot(&projected).unwrap();
+    let accepted = attempts.attempts[&attempt_id].clone();
+    let late_group_id = CompetingAttemptGroupId::new_v7();
+    let mut competitor = new_attempt(
+        accepted.task_id,
+        accepted.workstream_id,
+        accepted.repository_instance_id,
+        accepted.worktree_instance_ids.clone(),
+        vec![],
+        accepted.strategy_contract.clone(),
+        accepted.source_watermark + 1,
+    )
+    .unwrap();
+    competitor.competing_group_ids = vec![late_group_id];
+    competitor.validate().unwrap();
+    let mut with_late_group = accepted.clone();
+    with_late_group.revision_id = revision();
+    with_late_group.predecessor_revision_id = Some(accepted.revision_id);
+    with_late_group.revision_generation += 1;
+    with_late_group.competing_group_ids.push(late_group_id);
+    with_late_group.competing_group_ids.sort();
+    with_late_group.source_watermark += 1;
+    accepted.validate_successor(&with_late_group).unwrap();
+    let mut member_attempt_ids = vec![attempt_id, competitor.attempt_id];
+    member_attempt_ids.sort();
+    let late_group = CompetingAttemptGroup {
+        competing_group_id: late_group_id,
+        revision_id: revision(),
+        predecessor_revision_id: None,
+        revision_generation: 1,
+        task_id: accepted.task_id,
+        decision_boundary_ref: "recovery-anchor-late-current-acceptance".into(),
+        comparison_contract_ref: None,
+        origin_workstream_id: Some(accepted.workstream_id),
+        origin_episode_id: None,
+        member_workstream_ids: vec![accepted.workstream_id],
+        member_attempt_ids,
+        candidate_snapshot_refs: vec![],
+        target_refs: vec![],
+        conflict_kind: CompetingConflictKind::AlternativeStrategy,
+        resolution_status: CompetingResolutionStatus::Open,
+        selected_attempt_id: None,
+        partially_integrated_attempt_ids: vec![],
+        resolution_evidence_refs: vec![],
+        source_watermark: with_late_group.source_watermark + 1,
+    };
+    late_group.validate().unwrap();
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                [
+                    JournalPayload::AttemptRecorded(Box::new(with_late_group.clone())),
+                    JournalPayload::AttemptRecorded(Box::new(competitor)),
+                    JournalPayload::CompetingAttemptGroupRecorded(Box::new(late_group.clone())),
+                ]
+                .into_iter()
+                .map(|payload| {
+                    JournalEventDraft::runtime(43, [7; 32], "s17-anchor-late-group", payload)
+                })
+                .collect(),
+            )
+            .unwrap(),
+            43,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !action
+            .supports_compatible_lineage_transfer(recovery_application_id)
+            .await
+            .unwrap()
+    );
+    let unresolved_frontier = handle.project().await.unwrap().frontier;
+    action.handle(action_request).await.unwrap();
+    assert_eq!(
+        handle.project().await.unwrap().frontier,
+        unresolved_frontier
+    );
+
+    let mut selected_late_group = late_group;
+    let late_group_root_revision = selected_late_group.revision_id;
+    selected_late_group.revision_id = revision();
+    selected_late_group.predecessor_revision_id = Some(late_group_root_revision);
+    selected_late_group.revision_generation = 2;
+    selected_late_group.resolution_status = CompetingResolutionStatus::Selected;
+    selected_late_group.selected_attempt_id = Some(attempt_id);
+    selected_late_group.resolution_evidence_refs = vec!["typed:recovery-anchor-selected".into()];
+    selected_late_group.source_watermark += 1;
+    let current_late_group = AttemptCurrentView::from_snapshot(&handle.project().await.unwrap())
+        .unwrap()
+        .competing_groups[&late_group_id]
+        .clone();
+    current_late_group
+        .validate_successor(&selected_late_group)
+        .unwrap();
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                [JournalPayload::CompetingAttemptGroupRecorded(Box::new(
+                    selected_late_group,
+                ))]
+                .into_iter()
+                .map(|payload| {
+                    JournalEventDraft::runtime(44, [7; 32], "s17-anchor-late-selected", payload)
+                })
+                .collect(),
+            )
+            .unwrap(),
+            44,
+        )
+        .await
+        .unwrap();
+    let before_late_revalidation = handle.project().await.unwrap().frontier;
+    action.handle(action_request).await.unwrap();
+    let after_late_revalidation = handle.project().await.unwrap();
+    assert_eq!(
+        after_late_revalidation.frontier,
+        before_late_revalidation + 1
+    );
+    assert!(
+        action
+            .supports_compatible_lineage_transfer(recovery_application_id)
+            .await
+            .unwrap()
+    );
+    let final_frontier = after_late_revalidation.frontier;
+    action.handle(action_request).await.unwrap();
+    assert_eq!(handle.project().await.unwrap().frontier, final_frontier);
+
+    let rebuilt = RecoveryCurrentView::from_snapshot(&after_late_revalidation).unwrap();
+    let mut missing_coverage = rebuilt.state.applications[&recovery_application_id].clone();
+    missing_coverage.anchor_verifier_receipts.clear();
+    assert!(!missing_coverage.has_complete_recorded_lineage_transfer_receipts());
+    let mut tampered = rebuilt.state.applications[&recovery_application_id].clone();
+    tampered.anchor_verifier_receipts[0]
+        .affected_relative_path
+        .cas_ref = "66".repeat(32);
+    assert!(!tampered.has_complete_recorded_lineage_transfer_receipts());
+    let frontier = final_frontier;
+    let replay = action.handle(action_request).await.unwrap();
+    assert!(matches!(
+        replay,
+        evertrace_engine::RecoveryActionOutcome::Application {
+            recovery_application_id: id,
+            replayed: true,
+            ..
+        } if id == recovery_application_id
+    ));
+    assert_eq!(handle.project().await.unwrap().frontier, frontier);
+    action.shutdown_and_drain().await;
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let restarted = JournalWriter::open(root.path()).await.unwrap();
+    let full = restarted.full_projection().await.unwrap();
+    let full_current = RecoveryCurrentView::from_snapshot(&full).unwrap();
+    assert!(
+        full_current.state.applications[&recovery_application_id]
+            .has_complete_recorded_lineage_transfer_receipts()
+    );
+    let (restart_handle, restart_task) = spawn_writer(restarted, 8).unwrap();
+    let restart_projection = restart_handle.project().await.unwrap();
+    assert_eq!(restart_projection, full);
+    let restart_current = RecoveryCurrentView::from_snapshot(&restart_projection).unwrap();
+    assert!(
+        restart_current.state.applications[&recovery_application_id]
+            .has_complete_recorded_lineage_transfer_receipts()
+    );
+    let restart_action = evertrace_engine::RecoveryActionService::new(
+        snapshot,
+        restart_handle.clone(),
+        barrier.mutation_fence(),
+    );
+    assert!(
+        restart_action
+            .supports_compatible_lineage_transfer(recovery_application_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        restart_handle.project().await.unwrap().frontier,
+        full.frontier
+    );
+    restart_action.shutdown_and_drain().await;
+    restart_handle.shutdown().await.unwrap();
+    restart_task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1831,6 +2579,7 @@ async fn durable_complete_wins_over_late_timeout_proposal_without_a_revision_for
                 .into_iter()
                 .collect(),
             bundles: [(bundle.recovery_bundle_id, bundle)].into_iter().collect(),
+            applications: BTreeMap::new(),
         },
     };
     let late_timeout = RecoveryCaptureRequest {
@@ -1864,22 +2613,45 @@ async fn durable_complete_wins_over_late_timeout_proposal_without_a_revision_for
 
 #[test]
 fn application_successors_and_lineage_transfer_are_fail_closed() {
+    let result_observation = SourceObservationId::from_digest([0x33; 32]);
+    let post_snapshot = snapshot_id();
     let current = RecoveryApplication {
         recovery_application_id: application_id(),
         revision_id: revision(),
         parent_revision_id: None,
         recovery_bundle_id: evertrace_domain::ids::RecoveryBundleId::new_v7(),
         target_worktree_instance_id: worktree_id(),
-        pre_application_snapshot_id: Some(snapshot_id()),
-        post_application_snapshot_id: Some(snapshot_id()),
-        application_kind: RecoveryApplicationKind::FileRestore,
-        application_evidence_refs: vec!["normal-tool-input".into()],
-        verification_refs: Vec::new(),
-        application_status: RecoveryApplicationStatus::PartiallyApplied,
+        pre_application_snapshot_id: snapshot_id(),
+        post_application_snapshot_id: None,
+        application_kind: RecoveryApplicationKind::Patch,
+        ticket_claims_version: 1,
+        selected_cas_refs: vec![CasId::from_digest([0x22; 32])],
+        input_delivery_kind: RecoveryInputDeliveryKind::PatchStdin,
+        input_delivery_state: RecoveryInputDeliveryState::Admitted,
+        operation_id: None,
+        operation_revision: None,
+        execution_lane_id: None,
+        capture_receipt_revision_id: None,
+        scope_effect_ids: vec![],
+        input_source_observation_ids: vec![],
+        result_source_observation_ids: vec![],
+        verifier_receipts: vec![],
+        relevant_attempt_anchor_ids: vec![],
+        attempt_anchor_claims: vec![],
+        anchor_verifier_receipts: vec![],
+        application_status: RecoveryApplicationStatus::Unknown,
         created_at_us: 10,
     };
     current.validate().unwrap();
-    assert!(!current.supports_compatible_lineage_transfer());
+    let mut candidate_only_application = current.clone();
+    candidate_only_application.relevant_attempt_anchor_ids = vec![AttemptId::new_v7()];
+    candidate_only_application.validate().unwrap();
+    assert!(
+        build_recovery_application_relation_rows(&[candidate_only_application])
+            .unwrap()
+            .iter()
+            .all(|row| row.kind != RecoveryRelationKind::ApplicationToAttemptAnchor)
+    );
     let no_evidence_progress = RecoveryApplication {
         revision_id: revision(),
         parent_revision_id: Some(current.revision_id),
@@ -1887,36 +2659,289 @@ fn application_successors_and_lineage_transfer_are_fail_closed() {
         ..current.clone()
     };
     assert!(!no_evidence_progress.is_successor_of(&current));
-    let failed = RecoveryApplication {
+    let partial = RecoveryApplication {
         revision_id: revision(),
         parent_revision_id: Some(current.revision_id),
-        application_evidence_refs: vec!["normal-tool-input".into(), "typed-result".into()],
-        application_status: RecoveryApplicationStatus::Failed,
+        post_application_snapshot_id: Some(post_snapshot),
+        input_delivery_state: RecoveryInputDeliveryState::Delivered,
+        operation_id: Some(OperationId::new_v7()),
+        operation_revision: Some(1),
+        execution_lane_id: Some(ExecutionLaneId::new_v7()),
+        capture_receipt_revision_id: Some(CaptureReceiptId::new_v7()),
+        scope_effect_ids: vec![ScopeEffectId::new_v7()],
+        input_source_observation_ids: vec![SourceObservationId::from_digest([0x32; 32])],
+        result_source_observation_ids: vec![result_observation],
+        verifier_receipts: vec![RecoveryVerifierReceipt {
+            verification_revision: 1,
+            verifier_version: 1,
+            result_source_observation_id: result_observation,
+            post_application_snapshot_id: post_snapshot,
+            outcome: RecoveryVerificationOutcome::PartiallyApplied,
+        }],
+        application_status: RecoveryApplicationStatus::PartiallyApplied,
         created_at_us: 20,
         ..current.clone()
     };
-    assert!(failed.is_successor_of(&current));
+    assert!(partial.is_successor_of(&current));
+    let mut skipped_receipts = partial.verifier_receipts.clone();
+    skipped_receipts.push(RecoveryVerifierReceipt {
+        verification_revision: 2,
+        verifier_version: 1,
+        result_source_observation_id: result_observation,
+        post_application_snapshot_id: post_snapshot,
+        outcome: RecoveryVerificationOutcome::Applied,
+    });
+    let skipped_from_empty_history = RecoveryApplication {
+        revision_id: revision(),
+        parent_revision_id: Some(current.revision_id),
+        verifier_receipts: skipped_receipts.clone(),
+        application_status: RecoveryApplicationStatus::Applied,
+        created_at_us: 30,
+        ..partial.clone()
+    };
+    assert!(!skipped_from_empty_history.is_successor_of(&current));
+    let mut applied_receipts = partial.verifier_receipts.clone();
+    applied_receipts.push(RecoveryVerifierReceipt {
+        verification_revision: 2,
+        verifier_version: 1,
+        result_source_observation_id: result_observation,
+        post_application_snapshot_id: post_snapshot,
+        outcome: RecoveryVerificationOutcome::Applied,
+    });
+    let applied = RecoveryApplication {
+        revision_id: revision(),
+        parent_revision_id: Some(partial.revision_id),
+        verifier_receipts: applied_receipts,
+        application_status: RecoveryApplicationStatus::Applied,
+        created_at_us: 30,
+        ..partial.clone()
+    };
+    assert!(applied.is_successor_of(&partial));
+    let mut applied_verification_receipts = applied.verifier_receipts.clone();
+    applied_verification_receipts.push(RecoveryVerifierReceipt {
+        verification_revision: 3,
+        verifier_version: 1,
+        result_source_observation_id: result_observation,
+        post_application_snapshot_id: post_snapshot,
+        outcome: RecoveryVerificationOutcome::Applied,
+    });
+    let applied_verification = RecoveryApplication {
+        revision_id: revision(),
+        parent_revision_id: Some(applied.revision_id),
+        verifier_receipts: applied_verification_receipts,
+        created_at_us: 40,
+        ..applied.clone()
+    };
+    assert!(applied_verification.is_successor_of(&applied));
+    let skipped_from_partial = RecoveryApplication {
+        revision_id: revision(),
+        parent_revision_id: Some(partial.revision_id),
+        verifier_receipts: applied_verification.verifier_receipts.clone(),
+        application_status: RecoveryApplicationStatus::Applied,
+        created_at_us: 40,
+        ..partial.clone()
+    };
+    assert!(!skipped_from_partial.is_successor_of(&partial));
+    let mut failed_receipts = partial.verifier_receipts.clone();
+    failed_receipts.push(RecoveryVerifierReceipt {
+        verification_revision: 2,
+        verifier_version: 1,
+        result_source_observation_id: result_observation,
+        post_application_snapshot_id: post_snapshot,
+        outcome: RecoveryVerificationOutcome::NotApplied,
+    });
+    let failed = RecoveryApplication {
+        revision_id: revision(),
+        parent_revision_id: Some(partial.revision_id),
+        verifier_receipts: failed_receipts,
+        application_status: RecoveryApplicationStatus::Failed,
+        created_at_us: 30,
+        ..partial.clone()
+    };
+    assert!(failed.is_successor_of(&partial));
     let no_terminal_verification = RecoveryApplication {
         revision_id: revision(),
         parent_revision_id: Some(failed.revision_id),
-        created_at_us: 30,
+        created_at_us: 40,
         ..failed.clone()
     };
     assert!(!no_terminal_verification.is_successor_of(&failed));
+    let mut verification_receipts = failed.verifier_receipts.clone();
+    verification_receipts.push(RecoveryVerifierReceipt {
+        verification_revision: 3,
+        verifier_version: 1,
+        result_source_observation_id: result_observation,
+        post_application_snapshot_id: post_snapshot,
+        outcome: RecoveryVerificationOutcome::NotApplied,
+    });
     let verified_terminal = RecoveryApplication {
         revision_id: revision(),
         parent_revision_id: Some(failed.revision_id),
-        verification_refs: vec!["typed-verifier".into()],
-        created_at_us: 30,
+        verifier_receipts: verification_receipts,
+        created_at_us: 40,
         ..failed.clone()
     };
     assert!(verified_terminal.is_successor_of(&failed));
-    let mut forged = failed;
+    let mut duplicate_identity_receipts = verified_terminal.verifier_receipts.clone();
+    duplicate_identity_receipts.push(RecoveryVerifierReceipt {
+        verification_revision: 4,
+        verifier_version: 1,
+        result_source_observation_id: result_observation,
+        post_application_snapshot_id: post_snapshot,
+        outcome: RecoveryVerificationOutcome::Applied,
+    });
+    let duplicate_identity = RecoveryApplication {
+        revision_id: revision(),
+        parent_revision_id: Some(verified_terminal.revision_id),
+        verifier_receipts: duplicate_identity_receipts,
+        created_at_us: 50,
+        ..verified_terminal.clone()
+    };
+    assert!(!duplicate_identity.is_successor_of(&verified_terminal));
+    let mut missing_revision_receipts = verified_terminal.verifier_receipts.clone();
+    missing_revision_receipts.push(RecoveryVerifierReceipt {
+        verification_revision: 5,
+        verifier_version: 1,
+        result_source_observation_id: result_observation,
+        post_application_snapshot_id: post_snapshot,
+        outcome: RecoveryVerificationOutcome::NotApplied,
+    });
+    let missing_revision = RecoveryApplication {
+        revision_id: revision(),
+        parent_revision_id: Some(verified_terminal.revision_id),
+        verifier_receipts: missing_revision_receipts,
+        created_at_us: 50,
+        ..verified_terminal.clone()
+    };
+    assert!(missing_revision.validate().is_err());
+    let mut forged = partial;
     forged.recovery_bundle_id = evertrace_domain::ids::RecoveryBundleId::new_v7();
     assert!(!forged.is_successor_of(&current));
     assert!(
-        serde_json::from_str::<JournalPayload>(r#"{"RecoveryApplicationRecorded":{}}"#).is_err()
+        serde_json::to_string(&JournalPayload::RecoveryApplicationRecorded(Box::new(
+            current
+        )))
+        .is_ok()
     );
+
+    let anchor_id = evertrace_domain::ids::AttemptId::new_v7();
+    let source_repository = RepositoryId::new_v7();
+    let source_worktree = WorktreeId::from_str("wt:01890f47-6a4a-7cc1-98b9-01890f476a11").unwrap();
+    let source_snapshot = WorktreeSnapshotId::new_v7();
+    let path_ref = evertrace_domain::repository::RecoveryProtectedRef {
+        cas_ref: "44".repeat(32),
+        protected_length: 11,
+        original_length: 11,
+        protected_secret_digest: None,
+        redaction_spans: 0,
+    };
+    let claim = RecoveryAttemptAnchorClaim {
+        attempt_id: anchor_id,
+        attempt_revision_id: revision(),
+        strategy_contract_fingerprint: [0x55; 32],
+        source_repository_instance_id: source_repository,
+        source_worktree_instance_id: source_worktree,
+        source_snapshot_id: source_snapshot,
+        affected_relative_path: path_ref.clone(),
+        source_file_identity: RecoveryConfinedFileIdentity {
+            device: 1,
+            inode: 2,
+            size: 3,
+            mtime_seconds: 4,
+            mtime_nanoseconds: 5,
+            ctime_seconds: 6,
+            ctime_nanoseconds: 7,
+        },
+        competing_groups: vec![],
+    };
+    let mut transferable = applied;
+    transferable.relevant_attempt_anchor_ids = vec![anchor_id];
+    transferable.attempt_anchor_claims = vec![claim.clone()];
+    transferable.anchor_verifier_receipts = vec![RecoveryAnchorVerifierReceipt {
+        verifier_version: RECOVERY_ANCHOR_VERIFIER_VERSION,
+        attempt_id: anchor_id,
+        source_attempt_revision_id: claim.attempt_revision_id,
+        revalidated_attempt_revision_id: claim.attempt_revision_id,
+        strategy_contract_fingerprint: claim.strategy_contract_fingerprint,
+        source_repository_instance_id: source_repository,
+        source_worktree_instance_id: source_worktree,
+        source_snapshot_id: source_snapshot,
+        target_repository_instance_id: source_repository,
+        target_worktree_instance_id: transferable.target_worktree_instance_id,
+        post_application_snapshot_id: transferable.post_application_snapshot_id.unwrap(),
+        affected_relative_path: path_ref,
+        competing_groups: vec![],
+        revalidated_competing_groups: vec![],
+        operation_id: transferable.operation_id.unwrap(),
+        operation_revision: transferable.operation_revision.unwrap(),
+        execution_lane_id: transferable.execution_lane_id.unwrap(),
+        capture_receipt_revision_id: transferable.capture_receipt_revision_id.unwrap(),
+        scope_effect_ids: transferable.scope_effect_ids.clone(),
+        result_source_observation_id: result_observation,
+        recovery_verification_revision: 2,
+    }];
+    transferable.validate().unwrap();
+    assert!(transferable.has_complete_recorded_lineage_transfer_receipts());
+    let mut source_group_id = CompetingAttemptGroupId::new_v7();
+    let mut later_group_id = CompetingAttemptGroupId::new_v7();
+    if later_group_id < source_group_id {
+        std::mem::swap(&mut source_group_id, &mut later_group_id);
+    }
+    let source_group = evertrace_domain::repository::RecoveryCompetingGroupClaim {
+        competing_group_id: source_group_id,
+        revision_id: revision(),
+        resolution_status: CompetingResolutionStatus::Selected,
+    };
+    let later_group = evertrace_domain::repository::RecoveryCompetingGroupClaim {
+        competing_group_id: later_group_id,
+        revision_id: revision(),
+        resolution_status: CompetingResolutionStatus::Selected,
+    };
+    let mut compatible_group_superset = transferable.clone();
+    compatible_group_superset.attempt_anchor_claims[0].competing_groups =
+        vec![source_group.clone()];
+    compatible_group_superset.anchor_verifier_receipts[0].competing_groups =
+        vec![source_group.clone()];
+    compatible_group_superset.anchor_verifier_receipts[0].revalidated_competing_groups =
+        vec![source_group, later_group];
+    compatible_group_superset.validate().unwrap();
+    assert!(compatible_group_superset.has_complete_recorded_lineage_transfer_receipts());
+    let mut rejected_all = compatible_group_superset.clone();
+    rejected_all.anchor_verifier_receipts[0].revalidated_competing_groups[0].resolution_status =
+        CompetingResolutionStatus::RejectedAll;
+    assert!(rejected_all.validate().is_err());
+    let mut revalidated = compatible_group_superset.clone();
+    revalidated.revision_id = revision();
+    revalidated.parent_revision_id = Some(compatible_group_superset.revision_id);
+    revalidated.anchor_verifier_receipts[0].revalidated_attempt_revision_id = revision();
+    revalidated.anchor_verifier_receipts[0].revalidated_competing_groups[0].revision_id =
+        revision();
+    revalidated.created_at_us += 1;
+    assert!(revalidated.is_successor_of(&compatible_group_superset));
+    let mut no_revalidation_progress = compatible_group_superset.clone();
+    no_revalidation_progress.revision_id = revision();
+    no_revalidation_progress.parent_revision_id = Some(compatible_group_superset.revision_id);
+    no_revalidation_progress.created_at_us += 1;
+    assert!(!no_revalidation_progress.is_successor_of(&compatible_group_superset));
+    let mut deleted_receipt = compatible_group_superset.clone();
+    deleted_receipt.revision_id = revision();
+    deleted_receipt.parent_revision_id = Some(compatible_group_superset.revision_id);
+    deleted_receipt.anchor_verifier_receipts.clear();
+    deleted_receipt.created_at_us += 1;
+    assert!(!deleted_receipt.is_successor_of(&compatible_group_superset));
+    let mut missing = transferable.clone();
+    missing.anchor_verifier_receipts.clear();
+    assert!(!missing.has_complete_recorded_lineage_transfer_receipts());
+    let mut cross_repository = transferable.clone();
+    cross_repository.anchor_verifier_receipts[0].target_repository_instance_id =
+        RepositoryId::new_v7();
+    assert!(!cross_repository.has_complete_recorded_lineage_transfer_receipts());
+    let mut same_worktree = transferable.clone();
+    same_worktree.anchor_verifier_receipts[0].target_worktree_instance_id = source_worktree;
+    assert!(!same_worktree.has_complete_recorded_lineage_transfer_receipts());
+    let mut strategy_drift = transferable;
+    strategy_drift.anchor_verifier_receipts[0].strategy_contract_fingerprint = [0x77; 32];
+    assert!(!strategy_drift.has_complete_recorded_lineage_transfer_receipts());
 }
 #[test]
 fn runtime_v2_layout_and_spool_lookup_fail_closed() {
@@ -2087,26 +3112,29 @@ async fn typed_async_dispatcher_serves_the_bounded_sync_hook_client_over_uds() {
     let terminal_revision_id = RevisionId::new_v7();
     let expected = locator.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let server_task = tokio::spawn(server.run_dispatch(shutdown_rx, move |command| {
-        let expected = expected.clone();
-        async move {
-            match command {
-                evertrace_protocol::command::Command::RecoveryBarrier(value)
-                    if value == expected =>
-                {
-                    Ok(Response::RecoveryTerminal(RecoveryTerminalResponse {
-                        recovery_capture_request_id: value.recovery_capture_request_id,
-                        pending_revision_id: value.pending_revision_id,
-                        terminal_revision_id,
-                        status: RecoveryRequestStatus::TimedOut,
-                        recovery_bundle_id: None,
-                        durable_terminal_proven: true,
-                    }))
+    let server_task = tokio::spawn(server.run_dispatch(
+        shutdown_rx,
+        move |_request_id, command| {
+            let expected = expected.clone();
+            async move {
+                match command {
+                    evertrace_protocol::command::Command::RecoveryBarrier(value)
+                        if value == expected =>
+                    {
+                        Ok(Response::RecoveryTerminal(RecoveryTerminalResponse {
+                            recovery_capture_request_id: value.recovery_capture_request_id,
+                            pending_revision_id: value.pending_revision_id,
+                            terminal_revision_id,
+                            status: RecoveryRequestStatus::TimedOut,
+                            recovery_bundle_id: None,
+                            durable_terminal_proven: true,
+                        }))
+                    }
+                    _ => Err(evertrace_domain::error::ErrorCode::InvalidInput),
                 }
-                _ => Err(evertrace_domain::error::ErrorCode::InvalidInput),
             }
-        }
-    }));
+        },
+    ));
     let response = tokio::task::spawn_blocking(move || {
         request_recovery_barrier_sync(&socket, "hook-s16", locator, Duration::from_secs(1))
     })

@@ -8,6 +8,7 @@ use std::{
     cell::Cell,
     collections::BTreeSet,
     io::{Read, Write},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -163,6 +164,12 @@ pub enum GitProbeOp {
         tip: GitOid,
     },
     LsFilesStage,
+    LsFilesStagePath {
+        path: ValidatedRelativeGitPath,
+    },
+    LsTreeHeadPath {
+        path: ValidatedRelativeGitPath,
+    },
     LsFilesOthersStandard,
     LsFilesOthersIncludingIgnored,
     LsFilesOthersIgnoredOnly,
@@ -225,6 +232,14 @@ impl GitProbeOp {
                 argv.extend(["diff", "--raw", "-z", base.as_str(), tip.as_str()].map(str::to_owned))
             }
             Self::LsFilesStage => argv.extend(["ls-files", "--stage", "-z"].map(str::to_owned)),
+            Self::LsFilesStagePath { path } => {
+                argv.extend(["ls-files", "--stage", "-z", "--"].map(str::to_owned));
+                argv.push(path.as_str().to_owned());
+            }
+            Self::LsTreeHeadPath { path } => {
+                argv.extend(["ls-tree", "-z", "HEAD", "--"].map(str::to_owned));
+                argv.push(path.as_str().to_owned());
+            }
             Self::LsFilesOthersStandard => {
                 argv.extend(["ls-files", "--others", "-z", "--exclude-standard"].map(str::to_owned))
             }
@@ -390,6 +405,66 @@ pub struct RecoveryGitCaptureEvidence {
     pub omissions: Vec<RecoveryGitCaptureOmission>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitAdminIdentity {
+    pub filesystem: FilesystemIdentity,
+    pub owner: u32,
+    pub mode: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTreeEntryProof {
+    pub mode: String,
+    pub object_kind: String,
+    pub oid: GitOid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitIndexEntryProof {
+    pub mode: String,
+    pub oid: GitOid,
+    pub stage: u8,
+}
+
+/// A pathspec admitted by the recovery patch parser. Its private storage keeps
+/// arbitrary argv out of the closed Git probe operation catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedRelativeGitPath(String);
+
+impl ValidatedRelativeGitPath {
+    pub fn parse(path: &Path) -> Result<Self, RepositoryProbeError> {
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 4096
+            || path.is_absolute()
+            || path.components().any(|component| {
+                !matches!(component, std::path::Component::Normal(value) if value != ".git")
+            })
+        {
+            return Err(RepositoryProbeError::InvalidInput);
+        }
+        let value = path
+            .to_str()
+            .filter(|value| !value.chars().any(char::is_control))
+            .ok_or(RepositoryProbeError::InvalidInput)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AffectedPathGitProof {
+    pub head_entry: GitTreeEntryProof,
+    pub index_entry: GitIndexEntryProof,
+    pub git_dir: String,
+    pub git_dir_identity: GitAdminIdentity,
+    pub common_dir: String,
+    pub common_dir_identity: GitAdminIdentity,
+}
+
 impl std::fmt::Debug for RecoveryGitCaptureEvidence {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -436,6 +511,158 @@ pub fn probe_recovery_capture_scoped_pinned(
     limits.validate()?;
     validate_pinned_cwd(cwd, expected_identity)?;
     probe_recovery_capture_at(cwd, limits, scope)
+}
+
+pub fn probe_affected_path_git_proof_pinned(
+    cwd: &Path,
+    expected_identity: FilesystemIdentity,
+    relative_path: &Path,
+    limits: &ProbeLimits,
+) -> Result<Option<AffectedPathGitProof>, RepositoryProbeError> {
+    limits.validate()?;
+    validate_pinned_cwd(cwd, expected_identity)?;
+    let path = ValidatedRelativeGitPath::parse(relative_path)?;
+    let path_bytes = path.as_str().as_bytes().to_vec();
+    let Some(git_dir_raw) = required_probe_line(cwd, &GitProbeOp::RevParseGitDir, limits) else {
+        return Ok(None);
+    };
+    let Some(common_dir_raw) = required_probe_line(cwd, &GitProbeOp::RevParseCommonDir, limits)
+    else {
+        return Ok(None);
+    };
+    let Some(index_output) = required_probe_output(
+        cwd,
+        &GitProbeOp::LsFilesStagePath { path: path.clone() },
+        limits,
+    ) else {
+        return Ok(None);
+    };
+    let Some(tree_output) =
+        required_probe_output(cwd, &GitProbeOp::LsTreeHeadPath { path }, limits)
+    else {
+        return Ok(None);
+    };
+    let Some(index_entry) = exact_index_entry(&index_output, &path_bytes, limits.max_records)
+    else {
+        return Ok(None);
+    };
+    let Some(head_entry) = exact_tree_entry(&tree_output, &path_bytes, limits.max_records) else {
+        return Ok(None);
+    };
+    let git_dir_path = pinned_absolutize(cwd, Some(cwd), &git_dir_raw);
+    let common_dir_path = pinned_absolutize(cwd, Some(cwd), &common_dir_raw);
+    let Some(git_dir_identity) = admin_identity(&git_dir_path) else {
+        return Ok(None);
+    };
+    let Some(common_dir_identity) = admin_identity(&common_dir_path) else {
+        return Ok(None);
+    };
+    Ok(Some(AffectedPathGitProof {
+        head_entry,
+        index_entry,
+        git_dir: git_dir_path.to_string_lossy().into_owned(),
+        git_dir_identity,
+        common_dir: common_dir_path.to_string_lossy().into_owned(),
+        common_dir_identity,
+    }))
+}
+
+fn required_probe_line(cwd: &Path, op: &GitProbeOp, limits: &ProbeLimits) -> Option<String> {
+    first_line(&required_probe_output(cwd, op, limits)?)
+}
+
+fn required_probe_output(cwd: &Path, op: &GitProbeOp, limits: &ProbeLimits) -> Option<Vec<u8>> {
+    let output = run_op(cwd, op, limits).ok()?;
+    (output.code == Some(0) && !output.truncated && !output.timed_out).then_some(output.stdout)
+}
+
+fn exact_index_entry(output: &[u8], path: &[u8], max_records: usize) -> Option<GitIndexEntryProof> {
+    let records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect::<Vec<_>>();
+    if records.len() > max_records {
+        return None;
+    }
+    let matches = records
+        .into_iter()
+        .filter_map(|record| {
+            let tab = record.iter().position(|byte| *byte == b'\t')?;
+            (record.get(tab + 1..)? == path).then_some(&record[..tab])
+        })
+        .collect::<Vec<_>>();
+    let [metadata] = matches.as_slice() else {
+        return None;
+    };
+    let metadata = std::str::from_utf8(metadata).ok()?;
+    let mut fields = metadata.split(' ');
+    let mode = fields.next()?;
+    let oid = GitOid::parse(fields.next()?).ok()?;
+    let stage = fields.next()?.parse::<u8>().ok()?;
+    if fields.next().is_some()
+        || stage != 0
+        || mode.len() != 6
+        || !mode.bytes().all(|byte| (b'0'..=b'7').contains(&byte))
+    {
+        return None;
+    }
+    Some(GitIndexEntryProof {
+        mode: mode.into(),
+        oid,
+        stage,
+    })
+}
+
+fn exact_tree_entry(output: &[u8], path: &[u8], max_records: usize) -> Option<GitTreeEntryProof> {
+    let records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect::<Vec<_>>();
+    if records.len() > max_records {
+        return None;
+    }
+    let matches = records
+        .into_iter()
+        .filter_map(|record| {
+            let tab = record.iter().position(|byte| *byte == b'\t')?;
+            (record.get(tab + 1..)? == path).then_some(&record[..tab])
+        })
+        .collect::<Vec<_>>();
+    let [metadata] = matches.as_slice() else {
+        return None;
+    };
+    let metadata = std::str::from_utf8(metadata).ok()?;
+    let mut fields = metadata.split(' ');
+    let mode = fields.next()?;
+    let object_kind = fields.next()?;
+    let oid = GitOid::parse(fields.next()?).ok()?;
+    if fields.next().is_some()
+        || object_kind != "blob"
+        || mode.len() != 6
+        || !mode.bytes().all(|byte| (b'0'..=b'7').contains(&byte))
+    {
+        return None;
+    }
+    Some(GitTreeEntryProof {
+        mode: mode.into(),
+        object_kind: object_kind.into(),
+        oid,
+    })
+}
+
+fn admin_identity(path: &Path) -> Option<GitAdminIdentity> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    Some(GitAdminIdentity {
+        filesystem: FilesystemIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        owner: metadata.uid(),
+        mode: metadata.mode(),
+    })
 }
 
 fn probe_recovery_capture_at(
@@ -708,10 +935,17 @@ fn run_op(
     command
         .args(op.argv())
         .current_dir(cwd)
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_PAGER", "cat")
+        .env("HOME", "/nonexistent")
         .env("PAGER", "cat")
         .env("LC_ALL", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_CONFIG_HOME", "/nonexistent")
         .stdin(if stdin_bytes.is_some() {
             Stdio::piped()
         } else {
@@ -1827,6 +2061,73 @@ fn pinned_absolutize(cwd: &Path, logical_root: Option<&Path>, value: &str) -> Pa
 mod tests {
     use super::*;
 
+    fn test_git(cwd: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn affected_git_proof_is_path_local_under_unrelated_index_and_head_growth() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "evertrace-affected-proof-{}",
+            evertrace_domain::ids::CommandId::new_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "user.email", "probe@example.invalid"]);
+        test_git(&root, &["config", "user.name", "Probe"]);
+        std::fs::write(root.join("target.txt"), b"target\n").unwrap();
+        for index in 0..32 {
+            std::fs::write(root.join(format!("unrelated-{index:02}.txt")), b"u\n").unwrap();
+        }
+        test_git(&root, &["add", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let confined = evertrace_capture::ConfinedRoot::open_owned_private(&root).unwrap();
+        let cwd = confined.proc_cwd_path().unwrap();
+        let metadata = std::fs::metadata(&cwd).unwrap();
+        let identity = FilesystemIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let limits = ProbeLimits {
+            max_stdout_bytes: 512,
+            max_records: 1,
+            ..ProbeLimits::default()
+        };
+        let before =
+            probe_affected_path_git_proof_pinned(&cwd, identity, Path::new("target.txt"), &limits)
+                .unwrap()
+                .unwrap();
+
+        std::fs::write(root.join("unrelated-00.txt"), b"changed\n").unwrap();
+        test_git(&root, &["add", "--", "unrelated-00.txt"]);
+        test_git(&root, &["commit", "--quiet", "-m", "unrelated"]);
+        let after_unrelated =
+            probe_affected_path_git_proof_pinned(&cwd, identity, Path::new("target.txt"), &limits)
+                .unwrap()
+                .unwrap();
+        assert_eq!(before, after_unrelated);
+
+        std::fs::write(root.join("target.txt"), b"target changed\n").unwrap();
+        test_git(&root, &["add", "--", "target.txt"]);
+        let changed_target =
+            probe_affected_path_git_proof_pinned(&cwd, identity, Path::new("target.txt"), &limits)
+                .unwrap()
+                .unwrap();
+        assert_ne!(before, changed_target);
+        drop(confined);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn pinned_recovery_git_cwd_never_follows_a_replaced_locator() {
         use std::os::unix::fs::MetadataExt;
@@ -1956,6 +2257,37 @@ mod tests {
         GitOid::parse(&value.to_string().repeat(40)).unwrap()
     }
 
+    #[test]
+    fn affected_entry_parsers_are_exact_and_reject_unmerged_or_malformed_records() {
+        let oid_a = "a".repeat(40);
+        let oid_b = "b".repeat(40);
+        let index = format!(
+            "100644 {oid_a} 0\tother.txt\0\
+             100644 {oid_b} 0\tdir/quoted name.txt\0"
+        );
+        let parsed = exact_index_entry(index.as_bytes(), b"dir/quoted name.txt", 8).unwrap();
+        assert_eq!(parsed.stage, 0);
+        assert_eq!(parsed.oid.as_str(), oid_b);
+        let unmerged = format!(
+            "100644 {oid_a} 1\ttracked.txt\0\
+             100644 {oid_b} 2\ttracked.txt\0"
+        );
+        assert!(exact_index_entry(unmerged.as_bytes(), b"tracked.txt", 8).is_none());
+        assert!(exact_index_entry(b"100644 bad 0\ttracked.txt\0", b"tracked.txt", 8).is_none());
+
+        let tree = format!("100644 blob {oid_a}\tdir/quoted name.txt\0");
+        let parsed = exact_tree_entry(tree.as_bytes(), b"dir/quoted name.txt", 8).unwrap();
+        assert_eq!(parsed.object_kind, "blob");
+        assert!(
+            exact_tree_entry(
+                format!("040000 tree {oid_a}\tdir/quoted name.txt\0").as_bytes(),
+                b"dir/quoted name.txt",
+                8,
+            )
+            .is_none()
+        );
+    }
+
     fn all_ops() -> Vec<GitProbeOp> {
         vec![
             GitProbeOp::RevParseGitDir,
@@ -1979,6 +2311,12 @@ mod tests {
                 tip: oid('d'),
             },
             GitProbeOp::LsFilesStage,
+            GitProbeOp::LsFilesStagePath {
+                path: ValidatedRelativeGitPath::parse(Path::new("tracked.txt")).unwrap(),
+            },
+            GitProbeOp::LsTreeHeadPath {
+                path: ValidatedRelativeGitPath::parse(Path::new("tracked.txt")).unwrap(),
+            },
             GitProbeOp::ConfigGetRemoteUrls,
         ]
     }
@@ -1995,6 +2333,7 @@ mod tests {
             "cat-file",
             "diff",
             "ls-files",
+            "ls-tree",
             "config",
         ];
         const FORBIDDEN: &[&str] = &[
@@ -2035,7 +2374,7 @@ mod tests {
             "config-set",
         ];
         let ops = all_ops();
-        assert_eq!(ops.len(), 16);
+        assert_eq!(ops.len(), 18);
         for op in &ops {
             let argv = op.argv();
             assert_eq!(argv[0], "--no-pager");

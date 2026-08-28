@@ -377,7 +377,9 @@ impl DurableSpool {
     }
 
     pub fn sealed_segments(&self, limit: usize) -> Result<Vec<SealedSegment>, SpoolError> {
-        if limit == 0 || limit > 64 {
+        let configured_limit = usize::try_from(self.limits.max_main_files)
+            .map_err(|_| SpoolError::InvalidConfiguration)?;
+        if limit == 0 || limit > configured_limit.max(64) {
             return Err(SpoolError::InvalidConfiguration);
         }
         self.validate_directories()?;

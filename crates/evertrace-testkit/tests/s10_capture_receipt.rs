@@ -23,8 +23,9 @@ use evertrace_domain::{
     evidence::{
         CanonicalEventFamily, CaptureCompleteness, ContentTrust, CorrelationAdmission,
         CorrelationField, CorrelationFieldClaim, EvidenceSourceKind, HostCorrelationEvidence,
-        IdentityStrength, ObservationRole, ReconciliationProvenance, SourceRevisionMode,
-        SourceRole,
+        IdentityStrength, ObservationRole, ReconciliationProvenance, SourceInstanceId,
+        SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole,
+        source_observation_id,
     },
     ids::{CaptureReceiptId, CommandId, ExecutionLaneId, SourceObservationId},
     work::{
@@ -1609,6 +1610,123 @@ async fn shared_budget_is_strict_and_large_history_makes_bounded_progress() {
     assert!(spool.pending_gap_markers().unwrap().is_empty());
     assert_eq!(spool.pending_quarantine(64).unwrap().len(), 64);
 
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn selected_drain_reaches_a_late_exact_observation_without_acknowledging_backlog() {
+    let temp = TempDir::new().unwrap();
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let mut snapshot = runtime_snapshot(temp.path());
+    snapshot.max_main_files = 32;
+    let manifest = manifest();
+    let mut runtime = CaptureRuntime::open(snapshot.clone()).unwrap();
+    for index in 0..17_u64 {
+        let source = format!("unrelated-{index:02}");
+        runtime
+            .capture(lifecycle_capture_input!(
+                &source,
+                "revision",
+                1,
+                1,
+                &format!("session-{index:02}"),
+                "agent",
+                &format!("lane-{index:02}"),
+                Some("spawn"),
+                true,
+                Some("child"),
+                Some(1),
+                &manifest.adapter_manifest_id,
+            ))
+            .unwrap();
+        runtime.seal_active().unwrap();
+    }
+    runtime
+        .capture(lifecycle_capture_input!(
+            "selected-source",
+            "selected-revision",
+            1,
+            1,
+            "selected-session",
+            "selected-agent",
+            "selected-lane",
+            Some("selected-spawn"),
+            true,
+            Some("selected-child"),
+            Some(1),
+            &manifest.adapter_manifest_id,
+        ))
+        .unwrap();
+    runtime.seal_active().unwrap();
+    let selected_id = source_observation_id(
+        &SourceInstanceId::parse("selected-source").unwrap(),
+        &SourceRevision::parse("selected-revision").unwrap(),
+        &SourceRecordIdentity::parse("record-1").unwrap(),
+    )
+    .unwrap();
+
+    let (spool, _) =
+        DurableSpool::open(snapshot.spool_dir.clone(), snapshot.spool_limits().unwrap()).unwrap();
+    let gap_path = spool
+        .write_gap_marker(&marker("gap:selected-unrelated"))
+        .unwrap();
+    let quarantine_path = snapshot
+        .spool_dir
+        .join("quarantine/selected-unrelated.spool");
+    let quarantine_bytes = b"unrelated-quarantine";
+    let mut quarantine = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&quarantine_path)
+        .unwrap();
+    use std::io::Write;
+    quarantine.write_all(quarantine_bytes).unwrap();
+    quarantine.sync_all().unwrap();
+    drop(quarantine);
+    let gap_bytes = fs::read(&gap_path).unwrap();
+
+    let writer = open_writer(&temp.path().join("store")).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 16).unwrap();
+    let ingestor =
+        EvidenceIngestor::new(snapshot.clone(), handle.clone(), CONFIG_HASH, "s10-v1").unwrap();
+    let selected = ingestor
+        .drain_observations_once(&[selected_id])
+        .await
+        .unwrap();
+    assert_eq!(selected.committed_frames, 1);
+    assert_eq!(selected.sealed_segments, 1);
+    let projected = handle.project().await.unwrap();
+    let receipts = evertrace_store::RecoveryEvidenceCurrentView::from_snapshot(&projected).unwrap();
+    assert!(receipts.receipt_for_observation(selected_id).is_some());
+    assert_eq!(
+        projected
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
+            .count(),
+        1
+    );
+    assert_eq!(fs::read(&gap_path).unwrap(), gap_bytes);
+    assert_eq!(fs::read(&quarantine_path).unwrap(), quarantine_bytes);
+    fs::remove_file(&gap_path).unwrap();
+    fs::remove_file(&quarantine_path).unwrap();
+    let (spool, _) =
+        DurableSpool::open(snapshot.spool_dir.clone(), snapshot.spool_limits().unwrap()).unwrap();
+    assert_eq!(spool.sealed_segments(32).unwrap().len(), 17);
+
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 16);
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 1);
+    assert_eq!(
+        ingestor
+            .drain_observations_once(&[selected_id])
+            .await
+            .unwrap()
+            .committed_frames,
+        0
+    );
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
 }

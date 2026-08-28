@@ -9,8 +9,9 @@ use evertrace_domain::{
     },
     ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
     repository::{
-        IntegrationEvent, RecoveryBundle, RecoveryCaptureRequest, RecoveryRequestStatus,
-        RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
+        IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
+        RecoveryRequestStatus, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
+        WorktreeTransition,
     },
     semantic::ResultEvidence,
     work::{
@@ -514,6 +515,7 @@ pub enum JournalPayload {
     SegmentationCorrectionRecorded(Box<SegmentationCorrection>),
     RecoveryCaptureRequestRecorded(Box<RecoveryCaptureRequest>),
     RecoveryBundleRecorded(Box<RecoveryBundle>),
+    RecoveryApplicationRecorded(Box<RecoveryApplication>),
     ExperimentRunRecorded(Box<ExperimentRun>),
     ResultEvidenceRecorded(Box<ResultEvidence>),
     WorkArtifactRecorded(Box<WorkArtifact>),
@@ -560,6 +562,7 @@ impl JournalPayload {
             Self::SegmentationCorrectionRecorded(_) => "segmentation_correction_recorded_v1",
             Self::RecoveryCaptureRequestRecorded(_) => "recovery_capture_request_recorded_v1",
             Self::RecoveryBundleRecorded(_) => "recovery_bundle_recorded_v1",
+            Self::RecoveryApplicationRecorded(_) => "recovery_application_recorded_v1",
             Self::ExperimentRunRecorded(_) => "experiment_run_recorded_v1",
             Self::ResultEvidenceRecorded(_) => "result_evidence_recorded_v1",
             Self::WorkArtifactRecorded(_) => "work_artifact_recorded_v1",
@@ -595,9 +598,9 @@ impl JournalPayload {
             | Self::WorkEpisodeRecorded(_)
             | Self::WorkCheckpointRecorded(_) => RecordClass::ObjectEvent,
             Self::SegmentationCorrectionRecorded(_) => RecordClass::ObjectEvent,
-            Self::RecoveryCaptureRequestRecorded(_) | Self::RecoveryBundleRecorded(_) => {
-                RecordClass::ObjectEvent
-            }
+            Self::RecoveryCaptureRequestRecorded(_)
+            | Self::RecoveryBundleRecorded(_)
+            | Self::RecoveryApplicationRecorded(_) => RecordClass::ObjectEvent,
             Self::ExperimentRunRecorded(_)
             | Self::ResultEvidenceRecorded(_)
             | Self::WorkArtifactRecorded(_) => RecordClass::ObjectEvent,
@@ -733,6 +736,9 @@ impl JournalPayload {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::RecoveryBundleRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::RecoveryApplicationRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::ExperimentRunRecorded(value) => {
@@ -890,6 +896,9 @@ impl JournalPayload {
                 tagged_json("recovery_capture_request_recorded", value)
             }
             Self::RecoveryBundleRecorded(value) => tagged_json("recovery_bundle_recorded", value),
+            Self::RecoveryApplicationRecorded(value) => {
+                tagged_json("recovery_application_recorded", value)
+            }
             Self::ExperimentRunRecorded(value) => tagged_json("experiment_run_recorded", value),
             Self::ResultEvidenceRecorded(value) => tagged_json("result_evidence_recorded", value),
             Self::WorkArtifactRecorded(value) => tagged_json("work_artifact_recorded", value),
@@ -1045,6 +1054,23 @@ fn validate_recovery_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
             _ => None,
         })
         .collect::<Vec<_>>();
+    for (bundle_index, event) in events.iter().enumerate() {
+        let JournalPayload::RecoveryBundleRecorded(bundle) = &event.payload else {
+            continue;
+        };
+        let snapshot_position = events.iter().position(|candidate| {
+            matches!(
+                &candidate.payload,
+                JournalPayload::WorktreeSnapshotRecorded(snapshot)
+                    if snapshot.worktree_snapshot_id == bundle.source_snapshot_id
+            )
+        });
+        if !bundle.attempt_anchor_claims.is_empty()
+            && snapshot_position.is_some_and(|snapshot_index| snapshot_index >= bundle_index)
+        {
+            return Err(StoreError::InvalidInput);
+        }
+    }
 
     for (index, left) in requests.iter().enumerate() {
         if requests[index + 1..].iter().any(|right| {

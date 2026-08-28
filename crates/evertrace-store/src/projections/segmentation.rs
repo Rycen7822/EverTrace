@@ -443,6 +443,20 @@ impl SegmentationCurrentView {
     pub fn operation(&self, id: OperationId) -> Option<&Operation> {
         self.operations.get(&id)
     }
+    pub fn operation_for_observation(
+        &self,
+        id: evertrace_domain::ids::SourceObservationId,
+    ) -> Result<Option<&Operation>, StoreError> {
+        let mut matches = self.operations.values().filter(|operation| {
+            operation.input_source_observation_refs.contains(&id)
+                || operation.result_source_observation_refs.contains(&id)
+        });
+        let value = matches.next();
+        if matches.next().is_some() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(value)
+    }
     pub fn binding(&self, id: OperationId) -> Option<&WorkBindingRevision> {
         self.bindings.get(&id)
     }

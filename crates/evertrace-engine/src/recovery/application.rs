@@ -74,6 +74,15 @@ impl RecoveryTicketService {
         &self,
         request: RecoveryTicketIssueRequest,
     ) -> Result<RecoveryApplicationTicket, RecoveryError> {
+        self.issue_for_application(request, RecoveryApplicationId::new_v7())
+            .await
+    }
+
+    pub(super) async fn issue_for_application(
+        &self,
+        request: RecoveryTicketIssueRequest,
+        prospective_recovery_application_id: RecoveryApplicationId,
+    ) -> Result<RecoveryApplicationTicket, RecoveryError> {
         let projected = self
             .writer
             .project()
@@ -102,7 +111,7 @@ impl RecoveryTicketService {
             .map_err(|_| RecoveryError::Protection)?;
         let claims = RecoveryApplicationTicketClaims {
             ticket_version: RECOVERY_APPLICATION_TICKET_VERSION,
-            prospective_recovery_application_id: RecoveryApplicationId::new_v7(),
+            prospective_recovery_application_id,
             recovery_bundle_id: request.recovery_bundle_id,
             selected_content_refs,
             application_kind: request.application_kind,

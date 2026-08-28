@@ -188,7 +188,7 @@ impl JournalWriter {
         {
             return Err(StoreError::StaleFrontier);
         }
-        let next_admission_state = self.admission_state.apply_command(command)?;
+        let next_admission_state = self.admission_state.apply_command(command, self.next_seq)?;
         let first_seq = reserve_range(&mut self.next_seq, prepared.event_count)?;
         let rows = rows_for_append(&prepared, first_seq, ingested_at_us)?;
         append_rows(&self.journal, &rows).await?;

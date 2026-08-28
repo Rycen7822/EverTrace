@@ -1,6 +1,15 @@
-use std::str::FromStr;
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    process::Command,
+    str::FromStr,
+    time::Duration,
+};
 
-use evertrace_capture::{CasStore, DeviceKeyStore, protect};
+use evertrace_capture::{
+    CasStore, DeviceKeyStore, RecoveryGateMode, RecoverySnapshotSettings, RuntimeSnapshot,
+    SpoolLimits, protect,
+};
 use evertrace_domain::{
     evidence::{
         CanonicalEventFamily, CaptureCompleteness, ContentTrust, CorrelationAdmission,
@@ -11,39 +20,50 @@ use evertrace_domain::{
         source_receipt_id,
     },
     ids::{
-        AttemptId, CasId, CommandId, SourceReceiptId, TaskId, WorkBindingRevisionId, WorkstreamId,
+        AttemptId, CasId, CommandId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId,
+        RequestId, SourceReceiptId, TaskId, WorkBindingRevisionId, WorkstreamId, WorktreeId,
         WorktreeSnapshotId,
     },
     repository::{
-        FilesystemIdentity, GitObjectFormat, GitOperation, GitRegistrationState, PathObservation,
-        RepositoryInstance, SnapshotCaptureStatus, WorktreeInstance, WorktreeKind,
-        WorktreeLifecycle, WorktreeSnapshot,
+        DestructiveClass, DestructiveDetectionStatus, FilesystemIdentity, GitObjectFormat,
+        GitOperation, GitRegistrationState, OrderingIntegrity, PathObservation,
+        RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryBundle, RecoveryCaptureRequest,
+        RecoveryCaptureStatus, RecoveryContentRef, RecoveryProtectedRef, RecoveryReasonCode,
+        RecoveryRequestStatus, RecoveryVerificationOutcome, RecoveryVerifierReceipt,
+        RepositoryInstance, SnapshotCaptureStatus, UntrackedCaptureScope, WorktreeInstance,
+        WorktreeKind, WorktreeLifecycle, WorktreeSnapshot,
     },
     revision::RevisionId,
     semantic::{EvidenceCompleteness, ParserStatus, ResultScope, VerifierStatus},
     work::{
         ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
-        ArtifactRevision, ArtifactScope, AssignmentStatus, ContractField, MultiCasMetricPolicy,
-        PhaseContract, PhaseKind, PrimaryWorkBinding, RunContractValidity, RunExecutionStatus,
-        RunObservability, SeedPolicy, StrategyContract, Task, TaskIdentityConfidence,
-        TaskLifecycle, TaskScopeMembership, VariableDeclaration, WorkArtifact, WorkArtifactKind,
+        ArtifactRevision, ArtifactScope, AssignmentStatus, ContractField, CoverageLevel,
+        MultiCasMetricPolicy, PairingIntegrity, PayloadIntegrity, PhaseContract, PhaseKind,
+        PrimaryWorkBinding, RunContractValidity, RunExecutionStatus, RunObservability, SeedPolicy,
+        SourceCoverage, StrategyContract, Task, TaskIdentityConfidence, TaskLifecycle,
+        TaskScopeMembership, TerminalKind, VariableDeclaration, WorkArtifact, WorkArtifactKind,
         WorkBindingRevision, Workstream, WorkstreamStatus,
     },
 };
 use evertrace_engine::{
-    PhysicalNormalizer,
+    PhysicalNormalizer, RecoveryActionOutcome, RecoveryActionService, RecoveryBarrierService,
+    RecoveryRequest,
     autoresearch::{
         ArtifactService, AutoresearchCommandContext, AutoresearchError, AutoresearchResolution,
         ResultEvidenceService, ResultParseRequest, RunCreateInput, compatible_result_cohort,
         create_experiment_run, run_command,
     },
+    spawn_writer,
     work::attempt::new_attempt,
 };
+use evertrace_protocol::{LocalServer, ServerOptions, request_recovery};
 use evertrace_store::{
     DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter,
-    NormalizationWatermark, SourceIngestWatermark, projections::AutoresearchCurrentView,
+    NormalizationWatermark, SourceIngestWatermark,
+    projections::{AutoresearchCurrentView, RecoveryCurrentView},
 };
 use tempfile::TempDir;
+use tokio::sync::watch;
 
 const CONFIG: [u8; 32] = [0x17; 32];
 const PARSER: &str = "evertrace.result_metric.v1";
@@ -120,6 +140,44 @@ fn command(at: i64, payloads: Vec<JournalPayload>) -> JournalCommand {
             .into_iter()
             .map(|payload| JournalEventDraft::runtime(at, CONFIG, "s17-autoresearch-v2", payload))
             .collect(),
+    )
+    .unwrap()
+}
+
+fn git(root: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn recovery_runtime(root: &std::path::Path) -> RuntimeSnapshot {
+    RuntimeSnapshot::for_data_dir(
+        root,
+        1,
+        SpoolLimits {
+            high_watermark_bytes: 1 << 20,
+            low_watermark_bytes: 1,
+            max_main_files: 4,
+            emergency_slots: 1,
+        },
+        RecoverySnapshotSettings {
+            gate: RecoveryGateMode::Active,
+            preflight_timeout_ms: 10_000,
+            effective_config_hash: [7; 32],
+            adapter_manifest_id: Some("adapter-s17-recovery".into()),
+            classifier_revision: evertrace_codex::recovery::RECOVERY_CLASSIFIER_REVISION,
+            max_bundle_bytes: 4 << 20,
+            max_untracked_file_bytes: 1 << 20,
+            max_untracked_total_bytes: 2 << 20,
+        },
     )
     .unwrap()
 }
@@ -1137,12 +1195,574 @@ async fn artifact_second_cas_successor_no_delta_and_later_authority_rejected() {
     ));
 }
 
-#[test]
-fn recovery_application_recording_is_not_a_product_payload() {
-    assert!(
-        serde_json::from_str::<JournalPayload>(
-            r#"{"kind":"recovery_application_recorded","value":{}}"#
-        )
-        .is_err()
+#[tokio::test]
+async fn supervised_patch_is_real_at_most_once_and_unsupported_is_zero_delta() {
+    let root = TempDir::new().unwrap();
+    let worktree_path = root.path().join("worktree");
+    fs::create_dir(&worktree_path).unwrap();
+    fs::set_permissions(&worktree_path, fs::Permissions::from_mode(0o700)).unwrap();
+    git(&worktree_path, &["init", "--quiet"]);
+    git(
+        &worktree_path,
+        &["config", "user.email", "s17@example.invalid"],
     );
+    git(&worktree_path, &["config", "user.name", "S17"]);
+    fs::write(worktree_path.join("tracked.txt"), b"before\n").unwrap();
+    fs::write(worktree_path.join("other.txt"), b"other-before\n").unwrap();
+    git(&worktree_path, &["add", "tracked.txt", "other.txt"]);
+    git(&worktree_path, &["commit", "--quiet", "-m", "base"]);
+    fs::write(worktree_path.join("tracked.txt"), b"after\n").unwrap();
+    let patch = Command::new("git")
+        .args(["diff", "--binary", "--", "tracked.txt"])
+        .current_dir(&worktree_path)
+        .output()
+        .unwrap();
+    assert!(patch.status.success());
+    assert!(!patch.stdout.is_empty());
+    git(&worktree_path, &["restore", "--", "tracked.txt"]);
+
+    let store_root = root.path().join("store");
+    fs::create_dir(&store_root).unwrap();
+    fs::set_permissions(&store_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = recovery_runtime(&store_root);
+    let cas = CasStore::open(runtime.cas_dir.clone()).unwrap();
+    let key = DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let patch_id = put(&cas, &key, &patch.stdout);
+    let repository_id = RepositoryId::new_v7();
+    let worktree_id = WorktreeId::new_v7();
+    let snapshot_id = WorktreeSnapshotId::new_v7();
+    let capture_request_id = RecoveryCaptureRequestId::new_v7();
+    let bundle_id = RecoveryBundleId::new_v7();
+    let canonical_root = fs::canonicalize(&worktree_path).unwrap();
+    let git_dir = canonical_root.join(".git");
+    let git_metadata = fs::metadata(&git_dir).unwrap();
+    let path = canonical_root.to_string_lossy().into_owned();
+    let path_observation = PathObservation {
+        path: path.clone(),
+        first_observed_at_us: 1,
+        last_observed_at_us: 1,
+        evidence_refs: vec!["s17-recovery-path".into()],
+    };
+    let repository = RepositoryInstance {
+        repository_id,
+        repository_revision: 1,
+        predecessor_revision: None,
+        current_path: path.clone(),
+        path_history: vec![path_observation.clone()],
+        git_common_dir_path: Some(git_dir.to_string_lossy().into_owned()),
+        common_dir_filesystem: Some(FilesystemIdentity {
+            device: git_metadata.dev(),
+            inode: git_metadata.ino(),
+        }),
+        object_format: Some(GitObjectFormat::Sha1),
+        remote_fingerprints: vec![],
+        derived_from: None,
+        identity_evidence_refs: vec!["s17-recovery-git-common-dir".into()],
+        recorded_at_us: 1,
+    };
+    let worktree = WorktreeInstance {
+        worktree_instance_id: worktree_id,
+        worktree_revision: 1,
+        predecessor_revision: None,
+        repository_instance_id: repository_id,
+        kind: WorktreeKind::Main,
+        lifecycle: WorktreeLifecycle::Active,
+        current_path: Some(path.clone()),
+        path_history: vec![path_observation.clone()],
+        git_admin_path_history: vec![PathObservation {
+            path: git_dir.to_string_lossy().into_owned(),
+            evidence_refs: vec!["s17-recovery-git-admin".into()],
+            ..path_observation
+        }],
+        git_registration_state: GitRegistrationState::Registered,
+        current_snapshot_id: Some(snapshot_id),
+        created_event_ref: "s17-recovery-worktree".into(),
+        terminal_event_ref: None,
+        recreated_from_worktree_instance_id: None,
+        recorded_at_us: 1,
+    };
+    let snapshot = WorktreeSnapshot {
+        worktree_snapshot_id: snapshot_id,
+        worktree_instance_id: worktree_id,
+        head_oid: Some(git(&worktree_path, &["rev-parse", "HEAD"])),
+        tree_oid: Some(git(&worktree_path, &["rev-parse", "HEAD^{tree}"])),
+        branch_ref: Some(git(&worktree_path, &["symbolic-ref", "HEAD"])),
+        detached_head: false,
+        tracked_diff_digest: None,
+        index_digest: None,
+        untracked_manifest_digest: None,
+        relevant_anchor_digests: vec![],
+        dependency_fingerprints: vec![],
+        toolchain_fingerprint: None,
+        git_operation: GitOperation::None,
+        captured_at_us: 2,
+        evidence_refs: vec!["s17-recovery-pre-snapshot".into()],
+        capture_status: SnapshotCaptureStatus::Complete,
+        omission_reasons: vec![],
+    };
+    let pending_revision = RevisionId::new_v7();
+    let pending = RecoveryCaptureRequest {
+        recovery_capture_request_id: capture_request_id,
+        request_revision_id: pending_revision,
+        parent_request_revision_id: None,
+        trigger_event_id: "s17-recovery-trigger".into(),
+        repository_instance_id: repository_id,
+        worktree_instance_id: worktree_id,
+        pre_operation_snapshot_id: None,
+        command_fingerprint: "ab".repeat(32),
+        destructive_class: DestructiveClass::GitRestoreDiscard,
+        untracked_capture_scope: UntrackedCaptureScope::Standard,
+        detection_status: DestructiveDetectionStatus::Matched,
+        request_status: RecoveryRequestStatus::Pending,
+        recovery_bundle_id: None,
+        reason_codes: vec![],
+        started_at_us: 3,
+        finished_at_us: None,
+        effective_config_hash: [7; 32],
+    };
+    let terminal = RecoveryCaptureRequest {
+        request_revision_id: RevisionId::new_v7(),
+        parent_request_revision_id: Some(pending_revision),
+        pre_operation_snapshot_id: Some(snapshot_id),
+        request_status: RecoveryRequestStatus::Complete,
+        recovery_bundle_id: Some(bundle_id),
+        reason_codes: vec![RecoveryReasonCode::CaptureComplete],
+        finished_at_us: Some(4),
+        ..pending.clone()
+    };
+    let bundle = RecoveryBundle {
+        recovery_bundle_id: bundle_id,
+        source_worktree_instance_id: worktree_id,
+        source_snapshot_id: snapshot_id,
+        trigger_request_ids: vec![capture_request_id],
+        tracked_diff_blob_refs: vec![RecoveryContentRef {
+            item_ref: "git:tracked_diff".into(),
+            payload: RecoveryProtectedRef {
+                cas_ref: patch_id.to_string()[4..].into(),
+                protected_length: patch.stdout.len() as u64,
+                original_length: patch.stdout.len() as u64,
+                protected_secret_digest: None,
+                redaction_spans: 0,
+            },
+            protected_relative_path: None,
+        }],
+        tracked_file_blob_refs: vec![],
+        index_state_refs: vec![],
+        untracked_file_blob_refs: vec![],
+        untracked_work_artifact_refs: vec![],
+        metadata_only_work_artifact_refs: vec![],
+        config_and_run_refs: vec![],
+        attempt_anchor_ids: vec![],
+        attempt_anchor_claims: vec![],
+        omissions: vec![],
+        capture_status: RecoveryCaptureStatus::Complete,
+        ordering_integrity: OrderingIntegrity::Complete,
+        adapter_manifest_id: "adapter-s17-recovery".into(),
+        eligible_mutation_manifest_version: 1,
+        eligible_mutation_domain: evertrace_domain::repository::SUPPORTED_MUTATION_DOMAIN.into(),
+        captured_bytes: patch.stdout.len() as u64,
+        captured_at_us: 4,
+    };
+    pending.validate().unwrap();
+    terminal.validate().unwrap();
+    bundle.validate().unwrap();
+
+    let mut writer = JournalWriter::open(&store_root).await.unwrap();
+    for (at, payloads) in [
+        (
+            1,
+            vec![
+                JournalPayload::RepositoryInstanceRecorded(Box::new(repository)),
+                JournalPayload::WorktreeInstanceRecorded(Box::new(worktree)),
+                JournalPayload::WorktreeSnapshotRecorded(Box::new(snapshot)),
+            ],
+        ),
+        (
+            3,
+            vec![JournalPayload::RecoveryCaptureRequestRecorded(Box::new(
+                pending,
+            ))],
+        ),
+        (
+            4,
+            vec![
+                JournalPayload::RecoveryCaptureRequestRecorded(Box::new(terminal)),
+                JournalPayload::RecoveryBundleRecorded(Box::new(bundle)),
+            ],
+        ),
+    ] {
+        let seed = JournalCommand::new(
+            CommandId::new_v7(),
+            payloads
+                .into_iter()
+                .map(|payload| {
+                    JournalEventDraft::runtime(at, [7; 32], "s17-supervised-recovery-v1", payload)
+                })
+                .collect(),
+        )
+        .unwrap();
+        writer.commit(&seed, at).await.unwrap();
+    }
+    let frontier_before = writer.project().await.unwrap().frontier;
+    let (handle, writer_task) = spawn_writer(writer, 16).unwrap();
+    let barrier = RecoveryBarrierService::new(runtime.clone(), handle.clone());
+    let service = RecoveryActionService::new(runtime, handle.clone(), barrier.mutation_fence());
+    let server = LocalServer::bind(&store_root, ServerOptions::new("s17-test")).unwrap();
+    let socket = server.socket_path().to_path_buf();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let uds_service = service.clone();
+    let server_task = tokio::spawn(server.run_dispatch(shutdown_rx, move |request_id, command| {
+        let service = uds_service.clone();
+        async move {
+            let evertrace_protocol::command::Command::RequestRecovery(request) = command else {
+                return Err(evertrace_domain::error::ErrorCode::InvalidInput);
+            };
+            let outcome = service
+                .handle(RecoveryRequest {
+                    request_id,
+                    recovery_bundle_id: request.recovery_bundle_id,
+                    target_worktree_instance_id: request.target_worktree_instance_id,
+                    application_kind: request.application_kind,
+                })
+                .await
+                .map_err(|_| evertrace_domain::error::ErrorCode::InvalidInput)?;
+            let response = match outcome {
+                RecoveryActionOutcome::Application {
+                    recovery_application_id,
+                    application_status,
+                    replayed,
+                } => evertrace_protocol::response::RecoveryActionResponse {
+                    recovery_application_id: Some(recovery_application_id),
+                    application_status: Some(application_status),
+                    replayed,
+                    unsupported_reason: None,
+                },
+                RecoveryActionOutcome::Unsupported(_) => {
+                    evertrace_protocol::response::RecoveryActionResponse {
+                        recovery_application_id: None,
+                        application_status: None,
+                        replayed: false,
+                        unsupported_reason: Some(
+                            evertrace_protocol::response::RecoveryUnsupportedReason::UnsupportedApplicationKind,
+                        ),
+                    }
+                }
+            };
+            Ok(evertrace_protocol::response::Response::RecoveryAction(response))
+        }
+    }));
+
+    let unsupported_request_id = RequestId::new_v7();
+    let unsupported = request_recovery(
+        &socket,
+        "s17-client",
+        unsupported_request_id,
+        evertrace_protocol::command::RequestRecoveryCommand {
+            recovery_bundle_id: bundle_id,
+            target_worktree_instance_id: worktree_id,
+            application_kind: RecoveryApplicationKind::FileRestore,
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unsupported.unsupported_reason,
+        Some(evertrace_protocol::response::RecoveryUnsupportedReason::UnsupportedApplicationKind)
+    );
+    assert_eq!(handle.project().await.unwrap().frontier, frontier_before);
+    assert_eq!(
+        fs::read(worktree_path.join("tracked.txt")).unwrap(),
+        b"before\n"
+    );
+
+    let request_id = RequestId::new_v7();
+    fs::write(worktree_path.join("unrelated.txt"), b"unrelated\n").unwrap();
+    fs::write(worktree_path.join("other.txt"), b"other-staged\n").unwrap();
+    git(&worktree_path, &["add", "--", "other.txt"]);
+    git(
+        &worktree_path,
+        &["commit", "--quiet", "-m", "unrelated-head-change"],
+    );
+    let action_request = evertrace_protocol::command::RequestRecoveryCommand {
+        recovery_bundle_id: bundle_id,
+        target_worktree_instance_id: worktree_id,
+        application_kind: RecoveryApplicationKind::Patch,
+    };
+    let applied = request_recovery(
+        &socket,
+        "s17-client",
+        request_id,
+        action_request.clone(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let recovery_application_id = applied.recovery_application_id.unwrap();
+    let application_status = applied.application_status.unwrap();
+    let replayed = applied.replayed;
+    assert_eq!(recovery_application_id.as_uuid(), request_id.as_uuid());
+    assert_eq!(application_status, RecoveryApplicationStatus::Applied);
+    assert!(!replayed);
+    assert_eq!(
+        fs::read(worktree_path.join("tracked.txt")).unwrap(),
+        b"after\n"
+    );
+    assert_eq!(
+        fs::read(worktree_path.join("unrelated.txt")).unwrap(),
+        b"unrelated\n"
+    );
+    assert_eq!(
+        fs::read(worktree_path.join("other.txt")).unwrap(),
+        b"other-staged\n"
+    );
+    let projection_after = handle.project().await.unwrap();
+    let recovery = RecoveryCurrentView::from_snapshot(&projection_after).unwrap();
+    let recorded = &recovery.state.applications[&recovery_application_id];
+    assert_eq!(
+        recorded.application_status,
+        RecoveryApplicationStatus::Applied
+    );
+    assert!(!recorded.has_complete_recorded_lineage_transfer_receipts());
+    assert_ne!(recorded.pre_application_snapshot_id, snapshot_id);
+    assert_eq!(recorded.input_source_observation_ids.len(), 1);
+    assert_eq!(recorded.result_source_observation_ids.len(), 1);
+    let forged_result = evertrace_domain::ids::SourceObservationId::from_digest([0xf1; 32]);
+    let mut forged_application = recorded.clone();
+    forged_application.revision_id = RevisionId::new_v7();
+    forged_application.parent_revision_id = Some(recorded.revision_id);
+    forged_application
+        .result_source_observation_ids
+        .push(forged_result);
+    forged_application.result_source_observation_ids.sort();
+    forged_application
+        .verifier_receipts
+        .push(RecoveryVerifierReceipt {
+            verification_revision: 2,
+            verifier_version: 1,
+            result_source_observation_id: forged_result,
+            post_application_snapshot_id: recorded.post_application_snapshot_id.unwrap(),
+            outcome: RecoveryVerificationOutcome::NotApplied,
+        });
+    forged_application.created_at_us += 1;
+    let forged_frontier = projection_after.frontier;
+    assert!(
+        handle
+            .commit(
+                JournalCommand::new(
+                    CommandId::new_v7(),
+                    vec![JournalEventDraft::runtime(
+                        forged_application.created_at_us,
+                        [7; 32],
+                        "s17-supervised-recovery-v1",
+                        JournalPayload::RecoveryApplicationRecorded(Box::new(forged_application,)),
+                    )],
+                )
+                .unwrap(),
+                recorded.created_at_us + 1,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(handle.project().await.unwrap().frontier, forged_frontier);
+    let evidence =
+        evertrace_store::RecoveryEvidenceCurrentView::from_snapshot(&projection_after).unwrap();
+    let input_receipt = evidence
+        .receipt_for_observation(recorded.input_source_observation_ids[0])
+        .unwrap();
+    let result_receipt = evidence
+        .receipt_for_observation(recorded.result_source_observation_ids[0])
+        .unwrap();
+    assert!(input_receipt.spool_byte_range.start < input_receipt.spool_byte_range.end);
+    assert!(result_receipt.spool_byte_range.start < result_receipt.spool_byte_range.end);
+    assert!(input_receipt.spool_byte_range.end <= result_receipt.spool_byte_range.start);
+    assert_eq!(input_receipt.source_sequence_origin, Some(1));
+    assert_eq!(input_receipt.close_watermark, None);
+    assert_eq!(result_receipt.source_sequence_origin, Some(1));
+    assert_eq!(result_receipt.close_watermark, Some(2));
+    assert_eq!(
+        input_receipt.adapter_manifest_ref,
+        result_receipt.adapter_manifest_ref
+    );
+    assert_eq!(input_receipt.adapter_manifest_ref.len(), 64);
+    assert!(
+        input_receipt
+            .adapter_manifest_ref
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    let segmentation =
+        evertrace_store::projections::SegmentationCurrentView::from_snapshot(&projection_after)
+            .unwrap();
+    let lane = segmentation
+        .lane(recorded.execution_lane_id.unwrap())
+        .unwrap();
+    let capture_receipt = segmentation
+        .receipt(recorded.capture_receipt_revision_id.unwrap())
+        .unwrap();
+    assert_eq!(lane.terminal_kind, Some(TerminalKind::Normal));
+    assert!(lane.finalized);
+    assert_eq!(capture_receipt.coverage_level, CoverageLevel::Full);
+    assert_eq!(capture_receipt.source_coverage, SourceCoverage::Complete);
+    assert_eq!(
+        capture_receipt.pairing_integrity,
+        PairingIntegrity::Complete
+    );
+    assert_eq!(
+        capture_receipt.payload_integrity,
+        PayloadIntegrity::Complete
+    );
+    let admitted_revision = projection_after
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("recovery_application_revision"))
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(|payload| serde_json::from_str::<JournalPayload>(payload).ok())
+        .find_map(|payload| match payload {
+            JournalPayload::RecoveryApplicationRecorded(value)
+                if value.recovery_application_id == recovery_application_id
+                    && value.parent_revision_id.is_none() =>
+            {
+                Some(value.revision_id.to_string())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        evidence
+            .observation(recorded.input_source_observation_ids[0])
+            .unwrap()
+            .correlation
+            .strong_gate_receipt_ref
+            .as_deref(),
+        Some(admitted_revision.as_str())
+    );
+    let mut application_history = projection_after
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("recovery_application_revision"))
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(|payload| serde_json::from_str::<JournalPayload>(payload).ok())
+        .filter_map(|payload| match payload {
+            JournalPayload::RecoveryApplicationRecorded(value)
+                if value.recovery_application_id == recovery_application_id =>
+            {
+                Some(value.application_status)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    application_history.sort_by_key(|status| match status {
+        RecoveryApplicationStatus::Unknown => 0,
+        RecoveryApplicationStatus::Applied => 1,
+        RecoveryApplicationStatus::PartiallyApplied => 2,
+        RecoveryApplicationStatus::Failed => 3,
+    });
+    assert_eq!(
+        application_history,
+        vec![
+            RecoveryApplicationStatus::Unknown,
+            RecoveryApplicationStatus::Unknown,
+            RecoveryApplicationStatus::Applied,
+        ]
+    );
+
+    let replay = request_recovery(
+        &socket,
+        "s17-client",
+        request_id,
+        action_request,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(
+        handle.project().await.unwrap().frontier,
+        projection_after.frontier
+    );
+    assert_eq!(
+        fs::read(worktree_path.join("tracked.txt")).unwrap(),
+        b"after\n"
+    );
+    let repository_view = evertrace_store::repository::RepositoryCurrentView::from_snapshot(
+        &handle.project().await.unwrap(),
+    )
+    .unwrap();
+    let mut archived = repository_view.worktrees[&worktree_id].clone();
+    archived.predecessor_revision = Some(archived.worktree_revision);
+    archived.worktree_revision += 1;
+    archived.lifecycle = WorktreeLifecycle::Archived;
+    archived.recorded_at_us += 1;
+    let archived_at = archived.recorded_at_us;
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    archived_at,
+                    [7; 32],
+                    "s17-supervised-recovery-v1",
+                    JournalPayload::WorktreeInstanceRecorded(Box::new(archived)),
+                )],
+            )
+            .unwrap(),
+            archived_at,
+        )
+        .await
+        .unwrap();
+    let archived_projection = handle.project().await.unwrap();
+    assert_eq!(
+        RecoveryCurrentView::from_snapshot(&archived_projection)
+            .unwrap()
+            .state
+            .applications[&recovery_application_id]
+            .application_status,
+        RecoveryApplicationStatus::Applied
+    );
+    shutdown_tx.send(true).unwrap();
+    server_task.await.unwrap().unwrap();
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+
+    let restarted = JournalWriter::open(&store_root).await.unwrap();
+    assert_eq!(restarted.project().await.unwrap(), archived_projection);
+    assert_eq!(
+        restarted.full_projection().await.unwrap(),
+        archived_projection
+    );
+}
+
+#[test]
+fn recovery_wire_request_has_no_caller_authority_fields() {
+    let request_id = RequestId::new_v7();
+    let bundle_id = RecoveryBundleId::new_v7();
+    let worktree_id = WorktreeId::new_v7();
+    let value = serde_json::json!({
+        "request_id": request_id,
+        "command": {
+            "request_recovery": {
+                "recovery_bundle_id": bundle_id,
+                "target_worktree_instance_id": worktree_id,
+                "application_kind": "patch"
+            }
+        }
+    });
+    serde_json::from_value::<evertrace_protocol::command::CommandEnvelope>(value.clone()).unwrap();
+    for (field, forged) in [
+        ("ticket", serde_json::json!("caller-ticket")),
+        ("status", serde_json::json!("applied")),
+        (
+            "selected_item_refs",
+            serde_json::json!(["git:tracked_diff"]),
+        ),
+        ("success", serde_json::json!(true)),
+    ] {
+        let mut forged_value = value.clone();
+        forged_value["command"]["request_recovery"][field] = forged;
+        assert!(
+            serde_json::from_value::<evertrace_protocol::command::CommandEnvelope>(forged_value)
+                .is_err()
+        );
+    }
 }

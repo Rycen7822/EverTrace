@@ -56,6 +56,7 @@ pub(super) fn capture_recovery_bundle_until(
         metadata_only_work_artifact_refs: facts.metadata_artifact_refs,
         config_and_run_refs: facts.config_and_run_refs,
         attempt_anchor_ids: facts.attempt_anchor_ids,
+        attempt_anchor_claims: Vec::new(),
         omissions: facts.omissions,
         capture_status: RecoveryCaptureStatus::Complete,
         ordering_integrity: OrderingIntegrity::Complete,
@@ -217,7 +218,7 @@ pub(super) fn capture_recovery_bundle_until(
     Ok(bundle)
 }
 
-fn protected_ref(
+pub(super) fn protected_ref(
     protected: &evertrace_capture::ProtectedPayload,
     cas: &CasStore,
 ) -> Result<RecoveryProtectedRef, RecoveryError> {
@@ -279,6 +280,12 @@ pub fn terminal_capture_command(
     if bundle.as_ref().map(|value| value.recovery_bundle_id) != terminal.recovery_bundle_id
         || snapshot.as_ref().map(|value| value.worktree_snapshot_id)
             != terminal.pre_operation_snapshot_id
+        || bundle.as_ref().is_some_and(|value| {
+            Some(value.source_snapshot_id)
+                != snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.worktree_snapshot_id)
+        })
     {
         return Err(RecoveryError::InvalidInput);
     }
@@ -286,12 +293,12 @@ pub fn terminal_capture_command(
     if let Some(snapshot) = snapshot {
         payloads.push(JournalPayload::WorktreeSnapshotRecorded(Box::new(snapshot)));
     }
-    if let Some(bundle) = bundle {
-        payloads.push(JournalPayload::RecoveryBundleRecorded(Box::new(bundle)));
-    }
     payloads.push(JournalPayload::RecoveryCaptureRequestRecorded(Box::new(
         terminal.clone(),
     )));
+    if let Some(bundle) = bundle {
+        payloads.push(JournalPayload::RecoveryBundleRecorded(Box::new(bundle)));
+    }
     recovery_command(
         command_id,
         terminal.finished_at_us.ok_or(RecoveryError::InvalidInput)?,

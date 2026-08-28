@@ -274,7 +274,42 @@ pub async fn reconcile_once(
     input: ReconcileInput,
     writer: &WriterHandle,
 ) -> Result<ReconcileProgress, ReconcileError> {
+    reconcile_selected(input, writer, None).await
+}
+
+pub async fn reconcile_observations_once(
+    input: ReconcileInput,
+    writer: &WriterHandle,
+    observation_ids: &[SourceObservationId],
+) -> Result<ReconcileProgress, ReconcileError> {
+    if observation_ids.is_empty()
+        || observation_ids.len() > 16
+        || observation_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != observation_ids.len()
+    {
+        return Err(ReconcileError::InvalidInput);
+    }
+    reconcile_selected(input, writer, Some(observation_ids)).await
+}
+
+async fn reconcile_selected(
+    input: ReconcileInput,
+    writer: &WriterHandle,
+    observation_ids: Option<&[SourceObservationId]>,
+) -> Result<ReconcileProgress, ReconcileError> {
     validate_reconcile_input(&input)?;
+    let targeted = observation_ids.is_some();
+    if targeted
+        && (!input.reconciled_gaps.is_empty()
+            || !input.reconciled_outages.is_empty()
+            || !input.independent_source_reconciliations.is_empty())
+    {
+        return Err(ReconcileError::InvalidInput);
+    }
     let (spool, _) = DurableSpool::open(
         input.runtime_snapshot.spool_dir.clone(),
         input
@@ -283,19 +318,36 @@ pub async fn reconcile_once(
             .map_err(|_| ReconcileError::InvalidInput)?,
     )
     .map_err(|_| ReconcileError::Spool)?;
-    let marker_handles = spool
-        .pending_gap_marker_handles(input.runtime_snapshot.emergency_slots as usize)
-        .map_err(|_| ReconcileError::Spool)?;
-    let dirty_frontier = writer
-        .reconciliation_frontier(input.max_items)
-        .await
-        .map_err(map_reconcile_writer)?;
+    let marker_handles = if targeted {
+        Vec::new()
+    } else {
+        spool
+            .pending_gap_marker_handles(input.runtime_snapshot.emergency_slots as usize)
+            .map_err(|_| ReconcileError::Spool)?
+    };
+    let dirty_frontier = if let Some(observation_ids) = observation_ids {
+        writer
+            .project()
+            .await
+            .map_err(map_reconcile_writer)?
+            .reconciliation_frontier_for_observations(observation_ids)
+            .map_err(|_| ReconcileError::Projection)?
+    } else {
+        writer
+            .reconciliation_frontier(input.max_items)
+            .await
+            .map_err(map_reconcile_writer)?
+    };
     let quarantine_start = dirty_frontier.frontier.wrapping_add(
         u64::try_from(input.occurred_at_us).map_err(|_| ReconcileError::InvalidInput)?,
     );
-    let quarantine_handles = spool
-        .pending_quarantine_from(MAX_RECONCILE_ITEMS, quarantine_start)
-        .map_err(|_| ReconcileError::Spool)?;
+    let quarantine_handles = if targeted {
+        Vec::new()
+    } else {
+        spool
+            .pending_quarantine_from(MAX_RECONCILE_ITEMS, quarantine_start)
+            .map_err(|_| ReconcileError::Spool)?
+    };
     let filesystem_descriptors =
         filesystem_artifact_descriptors(&marker_handles, &quarantine_handles)?;
     let mut lookup_descriptors = filesystem_descriptors.clone();
@@ -445,10 +497,19 @@ pub async fn reconcile_once(
                 .map_err(map_reconcile_writer)?,
         )
     };
-    let after_dirty = writer
-        .reconciliation_frontier(1)
-        .await
-        .map_err(map_reconcile_writer)?;
+    let after_dirty = if let Some(observation_ids) = observation_ids {
+        writer
+            .project()
+            .await
+            .map_err(map_reconcile_writer)?
+            .reconciliation_frontier_for_observations(observation_ids)
+            .map_err(|_| ReconcileError::Projection)?
+    } else {
+        writer
+            .reconciliation_frontier(1)
+            .await
+            .map_err(map_reconcile_writer)?
+    };
     let after_artifacts = if filesystem_descriptors.is_empty() {
         None
     } else {
@@ -1666,6 +1727,7 @@ fn pairing_for_group(
     state: &CurrentCaptureState,
     groups: &BTreeMap<LaneIncarnationKey, Vec<SourceReceipt>>,
     key: &LaneIncarnationKey,
+    eligible_observation_ids: &BTreeSet<SourceObservationId>,
 ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     let observation_group = groups
         .iter()
@@ -1688,16 +1750,24 @@ fn pairing_for_group(
     let mut unmatched_results = Vec::new();
     for operation in operations {
         let id = operation.operation_id.to_string();
-        if !operation.input_source_observation_refs.is_empty() {
+        let input_seen = operation
+            .input_source_observation_refs
+            .iter()
+            .any(|observation| eligible_observation_ids.contains(observation));
+        let result_seen = operation
+            .result_source_observation_refs
+            .iter()
+            .any(|observation| eligible_observation_ids.contains(observation));
+        if input_seen {
             calls.push(id.clone());
         }
-        if !operation.result_source_observation_refs.is_empty() {
+        if result_seen {
             results.push(id.clone());
         }
-        match operation.pairing_state {
-            evertrace_domain::evidence::PairingState::UnmatchedIntent => unmatched_calls.push(id),
-            evertrace_domain::evidence::PairingState::UnmatchedResult => unmatched_results.push(id),
-            _ => {}
+        if input_seen && !result_seen {
+            unmatched_calls.push(id);
+        } else if result_seen && !input_seen {
+            unmatched_results.push(id);
         }
     }
     (calls, results, unmatched_calls, unmatched_results)
@@ -1748,10 +1818,30 @@ fn operation_lane_successors_typed(
         if operation.execution_lane_id.is_none() {
             let mut successor = operation.clone();
             successor.execution_lane_id = Some(lane_id);
-            successor.previous_operation_revision = Some(operation.operation_revision);
-            successor.operation_revision += 1;
+            let operation_is_pending = payloads.iter().any(|payload| {
+                matches!(payload, JournalPayload::OperationDerived(value) if value.operation_id == operation.operation_id)
+            });
+            if !operation_is_pending {
+                successor.previous_operation_revision = Some(operation.operation_revision);
+                successor.operation_revision += 1;
+            }
             successor.validate().map_err(|_| ReconcileError::Domain)?;
-            payloads.push(JournalPayload::OperationDerived(Box::new(successor)));
+            if operation_is_pending {
+                let pending = payloads
+                    .iter_mut()
+                    .find_map(|payload| match payload {
+                        JournalPayload::OperationDerived(value)
+                            if value.operation_id == operation.operation_id =>
+                        {
+                            Some(value)
+                        }
+                        _ => None,
+                    })
+                    .ok_or(ReconcileError::Domain)?;
+                **pending = successor;
+            } else {
+                payloads.push(JournalPayload::OperationDerived(Box::new(successor)));
+            }
             progress.operation_successors_recorded += 1;
         }
     }
@@ -2053,8 +2143,12 @@ fn reconcile_lane_groups(
                 last_sequence: interval.last,
             })
             .collect::<Vec<_>>();
+        let eligible_observation_ids = receipts
+            .iter()
+            .map(|receipt| receipt.source_observation_id)
+            .collect::<BTreeSet<_>>();
         let (tool_calls, tool_results, unmatched_calls, unmatched_results) =
-            pairing_for_group(state, groups, &key);
+            pairing_for_group(state, groups, &key, &eligible_observation_ids);
         let mut resolved = resolve_capture(CaptureResolverInput {
             execution_lane_id: lane_id,
             capture_receipt_revision_id: CaptureReceiptId::new_v7(),
