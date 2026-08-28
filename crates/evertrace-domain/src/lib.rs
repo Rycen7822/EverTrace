@@ -10,4 +10,5 @@ pub mod evidence;
 pub mod ids;
 pub mod repository;
 pub mod revision;
+pub mod semantic;
 pub mod work;

@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub mod attempt;
+pub mod autoresearch;
 pub mod binding;
 pub mod burst;
 pub mod episode;
@@ -16,6 +17,7 @@ pub mod task;
 pub mod workstream;
 
 pub use attempt::*;
+pub use autoresearch::*;
 pub use binding::{
     ActiveWorkContext, AssignmentStatus, PrimaryWorkBinding, SecondaryBindingRole,
     SecondaryBindingTarget, SecondaryWorkBinding, WorkBindingRevision,
@@ -754,6 +756,10 @@ pub enum WorkError {
     InvalidReceipt,
     #[error("a finalized execution lane cannot be reopened")]
     FinalizedLaneCannotReopen,
+    #[error("autoresearch work contract is invalid")]
+    InvalidAutoresearch,
+    #[error("autoresearch successor does not add compatible evidence")]
+    InvalidAutoresearchSuccessor,
 }
 
 #[cfg(test)]
