@@ -323,6 +323,39 @@ impl HostProbeReport {
         &self.project_policy
     }
 
+    /// Verifies that `evidence` is the exact policy evidence used by this
+    /// report's enabled project-policy gate.
+    ///
+    /// Callers must use this check instead of treating a manifest surface or
+    /// a caller-constructed [`PolicyEvidence`] as authority on its own.
+    pub fn verify_project_policy_evidence(
+        &self,
+        evidence: &PolicyEvidence,
+    ) -> Result<(), ProbeError> {
+        let recomputed = policy_receipt(
+            &self.manifest,
+            EvidenceSourceKind::ObservedHostCanary,
+            Some(evidence),
+        )?;
+        let surface_matches = evidence.resolved_scope.is_some_and(|resolved_scope| {
+            self.manifest.project_policy_surfaces.len() == 1
+                && self.manifest.project_policy_surfaces[0].policy_source_kind
+                    == evidence.policy_source_kind
+                && self.manifest.project_policy_surfaces[0].max_host_resolved_scope
+                    == resolved_scope
+        });
+        if self.project_policy.gate_kind != GateKind::ProjectPolicyAuthority
+            || self.project_policy.result != GateResult::Enabled
+            || self.project_policy.reason != GateReason::RequirementsSatisfied
+            || self.project_policy.adapter_manifest_revision != self.manifest.adapter_manifest_id
+            || recomputed != self.project_policy
+            || !surface_matches
+        {
+            return Err(ProbeError::InvalidEvidence);
+        }
+        Ok(())
+    }
+
     pub fn to_json(&self) -> Result<String, ProbeError> {
         serde_json::to_string(self).map_err(|_| ProbeError::Serialization)
     }
@@ -357,7 +390,11 @@ impl HostProbeReport {
                 &manifest,
                 evidence.normalization.as_ref(),
             )?,
-            project_policy: policy_receipt(&manifest, evidence.policy.as_ref())?,
+            project_policy: policy_receipt(
+                &manifest,
+                context.evidence_source,
+                evidence.policy.as_ref(),
+            )?,
         })
     }
 }
@@ -820,6 +857,7 @@ type ExactOccurrenceCanaryKey<'a> = (u32, &'a str, &'a str, &'a str, &'a str, &'
 
 fn policy_receipt(
     manifest: &AdapterCapabilityManifest,
+    evidence_source: EvidenceSourceKind,
     evidence: Option<&PolicyEvidence>,
 ) -> Result<GateReceipt, ProbeError> {
     let Some(evidence) = evidence else {
@@ -842,7 +880,9 @@ fn policy_receipt(
         .project_policy_surfaces
         .iter()
         .find(|surface| surface.policy_source_kind == evidence.policy_source_kind);
-    let reason = if !valid_summary(&summary)
+    let reason = if evidence_source != EvidenceSourceKind::ObservedHostCanary {
+        GateReason::TrustUnavailable
+    } else if !valid_summary(&summary)
         || evidence.policy_source_kind.is_empty()
         || evidence.source_revision.is_empty()
     {

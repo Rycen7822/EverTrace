@@ -6,6 +6,27 @@ use crate::{
     revision::RevisionId,
 };
 
+mod atom;
+mod constraint;
+mod proposal;
+
+pub(crate) use atom::valid_identifier;
+pub use atom::{
+    Atom, AtomAuthority, AtomDraft, AtomKind, AtomLifecycleStatus, AtomProvenance, AtomScope,
+    AtomValue, EpistemicStatus, PolicyAuthorityProvenance, PolicyHostScope, SemanticQualifier,
+    UserAuthorizationMode, UserAuthorizationProvenance, ValidityInterval,
+};
+pub use constraint::{
+    ApplicabilityExpr, ConstraintBinding, ConstraintExpr, ConstraintField, ConstraintState,
+    ConstraintTruth, ConstraintValue,
+};
+pub use proposal::{
+    AtomProposalPayload, ProposalAcceptance, ProposalAcceptanceAuthority, ProposalCreatedBy,
+    ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
+    ProposalTargetKind, ProposalWaitingOn, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+    tui_acceptance_event_payload,
+};
+
 const MAX_REFS: usize = 256;
 const MAX_TEXT: usize = 1024;
 
@@ -273,4 +294,16 @@ pub enum SemanticError {
     InvalidResultEvidence,
     #[error("result evidence successor does not add compatible evidence")]
     InvalidResultSuccessor,
+    #[error("atom contract is invalid")]
+    InvalidAtom,
+    #[error("atom successor contract is invalid")]
+    InvalidAtomSuccessor,
+    #[error("constraint expression is invalid")]
+    InvalidConstraintExpr,
+    #[error("constraint runtime state is invalid")]
+    InvalidConstraintState,
+    #[error("revision proposal contract is invalid")]
+    InvalidProposal,
+    #[error("revision proposal successor contract is invalid")]
+    InvalidProposalSuccessor,
 }
