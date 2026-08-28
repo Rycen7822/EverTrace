@@ -1,10 +1,9 @@
-use std::io;
+use std::io::{self, Read, Write};
 
 #[cfg(feature = "runtime")]
 use std::time::Duration;
 
 use serde::Serialize;
-#[cfg(feature = "runtime")]
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 #[cfg(feature = "runtime")]
@@ -35,6 +34,57 @@ pub enum FrameError {
 
 pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
     serde_json::to_vec(value).map_err(|_| FrameError::Serialization)
+}
+
+pub fn read_frame_sync<T>(reader: &mut impl Read, max_payload: usize) -> Result<T, FrameError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let mut prefix = [0_u8; 4];
+    reader.read_exact(&mut prefix).map_err(map_sync_read)?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > max_payload {
+        return Err(FrameError::Oversize);
+    }
+    let mut payload = vec![0_u8; length];
+    reader.read_exact(&mut payload).map_err(map_sync_read)?;
+    std::str::from_utf8(&payload).map_err(|_| FrameError::InvalidUtf8)?;
+    let value: T = serde_json::from_slice(&payload).map_err(|_| FrameError::InvalidJson)?;
+    if canonical_json(&value)? != payload {
+        return Err(FrameError::NonCanonical);
+    }
+    Ok(value)
+}
+
+pub fn write_frame_sync<T: Serialize>(
+    writer: &mut impl Write,
+    value: &T,
+    max_payload: usize,
+) -> Result<(), FrameError> {
+    let payload = canonical_json(value)?;
+    if payload.len() > max_payload || payload.len() > u32::MAX as usize {
+        return Err(FrameError::Oversize);
+    }
+    writer
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .and_then(|()| writer.write_all(&payload))
+        .and_then(|()| writer.flush())
+        .map_err(map_sync_write)
+}
+
+fn map_sync_read(error: io::Error) -> FrameError {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof => FrameError::Closed,
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => FrameError::Timeout,
+        _ => FrameError::Io(error),
+    }
+}
+
+fn map_sync_write(error: io::Error) -> FrameError {
+    match error.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => FrameError::Timeout,
+        _ => FrameError::Io(error),
+    }
 }
 
 #[cfg(feature = "runtime")]

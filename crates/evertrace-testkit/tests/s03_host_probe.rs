@@ -17,6 +17,8 @@ use evertrace_codex::{
         ProbeEvidence,
     },
 };
+use evertrace_domain::config::{ConfigFile, EffectiveConfig};
+use evertrace_engine::RecoveryRuntimeSettings;
 use serde_json::Value;
 
 #[path = "../src/probe.rs"]
@@ -207,6 +209,14 @@ fn complete_evidence_enables_five_independent_gates_and_is_stable() {
     assert_eq!(first.mcp().binding, McpSessionBinding::Exact);
     assert_eq!(first.mcp().mechanism, McpBindingMechanism::HookStamped);
     assert_eq!(first.manifest().capture_guarantee, CaptureGuarantee::Full);
+    let config = EffectiveConfig::new(ConfigFile::default()).unwrap();
+    let runtime = RecoveryRuntimeSettings::compile(&config, Some(&first), 7).unwrap();
+    assert_eq!(runtime.gate, evertrace_capture::RecoveryGateMode::Active);
+    assert_eq!(
+        runtime.adapter_manifest_id.as_deref(),
+        Some(first.manifest().adapter_manifest_id.as_str())
+    );
+    assert_eq!(runtime.effective_config_hash, config.hash());
 }
 
 #[test]
@@ -218,6 +228,11 @@ fn synthetic_fixture_alone_does_not_activate_strong_normalization() {
         report.strong_normalization().reason(),
         GateReason::EvidenceIntegrityFailed
     );
+    assert_eq!(report.recovery().result(), GateResult::Disabled);
+    assert_eq!(report.recovery().reason(), GateReason::RecoveryCanaryFailed);
+    let config = EffectiveConfig::new(ConfigFile::default()).unwrap();
+    let runtime = RecoveryRuntimeSettings::compile(&config, Some(&report), 7).unwrap();
+    assert_eq!(runtime.gate, evertrace_capture::RecoveryGateMode::Disabled);
 }
 
 #[test]

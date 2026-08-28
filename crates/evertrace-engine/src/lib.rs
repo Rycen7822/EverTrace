@@ -7,6 +7,7 @@ pub mod capture;
 pub mod ingest;
 pub mod jobs;
 pub mod normalize;
+pub mod recovery;
 pub mod repository;
 pub mod segmentation;
 mod service;
@@ -18,4 +19,5 @@ pub use jobs::{
     expired_leases, open_writer, pending_dirty, pending_outbox, spawn_writer,
 };
 pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
+pub use recovery::*;
 pub use service::{EngineError, EngineService, HealthDispatchError, HealthSnapshot, RuntimeMode};

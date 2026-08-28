@@ -4,8 +4,27 @@ use std::io;
 pub use evertrace_domain::error::ErrorCode;
 use evertrace_domain::ids::RequestId;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "runtime")]
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SyncProtocolError {
+    #[error("recovery barrier input is invalid")]
+    InvalidInput,
+    #[error("recovery barrier connection failed")]
+    Connect,
+    #[error("recovery barrier framing failed")]
+    Frame,
+    #[error("recovery barrier negotiation failed")]
+    Negotiation,
+    #[error("recovery barrier response is invalid")]
+    InvalidResponse,
+    #[error("recovery barrier timed out")]
+    Timeout,
+    #[error("recovery barrier daemon error")]
+    Wire,
+    #[error("recovery barrier request was not admitted")]
+    NotAdmitted,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +69,8 @@ pub enum ProtocolError {
     InvalidBuildId,
     #[error("peer returned invalid health data")]
     InvalidHealth,
+    #[error("peer returned invalid recovery terminal data")]
+    InvalidRecoveryTerminal,
     #[error("peer returned invalid frame negotiation")]
     InvalidNegotiation,
     #[error("runtime directory is not a private owned directory")]

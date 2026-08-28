@@ -14,12 +14,13 @@ use evertrace_domain::{
     },
     ids::{CommandId, RepositoryId, SourceObservationId, TaskId, WorktreeId},
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
     CasStore, DeviceKeyStore,
-    frame::{CaptureRecordBody, SpoolRecord, encode_record_body},
+    frame::{CaptureRecordBody, RecoveryPreflightCandidate, SpoolRecord, encode_record_body},
     protect,
     runtime_snapshot::RuntimeSnapshot,
     spool::{CaptureGapMarker, DurableSpool, GapReason, SpoolError},
@@ -97,11 +98,18 @@ pub enum CaptureOutcome {
         spool_record_id: String,
         cas_digest: String,
         end_watermark: u64,
+        recovery_preflight: Option<DurableRecoveryPreflight>,
     },
     GapRecorded {
         marker_path: PathBuf,
     },
     CompletenessLost,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableRecoveryPreflight {
+    pub request_id: evertrace_domain::ids::RecoveryCaptureRequestId,
+    pub pending_revision_id: evertrace_domain::revision::RevisionId,
 }
 
 #[derive(Debug)]
@@ -147,6 +155,41 @@ impl CaptureRuntime {
     }
 
     pub fn capture(&mut self, input: CaptureRecordInput) -> Result<CaptureOutcome, CaptureError> {
+        self.capture_inner(input, None)
+    }
+
+    pub fn record_recovery_unavailable(
+        &self,
+        input: &CaptureRecordInput,
+    ) -> Result<CaptureOutcome, CaptureError> {
+        validate_input(input)?;
+        let spool_record_id = Uuid::now_v7().hyphenated().to_string();
+        let mut digest = Sha256::new();
+        digest.update(b"evertrace.recovery_unavailable.v1\0");
+        digest.update(input.source_ref.as_bytes());
+        digest.update([0]);
+        digest.update(input.session_ref.as_bytes());
+        Ok(self.record_gap(
+            input,
+            &spool_record_id,
+            &format!("{:x}", digest.finalize()),
+            GapReason::RecoveryUnavailable,
+        ))
+    }
+
+    pub fn capture_with_recovery_preflight(
+        &mut self,
+        input: CaptureRecordInput,
+        pending: RecoveryPreflightCandidate,
+    ) -> Result<CaptureOutcome, CaptureError> {
+        self.capture_inner(input, Some(pending))
+    }
+
+    fn capture_inner(
+        &mut self,
+        input: CaptureRecordInput,
+        pending: Option<RecoveryPreflightCandidate>,
+    ) -> Result<CaptureOutcome, CaptureError> {
         validate_input(&input)?;
         let recorded_at_us = now_us()?;
         let command_id = CommandId::new_v7();
@@ -291,6 +334,7 @@ impl CaptureRuntime {
             protection_key_generation: protected.key_generation(),
             event_time_us: input.event_time_us.unwrap_or(recorded_at_us),
             recorded_at_us,
+            recovery_preflight: pending.clone(),
         };
         let body = encode_record_body(&body)?;
         let record = SpoolRecord {
@@ -310,6 +354,10 @@ impl CaptureRuntime {
                     spool_record_id,
                     cas_digest,
                     end_watermark: written.end_watermark,
+                    recovery_preflight: pending.map(|intent| DurableRecoveryPreflight {
+                        request_id: intent.recovery_capture_request_id,
+                        pending_revision_id: intent.pending_revision_id,
+                    }),
                 })
             }
             Err(SpoolError::Pressure) => {

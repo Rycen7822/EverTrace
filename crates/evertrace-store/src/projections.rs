@@ -8,13 +8,14 @@ use evertrace_domain::{
     },
     ids::{
         AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
-        HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId, OperationId, RepositoryId,
-        ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId, WorkBindingRevisionId,
-        WorkEpisodeId, WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
+        HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId, OperationId,
+        RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId, ScopeEffectId,
+        SourceObservationId, SourceReceiptId, TaskId, WorkBindingRevisionId, WorkEpisodeId,
+        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
     repository::{
-        IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
-        WorktreeTransition,
+        IntegrationEvent, RecoveryBundle, RecoveryCaptureRequest, RepositoryInstance,
+        WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
     },
     work::{
         ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus,
@@ -43,7 +44,9 @@ use crate::{
     },
 };
 
+mod recovery;
 mod segmentation;
+pub use recovery::{RecoveryCurrentState, RecoveryCurrentView};
 pub use segmentation::{
     EpisodeCurrentView, OperationBurstCurrentView, SegmentationCurrentState,
     SegmentationCurrentView,
@@ -61,6 +64,78 @@ const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
 pub struct ProjectionSnapshot {
     pub frontier: u64,
     pub rows: Vec<ObjectRow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryEvidenceCurrentView {
+    frontier: u64,
+    receipts: BTreeMap<SourceReceiptId, SourceReceipt>,
+    observations: BTreeMap<SourceObservationId, SourceObservation>,
+}
+
+impl RecoveryEvidenceCurrentView {
+    pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let mut view = Self {
+            frontier: snapshot.frontier,
+            receipts: BTreeMap::new(),
+            observations: BTreeMap::new(),
+        };
+        for row in snapshot.data_rows() {
+            let Some(kind) = row.object_kind.as_deref() else {
+                continue;
+            };
+            if !matches!(kind, "source_receipt" | "source_observation") {
+                continue;
+            }
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            match payload {
+                JournalPayload::SourceReceiptRecorded(value) if kind == "source_receipt" => {
+                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                    if view
+                        .receipts
+                        .insert(value.source_receipt_id, *value)
+                        .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::SourceObservationRecorded(value)
+                    if kind == "source_observation" =>
+                {
+                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                    if view
+                        .observations
+                        .insert(value.source_observation_id, *value)
+                        .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        Ok(view)
+    }
+
+    pub const fn frontier(&self) -> u64 {
+        self.frontier
+    }
+
+    pub fn observation(&self, id: SourceObservationId) -> Option<&SourceObservation> {
+        self.observations.get(&id)
+    }
+
+    pub fn receipt_for_observation(&self, id: SourceObservationId) -> Option<&SourceReceipt> {
+        let observation = self.observation(id)?;
+        self.receipts
+            .get(&observation.source_receipt_ref)
+            .filter(|receipt| receipt.source_observation_id == id)
+    }
 }
 
 impl ProjectionSnapshot {
@@ -1089,6 +1164,10 @@ struct ReducerState {
     episode_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
     checkpoints: BTreeMap<String, (WorkCheckpoint, u64)>,
     corrections: BTreeMap<evertrace_domain::revision::RevisionId, (SegmentationCorrection, u64)>,
+    recovery_requests: BTreeMap<RecoveryCaptureRequestId, (RecoveryCaptureRequest, u64)>,
+    recovery_request_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryCaptureRequest, u64)>,
+    recovery_bundles: BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1143,6 +1222,7 @@ impl KnownSourceRange {
 pub(crate) struct JournalAdmissionState {
     source_ranges: BTreeMap<String, KnownSourceRange>,
     source_observations: BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    source_receipts: BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
     operation_revisions: BTreeMap<(OperationId, u32), (Operation, u64)>,
@@ -1174,6 +1254,10 @@ pub(crate) struct JournalAdmissionState {
     episode_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
     checkpoints: BTreeMap<String, (WorkCheckpoint, u64)>,
     corrections: BTreeMap<evertrace_domain::revision::RevisionId, (SegmentationCorrection, u64)>,
+    recovery_requests: BTreeMap<RecoveryCaptureRequestId, (RecoveryCaptureRequest, u64)>,
+    recovery_request_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryCaptureRequest, u64)>,
+    recovery_bundles: BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
 }
 
 impl JournalAdmissionState {
@@ -1339,6 +1423,13 @@ impl JournalAdmissionState {
         match payload {
             JournalPayload::SourceReceiptRecorded(value) => {
                 record_known_source(&mut self.source_ranges, &value)?;
+                if self
+                    .source_receipts
+                    .insert(value.source_receipt_id, (*value, seq))
+                    .is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
             JournalPayload::SourceObservationRecorded(value) => {
                 if self
@@ -1446,6 +1537,19 @@ impl JournalAdmissionState {
             JournalPayload::SegmentationCorrectionRecorded(value) => {
                 record_correction(&mut self.corrections, *value, seq)?;
             }
+            JournalPayload::RecoveryCaptureRequestRecorded(value) => recovery::record_request(
+                &mut self.recovery_requests,
+                &mut self.recovery_request_revisions,
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
+            JournalPayload::RecoveryBundleRecorded(value) => recovery::record_bundle(
+                &mut self.recovery_bundles,
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
             _ => {}
         }
         Ok(())
@@ -1519,7 +1623,13 @@ impl JournalAdmissionState {
             &self.worktree_snapshots,
             &self.worktree_transitions,
             &self.integration_events,
-        )
+        )?;
+        recovery::validate_relations(recovery::RecoveryRelationInputs {
+            requests: &self.recovery_requests,
+            bundles: &self.recovery_bundles,
+            worktrees: &self.worktrees,
+            snapshots: &self.worktree_snapshots,
+        })
     }
 }
 
@@ -2083,6 +2193,19 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         JournalPayload::SegmentationCorrectionRecorded(value) => {
             record_correction(&mut state.corrections, *value, row.seq)?;
         }
+        JournalPayload::RecoveryCaptureRequestRecorded(value) => recovery::record_request(
+            &mut state.recovery_requests,
+            &mut state.recovery_request_revisions,
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
+        JournalPayload::RecoveryBundleRecorded(value) => recovery::record_bundle(
+            &mut state.recovery_bundles,
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
     }
     Ok(())
 }
@@ -2963,6 +3086,11 @@ impl ReducerState {
             }
             self.episodes.insert(value.episode_id, (value, seq));
         }
+        recovery::rebuild_requests(
+            &mut self.recovery_requests,
+            &self.recovery_request_revisions,
+            StoreError::StoreCorrupt,
+        )?;
         Ok(())
     }
 
@@ -3606,6 +3734,38 @@ impl ReducerState {
                     .insert(value.integration_event_id, (value, row.source_event_seq))
                     .is_some()
             }
+            JournalPayload::RecoveryCaptureRequestRecorded(value) => {
+                let value = *value;
+                recovery::require_revision_row(
+                    row,
+                    "recovery_capture_request_revision",
+                    &value.recovery_capture_request_id.to_string(),
+                    &value.request_revision_id.to_string(),
+                )?;
+                recovery::record_request(
+                    &mut self.recovery_requests,
+                    &mut self.recovery_request_revisions,
+                    value,
+                    row.source_event_seq,
+                    StoreError::StoreCorrupt,
+                )?;
+                false
+            }
+            JournalPayload::RecoveryBundleRecorded(value) => {
+                recovery::require_revision_row(
+                    row,
+                    "recovery_bundle",
+                    &value.recovery_bundle_id.to_string(),
+                    &value.recovery_bundle_id.to_string(),
+                )?;
+                recovery::record_bundle(
+                    &mut self.recovery_bundles,
+                    *value,
+                    row.source_event_seq,
+                    StoreError::StoreCorrupt,
+                )?;
+                false
+            }
         };
         if duplicate {
             return Err(StoreError::StoreCorrupt);
@@ -4048,6 +4208,10 @@ impl ReducerState {
                 seq,
             )?);
         }
+        rows.extend(recovery::revision_rows(
+            self.recovery_request_revisions,
+            self.recovery_bundles,
+        )?);
         Ok(rows)
     }
 
@@ -4191,6 +4355,12 @@ impl ReducerState {
             &self.worktree_transitions,
             &self.integration_events,
         )?;
+        recovery::validate_relations(recovery::RecoveryRelationInputs {
+            requests: &self.recovery_requests,
+            bundles: &self.recovery_bundles,
+            worktrees: &self.worktrees,
+            snapshots: &self.worktree_snapshots,
+        })?;
         Ok(())
     }
 
@@ -4198,6 +4368,7 @@ impl ReducerState {
         Ok(JournalAdmissionState {
             source_ranges: current_source_ranges(&self.source_receipts)?,
             source_observations: self.source_observations.clone(),
+            source_receipts: self.source_receipts.clone(),
             host_occurrences: self.host_occurrences.clone(),
             operations: self.operations.clone(),
             operation_revisions: self.operation_revisions.clone(),
@@ -4226,6 +4397,9 @@ impl ReducerState {
             episode_revisions: self.episode_revisions.clone(),
             checkpoints: self.checkpoints.clone(),
             corrections: self.corrections.clone(),
+            recovery_requests: self.recovery_requests.clone(),
+            recovery_request_revisions: self.recovery_request_revisions.clone(),
+            recovery_bundles: self.recovery_bundles.clone(),
         })
     }
 }

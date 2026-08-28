@@ -9,6 +9,7 @@ license.workspace = true
 evertrace-domain = { path = "../evertrace-domain" }
 fs2.workspace = true
 hmac.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

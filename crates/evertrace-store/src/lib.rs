@@ -27,8 +27,8 @@ pub use projections::{
     ProjectionSnapshot, ProjectionWorker, ReconciliationArtifactContext,
     ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
     ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
-    SegmentationCurrentState, SegmentationCurrentView, WorkBindingCurrentView,
-    WorkIdentityCurrentView, reduce_journal,
+    RecoveryEvidenceCurrentView, SegmentationCurrentState, SegmentationCurrentView,
+    WorkBindingCurrentView, WorkIdentityCurrentView, reduce_journal,
 };
 pub use schema::{PROBE_SCHEMA_VERSION, ProbeRow, probe_batch, probe_schema, schema_fingerprint};
 pub use writer::{JournalWriter, SiblingWriterLock};

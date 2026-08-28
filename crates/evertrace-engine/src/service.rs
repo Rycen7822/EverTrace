@@ -48,6 +48,10 @@ impl EngineService {
         &self.config.config().runtime.data_dir
     }
 
+    pub const fn effective_config(&self) -> &EffectiveConfig {
+        &self.config
+    }
+
     pub fn health(&self) -> Result<HealthSnapshot, HealthDispatchError> {
         if self.mode == RuntimeMode::Maintenance {
             return Err(HealthDispatchError::MaintenanceMode);

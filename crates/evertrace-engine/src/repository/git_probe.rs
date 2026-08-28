@@ -5,6 +5,7 @@
 //! process as soon as any bound is exceeded.
 
 use std::{
+    cell::Cell,
     collections::BTreeSet,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -22,7 +23,7 @@ use evertrace_domain::{
     evidence::hex,
     repository::{
         FilesystemIdentity, GitObjectFormat, GitOperation, ProbeUnavailableReason,
-        REMOTE_FINGERPRINT_PREFIX, SnapshotField,
+        REMOTE_FINGERPRINT_PREFIX, SnapshotField, UntrackedCaptureScope,
     },
 };
 use thiserror::Error;
@@ -36,6 +37,29 @@ const UNTRACKED_DIGEST_TAG: &str = "worktree_untracked_manifest_v1";
 const PATCH_EQUIVALENCE_TAG: &str = "worktree_patch_equivalence_v1";
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+thread_local! {
+    static SHARED_PROBE_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Applies one absolute budget to every closed Git operation performed by
+/// `operation` on this blocking worker thread. Nested scopes can only shorten
+/// the active deadline.
+pub(crate) fn with_probe_deadline<T>(deadline: Instant, operation: impl FnOnce() -> T) -> T {
+    SHARED_PROBE_DEADLINE.with(|slot| {
+        let previous = slot.replace(Some(
+            slot.get().map_or(deadline, |value| value.min(deadline)),
+        ));
+        struct Reset<'a>(&'a Cell<Option<Instant>>, Option<Instant>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _reset = Reset(slot, previous);
+        operation()
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostTrustDecision {
@@ -139,6 +163,11 @@ pub enum GitProbeOp {
         tip: GitOid,
     },
     LsFilesStage,
+    LsFilesOthersStandard,
+    LsFilesOthersIncludingIgnored,
+    LsFilesOthersIgnoredOnly,
+    DiffBinary,
+    DiffCachedBinary,
     ConfigGetRemoteUrls,
 }
 
@@ -195,7 +224,35 @@ impl GitProbeOp {
             Self::DiffRawRange { base, tip } => {
                 argv.extend(["diff", "--raw", "-z", base.as_str(), tip.as_str()].map(str::to_owned))
             }
-            Self::LsFilesStage => argv.extend(["ls-files", "--stage"].map(str::to_owned)),
+            Self::LsFilesStage => argv.extend(["ls-files", "--stage", "-z"].map(str::to_owned)),
+            Self::LsFilesOthersStandard => {
+                argv.extend(["ls-files", "--others", "-z", "--exclude-standard"].map(str::to_owned))
+            }
+            Self::LsFilesOthersIncludingIgnored => {
+                argv.extend(["ls-files", "--others", "-z"].map(str::to_owned))
+            }
+            Self::LsFilesOthersIgnoredOnly => argv.extend(
+                [
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "-z",
+                    "--exclude-standard",
+                ]
+                .map(str::to_owned),
+            ),
+            Self::DiffBinary => argv
+                .extend(["diff", "--binary", "--no-ext-diff", "--no-textconv"].map(str::to_owned)),
+            Self::DiffCachedBinary => argv.extend(
+                [
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ]
+                .map(str::to_owned),
+            ),
             Self::ConfigGetRemoteUrls => argv.extend(
                 ["config", "--null", "--get-regexp", "^remote\\..*\\.url$"].map(str::to_owned),
             ),
@@ -205,7 +262,9 @@ impl GitProbeOp {
 
     fn stdout_limit(&self, limits: &ProbeLimits) -> usize {
         match self {
-            Self::DiffRawRange { .. } => limits.max_diff_bytes,
+            Self::DiffRawRange { .. } | Self::DiffBinary | Self::DiffCachedBinary => {
+                limits.max_diff_bytes
+            }
             _ => limits.max_stdout_bytes,
         }
     }
@@ -282,6 +341,7 @@ pub struct GitProbeEvidence {
     pub evidence_refs: Vec<String>,
     pub unavailable_reason: Option<ProbeUnavailableReason>,
     pub worktree_root: Option<String>,
+    pub worktree_root_filesystem: Option<FilesystemIdentity>,
     pub git_dir: Option<String>,
     pub common_dir: Option<String>,
     pub common_dir_filesystem: Option<FilesystemIdentity>,
@@ -305,6 +365,263 @@ pub struct GitProbeEvidence {
     pub omissions: Vec<ProbeOmission>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryGitCaptureItem {
+    WorktreeStatus,
+    TrackedDiff,
+    IndexDiff,
+    IndexEntries,
+    UntrackedManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryGitCaptureOmission {
+    pub item: RecoveryGitCaptureItem,
+    pub reason: ProbeUnavailableReason,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveryGitCaptureEvidence {
+    pub fingerprint: Option<String>,
+    pub tracked_diff: Option<Vec<u8>>,
+    pub index_diff: Option<Vec<u8>>,
+    pub index_entries: Option<Vec<u8>>,
+    pub untracked_paths: Vec<std::path::PathBuf>,
+    pub omissions: Vec<RecoveryGitCaptureOmission>,
+}
+
+impl std::fmt::Debug for RecoveryGitCaptureEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryGitCaptureEvidence")
+            .field("has_fingerprint", &self.fingerprint.is_some())
+            .field(
+                "tracked_diff_bytes",
+                &self.tracked_diff.as_ref().map(Vec::len),
+            )
+            .field("index_diff_bytes", &self.index_diff.as_ref().map(Vec::len))
+            .field(
+                "index_entries_bytes",
+                &self.index_entries.as_ref().map(Vec::len),
+            )
+            .field("untracked_path_count", &self.untracked_paths.len())
+            .field("omissions", &self.omissions)
+            .finish()
+    }
+}
+
+pub fn probe_recovery_capture(
+    cwd: &Path,
+    limits: &ProbeLimits,
+) -> Result<RecoveryGitCaptureEvidence, RepositoryProbeError> {
+    probe_recovery_capture_scoped(cwd, limits, UntrackedCaptureScope::Standard)
+}
+
+pub fn probe_recovery_capture_scoped(
+    cwd: &Path,
+    limits: &ProbeLimits,
+    scope: UntrackedCaptureScope,
+) -> Result<RecoveryGitCaptureEvidence, RepositoryProbeError> {
+    limits.validate()?;
+    let canonical = std::fs::canonicalize(cwd).map_err(|_| RepositoryProbeError::InvalidInput)?;
+    probe_recovery_capture_at(&canonical, limits, scope)
+}
+
+pub fn probe_recovery_capture_scoped_pinned(
+    cwd: &Path,
+    expected_identity: FilesystemIdentity,
+    limits: &ProbeLimits,
+    scope: UntrackedCaptureScope,
+) -> Result<RecoveryGitCaptureEvidence, RepositoryProbeError> {
+    limits.validate()?;
+    validate_pinned_cwd(cwd, expected_identity)?;
+    probe_recovery_capture_at(cwd, limits, scope)
+}
+
+fn probe_recovery_capture_at(
+    cwd: &Path,
+    limits: &ProbeLimits,
+    scope: UntrackedCaptureScope,
+) -> Result<RecoveryGitCaptureEvidence, RepositoryProbeError> {
+    let mut evidence = RecoveryGitCaptureEvidence {
+        fingerprint: None,
+        tracked_diff: None,
+        index_diff: None,
+        index_entries: None,
+        untracked_paths: Vec::new(),
+        omissions: Vec::new(),
+    };
+    let status = capture_op(
+        cwd,
+        &GitProbeOp::StatusPorcelainV2,
+        limits,
+        RecoveryGitCaptureItem::WorktreeStatus,
+        &mut evidence.omissions,
+    );
+    let untracked_manifest = capture_op(
+        cwd,
+        &match scope {
+            UntrackedCaptureScope::Standard => GitProbeOp::LsFilesOthersStandard,
+            UntrackedCaptureScope::StandardAndIgnored => GitProbeOp::LsFilesOthersIncludingIgnored,
+            UntrackedCaptureScope::IgnoredOnly => GitProbeOp::LsFilesOthersIgnoredOnly,
+        },
+        limits,
+        RecoveryGitCaptureItem::UntrackedManifest,
+        &mut evidence.omissions,
+    );
+    if let Some(manifest) = untracked_manifest.as_ref() {
+        let records = manifest
+            .strip_suffix(&[0])
+            .unwrap_or(manifest)
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .collect::<Vec<_>>();
+        let malformed = (!manifest.is_empty() && !manifest.ends_with(&[0]))
+            || manifest.windows(2).any(|bytes| bytes == [0, 0]);
+        if records.len() > limits.max_records {
+            evidence.omissions.push(RecoveryGitCaptureOmission {
+                item: RecoveryGitCaptureItem::UntrackedManifest,
+                reason: ProbeUnavailableReason::OutputLimitExceeded,
+            });
+        } else {
+            #[cfg(unix)]
+            use std::os::unix::ffi::OsStringExt;
+            let mut paths = BTreeSet::new();
+            #[cfg(unix)]
+            let invalid_record = malformed;
+            #[cfg(not(unix))]
+            let mut invalid_record = malformed;
+            for record in records {
+                #[cfg(unix)]
+                paths.insert(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                    record.to_vec(),
+                )));
+                #[cfg(not(unix))]
+                match std::str::from_utf8(record) {
+                    Ok(path) => {
+                        paths.insert(std::path::PathBuf::from(path));
+                    }
+                    Err(_) => invalid_record = true,
+                }
+            }
+            if invalid_record {
+                evidence.omissions.push(RecoveryGitCaptureOmission {
+                    item: RecoveryGitCaptureItem::UntrackedManifest,
+                    reason: ProbeUnavailableReason::CorruptAdminMetadata,
+                });
+            }
+            if paths.len() > limits.max_untracked_paths {
+                evidence.omissions.push(RecoveryGitCaptureOmission {
+                    item: RecoveryGitCaptureItem::UntrackedManifest,
+                    reason: ProbeUnavailableReason::OutputLimitExceeded,
+                });
+            } else {
+                evidence.untracked_paths = paths.into_iter().collect();
+            }
+        }
+    }
+    evidence.tracked_diff = capture_op(
+        cwd,
+        &GitProbeOp::DiffBinary,
+        limits,
+        RecoveryGitCaptureItem::TrackedDiff,
+        &mut evidence.omissions,
+    );
+    evidence.index_diff = capture_op(
+        cwd,
+        &GitProbeOp::DiffCachedBinary,
+        limits,
+        RecoveryGitCaptureItem::IndexDiff,
+        &mut evidence.omissions,
+    );
+    evidence.index_entries = capture_op(
+        cwd,
+        &GitProbeOp::LsFilesStage,
+        limits,
+        RecoveryGitCaptureItem::IndexEntries,
+        &mut evidence.omissions,
+    );
+    if let (
+        Some(status),
+        Some(tracked_diff),
+        Some(index_diff),
+        Some(index_entries),
+        Some(untracked),
+    ) = (
+        status.as_ref(),
+        evidence.tracked_diff.as_ref(),
+        evidence.index_diff.as_ref(),
+        evidence.index_entries.as_ref(),
+        untracked_manifest.as_ref(),
+    ) {
+        let value = CanonicalValue::Map(vec![
+            ("status".into(), CanonicalValue::Bytes(status.clone())),
+            (
+                "tracked_diff".into(),
+                CanonicalValue::Bytes(tracked_diff.clone()),
+            ),
+            (
+                "index_diff".into(),
+                CanonicalValue::Bytes(index_diff.clone()),
+            ),
+            (
+                "index_entries".into(),
+                CanonicalValue::Bytes(index_entries.clone()),
+            ),
+            (
+                "untracked_scope".into(),
+                CanonicalValue::String(
+                    match scope {
+                        UntrackedCaptureScope::Standard => "standard",
+                        UntrackedCaptureScope::StandardAndIgnored => "standard_and_ignored",
+                        UntrackedCaptureScope::IgnoredOnly => "ignored_only",
+                    }
+                    .to_owned(),
+                ),
+            ),
+            (
+                "untracked_manifest".into(),
+                CanonicalValue::Bytes(untracked.clone()),
+            ),
+        ]);
+        evidence.fingerprint = sha256("recovery_fence_fingerprint_v2", 2, &value)
+            .ok()
+            .map(|value| hex(&value));
+    }
+    Ok(evidence)
+}
+
+fn capture_op(
+    cwd: &Path,
+    op: &GitProbeOp,
+    limits: &ProbeLimits,
+    item: RecoveryGitCaptureItem,
+    omissions: &mut Vec<RecoveryGitCaptureOmission>,
+) -> Option<Vec<u8>> {
+    match run_op(cwd, op, limits) {
+        Ok(output) if output.code == Some(0) && !output.truncated && !output.timed_out => {
+            Some(output.stdout)
+        }
+        Ok(output) => {
+            omissions.push(RecoveryGitCaptureOmission {
+                item,
+                reason: if output.timed_out {
+                    ProbeUnavailableReason::Timeout
+                } else if output.truncated {
+                    ProbeUnavailableReason::OutputLimitExceeded
+                } else {
+                    ProbeUnavailableReason::CorruptAdminMetadata
+                },
+            });
+            None
+        }
+        Err(reason) => {
+            omissions.push(RecoveryGitCaptureOmission { item, reason });
+            None
+        }
+    }
+}
+
 impl GitProbeEvidence {
     fn unavailable(
         candidate_path: String,
@@ -319,6 +636,7 @@ impl GitProbeEvidence {
             evidence_refs,
             unavailable_reason: Some(reason),
             worktree_root: None,
+            worktree_root_filesystem: None,
             git_dir: None,
             common_dir: None,
             common_dir_filesystem: None,
@@ -437,7 +755,10 @@ fn run_op(
         }
         drop(stdin);
     }
-    let deadline = Instant::now() + Duration::from_millis(limits.max_duration_ms);
+    let local_deadline = Instant::now() + Duration::from_millis(limits.max_duration_ms);
+    let deadline = SHARED_PROBE_DEADLINE
+        .with(|slot| slot.get())
+        .map_or(local_deadline, |shared| shared.min(local_deadline));
     let mut timed_out = false;
     let status = loop {
         if truncated.load(Ordering::Acquire) {
@@ -519,6 +840,33 @@ fn filesystem_identity(path: &Path) -> Result<FilesystemIdentity, ProbeUnavailab
         device: metadata.dev(),
         inode: metadata.ino(),
     })
+}
+
+fn validate_pinned_cwd(
+    path: &Path,
+    expected_identity: FilesystemIdentity,
+) -> Result<(), RepositoryProbeError> {
+    let value = path.to_str().ok_or(RepositoryProbeError::InvalidInput)?;
+    let prefix = format!("/proc/{}/fd/", std::process::id());
+    let fd = value
+        .strip_prefix(&prefix)
+        .filter(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|suffix| suffix.parse::<i32>().ok().map(|fd| (suffix, fd)))
+        .filter(|(suffix, fd)| fd.to_string() == *suffix)
+        .ok_or(RepositoryProbeError::InvalidInput)?;
+    let link = std::fs::read_link(path).map_err(|_| RepositoryProbeError::InvalidInput)?;
+    if link.to_string_lossy().ends_with(" (deleted)") {
+        return Err(RepositoryProbeError::InvalidInput);
+    }
+    let metadata = std::fs::metadata(path).map_err(|_| RepositoryProbeError::InvalidInput)?;
+    if !metadata.is_dir()
+        || filesystem_identity(path).map_err(|_| RepositoryProbeError::InvalidInput)?
+            != expected_identity
+    {
+        return Err(RepositoryProbeError::InvalidInput);
+    }
+    let _ = fd;
+    Ok(())
 }
 
 /// Normalizes a remote URL into a credential-free `scheme://host/path`
@@ -617,11 +965,68 @@ pub fn probe_repository(
     known_admin_paths: &[String],
     known_head_oids: &[GitOid],
 ) -> Result<GitProbeEvidence, RepositoryProbeError> {
+    probe_repository_impl(
+        candidate_path,
+        None,
+        trust,
+        evidence_refs,
+        occurred_at_us,
+        limits,
+        known_admin_paths,
+        known_head_oids,
+    )
+}
+
+/// Runs the same closed probe with a caller-validated proc-fd cwd.
+///
+/// This is restricted to recovery custody: the proc-fd symlink is followed
+/// once to the already-open directory, while ordinary repository discovery
+/// continues to reject symlink candidates.
+#[allow(clippy::too_many_arguments)]
+pub fn probe_repository_pinned(
+    candidate_path: &Path,
+    logical_target_path: &Path,
+    expected_identity: FilesystemIdentity,
+    trust: HostTrustDecision,
+    evidence_refs: &[String],
+    occurred_at_us: i64,
+    limits: &ProbeLimits,
+    known_admin_paths: &[String],
+    known_head_oids: &[GitOid],
+) -> Result<GitProbeEvidence, RepositoryProbeError> {
+    validate_pinned_cwd(candidate_path, expected_identity)?;
+    if !logical_target_path.is_absolute() {
+        return Err(RepositoryProbeError::InvalidInput);
+    }
+    probe_repository_impl(
+        candidate_path,
+        Some((logical_target_path, expected_identity)),
+        trust,
+        evidence_refs,
+        occurred_at_us,
+        limits,
+        known_admin_paths,
+        known_head_oids,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_repository_impl(
+    candidate_path: &Path,
+    pinned: Option<(&Path, FilesystemIdentity)>,
+    trust: HostTrustDecision,
+    evidence_refs: &[String],
+    occurred_at_us: i64,
+    limits: &ProbeLimits,
+    known_admin_paths: &[String],
+    known_head_oids: &[GitOid],
+) -> Result<GitProbeEvidence, RepositoryProbeError> {
     limits.validate()?;
     if occurred_at_us < 0 || evidence_refs.is_empty() || !candidate_path.is_absolute() {
         return Err(RepositoryProbeError::InvalidInput);
     }
-    let candidate = candidate_path.to_string_lossy().into_owned();
+    let candidate = pinned.map_or(candidate_path, |(logical, _)| logical);
+    let candidate = candidate.to_string_lossy().into_owned();
     let refs = evidence_refs.to_vec();
     if !trust.permits_content_probe() {
         return Ok(GitProbeEvidence::unavailable(
@@ -631,8 +1036,13 @@ pub fn probe_repository(
             ProbeUnavailableReason::TrustDenied,
         ));
     }
-    let metadata = std::fs::symlink_metadata(candidate_path);
-    let canonical = match metadata {
+    let metadata = if pinned.is_some() {
+        std::fs::metadata(candidate_path)
+    } else {
+        std::fs::symlink_metadata(candidate_path)
+    };
+    let command_cwd = match metadata {
+        Ok(metadata) if metadata.is_dir() && pinned.is_some() => candidate_path.to_path_buf(),
         Ok(metadata) if metadata.is_dir() => match std::fs::canonicalize(candidate_path) {
             Ok(path) => path,
             Err(error) => {
@@ -668,14 +1078,10 @@ pub fn probe_repository(
             present: std::fs::metadata(path).is_ok(),
         })
         .collect::<Vec<_>>();
-    let mut evidence = GitProbeEvidence::established(
-        canonical.to_string_lossy().into_owned(),
-        occurred_at_us,
-        refs,
-        admin_path_probes,
-    );
+    let mut evidence =
+        GitProbeEvidence::established(candidate.clone(), occurred_at_us, refs, admin_path_probes);
 
-    let inside = run_op(&canonical, &GitProbeOp::RevParseIsInsideWorkTree, limits);
+    let inside = run_op(&command_cwd, &GitProbeOp::RevParseIsInsideWorkTree, limits);
     match inside {
         Ok(output) if output.code == Some(0) && output.stdout == b"true\n" => {}
         Ok(output) if output.timed_out => {
@@ -686,7 +1092,7 @@ pub fn probe_repository(
             // Git refused the directory. If admin metadata exists, Git
             // rejected it: corrupt, not absent.
             evidence.unavailable_reason = Some(
-                if std::fs::symlink_metadata(canonical.join(".git")).is_ok() {
+                if std::fs::symlink_metadata(command_cwd.join(".git")).is_ok() {
                     ProbeUnavailableReason::CorruptAdminMetadata
                 } else {
                     ProbeUnavailableReason::NonGit
@@ -703,7 +1109,7 @@ pub fn probe_repository(
     // From here the path is a Git worktree; individual failures degrade the
     // evidence to partial, and inconsistent admin metadata makes the whole
     // probe unavailable.
-    match run_op(&canonical, &GitProbeOp::RevParseShowToplevel, limits) {
+    match run_op(&command_cwd, &GitProbeOp::RevParseShowToplevel, limits) {
         Ok(output) if output.code == Some(0) => {
             evidence.worktree_root = Some(first_line(&output.stdout).unwrap_or_default());
         }
@@ -712,10 +1118,17 @@ pub fn probe_repository(
             return Ok(evidence);
         }
     }
-    match run_op(&canonical, &GitProbeOp::RevParseGitDir, limits) {
+    if let Some(worktree_root) = evidence.worktree_root.as_deref() {
+        evidence.worktree_root_filesystem = filesystem_identity(Path::new(worktree_root)).ok();
+        if evidence.worktree_root_filesystem.is_none() {
+            evidence.unavailable_reason = Some(ProbeUnavailableReason::PathMissing);
+            return Ok(evidence);
+        }
+    }
+    match run_op(&command_cwd, &GitProbeOp::RevParseGitDir, limits) {
         Ok(output) if output.code == Some(0) => {
             evidence.git_dir = first_line(&output.stdout).map(|value| {
-                absolutize(&canonical, &value)
+                pinned_absolutize(&command_cwd, pinned.map(|value| value.0), &value)
                     .to_string_lossy()
                     .into_owned()
             });
@@ -725,10 +1138,10 @@ pub fn probe_repository(
             return Ok(evidence);
         }
     }
-    match run_op(&canonical, &GitProbeOp::RevParseCommonDir, limits) {
+    match run_op(&command_cwd, &GitProbeOp::RevParseCommonDir, limits) {
         Ok(output) if output.code == Some(0) => {
             evidence.common_dir = first_line(&output.stdout).map(|value| {
-                absolutize(&canonical, &value)
+                pinned_absolutize(&command_cwd, pinned.map(|value| value.0), &value)
                     .to_string_lossy()
                     .into_owned()
             });
@@ -738,7 +1151,7 @@ pub fn probe_repository(
             return Ok(evidence);
         }
     }
-    match run_op(&canonical, &GitProbeOp::RevParseShowObjectFormat, limits) {
+    match run_op(&command_cwd, &GitProbeOp::RevParseShowObjectFormat, limits) {
         Ok(output) if output.code == Some(0) => {
             evidence.object_format =
                 first_line(&output.stdout).and_then(|value| GitObjectFormat::parse(&value).ok());
@@ -761,14 +1174,14 @@ pub fn probe_repository(
             }),
         }
     }
-    probe_head(&canonical, limits, &mut evidence);
-    probe_status(&canonical, limits, &mut evidence);
-    probe_index(&canonical, limits, &mut evidence);
-    probe_refs(&canonical, limits, &mut evidence);
-    probe_continuity(&canonical, limits, &mut evidence, known_head_oids);
-    probe_remotes(&canonical, limits, &mut evidence);
+    probe_head(&command_cwd, limits, &mut evidence);
+    probe_status(&command_cwd, limits, &mut evidence);
+    probe_index(&command_cwd, limits, &mut evidence);
+    probe_refs(&command_cwd, limits, &mut evidence);
+    probe_continuity(&command_cwd, limits, &mut evidence, known_head_oids);
+    probe_remotes(&command_cwd, limits, &mut evidence);
     probe_git_operation(&evidence.git_dir.clone(), &mut evidence);
-    probe_worktree_entries(&canonical, limits, &mut evidence);
+    probe_worktree_entries(&command_cwd, pinned.is_none(), limits, &mut evidence);
     Ok(evidence)
 }
 
@@ -854,15 +1267,25 @@ fn probe_status(canonical: &Path, limits: &ProbeLimits, evidence: &mut GitProbeE
                 &CanonicalValue::Bytes(output.stdout.clone()),
             );
             evidence.tracked_diff_digest = digest.ok().map(|value| hex(&value));
+            let mut invalid_untracked = false;
             let untracked = records
                 .iter()
-                .filter_map(|record| {
-                    std::str::from_utf8(record)
-                        .ok()
-                        .and_then(|record| record.strip_prefix("? "))
-                        .map(str::to_owned)
+                .filter_map(|record| match std::str::from_utf8(record) {
+                    Ok(record) => record.strip_prefix("? ").map(str::to_owned),
+                    Err(_) => {
+                        if record.starts_with(b"? ") {
+                            invalid_untracked = true;
+                        }
+                        None
+                    }
                 })
                 .collect::<BTreeSet<_>>();
+            if invalid_untracked {
+                evidence.omissions.push(ProbeOmission {
+                    field: ProbeField::UntrackedManifest,
+                    reason: ProbeUnavailableReason::CorruptAdminMetadata,
+                });
+            }
             if untracked.len() > limits.max_untracked_paths {
                 evidence.omissions.push(ProbeOmission {
                     field: ProbeField::UntrackedManifest,
@@ -1213,7 +1636,12 @@ fn probe_git_operation(git_dir: &Option<String>, evidence: &mut GitProbeEvidence
     };
 }
 
-fn probe_worktree_entries(canonical: &Path, limits: &ProbeLimits, evidence: &mut GitProbeEvidence) {
+fn probe_worktree_entries(
+    canonical: &Path,
+    probe_entry_gitdirs: bool,
+    limits: &ProbeLimits,
+    evidence: &mut GitProbeEvidence,
+) {
     let output = match run_op(canonical, &GitProbeOp::WorktreeListPorcelain, limits) {
         Ok(output) if output.code == Some(0) && !output.truncated && !output.timed_out => output,
         Ok(output) => {
@@ -1289,7 +1717,7 @@ fn probe_worktree_entries(canonical: &Path, limits: &ProbeLimits, evidence: &mut
         return;
     }
     for entry in &mut entries {
-        if entry.prunable || std::fs::metadata(&entry.path).is_err() {
+        if !probe_entry_gitdirs || entry.prunable || std::fs::metadata(&entry.path).is_err() {
             continue;
         }
         if let Ok(gitdir) = run_op(Path::new(&entry.path), &GitProbeOp::RevParseGitDir, limits)
@@ -1386,9 +1814,143 @@ fn absolutize(cwd: &Path, value: &str) -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
+fn pinned_absolutize(cwd: &Path, logical_root: Option<&Path>, value: &str) -> PathBuf {
+    let value = Path::new(value);
+    if value.is_absolute() {
+        value.to_path_buf()
+    } else {
+        logical_root.unwrap_or(cwd).join(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_recovery_git_cwd_never_follows_a_replaced_locator() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "evertrace-pinned-{}",
+            evertrace_domain::ids::CommandId::new_v7()
+        ));
+        let root = base.join("worktree");
+        let displaced = base.join("pinned-a");
+        let replacement = base.join("replacement-b");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("from-a"), b"a").unwrap();
+        let confined = evertrace_capture::ConfinedRoot::open(&root).unwrap();
+        let cwd = confined.proc_cwd_path().unwrap();
+        let metadata = std::fs::metadata(&cwd).unwrap();
+        let identity = FilesystemIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let limits = ProbeLimits::default();
+        let first = probe_recovery_capture_scoped_pinned(
+            &cwd,
+            identity,
+            &limits,
+            UntrackedCaptureScope::Standard,
+        )
+        .unwrap();
+        assert!(first.untracked_paths.contains(&PathBuf::from("from-a")));
+
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("from-b"), b"b").unwrap();
+        let during_replacement = probe_recovery_capture_scoped_pinned(
+            &cwd,
+            identity,
+            &limits,
+            UntrackedCaptureScope::Standard,
+        )
+        .unwrap();
+        assert!(
+            during_replacement
+                .untracked_paths
+                .contains(&PathBuf::from("from-a"))
+        );
+        assert!(
+            !during_replacement
+                .untracked_paths
+                .contains(&PathBuf::from("from-b"))
+        );
+        assert!(confined.revalidate().is_err());
+
+        std::fs::rename(&root, &replacement).unwrap();
+        std::fs::rename(&displaced, &root).unwrap();
+        // The open descriptor still names A, while root locator validation
+        // conservatively detects the rename/ABA metadata change.
+        assert!(confined.revalidate().is_err());
+        let after_aba = probe_recovery_capture_scoped_pinned(
+            &cwd,
+            identity,
+            &limits,
+            UntrackedCaptureScope::Standard,
+        )
+        .unwrap();
+        assert!(after_aba.untracked_paths.contains(&PathBuf::from("from-a")));
+        assert!(!after_aba.untracked_paths.contains(&PathBuf::from("from-b")));
+        assert!(
+            probe_recovery_capture_scoped_pinned(
+                &cwd,
+                FilesystemIdentity {
+                    device: identity.device,
+                    inode: identity.inode.saturating_add(1),
+                },
+                &limits,
+                UntrackedCaptureScope::Standard,
+            )
+            .is_err()
+        );
+        assert!(
+            probe_recovery_capture_scoped_pinned(
+                Path::new("/proc/self/fd/not-a-fd"),
+                identity,
+                &limits,
+                UntrackedCaptureScope::Standard,
+            )
+            .is_err()
+        );
+
+        drop(confined);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn shared_probe_deadline_is_monotonic_and_never_extended_by_a_stage() {
+        let outer = Instant::now() + Duration::from_secs(10);
+        let shorter = Instant::now() + Duration::from_secs(5);
+        with_probe_deadline(outer, || {
+            assert_eq!(SHARED_PROBE_DEADLINE.with(Cell::get), Some(outer));
+            with_probe_deadline(outer + Duration::from_secs(10), || {
+                assert_eq!(SHARED_PROBE_DEADLINE.with(Cell::get), Some(outer));
+            });
+            with_probe_deadline(shorter, || {
+                assert_eq!(SHARED_PROBE_DEADLINE.with(Cell::get), Some(shorter));
+            });
+            assert_eq!(SHARED_PROBE_DEADLINE.with(Cell::get), Some(outer));
+        });
+        assert_eq!(SHARED_PROBE_DEADLINE.with(Cell::get), None);
+    }
 
     fn oid(value: char) -> GitOid {
         GitOid::parse(&value.to_string().repeat(40)).unwrap()

@@ -1,4 +1,7 @@
-use evertrace_domain::ids::RequestId;
+use evertrace_domain::{
+    ids::{RecoveryCaptureRequestId, RequestId},
+    revision::RevisionId,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -8,8 +11,27 @@ pub struct CommandEnvelope {
     pub command: Command,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
     Health,
+    RecoveryBarrier(RecoveryBarrierLocator),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryBarrierLocator {
+    pub spool_record_id: String,
+    pub recovery_capture_request_id: RecoveryCaptureRequestId,
+    pub pending_revision_id: RevisionId,
+}
+
+impl RecoveryBarrierLocator {
+    pub fn validate(&self) -> bool {
+        !self.spool_record_id.is_empty()
+            && self.spool_record_id.len() <= 256
+            && self.spool_record_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+    }
 }
