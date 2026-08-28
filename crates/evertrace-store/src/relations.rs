@@ -18,6 +18,8 @@ mod segmentation;
 pub use segmentation::*;
 mod recovery;
 pub use recovery::*;
+mod autoresearch;
+pub use autoresearch::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]

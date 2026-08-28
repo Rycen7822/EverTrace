@@ -8,21 +8,24 @@ use evertrace_domain::{
     },
     ids::{
         AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
-        HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId, OperationId,
-        RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId, ScopeEffectId,
-        SourceObservationId, SourceReceiptId, TaskId, WorkBindingRevisionId, WorkEpisodeId,
-        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
+        ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId,
+        OperationId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId, ResultEvidenceId,
+        ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId,
+        WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId, WorktreeSnapshotId,
+        WorktreeTransitionId,
     },
     repository::{
         IntegrationEvent, RecoveryBundle, RecoveryCaptureRequest, RepositoryInstance,
         WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
     },
+    semantic::ResultEvidence,
     work::{
         ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus,
         AttemptExecutionStatus, AttemptOutcomeState, AttemptVerification, CaptureReceipt,
-        CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, LaneStatus,
+        CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, ExperimentRun, LaneStatus,
         OperationBurst, ResumeStateAssessment, SegmentationCorrection, SourceCoverage, Task,
-        TaskIdentityConfidence, WorkBindingRevision, WorkCheckpoint, WorkEpisode, Workstream,
+        TaskIdentityConfidence, WorkArtifact, WorkBindingRevision, WorkCheckpoint, WorkEpisode,
+        Workstream,
     },
 };
 use lancedb::Table;
@@ -44,8 +47,11 @@ use crate::{
     },
 };
 
+mod autoresearch;
 mod recovery;
 mod segmentation;
+pub use autoresearch::AutoresearchCurrentView;
+use autoresearch::{record_artifact, record_result, record_run};
 pub use recovery::{RecoveryCurrentState, RecoveryCurrentView};
 pub use segmentation::{
     EpisodeCurrentView, OperationBurstCurrentView, SegmentationCurrentState,
@@ -1168,6 +1174,14 @@ struct ReducerState {
     recovery_request_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryCaptureRequest, u64)>,
     recovery_bundles: BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
+    experiment_runs: BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
+    experiment_run_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (ExperimentRun, u64)>,
+    result_evidence: BTreeMap<ResultEvidenceId, (ResultEvidence, u64)>,
+    result_evidence_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (ResultEvidence, u64)>,
+    work_artifacts: BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
+    artifact_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkArtifact, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1258,6 +1272,14 @@ pub(crate) struct JournalAdmissionState {
     recovery_request_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryCaptureRequest, u64)>,
     recovery_bundles: BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
+    experiment_runs: BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
+    experiment_run_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (ExperimentRun, u64)>,
+    result_evidence: BTreeMap<ResultEvidenceId, (ResultEvidence, u64)>,
+    result_evidence_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (ResultEvidence, u64)>,
+    work_artifacts: BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
+    artifact_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkArtifact, u64)>,
 }
 
 impl JournalAdmissionState {
@@ -1550,6 +1572,27 @@ impl JournalAdmissionState {
                 seq,
                 StoreError::StoreCorrupt,
             )?,
+            JournalPayload::ExperimentRunRecorded(value) => record_run(
+                &mut self.experiment_runs,
+                Some(&mut self.experiment_run_revisions),
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
+            JournalPayload::ResultEvidenceRecorded(value) => record_result(
+                &mut self.result_evidence,
+                Some(&mut self.result_evidence_revisions),
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
+            JournalPayload::WorkArtifactRecorded(value) => record_artifact(
+                &mut self.work_artifacts,
+                Some(&mut self.artifact_revisions),
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
             _ => {}
         }
         Ok(())
@@ -1587,6 +1630,7 @@ impl JournalAdmissionState {
             &self.attempts,
             &self.competing_groups,
             &self.episodes,
+            &self.experiment_runs,
         )?;
         validate_attempt_relations(
             &self.attempts,
@@ -1629,6 +1673,22 @@ impl JournalAdmissionState {
             bundles: &self.recovery_bundles,
             worktrees: &self.worktrees,
             snapshots: &self.worktree_snapshots,
+        })?;
+        autoresearch::validate_relations(autoresearch::AutoresearchRelationInputs {
+            runs: &self.experiment_runs,
+            run_revisions: &self.experiment_run_revisions,
+            results: &self.result_evidence,
+            artifacts: &self.work_artifacts,
+            attempts: &self.attempts,
+            tasks: &self.tasks,
+            workstreams: &self.workstreams,
+            operations: &self.operations,
+            episodes: &self.episodes,
+            snapshots: &self.worktree_snapshots,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            source_receipts: &self.source_receipts,
+            source_observations: &self.source_observations,
         })
     }
 }
@@ -2206,6 +2266,27 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             row.seq,
             StoreError::StoreCorrupt,
         )?,
+        JournalPayload::ExperimentRunRecorded(value) => record_run(
+            &mut state.experiment_runs,
+            Some(&mut state.experiment_run_revisions),
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
+        JournalPayload::ResultEvidenceRecorded(value) => record_result(
+            &mut state.result_evidence,
+            Some(&mut state.result_evidence_revisions),
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
+        JournalPayload::WorkArtifactRecorded(value) => record_artifact(
+            &mut state.work_artifacts,
+            Some(&mut state.artifact_revisions),
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
     }
     Ok(())
 }
@@ -2397,6 +2478,7 @@ fn validate_work_binding_relations(
     attempts: &BTreeMap<AttemptId, (Attempt, u64)>,
     groups: &BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
     episodes: &BTreeMap<WorkEpisodeId, (WorkEpisode, u64)>,
+    runs: &BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
 ) -> Result<(), StoreError> {
     current_binding_lineage(bindings.values().map(|(binding, _)| binding))?;
     for (binding, _) in bindings.values() {
@@ -2475,8 +2557,21 @@ fn validate_work_binding_relations(
                         return Err(StoreError::StoreCorrupt);
                     }
                 }
-                if binding.primary_binding.experiment_run_id.is_some() {
-                    return Err(StoreError::StoreCorrupt);
+                if let Some(run_id) = binding.primary_binding.experiment_run_id {
+                    let run = &runs.get(&run_id).ok_or(StoreError::StoreCorrupt)?.0;
+                    let run_attempt_id = run.attempt_id.ok_or(StoreError::StoreCorrupt)?;
+                    let attempt = &attempts
+                        .get(&run_attempt_id)
+                        .ok_or(StoreError::StoreCorrupt)?
+                        .0;
+                    if binding.assignment_status != AssignmentStatus::Resolved
+                        || binding.primary_binding.attempt_id != Some(run_attempt_id)
+                        || run.workstream_id != workstream_id
+                        || attempt.task_id != task_id
+                        || attempt.workstream_id != workstream_id
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
                 }
             }
             (None, None) => {
@@ -3091,6 +3186,9 @@ impl ReducerState {
             &self.recovery_request_revisions,
             StoreError::StoreCorrupt,
         )?;
+        autoresearch::rebuild_runs(&mut self.experiment_runs, &self.experiment_run_revisions)?;
+        autoresearch::rebuild_results(&mut self.result_evidence, &self.result_evidence_revisions)?;
+        autoresearch::rebuild_artifacts(&mut self.work_artifacts, &self.artifact_revisions)?;
         Ok(())
     }
 
@@ -3766,6 +3864,79 @@ impl ReducerState {
                 )?;
                 false
             }
+            JournalPayload::ExperimentRunRecorded(value) => {
+                let value = *value;
+                let mut normalized = row.clone();
+                normalized.row_id = format!("object:work:experiment_run:{}", value.run_id);
+                require_work_identity_row(
+                    &normalized,
+                    "experiment_run",
+                    &value.run_id.to_string(),
+                    &value.revision_id.to_string(),
+                    None,
+                    Some(&value.workstream_id.to_string()),
+                    None,
+                    None,
+                    value.execution_status.as_str(),
+                )?;
+                self.experiment_run_revisions
+                    .insert(value.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::ResultEvidenceRecorded(value) => {
+                let value = *value;
+                let mut normalized = row.clone();
+                normalized.row_id =
+                    format!("object:work:result_evidence:{}", value.result_evidence_id);
+                require_work_identity_row(
+                    &normalized,
+                    "result_evidence",
+                    &value.result_evidence_id.to_string(),
+                    &value.revision_id.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    value.completeness.as_str(),
+                )?;
+                self.result_evidence_revisions
+                    .insert(value.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::WorkArtifactRecorded(value) => {
+                let value = *value;
+                let mut normalized = row.clone();
+                normalized.row_id = format!("object:work:work_artifact:{}", value.work_artifact_id);
+                require_work_identity_row(
+                    &normalized,
+                    "work_artifact",
+                    &value.work_artifact_id.to_string(),
+                    &value.revision.revision_id.to_string(),
+                    value
+                        .revision
+                        .scope
+                        .task_id()
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    None,
+                    value
+                        .revision
+                        .scope
+                        .repository_id()
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    value
+                        .revision
+                        .scope
+                        .worktree_id()
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    value.revision.payload_status.as_str(),
+                )?;
+                self.artifact_revisions
+                    .insert(value.revision.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
         };
         if duplicate {
             return Err(StoreError::StoreCorrupt);
@@ -4212,6 +4383,73 @@ impl ReducerState {
             self.recovery_request_revisions,
             self.recovery_bundles,
         )?);
+        for (_revision_id, (value, seq)) in self.experiment_run_revisions {
+            let mut row = work_identity_row(
+                "experiment_run",
+                value.run_id.to_string(),
+                value.revision_id.to_string(),
+                value.execution_status.as_str(),
+                None,
+                Some(value.workstream_id.to_string()),
+                None,
+                None,
+                &JournalPayload::ExperimentRunRecorded(Box::new(value)),
+                seq,
+            )?;
+            row.row_id = format!(
+                "object:work:experiment_run:{}",
+                row.current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+            );
+            rows.push(row);
+        }
+        for (_revision_id, (value, seq)) in self.result_evidence_revisions {
+            let mut row = work_identity_row(
+                "result_evidence",
+                value.result_evidence_id.to_string(),
+                value.revision_id.to_string(),
+                value.completeness.as_str(),
+                None,
+                None,
+                None,
+                None,
+                &JournalPayload::ResultEvidenceRecorded(Box::new(value)),
+                seq,
+            )?;
+            row.row_id = format!(
+                "object:work:result_evidence:{}",
+                row.current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+            );
+            rows.push(row);
+        }
+        for (_revision_id, (value, seq)) in self.artifact_revisions {
+            let mut row = work_identity_row(
+                "work_artifact",
+                value.work_artifact_id.to_string(),
+                value.revision.revision_id.to_string(),
+                value.revision.payload_status.as_str(),
+                value.revision.scope.task_id().map(|id| id.to_string()),
+                None,
+                value
+                    .revision
+                    .scope
+                    .repository_id()
+                    .map(|id| id.to_string()),
+                value.revision.scope.worktree_id().map(|id| id.to_string()),
+                &JournalPayload::WorkArtifactRecorded(Box::new(value)),
+                seq,
+            )?;
+            row.row_id = format!(
+                "object:work:work_artifact:{}",
+                row.current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+            );
+            rows.push(row);
+        }
         Ok(rows)
     }
 
@@ -4318,6 +4556,7 @@ impl ReducerState {
             &self.attempts,
             &self.competing_groups,
             &self.episodes,
+            &self.experiment_runs,
         )?;
         validate_attempt_relations(
             &self.attempts,
@@ -4361,6 +4600,22 @@ impl ReducerState {
             worktrees: &self.worktrees,
             snapshots: &self.worktree_snapshots,
         })?;
+        autoresearch::validate_relations(autoresearch::AutoresearchRelationInputs {
+            runs: &self.experiment_runs,
+            run_revisions: &self.experiment_run_revisions,
+            results: &self.result_evidence,
+            artifacts: &self.work_artifacts,
+            attempts: &self.attempts,
+            tasks: &self.tasks,
+            workstreams: &self.workstreams,
+            operations: &self.operations,
+            episodes: &self.episodes,
+            snapshots: &self.worktree_snapshots,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            source_receipts: &self.source_receipts,
+            source_observations: &self.source_observations,
+        })?;
         Ok(())
     }
 
@@ -4400,6 +4655,12 @@ impl ReducerState {
             recovery_requests: self.recovery_requests.clone(),
             recovery_request_revisions: self.recovery_request_revisions.clone(),
             recovery_bundles: self.recovery_bundles.clone(),
+            experiment_runs: self.experiment_runs.clone(),
+            experiment_run_revisions: self.experiment_run_revisions.clone(),
+            result_evidence: self.result_evidence.clone(),
+            result_evidence_revisions: self.result_evidence_revisions.clone(),
+            work_artifacts: self.work_artifacts.clone(),
+            artifact_revisions: self.artifact_revisions.clone(),
         })
     }
 }

@@ -12,10 +12,11 @@ use evertrace_domain::{
         IntegrationEvent, RecoveryBundle, RecoveryCaptureRequest, RecoveryRequestStatus,
         RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
     },
+    semantic::ResultEvidence,
     work::{
         AdmissionFailureObservability, Attempt, CaptureReceipt, CompetingAttemptGroup,
-        ExecutionLane, OperationBurst, SegmentationCorrection, Task, WorkBindingRevision,
-        WorkCheckpoint, WorkEpisode, Workstream,
+        ExecutionLane, ExperimentRun, OperationBurst, SegmentationCorrection, Task, WorkArtifact,
+        WorkBindingRevision, WorkCheckpoint, WorkEpisode, Workstream,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -513,6 +514,9 @@ pub enum JournalPayload {
     SegmentationCorrectionRecorded(Box<SegmentationCorrection>),
     RecoveryCaptureRequestRecorded(Box<RecoveryCaptureRequest>),
     RecoveryBundleRecorded(Box<RecoveryBundle>),
+    ExperimentRunRecorded(Box<ExperimentRun>),
+    ResultEvidenceRecorded(Box<ResultEvidence>),
+    WorkArtifactRecorded(Box<WorkArtifact>),
 }
 
 impl JournalPayload {
@@ -556,6 +560,9 @@ impl JournalPayload {
             Self::SegmentationCorrectionRecorded(_) => "segmentation_correction_recorded_v1",
             Self::RecoveryCaptureRequestRecorded(_) => "recovery_capture_request_recorded_v1",
             Self::RecoveryBundleRecorded(_) => "recovery_bundle_recorded_v1",
+            Self::ExperimentRunRecorded(_) => "experiment_run_recorded_v1",
+            Self::ResultEvidenceRecorded(_) => "result_evidence_recorded_v1",
+            Self::WorkArtifactRecorded(_) => "work_artifact_recorded_v1",
         }
     }
 
@@ -591,6 +598,9 @@ impl JournalPayload {
             Self::RecoveryCaptureRequestRecorded(_) | Self::RecoveryBundleRecorded(_) => {
                 RecordClass::ObjectEvent
             }
+            Self::ExperimentRunRecorded(_)
+            | Self::ResultEvidenceRecorded(_)
+            | Self::WorkArtifactRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -723,6 +733,20 @@ impl JournalPayload {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::RecoveryBundleRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::ExperimentRunRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)?;
+                if value.is_declaration_only() {
+                    Ok(())
+                } else {
+                    Err(StoreError::InvalidInput)
+                }
+            }
+            Self::ResultEvidenceRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::WorkArtifactRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
         }
@@ -866,6 +890,9 @@ impl JournalPayload {
                 tagged_json("recovery_capture_request_recorded", value)
             }
             Self::RecoveryBundleRecorded(value) => tagged_json("recovery_bundle_recorded", value),
+            Self::ExperimentRunRecorded(value) => tagged_json("experiment_run_recorded", value),
+            Self::ResultEvidenceRecorded(value) => tagged_json("result_evidence_recorded", value),
+            Self::WorkArtifactRecorded(value) => tagged_json("work_artifact_recorded", value),
         }
     }
 

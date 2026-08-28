@@ -275,6 +275,7 @@ uuid_id!(OperationBurstId, "burst");
 uuid_id!(AttemptId, "att");
 uuid_id!(CompetingAttemptGroupId, "cmp");
 uuid_id!(ExperimentRunId, "run");
+uuid_id!(ResultEvidenceId, "result");
 uuid_id!(AtomId, "atom");
 uuid_id!(ProcedureId, "proc");
 uuid_id!(RevisionProposalId, "proposal");
@@ -322,6 +323,9 @@ impl_new_v7!(
     AttemptId,
     CompetingAttemptGroupId,
     OperationBurstId,
+    ExperimentRunId,
+    ResultEvidenceId,
+    WorkArtifactId,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,6 +354,7 @@ pub enum AnyPublicId {
     Attempt(AttemptId),
     CompetingAttemptGroup(CompetingAttemptGroupId),
     ExperimentRun(ExperimentRunId),
+    ResultEvidence(ResultEvidenceId),
     Atom(AtomId),
     Procedure(ProcedureId),
     RevisionProposal(RevisionProposalId),
@@ -406,6 +411,7 @@ impl AnyPublicId {
             Self::Attempt(_) => "att",
             Self::CompetingAttemptGroup(_) => "cmp",
             Self::ExperimentRun(_) => "run",
+            Self::ResultEvidence(_) => "result",
             Self::Atom(_) => "atom",
             Self::Procedure(_) => "proc",
             Self::RevisionProposal(_) => "proposal",
@@ -451,6 +457,7 @@ impl FromStr for AnyPublicId {
             "att" => Ok(Self::Attempt(value.parse()?)),
             "cmp" => Ok(Self::CompetingAttemptGroup(value.parse()?)),
             "run" => Ok(Self::ExperimentRun(value.parse()?)),
+            "result" => Ok(Self::ResultEvidence(value.parse()?)),
             "atom" => Ok(Self::Atom(value.parse()?)),
             "proc" => Ok(Self::Procedure(value.parse()?)),
             "proposal" => Ok(Self::RevisionProposal(value.parse()?)),

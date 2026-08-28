@@ -3,6 +3,7 @@
 
 //! Minimal engine service boundary for the local daemon.
 
+pub mod autoresearch;
 pub mod capture;
 pub mod ingest;
 pub mod jobs;
