@@ -2045,7 +2045,7 @@ async fn store_enforces_one_unfinished_proposal_per_fingerprint() {
 }
 
 #[tokio::test]
-async fn task_and_repository_acceptance_are_atomic_restart_safe_and_two_table_only() {
+async fn task_and_repository_acceptance_are_atomic_restart_safe_and_four_table_only() {
     let temp = TempDir::new().unwrap();
     let scope = scope_fixture(temp.path());
     let message = "Honor the exact current task instruction.";
@@ -2401,7 +2401,12 @@ async fn task_and_repository_acceptance_are_atomic_restart_safe_and_two_table_on
     assert_eq!(writer.journal_rows().await.unwrap().len(), before_no_delta);
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search",
+        ]
     );
 
     let atoms = SemanticCurrentView::from_snapshot(&final_snapshot).unwrap();

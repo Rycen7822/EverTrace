@@ -692,7 +692,7 @@ fn exact_observation(cas: CasId, bytes: &[u8]) -> (SourceReceipt, SourceObservat
 }
 
 #[tokio::test]
-async fn real_two_table_batch_rebuild_restart_and_fail_closed_relations() {
+async fn real_four_table_batch_rebuild_restart_and_fail_closed_relations() {
     let temp = TempDir::new().unwrap();
     let cas = CasStore::open(temp.path().join("cas")).unwrap();
     let key = DeviceKeyStore::new(temp.path().join("key"))
@@ -888,7 +888,12 @@ async fn real_two_table_batch_rebuild_restart_and_fail_closed_relations() {
     assert_eq!(incremental, writer.full_projection().await.unwrap());
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search",
+        ]
     );
     let view = AutoresearchCurrentView::from_snapshot(&incremental).unwrap();
     assert_eq!(view.runs[&run.run_id], run_with_artifact);

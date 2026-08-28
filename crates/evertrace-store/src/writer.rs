@@ -15,12 +15,15 @@ use crate::{
         JOURNAL_TABLE, append_rows, read_all_journal_rows, read_command_rows,
         read_journal_frontier, replay_outcome, rows_for_append, validate_journal_table,
     },
-    migrations::{L0001, MigrationOutcome},
+    migrations::{L0002, MigrationOutcome},
     objects::{OBJECTS_TABLE, read_object_rows, validate_objects_table},
     projections::{
         JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
         ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
     },
+    query::L0002ProjectionWorker,
+    relations::RELATIONS_TABLE,
+    search::SEARCH_TABLE,
 };
 
 #[derive(Debug)]
@@ -94,6 +97,8 @@ pub struct JournalWriter {
     connection: Connection,
     journal: Table,
     objects: Table,
+    relations: Table,
+    search: Table,
     next_seq: u64,
     admission_state: JournalAdmissionState,
     migration_outcome: MigrationOutcome,
@@ -106,7 +111,7 @@ impl JournalWriter {
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        let migration_outcome = L0001::apply(&connection).await?;
+        let migration_outcome = L0002::apply(&connection).await?;
         let journal = connection
             .open_table(JOURNAL_TABLE)
             .execute()
@@ -114,6 +119,16 @@ impl JournalWriter {
             .map_err(|_| StoreError::LanceDb)?;
         let objects = connection
             .open_table(OBJECTS_TABLE)
+            .execute()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let relations = connection
+            .open_table(RELATIONS_TABLE)
+            .execute()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let search = connection
+            .open_table(SEARCH_TABLE)
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
@@ -133,6 +148,8 @@ impl JournalWriter {
             connection,
             journal,
             objects,
+            relations,
+            search,
             next_seq,
             admission_state,
             migration_outcome,
@@ -203,9 +220,17 @@ impl JournalWriter {
     }
 
     pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
-        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
+        let snapshot = ProjectionWorker::new(self.journal.clone(), self.objects.clone())
             .catch_up()
-            .await
+            .await?;
+        L0002ProjectionWorker::new(
+            self.journal.clone(),
+            self.relations.clone(),
+            self.search.clone(),
+        )
+        .catch_up(&snapshot)
+        .await?;
+        Ok(snapshot)
     }
 
     pub async fn reconciliation_frontier(
@@ -239,6 +264,14 @@ impl JournalWriter {
 
     pub async fn object_rows(&self) -> Result<Vec<crate::ObjectRow>, StoreError> {
         read_object_rows(&self.objects).await
+    }
+
+    pub async fn relation_rows(&self) -> Result<Vec<crate::RelationProjectionRow>, StoreError> {
+        crate::read_relation_rows(&self.relations).await
+    }
+
+    pub async fn search_rows(&self) -> Result<Vec<crate::SearchProjectionRow>, StoreError> {
+        crate::read_search_rows(&self.search).await
     }
 
     pub async fn table_names(&self) -> Result<Vec<String>, StoreError> {
@@ -524,7 +557,7 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.first_seq, first_seq);
         assert_eq!(replay.last_seq, first_seq);
-        assert_eq!(reopened.journal_rows().await.unwrap().len(), 2);
+        assert_eq!(reopened.journal_rows().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -581,7 +614,7 @@ mod tests {
                 .await,
             Err(StoreError::StaleFrontier)
         );
-        assert_eq!(writer.journal_rows().await.unwrap().len(), 2);
+        assert_eq!(writer.journal_rows().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -602,7 +635,7 @@ mod tests {
             writer.commit(&orphan, 1).await,
             Err(StoreError::InvalidInput)
         );
-        assert_eq!(writer.journal_rows().await.unwrap().len(), 1);
+        assert_eq!(writer.journal_rows().await.unwrap().len(), 2);
 
         let initial = capture_command(
             "01890f47-6a4a-7cc1-98b9-01890f476a7e",

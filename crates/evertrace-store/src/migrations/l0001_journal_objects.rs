@@ -32,19 +32,35 @@ pub struct L0001;
 
 impl L0001 {
     pub async fn apply(connection: &Connection) -> Result<MigrationOutcome, StoreError> {
+        Self::apply_inner(connection, false).await
+    }
+
+    pub(crate) async fn reconcile_for_l0002(
+        connection: &Connection,
+    ) -> Result<MigrationOutcome, StoreError> {
+        Self::apply_inner(connection, true).await
+    }
+
+    async fn apply_inner(
+        connection: &Connection,
+        l0002_tables_present: bool,
+    ) -> Result<MigrationOutcome, StoreError> {
         let names = connection
             .table_names()
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        if names
+        let has_l0002_table = names
             .iter()
-            .any(|name| L0002_RESERVED_TABLES.contains(&name.as_str()))
-        {
+            .any(|name| L0002_RESERVED_TABLES.contains(&name.as_str()));
+        if has_l0002_table != l0002_tables_present {
             return Err(StoreError::StoreCorrupt);
         }
         let journal_exists = names.iter().any(|name| name == JOURNAL_TABLE);
         let objects_exists = names.iter().any(|name| name == OBJECTS_TABLE);
+        if l0002_tables_present && !journal_exists {
+            return Err(StoreError::StoreCorrupt);
+        }
 
         if !journal_exists && objects_exists {
             let objects = connection
@@ -79,6 +95,11 @@ impl L0001 {
                 .map_err(|_| StoreError::Migration)?
         };
 
+        if l0002_tables_present {
+            let rows = read_all_journal_rows(&journal).await?;
+            validate_migration_marker(&rows, true)?;
+        }
+
         let mut rebuilt_objects = false;
         let objects = if objects_exists {
             let table = connection
@@ -112,35 +133,7 @@ impl L0001 {
         validate_journal_table(&journal).await?;
         validate_objects_table(&objects).await?;
         let before_rows = read_all_journal_rows(&journal).await?;
-        let expected_migration = prepare_command(&migration_command()?)?;
-        let migration_rows = before_rows
-            .iter()
-            .filter_map(|row| match row.payload() {
-                Ok(JournalPayload::MigrationApplied(MigrationApplied { migration_id }))
-                    if migration_id == MIGRATION_ID =>
-                {
-                    Some(Ok(row))
-                }
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if migration_rows.len() > 1
-            || migration_rows.first().is_some_and(|row| {
-                row.command_id != expected_migration.command_id
-                    || row.command_hash != expected_migration.command_hash
-                    || row.command_event_count != 1
-                    || row.ordinal != 0
-                    || row.event_id != expected_migration.events[0].event_id
-            })
-            || (migration_rows.is_empty()
-                && before_rows
-                    .iter()
-                    .any(|row| row.command_id == expected_migration.command_id))
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-        let appended_event = migration_rows.is_empty();
+        let appended_event = !validate_migration_marker(&before_rows, l0002_tables_present)?;
         if appended_event {
             append_migration_event(&journal, &before_rows).await?;
         }
@@ -158,6 +151,39 @@ impl L0001 {
             MigrationOutcome::Noop
         })
     }
+}
+
+fn validate_migration_marker(
+    rows: &[crate::journal::JournalRow],
+    require_present: bool,
+) -> Result<bool, StoreError> {
+    let expected = prepare_command(&migration_command()?)?;
+    let matches = rows
+        .iter()
+        .filter_map(|row| match row.payload() {
+            Ok(JournalPayload::MigrationApplied(MigrationApplied { migration_id }))
+                if migration_id == MIGRATION_ID =>
+            {
+                Some(Ok(row))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if matches.len() > 1
+        || matches.first().is_some_and(|row| {
+            row.command_id != expected.command_id
+                || row.command_hash != expected.command_hash
+                || row.command_event_count != 1
+                || row.ordinal != 0
+                || row.event_id != expected.events[0].event_id
+        })
+        || (matches.is_empty() && rows.iter().any(|row| row.command_id == expected.command_id))
+        || (require_present && matches.is_empty())
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(!matches.is_empty())
 }
 
 async fn validate_empty_objects_schema(table: &Table) -> Result<(), StoreError> {
@@ -252,7 +278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l0001_rejects_reserved_l0002_tables_without_touching_them() {
+    async fn l0001_rejects_wrong_schema_partial_l0002_tables_without_touching_them() {
         let (_temp, connection) = connection().await;
         connection
             .create_empty_table("evertrace_relations", objects_schema())

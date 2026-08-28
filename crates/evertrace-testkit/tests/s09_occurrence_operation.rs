@@ -608,7 +608,12 @@ async fn journal_projection_replay_relations_and_no_delta_are_closed() {
 
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search"
+        ]
     );
     let reader = CompatibilityStore::connect_local(&root).await.unwrap();
     let objects = reader

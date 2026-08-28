@@ -295,7 +295,7 @@ fn evidence(task: &Task, stream: &Workstream, name: &str) -> BindingEvidence {
 }
 
 #[tokio::test]
-async fn resolved_successor_replay_projection_restart_and_two_tables_are_closed() {
+async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("store");
     let mut writer = JournalWriter::open(&root).await.unwrap();
@@ -402,7 +402,12 @@ async fn resolved_successor_replay_projection_restart_and_two_tables_are_closed(
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search"
+        ]
     );
     drop(writer);
     let writer = JournalWriter::open(&root).await.unwrap();

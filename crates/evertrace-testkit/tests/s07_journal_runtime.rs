@@ -58,9 +58,14 @@ async fn l0001_bootstrap_reopen_is_noop_and_creates_only_authorized_tables() {
     assert_eq!(writer.migration_outcome(), MigrationOutcome::Applied);
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search",
+        ]
     );
-    assert_eq!(writer.journal_rows().await.unwrap().len(), 1);
+    assert_eq!(writer.journal_rows().await.unwrap().len(), 2);
     let objects = writer.object_rows().await.unwrap();
     assert_eq!(
         objects
@@ -90,7 +95,7 @@ async fn l0001_bootstrap_reopen_is_noop_and_creates_only_authorized_tables() {
 
     let reopened = JournalWriter::open(&root).await.unwrap();
     assert_eq!(reopened.migration_outcome(), MigrationOutcome::Noop);
-    assert_eq!(reopened.journal_rows().await.unwrap().len(), 1);
+    assert_eq!(reopened.journal_rows().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -197,7 +202,7 @@ async fn command_commit_retry_conflict_and_lost_ack_reopen_are_strict() {
     assert!(!first.replayed);
     let replay = writer.commit(&original, 99).await.unwrap();
     assert_replay(&first, &replay);
-    assert_eq!(writer.journal_rows().await.unwrap().len(), 3);
+    assert_eq!(writer.journal_rows().await.unwrap().len(), 4);
     drop(writer);
 
     let mut reopened = JournalWriter::open(&root).await.unwrap();
@@ -208,7 +213,7 @@ async fn command_commit_retry_conflict_and_lost_ack_reopen_are_strict() {
         reopened.commit(&conflict, 101).await,
         Err(StoreError::IdempotencyConflict)
     );
-    assert_eq!(reopened.journal_rows().await.unwrap().len(), 3);
+    assert_eq!(reopened.journal_rows().await.unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -230,7 +235,7 @@ async fn preflight_failure_has_no_partial_command_and_fixed_retry_sequence_is_st
         writer.commit(&invalid, 1).await,
         Err(StoreError::InvalidInput)
     );
-    assert_eq!(writer.journal_rows().await.unwrap().len(), 1);
+    assert_eq!(writer.journal_rows().await.unwrap().len(), 2);
     let unpaired_outbox = command(
         0x83,
         vec![JournalPayload::OutboxEnqueued(OutboxEntry {
@@ -266,7 +271,7 @@ async fn preflight_failure_has_no_partial_command_and_fixed_retry_sequence_is_st
         }
     }
     let rows = writer.journal_rows().await.unwrap();
-    assert_eq!(rows.len(), 9);
+    assert_eq!(rows.len(), 10);
     let mut seqs = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
     seqs.sort_unstable();
     seqs.dedup();
@@ -278,7 +283,7 @@ async fn preflight_failure_has_no_partial_command_and_fixed_retry_sequence_is_st
     }
     let snapshot = reduce_journal(&gapped).unwrap();
     assert_eq!(snapshot.frontier, gapped.last().unwrap().seq);
-    assert_eq!(snapshot.data_rows().count(), 9);
+    assert_eq!(snapshot.data_rows().count(), 10);
 }
 
 #[tokio::test]

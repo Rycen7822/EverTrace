@@ -1915,7 +1915,7 @@ fn receipt_replacement_is_one_per_lane_and_capture_frontier_is_minimum() {
 }
 
 #[tokio::test]
-async fn atomic_activation_checkpoint_replay_and_two_table_restart_are_stable() {
+async fn atomic_activation_checkpoint_replay_and_four_table_restart_are_stable() {
     let temp = TempDir::new().unwrap();
     let root = task();
     let stream = stream(root.task_id, 2);
@@ -2030,7 +2030,7 @@ async fn atomic_activation_checkpoint_replay_and_two_table_restart_are_stable() 
     let incremental = writer.project().await.unwrap();
     let full = reduce_journal(&writer.journal_rows().await.unwrap()).unwrap();
     assert_eq!(incremental, full);
-    assert_eq!(writer.table_names().await.unwrap().len(), 2);
+    assert_eq!(writer.table_names().await.unwrap().len(), 4);
     drop(writer);
     let writer = JournalWriter::open(&store).await.unwrap();
     assert_eq!(writer.project().await.unwrap(), full);

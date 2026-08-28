@@ -959,7 +959,12 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
             let restarted = JournalWriter::open(root.path()).await.unwrap();
             assert_eq!(
                 restarted.table_names().await.unwrap(),
-                vec!["evertrace_journal", "evertrace_objects"]
+                vec![
+                    "evertrace_journal",
+                    "evertrace_objects",
+                    "evertrace_relations",
+                    "evertrace_search"
+                ]
             );
             let (restart_handle, restart_task) = spawn_writer(restarted, 8).unwrap();
             let restarted_tickets = RecoveryTicketService::new(

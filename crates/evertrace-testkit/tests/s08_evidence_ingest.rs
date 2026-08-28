@@ -634,7 +634,12 @@ async fn surfaces_are_bounded_authority_free_and_secret_reasoning_binary_are_exc
     }
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_journal", "evertrace_objects"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search",
+        ]
     );
     assert_no_bytes_outside_cas(temp.path(), secret);
 }
