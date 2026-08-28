@@ -288,113 +288,41 @@ internal_uuid_id!(CommandId);
 internal_uuid_id!(JobId);
 internal_uuid_id!(RequestId);
 
-impl OperationId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
+macro_rules! impl_new_v7 {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl $name {
+                pub fn new_v7() -> Self {
+                    Self(Uuid::now_v7())
+                }
+            }
+        )+
+    };
 }
 
-impl CaptureReceiptId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl CaptureOutageIntervalId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl ExecutionLaneId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl ScopeEffectId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl WorkBindingRevisionId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl DuplicateGroupId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl RepositoryId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl WorktreeId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl WorktreeSnapshotId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl WorktreeTransitionId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl IntegrationEventId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl TaskId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl WorkstreamId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl WorkEpisodeId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl AttemptId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl CompetingAttemptGroupId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl OperationBurstId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
+impl_new_v7!(
+    OperationId,
+    CaptureReceiptId,
+    CaptureOutageIntervalId,
+    ExecutionLaneId,
+    ScopeEffectId,
+    WorkBindingRevisionId,
+    DuplicateGroupId,
+    RepositoryId,
+    WorktreeId,
+    WorktreeSnapshotId,
+    WorktreeTransitionId,
+    IntegrationEventId,
+    RecoveryCaptureRequestId,
+    RecoveryBundleId,
+    RecoveryApplicationId,
+    TaskId,
+    WorkstreamId,
+    WorkEpisodeId,
+    AttemptId,
+    CompetingAttemptGroupId,
+    OperationBurstId,
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnyPublicId {
@@ -431,6 +359,24 @@ pub enum AnyPublicId {
     WorkArtifact(WorkArtifactId),
     DuplicateGroup(DuplicateGroupId),
     Cas(CasId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId};
+    use uuid::Variant;
+
+    #[test]
+    fn public_uuid_macro_constructs_rfc_uuid_v7() {
+        for value in [
+            RecoveryCaptureRequestId::new_v7().as_uuid(),
+            RecoveryBundleId::new_v7().as_uuid(),
+            RecoveryApplicationId::new_v7().as_uuid(),
+        ] {
+            assert_eq!(value.get_version_num(), 7);
+            assert_eq!(value.get_variant(), Variant::RFC4122);
+        }
+    }
 }
 
 impl AnyPublicId {

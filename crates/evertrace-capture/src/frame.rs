@@ -18,7 +18,7 @@ use thiserror::Error;
 const MAGIC: &[u8; 8] = b"ETSPL001";
 const COMMIT_TRAILER: &[u8; 8] = b"ETCOMMIT";
 pub const SPOOL_FRAME_VERSION: u16 = 1;
-pub const CAPTURE_RECORD_BODY_VERSION: u16 = 5;
+pub const CAPTURE_RECORD_BODY_VERSION: u16 = 9;
 pub const MAX_RECORD_BODY: usize = 1_048_576;
 const PREFIX_LENGTH: usize = 8 + 2 + 4 + 8 + 32;
 
@@ -94,6 +94,33 @@ pub struct CaptureRecordBody {
     pub protection_key_generation: u64,
     pub event_time_us: i64,
     pub recorded_at_us: i64,
+    #[serde(default)]
+    pub recovery_preflight: Option<RecoveryPreflightCandidate>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPreflightCandidate {
+    pub pending_command_id: CommandId,
+    pub recovery_capture_request_id: evertrace_domain::ids::RecoveryCaptureRequestId,
+    pub pending_revision_id: evertrace_domain::revision::RevisionId,
+    pub observed_cwd: String,
+    pub classifier_revision: u32,
+    pub adapter_manifest_id: String,
+}
+
+impl std::fmt::Debug for RecoveryPreflightCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryPreflightCandidate")
+            .field("request_id", &self.recovery_capture_request_id)
+            .field("pending_revision_id", &self.pending_revision_id)
+            .field("pending_command_id", &self.pending_command_id)
+            .field("classifier_revision", &self.classifier_revision)
+            .field("has_observed_cwd", &true)
+            .field("adapter_manifest_id", &self.adapter_manifest_id)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for CaptureRecordBody {
@@ -111,6 +138,7 @@ impl std::fmt::Debug for CaptureRecordBody {
             .field("original_length", &self.original_length)
             .field("redaction_count", &self.redaction_spans.len())
             .field("surface_eligible", &self.surface_eligible)
+            .field("has_recovery_preflight", &self.recovery_preflight.is_some())
             .finish()
     }
 }
@@ -222,6 +250,18 @@ impl CaptureRecordBody {
                 return Err(SpoolFrameError::Invalid);
             }
             previous_end = span.end;
+        }
+        if let Some(intent) = &self.recovery_preflight
+            && (intent.pending_command_id == self.command_id
+                || self.repository_instance_id.is_none()
+                || self.worktree_instance_id.is_none()
+                || intent.adapter_manifest_id != self.adapter_manifest_ref
+                || intent.classifier_revision == 0
+                || !intent.observed_cwd.starts_with('/')
+                || intent.observed_cwd.len() > 4096
+                || intent.observed_cwd.chars().any(char::is_control))
+        {
+            return Err(SpoolFrameError::Invalid);
         }
         Ok(())
     }

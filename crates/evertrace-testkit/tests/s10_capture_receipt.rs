@@ -443,6 +443,15 @@ fn runtime_snapshot(root: &Path) -> RuntimeSnapshot {
         main_low_watermark_bytes: limits.low_watermark_bytes,
         max_main_files: limits.max_main_files,
         emergency_slots: limits.emergency_slots,
+        recovery_gate: evertrace_capture::RecoveryGateMode::Disabled,
+        recovery_socket_path: root.join("runtime/evertraced-v1.sock"),
+        recovery_preflight_timeout_ms: 250,
+        effective_config_hash: [1; 32],
+        recovery_adapter_manifest_id: None,
+        recovery_classifier_revision: 1,
+        recovery_max_bundle_bytes: 4 << 20,
+        recovery_max_untracked_file_bytes: 1 << 20,
+        recovery_max_untracked_total_bytes: 2 << 20,
     }
 }
 

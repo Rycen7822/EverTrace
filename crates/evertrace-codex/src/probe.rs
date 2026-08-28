@@ -262,6 +262,10 @@ impl GateReceipt {
     pub fn protected_digest(&self) -> &str {
         &self.protected_digest
     }
+
+    pub fn adapter_manifest_revision(&self) -> &str {
+        &self.adapter_manifest_revision
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -298,6 +302,15 @@ impl HostProbeReport {
         &self.recovery
     }
 
+    /// The runtime snapshot may enable the synchronous barrier only from
+    /// this positive, canary-backed receipt. Input payloads never self-enable
+    /// the gate.
+    pub fn recovery_barrier_active(&self) -> bool {
+        self.recovery.gate_kind == GateKind::RecoveryComplete
+            && self.recovery.result == GateResult::Enabled
+            && self.recovery.reason == GateReason::RequirementsSatisfied
+    }
+
     pub const fn active_search_due(&self) -> &GateReceipt {
         &self.active_search_due
     }
@@ -326,7 +339,11 @@ impl HostProbeReport {
             hook,
             mcp,
             capture: capture_receipt(&manifest, evidence.capture.as_ref())?,
-            recovery: recovery_receipt(&manifest, evidence.recovery.as_ref())?,
+            recovery: recovery_receipt(
+                &manifest,
+                context.evidence_source,
+                evidence.recovery.as_ref(),
+            )?,
             active_search_due: due_receipt(
                 &manifest,
                 evidence.hook.as_ref(),
@@ -441,7 +458,9 @@ fn compile_manifest(
     } else {
         CaptureGuarantee::Opaque
     };
-    let recovery_ordering =
+    let recovery_ordering = if context.evidence_source != EvidenceSourceKind::ObservedHostCanary {
+        RecoveryOrdering::Unavailable
+    } else {
         evidence
             .recovery
             .as_ref()
@@ -461,7 +480,8 @@ fn compile_manifest(
                 } else {
                     RecoveryOrdering::BestEffort
                 }
-            });
+            })
+    };
     let cue_boundary = evidence
         .cue
         .as_ref()
@@ -597,6 +617,7 @@ fn capture_receipt(
 
 fn recovery_receipt(
     manifest: &AdapterCapabilityManifest,
+    evidence_source: EvidenceSourceKind,
     evidence: Option<&RecoveryEvidence>,
 ) -> Result<GateReceipt, ProbeError> {
     let Some(evidence) = evidence else {
@@ -629,7 +650,9 @@ fn recovery_receipt(
                 && pair.fence_completed
                 && !pair.replayed
         });
-    let reason = if !valid_summary(&summary)
+    let reason = if evidence_source != EvidenceSourceKind::ObservedHostCanary {
+        GateReason::RecoveryCanaryFailed
+    } else if !valid_summary(&summary)
         || evidence.source_identity.is_empty()
         || evidence.first_sequence > evidence.last_sequence
     {

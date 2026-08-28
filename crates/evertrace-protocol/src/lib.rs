@@ -21,6 +21,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+#[cfg(unix)]
+use std::{os::unix::net::UnixStream as StdUnixStream, time::Instant};
+#[cfg(all(unix, not(feature = "runtime")))]
+use std::{path::Path, time::Duration};
 
 #[cfg(feature = "runtime")]
 use command::Command;
@@ -119,15 +123,33 @@ impl LocalServer {
     }
 
     pub async fn run<F>(
-        mut self,
-        mut shutdown: watch::Receiver<bool>,
+        self,
+        shutdown: watch::Receiver<bool>,
         health_handler: F,
     ) -> Result<(), ProtocolError>
     where
         F: Fn() -> Result<HealthResponse, ErrorCode> + Send + Sync + 'static,
     {
+        self.run_dispatch(shutdown, move |command| {
+            std::future::ready(match command {
+                Command::Health => health_handler().map(Response::Health),
+                Command::RecoveryBarrier(_) => Err(ErrorCode::InvalidInput),
+            })
+        })
+        .await
+    }
+
+    pub async fn run_dispatch<F, Fut>(
+        mut self,
+        mut shutdown: watch::Receiver<bool>,
+        command_handler: F,
+    ) -> Result<(), ProtocolError>
+    where
+        F: Fn(Command) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Response, ErrorCode>> + Send + 'static,
+    {
         let semaphore = Arc::new(Semaphore::new(self.options.connection_limit.max(1)));
-        let health_handler = Arc::new(health_handler);
+        let command_handler = Arc::new(command_handler);
         let mut tasks = JoinSet::new();
         loop {
             while let Some(result) = tasks.try_join_next() {
@@ -148,14 +170,14 @@ impl LocalServer {
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted.map_err(ProtocolError::Accept)?;
                     let options = Arc::clone(&self.options);
-                    let health_handler = Arc::clone(&health_handler);
+                    let command_handler = Arc::clone(&command_handler);
                     let connection_shutdown = shutdown.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
                         let _ = handle_connection(
                             stream,
                             &options,
-                            health_handler.as_ref(),
+                            command_handler.as_ref(),
                             connection_shutdown,
                         )
                         .await;
@@ -210,12 +232,16 @@ impl Drop for LocalServer {
 }
 
 #[cfg(feature = "runtime")]
-async fn handle_connection(
+async fn handle_connection<F, Fut>(
     mut stream: UnixStream,
     options: &ServerOptions,
-    health_handler: &(impl Fn() -> Result<HealthResponse, ErrorCode> + ?Sized),
+    command_handler: &F,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), ProtocolError> {
+) -> Result<(), ProtocolError>
+where
+    F: Fn(Command) -> Fut + ?Sized,
+    Fut: std::future::Future<Output = Result<Response, ErrorCode>> + Send,
+{
     let first = match read_frame::<ClientEnvelope>(
         &mut stream,
         MAX_FRAME_SIZE,
@@ -328,30 +354,26 @@ async fn handle_connection(
                 return Err(ProtocolError::UnexpectedHandshake);
             }
         };
-        match command.command {
-            Command::Health => {
-                let health = match health_handler() {
-                    Ok(value) => value,
-                    Err(code) => {
-                        let _ = send_wire_error(
-                            &mut stream,
-                            code,
-                            Some(command.request_id),
-                            negotiated_max as usize,
-                            options,
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-                let response = ServerEnvelope::Response(response::ResponseEnvelope {
-                    request_id: command.request_id,
-                    response: Response::Health(health),
-                });
-                if canonical_json(&response)?.len() > negotiated_max as usize {
+        {
+            if let Command::RecoveryBarrier(locator) = &command.command
+                && !locator.validate()
+            {
+                let _ = send_wire_error(
+                    &mut stream,
+                    ErrorCode::InvalidInput,
+                    Some(command.request_id),
+                    negotiated_max as usize,
+                    options,
+                )
+                .await;
+                continue;
+            }
+            let dispatched = match command_handler(command.command).await {
+                Ok(value) => value,
+                Err(code) => {
                     let _ = send_wire_error(
                         &mut stream,
-                        ErrorCode::ResourceExhausted,
+                        code,
                         Some(command.request_id),
                         negotiated_max as usize,
                         options,
@@ -359,14 +381,29 @@ async fn handle_connection(
                     .await;
                     continue;
                 }
-                write_frame(
+            };
+            let response = ServerEnvelope::Response(response::ResponseEnvelope {
+                request_id: command.request_id,
+                response: dispatched,
+            });
+            if canonical_json(&response)?.len() > negotiated_max as usize {
+                let _ = send_wire_error(
                     &mut stream,
-                    &response,
+                    ErrorCode::ResourceExhausted,
+                    Some(command.request_id),
                     negotiated_max as usize,
-                    options.frame_timeout,
+                    options,
                 )
-                .await?;
+                .await;
+                continue;
             }
+            write_frame(
+                &mut stream,
+                &response,
+                negotiated_max as usize,
+                options.frame_timeout,
+            )
+            .await?;
         }
     }
 }
@@ -438,6 +475,7 @@ pub async fn request_health(
         ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
             Response::Health(health) if valid_health(&health) => Ok(health),
             Response::Health(_) => Err(ProtocolError::InvalidHealth),
+            Response::RecoveryTerminal(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
@@ -445,6 +483,171 @@ pub async fn request_health(
         }
         ServerEnvelope::Error(_) => Err(ProtocolError::RequestIdMismatch),
         _ => Err(ProtocolError::UnexpectedMessage),
+    }
+}
+
+#[cfg(unix)]
+pub fn request_recovery_barrier_sync(
+    socket_path: &Path,
+    build_id: &str,
+    locator: command::RecoveryBarrierLocator,
+    timeout_limit: Duration,
+) -> Result<response::RecoveryTerminalResponse, error::SyncProtocolError> {
+    use error::SyncProtocolError;
+    use frame::{read_frame_sync, write_frame_sync};
+
+    if !handshake::valid_build_id(build_id)
+        || timeout_limit < Duration::from_millis(1)
+        || !locator.validate()
+    {
+        return Err(SyncProtocolError::InvalidInput);
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout_limit)
+        .ok_or(SyncProtocolError::InvalidInput)?;
+    let socket_identity = checked_sync_socket(socket_path)?;
+    let mut stream = connect_sync_deadline(socket_path, deadline)?;
+    if checked_sync_socket(socket_path)? != socket_identity {
+        return Err(SyncProtocolError::Connect);
+    }
+    set_sync_deadline(&stream, deadline)?;
+    let handshake = envelope::ClientEnvelope::Handshake(handshake::Handshake {
+        protocol_version: dto::PROTOCOL_VERSION,
+        client_kind: dto::ClientKind::Hook,
+        build_id: build_id.to_owned(),
+        max_frame: dto::MAX_FRAME_SIZE as u32,
+    });
+    write_frame_sync(&mut stream, &handshake, dto::MAX_FRAME_SIZE).map_err(map_sync_frame_error)?;
+    set_sync_deadline(&stream, deadline)?;
+    let negotiated =
+        match read_frame_sync::<envelope::ServerEnvelope>(&mut stream, dto::MAX_FRAME_SIZE)
+            .map_err(map_sync_frame_error)?
+        {
+            envelope::ServerEnvelope::HandshakeAck(ack)
+                if ack.protocol_version == dto::PROTOCOL_VERSION
+                    && handshake::valid_build_id(&ack.build_id)
+                    && ack.max_frame > 0
+                    && ack.max_frame <= dto::MAX_FRAME_SIZE as u32 =>
+            {
+                ack.max_frame as usize
+            }
+            envelope::ServerEnvelope::Error(error) => {
+                return Err(if error.code == error::ErrorCode::Untrusted {
+                    SyncProtocolError::NotAdmitted
+                } else {
+                    SyncProtocolError::Wire
+                });
+            }
+            _ => return Err(SyncProtocolError::Negotiation),
+        };
+    let request_id = evertrace_domain::ids::RequestId::from_uuid(uuid::Uuid::now_v7())
+        .map_err(|_| SyncProtocolError::InvalidInput)?;
+    let command = envelope::ClientEnvelope::Command(command::CommandEnvelope {
+        request_id,
+        command: command::Command::RecoveryBarrier(locator.clone()),
+    });
+    set_sync_deadline(&stream, deadline)?;
+    write_frame_sync(&mut stream, &command, negotiated).map_err(map_sync_frame_error)?;
+    set_sync_deadline(&stream, deadline)?;
+    match read_frame_sync::<envelope::ServerEnvelope>(&mut stream, negotiated)
+        .map_err(map_sync_frame_error)?
+    {
+        envelope::ServerEnvelope::Response(value) if value.request_id == request_id => {
+            match value.response {
+                response::Response::RecoveryTerminal(terminal)
+                    if terminal.validate()
+                        && terminal.recovery_capture_request_id
+                            == locator.recovery_capture_request_id
+                        && terminal.pending_revision_id == locator.pending_revision_id =>
+                {
+                    if checked_sync_socket(socket_path)? != socket_identity {
+                        return Err(SyncProtocolError::Connect);
+                    }
+                    Ok(terminal)
+                }
+                _ => Err(SyncProtocolError::InvalidResponse),
+            }
+        }
+        envelope::ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
+            Err(if error.code == error::ErrorCode::Untrusted {
+                SyncProtocolError::NotAdmitted
+            } else {
+                SyncProtocolError::Wire
+            })
+        }
+        _ => Err(SyncProtocolError::InvalidResponse),
+    }
+}
+
+#[cfg(unix)]
+fn set_sync_deadline(
+    stream: &StdUnixStream,
+    deadline: Instant,
+) -> Result<(), error::SyncProtocolError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|value| !value.is_zero())
+        .ok_or(error::SyncProtocolError::Timeout)?;
+    stream
+        .set_read_timeout(Some(remaining))
+        .and_then(|()| stream.set_write_timeout(Some(remaining)))
+        .map_err(|_| error::SyncProtocolError::Connect)
+}
+
+#[cfg(unix)]
+fn connect_sync_deadline(
+    socket_path: &Path,
+    deadline: Instant,
+) -> Result<StdUnixStream, error::SyncProtocolError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|value| !value.is_zero())
+        .ok_or(error::SyncProtocolError::Timeout)?;
+    let path = socket_path.to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(StdUnixStream::connect(path));
+    });
+    receiver
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => error::SyncProtocolError::Timeout,
+            std::sync::mpsc::RecvTimeoutError::Disconnected => error::SyncProtocolError::Connect,
+        })?
+        .map_err(|_| error::SyncProtocolError::Connect)
+}
+
+#[cfg(unix)]
+fn checked_sync_socket(socket_path: &Path) -> Result<(u64, u64, u32), error::SyncProtocolError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata =
+        std::fs::symlink_metadata(socket_path).map_err(|_| error::SyncProtocolError::Connect)?;
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .and_then(|line| line.split_ascii_whitespace().nth(2))
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .ok_or(error::SyncProtocolError::Connect)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err(error::SyncProtocolError::Connect);
+    }
+    Ok((metadata.dev(), metadata.ino(), metadata.uid()))
+}
+
+#[cfg(unix)]
+fn map_sync_frame_error(error: frame::FrameError) -> error::SyncProtocolError {
+    if matches!(error, frame::FrameError::Timeout) {
+        error::SyncProtocolError::Timeout
+    } else {
+        error::SyncProtocolError::Frame
     }
 }
 

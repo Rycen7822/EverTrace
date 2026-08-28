@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::spool::SpoolLimits;
 
-pub const RUNTIME_SNAPSHOT_VERSION: u16 = 1;
+pub const RUNTIME_SNAPSHOT_VERSION: u16 = 2;
 const SNAPSHOT_MAGIC: &[u8; 8] = b"ETRUN001";
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,6 +26,35 @@ pub struct RuntimeSnapshot {
     pub main_low_watermark_bytes: u64,
     pub max_main_files: u32,
     pub emergency_slots: u16,
+    pub effective_config_hash: [u8; 32],
+    pub recovery_gate: RecoveryGateMode,
+    pub recovery_adapter_manifest_id: Option<String>,
+    pub recovery_classifier_revision: u32,
+    pub recovery_socket_path: PathBuf,
+    pub recovery_preflight_timeout_ms: u32,
+    pub recovery_max_bundle_bytes: u64,
+    pub recovery_max_untracked_file_bytes: u64,
+    pub recovery_max_untracked_total_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryGateMode {
+    Disabled,
+    BestEffort,
+    Active,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverySnapshotSettings {
+    pub gate: RecoveryGateMode,
+    pub preflight_timeout_ms: u32,
+    pub effective_config_hash: [u8; 32],
+    pub adapter_manifest_id: Option<String>,
+    pub classifier_revision: u32,
+    pub max_bundle_bytes: u64,
+    pub max_untracked_file_bytes: u64,
+    pub max_untracked_total_bytes: u64,
 }
 
 impl fmt::Debug for RuntimeSnapshot {
@@ -39,22 +68,104 @@ impl fmt::Debug for RuntimeSnapshot {
             .field("main_low_watermark_bytes", &self.main_low_watermark_bytes)
             .field("max_main_files", &self.max_main_files)
             .field("emergency_slots", &self.emergency_slots)
+            .field("recovery_gate", &self.recovery_gate)
+            .field(
+                "has_recovery_adapter_manifest",
+                &self.recovery_adapter_manifest_id.is_some(),
+            )
+            .field("recovery_socket_configured", &true)
+            .field(
+                "recovery_preflight_timeout_ms",
+                &self.recovery_preflight_timeout_ms,
+            )
             .finish()
     }
 }
 
 impl RuntimeSnapshot {
+    pub fn for_data_dir(
+        data_dir: &Path,
+        generation: u64,
+        limits: SpoolLimits,
+        recovery: RecoverySnapshotSettings,
+    ) -> Result<Self, RuntimeSnapshotError> {
+        if !is_normal_absolute(data_dir) {
+            return Err(RuntimeSnapshotError::Invalid);
+        }
+        let snapshot = Self {
+            snapshot_version: RUNTIME_SNAPSHOT_VERSION,
+            generation,
+            device_key_dir: data_dir.join("keys"),
+            cas_dir: data_dir.join("cas"),
+            spool_dir: data_dir.join("spool"),
+            main_high_watermark_bytes: limits.high_watermark_bytes,
+            main_low_watermark_bytes: limits.low_watermark_bytes,
+            max_main_files: limits.max_main_files,
+            emergency_slots: limits.emergency_slots,
+            effective_config_hash: recovery.effective_config_hash,
+            recovery_gate: recovery.gate,
+            recovery_adapter_manifest_id: recovery.adapter_manifest_id,
+            recovery_classifier_revision: recovery.classifier_revision,
+            recovery_socket_path: data_dir.join("runtime/evertraced-v1.sock"),
+            recovery_preflight_timeout_ms: recovery.preflight_timeout_ms,
+            recovery_max_bundle_bytes: recovery.max_bundle_bytes,
+            recovery_max_untracked_file_bytes: recovery.max_untracked_file_bytes,
+            recovery_max_untracked_total_bytes: recovery.max_untracked_total_bytes,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn snapshot_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("runtime/hook-runtime-v1.json")
+    }
+
+    pub fn data_dir(&self) -> Result<&Path, RuntimeSnapshotError> {
+        let data_dir = self
+            .spool_dir
+            .parent()
+            .ok_or(RuntimeSnapshotError::Invalid)?;
+        if !is_normal_absolute(data_dir)
+            || self.device_key_dir != data_dir.join("keys")
+            || self.cas_dir != data_dir.join("cas")
+            || self.spool_dir != data_dir.join("spool")
+            || self.recovery_socket_path != data_dir.join("runtime/evertraced-v1.sock")
+        {
+            return Err(RuntimeSnapshotError::Invalid);
+        }
+        Ok(data_dir)
+    }
+
     pub fn validate(&self) -> Result<(), RuntimeSnapshotError> {
         if self.snapshot_version != RUNTIME_SNAPSHOT_VERSION
             || self.generation == 0
             || [&self.device_key_dir, &self.cas_dir, &self.spool_dir]
                 .iter()
                 .any(|path| !path.is_absolute())
+            || !self.recovery_socket_path.is_absolute()
+            || self.recovery_preflight_timeout_ms == 0
+            || self.recovery_preflight_timeout_ms > 120_000
+            || self.recovery_classifier_revision == 0
+            || self.effective_config_hash == [0; 32]
+            || self.recovery_max_bundle_bytes == 0
+            || self.recovery_max_untracked_file_bytes == 0
+            || self.recovery_max_untracked_total_bytes == 0
+            || self.recovery_max_untracked_file_bytes > self.recovery_max_untracked_total_bytes
+            || self.recovery_max_untracked_total_bytes > self.recovery_max_bundle_bytes
+            || (self.recovery_gate == RecoveryGateMode::Active)
+                != self.recovery_adapter_manifest_id.is_some()
+            || self
+                .recovery_adapter_manifest_id
+                .as_deref()
+                .is_some_and(|value| {
+                    value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+                })
         {
             return Err(RuntimeSnapshotError::Invalid);
         }
         self.spool_limits()
             .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        self.data_dir()?;
         Ok(())
     }
 
@@ -107,6 +218,18 @@ impl RuntimeSnapshot {
         }
         result
     }
+}
+
+fn is_normal_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+                    | std::path::Component::Normal(_)
+            )
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -180,6 +303,32 @@ fn encode_snapshot(value: &RuntimeSnapshot) -> Result<Vec<u8>, RuntimeSnapshotEr
     bytes.extend_from_slice(&value.main_low_watermark_bytes.to_be_bytes());
     bytes.extend_from_slice(&value.max_main_files.to_be_bytes());
     bytes.extend_from_slice(&value.emergency_slots.to_be_bytes());
+    bytes.extend_from_slice(&value.effective_config_hash);
+    bytes.push(match value.recovery_gate {
+        RecoveryGateMode::Disabled => 0,
+        RecoveryGateMode::BestEffort => 1,
+        RecoveryGateMode::Active => 2,
+    });
+    match &value.recovery_adapter_manifest_id {
+        None => bytes.extend_from_slice(&0_u16.to_be_bytes()),
+        Some(value) => {
+            let length = u16::try_from(value.len()).map_err(|_| RuntimeSnapshotError::Invalid)?;
+            bytes.extend_from_slice(&length.to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+    }
+    bytes.extend_from_slice(&value.recovery_classifier_revision.to_be_bytes());
+    let socket = value
+        .recovery_socket_path
+        .to_str()
+        .ok_or(RuntimeSnapshotError::Invalid)?;
+    let length = u16::try_from(socket.len()).map_err(|_| RuntimeSnapshotError::Invalid)?;
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(socket.as_bytes());
+    bytes.extend_from_slice(&value.recovery_preflight_timeout_ms.to_be_bytes());
+    bytes.extend_from_slice(&value.recovery_max_bundle_bytes.to_be_bytes());
+    bytes.extend_from_slice(&value.recovery_max_untracked_file_bytes.to_be_bytes());
+    bytes.extend_from_slice(&value.recovery_max_untracked_total_bytes.to_be_bytes());
     Ok(bytes)
 }
 
@@ -199,6 +348,30 @@ fn decode_snapshot(bytes: &[u8]) -> Result<RuntimeSnapshot, RuntimeSnapshotError
     let main_low_watermark_bytes = cursor.u64()?;
     let max_main_files = cursor.u32()?;
     let emergency_slots = cursor.u16()?;
+    let mut effective_config_hash = [0_u8; 32];
+    effective_config_hash.copy_from_slice(cursor.take(32)?);
+    let recovery_gate = match cursor.take(1)?[0] {
+        0 => RecoveryGateMode::Disabled,
+        1 => RecoveryGateMode::BestEffort,
+        2 => RecoveryGateMode::Active,
+        _ => return Err(RuntimeSnapshotError::Invalid),
+    };
+    let manifest_length = usize::from(cursor.u16()?);
+    let recovery_adapter_manifest_id = if manifest_length == 0 {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(cursor.take(manifest_length)?)
+                .map_err(|_| RuntimeSnapshotError::Invalid)?
+                .to_owned(),
+        )
+    };
+    let recovery_classifier_revision = cursor.u32()?;
+    let recovery_socket_path = cursor.path()?;
+    let recovery_preflight_timeout_ms = cursor.u32()?;
+    let recovery_max_bundle_bytes = cursor.u64()?;
+    let recovery_max_untracked_file_bytes = cursor.u64()?;
+    let recovery_max_untracked_total_bytes = cursor.u64()?;
     if !cursor.remaining.is_empty() {
         return Err(RuntimeSnapshotError::Invalid);
     }
@@ -212,6 +385,15 @@ fn decode_snapshot(bytes: &[u8]) -> Result<RuntimeSnapshot, RuntimeSnapshotError
         main_low_watermark_bytes,
         max_main_files,
         emergency_slots,
+        effective_config_hash,
+        recovery_gate,
+        recovery_adapter_manifest_id,
+        recovery_classifier_revision,
+        recovery_socket_path,
+        recovery_preflight_timeout_ms,
+        recovery_max_bundle_bytes,
+        recovery_max_untracked_file_bytes,
+        recovery_max_untracked_total_bytes,
     })
 }
 

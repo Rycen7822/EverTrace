@@ -8,6 +8,9 @@ use crate::ids::{
     WorktreeTransitionId,
 };
 
+mod recovery;
+pub use recovery::*;
+
 pub const REPOSITORY_RESOLVER_VERSION: u32 = 1;
 
 const MAX_LOCATOR_BYTES: usize = 4096;
@@ -691,6 +694,8 @@ pub enum RepositoryError {
     InvalidTransition,
     #[error("integration event is invalid")]
     InvalidIntegration,
+    #[error("recovery evidence is invalid")]
+    InvalidRecovery,
 }
 
 #[cfg(test)]

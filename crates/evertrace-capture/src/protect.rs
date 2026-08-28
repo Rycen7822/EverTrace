@@ -1,7 +1,9 @@
 use std::fmt;
 
-use evertrace_domain::canonical::{CanonicalValue, hmac_sha256};
+use evertrace_domain::canonical::{CanonicalValue, encode, hmac_sha256};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use thiserror::Error;
 
 use crate::key::DeviceKey;
@@ -214,6 +216,60 @@ pub fn protect(input: &[u8], key: &DeviceKey) -> Result<ProtectedPayload, Protec
         key_generation: key.generation(),
         protected_secret_digest,
     })
+}
+
+/// Produces a fixed-domain device-keyed token for secret-safe recovery path
+/// metadata. The raw path is never returned or persisted by this helper.
+pub fn recovery_path_token(input: &[u8], key: &DeviceKey) -> Result<[u8; 32], ProtectError> {
+    hmac_sha256(
+        key.bytes(),
+        "evertrace.recovery_path_token",
+        1,
+        &CanonicalValue::Bytes(input.to_vec()),
+    )
+    .map_err(|_| ProtectError::Digest)
+}
+
+/// Produces a fixed-domain device-keyed identity for transient recovery fence
+/// comparison. It does not expose the captured bytes.
+pub fn recovery_content_token(input: &[u8], key: &DeviceKey) -> Result<[u8; 32], ProtectError> {
+    hmac_sha256(
+        key.bytes(),
+        "evertrace.recovery_content_token",
+        1,
+        &CanonicalValue::Bytes(input.to_vec()),
+    )
+    .map_err(|_| ProtectError::Digest)
+}
+
+/// Authenticates the single canonical S16 bundle-application ticket claims.
+/// This is intentionally not a general-purpose key or signing API.
+pub fn recovery_ticket_auth_tag(
+    claims: &CanonicalValue,
+    key: &DeviceKey,
+) -> Result<[u8; 32], ProtectError> {
+    hmac_sha256(
+        key.bytes(),
+        "evertrace.recovery_application_ticket",
+        1,
+        claims,
+    )
+    .map_err(|_| ProtectError::Digest)
+}
+
+/// Verifies the canonical S16 ticket tag without a timing-sensitive array
+/// comparison at the engine boundary.
+pub fn verify_recovery_ticket_auth_tag(
+    claims: &CanonicalValue,
+    key: &DeviceKey,
+    provided: &[u8; 32],
+) -> Result<bool, ProtectError> {
+    let encoded = encode("evertrace.recovery_application_ticket", 1, claims)
+        .map_err(|_| ProtectError::Digest)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.bytes()).expect("HMAC-SHA-256 accepts device keys");
+    mac.update(&encoded);
+    Ok(mac.verify_slice(provided).is_ok())
 }
 
 #[derive(Clone, Copy)]

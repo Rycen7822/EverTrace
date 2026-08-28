@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -57,6 +58,7 @@ pub enum GapReason {
     MainPressure,
     MainUnavailable,
     CorruptSegment,
+    RecoveryUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,6 +198,24 @@ impl DurableSpool {
         Ok((spool, report))
     }
 
+    pub fn open_read_only(
+        root: impl Into<PathBuf>,
+        limits: SpoolLimits,
+    ) -> Result<Self, SpoolError> {
+        let root = root.into();
+        let limits = limits.validate()?;
+        let spool = Self {
+            main_dir: root.join("main"),
+            emergency_dir: root.join("emergency"),
+            quarantine_dir: root.join("quarantine"),
+            root,
+            limits,
+            last_watermark: 0,
+        };
+        spool.validate_directories()?;
+        Ok(spool)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -260,6 +280,79 @@ impl DurableSpool {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(error) => Err(map_io(error)),
         }
+    }
+
+    /// Bounded read-only lookup across active and sealed durable segments.
+    pub fn find_durable_record(
+        &self,
+        spool_record_id: &str,
+        max_segments: usize,
+        max_bytes: u64,
+    ) -> Result<Option<SpoolRecord>, SpoolError> {
+        if spool_record_id.is_empty() {
+            return Err(SpoolError::InvalidConfiguration);
+        }
+        let mut found = None;
+        for record in self.read_durable_records(max_segments, max_bytes)? {
+            if record.spool_record_id == spool_record_id {
+                if found.is_some() {
+                    return Err(SpoolError::DuplicateRecord);
+                }
+                found = Some(record);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Bounded read-only scan used for typed recovery successor replay.
+    pub fn read_durable_records(
+        &self,
+        max_segments: usize,
+        max_bytes: u64,
+    ) -> Result<Vec<SpoolRecord>, SpoolError> {
+        if max_segments == 0 || max_segments > 64 || max_bytes == 0 {
+            return Err(SpoolError::InvalidConfiguration);
+        }
+        self.validate_directories()?;
+        let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
+        FileExt::lock_shared(&directory_lock).map_err(map_io)?;
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
+            let entry = entry.map_err(map_io)?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(map_io)?;
+            validate_owned_file_metadata(&metadata)?;
+            let is_active = entry.file_name() == ACTIVE_NAME;
+            if !is_active && path.extension().is_none_or(|value| value != "sealed") {
+                return Err(SpoolError::Corrupt);
+            }
+            paths.push((!is_active, path, metadata.len()));
+        }
+        paths.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        if paths.len() > max_segments {
+            return Err(SpoolError::ResourceExhausted);
+        }
+        let mut consumed = 0_u64;
+        let mut records = Vec::new();
+        let mut record_ids = BTreeSet::new();
+        for (_, path, length) in paths {
+            consumed = consumed
+                .checked_add(length)
+                .filter(|value| *value <= max_bytes)
+                .ok_or(SpoolError::ResourceExhausted)?;
+            let bytes = read_owned_file(&path)?;
+            let scan = scan_frames(&bytes)?;
+            if scan.incomplete_tail || scan.complete_length != length {
+                return Err(SpoolError::Corrupt);
+            }
+            for frame in scan.frames {
+                if !record_ids.insert(frame.record.spool_record_id.clone()) {
+                    return Err(SpoolError::DuplicateRecord);
+                }
+                records.push(frame.record);
+            }
+        }
+        Ok(records)
     }
 
     pub fn seal_active(&mut self, generation: u64) -> Result<Option<PathBuf>, SpoolError> {
@@ -739,6 +832,8 @@ pub enum SpoolError {
     InvalidAcknowledgement,
     #[error("spool segment identity changed during acknowledgement")]
     IdentityChanged,
+    #[error("spool contains duplicate record IDs")]
+    DuplicateRecord,
     #[error("spool path has an invalid type")]
     InvalidType,
     #[error("spool path has the wrong owner")]
@@ -909,6 +1004,7 @@ fn encode_marker_body(marker: &CaptureGapMarker) -> Result<Vec<u8>, SpoolError> 
         GapReason::MainPressure => 0,
         GapReason::MainUnavailable => 1,
         GapReason::CorruptSegment => 2,
+        GapReason::RecoveryUnavailable => 3,
     });
     body.extend_from_slice(marker.redacted_fingerprint.as_bytes());
     body.extend_from_slice(&marker.attempted_bytes.to_be_bytes());
@@ -927,6 +1023,7 @@ fn decode_marker_body(body: &[u8]) -> Result<CaptureGapMarker, SpoolError> {
         0 => GapReason::MainPressure,
         1 => GapReason::MainUnavailable,
         2 => GapReason::CorruptSegment,
+        3 => GapReason::RecoveryUnavailable,
         _ => return Err(SpoolError::Corrupt),
     };
     let redacted_fingerprint = std::str::from_utf8(cursor.take(64)?)

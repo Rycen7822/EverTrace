@@ -5,6 +5,7 @@
 
 pub mod admission;
 pub mod cas;
+pub mod confined_read;
 pub mod frame;
 pub mod key;
 pub mod protect;
@@ -13,17 +14,28 @@ pub mod spool;
 
 pub use admission::{
     CaptureAdmissionState, CaptureError, CaptureOutcome, CaptureRecordInput, CaptureRuntime,
+    DurableRecoveryPreflight,
 };
 pub use cas::{CasDigest, CasError, CasStore};
+pub use confined_read::{
+    ConfinedFile, ConfinedFileIdentity, ConfinedFileMetadata, ConfinedLimitKind, ConfinedReadError,
+    ConfinedReadLimits, ConfinedRoot,
+};
 pub use frame::{
-    CAPTURE_RECORD_BODY_VERSION, CaptureRecordBody, DecodedFrame, FrameScan, SpoolFrameError,
-    SpoolRecord, decode_record_body, encode_frame, encode_record_body, scan_frames,
+    CAPTURE_RECORD_BODY_VERSION, CaptureRecordBody, DecodedFrame, FrameScan,
+    RecoveryPreflightCandidate, SpoolFrameError, SpoolRecord, decode_record_body, encode_frame,
+    encode_record_body, scan_frames,
 };
 pub use key::{DeviceKey, DeviceKeyError, DeviceKeyStore};
 pub use protect::{
     ArchiveMode, ProtectError, ProtectedPayload, RedactionSpan, SecretKind, protect,
+    recovery_content_token, recovery_path_token, recovery_ticket_auth_tag,
+    verify_recovery_ticket_auth_tag,
 };
-pub use runtime_snapshot::{RUNTIME_SNAPSHOT_VERSION, RuntimeSnapshot, RuntimeSnapshotError};
+pub use runtime_snapshot::{
+    RUNTIME_SNAPSHOT_VERSION, RecoveryGateMode, RecoverySnapshotSettings, RuntimeSnapshot,
+    RuntimeSnapshotError,
+};
 pub use spool::{
     CaptureGapMarker, DurableSpool, GapEvidence, GapReason, PendingGapMarker, PendingQuarantine,
     RecoveryReport, SealedFrame, SealedSegment, SpoolError, SpoolLimits,

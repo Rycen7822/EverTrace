@@ -9,6 +9,7 @@ pub mod hook_input;
 pub mod install;
 pub mod policy;
 pub mod probe;
+pub mod recovery;
 pub mod source_catalog;
 
 pub use adapter_manifest::{AdapterCapabilityManifest, ManifestError};

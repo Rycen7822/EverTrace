@@ -7,6 +7,7 @@ pub const MAX_FRAME_SIZE: usize = 1_048_576;
 #[serde(rename_all = "snake_case")]
 pub enum ClientKind {
     Cli,
+    Hook,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

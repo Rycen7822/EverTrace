@@ -2,10 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::dto::ClientKind;
 
-#[cfg(feature = "runtime")]
 pub(crate) const MAX_BUILD_ID_BYTES: usize = 128;
 
-#[cfg(feature = "runtime")]
 pub(crate) fn valid_build_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_BUILD_ID_BYTES
 }

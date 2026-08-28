@@ -9,8 +9,8 @@ use evertrace_domain::{
     },
     ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
     repository::{
-        IntegrationEvent, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
-        WorktreeTransition,
+        IntegrationEvent, RecoveryBundle, RecoveryCaptureRequest, RecoveryRequestStatus,
+        RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
     },
     work::{
         AdmissionFailureObservability, Attempt, CaptureReceipt, CompetingAttemptGroup,
@@ -511,6 +511,8 @@ pub enum JournalPayload {
     WorkEpisodeRecorded(Box<WorkEpisode>),
     WorkCheckpointRecorded(Box<WorkCheckpoint>),
     SegmentationCorrectionRecorded(Box<SegmentationCorrection>),
+    RecoveryCaptureRequestRecorded(Box<RecoveryCaptureRequest>),
+    RecoveryBundleRecorded(Box<RecoveryBundle>),
 }
 
 impl JournalPayload {
@@ -552,6 +554,8 @@ impl JournalPayload {
             Self::WorkEpisodeRecorded(_) => "work_episode_recorded_v1",
             Self::WorkCheckpointRecorded(_) => "work_checkpoint_recorded_v1",
             Self::SegmentationCorrectionRecorded(_) => "segmentation_correction_recorded_v1",
+            Self::RecoveryCaptureRequestRecorded(_) => "recovery_capture_request_recorded_v1",
+            Self::RecoveryBundleRecorded(_) => "recovery_bundle_recorded_v1",
         }
     }
 
@@ -584,6 +588,9 @@ impl JournalPayload {
             | Self::WorkEpisodeRecorded(_)
             | Self::WorkCheckpointRecorded(_) => RecordClass::ObjectEvent,
             Self::SegmentationCorrectionRecorded(_) => RecordClass::ObjectEvent,
+            Self::RecoveryCaptureRequestRecorded(_) | Self::RecoveryBundleRecorded(_) => {
+                RecordClass::ObjectEvent
+            }
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -710,6 +717,12 @@ impl JournalPayload {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::SegmentationCorrectionRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::RecoveryCaptureRequestRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::RecoveryBundleRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
         }
@@ -849,6 +862,10 @@ impl JournalPayload {
             Self::SegmentationCorrectionRecorded(value) => {
                 tagged_json("segmentation_correction_recorded", value)
             }
+            Self::RecoveryCaptureRequestRecorded(value) => {
+                tagged_json("recovery_capture_request_recorded", value)
+            }
+            Self::RecoveryBundleRecorded(value) => tagged_json("recovery_bundle_recorded", value),
         }
     }
 
@@ -986,6 +1003,72 @@ pub(crate) struct PreparedCommand {
     pub events: Vec<PreparedEvent>,
 }
 
+fn validate_recovery_command(events: &[JournalEventDraft]) -> Result<(), StoreError> {
+    let requests = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            JournalPayload::RecoveryCaptureRequestRecorded(value) => Some(value.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let bundles = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            JournalPayload::RecoveryBundleRecorded(value) => Some(value.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for (index, left) in requests.iter().enumerate() {
+        if requests[index + 1..].iter().any(|right| {
+            right.recovery_capture_request_id == left.recovery_capture_request_id
+                || right.request_revision_id == left.request_revision_id
+        }) {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for (index, left) in bundles.iter().enumerate() {
+        if bundles[index + 1..]
+            .iter()
+            .any(|right| right.recovery_bundle_id == left.recovery_bundle_id)
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let paired = requests.iter().any(|request| {
+            request.request_status.is_terminal()
+                && request.recovery_bundle_id == Some(left.recovery_bundle_id)
+                && left
+                    .trigger_request_ids
+                    .contains(&request.recovery_capture_request_id)
+                && request.pre_operation_snapshot_id == Some(left.source_snapshot_id)
+                && request.worktree_instance_id == left.source_worktree_instance_id
+        });
+        if !paired {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for request in requests {
+        if request.request_status == RecoveryRequestStatus::Pending
+            && (!bundles.is_empty() || request.parent_request_revision_id.is_some())
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        if let Some(bundle_id) = request.recovery_bundle_id
+            && let Some(bundle) = bundles
+                .iter()
+                .find(|bundle| bundle.recovery_bundle_id == bundle_id)
+            && (!bundle
+                .trigger_request_ids
+                .contains(&request.recovery_capture_request_id)
+                || request.pre_operation_snapshot_id != Some(bundle.source_snapshot_id)
+                || request.worktree_instance_id != bundle.source_worktree_instance_id)
+        {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare_command(command: &JournalCommand) -> Result<PreparedCommand, StoreError> {
     let event_count = u16::try_from(command.events.len()).map_err(|_| StoreError::InvalidInput)?;
     if event_count == 0 {
@@ -1011,6 +1094,7 @@ pub(crate) fn prepare_command(command: &JournalCommand) -> Result<PreparedComman
     validate_evidence_command(&command.events)?;
     validate_normalization_command(&command.events)?;
     crate::repository::validate_repository_command(&command.events)?;
+    validate_recovery_command(&command.events)?;
     validate_work_identity_command(&command.events)?;
     let command_value = CanonicalValue::Map(vec![
         ("command_id".into(), text(&command.command_id.to_string())),
