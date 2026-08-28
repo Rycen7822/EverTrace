@@ -7,18 +7,18 @@ use evertrace_domain::{
         Operation, ScopeEffect, SourceObservation, SourceReceipt,
     },
     ids::{
-        AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
+        AtomId, AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
         ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId,
         OperationId, RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId,
-        RepositoryId, ResultEvidenceId, ScopeEffectId, SourceObservationId, SourceReceiptId,
-        TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
-        WorktreeSnapshotId, WorktreeTransitionId,
+        RepositoryId, ResultEvidenceId, RevisionProposalId, ScopeEffectId, SourceObservationId,
+        SourceReceiptId, TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId,
+        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
         RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
     },
-    semantic::ResultEvidence,
+    semantic::{Atom, ResultEvidence, RevisionProposal},
     work::{
         ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus,
         AttemptExecutionStatus, AttemptOutcomeState, AttemptVerification, CaptureReceipt,
@@ -50,6 +50,7 @@ use crate::{
 mod autoresearch;
 mod recovery;
 mod segmentation;
+mod semantic;
 pub use autoresearch::AutoresearchCurrentView;
 use autoresearch::{record_artifact, record_result, record_run};
 pub use recovery::{RecoveryCurrentState, RecoveryCurrentView};
@@ -61,6 +62,7 @@ use segmentation::{
     record_checkpoint, record_correction, record_episode, record_operation_burst,
     validate_episode_relations,
 };
+pub use semantic::SemanticCurrentView;
 
 const PROJECTION_GENERATION: u64 = 1;
 // S10 fail-closed safety ceiling. Pagination/cursors belong to the later S23 owner.
@@ -1237,6 +1239,10 @@ struct ReducerState {
         BTreeMap<evertrace_domain::revision::RevisionId, (ResultEvidence, u64)>,
     work_artifacts: BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
     artifact_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkArtifact, u64)>,
+    atoms: BTreeMap<AtomId, (Atom, u64)>,
+    atom_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Atom, u64)>,
+    proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1339,6 +1345,10 @@ pub(crate) struct JournalAdmissionState {
         BTreeMap<evertrace_domain::revision::RevisionId, (ResultEvidence, u64)>,
     work_artifacts: BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
     artifact_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (WorkArtifact, u64)>,
+    atoms: BTreeMap<AtomId, (Atom, u64)>,
+    atom_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Atom, u64)>,
+    proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
 }
 
 impl JournalAdmissionState {
@@ -1358,6 +1368,11 @@ impl JournalAdmissionState {
         self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
+        )?;
+        semantic::validate_command_boundary(
+            &self.atoms,
+            command.events().iter().map(|event| &event.payload),
+            StoreError::InvalidInput,
         )?;
         crate::repository::validate_repository_payloads(
             command.events().iter().map(|event| &event.payload),
@@ -1428,6 +1443,11 @@ impl JournalAdmissionState {
             .map_err(|_| StoreError::StoreCorrupt)?;
         self.validate_episode_binding_activation(parsed.iter().map(|(payload, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
+        semantic::validate_command_boundary(
+            &self.atoms,
+            parsed.iter().map(|(payload, _)| payload),
+            StoreError::StoreCorrupt,
+        )?;
         crate::repository::validate_repository_payloads(parsed.iter().map(|(payload, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
         let mut next = self.clone();
@@ -1674,6 +1694,20 @@ impl JournalAdmissionState {
                 seq,
                 StoreError::StoreCorrupt,
             )?,
+            JournalPayload::AtomRecorded(value) => semantic::record_atom(
+                &mut self.atoms,
+                &mut self.atom_revisions,
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
+            JournalPayload::RevisionProposalRecorded(value) => semantic::record_proposal(
+                &mut self.proposals,
+                &mut self.proposal_revisions,
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
             _ => {}
         }
         Ok(())
@@ -1780,6 +1814,17 @@ impl JournalAdmissionState {
             worktrees: &self.worktrees,
             source_receipts: &self.source_receipts,
             source_observations: &self.source_observations,
+        })?;
+        semantic::validate_relations(semantic::SemanticRelationInputs {
+            atom_revisions: &self.atom_revisions,
+            proposal_revisions: &self.proposal_revisions,
+            source_observations: &self.source_observations,
+            source_receipts: &self.source_receipts,
+            tasks: &self.tasks,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            results: &self.result_evidence,
+            artifacts: &self.work_artifacts,
         })
     }
 }
@@ -2392,6 +2437,20 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         JournalPayload::WorkArtifactRecorded(value) => record_artifact(
             &mut state.work_artifacts,
             Some(&mut state.artifact_revisions),
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
+        JournalPayload::AtomRecorded(value) => semantic::record_atom(
+            &mut state.atoms,
+            &mut state.atom_revisions,
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
+        JournalPayload::RevisionProposalRecorded(value) => semantic::record_proposal(
+            &mut state.proposals,
+            &mut state.proposal_revisions,
             *value,
             row.seq,
             StoreError::StoreCorrupt,
@@ -3303,6 +3362,8 @@ impl ReducerState {
         autoresearch::rebuild_runs(&mut self.experiment_runs, &self.experiment_run_revisions)?;
         autoresearch::rebuild_results(&mut self.result_evidence, &self.result_evidence_revisions)?;
         autoresearch::rebuild_artifacts(&mut self.work_artifacts, &self.artifact_revisions)?;
+        semantic::rebuild_atoms(&mut self.atoms, &self.atom_revisions)?;
+        semantic::rebuild_proposals(&mut self.proposals, &self.proposal_revisions)?;
         Ok(())
     }
 
@@ -4076,6 +4137,20 @@ impl ReducerState {
                     .insert(value.revision.revision_id, (value, row.source_event_seq))
                     .is_some()
             }
+            JournalPayload::AtomRecorded(value) => {
+                let value = *value;
+                require_semantic_atom_row(row, &value)?;
+                self.atom_revisions
+                    .insert(value.revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
+            JournalPayload::RevisionProposalRecorded(value) => {
+                let value = *value;
+                require_semantic_proposal_row(row, &value)?;
+                self.proposal_revisions
+                    .insert(value.proposal_revision_id, (value, row.source_event_seq))
+                    .is_some()
+            }
         };
         if duplicate {
             return Err(StoreError::StoreCorrupt);
@@ -4590,6 +4665,20 @@ impl ReducerState {
             );
             rows.push(row);
         }
+        for (_revision_id, (value, seq)) in self.atom_revisions {
+            rows.push(semantic_atom_row(
+                &value,
+                &JournalPayload::AtomRecorded(Box::new(value.clone())),
+                seq,
+            )?);
+        }
+        for (_revision_id, (value, seq)) in self.proposal_revisions {
+            rows.push(semantic_proposal_row(
+                &value,
+                &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
+                seq,
+            )?);
+        }
         Ok(rows)
     }
 
@@ -4766,6 +4855,17 @@ impl ReducerState {
             source_receipts: &self.source_receipts,
             source_observations: &self.source_observations,
         })?;
+        semantic::validate_relations(semantic::SemanticRelationInputs {
+            atom_revisions: &self.atom_revisions,
+            proposal_revisions: &self.proposal_revisions,
+            source_observations: &self.source_observations,
+            source_receipts: &self.source_receipts,
+            tasks: &self.tasks,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            results: &self.result_evidence,
+            artifacts: &self.work_artifacts,
+        })?;
         Ok(())
     }
 
@@ -4814,6 +4914,10 @@ impl ReducerState {
             result_evidence_revisions: self.result_evidence_revisions.clone(),
             work_artifacts: self.work_artifacts.clone(),
             artifact_revisions: self.artifact_revisions.clone(),
+            atoms: self.atoms.clone(),
+            atom_revisions: self.atom_revisions.clone(),
+            proposals: self.proposals.clone(),
+            proposal_revisions: self.proposal_revisions.clone(),
         })
     }
 }
@@ -5069,6 +5173,98 @@ fn physical_object_row(
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
+}
+
+fn semantic_atom_row(
+    atom: &Atom,
+    payload: &JournalPayload,
+    source_event_seq: u64,
+) -> Result<ObjectRow, StoreError> {
+    Ok(ObjectRow {
+        row_id: format!("object:atom:atom_revision:{}", atom.revision_id),
+        row_kind: ObjectRowKind::Data,
+        row_class: Some(ObjectRowClass::Object),
+        object_family: Some(ObjectFamily::Atom),
+        object_kind: Some("atom_revision".into()),
+        object_id: Some(atom.atom_id.to_string()),
+        current_revision_id: Some(atom.revision_id.to_string()),
+        lifecycle: Some(atom.lifecycle_status.as_str().into()),
+        epistemic: Some(atom.epistemic_status.as_str().into()),
+        authority: Some(atom.authority.as_str().into()),
+        publication_state: None,
+        support_state: None,
+        project_id: None,
+        repository_id: atom.scope.repository_id().map(|id| id.to_string()),
+        worktree_id: atom.scope.worktree_id().map(|id| id.to_string()),
+        task_id: atom.scope.task_id().map(|id| id.to_string()),
+        workstream_id: None,
+        session_id: None,
+        payload_json: Some(payload.canonical_json()?),
+        source_event_seq,
+        projection_generation: PROJECTION_GENERATION,
+    })
+}
+
+fn semantic_proposal_row(
+    proposal: &RevisionProposal,
+    payload: &JournalPayload,
+    source_event_seq: u64,
+) -> Result<ObjectRow, StoreError> {
+    Ok(ObjectRow {
+        row_id: format!(
+            "object:revision_proposal:revision_proposal_revision:{}",
+            proposal.proposal_revision_id
+        ),
+        row_kind: ObjectRowKind::Data,
+        row_class: Some(ObjectRowClass::Object),
+        object_family: Some(ObjectFamily::RevisionProposal),
+        object_kind: Some("revision_proposal_revision".into()),
+        object_id: Some(proposal.proposal_id.to_string()),
+        current_revision_id: Some(proposal.proposal_revision_id.to_string()),
+        lifecycle: Some(proposal.status.as_str().into()),
+        epistemic: Some("not_applicable".into()),
+        authority: Some("none".into()),
+        publication_state: None,
+        support_state: None,
+        project_id: None,
+        repository_id: None,
+        worktree_id: None,
+        task_id: None,
+        workstream_id: None,
+        session_id: None,
+        payload_json: Some(payload.canonical_json()?),
+        source_event_seq,
+        projection_generation: PROJECTION_GENERATION,
+    })
+}
+
+fn require_semantic_atom_row(row: &ObjectRow, atom: &Atom) -> Result<(), StoreError> {
+    let expected = semantic_atom_row(
+        atom,
+        &JournalPayload::AtomRecorded(Box::new(atom.clone())),
+        row.source_event_seq,
+    )?;
+    if row == &expected {
+        Ok(())
+    } else {
+        Err(StoreError::StoreCorrupt)
+    }
+}
+
+fn require_semantic_proposal_row(
+    row: &ObjectRow,
+    proposal: &RevisionProposal,
+) -> Result<(), StoreError> {
+    let expected = semantic_proposal_row(
+        proposal,
+        &JournalPayload::RevisionProposalRecorded(Box::new(proposal.clone())),
+        row.source_event_seq,
+    )?;
+    if row == &expected {
+        Ok(())
+    } else {
+        Err(StoreError::StoreCorrupt)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

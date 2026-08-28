@@ -13,7 +13,7 @@ use evertrace_domain::{
         RecoveryRequestStatus, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
         WorktreeTransition,
     },
-    semantic::ResultEvidence,
+    semantic::{Atom, ResultEvidence, RevisionProposal},
     work::{
         AdmissionFailureObservability, Attempt, CaptureReceipt, CompetingAttemptGroup,
         ExecutionLane, ExperimentRun, OperationBurst, SegmentationCorrection, Task, WorkArtifact,
@@ -519,6 +519,8 @@ pub enum JournalPayload {
     ExperimentRunRecorded(Box<ExperimentRun>),
     ResultEvidenceRecorded(Box<ResultEvidence>),
     WorkArtifactRecorded(Box<WorkArtifact>),
+    AtomRecorded(Box<Atom>),
+    RevisionProposalRecorded(Box<RevisionProposal>),
 }
 
 impl JournalPayload {
@@ -566,6 +568,8 @@ impl JournalPayload {
             Self::ExperimentRunRecorded(_) => "experiment_run_recorded_v1",
             Self::ResultEvidenceRecorded(_) => "result_evidence_recorded_v1",
             Self::WorkArtifactRecorded(_) => "work_artifact_recorded_v1",
+            Self::AtomRecorded(_) => "atom_recorded_v1",
+            Self::RevisionProposalRecorded(_) => "revision_proposal_recorded_v1",
         }
     }
 
@@ -603,7 +607,9 @@ impl JournalPayload {
             | Self::RecoveryApplicationRecorded(_) => RecordClass::ObjectEvent,
             Self::ExperimentRunRecorded(_)
             | Self::ResultEvidenceRecorded(_)
-            | Self::WorkArtifactRecorded(_) => RecordClass::ObjectEvent,
+            | Self::WorkArtifactRecorded(_)
+            | Self::AtomRecorded(_)
+            | Self::RevisionProposalRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -755,6 +761,10 @@ impl JournalPayload {
             Self::WorkArtifactRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
+            Self::AtomRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
+            Self::RevisionProposalRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
         }
     }
 
@@ -902,6 +912,10 @@ impl JournalPayload {
             Self::ExperimentRunRecorded(value) => tagged_json("experiment_run_recorded", value),
             Self::ResultEvidenceRecorded(value) => tagged_json("result_evidence_recorded", value),
             Self::WorkArtifactRecorded(value) => tagged_json("work_artifact_recorded", value),
+            Self::AtomRecorded(value) => tagged_json("atom_recorded", value),
+            Self::RevisionProposalRecorded(value) => {
+                tagged_json("revision_proposal_recorded", value)
+            }
         }
     }
 
@@ -1122,6 +1136,76 @@ fn validate_recovery_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
     Ok(())
 }
 
+fn validate_semantic_command(events: &[JournalEventDraft]) -> Result<(), StoreError> {
+    for (proposal_index, proposal) in
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match &event.payload {
+                JournalPayload::RevisionProposalRecorded(value)
+                    if value.status == evertrace_domain::semantic::ProposalStatus::Accepted =>
+                {
+                    Some((index, value.as_ref()))
+                }
+                _ => None,
+            })
+    {
+        let acceptance = proposal
+            .acceptance
+            .as_ref()
+            .ok_or(StoreError::InvalidInput)?;
+        let matching = events
+            .iter()
+            .enumerate()
+            .filter(|(atom_index, event)| {
+                *atom_index > proposal_index
+                    && matches!(
+                        &event.payload,
+                        JournalPayload::AtomRecorded(atom)
+                            if atom.atom_id == acceptance.accepted_atom_id
+                                && atom.revision_id == acceptance.accepted_atom_revision_id
+                                && atom.accepted_proposal_id == Some(proposal.proposal_id)
+                                && atom.accepted_proposal_revision_id
+                                    == Some(proposal.proposal_revision_id)
+                    )
+            })
+            .count();
+        if matching != 1 {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for atom in events.iter().filter_map(|event| match &event.payload {
+        JournalPayload::AtomRecorded(value) if value.accepted_proposal_revision_id.is_some() => {
+            Some(value.as_ref())
+        }
+        _ => None,
+    }) {
+        let (Some(proposal_id), Some(proposal_revision_id)) = (
+            atom.accepted_proposal_id,
+            atom.accepted_proposal_revision_id,
+        ) else {
+            return Err(StoreError::InvalidInput);
+        };
+        let matching = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    JournalPayload::RevisionProposalRecorded(proposal)
+                        if proposal.proposal_id == proposal_id
+                            && proposal.proposal_revision_id == proposal_revision_id
+                            && proposal.status
+                                == evertrace_domain::semantic::ProposalStatus::Accepted
+                )
+            })
+            .count();
+        if matching != 1 {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare_command(command: &JournalCommand) -> Result<PreparedCommand, StoreError> {
     let event_count = u16::try_from(command.events.len()).map_err(|_| StoreError::InvalidInput)?;
     if event_count == 0 {
@@ -1148,6 +1232,7 @@ pub(crate) fn prepare_command(command: &JournalCommand) -> Result<PreparedComman
     validate_normalization_command(&command.events)?;
     crate::repository::validate_repository_command(&command.events)?;
     validate_recovery_command(&command.events)?;
+    validate_semantic_command(&command.events)?;
     validate_work_identity_command(&command.events)?;
     let command_value = CanonicalValue::Map(vec![
         ("command_id".into(), text(&command.command_id.to_string())),

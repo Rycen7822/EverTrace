@@ -632,6 +632,40 @@ fn project_policy_requires_declared_loaded_current_readback_surface() {
 }
 
 #[test]
+fn project_policy_authority_requires_observed_host_canary_evidence() {
+    let evidence = probe_fixture::fixture("complete");
+    let live = report(&evidence);
+    assert_eq!(live.project_policy().result(), GateResult::Enabled);
+    assert!(
+        live.verify_project_policy_evidence(evidence.policy.as_ref().unwrap())
+            .is_ok()
+    );
+
+    for evidence_source in [
+        EvidenceSourceKind::SyntheticFixture,
+        EvidenceSourceKind::OfficialCodexHookContract,
+        EvidenceSourceKind::NoHostEvidence,
+    ] {
+        let mut context = synthetic_context();
+        context.evidence_source = evidence_source;
+        let report = HostProbeReport::evaluate(&context, &evidence).unwrap();
+        assert_eq!(report.project_policy().result(), GateResult::Disabled);
+        assert_eq!(
+            report.project_policy().reason(),
+            GateReason::TrustUnavailable
+        );
+        assert!(
+            report
+                .verify_project_policy_evidence(evidence.policy.as_ref().unwrap())
+                .is_err()
+        );
+        if evidence_source == EvidenceSourceKind::SyntheticFixture {
+            assert_eq!(report.capture().result(), GateResult::Enabled);
+        }
+    }
+}
+
+#[test]
 fn fixtures_and_packaging_are_content_free_minimal_inputs() {
     for name in ["empty", "complete"] {
         let text = probe_fixture::fixture_text(name);

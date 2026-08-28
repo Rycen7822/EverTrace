@@ -325,6 +325,8 @@ impl_new_v7!(
     OperationBurstId,
     ExperimentRunId,
     ResultEvidenceId,
+    AtomId,
+    RevisionProposalId,
     WorkArtifactId,
 );
 
