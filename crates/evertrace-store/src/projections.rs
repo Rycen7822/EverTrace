@@ -9,14 +9,14 @@ use evertrace_domain::{
     ids::{
         AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
         ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId,
-        OperationId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId, ResultEvidenceId,
-        ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId,
-        WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId, WorktreeSnapshotId,
-        WorktreeTransitionId,
+        OperationId, RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId,
+        RepositoryId, ResultEvidenceId, ScopeEffectId, SourceObservationId, SourceReceiptId,
+        TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
+        WorktreeSnapshotId, WorktreeTransitionId,
     },
     repository::{
-        IntegrationEvent, RecoveryBundle, RecoveryCaptureRequest, RepositoryInstance,
-        WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
+        IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
+        RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
     },
     semantic::ResultEvidence,
     work::{
@@ -192,6 +192,57 @@ impl ProjectionSnapshot {
                 }
             }
         }
+        Ok(ReconciliationFrontier {
+            frontier: self.frontier,
+            items,
+        })
+    }
+
+    pub fn reconciliation_frontier_for_observations(
+        &self,
+        observation_ids: &[SourceObservationId],
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        if observation_ids.is_empty()
+            || observation_ids.len() > 16
+            || observation_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != observation_ids.len()
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let selected = observation_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut items = Vec::new();
+        for row in self
+            .data_rows()
+            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
+        {
+            let payload = current_payload(row)?;
+            let JournalPayload::DirtyTarget(target) = &payload.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let target = target.clone();
+            if selected.contains(&target.target_id)
+                && matches!(
+                    target.target_kind,
+                    crate::command::DirtyTargetKind::PhysicalNormalization
+                        | crate::command::DirtyTargetKind::CaptureReconciliation
+                )
+                && let Some(item) = reconciliation_item(self, payload, target)?
+            {
+                items.push(item);
+            }
+        }
+        items.sort_by(|left, right| {
+            left.source_event_seq
+                .cmp(&right.source_event_seq)
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
         Ok(ReconciliationFrontier {
             frontier: self.frontier,
             items,
@@ -1144,6 +1195,7 @@ struct ReducerState {
     scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     normalization_watermarks: BTreeMap<SourceObservationId, (NormalizationWatermark, u64)>,
     execution_lanes: BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    execution_lane_revisions: BTreeMap<(ExecutionLaneId, u32), (ExecutionLane, u64)>,
     capture_receipts: BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
     capture_receipt_revisions:
         BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
@@ -1174,6 +1226,9 @@ struct ReducerState {
     recovery_request_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryCaptureRequest, u64)>,
     recovery_bundles: BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
+    recovery_applications: BTreeMap<RecoveryApplicationId, (RecoveryApplication, u64)>,
+    recovery_application_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryApplication, u64)>,
     experiment_runs: BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
     experiment_run_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (ExperimentRun, u64)>,
@@ -1242,6 +1297,7 @@ pub(crate) struct JournalAdmissionState {
     operation_revisions: BTreeMap<(OperationId, u32), (Operation, u64)>,
     scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     execution_lanes: BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    execution_lane_revisions: BTreeMap<(ExecutionLaneId, u32), (ExecutionLane, u64)>,
     capture_receipts: BTreeMap<ExecutionLaneId, (CaptureReceipt, u64)>,
     capture_receipt_revisions:
         BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
@@ -1272,6 +1328,9 @@ pub(crate) struct JournalAdmissionState {
     recovery_request_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryCaptureRequest, u64)>,
     recovery_bundles: BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
+    recovery_applications: BTreeMap<RecoveryApplicationId, (RecoveryApplication, u64)>,
+    recovery_application_revisions:
+        BTreeMap<evertrace_domain::revision::RevisionId, (RecoveryApplication, u64)>,
     experiment_runs: BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
     experiment_run_revisions:
         BTreeMap<evertrace_domain::revision::RevisionId, (ExperimentRun, u64)>,
@@ -1291,7 +1350,11 @@ impl JournalAdmissionState {
         Ok(state)
     }
 
-    pub(crate) fn apply_command(&self, command: &JournalCommand) -> Result<Self, StoreError> {
+    pub(crate) fn apply_command(
+        &self,
+        command: &JournalCommand,
+        first_seq: u64,
+    ) -> Result<Self, StoreError> {
         self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
@@ -1300,8 +1363,11 @@ impl JournalAdmissionState {
             command.events().iter().map(|event| &event.payload),
         )?;
         let mut next = self.clone();
-        for event in command.events() {
-            next.apply_payload(event.payload.clone(), 0)
+        for (offset, event) in command.events().iter().enumerate() {
+            let seq = first_seq
+                .checked_add(u64::try_from(offset).map_err(|_| StoreError::InvalidInput)?)
+                .ok_or(StoreError::InvalidInput)?;
+            next.apply_payload(event.payload.clone(), seq)
                 .map_err(|_| StoreError::InvalidInput)?;
         }
         next.validate_relations()
@@ -1486,7 +1552,15 @@ impl JournalAdmissionState {
                     .insert(value.scope_effect_id, (*value, seq));
             }
             JournalPayload::ExecutionLaneRecorded(value) => {
-                replace_lane(&mut self.execution_lanes, *value, seq)?;
+                let value = *value;
+                replace_lane(&mut self.execution_lanes, value.clone(), seq)?;
+                if self
+                    .execution_lane_revisions
+                    .insert((value.execution_lane_id, value.lane_revision), (value, seq))
+                    .is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
             JournalPayload::CaptureReceiptRecorded(value) => {
                 record_capture_receipt(
@@ -1568,6 +1642,13 @@ impl JournalAdmissionState {
             )?,
             JournalPayload::RecoveryBundleRecorded(value) => recovery::record_bundle(
                 &mut self.recovery_bundles,
+                *value,
+                seq,
+                StoreError::StoreCorrupt,
+            )?,
+            JournalPayload::RecoveryApplicationRecorded(value) => recovery::record_application(
+                &mut self.recovery_applications,
+                &mut self.recovery_application_revisions,
                 *value,
                 seq,
                 StoreError::StoreCorrupt,
@@ -1671,8 +1752,18 @@ impl JournalAdmissionState {
         recovery::validate_relations(recovery::RecoveryRelationInputs {
             requests: &self.recovery_requests,
             bundles: &self.recovery_bundles,
+            applications: &self.recovery_applications,
+            application_revisions: &self.recovery_application_revisions,
             worktrees: &self.worktrees,
             snapshots: &self.worktree_snapshots,
+            operation_revisions: &self.operation_revisions,
+            execution_lane_revisions: &self.execution_lane_revisions,
+            capture_receipt_revisions: &self.capture_receipt_revisions,
+            scope_effects: &self.scope_effects,
+            source_observations: &self.source_observations,
+            source_receipts: &self.source_receipts,
+            attempt_revisions: &self.attempt_revisions,
+            competing_group_revisions: &self.competing_group_revisions,
         })?;
         autoresearch::validate_relations(autoresearch::AutoresearchRelationInputs {
             runs: &self.experiment_runs,
@@ -2168,7 +2259,18 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
                 .insert(value.source_observation_id, (value, row.seq));
         }
         JournalPayload::ExecutionLaneRecorded(value) => {
-            replace_lane(&mut state.execution_lanes, *value, row.seq)?;
+            let value = *value;
+            replace_lane(&mut state.execution_lanes, value.clone(), row.seq)?;
+            if state
+                .execution_lane_revisions
+                .insert(
+                    (value.execution_lane_id, value.lane_revision),
+                    (value, row.seq),
+                )
+                .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
         }
         JournalPayload::CaptureReceiptRecorded(value) => {
             record_capture_receipt(
@@ -2262,6 +2364,13 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         )?,
         JournalPayload::RecoveryBundleRecorded(value) => recovery::record_bundle(
             &mut state.recovery_bundles,
+            *value,
+            row.seq,
+            StoreError::StoreCorrupt,
+        )?,
+        JournalPayload::RecoveryApplicationRecorded(value) => recovery::record_application(
+            &mut state.recovery_applications,
+            &mut state.recovery_application_revisions,
             *value,
             row.seq,
             StoreError::StoreCorrupt,
@@ -3186,6 +3295,11 @@ impl ReducerState {
             &self.recovery_request_revisions,
             StoreError::StoreCorrupt,
         )?;
+        recovery::rebuild_applications(
+            &mut self.recovery_applications,
+            &self.recovery_application_revisions,
+            StoreError::StoreCorrupt,
+        )?;
         autoresearch::rebuild_runs(&mut self.experiment_runs, &self.experiment_run_revisions)?;
         autoresearch::rebuild_results(&mut self.result_evidence, &self.result_evidence_revisions)?;
         autoresearch::rebuild_artifacts(&mut self.work_artifacts, &self.artifact_revisions)?;
@@ -3680,9 +3794,17 @@ impl ReducerState {
                     &value.execution_lane_id.to_string(),
                     &format!("{}@{}", value.execution_lane_id, value.lane_revision),
                 )?;
+                let duplicate_revision = self
+                    .execution_lane_revisions
+                    .insert(
+                        (value.execution_lane_id, value.lane_revision),
+                        (value.clone(), row.source_event_seq),
+                    )
+                    .is_some();
                 self.execution_lanes
                     .insert(value.execution_lane_id, (value, row.source_event_seq))
                     .is_some()
+                    || duplicate_revision
             }
             JournalPayload::CaptureReceiptRecorded(value) => {
                 let value = *value;
@@ -3859,6 +3981,23 @@ impl ReducerState {
                 recovery::record_bundle(
                     &mut self.recovery_bundles,
                     *value,
+                    row.source_event_seq,
+                    StoreError::StoreCorrupt,
+                )?;
+                false
+            }
+            JournalPayload::RecoveryApplicationRecorded(value) => {
+                let value = *value;
+                recovery::require_revision_row(
+                    row,
+                    "recovery_application_revision",
+                    &value.recovery_application_id.to_string(),
+                    &value.revision_id.to_string(),
+                )?;
+                recovery::record_application(
+                    &mut self.recovery_applications,
+                    &mut self.recovery_application_revisions,
+                    value,
                     row.source_event_seq,
                     StoreError::StoreCorrupt,
                 )?;
@@ -4382,6 +4521,7 @@ impl ReducerState {
         rows.extend(recovery::revision_rows(
             self.recovery_request_revisions,
             self.recovery_bundles,
+            self.recovery_application_revisions,
         )?);
         for (_revision_id, (value, seq)) in self.experiment_run_revisions {
             let mut row = work_identity_row(
@@ -4597,8 +4737,18 @@ impl ReducerState {
         recovery::validate_relations(recovery::RecoveryRelationInputs {
             requests: &self.recovery_requests,
             bundles: &self.recovery_bundles,
+            applications: &self.recovery_applications,
+            application_revisions: &self.recovery_application_revisions,
             worktrees: &self.worktrees,
             snapshots: &self.worktree_snapshots,
+            operation_revisions: &self.operation_revisions,
+            execution_lane_revisions: &self.execution_lane_revisions,
+            capture_receipt_revisions: &self.capture_receipt_revisions,
+            scope_effects: &self.scope_effects,
+            source_observations: &self.source_observations,
+            source_receipts: &self.source_receipts,
+            attempt_revisions: &self.attempt_revisions,
+            competing_group_revisions: &self.competing_group_revisions,
         })?;
         autoresearch::validate_relations(autoresearch::AutoresearchRelationInputs {
             runs: &self.experiment_runs,
@@ -4629,6 +4779,7 @@ impl ReducerState {
             operation_revisions: self.operation_revisions.clone(),
             scope_effects: self.scope_effects.clone(),
             execution_lanes: self.execution_lanes.clone(),
+            execution_lane_revisions: self.execution_lane_revisions.clone(),
             capture_receipts: self.capture_receipts.clone(),
             capture_receipt_revisions: self.capture_receipt_revisions.clone(),
             capture_gaps: self.capture_gaps.clone(),
@@ -4655,6 +4806,8 @@ impl ReducerState {
             recovery_requests: self.recovery_requests.clone(),
             recovery_request_revisions: self.recovery_request_revisions.clone(),
             recovery_bundles: self.recovery_bundles.clone(),
+            recovery_applications: self.recovery_applications.clone(),
+            recovery_application_revisions: self.recovery_application_revisions.clone(),
             experiment_runs: self.experiment_runs.clone(),
             experiment_run_revisions: self.experiment_run_revisions.clone(),
             result_evidence: self.result_evidence.clone(),

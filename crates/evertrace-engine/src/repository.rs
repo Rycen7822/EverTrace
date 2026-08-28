@@ -16,12 +16,13 @@ mod resolver;
 
 pub(crate) use git_probe::with_probe_deadline;
 pub use git_probe::{
-    AdminPathProbe, GIT_PROBE_SCHEMA_VERSION, GitOid, GitProbeEvidence, GitProbeOp,
-    HostTrustDecision, ProbeField, ProbeLimits, ProbeOmission, RecoveryGitCaptureEvidence,
-    RecoveryGitCaptureItem, RecoveryGitCaptureOmission, RepositoryProbeError, WorktreeAdminEntry,
-    probe_is_ancestor, probe_patch_equivalence, probe_recovery_capture,
-    probe_recovery_capture_scoped, probe_recovery_capture_scoped_pinned, probe_repository,
-    probe_repository_pinned, remote_fingerprint,
+    AdminPathProbe, AffectedPathGitProof, GIT_PROBE_SCHEMA_VERSION, GitAdminIdentity,
+    GitIndexEntryProof, GitOid, GitProbeEvidence, GitProbeOp, GitTreeEntryProof, HostTrustDecision,
+    ProbeField, ProbeLimits, ProbeOmission, RecoveryGitCaptureEvidence, RecoveryGitCaptureItem,
+    RecoveryGitCaptureOmission, RepositoryProbeError, WorktreeAdminEntry,
+    probe_affected_path_git_proof_pinned, probe_is_ancestor, probe_patch_equivalence,
+    probe_recovery_capture, probe_recovery_capture_scoped, probe_recovery_capture_scoped_pinned,
+    probe_repository, probe_repository_pinned, remote_fingerprint,
 };
 pub use integration::{IntegrationEvidence, resolve_integration};
 pub use resolver::{

@@ -1,5 +1,8 @@
 use evertrace_capture::{CasStore, DurableSpool, RuntimeSnapshot};
-use evertrace_domain::evidence::{SourceRevisionMode, SourceRole};
+use evertrace_domain::{
+    evidence::{SourceRevisionMode, SourceRole},
+    ids::SourceObservationId,
+};
 use evertrace_store::{
     DirtyTarget, DirtyTargetKind, EventScope, JournalCommand, JournalEventDraft, JournalPayload,
     SourceIngestWatermark, SourceKind, SourceRevisionRecorded,
@@ -47,6 +50,35 @@ impl EvidenceIngestor {
     }
 
     pub async fn drain_once(&self) -> Result<DrainProgress, IngestError> {
+        self.drain_selected(None).await
+    }
+
+    pub async fn drain_observations_once(
+        &self,
+        observation_ids: &[SourceObservationId],
+    ) -> Result<DrainProgress, IngestError> {
+        if observation_ids.is_empty()
+            || observation_ids.len() > 16
+            || observation_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != observation_ids.len()
+        {
+            return Err(IngestError::InvalidRecord);
+        }
+        let selected = observation_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.drain_selected(Some(&selected)).await
+    }
+
+    async fn drain_selected(
+        &self,
+        selected: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<DrainProgress, IngestError> {
         let cas = CasStore::open(self.snapshot.cas_dir.clone()).map_err(|_| IngestError::Cas)?;
         let (mut spool, recovery) = DurableSpool::open(
             self.snapshot.spool_dir.clone(),
@@ -55,19 +87,28 @@ impl EvidenceIngestor {
                 .map_err(|_| IngestError::Snapshot)?,
         )
         .map_err(|_| IngestError::Spool)?;
-        if recovery.repaired_tail_bytes != 0 || !recovery.gaps.is_empty() {
+        if recovery.repaired_tail_bytes != 0 || selected.is_none() && !recovery.gaps.is_empty() {
             return Err(IngestError::Recovering);
         }
         spool
             .seal_active(self.snapshot.generation)
             .map_err(|_| IngestError::Spool)?;
+        let segment_limit = match selected {
+            Some(_) => {
+                usize::try_from(self.snapshot.max_main_files).map_err(|_| IngestError::Snapshot)?
+            }
+            None => MAX_SEGMENTS_PER_DRAIN,
+        };
         let segments = spool
-            .sealed_segments(MAX_SEGMENTS_PER_DRAIN)
+            .sealed_segments(segment_limit)
             .map_err(|_| IngestError::Spool)?;
         let mut progress = DrainProgress::default();
         for segment in segments {
             let mut committed = 0_usize;
             for frame in segment.frames() {
+                if selected.is_some_and(|ids| !ids.contains(&frame.record.source_observation_id)) {
+                    continue;
+                }
                 let verified = verify_capture_frame(frame, &cas)?;
                 let surface_count = usize::from(verified.surface.is_some());
                 let recorded_at_us = verified.body.recorded_at_us;
@@ -82,11 +123,15 @@ impl EvidenceIngestor {
                 progress.replayed_frames += usize::from(outcome.replayed);
                 progress.projected_surfaces += surface_count;
             }
-            self.writer.project().await.map_err(map_writer_error)?;
-            spool
-                .acknowledge_segment(segment, committed)
-                .map_err(|_| IngestError::Acknowledgement)?;
-            progress.sealed_segments += 1;
+            if committed != 0 {
+                self.writer.project().await.map_err(map_writer_error)?;
+            }
+            if selected.is_none() || committed == segment.frames().len() {
+                spool
+                    .acknowledge_segment(segment, committed)
+                    .map_err(|_| IngestError::Acknowledgement)?;
+                progress.sealed_segments += 1;
+            }
         }
         Ok(progress)
     }

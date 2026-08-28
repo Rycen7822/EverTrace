@@ -33,9 +33,12 @@ pub struct RecoveryTerminalAck {
 pub struct RecoveryBarrierService {
     snapshot: evertrace_capture::RuntimeSnapshot,
     writer: crate::WriterHandle,
-    fenced: std::sync::Arc<
-        std::sync::Mutex<std::collections::BTreeSet<evertrace_domain::ids::WorktreeId>>,
-    >,
+    fence: RecoveryMutationFence,
+}
+
+#[derive(Clone, Default)]
+pub struct RecoveryMutationFence {
+    fenced: Arc<Mutex<BTreeSet<evertrace_domain::ids::WorktreeId>>>,
 }
 
 pub(super) struct RecoveryFenceLease {
@@ -51,6 +54,7 @@ struct CaptureAndCommitContext<'a> {
     protected_target_paths: Vec<std::path::PathBuf>,
     repository_view: &'a evertrace_store::repository::RepositoryCurrentView,
     recovery_view: &'a RecoveryCurrentView,
+    attempt_view: &'a evertrace_store::projections::AttemptCurrentView,
     attempt_anchor_ids: Vec<evertrace_domain::ids::AttemptId>,
     artifact_refs: Vec<String>,
     config_and_run_refs: Vec<String>,
@@ -77,6 +81,15 @@ impl RecoveryFenceLease {
             fenced,
             worktree_id,
         })
+    }
+}
+
+impl RecoveryMutationFence {
+    pub(super) fn acquire(
+        &self,
+        worktree_id: evertrace_domain::ids::WorktreeId,
+    ) -> Result<RecoveryFenceLease, RecoveryError> {
+        RecoveryFenceLease::acquire(Arc::clone(&self.fenced), worktree_id)
     }
 }
 
@@ -135,8 +148,12 @@ impl RecoveryBarrierService {
         Self {
             snapshot,
             writer,
-            fenced: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
+            fence: RecoveryMutationFence::default(),
         }
+    }
+
+    pub fn mutation_fence(&self) -> RecoveryMutationFence {
+        self.fence.clone()
     }
 
     pub async fn handle(
@@ -297,10 +314,7 @@ impl RecoveryBarrierService {
             return Err(RecoveryError::NotAdmitted);
         }
         let target_worktree = target_worktree[0];
-        let admission_lease = RecoveryFenceLease::acquire(
-            Arc::clone(&self.fenced),
-            target_worktree.worktree_instance_id,
-        )?;
+        let admission_lease = self.fence.acquire(target_worktree.worktree_instance_id)?;
         let limits = self.probe_limits(deadline)?;
         let probe_path = target_path.clone();
         let untracked_scope = if preliminary.destructive_class
@@ -453,46 +467,24 @@ impl RecoveryBarrierService {
                 evertrace_store::repository::RepositoryCurrentView::from_snapshot(&projected)?;
             let attempt_view =
                 evertrace_store::projections::AttemptCurrentView::from_snapshot(&projected)?;
-            let relevant_attempts = attempt_view
+            let attempt_anchor_ids = attempt_view
                 .attempts
                 .values()
                 .filter(|attempt| {
-                    attempt
-                        .worktree_instance_ids
-                        .contains(&request.worktree_instance_id)
+                    attempt.repository_instance_id == Some(request.repository_instance_id)
+                        && attempt
+                            .worktree_instance_ids
+                            .contains(&request.worktree_instance_id)
+                        && attempt.lifecycle_status
+                            == evertrace_domain::work::AttemptLifecycleStatus::Active
+                        && matches!(
+                            attempt.execution_status,
+                            evertrace_domain::work::AttemptExecutionStatus::Proposed
+                                | evertrace_domain::work::AttemptExecutionStatus::Active
+                                | evertrace_domain::work::AttemptExecutionStatus::Interrupted
+                        )
                 })
-                .collect::<Vec<_>>();
-            let attempt_anchor_ids = relevant_attempts
-                .iter()
                 .map(|attempt| attempt.attempt_id)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let config_and_run_refs = relevant_attempts
-                .iter()
-                .flat_map(|attempt| attempt.experiment_run_ids.iter())
-                .map(|id| format!("experiment_run:{id}"))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let artifact_refs = relevant_attempts
-                .iter()
-                .flat_map(|attempt| {
-                    attempt
-                        .local_outcome_refs
-                        .iter()
-                        .chain(&attempt.outcome_refs)
-                })
-                .filter_map(|reference| {
-                    reference
-                        .strip_prefix("artifact:")
-                        .and_then(|value| {
-                            evertrace_domain::ids::WorkArtifactId::from_str(value).ok()
-                        })
-                        .map(|id| format!("artifact:{id}"))
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
                 .collect::<Vec<_>>();
             let worktree = repository_view
                 .worktrees
@@ -511,9 +503,10 @@ impl RecoveryBarrierService {
                 protected_target_paths,
                 repository_view: &repository_view,
                 recovery_view: &recovery_view,
+                attempt_view: &attempt_view,
                 attempt_anchor_ids,
-                artifact_refs,
-                config_and_run_refs,
+                artifact_refs: Vec::new(),
+                config_and_run_refs: Vec::new(),
                 frontier: projected.frontier,
                 cas: &cas,
                 deadline,
@@ -653,6 +646,7 @@ impl RecoveryBarrierService {
             protected_target_paths,
             repository_view,
             recovery_view,
+            attempt_view,
             attempt_anchor_ids,
             artifact_refs,
             config_and_run_refs,
@@ -668,9 +662,10 @@ impl RecoveryBarrierService {
         let adapter_manifest_id = adapter_manifest_id.to_owned();
         let target_path = target_path.to_path_buf();
         let repository_view = repository_view.clone();
+        let attempt_view = attempt_view.clone();
         let cas = cas.clone();
         let (mut prepared, _lease, pinned_root) = tokio::task::spawn_blocking(move || {
-            let prepared = crate::repository::with_probe_deadline(deadline.0, || {
+            let mut prepared = crate::repository::with_probe_deadline(deadline.0, || {
                 prepare_capture(PrepareCaptureContext {
                     runtime: &snapshot_config,
                     locator: &locator_owned,
@@ -687,6 +682,15 @@ impl RecoveryBarrierService {
                     deadline,
                 })
             })?;
+            attach_attempt_anchor_claims(
+                &mut prepared,
+                &attempt_view,
+                &pending_owned,
+                &pinned_root,
+                &cas,
+                &snapshot_config,
+                deadline,
+            );
             Ok::<_, RecoveryError>((prepared, lease, pinned_root))
         })
         .await
@@ -749,6 +753,123 @@ impl RecoveryBarrierService {
         let result = ack(durable, locator.pending_revision_id);
         drop(pinned_root);
         result
+    }
+}
+
+fn attach_attempt_anchor_claims(
+    prepared: &mut super::capture::PreparedRecoveryCapture,
+    attempts: &evertrace_store::projections::AttemptCurrentView,
+    pending: &RecoveryCaptureRequest,
+    pinned_root: &evertrace_capture::ConfinedRoot,
+    cas: &CasStore,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    deadline: RecoveryDeadline,
+) {
+    let (Some(snapshot), Some(bundle)) = (&prepared.snapshot, &mut prepared.bundle) else {
+        return;
+    };
+    if snapshot.capture_status != evertrace_domain::repository::SnapshotCaptureStatus::Complete
+        || !bundle.is_exact_patch_only_anchor_shape()
+        || bundle.attempt_anchor_ids.is_empty()
+    {
+        return;
+    }
+    let diff = &bundle.tracked_diff_blob_refs[0];
+    if diff.payload.redaction_spans != 0 || diff.payload.protected_secret_digest.is_some() {
+        return;
+    }
+    let Ok(digest) = evertrace_capture::CasDigest::from_str(&diff.payload.cas_ref) else {
+        return;
+    };
+    let Ok(patch) = cas.read(&digest) else {
+        return;
+    };
+    let Some(relative_path) = super::patch::strict_patch_target(&patch) else {
+        return;
+    };
+    let Ok(file) = pinned_root.read_after_owned_mutation(
+        &relative_path,
+        evertrace_capture::ConfinedReadLimits {
+            single_file_remaining: runtime.recovery_max_bundle_bytes,
+            untracked_total_remaining: runtime.recovery_max_bundle_bytes,
+            bundle_remaining: runtime.recovery_max_bundle_bytes,
+            deadline: deadline.0,
+        },
+    ) else {
+        return;
+    };
+    let Ok(key) = evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir.clone()).load()
+    else {
+        return;
+    };
+    #[cfg(unix)]
+    let raw_path = {
+        use std::os::unix::ffi::OsStrExt;
+        relative_path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let raw_path = relative_path.to_string_lossy().as_bytes();
+    let Ok(protected_path) = evertrace_capture::protect(raw_path, &key) else {
+        return;
+    };
+    let Ok(path_ref) = super::bundle::protected_ref(&protected_path, cas) else {
+        return;
+    };
+    let Some(captured_bytes) = bundle
+        .captured_bytes
+        .checked_add(path_ref.protected_length)
+        .filter(|value| *value <= runtime.recovery_max_bundle_bytes)
+    else {
+        return;
+    };
+    let identity = evertrace_domain::repository::RecoveryConfinedFileIdentity {
+        device: file.identity.device,
+        inode: file.identity.inode,
+        size: file.identity.size,
+        mtime_seconds: file.identity.mtime_seconds,
+        mtime_nanoseconds: file.identity.mtime_nanoseconds,
+        ctime_seconds: file.identity.ctime_seconds,
+        ctime_nanoseconds: file.identity.ctime_nanoseconds,
+    };
+    let mut claims = Vec::new();
+    for attempt_id in &bundle.attempt_anchor_ids {
+        let Some(attempt) = attempts.attempts.get(attempt_id) else {
+            continue;
+        };
+        let mut competing_groups = Vec::new();
+        let mut complete = true;
+        for group_id in &attempt.competing_group_ids {
+            let Some(group) = attempts
+                .competing_groups
+                .get(group_id)
+                .filter(|group| group.member_attempt_ids.contains(attempt_id))
+            else {
+                complete = false;
+                break;
+            };
+            competing_groups.push(evertrace_domain::repository::RecoveryCompetingGroupClaim {
+                competing_group_id: *group_id,
+                revision_id: group.revision_id,
+                resolution_status: group.resolution_status,
+            });
+        }
+        if complete {
+            claims.push(evertrace_domain::repository::RecoveryAttemptAnchorClaim {
+                attempt_id: *attempt_id,
+                attempt_revision_id: attempt.revision_id,
+                strategy_contract_fingerprint: attempt.strategy_contract_fingerprint,
+                source_repository_instance_id: pending.repository_instance_id,
+                source_worktree_instance_id: pending.worktree_instance_id,
+                source_snapshot_id: snapshot.worktree_snapshot_id,
+                affected_relative_path: path_ref.clone(),
+                source_file_identity: identity,
+                competing_groups,
+            });
+        }
+    }
+    if !claims.is_empty() && claims.iter().all(|claim| claim.validate().is_ok()) {
+        bundle.attempt_anchor_claims = claims;
+        bundle.captured_bytes = captured_bytes;
     }
 }
 

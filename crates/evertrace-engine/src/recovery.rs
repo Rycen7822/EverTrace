@@ -1,6 +1,4 @@
-//! S16 deterministic destructive classification and recovery orchestration.
-//!
-//! This module never applies a bundle and never executes a mutating command.
+//! Deterministic destructive classification, capture, and supervised recovery.
 
 use evertrace_domain::repository::{RecoveryOmission, WorktreeSnapshot};
 use evertrace_store::StoreError;
@@ -218,11 +216,16 @@ impl From<StoreError> for RecoveryError {
     }
 }
 
+mod action;
 mod application;
 mod barrier;
 mod bundle;
 mod capture;
+mod patch;
 
+pub use action::{
+    RecoveryActionOutcome, RecoveryActionService, RecoveryRequest, RecoveryUnsupportedReason,
+};
 pub use application::{
     RECOVERY_APPLICATION_TICKET_VERSION, RecoveryApplicationTicket,
     RecoveryApplicationTicketClaims, RecoveryTicketIssueRequest, RecoveryTicketService,

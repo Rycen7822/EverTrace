@@ -1,6 +1,6 @@
 use evertrace_domain::{
-    ids::{RecoveryBundleId, RecoveryCaptureRequestId, RequestId},
-    repository::RecoveryRequestStatus,
+    ids::{RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId, RequestId},
+    repository::{RecoveryApplicationStatus, RecoveryRequestStatus},
     revision::RevisionId,
 };
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,43 @@ pub struct ResponseEnvelope {
 pub enum Response {
     Health(HealthResponse),
     RecoveryTerminal(RecoveryTerminalResponse),
+    RecoveryAction(RecoveryActionResponse),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryUnsupportedReason {
+    UnsupportedApplicationKind,
+    AmbiguousPatchContent,
+    UnsupportedPatchShape,
+    RedactedContent,
+    IncompleteBundle,
+    TargetUnavailable,
+    PatchPreflightFailed,
+    PhysicalPreflightUnavailable,
+    PhysicalPreflightRaced,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryActionResponse {
+    pub recovery_application_id: Option<RecoveryApplicationId>,
+    pub application_status: Option<RecoveryApplicationStatus>,
+    pub replayed: bool,
+    pub unsupported_reason: Option<RecoveryUnsupportedReason>,
+}
+
+impl RecoveryActionResponse {
+    pub fn validate(&self) -> bool {
+        let supported = self.recovery_application_id.is_some()
+            && self.application_status.is_some()
+            && self.unsupported_reason.is_none();
+        let unsupported = self.recovery_application_id.is_none()
+            && self.application_status.is_none()
+            && self.unsupported_reason.is_some()
+            && !self.replayed;
+        supported || unsupported
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

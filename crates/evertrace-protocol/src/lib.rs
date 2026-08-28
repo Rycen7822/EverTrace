@@ -41,7 +41,7 @@ use handshake::{HandshakeAck, valid_build_id};
 #[cfg(feature = "runtime")]
 use notification::{Notification, NotificationEnvelope};
 #[cfg(feature = "runtime")]
-use response::{HealthResponse, Response};
+use response::{HealthResponse, RecoveryActionResponse, Response};
 #[cfg(feature = "runtime")]
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -130,10 +130,11 @@ impl LocalServer {
     where
         F: Fn() -> Result<HealthResponse, ErrorCode> + Send + Sync + 'static,
     {
-        self.run_dispatch(shutdown, move |command| {
+        self.run_dispatch(shutdown, move |_request_id, command| {
             std::future::ready(match command {
                 Command::Health => health_handler().map(Response::Health),
                 Command::RecoveryBarrier(_) => Err(ErrorCode::InvalidInput),
+                Command::RequestRecovery(_) => Err(ErrorCode::InvalidInput),
             })
         })
         .await
@@ -145,7 +146,7 @@ impl LocalServer {
         command_handler: F,
     ) -> Result<(), ProtocolError>
     where
-        F: Fn(Command) -> Fut + Send + Sync + 'static,
+        F: Fn(evertrace_domain::ids::RequestId, Command) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Response, ErrorCode>> + Send + 'static,
     {
         let semaphore = Arc::new(Semaphore::new(self.options.connection_limit.max(1)));
@@ -239,7 +240,7 @@ async fn handle_connection<F, Fut>(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ProtocolError>
 where
-    F: Fn(Command) -> Fut + ?Sized,
+    F: Fn(evertrace_domain::ids::RequestId, Command) -> Fut + ?Sized,
     Fut: std::future::Future<Output = Result<Response, ErrorCode>> + Send,
 {
     let first = match read_frame::<ClientEnvelope>(
@@ -368,7 +369,7 @@ where
                 .await;
                 continue;
             }
-            let dispatched = match command_handler(command.command).await {
+            let dispatched = match command_handler(command.request_id, command.command).await {
                 Ok(value) => value,
                 Err(code) => {
                     let _ = send_wire_error(
@@ -475,7 +476,78 @@ pub async fn request_health(
         ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
             Response::Health(health) if valid_health(&health) => Ok(health),
             Response::Health(_) => Err(ProtocolError::InvalidHealth),
-            Response::RecoveryTerminal(_) => Err(ProtocolError::UnexpectedMessage),
+            Response::RecoveryTerminal(_) | Response::RecoveryAction(_) => {
+                Err(ProtocolError::UnexpectedMessage)
+            }
+        },
+        ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
+        ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
+            Err(ProtocolError::Wire(error.code))
+        }
+        ServerEnvelope::Error(_) => Err(ProtocolError::RequestIdMismatch),
+        _ => Err(ProtocolError::UnexpectedMessage),
+    }
+}
+
+#[cfg(feature = "runtime")]
+pub async fn request_recovery(
+    socket_path: &Path,
+    build_id: impl Into<String>,
+    request_id: evertrace_domain::ids::RequestId,
+    request: command::RequestRecoveryCommand,
+    frame_timeout: Duration,
+) -> Result<RecoveryActionResponse, ProtocolError> {
+    let build_id = build_id.into();
+    if !valid_build_id(&build_id) {
+        return Err(ProtocolError::InvalidBuildId);
+    }
+    let mut stream = timeout(frame_timeout, UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| ProtocolError::Timeout)?
+        .map_err(ProtocolError::Connect)?;
+    write_frame(
+        &mut stream,
+        &ClientEnvelope::Handshake(handshake::Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            client_kind: dto::ClientKind::Cli,
+            build_id,
+            max_frame: MAX_FRAME_SIZE as u32,
+        }),
+        MAX_FRAME_SIZE,
+        frame_timeout,
+    )
+    .await?;
+    let negotiated_max =
+        match read_frame::<ServerEnvelope>(&mut stream, MAX_FRAME_SIZE, frame_timeout).await? {
+            ServerEnvelope::HandshakeAck(ack)
+                if ack.protocol_version == PROTOCOL_VERSION
+                    && ack.max_frame != 0
+                    && ack.max_frame <= MAX_FRAME_SIZE as u32
+                    && valid_build_id(&ack.build_id) =>
+            {
+                ack.max_frame as usize
+            }
+            ServerEnvelope::HandshakeAck(_) => return Err(ProtocolError::InvalidNegotiation),
+            ServerEnvelope::Error(error) => return Err(ProtocolError::Wire(error.code)),
+            _ => return Err(ProtocolError::UnexpectedMessage),
+        };
+    write_frame(
+        &mut stream,
+        &ClientEnvelope::Command(command::CommandEnvelope {
+            request_id,
+            command: Command::RequestRecovery(request),
+        }),
+        negotiated_max,
+        frame_timeout,
+    )
+    .await?;
+    match read_frame::<ServerEnvelope>(&mut stream, negotiated_max, frame_timeout).await? {
+        ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
+            Response::RecoveryAction(response) if response.validate() => Ok(response),
+            Response::RecoveryAction(_) => Err(ProtocolError::InvalidRecoveryAction),
+            Response::Health(_) | Response::RecoveryTerminal(_) => {
+                Err(ProtocolError::UnexpectedMessage)
+            }
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {

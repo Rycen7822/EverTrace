@@ -81,6 +81,8 @@ pub struct ConfinedRoot {
     fd: OwnedFd,
     locator: PathBuf,
     identity: ConfinedFileIdentity,
+    owner: u32,
+    mode: u32,
 }
 
 impl ConfinedRoot {
@@ -100,6 +102,54 @@ impl ConfinedRoot {
             fd,
             locator,
             identity: identity(&stat)?,
+            owner: stat.st_uid,
+            mode: stat.st_mode,
+        })
+    }
+
+    /// Opens a recovery mutation root only when the locator itself is a
+    /// directory (not a symlink), is owned by the daemon user, and is not
+    /// writable by group or other users. The returned descriptor remains the
+    /// authority for all subsequent child cwd and probe operations.
+    pub fn open_owned_private(root: &Path) -> Result<Self, ConfinedReadError> {
+        if !root.is_absolute() {
+            return Err(ConfinedReadError::InvalidPath);
+        }
+        let fd = open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ConfinedReadError::Io)?;
+        let opened = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+        let entry =
+            statat(CWD, root, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ConfinedReadError::Io)?;
+        let process_fd = open(
+            "/proc/self",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ConfinedReadError::Io)?;
+        let process = fstat(&process_fd).map_err(|_| ConfinedReadError::Io)?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
+            || FileType::from_raw_mode(entry.st_mode) != FileType::Directory
+            || opened.st_dev != entry.st_dev
+            || opened.st_ino != entry.st_ino
+            || opened.st_uid != entry.st_uid
+            || opened.st_mode != entry.st_mode
+            || opened.st_uid != process.st_uid
+            || entry.st_uid != process.st_uid
+            || opened.st_mode & 0o022 != 0
+            || entry.st_mode & 0o022 != 0
+        {
+            return Err(ConfinedReadError::UnsupportedType);
+        }
+        Ok(Self {
+            fd,
+            locator: root.to_path_buf(),
+            identity: identity(&opened)?,
+            owner: opened.st_uid,
+            mode: opened.st_mode,
         })
     }
 
@@ -108,7 +158,17 @@ impl ConfinedRoot {
         relative: &Path,
         limits: ConfinedReadLimits,
     ) -> Result<ConfinedFile, ConfinedReadError> {
-        self.read_impl(relative, limits, || {})
+        self.read_impl(relative, limits, true, || {})
+    }
+
+    /// Reads through the already-pinned root after the supervised mutation
+    /// may legitimately have changed directory timestamps.
+    pub fn read_after_owned_mutation(
+        &self,
+        relative: &Path,
+        limits: ConfinedReadLimits,
+    ) -> Result<ConfinedFile, ConfinedReadError> {
+        self.read_impl(relative, limits, false, || {})
     }
 
     pub const fn identity(&self) -> ConfinedFileIdentity {
@@ -126,7 +186,7 @@ impl ConfinedRoot {
             self.fd.as_raw_fd()
         ));
         let stat = statat(CWD, &path, AtFlags::empty()).map_err(|_| ConfinedReadError::Io)?;
-        if identity(&stat)? != self.identity {
+        if !self.matches_root(&stat)? {
             return Err(ConfinedReadError::Changed);
         }
         Ok(path)
@@ -139,13 +199,14 @@ impl ConfinedRoot {
         limits: ConfinedReadLimits,
         before_read: impl FnOnce(),
     ) -> Result<ConfinedFile, ConfinedReadError> {
-        self.read_impl(relative, limits, before_read)
+        self.read_impl(relative, limits, true, before_read)
     }
 
     fn read_impl(
         &self,
         relative: &Path,
         limits: ConfinedReadLimits,
+        strict_root: bool,
         before_read: impl FnOnce(),
     ) -> Result<ConfinedFile, ConfinedReadError> {
         check_deadline(limits.deadline)?;
@@ -248,7 +309,11 @@ impl ConfinedRoot {
                 return Err(ConfinedReadError::Changed);
             }
         }
-        self.revalidate()?;
+        if strict_root {
+            self.revalidate()?;
+        } else {
+            self.revalidate_stable()?;
+        }
         Ok(ConfinedFile {
             bytes,
             identity: before_identity,
@@ -258,10 +323,34 @@ impl ConfinedRoot {
     pub fn revalidate(&self) -> Result<(), ConfinedReadError> {
         let current = statat(CWD, &self.locator, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ConfinedReadError::Io)?;
-        if identity(&current)? != self.identity {
+        let opened = fstat(&self.fd).map_err(|_| ConfinedReadError::Io)?;
+        if !self.matches_original_root(&current)? || !self.matches_original_root(&opened)? {
             return Err(ConfinedReadError::Changed);
         }
         Ok(())
+    }
+
+    pub fn revalidate_stable(&self) -> Result<(), ConfinedReadError> {
+        let current = statat(CWD, &self.locator, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ConfinedReadError::Io)?;
+        let opened = fstat(&self.fd).map_err(|_| ConfinedReadError::Io)?;
+        if !self.matches_root(&current)? || !self.matches_root(&opened)? {
+            return Err(ConfinedReadError::Changed);
+        }
+        Ok(())
+    }
+
+    fn matches_original_root(&self, stat: &Stat) -> Result<bool, ConfinedReadError> {
+        Ok(self.matches_root(stat)? && identity(stat)? == self.identity)
+    }
+
+    fn matches_root(&self, stat: &Stat) -> Result<bool, ConfinedReadError> {
+        let current = identity(stat)?;
+        Ok(FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+            && current.device == self.identity.device
+            && current.inode == self.identity.inode
+            && stat.st_uid == self.owner
+            && stat.st_mode == self.mode)
     }
 }
 
@@ -487,6 +576,43 @@ mod tests {
             confined.read(Path::new("file"), limits(32)),
             Err(ConfinedReadError::Changed)
         );
+        std::fs::remove_dir_all(root).expect("cleanup replacement");
+        std::fs::remove_dir_all(displaced).expect("cleanup original");
+    }
+
+    #[test]
+    fn owned_private_root_preserves_the_absolute_nofollow_locator_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root();
+        let confined = ConfinedRoot::open_owned_private(&root).expect("open owned private root");
+        let displaced = root.with_extension("owned-displaced");
+        std::fs::rename(&root, &displaced).expect("displace root");
+        std::fs::create_dir(&root).expect("replacement root");
+        assert_eq!(
+            confined.revalidate_stable(),
+            Err(ConfinedReadError::Changed)
+        );
+
+        let symlink_root = root.with_extension("owned-symlink");
+        symlink(&root, &symlink_root).expect("root symlink");
+        assert!(ConfinedRoot::open_owned_private(&symlink_root).is_err());
+        assert_eq!(
+            ConfinedRoot::open_owned_private(Path::new("relative-root")).err(),
+            Some(ConfinedReadError::InvalidPath)
+        );
+
+        let public_root = root.with_extension("owned-public");
+        std::fs::create_dir(&public_root).expect("public root");
+        std::fs::set_permissions(&public_root, std::fs::Permissions::from_mode(0o770))
+            .expect("public permissions");
+        assert_eq!(
+            ConfinedRoot::open_owned_private(&public_root).err(),
+            Some(ConfinedReadError::UnsupportedType)
+        );
+
+        std::fs::remove_file(symlink_root).expect("cleanup symlink");
+        std::fs::remove_dir_all(public_root).expect("cleanup public root");
         std::fs::remove_dir_all(root).expect("cleanup replacement");
         std::fs::remove_dir_all(displaced).expect("cleanup original");
     }

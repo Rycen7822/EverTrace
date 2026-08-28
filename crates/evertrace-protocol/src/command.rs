@@ -1,5 +1,6 @@
 use evertrace_domain::{
-    ids::{RecoveryCaptureRequestId, RequestId},
+    ids::{RecoveryBundleId, RecoveryCaptureRequestId, RequestId, WorktreeId},
+    repository::RecoveryApplicationKind,
     revision::RevisionId,
 };
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,15 @@ pub struct CommandEnvelope {
 pub enum Command {
     Health,
     RecoveryBarrier(RecoveryBarrierLocator),
+    RequestRecovery(RequestRecoveryCommand),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestRecoveryCommand {
+    pub recovery_bundle_id: RecoveryBundleId,
+    pub target_worktree_instance_id: WorktreeId,
+    pub application_kind: RecoveryApplicationKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
