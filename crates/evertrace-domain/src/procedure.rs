@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod usage;
+pub use usage::*;
+
 use crate::{
     config::PromotionLevel,
     ids::{ProcedureId, RepositoryId, WorktreeId},
@@ -252,6 +255,7 @@ pub enum ProcedureStateReason {
     SupportRestored,
     ObjectiveSuccesses,
     IrConflict,
+    SuspectedHarm,
     ConfirmedHarm,
     EvidenceInvalidated,
     ContractInvalidated,

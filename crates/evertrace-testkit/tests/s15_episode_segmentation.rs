@@ -1200,6 +1200,16 @@ async fn exact_replay_cannot_advance_journal_or_object_projection() {
         SegmentOutcome::NoDelta
     );
     assert_eq!(writer.project().await.unwrap(), after_commit);
+    let occurrence_id = occurrence.host_occurrence_id;
+    let first_occurrence_seq = after_commit
+        .rows
+        .iter()
+        .find(|row| {
+            row.object_kind.as_deref() == Some("host_occurrence")
+                && row.object_id.as_deref() == Some(occurrence_id.to_string().as_str())
+        })
+        .unwrap()
+        .source_event_seq;
 
     let mut operation_successor = operation;
     operation_successor.previous_operation_revision = Some(operation_successor.operation_revision);
@@ -1218,6 +1228,19 @@ async fn exact_replay_cannot_advance_journal_or_object_projection() {
         .await
         .unwrap();
     let next_projection = writer.project().await.unwrap();
+    assert_eq!(
+        next_projection
+            .rows
+            .iter()
+            .find(|row| {
+                row.object_kind.as_deref() == Some("host_occurrence")
+                    && row.object_id.as_deref() == Some(occurrence_id.to_string().as_str())
+            })
+            .unwrap()
+            .source_event_seq,
+        first_occurrence_seq
+    );
+    assert_eq!(next_projection, writer.full_projection().await.unwrap());
     assert_eq!(
         next_projection
             .rows

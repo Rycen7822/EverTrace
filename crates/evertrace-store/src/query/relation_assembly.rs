@@ -375,6 +375,27 @@ pub(super) fn add_semantic(
             }
             SemanticRelationKind::ProcedureRevisionSuccessor => "procedure_revision_successor",
             SemanticRelationKind::ProcedureSupportsRevision => "procedure_supports_revision",
+            SemanticRelationKind::ProcedureUsageToRevision => "procedure_usage_to_revision",
+            SemanticRelationKind::ProcedureUsageToTask => "procedure_usage_to_task",
+            SemanticRelationKind::ProcedureUsageToWorkstream => "procedure_usage_to_workstream",
+            SemanticRelationKind::ProcedureUsageToExposureEpisode => {
+                "procedure_usage_to_exposure_episode"
+            }
+            SemanticRelationKind::ProcedureUsageToAttempt => "procedure_usage_to_attempt",
+            SemanticRelationKind::ProcedureUsageToActionOperation => {
+                "procedure_usage_to_action_operation"
+            }
+            SemanticRelationKind::ProcedureUsageToVerificationOperation => {
+                "procedure_usage_to_verification_operation"
+            }
+            SemanticRelationKind::ProcedureUsageToBindingRevision => {
+                "procedure_usage_to_binding_revision"
+            }
+            SemanticRelationKind::ProcedureUsageToScopeEffect => "procedure_usage_to_scope_effect",
+            SemanticRelationKind::ProcedureNegativeToUsage => "procedure_negative_to_usage",
+            SemanticRelationKind::ProcedureNegativeToRevision => "procedure_negative_to_revision",
+            SemanticRelationKind::ProcedureNegativeToTask => "procedure_negative_to_task",
+            SemanticRelationKind::ProcedureReviewToNegative => "procedure_review_to_negative",
         };
         out.insert(RelationProjectionRow::edge(
             kind,
