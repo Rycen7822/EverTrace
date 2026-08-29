@@ -113,6 +113,16 @@ fn allowlisted_object_text(payload: &JournalPayload) -> Option<(Vec<String>, i64
             safe_artifact_fields(&value.revision.logical_name, &value.revision.media_type),
             value.revision.created_at_us,
         )),
+        JournalPayload::ScenarioRecorded(value) => {
+            let mut text = vec![value.goal.clone()];
+            text.extend(value.current_state.iter().cloned());
+            text.extend(value.open_loops.iter().cloned());
+            text.extend(value.completed_outcomes.iter().cloned());
+            Some((text, 0))
+        }
+        JournalPayload::CoreMembershipRecorded(_)
+        | JournalPayload::GlobalSupportContractRecorded(_)
+        | JournalPayload::GlobalSupportValidationRecorded(_) => Some((Vec::new(), 0)),
         _ => None,
     }
 }

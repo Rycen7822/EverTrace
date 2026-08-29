@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use evertrace_domain::semantic::{Atom, ProposalStatus, ProposalTargetId, RevisionProposal};
+use evertrace_domain::semantic::{
+    Atom, CoreMembership, GlobalSuccessorSupportContract, ProposalStatus, ProposalTargetId,
+    RevisionProposal,
+};
 
 use crate::StoreError;
 
@@ -15,6 +18,69 @@ pub enum SemanticRelationKind {
     ProposalReviewedRevision,
     ProposalTargetsAtom,
     ProposalAcceptedAtomRevision,
+    CoreMembershipToAtomRevision,
+    CoreMembershipSuccessor,
+    SupportContractSupportsRevision,
+    SupportContractAuthorizesRevision,
+}
+
+pub fn build_core_support_relation_rows(
+    memberships: &[CoreMembership],
+    contracts: &[GlobalSuccessorSupportContract],
+) -> Result<Vec<SemanticRelationRow>, StoreError> {
+    let membership_revisions = memberships
+        .iter()
+        .map(|value| value.membership_revision_id)
+        .collect::<BTreeSet<_>>();
+    let contract_ids = contracts
+        .iter()
+        .map(|value| value.support_contract_revision_id)
+        .collect::<BTreeSet<_>>();
+    if membership_revisions.len() != memberships.len() || contract_ids.len() != contracts.len() {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut rows = BTreeSet::new();
+    for membership in memberships {
+        membership
+            .validate()
+            .map_err(|_| StoreError::InvalidInput)?;
+        if !contract_ids.contains(&membership.support_contract_ref) {
+            return Err(StoreError::InvalidInput);
+        }
+        rows.insert(SemanticRelationRow {
+            kind: SemanticRelationKind::CoreMembershipToAtomRevision,
+            source_id: membership.membership_revision_id.to_string(),
+            target_id: membership.atom_revision_id.to_string(),
+        });
+        if let Some(parent) = membership.supersedes_membership_revision_id {
+            if !membership_revisions.contains(&parent) {
+                return Err(StoreError::InvalidInput);
+            }
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::CoreMembershipSuccessor,
+                source_id: membership.membership_revision_id.to_string(),
+                target_id: parent.to_string(),
+            });
+        }
+    }
+    for contract in contracts {
+        contract.validate().map_err(|_| StoreError::InvalidInput)?;
+        for revision in &contract.support_revision_refs {
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::SupportContractSupportsRevision,
+                source_id: contract.support_contract_revision_id.to_string(),
+                target_id: revision.to_string(),
+            });
+        }
+        for revision in &contract.authorization_revision_refs {
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::SupportContractAuthorizesRevision,
+                source_id: contract.support_contract_revision_id.to_string(),
+                target_id: revision.to_string(),
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -126,13 +192,15 @@ pub fn build_semantic_relation_rows(
                 proposal.proposal_revision_id,
                 acceptance.reviewed_proposal_revision_id,
             );
-            require_target(&atom_revisions, acceptance.accepted_atom_revision_id)?;
-            insert(
-                &mut rows,
-                SemanticRelationKind::ProposalAcceptedAtomRevision,
-                proposal.proposal_revision_id,
-                acceptance.accepted_atom_revision_id,
-            );
+            if let Some((_, accepted_atom_revision_id, _)) = acceptance.accepted_atom() {
+                require_target(&atom_revisions, accepted_atom_revision_id)?;
+                insert(
+                    &mut rows,
+                    SemanticRelationKind::ProposalAcceptedAtomRevision,
+                    proposal.proposal_revision_id,
+                    accepted_atom_revision_id,
+                );
+            }
         }
     }
     Ok(rows.into_iter().collect())

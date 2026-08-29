@@ -59,7 +59,13 @@ impl FutureCueCompiler {
                     .current_revision_id
                     .clone()
                     .ok_or(StoreError::StoreCorrupt)?;
-                Ok((revision, row.source_event_seq))
+                Ok((
+                    revision,
+                    (
+                        row.source_event_seq,
+                        row.support_state.as_deref() == Some("valid"),
+                    ),
+                ))
             })
             .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
         let mut contracts = Vec::new();
@@ -70,11 +76,11 @@ impl FutureCueCompiler {
             .filter(|atom| atom.kind.is_normative())
         {
             let source_revision_id = atom.revision_id.to_string();
-            let watermark = source_rows
+            let (watermark, global_support_valid) = source_rows
                 .get(&source_revision_id)
                 .copied()
                 .ok_or(StoreError::StoreCorrupt)?;
-            match compile_atom_future_cue(atom, true, watermark) {
+            match compile_atom_future_cue(atom, true, global_support_valid, watermark) {
                 Ok(contract) => contracts.push(contract),
                 Err(diagnostic) => diagnostics.push(FutureCueCompilationDiagnostic {
                     source_revision_id,
@@ -114,7 +120,8 @@ impl RecallTriggerIndex {
         let mut by_id = BTreeMap::<[u8; 32], RecallTriggerEntry>::new();
         let mut sources = BTreeSet::new();
         for source in contexts.iter().flat_map(|context| context.atoms.iter()) {
-            let Ok(contract) = compile_atom_future_cue(&source.atom, true, source.source_event_seq)
+            let Ok(contract) =
+                compile_atom_future_cue(&source.atom, true, true, source.source_event_seq)
             else {
                 continue;
             };
@@ -268,6 +275,9 @@ fn row_scope(row: &evertrace_store::ObjectRow) -> Result<AtomScope, StoreError> 
             repository_instance_id: RepositoryId::from_str(repository)
                 .map_err(|_| StoreError::StoreCorrupt)?,
         }),
+        (None, None, None) if row.support_state.as_deref() == Some("valid") => {
+            Ok(AtomScope::Global)
+        }
         _ => Err(StoreError::StoreCorrupt),
     }
 }

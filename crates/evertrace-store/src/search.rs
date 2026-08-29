@@ -493,6 +493,10 @@ impl SearchProjectionRow {
                             | "experiment_run"
                             | "result_evidence"
                             | "work_artifact"
+                            | "scenario"
+                            | "core_membership"
+                            | "global_support_contract"
+                            | "global_support_validation"
                     )
                 )
                 || !matches!(self.currentness.as_deref(), Some("current" | "historical"))
@@ -727,6 +731,10 @@ pub(crate) fn search_batch(rows: &[SearchProjectionRow]) -> Result<RecordBatch, 
 }
 
 pub async fn read_search_rows(table: &Table) -> Result<Vec<SearchProjectionRow>, StoreError> {
+    table
+        .checkout_latest()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
     let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
     if schema.as_ref() != search_schema().as_ref() {
         return Err(StoreError::StoreCorrupt);

@@ -2,7 +2,7 @@ mod deterministic;
 mod executor;
 
 pub use deterministic::{
-    JobResultDisposition, RecoveryAction, classify_job_result, expired_leases, pending_dirty,
-    pending_outbox,
+    JobResultDisposition, RecoveryAction, SupportClosureAction, classify_job_result,
+    expired_leases, pending_dirty, pending_outbox, support_closure_result,
 };
 pub use executor::{WriterActorError, WriterHandle, open_writer, spawn_writer};

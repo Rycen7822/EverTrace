@@ -210,6 +210,10 @@ pub(crate) async fn validate_objects_table(table: &Table) -> Result<Vec<ObjectRo
 }
 
 pub async fn read_object_rows(table: &Table) -> Result<Vec<ObjectRow>, StoreError> {
+    table
+        .checkout_latest()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
     let batches = collect_batches(&table.query())
         .await
         .map_err(|_| StoreError::LanceDb)?;

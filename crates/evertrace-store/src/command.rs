@@ -14,7 +14,10 @@ use evertrace_domain::{
         RecoveryRequestStatus, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
         WorktreeTransition,
     },
-    semantic::{Atom, ResultEvidence, RevisionProposal},
+    semantic::{
+        Atom, CoreMembership, GlobalSuccessorSupportContract, GlobalSupportValidationEvent,
+        ResultEvidence, RevisionProposal, Scenario,
+    },
     work::{
         AdmissionFailureObservability, Attempt, CaptureReceipt, CompetingAttemptGroup,
         ExecutionLane, ExperimentRun, OperationBurst, SegmentationCorrection, Task, WorkArtifact,
@@ -523,6 +526,10 @@ pub enum JournalPayload {
     WorkArtifactRecorded(Box<WorkArtifact>),
     AtomRecorded(Box<Atom>),
     RevisionProposalRecorded(Box<RevisionProposal>),
+    ScenarioRecorded(Box<Scenario>),
+    CoreMembershipRecorded(Box<CoreMembership>),
+    GlobalSupportContractRecorded(Box<GlobalSuccessorSupportContract>),
+    GlobalSupportValidationRecorded(Box<GlobalSupportValidationEvent>),
     RecallLedgerRecorded(Box<RecallLedgerEvent>),
 }
 
@@ -573,6 +580,10 @@ impl JournalPayload {
             Self::WorkArtifactRecorded(_) => "work_artifact_recorded_v1",
             Self::AtomRecorded(_) => ATOM_RECORDED_EVENT_TYPE,
             Self::RevisionProposalRecorded(_) => "revision_proposal_recorded_v1",
+            Self::ScenarioRecorded(_) => "scenario_recorded_v1",
+            Self::CoreMembershipRecorded(_) => "core_membership_recorded_v1",
+            Self::GlobalSupportContractRecorded(_) => "global_support_contract_recorded_v1",
+            Self::GlobalSupportValidationRecorded(_) => "global_support_validation_recorded_v1",
             Self::RecallLedgerRecorded(_) => "recall_ledger_recorded_v1",
         }
     }
@@ -614,6 +625,10 @@ impl JournalPayload {
             | Self::WorkArtifactRecorded(_)
             | Self::AtomRecorded(_)
             | Self::RevisionProposalRecorded(_)
+            | Self::ScenarioRecorded(_)
+            | Self::CoreMembershipRecorded(_)
+            | Self::GlobalSupportContractRecorded(_)
+            | Self::GlobalSupportValidationRecorded(_)
             | Self::RecallLedgerRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
@@ -768,6 +783,16 @@ impl JournalPayload {
             }
             Self::AtomRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
             Self::RevisionProposalRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::ScenarioRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
+            Self::CoreMembershipRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::GlobalSupportContractRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::GlobalSupportValidationRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::RecallLedgerRecorded(value) => {
@@ -927,6 +952,14 @@ impl JournalPayload {
             Self::AtomRecorded(value) => tagged_json("atom_recorded", value),
             Self::RevisionProposalRecorded(value) => {
                 tagged_json("revision_proposal_recorded", value)
+            }
+            Self::ScenarioRecorded(value) => tagged_json("scenario_recorded", value),
+            Self::CoreMembershipRecorded(value) => tagged_json("core_membership_recorded", value),
+            Self::GlobalSupportContractRecorded(value) => {
+                tagged_json("global_support_contract_recorded", value)
+            }
+            Self::GlobalSupportValidationRecorded(value) => {
+                tagged_json("global_support_validation_recorded", value)
             }
             Self::RecallLedgerRecorded(value) => tagged_json("recall_ledger_recorded", value),
         }
@@ -1167,23 +1200,161 @@ fn validate_semantic_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
             .acceptance
             .as_ref()
             .ok_or(StoreError::InvalidInput)?;
-        let matching = events
-            .iter()
-            .enumerate()
-            .filter(|(atom_index, event)| {
-                *atom_index > proposal_index
-                    && matches!(
-                        &event.payload,
-                        JournalPayload::AtomRecorded(atom)
-                            if atom.atom_id == acceptance.accepted_atom_id
-                                && atom.revision_id == acceptance.accepted_atom_revision_id
+        let (successor_ref, expected_support_refs, expected_contract_ref) =
+            match acceptance.accepted_target {
+                evertrace_domain::semantic::AcceptedProposalTarget::Atom {
+                    atom_id,
+                    atom_revision_id,
+                    ..
+                } => {
+                    let matching_atoms = events
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, event)| {
+                            if index > proposal_index
+                                && let JournalPayload::AtomRecorded(atom) = &event.payload
+                                && atom.atom_id == atom_id
+                                && atom.revision_id == atom_revision_id
                                 && atom.accepted_proposal_id == Some(proposal.proposal_id)
                                 && atom.accepted_proposal_revision_id
                                     == Some(proposal.proposal_revision_id)
+                            {
+                                Some(atom.as_ref())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let [atom] = matching_atoms.as_slice() else {
+                        return Err(StoreError::InvalidInput);
+                    };
+                    (
+                        atom_revision_id.to_string(),
+                        matches!(atom.scope, evertrace_domain::semantic::AtomScope::Global)
+                            .then(|| atom.supports_revision_refs.clone()),
+                        None,
                     )
+                }
+                evertrace_domain::semantic::AcceptedProposalTarget::CoreMembership {
+                    core_membership_id,
+                    membership_revision_id,
+                } => {
+                    let matching = events
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, event)| match &event.payload {
+                            JournalPayload::CoreMembershipRecorded(value)
+                                if index > proposal_index
+                                    && value.core_membership_id == core_membership_id
+                                    && value.membership_revision_id == membership_revision_id
+                                    && value.created_by_acceptance_ref
+                                        == proposal.proposal_revision_id
+                                    && value.authorization_revision_refs
+                                        == vec![proposal.proposal_revision_id] =>
+                            {
+                                Some(value.as_ref())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let [membership] = matching.as_slice() else {
+                        return Err(StoreError::InvalidInput);
+                    };
+                    (
+                        membership_revision_id.to_string(),
+                        Some(vec![membership.atom_revision_id]),
+                        Some(membership.support_contract_ref),
+                    )
+                }
+            };
+        let Some(expected_support_refs) = expected_support_refs else {
+            continue;
+        };
+        let contracts = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                JournalPayload::GlobalSupportContractRecorded(value)
+                    if value.successor_revision_or_membership_ref == successor_ref =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
             })
-            .count();
-        if matching != 1 {
+            .collect::<Vec<_>>();
+        let [contract] = contracts.as_slice() else {
+            return Err(StoreError::InvalidInput);
+        };
+        let validations = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                JournalPayload::GlobalSupportValidationRecorded(value)
+                    if value.support_contract_ref == contract.support_contract_revision_id
+                        && value.successor_ref == successor_ref
+                        && value.dependency_generation == 1
+                        && value.state == evertrace_domain::semantic::GlobalSupportState::Valid =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [validation] = validations.as_slice() else {
+            return Err(StoreError::InvalidInput);
+        };
+        if contract.support_revision_refs != expected_support_refs
+            || expected_contract_ref
+                .is_some_and(|expected| contract.support_contract_revision_id != expected)
+            || contract.authorization_revision_refs != vec![proposal.proposal_revision_id]
+            || contract.promotion_proposal_revision_id != proposal.proposal_revision_id
+            || validation.surviving_support_refs != contract.support_revision_refs
+            || !validation.invalid_or_missing_refs.is_empty()
+            || validation.provenance_degraded
+            || !validation.trigger_refs.is_empty()
+            || validation.validator_revision != contract.promotion_validator_revision
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let matching_dirty = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                JournalPayload::DirtyTarget(value)
+                    if value.target_kind == DirtyTargetKind::RuntimeJob
+                        && value.target_id == contract.support_contract_revision_id.to_string()
+                        && value.source_watermark == 1 =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [dirty] = matching_dirty.as_slice() else {
+            return Err(StoreError::InvalidInput);
+        };
+        if events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload, JournalPayload::OutboxEnqueued(value) if &value.dirty == *dirty)
+            })
+            .count()
+            != 1
+        {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for contract in events.iter().filter_map(|event| match &event.payload {
+        JournalPayload::GlobalSupportContractRecorded(value) => Some(value.as_ref()),
+        _ => None,
+    }) {
+        if events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload, JournalPayload::RevisionProposalRecorded(proposal)
+                    if proposal.proposal_revision_id == contract.promotion_proposal_revision_id
+                        && proposal.status == evertrace_domain::semantic::ProposalStatus::Accepted)
+            })
+            .count()
+            != 1
+        {
             return Err(StoreError::InvalidInput);
         }
     }

@@ -52,6 +52,7 @@ mod recall_ledger;
 #[path = "recall_projection.rs"]
 mod recall_projection;
 mod recovery;
+mod s23;
 mod segmentation;
 mod semantic;
 pub use autoresearch::AutoresearchCurrentView;
@@ -79,6 +80,10 @@ pub fn recall_need(
     row: &ObjectRow,
 ) -> Result<Option<evertrace_domain::recall::RecallNeed>, StoreError> {
     recall_ledger::need(row)
+}
+
+pub(crate) fn l3_core_projection(row: &ObjectRow) -> Result<bool, StoreError> {
+    s23::S23State::restore_projection(row)
 }
 
 const PROJECTION_GENERATION: u64 = 1;
@@ -1283,6 +1288,7 @@ struct ReducerState {
     proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
     recall_ledger: recall_ledger::RecallLedgerState,
+    s23: s23::S23State,
 }
 
 #[derive(Clone, Debug)]
@@ -1390,6 +1396,7 @@ pub(crate) struct JournalAdmissionState {
     proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
     recall_ledger: recall_ledger::RecallLedgerState,
+    s23: s23::S23State,
 }
 
 fn recall_scope_matches(
@@ -1584,6 +1591,7 @@ impl JournalAdmissionState {
                         (atom.lifecycle_status
                             == evertrace_domain::semantic::AtomLifecycleStatus::Active
                             && atom.kind.is_normative()
+                            && self.s23.atom_support_eligible(atom.revision_id)
                             && recall_scope_matches(&atom.scope, episode))
                         .then_some(RecallCurrentAtom {
                             atom: atom.clone(),
@@ -2013,6 +2021,12 @@ impl JournalAdmissionState {
                 seq,
                 StoreError::StoreCorrupt,
             )?,
+            payload @ (JournalPayload::ScenarioRecorded(_)
+            | JournalPayload::CoreMembershipRecorded(_)
+            | JournalPayload::GlobalSupportContractRecorded(_)
+            | JournalPayload::GlobalSupportValidationRecorded(_)) => {
+                self.s23.apply(payload, seq)?;
+            }
             JournalPayload::RecallLedgerRecorded(value) => {
                 self.recall_ledger.apply(*value, seq)?;
             }
@@ -2825,6 +2839,12 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             row.seq,
             StoreError::StoreCorrupt,
         )?,
+        payload @ (JournalPayload::ScenarioRecorded(_)
+        | JournalPayload::CoreMembershipRecorded(_)
+        | JournalPayload::GlobalSupportContractRecorded(_)
+        | JournalPayload::GlobalSupportValidationRecorded(_)) => {
+            state.s23.apply(payload, row.seq)?;
+        }
         JournalPayload::RecallLedgerRecorded(value) => {
             state.recall_ledger.apply(*value, row.seq)?;
         }
@@ -3737,6 +3757,7 @@ impl ReducerState {
         autoresearch::rebuild_artifacts(&mut self.work_artifacts, &self.artifact_revisions)?;
         semantic::rebuild_atoms(&mut self.atoms, &self.atom_revisions)?;
         semantic::rebuild_proposals(&mut self.proposals, &self.proposal_revisions)?;
+        self.s23.rebuild()?;
         Ok(())
     }
 
@@ -3764,6 +3785,9 @@ impl ReducerState {
                 return Err(StoreError::StoreCorrupt);
             }
             if recall_projection::contract(row)?.is_some() {
+                continue;
+            }
+            if s23::S23State::restore_projection(row)? {
                 continue;
             }
             if let Some(need) = recall_ledger::need(row)? {
@@ -4531,6 +4555,13 @@ impl ReducerState {
                     .insert(value.proposal_revision_id, (value, row.source_event_seq))
                     .is_some()
             }
+            payload @ (JournalPayload::ScenarioRecorded(_)
+            | JournalPayload::CoreMembershipRecorded(_)
+            | JournalPayload::GlobalSupportContractRecorded(_)
+            | JournalPayload::GlobalSupportValidationRecorded(_)) => {
+                self.s23.restore(payload, row.source_event_seq)?;
+                false
+            }
             JournalPayload::RecallLedgerRecorded(_) => return Err(StoreError::StoreCorrupt),
         };
         if duplicate {
@@ -4549,8 +4580,11 @@ impl ReducerState {
 
     fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
         let mut rows = Vec::new();
-        rows.extend(recall_projection::rows(&self.atoms)?);
+        rows.extend(recall_projection::rows(&self.atoms, |atom| {
+            self.s23.atom_support_eligible(atom.revision_id)
+        })?);
         rows.extend(self.recall_ledger.clone().rows(PROJECTION_GENERATION)?);
+        rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
         for (migration, (payload, seq)) in self.migrations {
             rows.push(runtime_row(
                 format!("projection:migration:{migration}"),
@@ -5049,11 +5083,16 @@ impl ReducerState {
             rows.push(row);
         }
         for (_revision_id, (value, seq)) in self.atom_revisions {
-            rows.push(semantic_atom_row(
+            let mut row = semantic_atom_row(
                 &value,
                 &JournalPayload::AtomRecorded(Box::new(value.clone())),
                 seq,
-            )?);
+            )?;
+            row.support_state = self
+                .s23
+                .atom_support_state(value.revision_id)
+                .map(str::to_owned);
+            rows.push(row);
         }
         for (_revision_id, (value, seq)) in self.proposal_revisions {
             rows.push(semantic_proposal_row(
@@ -5066,6 +5105,8 @@ impl ReducerState {
     }
 
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
+        self.s23
+            .validate(&self.atom_revisions, &self.proposal_revisions)?;
         let source_ranges = current_source_ranges(&self.source_receipts)?;
         validate_capture_relations(
             &self.execution_lanes,
@@ -5303,6 +5344,7 @@ impl ReducerState {
             proposals: self.proposals.clone(),
             proposal_revisions: self.proposal_revisions.clone(),
             recall_ledger: self.recall_ledger.clone(),
+            s23: self.s23.clone(),
         })
     }
 }
@@ -5624,11 +5666,19 @@ fn semantic_proposal_row(
 }
 
 fn require_semantic_atom_row(row: &ObjectRow, atom: &Atom) -> Result<(), StoreError> {
-    let expected = semantic_atom_row(
+    let mut expected = semantic_atom_row(
         atom,
         &JournalPayload::AtomRecorded(Box::new(atom.clone())),
         row.source_event_seq,
     )?;
+    if row.support_state.as_deref().is_some_and(|value| {
+        matches!(
+            value,
+            "valid" | "revalidation_pending" | "insufficient" | "invalidated"
+        )
+    }) {
+        expected.support_state = row.support_state.clone();
+    }
     if row == &expected {
         Ok(())
     } else {
@@ -5788,7 +5838,7 @@ impl ProjectionWorker {
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
             }
-            self.commit_rows(&expected.rows, true).await?;
+            self.commit_rows(&expected.rows, true, true).await?;
             let persisted = validate_objects_table(&self.objects).await?;
             if persisted != expected.rows {
                 return Err(StoreError::Projection);
@@ -5804,9 +5854,16 @@ impl ProjectionWorker {
                 rows: current,
             });
         }
-        let reconcile_recall = delta
-            .iter()
-            .any(|row| row.event_type == ATOM_RECORDED_EVENT_TYPE);
+        let reconcile_core = delta.iter().any(|row| {
+            matches!(
+                row.event_type.as_str(),
+                ATOM_RECORDED_EVENT_TYPE
+                    | "core_membership_recorded_v1"
+                    | "global_support_contract_recorded_v1"
+                    | "global_support_validation_recorded_v1"
+            )
+        });
+        let reconcile_recall = reconcile_core;
         let mut admission = state.admission_state()?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
@@ -5820,11 +5877,13 @@ impl ProjectionWorker {
             .iter()
             .map(|row| (row.row_id.as_str(), row))
             .collect::<BTreeMap<_, _>>();
-        let changed = incremental_changed_rows(&expected, &current_by_id, reconcile_recall);
+        let changed =
+            incremental_changed_rows(&expected, &current_by_id, reconcile_recall, reconcile_core);
         if inject_before_commit_failure {
             return Err(StoreError::Projection);
         }
-        self.commit_rows(&changed, reconcile_recall).await?;
+        self.commit_rows(&changed, reconcile_recall, reconcile_core)
+            .await?;
         let persisted = validate_objects_table(&self.objects).await?;
         let persisted_snapshot = ProjectionSnapshot {
             frontier: expected.frontier,
@@ -5849,6 +5908,7 @@ impl ProjectionWorker {
         &self,
         rows: &[ObjectRow],
         reconcile_recall: bool,
+        reconcile_core: bool,
     ) -> Result<(), StoreError> {
         let batch = objects_batch(rows)?;
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
@@ -5857,11 +5917,18 @@ impl ProjectionWorker {
         let mut merge = self.objects.merge_insert(&["row_id"]);
         merge.when_matched_update_all(None);
         merge.when_not_matched_insert_all();
-        if reconcile_recall {
-            merge.when_not_matched_by_source_delete(Some(format!(
-                "object_kind = '{}'",
-                recall_projection::RECALL_TRIGGER_INDEX_KIND
-            )));
+        if reconcile_recall || reconcile_core {
+            let mut predicates = Vec::new();
+            if reconcile_recall {
+                predicates.push(format!(
+                    "object_kind = '{}'",
+                    recall_projection::RECALL_TRIGGER_INDEX_KIND
+                ));
+            }
+            if reconcile_core {
+                predicates.push(format!("object_kind = '{}'", s23::CORE_PROJECTION_KIND));
+            }
+            merge.when_not_matched_by_source_delete(Some(predicates.join(" OR ")));
         }
         merge
             .execute(reader)
@@ -5875,6 +5942,7 @@ fn incremental_changed_rows(
     expected: &ProjectionSnapshot,
     current_by_id: &BTreeMap<&str, &ObjectRow>,
     reconcile_recall: bool,
+    reconcile_core: bool,
 ) -> Vec<ObjectRow> {
     expected
         .rows
@@ -5884,6 +5952,7 @@ fn incremental_changed_rows(
                 || reconcile_recall
                     && row.object_kind.as_deref()
                         == Some(recall_projection::RECALL_TRIGGER_INDEX_KIND)
+                || reconcile_core && row.object_kind.as_deref() == Some(s23::CORE_PROJECTION_KIND)
                 || current_by_id.get(row.row_id.as_str()).copied() != Some(*row)
         })
         .cloned()
@@ -5970,11 +6039,11 @@ mod tests {
         };
 
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, false),
+            incremental_changed_rows(&expected, &current_by_id, false, false),
             vec![expected.rows[0].clone()]
         );
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, true),
+            incremental_changed_rows(&expected, &current_by_id, true, false),
             expected.rows
         );
     }
@@ -6715,6 +6784,7 @@ mod tests {
             .commit_rows(
                 &[ObjectRow::checkpoint(10_000, PROJECTION_GENERATION)],
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -6760,7 +6830,10 @@ mod tests {
             .canonical_json()
             .unwrap(),
         );
-        worker.commit_rows(&[migration], false).await.unwrap();
+        worker
+            .commit_rows(&[migration], false, false)
+            .await
+            .unwrap();
         assert!(matches!(
             worker.catch_up().await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
@@ -6822,7 +6895,11 @@ mod tests {
             .unwrap();
         let worker = ProjectionWorker::new(journal, objects);
         worker
-            .commit_rows(&[ObjectRow::checkpoint(3, PROJECTION_GENERATION)], false)
+            .commit_rows(
+                &[ObjectRow::checkpoint(3, PROJECTION_GENERATION)],
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));

@@ -1,3 +1,7 @@
+use evertrace_domain::{
+    revision::RevisionId,
+    semantic::{GlobalSuccessorSupportContract, GlobalSupportState, GlobalSupportValidationEvent},
+};
 use evertrace_store::{
     DirtyTarget, DurableJob, JobStatus, JournalPayload, ObjectRow, ObjectRowKind, OutboxEntry,
     StaleGenerationAudit, StoreError,
@@ -13,6 +17,86 @@ pub struct RecoveryAction {
 pub enum JobResultDisposition {
     Apply,
     StaleAudit(StaleGenerationAudit),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupportClosureAction {
+    pub disposition: JobResultDisposition,
+    pub validation: Option<GlobalSupportValidationEvent>,
+}
+
+pub fn support_closure_result(
+    job: &DurableJob,
+    contract: &GlobalSuccessorSupportContract,
+    current: &GlobalSupportValidationEvent,
+    mut surviving_support_refs: Vec<RevisionId>,
+    mut invalid_or_missing_refs: Vec<RevisionId>,
+    authorization_current: bool,
+    occurred_at_us: i64,
+) -> Result<SupportClosureAction, StoreError> {
+    if job.kind != "support_closure"
+        || job.target_revision != current.successor_ref
+        || current.support_contract_ref != contract.support_contract_revision_id
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let disposition = classify_job_result(job, current.dependency_generation);
+    if matches!(disposition, JobResultDisposition::StaleAudit(_)) {
+        return Ok(SupportClosureAction {
+            disposition,
+            validation: None,
+        });
+    }
+    surviving_support_refs.sort();
+    surviving_support_refs.dedup();
+    invalid_or_missing_refs.sort();
+    invalid_or_missing_refs.dedup();
+    if surviving_support_refs
+        .iter()
+        .any(|value| invalid_or_missing_refs.contains(value))
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut partition = surviving_support_refs.clone();
+    partition.extend(invalid_or_missing_refs.iter().copied());
+    partition.sort();
+    if partition != contract.support_revision_refs {
+        return Err(StoreError::InvalidInput);
+    }
+    let support_sufficient = surviving_support_refs.len()
+        >= usize::from(
+            contract
+                .support_threshold_snapshot
+                .minimum_surviving_support,
+        );
+    let authorization_satisfied =
+        !contract.support_threshold_snapshot.require_authorization || authorization_current;
+    let validation = GlobalSupportValidationEvent {
+        validation_revision_id: RevisionId::new_v7(),
+        support_contract_ref: current.support_contract_ref,
+        successor_ref: current.successor_ref.clone(),
+        dependency_generation: current.dependency_generation,
+        state: if support_sufficient && authorization_satisfied {
+            GlobalSupportState::Valid
+        } else if !authorization_satisfied {
+            GlobalSupportState::Invalidated
+        } else {
+            GlobalSupportState::Insufficient
+        },
+        provenance_degraded: !invalid_or_missing_refs.is_empty(),
+        surviving_support_refs,
+        invalid_or_missing_refs,
+        trigger_refs: vec![job.idempotency_key.clone()],
+        validator_revision: 1,
+        created_at_us: occurred_at_us,
+    };
+    validation
+        .validate()
+        .map_err(|_| StoreError::InvalidInput)?;
+    Ok(SupportClosureAction {
+        disposition,
+        validation: Some(validation),
+    })
 }
 
 pub fn expired_leases(
@@ -127,7 +211,10 @@ fn data_rows_at_frontier(
 mod tests {
     use std::str::FromStr;
 
-    use evertrace_domain::ids::JobId;
+    use evertrace_domain::{
+        ids::JobId,
+        semantic::{GlobalSupportState, SupportThresholdSnapshot},
+    };
     use evertrace_store::ObjectRowClass;
 
     use super::*;
@@ -193,5 +280,158 @@ mod tests {
                 observed_generation: 8,
             })
         );
+    }
+
+    #[test]
+    fn support_closure_never_allows_a_stale_generation_to_restore_pending() {
+        let support = RevisionId::new_v7();
+        let authorization = RevisionId::new_v7();
+        let contract_id = RevisionId::new_v7();
+        let contract = GlobalSuccessorSupportContract {
+            support_contract_revision_id: contract_id,
+            successor_revision_or_membership_ref: "coremem:01890f47-6a4a-7cc1-98b9-01890f476a4b"
+                .into(),
+            support_revision_refs: vec![support],
+            authorization_revision_refs: vec![authorization],
+            evidence_cohort_hash: [1; 32],
+            support_threshold_snapshot: SupportThresholdSnapshot {
+                minimum_surviving_support: 1,
+                require_authorization: true,
+            },
+            promotion_proposal_revision_id: RevisionId::new_v7(),
+            promotion_validator_revision: 1,
+            applicability_contract_hash: [2; 32],
+            created_at_us: 1,
+        };
+        let pending = GlobalSupportValidationEvent {
+            validation_revision_id: RevisionId::new_v7(),
+            support_contract_ref: contract_id,
+            successor_ref: contract.successor_revision_or_membership_ref.clone(),
+            dependency_generation: 2,
+            state: GlobalSupportState::RevalidationPending,
+            provenance_degraded: false,
+            surviving_support_refs: vec![support],
+            invalid_or_missing_refs: Vec::new(),
+            trigger_refs: vec!["dependency:changed".into()],
+            validator_revision: 1,
+            created_at_us: 2,
+        };
+        let job = DurableJob {
+            job_id: JobId::new_v7(),
+            idempotency_key: "support:closure:2".into(),
+            target_revision: pending.successor_ref.clone(),
+            target_watermark: 2,
+            target_generation: 2,
+            kind: "support_closure".into(),
+            priority: 0,
+            state: JobStatus::Queued,
+            attempt: 0,
+            backoff_until_us: None,
+            config_hash: [3; 32],
+            lease_until_us: None,
+        };
+        let applied = support_closure_result(
+            &job,
+            &contract,
+            &pending,
+            vec![support],
+            Vec::new(),
+            true,
+            3,
+        )
+        .unwrap();
+        let validation = applied.validation.unwrap();
+        assert_eq!(validation.dependency_generation, 2);
+        assert_eq!(validation.state, GlobalSupportState::Valid);
+        assert!(!validation.provenance_degraded);
+
+        assert!(matches!(
+            support_closure_result(
+                &job,
+                &contract,
+                &pending,
+                vec![RevisionId::new_v7()],
+                Vec::new(),
+                true,
+                3,
+            ),
+            Err(StoreError::InvalidInput)
+        ));
+        assert!(matches!(
+            support_closure_result(&job, &contract, &pending, Vec::new(), Vec::new(), true, 3,),
+            Err(StoreError::InvalidInput)
+        ));
+        let duplicate = support_closure_result(
+            &job,
+            &contract,
+            &pending,
+            vec![support, support],
+            Vec::new(),
+            true,
+            3,
+        )
+        .unwrap()
+        .validation
+        .unwrap();
+        assert_eq!(duplicate.state, GlobalSupportState::Valid);
+        assert_eq!(duplicate.surviving_support_refs, vec![support]);
+
+        let other_support = RevisionId::new_v7();
+        let mut partial_contract = contract.clone();
+        partial_contract.support_revision_refs = vec![support, other_support];
+        partial_contract.support_revision_refs.sort();
+        let surviving = partial_contract.support_revision_refs[0];
+        let missing = partial_contract.support_revision_refs[1];
+        let partial = support_closure_result(
+            &job,
+            &partial_contract,
+            &pending,
+            vec![surviving],
+            vec![missing],
+            true,
+            3,
+        )
+        .unwrap()
+        .validation
+        .unwrap();
+        assert_eq!(partial.state, GlobalSupportState::Valid);
+        assert!(partial.provenance_degraded);
+
+        let mut no_authorization_required = contract.clone();
+        no_authorization_required
+            .support_threshold_snapshot
+            .require_authorization = false;
+        let insufficient = support_closure_result(
+            &job,
+            &no_authorization_required,
+            &pending,
+            Vec::new(),
+            vec![support],
+            false,
+            3,
+        )
+        .unwrap()
+        .validation
+        .unwrap();
+        assert_eq!(insufficient.state, GlobalSupportState::Insufficient);
+        assert_eq!(insufficient.invalid_or_missing_refs, vec![support]);
+
+        let mut stale_job = job;
+        stale_job.target_generation = 1;
+        let stale = support_closure_result(
+            &stale_job,
+            &contract,
+            &pending,
+            vec![support],
+            Vec::new(),
+            true,
+            4,
+        )
+        .unwrap();
+        assert!(stale.validation.is_none());
+        assert!(matches!(
+            stale.disposition,
+            JobResultDisposition::StaleAudit(_)
+        ));
     }
 }

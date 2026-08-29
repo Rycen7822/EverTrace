@@ -9,6 +9,7 @@ use crate::{
 mod atom;
 mod constraint;
 mod proposal;
+mod scenario_core;
 
 pub(crate) use atom::valid_identifier;
 pub use atom::{
@@ -22,10 +23,15 @@ pub use constraint::{
     ConstraintTruth, ConstraintValue,
 };
 pub use proposal::{
-    AtomProposalPayload, ProposalAcceptance, ProposalAcceptanceAuthority, ProposalCreatedBy,
-    ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
-    ProposalTargetKind, ProposalWaitingOn, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-    tui_acceptance_event_payload,
+    AcceptedProposalTarget, AtomProposalPayload, CoreMembershipProposalPayload, ProposalAcceptance,
+    ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
+    ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind, ProposalWaitingOn,
+    RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF, tui_acceptance_event_payload,
+};
+pub use scenario_core::{
+    ActiveScenarioLineage, CoreMembership, CoreScopeIdentity, GlobalSuccessorSupportContract,
+    GlobalSupportState, GlobalSupportValidationEvent, L3CoreProjection, Scenario, ScenarioScope,
+    ScenarioStatus, ScenarioWorkstream, SupportThresholdSnapshot,
 };
 
 const MAX_REFS: usize = 256;
@@ -307,4 +313,10 @@ pub enum SemanticError {
     InvalidProposal,
     #[error("revision proposal successor contract is invalid")]
     InvalidProposalSuccessor,
+    #[error("scenario contract is invalid")]
+    InvalidScenario,
+    #[error("core membership contract is invalid")]
+    InvalidCoreMembership,
+    #[error("global support contract is invalid")]
+    InvalidGlobalSupport,
 }

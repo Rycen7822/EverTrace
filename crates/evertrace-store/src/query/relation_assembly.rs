@@ -363,6 +363,16 @@ pub(super) fn add_semantic(
             SemanticRelationKind::ProposalReviewedRevision => "proposal_reviewed_revision",
             SemanticRelationKind::ProposalTargetsAtom => "proposal_targets_atom",
             SemanticRelationKind::ProposalAcceptedAtomRevision => "proposal_accepted_atom_revision",
+            SemanticRelationKind::CoreMembershipToAtomRevision => {
+                "core_membership_to_atom_revision"
+            }
+            SemanticRelationKind::CoreMembershipSuccessor => "core_membership_successor",
+            SemanticRelationKind::SupportContractSupportsRevision => {
+                "support_contract_supports_revision"
+            }
+            SemanticRelationKind::SupportContractAuthorizesRevision => {
+                "support_contract_authorizes_revision"
+            }
         };
         out.insert(RelationProjectionRow::edge(
             kind,

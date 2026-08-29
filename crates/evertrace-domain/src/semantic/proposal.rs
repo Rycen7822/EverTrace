@@ -7,7 +7,7 @@ use crate::{
     revision::RevisionId,
 };
 
-use super::{AtomDraft, AtomScope, SemanticError, valid_identifier};
+use super::{AtomDraft, AtomScope, CoreScopeIdentity, SemanticError, valid_identifier};
 
 const MAX_REFS: usize = 256;
 const MAX_SPLIT_OUTPUTS: usize = 16;
@@ -174,9 +174,24 @@ impl AtomProposalPayload {
 )]
 pub enum ProposalPayload {
     Atom(Box<AtomProposalPayload>),
+    CoreMembership(Box<CoreMembershipProposalPayload>),
     ReservedTarget {
         schema_version: u32,
         summary: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CoreMembershipProposalPayload {
+    Create {
+        atom_revision_id: RevisionId,
+        scope_identity: CoreScopeIdentity,
+    },
+    ResolveConflict {
+        left_atom_revision_id: RevisionId,
+        right_atom_revision_id: RevisionId,
+        scope_identity: CoreScopeIdentity,
     },
 }
 
@@ -184,6 +199,14 @@ impl ProposalPayload {
     fn validate(&self, target_kind: ProposalTargetKind) -> Result<(), SemanticError> {
         match (target_kind, self) {
             (ProposalTargetKind::Atom, Self::Atom(payload)) => payload.validate(),
+            (ProposalTargetKind::CoreMembership, Self::CoreMembership(payload)) => {
+                if matches!(payload.as_ref(), CoreMembershipProposalPayload::ResolveConflict { left_atom_revision_id, right_atom_revision_id, .. } if left_atom_revision_id == right_atom_revision_id)
+                {
+                    Err(SemanticError::InvalidProposal)
+                } else {
+                    Ok(())
+                }
+            }
             (
                 ProposalTargetKind::Procedure | ProposalTargetKind::CoreMembership,
                 Self::ReservedTarget {
@@ -279,11 +302,36 @@ pub struct ProposalAcceptance {
     pub acceptance_event_ref: String,
     pub reviewed_proposal_revision_id: RevisionId,
     pub reviewed_fingerprint: [u8; 32],
-    pub accepted_atom_id: AtomId,
-    pub accepted_atom_revision_id: RevisionId,
-    pub accepted_structure_hash: [u8; 32],
+    pub accepted_target: AcceptedProposalTarget,
     pub authority_basis: ProposalAcceptanceAuthority,
     pub accepted_at_us: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AcceptedProposalTarget {
+    Atom {
+        atom_id: AtomId,
+        atom_revision_id: RevisionId,
+        structure_hash: [u8; 32],
+    },
+    CoreMembership {
+        core_membership_id: CoreMembershipId,
+        membership_revision_id: RevisionId,
+    },
+}
+
+impl ProposalAcceptance {
+    pub const fn accepted_atom(&self) -> Option<(AtomId, RevisionId, [u8; 32])> {
+        match self.accepted_target {
+            AcceptedProposalTarget::Atom {
+                atom_id,
+                atom_revision_id,
+                structure_hash,
+            } => Some((atom_id, atom_revision_id, structure_hash)),
+            AcceptedProposalTarget::CoreMembership { .. } => None,
+        }
+    }
 }
 
 impl ProposalAcceptance {
@@ -364,6 +412,7 @@ impl RevisionProposal {
     fn validate_shape(&self) -> Result<(), SemanticError> {
         match (&self.payload, self.operation) {
             (ProposalPayload::Atom(payload), operation) if payload.operation() == operation => {}
+            (ProposalPayload::CoreMembership(_), ProposalOperation::Create) => {}
             (ProposalPayload::ReservedTarget { .. }, _) => {}
             _ => return Err(SemanticError::InvalidProposal),
         }
@@ -402,8 +451,25 @@ impl RevisionProposal {
             return Err(SemanticError::InvalidProposal);
         }
         if let Some(acceptance) = &self.acceptance {
+            if matches!(
+                self.payload,
+                ProposalPayload::CoreMembership(ref payload)
+                    if matches!(payload.as_ref(), CoreMembershipProposalPayload::ResolveConflict { .. })
+            ) {
+                return Err(SemanticError::InvalidProposal);
+            }
             acceptance.validate()?;
-            if self.target_kind != ProposalTargetKind::Atom
+            let target_matches = matches!(
+                (self.target_kind, &acceptance.accepted_target),
+                (
+                    ProposalTargetKind::Atom,
+                    AcceptedProposalTarget::Atom { .. }
+                ) | (
+                    ProposalTargetKind::CoreMembership,
+                    AcceptedProposalTarget::CoreMembership { .. }
+                )
+            );
+            if !target_matches
                 || acceptance.reviewed_fingerprint != self.fingerprint
                 || acceptance.reviewed_proposal_revision_id == self.proposal_revision_id
             {
