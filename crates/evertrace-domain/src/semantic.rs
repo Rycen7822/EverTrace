@@ -23,10 +23,11 @@ pub use constraint::{
     ConstraintTruth, ConstraintValue,
 };
 pub use proposal::{
-    AcceptedProposalTarget, AtomProposalPayload, CoreMembershipProposalPayload, ProposalAcceptance,
-    ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-    ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind, ProposalWaitingOn,
-    RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF, tui_acceptance_event_payload,
+    AcceptedProposalTarget, AtomProposalPayload, CoreMembershipProposalPayload,
+    ProcedureProposalPayload, ProposalAcceptance, ProposalAcceptanceAuthority, ProposalCreatedBy,
+    ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
+    ProposalTargetKind, ProposalWaitingOn, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+    tui_acceptance_event_payload,
 };
 pub use scenario_core::{
     ActiveScenarioLineage, CoreMembership, CoreScopeIdentity, GlobalSuccessorSupportContract,
@@ -309,6 +310,12 @@ pub enum SemanticError {
     InvalidConstraintExpr,
     #[error("constraint runtime state is invalid")]
     InvalidConstraintState,
+    #[error("procedure contract is invalid")]
+    InvalidProcedure,
+    #[error("procedure successor contract is invalid")]
+    InvalidProcedureSuccessor,
+    #[error("procedure publication transition is invalid")]
+    InvalidProcedurePublication,
     #[error("revision proposal contract is invalid")]
     InvalidProposal,
     #[error("revision proposal successor contract is invalid")]

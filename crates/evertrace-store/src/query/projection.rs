@@ -14,10 +14,11 @@ use crate::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
         build_capture_relation_rows, build_core_support_relation_rows, build_episode_relation_rows,
         build_operation_burst_relation_rows, build_physical_relation_rows,
-        build_recovery_application_relation_rows, build_recovery_relation_rows,
-        build_repository_relation_rows, build_segmentation_correction_relation_rows,
-        build_semantic_relation_rows, build_work_binding_relation_rows,
-        build_work_identity_relation_rows, read_relation_rows, relations_batch,
+        build_procedure_relation_rows, build_recovery_application_relation_rows,
+        build_recovery_relation_rows, build_repository_relation_rows,
+        build_segmentation_correction_relation_rows, build_semantic_relation_rows,
+        build_work_binding_relation_rows, build_work_identity_relation_rows, read_relation_rows,
+        relations_batch,
     },
     search::{SearchProjectionRow, read_search_rows, search_batch},
 };
@@ -229,6 +230,7 @@ pub fn derive_l0002_projections(
     let mut artifacts = BTreeMap::new();
     let mut atoms = BTreeMap::new();
     let mut proposals = BTreeMap::new();
+    let mut procedures = BTreeMap::new();
     let mut core_memberships = BTreeMap::new();
     let mut support_contracts = BTreeMap::new();
     let mut exact_rows = BTreeMap::new();
@@ -437,6 +439,9 @@ pub fn derive_l0002_projections(
             JournalPayload::RevisionProposalRecorded(value) => {
                 proposals.insert(value.proposal_revision_id, (*value, row.source_event_seq));
             }
+            JournalPayload::ProcedureRevisionRecorded(value) => {
+                procedures.insert(value.revision_id, (*value, row.source_event_seq));
+            }
             JournalPayload::CoreMembershipRecorded(value) => {
                 core_memberships
                     .insert(value.membership_revision_id, (*value, row.source_event_seq));
@@ -544,6 +549,11 @@ pub fn derive_l0002_projections(
     add_semantic(
         &mut relations,
         build_semantic_relation_rows(&all_values(&atoms), &all_values(&proposals))?,
+        &endpoint_seqs,
+    );
+    add_semantic(
+        &mut relations,
+        build_procedure_relation_rows(&all_values(&procedures), &all_values(&atoms))?,
         &endpoint_seqs,
     );
     add_semantic(

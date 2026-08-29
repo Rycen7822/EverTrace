@@ -48,6 +48,7 @@ use crate::{
 };
 
 mod autoresearch;
+mod procedure;
 mod recall_ledger;
 #[path = "recall_projection.rs"]
 mod recall_projection;
@@ -1289,6 +1290,7 @@ struct ReducerState {
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
     recall_ledger: recall_ledger::RecallLedgerState,
     s23: s23::S23State,
+    procedure: procedure::ProcedureState,
 }
 
 #[derive(Clone, Debug)]
@@ -1397,6 +1399,7 @@ pub(crate) struct JournalAdmissionState {
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
     recall_ledger: recall_ledger::RecallLedgerState,
     s23: s23::S23State,
+    procedure: procedure::ProcedureState,
 }
 
 fn recall_scope_matches(
@@ -2021,6 +2024,10 @@ impl JournalAdmissionState {
                 seq,
                 StoreError::StoreCorrupt,
             )?,
+            payload @ (JournalPayload::ProcedureRevisionRecorded(_)
+            | JournalPayload::ProcedureStateRecorded(_)) => {
+                self.procedure.apply(payload, seq)?;
+            }
             payload @ (JournalPayload::ScenarioRecorded(_)
             | JournalPayload::CoreMembershipRecorded(_)
             | JournalPayload::GlobalSupportContractRecorded(_)
@@ -2839,6 +2846,10 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             row.seq,
             StoreError::StoreCorrupt,
         )?,
+        payload @ (JournalPayload::ProcedureRevisionRecorded(_)
+        | JournalPayload::ProcedureStateRecorded(_)) => {
+            state.procedure.apply(payload, row.seq)?;
+        }
         payload @ (JournalPayload::ScenarioRecorded(_)
         | JournalPayload::CoreMembershipRecorded(_)
         | JournalPayload::GlobalSupportContractRecorded(_)
@@ -3757,6 +3768,7 @@ impl ReducerState {
         autoresearch::rebuild_artifacts(&mut self.work_artifacts, &self.artifact_revisions)?;
         semantic::rebuild_atoms(&mut self.atoms, &self.atom_revisions)?;
         semantic::rebuild_proposals(&mut self.proposals, &self.proposal_revisions)?;
+        self.procedure.rebuild()?;
         self.s23.rebuild()?;
         Ok(())
     }
@@ -4555,6 +4567,11 @@ impl ReducerState {
                     .insert(value.proposal_revision_id, (value, row.source_event_seq))
                     .is_some()
             }
+            payload @ (JournalPayload::ProcedureRevisionRecorded(_)
+            | JournalPayload::ProcedureStateRecorded(_)) => {
+                self.procedure.restore(payload, row.source_event_seq)?;
+                false
+            }
             payload @ (JournalPayload::ScenarioRecorded(_)
             | JournalPayload::CoreMembershipRecorded(_)
             | JournalPayload::GlobalSupportContractRecorded(_)
@@ -4584,6 +4601,7 @@ impl ReducerState {
             self.s23.atom_support_eligible(atom.revision_id)
         })?);
         rows.extend(self.recall_ledger.clone().rows(PROJECTION_GENERATION)?);
+        rows.extend(self.procedure.rows(PROJECTION_GENERATION, &self.s23)?);
         rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
         for (migration, (payload, seq)) in self.migrations {
             rows.push(runtime_row(
@@ -5105,8 +5123,11 @@ impl ReducerState {
     }
 
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
-        self.s23
-            .validate(&self.atom_revisions, &self.proposal_revisions)?;
+        self.s23.validate(
+            &self.atom_revisions,
+            &self.proposal_revisions,
+            &self.procedure,
+        )?;
         let source_ranges = current_source_ranges(&self.source_receipts)?;
         validate_capture_relations(
             &self.execution_lanes,
@@ -5345,6 +5366,7 @@ impl ReducerState {
             proposal_revisions: self.proposal_revisions.clone(),
             recall_ledger: self.recall_ledger.clone(),
             s23: self.s23.clone(),
+            procedure: self.procedure.clone(),
         })
     }
 }

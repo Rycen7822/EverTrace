@@ -9,6 +9,7 @@ use evertrace_domain::{
         AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SourceObservationId,
         SourceReceiptId, TaskId, WorkArtifactId, WorktreeId,
     },
+    procedure::ProcedureScope,
     repository::{RepositoryInstance, WorktreeInstance},
     revision::RevisionId,
     semantic::{
@@ -655,6 +656,99 @@ fn validate_proposal_relations(
         }
         return Ok(());
     }
+    if proposal.target_kind == ProposalTargetKind::Procedure {
+        let evertrace_domain::semantic::ProposalPayload::Procedure(payload) = &proposal.payload
+        else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        match (
+            proposal.operation,
+            proposal.target_id,
+            proposal.base_revision_id,
+        ) {
+            (ProposalOperation::Create, None, None) => {}
+            (ProposalOperation::Replace, Some(ProposalTargetId::Procedure(_)), Some(_)) => {}
+            _ => return Err(StoreError::StoreCorrupt),
+        }
+        if proposal.status == ProposalStatus::Accepted {
+            let acceptance = proposal
+                .acceptance
+                .as_ref()
+                .ok_or(StoreError::StoreCorrupt)?;
+            let evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
+                auto_full_audit,
+                ..
+            } = &acceptance.accepted_target
+            else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            match &acceptance.authority_basis {
+                ProposalAcceptanceAuthority::TuiAcceptance {
+                    user_source_observation_ref,
+                    authorized_scope_ceiling,
+                } => {
+                    if auto_full_audit.is_some() {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    let sources = validate_acceptance_sources(proposal, input)?;
+                    if *user_source_observation_ref != sources.observation_id
+                        || !authorized_scope_ceiling
+                            .contains(&procedure_atom_scope(payload.draft().scope))
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    validate_tui_acceptance_event(
+                        proposal,
+                        acceptance,
+                        sources.reviewed.created_at_us,
+                        sources.observation,
+                        sources.receipt,
+                    )?;
+                }
+                ProposalAcceptanceAuthority::ObjectiveEvidence {
+                    user_source_observation_ref,
+                } => {
+                    let audit = auto_full_audit.as_deref().ok_or(StoreError::StoreCorrupt)?;
+                    audit
+                        .validate(matches!(payload.draft().scope, ProcedureScope::Global))
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    if audit.eligibility.verifier_observation_ref
+                        != Some(*user_source_observation_ref)
+                        || proposal.eligibility != ProposalEligibility::AutoEligibleFull
+                        || acceptance.acceptance_event_ref
+                            != user_source_observation_ref.to_string()
+                        || acceptance.reviewer_identity
+                            != format!("objective_evidence:{user_source_observation_ref}")
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    let (observation, _) = input
+                        .source_observations
+                        .get(user_source_observation_ref)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    let (receipt, _) = input
+                        .source_receipts
+                        .get(&observation.source_receipt_ref)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    if !matches!(observation.source_role, SourceRole::Host | SourceRole::Tool)
+                        || observation.content_trust != ContentTrust::Observed
+                        || observation.capture_completeness != CaptureCompleteness::Complete
+                        || receipt.capture_completeness != CaptureCompleteness::Complete
+                        || !proposal.evidence_refs.iter().any(|reference| {
+                            reference == &observation.source_observation_id.to_string()
+                                || reference == &receipt.source_receipt_id.to_string()
+                        })
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                ProposalAcceptanceAuthority::CurrentTaskExactMessage { .. } => {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+        }
+        return Ok(());
+    }
     if proposal.target_kind != ProposalTargetKind::Atom {
         return Ok(());
     }
@@ -802,6 +896,22 @@ fn validate_proposal_relations(
         }
     }
     Ok(())
+}
+
+fn procedure_atom_scope(scope: ProcedureScope) -> AtomScope {
+    match scope {
+        ProcedureScope::Worktree {
+            repository_id,
+            worktree_id,
+        } => AtomScope::Worktree {
+            repository_instance_id: repository_id,
+            worktree_instance_id: worktree_id,
+        },
+        ProcedureScope::Repository { repository_id } => AtomScope::Repository {
+            repository_instance_id: repository_id,
+        },
+        ProcedureScope::Global => AtomScope::Global,
+    }
 }
 
 struct AcceptanceSources<'a> {

@@ -211,6 +211,8 @@ pub fn is_persisted_relation_kind(kind: &str) -> bool {
             | "core_membership_successor"
             | "support_contract_supports_revision"
             | "support_contract_authorizes_revision"
+            | "procedure_revision_successor"
+            | "procedure_supports_revision"
     )
 }
 

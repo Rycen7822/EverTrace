@@ -235,7 +235,17 @@ pub(crate) fn accepted_proposal_successor_with_audit(
     accepted.parent_proposal_revision_id = Some(parent_revision_id);
     accepted.status = ProposalStatus::Accepted;
     accepted.waiting_on.clear();
-    accepted.review_reason = Some("manual_acceptance".into());
+    accepted.review_reason = Some(
+        if matches!(
+            audit.authority_basis,
+            ProposalAcceptanceAuthority::ObjectiveEvidence { .. }
+        ) {
+            "automatic_acceptance"
+        } else {
+            "manual_acceptance"
+        }
+        .into(),
+    );
     accepted.acceptance = Some(ProposalAcceptance {
         reviewer_identity: audit.reviewer_identity,
         acceptance_event_ref: audit.acceptance_event_ref,
@@ -507,7 +517,9 @@ impl RevisionProposalService {
                     return Err(SemanticServiceError::UnsupportedTarget);
                 }
             },
-            ProposalPayload::CoreMembership(_) | ProposalPayload::ReservedTarget { .. } => {
+            ProposalPayload::Procedure(_)
+            | ProposalPayload::CoreMembership(_)
+            | ProposalPayload::ReservedTarget { .. } => {
                 return Err(SemanticServiceError::UnsupportedTarget);
             }
         };
@@ -696,7 +708,9 @@ fn accepted_draft(
                 Err(SemanticServiceError::UnsupportedTarget)
             }
         }?,
-        ProposalPayload::CoreMembership(_) | ProposalPayload::ReservedTarget { .. } => {
+        ProposalPayload::Procedure(_)
+        | ProposalPayload::CoreMembership(_)
+        | ProposalPayload::ReservedTarget { .. } => {
             return Err(SemanticServiceError::UnsupportedTarget);
         }
     };

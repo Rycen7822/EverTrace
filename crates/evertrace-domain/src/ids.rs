@@ -329,6 +329,7 @@ impl_new_v7!(
     ExperimentRunId,
     ResultEvidenceId,
     AtomId,
+    ProcedureId,
     RevisionProposalId,
     CoreMembershipId,
     WorkArtifactId,

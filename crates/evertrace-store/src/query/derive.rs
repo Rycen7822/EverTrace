@@ -19,7 +19,10 @@ pub(super) fn exact_identifier_row(
             .ok_or(StoreError::StoreCorrupt)?,
     )
     .map_err(|_| StoreError::StoreCorrupt)?;
-    let Some((semantic, event_time_us)) = allowlisted_object_text(&payload) else {
+    let Some((semantic, event_time_us)) = allowlisted_object_text(
+        &payload,
+        (8_usize * 1024).saturating_sub(id.len().saturating_add(1)),
+    ) else {
         return Ok(None);
     };
     let text = bounded_search_text(id, &semantic);
@@ -62,7 +65,10 @@ pub(super) fn exact_identifier_row(
     }))
 }
 
-fn allowlisted_object_text(payload: &JournalPayload) -> Option<(Vec<String>, i64)> {
+fn allowlisted_object_text(
+    payload: &JournalPayload,
+    max_text_bytes: usize,
+) -> Option<(Vec<String>, i64)> {
     match payload {
         JournalPayload::AtomRecorded(value) => {
             let mut text = vec![
@@ -119,6 +125,9 @@ fn allowlisted_object_text(payload: &JournalPayload) -> Option<(Vec<String>, i64
             text.extend(value.open_loops.iter().cloned());
             text.extend(value.completed_outcomes.iter().cloned());
             Some((text, 0))
+        }
+        JournalPayload::ProcedureRevisionRecorded(value) => {
+            Some((value.route_text_fields(max_text_bytes), value.created_at_us))
         }
         JournalPayload::CoreMembershipRecorded(_)
         | JournalPayload::GlobalSupportContractRecorded(_)

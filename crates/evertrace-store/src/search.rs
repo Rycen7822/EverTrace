@@ -497,6 +497,7 @@ impl SearchProjectionRow {
                             | "core_membership"
                             | "global_support_contract"
                             | "global_support_validation"
+                            | "procedure_revision"
                     )
                 )
                 || !matches!(self.currentness.as_deref(), Some("current" | "historical"))
