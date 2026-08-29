@@ -13,8 +13,9 @@ mod proposal;
 pub(crate) use atom::valid_identifier;
 pub use atom::{
     Atom, AtomAuthority, AtomDraft, AtomKind, AtomLifecycleStatus, AtomProvenance, AtomScope,
-    AtomValue, EpistemicStatus, PolicyAuthorityProvenance, PolicyHostScope, SemanticQualifier,
-    UserAuthorizationMode, UserAuthorizationProvenance, ValidityInterval,
+    AtomValue, EpistemicStatus, FutureCueLifecycleExprs, PolicyAuthorityProvenance,
+    PolicyHostScope, SemanticQualifier, UserAuthorizationMode, UserAuthorizationProvenance,
+    ValidityInterval,
 };
 pub use constraint::{
     ApplicabilityExpr, ConstraintBinding, ConstraintExpr, ConstraintField, ConstraintState,

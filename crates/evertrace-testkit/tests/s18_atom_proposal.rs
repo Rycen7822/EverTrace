@@ -384,6 +384,7 @@ fn draft(
         value: value("semantic value"),
         scope,
         applicability_expr: ApplicabilityExpr::Always,
+        future_cue_lifecycle_exprs: None,
         validity_interval: ValidityInterval {
             valid_from_us: 1,
             valid_until_us: Some(100),

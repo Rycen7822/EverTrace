@@ -101,6 +101,7 @@ pub fn materialize_atom(
         scope: draft.scope,
         condition_ir_version: 1,
         applicability_expr: draft.applicability_expr,
+        future_cue_lifecycle_exprs: draft.future_cue_lifecycle_exprs,
         validity_interval: draft.validity_interval,
         provenance: draft.provenance,
         user_authorization_provenance,
@@ -522,6 +523,7 @@ pub fn exact_task_constraint_draft(
         },
         scope: AtomScope::Task { task_id },
         applicability_expr: ApplicabilityExpr::Always,
+        future_cue_lifecycle_exprs: None,
         validity_interval: ValidityInterval {
             valid_from_us,
             valid_until_us: Some(valid_until_us),

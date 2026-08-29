@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +175,30 @@ impl ConstraintExpr {
     pub fn validate(&self) -> Result<(), SemanticError> {
         let mut nodes = 0;
         self.validate_inner(1, &mut nodes)
+    }
+
+    pub fn referenced_fields(&self) -> BTreeSet<ConstraintField> {
+        let mut fields = BTreeSet::new();
+        self.collect_referenced_fields(&mut fields);
+        fields
+    }
+
+    fn collect_referenced_fields(&self, fields: &mut BTreeSet<ConstraintField>) {
+        match self {
+            Self::All { terms } | Self::Any { terms } => {
+                for term in terms {
+                    term.collect_referenced_fields(fields);
+                }
+            }
+            Self::Not { term } => term.collect_referenced_fields(fields),
+            Self::Eq { field, .. }
+            | Self::In { field, .. }
+            | Self::Exists { field }
+            | Self::Changed { field }
+            | Self::Transitioned { field, .. } => {
+                fields.insert(*field);
+            }
+        }
     }
 
     fn validate_inner(&self, depth: usize, nodes: &mut usize) -> Result<(), SemanticError> {

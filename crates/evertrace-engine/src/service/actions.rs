@@ -669,6 +669,7 @@ mod tests {
             scope: scope.clone(),
             condition_ir_version: 1,
             applicability_expr: evertrace_domain::semantic::ApplicabilityExpr::Always,
+            future_cue_lifecycle_exprs: None,
             validity_interval: ValidityInterval {
                 valid_from_us: 0,
                 valid_until_us: Some(i64::MAX),
