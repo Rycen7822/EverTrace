@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use evertrace_domain::procedure::ProcedureRevision;
+use evertrace_domain::procedure::{
+    ProcedureNegativeEvidence, ProcedureNegativeReviewEvent, ProcedureRevision,
+    ProcedureUsageRevision,
+};
 use evertrace_domain::semantic::{
     Atom, CoreMembership, GlobalSuccessorSupportContract, ProposalStatus, ProposalTargetId,
     RevisionProposal,
@@ -25,6 +28,134 @@ pub enum SemanticRelationKind {
     SupportContractAuthorizesRevision,
     ProcedureRevisionSuccessor,
     ProcedureSupportsRevision,
+    ProcedureUsageToRevision,
+    ProcedureUsageToTask,
+    ProcedureUsageToWorkstream,
+    ProcedureUsageToExposureEpisode,
+    ProcedureUsageToAttempt,
+    ProcedureUsageToActionOperation,
+    ProcedureUsageToVerificationOperation,
+    ProcedureUsageToBindingRevision,
+    ProcedureUsageToScopeEffect,
+    ProcedureNegativeToUsage,
+    ProcedureNegativeToRevision,
+    ProcedureNegativeToTask,
+    ProcedureReviewToNegative,
+}
+
+pub fn build_procedure_usage_relation_rows(
+    usages: &[ProcedureUsageRevision],
+    negatives: &[ProcedureNegativeEvidence],
+    reviews: &[ProcedureNegativeReviewEvent],
+) -> Result<Vec<SemanticRelationRow>, StoreError> {
+    let usage_ids = usages
+        .iter()
+        .map(|value| value.procedure_usage_id)
+        .collect::<BTreeSet<_>>();
+    let negative_ids = negatives
+        .iter()
+        .map(|value| value.negative_evidence_id)
+        .collect::<BTreeSet<_>>();
+    if usage_ids.len() != usages.len() || negative_ids.len() != negatives.len() {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut rows = BTreeSet::new();
+    for usage in usages {
+        if !usage.validate() {
+            return Err(StoreError::InvalidInput);
+        }
+        let source = usage.usage_revision_id.to_string();
+        let mut add = |kind, target: String| {
+            rows.insert(SemanticRelationRow {
+                kind,
+                source_id: source.clone(),
+                target_id: target,
+            });
+        };
+        add(
+            SemanticRelationKind::ProcedureUsageToRevision,
+            usage.procedure_revision_id.to_string(),
+        );
+        add(
+            SemanticRelationKind::ProcedureUsageToTask,
+            usage.task_id.to_string(),
+        );
+        add(
+            SemanticRelationKind::ProcedureUsageToWorkstream,
+            usage.workstream_id.to_string(),
+        );
+        add(
+            SemanticRelationKind::ProcedureUsageToExposureEpisode,
+            usage.exposure_episode_revision_id.to_string(),
+        );
+        for value in &usage.attempt_ids {
+            add(
+                SemanticRelationKind::ProcedureUsageToAttempt,
+                value.to_string(),
+            );
+        }
+        for value in &usage.action_operation_refs {
+            add(
+                SemanticRelationKind::ProcedureUsageToActionOperation,
+                value.to_string(),
+            );
+        }
+        for value in &usage.verification_operation_refs {
+            add(
+                SemanticRelationKind::ProcedureUsageToVerificationOperation,
+                value.to_string(),
+            );
+        }
+        for value in &usage.work_binding_revision_refs {
+            add(
+                SemanticRelationKind::ProcedureUsageToBindingRevision,
+                value.to_string(),
+            );
+        }
+        for value in &usage.scope_effect_refs {
+            add(
+                SemanticRelationKind::ProcedureUsageToScopeEffect,
+                value.to_string(),
+            );
+        }
+    }
+    for negative in negatives {
+        if !negative.validate() || !usage_ids.contains(&negative.procedure_usage_id) {
+            return Err(StoreError::InvalidInput);
+        }
+        let source = negative.negative_evidence_id.to_string();
+        for (kind, target) in [
+            (
+                SemanticRelationKind::ProcedureNegativeToUsage,
+                negative.procedure_usage_id.to_string(),
+            ),
+            (
+                SemanticRelationKind::ProcedureNegativeToRevision,
+                negative.procedure_revision_id.to_string(),
+            ),
+            (
+                SemanticRelationKind::ProcedureNegativeToTask,
+                negative.task_id.to_string(),
+            ),
+        ] {
+            rows.insert(SemanticRelationRow {
+                kind,
+                source_id: source.clone(),
+                target_id: target,
+            });
+        }
+    }
+    for review in reviews {
+        if !review.validate() || !negative_ids.contains(&review.negative_evidence_id) {
+            return Err(StoreError::InvalidInput);
+        }
+        rows.insert(SemanticRelationRow {
+            kind: SemanticRelationKind::ProcedureReviewToNegative,
+            source_id: review.review_event_id.to_string(),
+            target_id: review.negative_evidence_id.to_string(),
+        });
+    }
+    Ok(rows.into_iter().collect())
 }
 
 pub fn build_procedure_relation_rows(

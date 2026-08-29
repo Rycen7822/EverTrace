@@ -14,7 +14,9 @@ use evertrace_domain::{
         ProposalPayload, ProposalTargetId, ProposalTargetKind,
     },
 };
-use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload, SemanticCurrentView};
+use evertrace_store::{
+    JournalCommand, JournalEventDraft, JournalPayload, ProjectionSnapshot, SemanticCurrentView,
+};
 
 use crate::semantic::{
     AtomAcceptanceContext, ProposalAcceptanceAudit, ProposalCommandContext, SemanticServiceError,
@@ -316,6 +318,21 @@ pub struct RoutedProcedure {
     pub done: Option<ProcedureDone>,
     pub excludes: Vec<String>,
     pub pitfalls: Vec<String>,
+    route_proof: ProcedureRouteProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcedureRouteProof {
+    procedure_id: ProcedureId,
+    revision_id: RevisionId,
+    decision: ProcedureDecision,
+    publication: ProcedurePublicationState,
+    task_id: Option<evertrace_domain::ids::TaskId>,
+    repository_id: Option<evertrace_domain::ids::RepositoryId>,
+    worktree_id: Option<evertrace_domain::ids::WorktreeId>,
+    phase: ProcedurePhase,
+    failure_signature: Option<String>,
+    eligibility: ConstraintTruth,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,6 +489,26 @@ fn evaluate_candidate(
         }),
         excludes: candidate.revision.draft.when.excludes.clone(),
         pitfalls: candidate.revision.draft.pitfalls.clone(),
+        route_proof: ProcedureRouteProof {
+            procedure_id: candidate.revision.procedure_id,
+            revision_id: candidate.revision.revision_id,
+            decision,
+            publication: candidate.publication,
+            task_id: context.task_id,
+            repository_id: context.repository_id,
+            worktree_id: context.worktree_id,
+            phase: candidate.phase,
+            failure_signature: current.bindings.iter().find_map(|binding| {
+                if binding.field == evertrace_domain::semantic::ConstraintField::FailureSignature
+                    && let evertrace_domain::semantic::ConstraintValue::Text(value) = &binding.value
+                {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            }),
+            eligibility: applicability,
+        },
     })
 }
 
@@ -530,3 +567,6 @@ fn empty() -> ProcedureRouteResult {
         items: Vec::new(),
     }
 }
+
+mod usage;
+pub use usage::*;

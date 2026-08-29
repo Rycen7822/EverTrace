@@ -259,6 +259,8 @@ uuid_id!(CaptureOutageIntervalId, "outage");
 uuid_id!(OperationId, "op");
 uuid_id!(ScopeEffectId, "se");
 uuid_id!(WorkBindingRevisionId, "wb");
+uuid_id!(ProcedureUsageId, "puse");
+uuid_id!(ProcedureNegativeEvidenceId, "pneg");
 uuid_id!(RepositoryId, "repo");
 uuid_id!(WorktreeId, "wt");
 uuid_id!(WorktreeSnapshotId, "wts");
@@ -311,6 +313,8 @@ impl_new_v7!(
     ExecutionLaneId,
     ScopeEffectId,
     WorkBindingRevisionId,
+    ProcedureUsageId,
+    ProcedureNegativeEvidenceId,
     DuplicateGroupId,
     RepositoryId,
     WorktreeId,

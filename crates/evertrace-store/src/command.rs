@@ -8,7 +8,10 @@ use evertrace_domain::{
         SourceRevisionMode,
     },
     ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
-    procedure::{ProcedureRevision, ProcedureStateEvent},
+    procedure::{
+        ProcedureNegativeEvidence, ProcedureNegativeReviewEvent, ProcedureRevision,
+        ProcedureStateEvent, ProcedureUsageRevision,
+    },
     recall::RecallLedgerEvent,
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
@@ -529,6 +532,9 @@ pub enum JournalPayload {
     RevisionProposalRecorded(Box<RevisionProposal>),
     ProcedureRevisionRecorded(Box<ProcedureRevision>),
     ProcedureStateRecorded(Box<ProcedureStateEvent>),
+    ProcedureUsageRecorded(Box<ProcedureUsageRevision>),
+    ProcedureNegativeEvidenceRecorded(Box<ProcedureNegativeEvidence>),
+    ProcedureNegativeReviewRecorded(Box<ProcedureNegativeReviewEvent>),
     ScenarioRecorded(Box<Scenario>),
     CoreMembershipRecorded(Box<CoreMembership>),
     GlobalSupportContractRecorded(Box<GlobalSuccessorSupportContract>),
@@ -585,6 +591,9 @@ impl JournalPayload {
             Self::RevisionProposalRecorded(_) => "revision_proposal_recorded_v1",
             Self::ProcedureRevisionRecorded(_) => "procedure_revision_recorded_v1",
             Self::ProcedureStateRecorded(_) => "procedure_state_recorded_v1",
+            Self::ProcedureUsageRecorded(_) => "procedure_usage_recorded_v1",
+            Self::ProcedureNegativeEvidenceRecorded(_) => "procedure_negative_evidence_recorded_v1",
+            Self::ProcedureNegativeReviewRecorded(_) => "procedure_negative_review_recorded_v1",
             Self::ScenarioRecorded(_) => "scenario_recorded_v1",
             Self::CoreMembershipRecorded(_) => "core_membership_recorded_v1",
             Self::GlobalSupportContractRecorded(_) => "global_support_contract_recorded_v1",
@@ -632,6 +641,9 @@ impl JournalPayload {
             | Self::RevisionProposalRecorded(_)
             | Self::ProcedureRevisionRecorded(_)
             | Self::ProcedureStateRecorded(_)
+            | Self::ProcedureUsageRecorded(_)
+            | Self::ProcedureNegativeEvidenceRecorded(_)
+            | Self::ProcedureNegativeReviewRecorded(_)
             | Self::ScenarioRecorded(_)
             | Self::CoreMembershipRecorded(_)
             | Self::GlobalSupportContractRecorded(_)
@@ -797,6 +809,27 @@ impl JournalPayload {
             }
             Self::ProcedureStateRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::ProcedureUsageRecorded(value) => {
+                if value.validate() {
+                    Ok(())
+                } else {
+                    Err(StoreError::InvalidInput)
+                }
+            }
+            Self::ProcedureNegativeEvidenceRecorded(value) => {
+                if value.validate() {
+                    Ok(())
+                } else {
+                    Err(StoreError::InvalidInput)
+                }
+            }
+            Self::ProcedureNegativeReviewRecorded(value) => {
+                if value.validate() {
+                    Ok(())
+                } else {
+                    Err(StoreError::InvalidInput)
+                }
             }
             Self::ScenarioRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
             Self::CoreMembershipRecorded(value) => {
@@ -970,6 +1003,13 @@ impl JournalPayload {
                 tagged_json("procedure_revision_recorded", value)
             }
             Self::ProcedureStateRecorded(value) => tagged_json("procedure_state_recorded", value),
+            Self::ProcedureUsageRecorded(value) => tagged_json("procedure_usage_recorded", value),
+            Self::ProcedureNegativeEvidenceRecorded(value) => {
+                tagged_json("procedure_negative_evidence_recorded", value)
+            }
+            Self::ProcedureNegativeReviewRecorded(value) => {
+                tagged_json("procedure_negative_review_recorded", value)
+            }
             Self::ScenarioRecorded(value) => tagged_json("scenario_recorded", value),
             Self::CoreMembershipRecorded(value) => tagged_json("core_membership_recorded", value),
             Self::GlobalSupportContractRecorded(value) => {
@@ -1538,6 +1578,94 @@ fn validate_semantic_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
             })
             .count();
         if matching != 1 {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for negative in events.iter().filter_map(|event| match &event.payload {
+        JournalPayload::ProcedureNegativeEvidenceRecorded(value) => Some(value.as_ref()),
+        _ => None,
+    }) {
+        let reviews = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                JournalPayload::ProcedureNegativeReviewRecorded(value)
+                    if value.negative_evidence_id == negative.negative_evidence_id
+                        && value.review_generation == 1
+                        && value.status
+                            == evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .count();
+        let states = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                JournalPayload::ProcedureStateRecorded(value)
+                    if value.procedure_revision_id == negative.procedure_revision_id
+                        && value.evidence_refs
+                            == vec![negative.negative_evidence_id.to_string()] =>
+                {
+                    Some((value.to_state, value.reason))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected_state = match negative.level {
+            evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective => None,
+            evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                if negative.attribution_basis
+                    == evertrace_domain::procedure::ProcedureAttributionBasis::ResolvedLocalized =>
+            {
+                None
+            }
+            evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm => Some((
+                evertrace_domain::procedure::ProcedurePublicationState::ReviewHold,
+                evertrace_domain::procedure::ProcedureStateReason::SuspectedHarm,
+            )),
+            evertrace_domain::procedure::ProcedureNegativeLevel::ConfirmedHarm => Some((
+                evertrace_domain::procedure::ProcedurePublicationState::Suspended,
+                evertrace_domain::procedure::ProcedureStateReason::ConfirmedHarm,
+            )),
+        };
+        if reviews != 1
+            || states.len() > 1
+            || states
+                .first()
+                .is_some_and(|state| Some(*state) != expected_state)
+        {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for state in events.iter().filter_map(|event| match &event.payload {
+        JournalPayload::ProcedureStateRecorded(value)
+            if value.to_state
+                == evertrace_domain::procedure::ProcedurePublicationState::ActiveStable
+                && value.reason
+                    == evertrace_domain::procedure::ProcedureStateReason::ObjectiveSuccesses =>
+        {
+            Some(value.as_ref())
+        }
+        _ => None,
+    }) {
+        let usages = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                JournalPayload::ProcedureUsageRecorded(value)
+                    if value.procedure_revision_id == state.procedure_revision_id
+                        && value.outcome_supported
+                            == evertrace_domain::procedure::ProcedureTruth::True
+                        && state
+                            .evidence_refs
+                            .contains(&value.usage_revision_id.to_string()) =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .count();
+        if usages != 1 {
             return Err(StoreError::InvalidInput);
         }
     }

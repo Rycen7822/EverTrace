@@ -9,10 +9,11 @@ use evertrace_domain::{
     ids::{
         AtomId, AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
         ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId,
-        OperationId, RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId,
-        RepositoryId, ResultEvidenceId, RevisionProposalId, ScopeEffectId, SourceObservationId,
-        SourceReceiptId, TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId,
-        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
+        OperationId, ProcedureNegativeEvidenceId, ProcedureUsageId, RecoveryApplicationId,
+        RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId, ResultEvidenceId,
+        RevisionProposalId, ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId,
+        WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
+        WorktreeSnapshotId, WorktreeTransitionId,
     },
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
@@ -49,6 +50,7 @@ use crate::{
 
 mod autoresearch;
 mod procedure;
+mod procedure_validation;
 mod recall_ledger;
 #[path = "recall_projection.rs"]
 mod recall_projection;
@@ -1237,6 +1239,7 @@ struct ReducerState {
     source_watermarks: BTreeMap<String, (SourceIngestWatermark, u64)>,
     evidence_surfaces: BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
+    host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
     operation_revisions: BTreeMap<(OperationId, u32), (Operation, u64)>,
     scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
@@ -1343,10 +1346,12 @@ impl KnownSourceRange {
 
 #[derive(Clone, Default)]
 pub(crate) struct JournalAdmissionState {
+    frontier: u64,
     source_ranges: BTreeMap<String, KnownSourceRange>,
     source_observations: BTreeMap<SourceObservationId, (SourceObservation, u64)>,
     source_receipts: BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
+    host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
     operation_revisions: BTreeMap<(OperationId, u32), (Operation, u64)>,
     scope_effects: BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
@@ -1685,6 +1690,14 @@ impl JournalAdmissionState {
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
         )?;
+        self.validate_procedure_usage_command(command.events().iter().map(|event| &event.payload))
+            .map_err(|_| StoreError::InvalidInput)?;
+        self.procedure
+            .validate_command_cohort(
+                &self.tasks,
+                command.events().iter().map(|event| &event.payload),
+            )
+            .map_err(|_| StoreError::InvalidInput)?;
         semantic::validate_command_boundary(
             &self.atoms,
             command.events().iter().map(|event| &event.payload),
@@ -1759,6 +1772,9 @@ impl JournalAdmissionState {
             .map_err(|_| StoreError::StoreCorrupt)?;
         self.validate_episode_binding_activation(parsed.iter().map(|(payload, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
+        self.validate_procedure_usage_command(parsed.iter().map(|(payload, _)| payload))?;
+        self.procedure
+            .validate_command_cohort(&self.tasks, parsed.iter().map(|(payload, _)| payload))?;
         semantic::validate_command_boundary(
             &self.atoms,
             parsed.iter().map(|(payload, _)| payload),
@@ -1865,17 +1881,33 @@ impl JournalAdmissionState {
                 }
             }
             JournalPayload::HostOccurrenceNormalized(value) => {
-                replace_occurrence(&mut self.host_occurrences, *value, seq)?;
+                let value = *value;
+                replace_occurrence(&mut self.host_occurrences, value.clone(), seq)?;
+                let key = (value.host_occurrence_id, value.normalization_revision);
+                match self.host_occurrence_revisions.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((value, seq));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().0 == value => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
             }
             JournalPayload::OperationDerived(value) => {
                 let value = *value;
                 replace_operation(&mut self.operations, value.clone(), seq)?;
-                if self
-                    .operation_revisions
-                    .insert((value.operation_id, value.operation_revision), (value, seq))
-                    .is_some()
-                {
-                    return Err(StoreError::StoreCorrupt);
+                let key = (value.operation_id, value.operation_revision);
+                match self.operation_revisions.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((value, seq));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().0 == value => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(StoreError::StoreCorrupt);
+                    }
                 }
             }
             JournalPayload::ScopeEffectDerived(value) => {
@@ -2025,7 +2057,10 @@ impl JournalAdmissionState {
                 StoreError::StoreCorrupt,
             )?,
             payload @ (JournalPayload::ProcedureRevisionRecorded(_)
-            | JournalPayload::ProcedureStateRecorded(_)) => {
+            | JournalPayload::ProcedureStateRecorded(_)
+            | JournalPayload::ProcedureUsageRecorded(_)
+            | JournalPayload::ProcedureNegativeEvidenceRecorded(_)
+            | JournalPayload::ProcedureNegativeReviewRecorded(_)) => {
                 self.procedure.apply(payload, seq)?;
             }
             payload @ (JournalPayload::ScenarioRecorded(_)
@@ -2039,6 +2074,7 @@ impl JournalAdmissionState {
             }
             _ => {}
         }
+        self.frontier = self.frontier.max(seq);
         Ok(())
     }
 
@@ -2155,6 +2191,7 @@ impl JournalAdmissionState {
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
         })?;
+        self.validate_procedure_relations()?;
         validate_recall_relations(
             self.recall_ledger.values(),
             &self.execution_lanes,
@@ -2652,20 +2689,30 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         }
         JournalPayload::HostOccurrenceNormalized(value) => {
             let value = *value;
-            replace_occurrence(&mut state.host_occurrences, value, row.seq)?;
+            replace_occurrence(&mut state.host_occurrences, value.clone(), row.seq)?;
+            let key = (value.host_occurrence_id, value.normalization_revision);
+            match state.host_occurrence_revisions.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((value, row.seq));
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get().0 == value => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
         }
         JournalPayload::OperationDerived(value) => {
             let value = *value;
             replace_operation(&mut state.operations, value.clone(), row.seq)?;
-            if state
-                .operation_revisions
-                .insert(
-                    (value.operation_id, value.operation_revision),
-                    (value, row.seq),
-                )
-                .is_some()
-            {
-                return Err(StoreError::StoreCorrupt);
+            let key = (value.operation_id, value.operation_revision);
+            match state.operation_revisions.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((value, row.seq));
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get().0 == value => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
         }
         JournalPayload::ScopeEffectDerived(value) => {
@@ -2847,7 +2894,10 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             StoreError::StoreCorrupt,
         )?,
         payload @ (JournalPayload::ProcedureRevisionRecorded(_)
-        | JournalPayload::ProcedureStateRecorded(_)) => {
+        | JournalPayload::ProcedureStateRecorded(_)
+        | JournalPayload::ProcedureUsageRecorded(_)
+        | JournalPayload::ProcedureNegativeEvidenceRecorded(_)
+        | JournalPayload::ProcedureNegativeReviewRecorded(_)) => {
             state.procedure.apply(payload, row.seq)?;
         }
         payload @ (JournalPayload::ScenarioRecorded(_)
@@ -3693,6 +3743,17 @@ fn replace_outage(
 
 impl ReducerState {
     fn rebuild_revision_currents(&mut self) -> Result<(), StoreError> {
+        self.host_occurrences.clear();
+        let mut occurrences = self
+            .host_occurrence_revisions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        occurrences
+            .sort_by_key(|(value, _)| (value.host_occurrence_id, value.normalization_revision));
+        for (value, seq) in occurrences {
+            replace_occurrence(&mut self.host_occurrences, value, seq)?;
+        }
         self.operations.clear();
         let mut operations = self
             .operation_revisions
@@ -4196,8 +4257,21 @@ impl ReducerState {
             }
             JournalPayload::HostOccurrenceNormalized(value) => {
                 let value = *value;
+                if row.row_id
+                    != format!(
+                        "object:evidence:host_occurrence:{}@{}",
+                        value.host_occurrence_id, value.normalization_revision
+                    )
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                let mut canonical = row.clone();
+                canonical.row_id = format!(
+                    "object:evidence:host_occurrence:{}",
+                    value.host_occurrence_id
+                );
                 require_physical_row(
-                    row,
+                    &canonical,
                     ObjectFamily::Evidence,
                     "host_occurrence",
                     &value.host_occurrence_id.to_string(),
@@ -4206,8 +4280,11 @@ impl ReducerState {
                         value.host_occurrence_id, value.normalization_revision
                     ),
                 )?;
-                self.host_occurrences
-                    .insert(value.host_occurrence_id, (value, row.source_event_seq))
+                self.host_occurrence_revisions
+                    .insert(
+                        (value.host_occurrence_id, value.normalization_revision),
+                        (value, row.source_event_seq),
+                    )
                     .is_some()
             }
             JournalPayload::OperationDerived(value) => {
@@ -4568,7 +4645,10 @@ impl ReducerState {
                     .is_some()
             }
             payload @ (JournalPayload::ProcedureRevisionRecorded(_)
-            | JournalPayload::ProcedureStateRecorded(_)) => {
+            | JournalPayload::ProcedureStateRecorded(_)
+            | JournalPayload::ProcedureUsageRecorded(_)
+            | JournalPayload::ProcedureNegativeEvidenceRecorded(_)
+            | JournalPayload::ProcedureNegativeReviewRecorded(_)) => {
                 self.procedure.restore(payload, row.source_event_seq)?;
                 false
             }
@@ -4718,15 +4798,17 @@ impl ReducerState {
         for (id, (value, seq)) in self.evidence_surfaces {
             rows.push(surface_row(id, value, seq)?);
         }
-        for (id, (value, seq)) in self.host_occurrences {
-            rows.push(physical_object_row(
+        for ((id, revision), (value, seq)) in self.host_occurrence_revisions {
+            let mut row = physical_object_row(
                 ObjectFamily::Evidence,
                 "host_occurrence",
                 id.to_string(),
-                format!("{}@{}", id, value.normalization_revision),
+                format!("{id}@{revision}"),
                 &JournalPayload::HostOccurrenceNormalized(Box::new(value)),
                 seq,
-            )?);
+            )?;
+            row.row_id = format!("object:evidence:host_occurrence:{id}@{revision}");
+            rows.push(row);
         }
         for ((id, revision), (value, seq)) in self.operation_revisions {
             let mut row = physical_object_row(
@@ -5311,16 +5393,20 @@ impl ReducerState {
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
         })?;
+        let admission = self.admission_state(0)?;
+        admission.validate_procedure_relations()?;
         validate_recall_ledger_relations(self)?;
         Ok(())
     }
 
-    fn admission_state(&self) -> Result<JournalAdmissionState, StoreError> {
+    fn admission_state(&self, frontier: u64) -> Result<JournalAdmissionState, StoreError> {
         Ok(JournalAdmissionState {
+            frontier,
             source_ranges: current_source_ranges(&self.source_receipts)?,
             source_observations: self.source_observations.clone(),
             source_receipts: self.source_receipts.clone(),
             host_occurrences: self.host_occurrences.clone(),
+            host_occurrence_revisions: self.host_occurrence_revisions.clone(),
             operations: self.operations.clone(),
             operation_revisions: self.operation_revisions.clone(),
             scope_effects: self.scope_effects.clone(),
@@ -5886,7 +5972,7 @@ impl ProjectionWorker {
             )
         });
         let reconcile_recall = reconcile_core;
-        let mut admission = state.admission_state()?;
+        let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
             for row in batch {
@@ -6012,8 +6098,8 @@ mod tests {
     use evertrace_domain::{
         evidence::{
             CaptureGapMarkerEvidence, CaptureOutageInterval, CaptureOutagePositiveSource,
-            OperationKind, PairingState, ReconciliationProvenance, SourceInstanceId,
-            SourceRevision,
+            CorrelationStrength, NormalizationState, OperationKind, PairingState,
+            ReconciliationProvenance, SourceInstanceId, SourceRevision,
         },
         ids::{
             CaptureOutageIntervalId, CommandId, ExecutionLaneId, HostOccurrenceId, JobId,
@@ -6180,6 +6266,90 @@ mod tests {
             operation_revision: revision,
             previous_operation_revision: previous,
         }
+    }
+
+    fn occurrence() -> HostOccurrence {
+        HostOccurrence {
+            host_occurrence_id: HostOccurrenceId::from_digest([0x71; 32]),
+            exact_key: None,
+            host_instance_id: None,
+            host_trace_lineage_id: None,
+            host_lane_key: None,
+            canonical_event_family: None,
+            native_request_id: None,
+            physical_execution_ordinal: None,
+            correlation_strength: CorrelationStrength::Unavailable,
+            source_observation_refs: vec![SourceObservationId::from_digest([0x72; 32])],
+            field_provenance: Vec::new(),
+            normalization_state: NormalizationState::SingleSource,
+            pairing_state: PairingState::UnmatchedIntent,
+            possible_duplicate_group_id: None,
+            correlation_resolver_version: 1,
+            normalization_revision: 1,
+            previous_normalization_revision: None,
+        }
+    }
+
+    #[test]
+    fn physical_revision_exact_repeat_keeps_first_seq_and_conflicts_fail_closed() {
+        let mut state = JournalAdmissionState::default();
+        let occurrence = occurrence();
+        state
+            .apply_payload(
+                JournalPayload::HostOccurrenceNormalized(Box::new(occurrence.clone())),
+                10,
+            )
+            .unwrap();
+        state
+            .apply_payload(
+                JournalPayload::HostOccurrenceNormalized(Box::new(occurrence.clone())),
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            state.host_occurrence_revisions[&(
+                occurrence.host_occurrence_id,
+                occurrence.normalization_revision
+            )]
+                .1,
+            10
+        );
+        let mut conflicting_occurrence = occurrence.clone();
+        conflicting_occurrence.correlation_resolver_version += 1;
+        assert_eq!(
+            state.apply_payload(
+                JournalPayload::HostOccurrenceNormalized(Box::new(conflicting_occurrence)),
+                30,
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let operation = operation(1, None);
+        state
+            .apply_payload(
+                JournalPayload::OperationDerived(Box::new(operation.clone())),
+                11,
+            )
+            .unwrap();
+        state
+            .apply_payload(
+                JournalPayload::OperationDerived(Box::new(operation.clone())),
+                21,
+            )
+            .unwrap();
+        assert_eq!(
+            state.operation_revisions[&(operation.operation_id, operation.operation_revision)].1,
+            11
+        );
+        let mut conflicting_operation = operation;
+        conflicting_operation.operation_kind = OperationKind::Search;
+        assert_eq!(
+            state.apply_payload(
+                JournalPayload::OperationDerived(Box::new(conflicting_operation)),
+                31,
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
     }
 
     #[test]

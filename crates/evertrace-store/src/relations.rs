@@ -213,6 +213,19 @@ pub fn is_persisted_relation_kind(kind: &str) -> bool {
             | "support_contract_authorizes_revision"
             | "procedure_revision_successor"
             | "procedure_supports_revision"
+            | "procedure_usage_to_revision"
+            | "procedure_usage_to_task"
+            | "procedure_usage_to_workstream"
+            | "procedure_usage_to_exposure_episode"
+            | "procedure_usage_to_attempt"
+            | "procedure_usage_to_action_operation"
+            | "procedure_usage_to_verification_operation"
+            | "procedure_usage_to_binding_revision"
+            | "procedure_usage_to_scope_effect"
+            | "procedure_negative_to_usage"
+            | "procedure_negative_to_revision"
+            | "procedure_negative_to_task"
+            | "procedure_review_to_negative"
     )
 }
 
