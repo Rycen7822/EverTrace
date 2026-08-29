@@ -65,6 +65,9 @@ fn stable_launcher_performs_native_pretooluse_uds_issue_and_exact_rewrite() {
         recovery_max_bundle_bytes: 4 << 20,
         recovery_max_untracked_file_bytes: 1 << 20,
         recovery_max_untracked_total_bytes: 2 << 20,
+        recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+        recall_cue_adapter_manifest_id: None,
+        recall_cues: Vec::new(),
     };
     assert!(snapshot.spool_limits().is_ok_and(|limits| limits
         == SpoolLimits {

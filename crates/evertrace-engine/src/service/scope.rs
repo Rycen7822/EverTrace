@@ -2,8 +2,9 @@ use std::path::Path;
 
 use evertrace_codex::binding::{BindingAnchor, PublicWorkspace, valid_lexical_absolute_path};
 use evertrace_domain::{
-    ids::{RepositoryId, TaskId, WorkEpisodeId, WorkstreamId, WorktreeId},
+    ids::{ExecutionLaneId, RepositoryId, TaskId, WorkEpisodeId, WorkstreamId, WorktreeId},
     repository::{RepositoryInstance, WorktreeInstance, WorktreeLifecycle},
+    revision::RevisionId,
     work::{EpisodeLifecycle, LaneStatus, Task, TaskLifecycle, WorkEpisode, WorkstreamStatus},
 };
 use evertrace_store::{JournalPayload, ObjectRowKind, ProjectionSnapshot};
@@ -13,9 +14,12 @@ use super::{McpResolvedScope, McpScopeMechanism};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpQueryAnchor {
     pub mechanism: McpScopeMechanism,
+    pub session_id: Option<String>,
+    pub execution_lane_id: Option<ExecutionLaneId>,
     pub task_id: Option<TaskId>,
     pub workstream_id: Option<WorkstreamId>,
     pub episode_id: Option<WorkEpisodeId>,
+    pub episode_revision_id: Option<RevisionId>,
     pub repository_id: Option<RepositoryId>,
     pub worktree_id: Option<WorktreeId>,
     pub cwd_only: bool,
@@ -40,9 +44,12 @@ pub fn resolve_query_anchor(
         (None, McpScopeMechanism::Explicit, PublicWorkspace::Repository(id)) => {
             unique_repository(snapshot, *id).map(|_| McpQueryAnchor {
                 mechanism: McpScopeMechanism::Explicit,
+                session_id: None,
+                execution_lane_id: None,
                 task_id: None,
                 workstream_id: None,
                 episode_id: None,
+                episode_revision_id: None,
                 repository_id: Some(*id),
                 worktree_id: None,
                 cwd_only: false,
@@ -52,9 +59,12 @@ pub fn resolve_query_anchor(
             let worktree = unique_worktree(snapshot, *id)?;
             Some(McpQueryAnchor {
                 mechanism: McpScopeMechanism::Explicit,
+                session_id: None,
+                execution_lane_id: None,
                 task_id: None,
                 workstream_id: None,
                 episode_id: None,
+                episode_revision_id: None,
                 repository_id: Some(worktree.repository_instance_id),
                 worktree_id: Some(*id),
                 cwd_only: false,
@@ -135,21 +145,13 @@ fn exact_anchor(
     });
     let _task: Task = exactly_one(task)?;
     let episode_id = workstream.active_episode_id?;
-    let episodes = payloads(snapshot, "work_episode").filter_map(|payload| match payload {
-        JournalPayload::WorkEpisodeRecorded(value)
-            if value.episode_id == episode_id
-                && value.lifecycle_status == EpisodeLifecycle::Open
-                && value.task_id == workstream.task_id
-                && value.workstream_id == workstream.workstream_id
-                && value.execution_lane_ids.contains(&lane.execution_lane_id)
-                && value.session_ids.contains(&anchor.session_id) =>
-        {
-            Some(*value)
-        }
-        _ => None,
-    });
-    let episode: WorkEpisode = exactly_one(episodes)?;
-    if episode.repository_instance_id != workstream.repository_instance_id
+    let episode = current_episode(snapshot, episode_id)?;
+    if episode.lifecycle_status != EpisodeLifecycle::Open
+        || episode.task_id != workstream.task_id
+        || episode.workstream_id != workstream.workstream_id
+        || !episode.execution_lane_ids.contains(&lane.execution_lane_id)
+        || !episode.session_ids.contains(&anchor.session_id)
+        || episode.repository_instance_id != workstream.repository_instance_id
         || episode.worktree_instance_id != workstream.active_worktree_instance_id
     {
         return None;
@@ -165,13 +167,38 @@ fn exact_anchor(
     }
     Some(McpQueryAnchor {
         mechanism,
+        session_id: Some(anchor.session_id.clone()),
+        execution_lane_id: Some(lane.execution_lane_id),
         task_id: Some(workstream.task_id),
         workstream_id: Some(workstream.workstream_id),
         episode_id: Some(episode.episode_id),
+        episode_revision_id: Some(episode.revision_id),
         repository_id: workstream.repository_instance_id,
         worktree_id: workstream.active_worktree_instance_id,
         cwd_only: false,
     })
+}
+
+fn current_episode(
+    snapshot: &ProjectionSnapshot,
+    episode_id: evertrace_domain::ids::WorkEpisodeId,
+) -> Option<WorkEpisode> {
+    let mut current: Option<WorkEpisode> = None;
+    for episode in payloads(snapshot, "work_episode").filter_map(|payload| match payload {
+        JournalPayload::WorkEpisodeRecorded(value) if value.episode_id == episode_id => {
+            Some(*value)
+        }
+        _ => None,
+    }) {
+        match current.as_ref() {
+            Some(selected) if selected.revision_generation == episode.revision_generation => {
+                return None;
+            }
+            Some(selected) if selected.revision_generation > episode.revision_generation => {}
+            _ => current = Some(episode),
+        }
+    }
+    current
 }
 
 fn cwd_anchor(snapshot: &ProjectionSnapshot, cwd: &str) -> Option<McpQueryAnchor> {
@@ -196,9 +223,12 @@ fn cwd_anchor(snapshot: &ProjectionSnapshot, cwd: &str) -> Option<McpQueryAnchor
         unique_repository(snapshot, worktree.repository_instance_id)?;
         return Some(McpQueryAnchor {
             mechanism: McpScopeMechanism::CwdOnly,
+            session_id: None,
+            execution_lane_id: None,
             task_id: None,
             workstream_id: None,
             episode_id: None,
+            episode_revision_id: None,
             repository_id: Some(worktree.repository_instance_id),
             worktree_id: Some(worktree.worktree_instance_id),
             cwd_only: true,
@@ -215,9 +245,12 @@ fn cwd_anchor(snapshot: &ProjectionSnapshot, cwd: &str) -> Option<McpQueryAnchor
     let repository = exactly_one(repositories)?;
     Some(McpQueryAnchor {
         mechanism: McpScopeMechanism::CwdOnly,
+        session_id: None,
+        execution_lane_id: None,
         task_id: None,
         workstream_id: None,
         episode_id: None,
+        episode_revision_id: None,
         repository_id: Some(repository.repository_id),
         worktree_id: None,
         cwd_only: true,
@@ -693,5 +726,39 @@ mod tests {
         );
         anchor.agent_id = Some("missing-agent".into());
         assert!(resolve_query_anchor(&snapshot, &binding(anchor), "/cwd").is_none());
+    }
+
+    #[test]
+    fn exact_anchor_selects_current_episode_and_never_revives_an_open_predecessor() {
+        let (mut snapshot, anchor, _, _, _) = exact_fixture();
+        let payload = snapshot
+            .rows
+            .iter()
+            .find(|row| row.object_kind.as_deref() == Some("work_episode"))
+            .and_then(|row| row.payload_json.as_deref())
+            .and_then(|value| serde_json::from_str::<JournalPayload>(value).ok())
+            .unwrap();
+        let JournalPayload::WorkEpisodeRecorded(open) = payload else {
+            unreachable!()
+        };
+        let mut closed = (*open).clone();
+        closed.predecessor_revision_id = Some(open.revision_id);
+        closed.revision_id = RevisionId::new_v7();
+        closed.revision_generation += 1;
+        closed.lifecycle_status = EpisodeLifecycle::Closed;
+        closed.boundary_status = evertrace_domain::work::BoundaryStatus::Confirmed;
+        closed.confirmation_watermark = closed.source_watermark.max(1);
+        assert!(closed.validate().is_ok());
+        snapshot.rows.push(row(
+            "closed-episode-successor",
+            "work_episode",
+            JournalPayload::WorkEpisodeRecorded(Box::new(closed)),
+        ));
+        let binding = McpResolvedScope {
+            workspace: PublicWorkspace::Active,
+            anchor: Some(anchor),
+            mechanism: McpScopeMechanism::ExactClaim,
+        };
+        assert!(resolve_query_anchor(&snapshot, &binding, "/cwd").is_none());
     }
 }

@@ -284,6 +284,8 @@ digest_id!(WikiProjectionId, "wiki");
 digest_id!(CoreProjectionId, "core");
 uuid_id!(WorkArtifactId, "art");
 uuid_id!(DuplicateGroupId, "dup");
+uuid_id!(RecallNeedId, "need");
+uuid_id!(PresentationAttemptId, "present");
 digest_id!(CasId, "cas");
 internal_uuid_id!(CommandId);
 internal_uuid_id!(JobId);
@@ -328,6 +330,8 @@ impl_new_v7!(
     AtomId,
     RevisionProposalId,
     WorkArtifactId,
+    RecallNeedId,
+    PresentationAttemptId,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

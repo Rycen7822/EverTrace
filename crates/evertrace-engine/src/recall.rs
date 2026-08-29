@@ -2,15 +2,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use evertrace_domain::{
-    ids::{RepositoryId, TaskId, WorktreeId},
-    recall::{FutureCueContract, FutureCueDiagnostic, compile_atom_future_cue},
-    semantic::{AtomScope, ConstraintField, ConstraintState, ConstraintTruth},
+    ids::{ExecutionLaneId, RecallNeedId, RepositoryId, TaskId, WorkstreamId, WorktreeId},
+    recall::{
+        FutureCueContract, FutureCueDiagnostic, RecallAgentResponse, RecallDeliveryState,
+        RecallLedgerEvent, RecallNeed, RecallObligationState, RecallPlan, RecallTriggerState,
+        TriggerFamily, compile_atom_future_cue,
+    },
+    revision::RevisionId,
+    semantic::{
+        AtomScope, ConstraintBinding, ConstraintField, ConstraintState, ConstraintTruth,
+        ConstraintValue,
+    },
+    work::{CheckpointReason, CheckpointVerifierState, PhaseKind, WorkCheckpoint},
 };
 use evertrace_store::{
-    ObjectRowClass, StoreError,
+    JournalCommand, JournalEventDraft, JournalPayload, ObjectRowClass, StoreError,
     projections::{
         ProjectionSnapshot, RECALL_TRIGGER_INDEX_KIND, SemanticCurrentView, recall_trigger_contract,
     },
+};
+
+mod cue;
+mod detector;
+mod validation;
+pub use cue::{RecallCueError, RecallCueOutcome, RecallCueService};
+pub use detector::{RecallDetectionAnchor, spawn_recall_worker};
+pub(crate) use validation::{
+    RecallNeedValidity, revalidate_need, terminal_need_event, validate_need_against_current,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,9 +103,53 @@ pub struct RecallTriggerIndex {
     pub frontier: u64,
     pub entries: Vec<RecallTriggerEntry>,
     field_entries: BTreeMap<ConstraintField, Vec<usize>>,
+    contract_entries: BTreeMap<[u8; 32], usize>,
 }
 
 impl RecallTriggerIndex {
+    pub(crate) fn from_current_contexts(
+        frontier: u64,
+        contexts: &[evertrace_store::RecallCurrentContext],
+    ) -> Result<Self, StoreError> {
+        let mut by_id = BTreeMap::<[u8; 32], RecallTriggerEntry>::new();
+        let mut sources = BTreeSet::new();
+        for source in contexts.iter().flat_map(|context| context.atoms.iter()) {
+            let Ok(contract) = compile_atom_future_cue(&source.atom, true, source.source_event_seq)
+            else {
+                continue;
+            };
+            if let Some(existing) = by_id.get(&contract.future_cue_contract_id) {
+                if existing.contract != contract || existing.scope != source.atom.scope {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                continue;
+            }
+            if !sources.insert(contract.source_revision_id) {
+                return Err(StoreError::StoreCorrupt);
+            }
+            by_id.insert(
+                contract.future_cue_contract_id,
+                RecallTriggerEntry {
+                    contract,
+                    scope: source.atom.scope.clone(),
+                },
+            );
+        }
+        let entries = by_id.into_values().collect::<Vec<_>>();
+        let field_entries = field_entries(&entries);
+        let contract_entries = entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.contract.future_cue_contract_id, position))
+            .collect();
+        Ok(Self {
+            frontier,
+            entries,
+            field_entries,
+            contract_entries,
+        })
+    }
+
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
         let mut ids = BTreeSet::new();
         let mut sources = BTreeSet::new();
@@ -114,11 +176,23 @@ impl RecallTriggerIndex {
         }
         entries.sort_by_key(|entry| entry.contract.future_cue_contract_id);
         let field_entries = field_entries(&entries);
+        let contract_entries = entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.contract.future_cue_contract_id, position))
+            .collect();
         Ok(Self {
             frontier: snapshot.frontier,
             entries,
             field_entries,
+            contract_entries,
         })
+    }
+
+    pub(crate) fn entry(&self, contract_id: &[u8; 32]) -> Option<&RecallTriggerEntry> {
+        self.contract_entries
+            .get(contract_id)
+            .map(|position| &self.entries[*position])
     }
 
     pub fn evaluate(
@@ -232,10 +306,16 @@ mod tests {
 
     fn index(entries: Vec<RecallTriggerEntry>) -> RecallTriggerIndex {
         let field_entries = field_entries(&entries);
+        let contract_entries = entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.contract.future_cue_contract_id, position))
+            .collect();
         RecallTriggerIndex {
             frontier: 1,
             entries,
             field_entries,
+            contract_entries,
         }
     }
 
@@ -293,6 +373,11 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.future_cue_contract_id != [3; 32])
         );
+        assert_eq!(
+            index.entry(&[2; 32]).map(|entry| &entry.contract),
+            Some(&index.entries[1].contract)
+        );
+        assert!(index.entry(&[9; 32]).is_none());
 
         let previous = ConstraintState {
             bindings: vec![
@@ -334,5 +419,27 @@ mod tests {
             ],
         };
         assert!(index.evaluate(&invalid, None).is_empty());
+    }
+
+    #[test]
+    fn one_index_reuses_sorted_contract_lookup_across_anchors() {
+        let index = index(vec![
+            entry(
+                1,
+                ConstraintExpr::Exists {
+                    field: ConstraintField::Phase,
+                },
+            ),
+            entry(
+                2,
+                ConstraintExpr::Exists {
+                    field: ConstraintField::VerifierState,
+                },
+            ),
+        ]);
+        let first_anchor = index.entry(&[2; 32]).unwrap();
+        let second_anchor = index.entry(&[2; 32]).unwrap();
+        assert!(std::ptr::eq(first_anchor, second_anchor));
+        assert_eq!(first_anchor, &index.entries[1]);
     }
 }

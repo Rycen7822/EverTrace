@@ -17,6 +17,8 @@ pub struct RecoveryRuntimeSettings {
     pub max_bundle_bytes: u64,
     pub max_untracked_file_bytes: u64,
     pub max_untracked_total_bytes: u64,
+    pub recall_cue_gate: evertrace_capture::RecallCueGateMode,
+    pub recall_cue_adapter_manifest_id: Option<String>,
 }
 
 impl RecoveryRuntimeSettings {
@@ -45,6 +47,16 @@ impl RecoveryRuntimeSettings {
                     && value.manifest().validate().is_ok()
             })
             .map(|value| value.manifest().adapter_manifest_id.clone());
+        let recall_cue_manifest = report
+            .filter(|value| {
+                let receipt = value.active_search_due();
+                receipt.gate_kind() == evertrace_codex::GateKind::ActiveSearchDue
+                    && receipt.result() == evertrace_codex::GateResult::Enabled
+                    && receipt.reason() == evertrace_codex::GateReason::RequirementsSatisfied
+                    && receipt.adapter_manifest_revision() == value.manifest().adapter_manifest_id
+                    && value.manifest().validate().is_ok()
+            })
+            .map(|value| value.manifest().adapter_manifest_id.clone());
         Ok(Self {
             generation,
             effective_config_hash: config.hash(),
@@ -59,6 +71,12 @@ impl RecoveryRuntimeSettings {
             max_bundle_bytes: mib(recovery.max_bundle_mib)?,
             max_untracked_file_bytes: mib(recovery.max_untracked_file_mib)?,
             max_untracked_total_bytes: mib(recovery.max_untracked_total_mib)?,
+            recall_cue_gate: if recall_cue_manifest.is_some() {
+                evertrace_capture::RecallCueGateMode::Active
+            } else {
+                evertrace_capture::RecallCueGateMode::Disabled
+            },
+            recall_cue_adapter_manifest_id: recall_cue_manifest,
         })
     }
 }
@@ -111,6 +129,8 @@ pub fn publish_recovery_runtime(
             max_bundle_bytes: settings.max_bundle_bytes,
             max_untracked_file_bytes: settings.max_untracked_file_bytes,
             max_untracked_total_bytes: settings.max_untracked_total_bytes,
+            recall_cue_gate: settings.recall_cue_gate,
+            recall_cue_adapter_manifest_id: settings.recall_cue_adapter_manifest_id,
         },
     )
     .map_err(|_| RecoveryError::InvalidInput)?;

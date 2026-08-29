@@ -213,10 +213,20 @@ fn complete_evidence_enables_five_independent_gates_and_is_stable() {
     let runtime = RecoveryRuntimeSettings::compile(&config, Some(&first), 7).unwrap();
     assert_eq!(runtime.gate, evertrace_capture::RecoveryGateMode::Active);
     assert_eq!(
+        runtime.recall_cue_gate,
+        evertrace_capture::RecallCueGateMode::Active
+    );
+    assert_eq!(
         runtime.adapter_manifest_id.as_deref(),
         Some(first.manifest().adapter_manifest_id.as_str())
     );
     assert_eq!(runtime.effective_config_hash, config.hash());
+    let unprobed = RecoveryRuntimeSettings::compile(&config, None, 8).unwrap();
+    assert_eq!(
+        unprobed.recall_cue_gate,
+        evertrace_capture::RecallCueGateMode::Disabled
+    );
+    assert!(unprobed.recall_cue_adapter_manifest_id.is_none());
 }
 
 #[test]
@@ -344,6 +354,15 @@ fn breaking_each_gate_only_disables_that_gate() {
             report.project_policy(),
         ];
         assert_eq!(receipts[disabled_index].reason(), reason);
+        if disabled_index == 2 {
+            let config = EffectiveConfig::new(ConfigFile::default()).unwrap();
+            let runtime = RecoveryRuntimeSettings::compile(&config, Some(&report), 7).unwrap();
+            assert_eq!(
+                runtime.recall_cue_gate,
+                evertrace_capture::RecallCueGateMode::Disabled
+            );
+            assert!(runtime.recall_cue_adapter_manifest_id.is_none());
+        }
     }
 }
 

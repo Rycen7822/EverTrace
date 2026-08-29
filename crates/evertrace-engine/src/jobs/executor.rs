@@ -1,12 +1,12 @@
 use evertrace_store::{
-    CommitOutcome, JournalCommand, JournalWriter, ProjectionSnapshot,
+    CommitOutcome, JournalCommand, JournalWriter, ProjectionSnapshot, RecallCurrentContext,
     ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
     StoreError,
 };
 use std::path::Path;
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -25,6 +25,10 @@ enum WriterRequest {
     Project {
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
+    RecallCurrentContexts {
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<RecallCurrentContext>, WriterActorError>>,
+    },
     ReconciliationFrontier {
         limit: usize,
         reply: oneshot::Sender<Result<ReconciliationFrontier, WriterActorError>>,
@@ -42,9 +46,25 @@ enum WriterRequest {
 #[derive(Clone)]
 pub struct WriterHandle {
     sender: mpsc::Sender<WriterRequest>,
+    recall_frontier: watch::Sender<u64>,
 }
 
 impl WriterHandle {
+    pub fn subscribe_recall_frontier(&self) -> watch::Receiver<u64> {
+        self.recall_frontier.subscribe()
+    }
+
+    pub async fn recall_current_contexts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RecallCurrentContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::RecallCurrentContexts { limit, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
     pub async fn commit(
         &self,
         command: JournalCommand,
@@ -156,14 +176,23 @@ pub fn spawn_writer(
     if capacity == 0 {
         return Err(WriterActorError::InvalidInput);
     }
+    let frontier = writer.frontier();
     let (sender, receiver) = mpsc::channel(capacity);
-    let task = tokio::spawn(run_writer(writer, receiver));
-    Ok((WriterHandle { sender }, task))
+    let (recall_frontier, _) = watch::channel(frontier);
+    let task = tokio::spawn(run_writer(writer, receiver, recall_frontier.clone()));
+    Ok((
+        WriterHandle {
+            sender,
+            recall_frontier,
+        },
+        task,
+    ))
 }
 
 async fn run_writer(
     mut writer: JournalWriter,
     mut receiver: mpsc::Receiver<WriterRequest>,
+    recall_frontier: watch::Sender<u64>,
 ) -> Result<(), WriterActorError> {
     let mut shutdown_replies = Vec::new();
     while let Some(request) = receiver.recv().await {
@@ -177,6 +206,11 @@ async fn run_writer(
                     .commit(&command, ingested_at_us)
                     .await
                     .map_err(map_store_error);
+                let notify = result
+                    .as_ref()
+                    .ok()
+                    .filter(|_| recall_relevant(&command))
+                    .map(|outcome| outcome.last_seq);
                 let fatal = result.as_ref().err().copied().filter(|error| {
                     matches!(
                         error,
@@ -184,6 +218,9 @@ async fn run_writer(
                     )
                 });
                 let _ = reply.send(result);
+                if let Some(frontier) = notify {
+                    recall_frontier.send_replace(frontier);
+                }
                 if let Some(error) = fatal {
                     return Err(error);
                 }
@@ -198,6 +235,11 @@ async fn run_writer(
                     .commit_if_frontier(&command, ingested_at_us, expected_frontier)
                     .await
                     .map_err(map_store_error);
+                let notify = result
+                    .as_ref()
+                    .ok()
+                    .filter(|_| recall_relevant(&command))
+                    .map(|outcome| outcome.last_seq);
                 let fatal = result.as_ref().err().copied().filter(|error| {
                     matches!(
                         error,
@@ -205,6 +247,9 @@ async fn run_writer(
                     )
                 });
                 let _ = reply.send(result);
+                if let Some(frontier) = notify {
+                    recall_frontier.send_replace(frontier);
+                }
                 if let Some(error) = fatal {
                     return Err(error);
                 }
@@ -216,6 +261,12 @@ async fn run_writer(
                 if fatal {
                     return Err(WriterActorError::Store);
                 }
+            }
+            WriterRequest::RecallCurrentContexts { limit, reply } => {
+                let result = writer
+                    .recall_current_contexts(limit)
+                    .map_err(map_store_error);
+                let _ = reply.send(result);
             }
             WriterRequest::ReconciliationFrontier { limit, reply } => {
                 let result = writer
@@ -263,6 +314,22 @@ async fn run_writer(
         let _ = reply.send(());
     }
     Ok(())
+}
+
+fn recall_relevant(command: &JournalCommand) -> bool {
+    command.events().iter().any(|event| {
+        matches!(
+            event.payload,
+            evertrace_store::JournalPayload::TaskRecorded(_)
+                | evertrace_store::JournalPayload::WorkstreamRecorded(_)
+                | evertrace_store::JournalPayload::ExecutionLaneRecorded(_)
+                | evertrace_store::JournalPayload::WorkBindingRecorded(_)
+                | evertrace_store::JournalPayload::WorkEpisodeRecorded(_)
+                | evertrace_store::JournalPayload::WorkCheckpointRecorded(_)
+                | evertrace_store::JournalPayload::AtomRecorded(_)
+                | evertrace_store::JournalPayload::RecallLedgerRecorded(_)
+        )
+    })
 }
 
 fn map_store_error(error: StoreError) -> WriterActorError {

@@ -1,5 +1,6 @@
 use evertrace_domain::{
     ids::{RecoveryBundleId, RecoveryCaptureRequestId, RequestId, WorktreeId},
+    recall::{PresentationAttemptState, RecallCueSnapshot},
     repository::RecoveryApplicationKind,
     revision::RevisionId,
 };
@@ -22,6 +23,19 @@ pub enum Command {
     RequestRecovery(RequestRecoveryCommand),
     IssueMcpBinding(McpBindingIssueCommand),
     McpCall(McpCallCommand),
+    RecallCue(RecallCueCommand),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecallCueCommand {
+    Authorize {
+        snapshot: RecallCueSnapshot,
+    },
+    Outcome {
+        snapshot: RecallCueSnapshot,
+        outcome: PresentationAttemptState,
+    },
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]

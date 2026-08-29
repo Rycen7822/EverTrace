@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::spool::SpoolLimits;
 
-pub const RUNTIME_SNAPSHOT_VERSION: u16 = 2;
+pub const RUNTIME_SNAPSHOT_VERSION: u16 = 4;
 const SNAPSHOT_MAGIC: &[u8; 8] = b"ETRUN001";
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -35,6 +35,9 @@ pub struct RuntimeSnapshot {
     pub recovery_max_bundle_bytes: u64,
     pub recovery_max_untracked_file_bytes: u64,
     pub recovery_max_untracked_total_bytes: u64,
+    pub recall_cue_gate: RecallCueGateMode,
+    pub recall_cue_adapter_manifest_id: Option<String>,
+    pub recall_cues: Vec<evertrace_domain::recall::RecallCueSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +45,13 @@ pub struct RuntimeSnapshot {
 pub enum RecoveryGateMode {
     Disabled,
     BestEffort,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallCueGateMode {
+    Disabled,
     Active,
 }
 
@@ -55,6 +65,8 @@ pub struct RecoverySnapshotSettings {
     pub max_bundle_bytes: u64,
     pub max_untracked_file_bytes: u64,
     pub max_untracked_total_bytes: u64,
+    pub recall_cue_gate: RecallCueGateMode,
+    pub recall_cue_adapter_manifest_id: Option<String>,
 }
 
 impl fmt::Debug for RuntimeSnapshot {
@@ -111,6 +123,9 @@ impl RuntimeSnapshot {
             recovery_max_bundle_bytes: recovery.max_bundle_bytes,
             recovery_max_untracked_file_bytes: recovery.max_untracked_file_bytes,
             recovery_max_untracked_total_bytes: recovery.max_untracked_total_bytes,
+            recall_cue_gate: recovery.recall_cue_gate,
+            recall_cue_adapter_manifest_id: recovery.recall_cue_adapter_manifest_id,
+            recall_cues: Vec::new(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -154,8 +169,35 @@ impl RuntimeSnapshot {
             || self.recovery_max_untracked_total_bytes > self.recovery_max_bundle_bytes
             || (self.recovery_gate == RecoveryGateMode::Active)
                 != self.recovery_adapter_manifest_id.is_some()
+            || (self.recall_cue_gate == RecallCueGateMode::Active)
+                != self.recall_cue_adapter_manifest_id.is_some()
+            || self.recall_cues.len() > 32
+            || self.recall_cues.iter().any(|cue| {
+                !cue.validate()
+                    || cue.runtime_generation != self.generation
+                    || Some(cue.adapter_manifest_id.as_str())
+                        != self.recall_cue_adapter_manifest_id.as_deref()
+            })
+            || self.recall_cues.windows(2).any(|pair| {
+                pair[0]
+                    .session_id
+                    .cmp(&pair[1].session_id)
+                    .then(pair[0].execution_lane_id.cmp(&pair[1].execution_lane_id))
+                    .then(
+                        pair[0]
+                            .presentation_attempt_id
+                            .cmp(&pair[1].presentation_attempt_id),
+                    )
+                    .is_ge()
+            })
             || self
                 .recovery_adapter_manifest_id
+                .as_deref()
+                .is_some_and(|value| {
+                    value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+                })
+            || self
+                .recall_cue_adapter_manifest_id
                 .as_deref()
                 .is_some_and(|value| {
                     value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
@@ -329,6 +371,32 @@ fn encode_snapshot(value: &RuntimeSnapshot) -> Result<Vec<u8>, RuntimeSnapshotEr
     bytes.extend_from_slice(&value.recovery_max_bundle_bytes.to_be_bytes());
     bytes.extend_from_slice(&value.recovery_max_untracked_file_bytes.to_be_bytes());
     bytes.extend_from_slice(&value.recovery_max_untracked_total_bytes.to_be_bytes());
+    bytes.push(match value.recall_cue_gate {
+        RecallCueGateMode::Disabled => 0,
+        RecallCueGateMode::Active => 1,
+    });
+    match &value.recall_cue_adapter_manifest_id {
+        None => bytes.extend_from_slice(&0_u16.to_be_bytes()),
+        Some(value) => {
+            let length = u16::try_from(value.len()).map_err(|_| RuntimeSnapshotError::Invalid)?;
+            bytes.extend_from_slice(&length.to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+    }
+    bytes.extend_from_slice(
+        &u16::try_from(value.recall_cues.len())
+            .map_err(|_| RuntimeSnapshotError::Invalid)?
+            .to_be_bytes(),
+    );
+    for cue in &value.recall_cues {
+        let encoded = serde_json::to_vec(cue).map_err(|_| RuntimeSnapshotError::Invalid)?;
+        bytes.extend_from_slice(
+            &u32::try_from(encoded.len())
+                .map_err(|_| RuntimeSnapshotError::Invalid)?
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(&encoded);
+    }
     Ok(bytes)
 }
 
@@ -372,6 +440,32 @@ fn decode_snapshot(bytes: &[u8]) -> Result<RuntimeSnapshot, RuntimeSnapshotError
     let recovery_max_bundle_bytes = cursor.u64()?;
     let recovery_max_untracked_file_bytes = cursor.u64()?;
     let recovery_max_untracked_total_bytes = cursor.u64()?;
+    let recall_cue_gate = match cursor.take(1)?[0] {
+        0 => RecallCueGateMode::Disabled,
+        1 => RecallCueGateMode::Active,
+        _ => return Err(RuntimeSnapshotError::Invalid),
+    };
+    let cue_manifest_length = usize::from(cursor.u16()?);
+    let recall_cue_adapter_manifest_id = if cue_manifest_length == 0 {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(cursor.take(cue_manifest_length)?)
+                .map_err(|_| RuntimeSnapshotError::Invalid)?
+                .to_owned(),
+        )
+    };
+    let cue_count = usize::from(cursor.u16()?);
+    if cue_count > 32 {
+        return Err(RuntimeSnapshotError::Invalid);
+    }
+    let mut recall_cues = Vec::with_capacity(cue_count);
+    for _ in 0..cue_count {
+        let length = usize::try_from(cursor.u32()?).map_err(|_| RuntimeSnapshotError::Invalid)?;
+        let cue = serde_json::from_slice(cursor.take(length)?)
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        recall_cues.push(cue);
+    }
     if !cursor.remaining.is_empty() {
         return Err(RuntimeSnapshotError::Invalid);
     }
@@ -394,6 +488,9 @@ fn decode_snapshot(bytes: &[u8]) -> Result<RuntimeSnapshot, RuntimeSnapshotError
         recovery_max_bundle_bytes,
         recovery_max_untracked_file_bytes,
         recovery_max_untracked_total_bytes,
+        recall_cue_gate,
+        recall_cue_adapter_manifest_id,
+        recall_cues,
     })
 }
 
@@ -451,4 +548,70 @@ fn current_uid() -> Result<u32, RuntimeSnapshotError> {
 
 fn map_io(_: io::Error) -> RuntimeSnapshotError {
     RuntimeSnapshotError::Io
+}
+
+#[cfg(test)]
+mod tests {
+    use evertrace_domain::{
+        ids::{ExecutionLaneId, PresentationAttemptId},
+        recall::RecallCueSnapshot,
+    };
+
+    use super::*;
+
+    fn active_snapshot() -> RuntimeSnapshot {
+        RuntimeSnapshot::for_data_dir(
+            Path::new("/tmp/evertrace-runtime-snapshot-test"),
+            7,
+            SpoolLimits {
+                high_watermark_bytes: 1024,
+                low_watermark_bytes: 512,
+                max_main_files: 4,
+                emergency_slots: 2,
+            },
+            RecoverySnapshotSettings {
+                gate: RecoveryGateMode::Disabled,
+                preflight_timeout_ms: 100,
+                effective_config_hash: [7; 32],
+                adapter_manifest_id: None,
+                classifier_revision: 1,
+                max_bundle_bytes: 4096,
+                max_untracked_file_bytes: 1024,
+                max_untracked_total_bytes: 2048,
+                recall_cue_gate: RecallCueGateMode::Active,
+                recall_cue_adapter_manifest_id: Some("adapter:s22".into()),
+            },
+        )
+        .unwrap()
+    }
+
+    fn cue(session_id: &str) -> RecallCueSnapshot {
+        RecallCueSnapshot {
+            session_id: session_id.into(),
+            execution_lane_id: ExecutionLaneId::new_v7(),
+            host_lane_key: format!("lane:{session_id}"),
+            adapter_manifest_id: "adapter:s22".into(),
+            runtime_generation: 7,
+            recall_need_hash: [8; 32],
+            presentation_attempt_id: PresentationAttemptId::new_v7(),
+            expires_at_us: i64::MAX,
+            checksum: [0; 32],
+        }
+        .seal()
+        .unwrap()
+    }
+
+    #[test]
+    fn recall_cues_round_trip_and_enforce_order_uniqueness_and_limit() {
+        let mut snapshot = active_snapshot();
+        snapshot.recall_cues = vec![cue("a"), cue("b")];
+        snapshot.validate().unwrap();
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        assert_eq!(decode_snapshot(&encoded).unwrap(), snapshot);
+
+        snapshot.recall_cues.swap(0, 1);
+        assert_eq!(snapshot.validate(), Err(RuntimeSnapshotError::Invalid));
+        snapshot.recall_cues = (0..33).map(|index| cue(&format!("s{index:02}"))).collect();
+        assert_eq!(snapshot.validate(), Err(RuntimeSnapshotError::Invalid));
+    }
 }

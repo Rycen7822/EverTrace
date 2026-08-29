@@ -8,6 +8,7 @@ use evertrace_domain::{
         SourceRevisionMode,
     },
     ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
+    recall::RecallLedgerEvent,
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
         RecoveryRequestStatus, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
@@ -522,6 +523,7 @@ pub enum JournalPayload {
     WorkArtifactRecorded(Box<WorkArtifact>),
     AtomRecorded(Box<Atom>),
     RevisionProposalRecorded(Box<RevisionProposal>),
+    RecallLedgerRecorded(Box<RecallLedgerEvent>),
 }
 
 impl JournalPayload {
@@ -571,6 +573,7 @@ impl JournalPayload {
             Self::WorkArtifactRecorded(_) => "work_artifact_recorded_v1",
             Self::AtomRecorded(_) => ATOM_RECORDED_EVENT_TYPE,
             Self::RevisionProposalRecorded(_) => "revision_proposal_recorded_v1",
+            Self::RecallLedgerRecorded(_) => "recall_ledger_recorded_v1",
         }
     }
 
@@ -610,7 +613,8 @@ impl JournalPayload {
             | Self::ResultEvidenceRecorded(_)
             | Self::WorkArtifactRecorded(_)
             | Self::AtomRecorded(_)
-            | Self::RevisionProposalRecorded(_) => RecordClass::ObjectEvent,
+            | Self::RevisionProposalRecorded(_)
+            | Self::RecallLedgerRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -766,6 +770,13 @@ impl JournalPayload {
             Self::RevisionProposalRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
+            Self::RecallLedgerRecorded(value) => {
+                if value.validate() {
+                    Ok(())
+                } else {
+                    Err(StoreError::InvalidInput)
+                }
+            }
         }
     }
 
@@ -917,6 +928,7 @@ impl JournalPayload {
             Self::RevisionProposalRecorded(value) => {
                 tagged_json("revision_proposal_recorded", value)
             }
+            Self::RecallLedgerRecorded(value) => tagged_json("recall_ledger_recorded", value),
         }
     }
 

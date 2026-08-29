@@ -136,7 +136,9 @@ impl LocalServer {
                 Command::Health => health_handler().map(Response::Health),
                 Command::RecoveryBarrier(_) => Err(ErrorCode::InvalidInput),
                 Command::RequestRecovery(_) => Err(ErrorCode::InvalidInput),
-                Command::IssueMcpBinding(_) | Command::McpCall(_) => Err(ErrorCode::InvalidInput),
+                Command::IssueMcpBinding(_) | Command::McpCall(_) | Command::RecallCue(_) => {
+                    Err(ErrorCode::InvalidInput)
+                }
             })
         })
         .await
@@ -601,7 +603,8 @@ pub async fn request_health(
             Response::RecoveryTerminal(_)
             | Response::RecoveryAction(_)
             | Response::McpBindingIssued(_)
-            | Response::McpResult(_) => Err(ProtocolError::UnexpectedMessage),
+            | Response::McpResult(_)
+            | Response::RecallCue(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
@@ -671,7 +674,8 @@ pub async fn request_recovery(
             Response::Health(_)
             | Response::RecoveryTerminal(_)
             | Response::McpBindingIssued(_)
-            | Response::McpResult(_) => Err(ProtocolError::UnexpectedMessage),
+            | Response::McpResult(_)
+            | Response::RecallCue(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
@@ -855,6 +859,113 @@ pub fn request_mcp_binding_sync(
         }
         envelope::ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
             Err(SyncProtocolError::Wire)
+        }
+        _ => Err(SyncProtocolError::InvalidResponse),
+    }
+}
+
+#[cfg(unix)]
+pub fn request_recall_cue_sync<F>(
+    socket_path: &Path,
+    build_id: &str,
+    snapshot: evertrace_domain::recall::RecallCueSnapshot,
+    timeout_limit: Duration,
+    emit: F,
+) -> Result<bool, error::SyncProtocolError>
+where
+    F: FnOnce(
+        &evertrace_domain::recall::RecallCueSnapshot,
+    ) -> evertrace_domain::recall::PresentationAttemptState,
+{
+    use error::SyncProtocolError;
+    use frame::{read_frame_sync, write_frame_sync};
+
+    if !snapshot.validate() {
+        return Err(SyncProtocolError::InvalidInput);
+    }
+    let SyncHookConnection {
+        mut stream,
+        deadline,
+        socket_identity,
+        negotiated_max: negotiated,
+    } = connect_sync_hook(socket_path, build_id, timeout_limit)?;
+    let request_id = evertrace_domain::ids::RequestId::new_v7();
+    set_sync_deadline(&stream, deadline)?;
+    write_frame_sync(
+        &mut stream,
+        &envelope::ClientEnvelope::Command(command::CommandEnvelope {
+            request_id,
+            command: command::Command::RecallCue(command::RecallCueCommand::Authorize {
+                snapshot: snapshot.clone(),
+            }),
+        }),
+        negotiated,
+    )
+    .map_err(map_sync_frame_error)?;
+    set_sync_deadline(&stream, deadline)?;
+    match read_frame_sync::<envelope::ServerEnvelope>(&mut stream, negotiated)
+        .map_err(map_sync_frame_error)?
+    {
+        envelope::ServerEnvelope::Response(value) if value.request_id == request_id => {
+            match value.response {
+                response::Response::RecallCue(response::RecallCueResponse::Authorized) => {}
+                _ => return Err(SyncProtocolError::InvalidResponse),
+            }
+        }
+        envelope::ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
+            return Err(SyncProtocolError::NotAdmitted);
+        }
+        _ => return Err(SyncProtocolError::InvalidResponse),
+    }
+    if checked_sync_socket(socket_path)? != socket_identity {
+        return Err(SyncProtocolError::Connect);
+    }
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| SyncProtocolError::InvalidResponse)?
+        .as_micros();
+    let not_expired = i64::try_from(now_us)
+        .ok()
+        .is_some_and(|now| snapshot.expires_at_us > now);
+    let outcome = if not_expired {
+        emit(&snapshot)
+    } else {
+        evertrace_domain::recall::PresentationAttemptState::FailedPreEmit
+    };
+    if !matches!(
+        outcome,
+        evertrace_domain::recall::PresentationAttemptState::Emitted
+            | evertrace_domain::recall::PresentationAttemptState::FailedPreEmit
+            | evertrace_domain::recall::PresentationAttemptState::PresentationUnknown
+    ) {
+        return Err(SyncProtocolError::InvalidInput);
+    }
+    let emitted = outcome == evertrace_domain::recall::PresentationAttemptState::Emitted;
+    let outcome_id = evertrace_domain::ids::RequestId::new_v7();
+    set_sync_deadline(&stream, deadline)?;
+    write_frame_sync(
+        &mut stream,
+        &envelope::ClientEnvelope::Command(command::CommandEnvelope {
+            request_id: outcome_id,
+            command: command::Command::RecallCue(command::RecallCueCommand::Outcome {
+                snapshot,
+                outcome,
+            }),
+        }),
+        negotiated,
+    )
+    .map_err(map_sync_frame_error)?;
+    set_sync_deadline(&stream, deadline)?;
+    match read_frame_sync::<envelope::ServerEnvelope>(&mut stream, negotiated)
+        .map_err(map_sync_frame_error)?
+    {
+        envelope::ServerEnvelope::Response(value) if value.request_id == outcome_id => {
+            match value.response {
+                response::Response::RecallCue(response::RecallCueResponse::OutcomeAccepted) => {
+                    Ok(emitted)
+                }
+                _ => Err(SyncProtocolError::InvalidResponse),
+            }
         }
         _ => Err(SyncProtocolError::InvalidResponse),
     }

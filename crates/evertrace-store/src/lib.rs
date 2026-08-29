@@ -25,11 +25,12 @@ pub use objects::{
 };
 pub use projections::{
     AttemptCurrentView, EpisodeCurrentView, NamedCurrentDependency, OperationBurstCurrentView,
-    ProjectionSnapshot, ProjectionWorker, ReconciliationArtifactContext,
-    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
-    ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
-    RecoveryEvidenceCurrentView, SegmentationCurrentState, SegmentationCurrentView,
-    SemanticCurrentView, WorkBindingCurrentView, WorkIdentityCurrentView, reduce_journal,
+    ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom, RecallCurrentContext,
+    ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
+    ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
+    ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
+    SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView,
+    WorkIdentityCurrentView, reduce_journal,
 };
 pub use query::{L0002ProjectionSnapshot, derive_l0002_projections, object_projection_hash};
 pub use relations::{

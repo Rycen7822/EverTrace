@@ -177,6 +177,8 @@ fn recovery_runtime(root: &std::path::Path) -> RuntimeSnapshot {
             max_bundle_bytes: 4 << 20,
             max_untracked_file_bytes: 1 << 20,
             max_untracked_total_bytes: 2 << 20,
+            recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+            recall_cue_adapter_manifest_id: None,
         },
     )
     .unwrap()

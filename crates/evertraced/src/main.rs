@@ -5,21 +5,22 @@ use std::{env, fs, path::PathBuf, sync::Arc};
 
 use evertrace_engine::{
     EngineService, HealthDispatchError, McpActionService, McpBindingAuthority, McpBindingIssue,
-    McpServiceAction, McpServiceRequest, McpServiceResult, McpServiceStatus, RecoveryActionOutcome,
-    RecoveryActionService, RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService,
-    RecoveryError, RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason,
-    RuntimeMode, open_writer, publish_recovery_runtime, spawn_writer,
+    McpServiceAction, McpServiceRequest, McpServiceResult, McpServiceStatus, RecallCueOutcome,
+    RecallCueService, RecoveryActionOutcome, RecoveryActionService,
+    RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
+    RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason, RuntimeMode,
+    open_writer, publish_recovery_runtime, recall::spawn_recall_worker, spawn_writer,
 };
 use evertrace_protocol::{
     LocalServer, ServerOptions,
-    command::Command as ProtocolCommand,
+    command::{Command as ProtocolCommand, RecallCueCommand},
     dto::{ClientKind, HealthMode, PROTOCOL_VERSION},
     envelope::{McpItem, McpItems, McpResultEnvelope, McpStatus},
     error::ErrorCode,
     resolve_data_dir,
     response::{
-        HealthResponse, McpBindingIssuedResponse, RecoveryActionResponse, RecoveryTerminalResponse,
-        RecoveryUnsupportedReason, Response,
+        HealthResponse, McpBindingIssuedResponse, RecallCueResponse, RecoveryActionResponse,
+        RecoveryTerminalResponse, RecoveryUnsupportedReason, Response,
     },
 };
 use tokio::sync::watch;
@@ -47,6 +48,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_snapshot = publish_recovery_runtime(&data_dir, engine.effective_config(), None)?;
     let writer = open_writer(&data_dir).await?;
     let (writer_handle, mut writer_task) = spawn_writer(writer, 64)?;
+    let mut recall_worker = spawn_recall_worker(
+        writer_handle.clone(),
+        runtime_snapshot.clone(),
+        data_dir.clone(),
+    );
     let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
     let mcp_service = McpActionService::open(
         mcp_bindings.clone(),
@@ -57,6 +63,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let recovery_service =
         RecoveryBarrierService::new(runtime_snapshot.clone(), writer_handle.clone());
+    let recall_cue_service = RecallCueService::new(
+        writer_handle.clone(),
+        runtime_snapshot.recall_cue_gate,
+        runtime_snapshot.recall_cue_adapter_manifest_id.clone(),
+        runtime_snapshot.generation,
+        runtime_snapshot.effective_config_hash,
+        &data_dir,
+    );
     let recovery_action_service = RecoveryActionService::new(
         runtime_snapshot,
         writer_handle.clone(),
@@ -90,6 +104,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let recovery_action_service = handler_recovery_action_service.clone();
             let mcp_bindings = handler_mcp_bindings.clone();
             let mcp_service = handler_mcp_service.clone();
+            let recall_cue_service = recall_cue_service.clone();
             async move {
                 match command {
                     ProtocolCommand::Health => {
@@ -202,6 +217,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .map_err(|_| ErrorCode::Internal)?;
                         Ok(Response::McpResult(Box::new(map_mcp_result(result))))
                     }
+                    ProtocolCommand::RecallCue(command) => {
+                        if context.client_kind != ClientKind::Hook {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        let outcome = match command {
+                            RecallCueCommand::Authorize { snapshot } => {
+                                recall_cue_service.authorize(&snapshot).await
+                            }
+                            RecallCueCommand::Outcome { snapshot, outcome } => {
+                                recall_cue_service.outcome(&snapshot, outcome).await
+                            }
+                        }
+                        .map_err(|_| ErrorCode::Untrusted)?;
+                        Ok(Response::RecallCue(match outcome {
+                            RecallCueOutcome::Authorized => RecallCueResponse::Authorized,
+                            RecallCueOutcome::OutcomeAccepted => RecallCueResponse::OutcomeAccepted,
+                        }))
+                    }
                 }
             }
         },
@@ -210,6 +243,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut task => {
             let server_result = result;
             recovery_action_service.shutdown_and_drain().await;
+            recall_worker.abort();
+            let _ = (&mut recall_worker).await;
             if let Some(handle) = writer_handle.take() {
                 handle.shutdown().await?;
             }
@@ -220,15 +255,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut writer_task => {
             let _ = shutdown_tx.send(true);
             recovery_action_service.shutdown_and_drain().await;
+            recall_worker.abort();
+            let _ = (&mut recall_worker).await;
             task.await??;
             result??;
             Err("writer stopped unexpectedly".into())
+        }
+        result = &mut recall_worker => {
+            let _ = shutdown_tx.send(true);
+            recovery_action_service.shutdown_and_drain().await;
+            task.await??;
+            if let Some(handle) = writer_handle.take() {
+                handle.shutdown().await?;
+            }
+            writer_task.await??;
+            result?;
+            Err("recall worker stopped unexpectedly".into())
         }
         signal = wait_for_signal() => {
             signal?;
             let _ = shutdown_tx.send(true);
             recovery_action_service.shutdown_and_drain().await;
             task.await??;
+            recall_worker.abort();
+            let _ = (&mut recall_worker).await;
             if let Some(handle) = writer_handle.take() {
                 handle.shutdown().await?;
             }

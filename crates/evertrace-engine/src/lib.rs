@@ -23,6 +23,7 @@ pub use jobs::{
     expired_leases, open_writer, pending_dirty, pending_outbox, spawn_writer,
 };
 pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
+pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};
 pub use recovery::*;
 pub use service::{
     EngineError, EngineService, HealthDispatchError, HealthSnapshot, McpActionService,
