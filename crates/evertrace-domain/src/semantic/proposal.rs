@@ -4,6 +4,7 @@ use crate::{
     canonical::{CanonicalValue, sha256},
     evidence::hex,
     ids::{AtomId, CoreMembershipId, ProcedureId, RevisionProposalId},
+    procedure::{ProcedureAutoFullAudit, ProcedureDraft},
     revision::RevisionId,
 };
 
@@ -174,11 +175,34 @@ impl AtomProposalPayload {
 )]
 pub enum ProposalPayload {
     Atom(Box<AtomProposalPayload>),
+    Procedure(Box<ProcedureProposalPayload>),
     CoreMembership(Box<CoreMembershipProposalPayload>),
     ReservedTarget {
         schema_version: u32,
         summary: String,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProcedureProposalPayload {
+    Create { draft: ProcedureDraft },
+    Replace { draft: ProcedureDraft },
+}
+
+impl ProcedureProposalPayload {
+    pub const fn operation(&self) -> ProposalOperation {
+        match self {
+            Self::Create { .. } => ProposalOperation::Create,
+            Self::Replace { .. } => ProposalOperation::Replace,
+        }
+    }
+
+    pub fn draft(&self) -> &ProcedureDraft {
+        match self {
+            Self::Create { draft } | Self::Replace { draft } => draft,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -199,6 +223,7 @@ impl ProposalPayload {
     fn validate(&self, target_kind: ProposalTargetKind) -> Result<(), SemanticError> {
         match (target_kind, self) {
             (ProposalTargetKind::Atom, Self::Atom(payload)) => payload.validate(),
+            (ProposalTargetKind::Procedure, Self::Procedure(payload)) => payload.draft().validate(),
             (ProposalTargetKind::CoreMembership, Self::CoreMembership(payload)) => {
                 if matches!(payload.as_ref(), CoreMembershipProposalPayload::ResolveConflict { left_atom_revision_id, right_atom_revision_id, .. } if left_atom_revision_id == right_atom_revision_id)
                 {
@@ -208,7 +233,7 @@ impl ProposalPayload {
                 }
             }
             (
-                ProposalTargetKind::Procedure | ProposalTargetKind::CoreMembership,
+                ProposalTargetKind::CoreMembership,
                 Self::ReservedTarget {
                     schema_version: 1,
                     summary,
@@ -319,6 +344,12 @@ pub enum AcceptedProposalTarget {
         core_membership_id: CoreMembershipId,
         membership_revision_id: RevisionId,
     },
+    Procedure {
+        procedure_id: ProcedureId,
+        procedure_revision_id: RevisionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_full_audit: Option<Box<ProcedureAutoFullAudit>>,
+    },
 }
 
 impl ProposalAcceptance {
@@ -329,7 +360,8 @@ impl ProposalAcceptance {
                 atom_revision_id,
                 structure_hash,
             } => Some((atom_id, atom_revision_id, structure_hash)),
-            AcceptedProposalTarget::CoreMembership { .. } => None,
+            AcceptedProposalTarget::CoreMembership { .. }
+            | AcceptedProposalTarget::Procedure { .. } => None,
         }
     }
 }
@@ -412,6 +444,8 @@ impl RevisionProposal {
     fn validate_shape(&self) -> Result<(), SemanticError> {
         match (&self.payload, self.operation) {
             (ProposalPayload::Atom(payload), operation) if payload.operation() == operation => {}
+            (ProposalPayload::Procedure(payload), operation)
+                if payload.operation() == operation => {}
             (ProposalPayload::CoreMembership(_), ProposalOperation::Create) => {}
             (ProposalPayload::ReservedTarget { .. }, _) => {}
             _ => return Err(SemanticError::InvalidProposal),
@@ -467,6 +501,9 @@ impl RevisionProposal {
                 ) | (
                     ProposalTargetKind::CoreMembership,
                     AcceptedProposalTarget::CoreMembership { .. }
+                ) | (
+                    ProposalTargetKind::Procedure,
+                    AcceptedProposalTarget::Procedure { .. }
                 )
             );
             if !target_matches

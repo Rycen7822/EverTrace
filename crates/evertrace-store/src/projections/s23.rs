@@ -41,6 +41,28 @@ impl S23State {
             .max_by_key(|state| support_state_rank(state))
     }
 
+    pub(super) fn successor_support_states(&self) -> BTreeMap<String, &'static str> {
+        let mut states: BTreeMap<String, &'static str> = BTreeMap::new();
+        for (contract, _) in self.contracts.values() {
+            let Some((validation, _)) = self
+                .current_validations
+                .get(&contract.support_contract_revision_id)
+            else {
+                continue;
+            };
+            let candidate = support_state(validation.state);
+            states
+                .entry(contract.successor_revision_or_membership_ref.clone())
+                .and_modify(|current| {
+                    if support_state_rank(candidate) > support_state_rank(current) {
+                        *current = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+        states
+    }
+
     fn atom_support_validations(
         &self,
         revision_id: RevisionId,
@@ -152,6 +174,7 @@ impl S23State {
         &self,
         atom_revisions: &BTreeMap<RevisionId, (Atom, u64)>,
         proposal_revisions: &BTreeMap<RevisionId, (RevisionProposal, u64)>,
+        procedures: &super::procedure::ProcedureState,
     ) -> Result<(), StoreError> {
         for (membership, _) in self.memberships.values() {
             let atom = atom_revisions
@@ -228,7 +251,8 @@ impl S23State {
                 .any(|value| value.to_string() == contract.successor_revision_or_membership_ref)
                 || self.membership_revisions.keys().any(|value| {
                     value.to_string() == contract.successor_revision_or_membership_ref
-                });
+                })
+                || procedures.contains_revision_ref(&contract.successor_revision_or_membership_ref);
             if !target_exists
                 || !self
                     .current_validations
@@ -747,6 +771,27 @@ mod tests {
 
     use super::*;
 
+    fn support_contract(
+        contract_id: RevisionId,
+        successor_ref: &str,
+    ) -> GlobalSuccessorSupportContract {
+        GlobalSuccessorSupportContract {
+            support_contract_revision_id: contract_id,
+            successor_revision_or_membership_ref: successor_ref.into(),
+            support_revision_refs: vec![RevisionId::new_v7()],
+            authorization_revision_refs: vec![RevisionId::new_v7()],
+            evidence_cohort_hash: [1; 32],
+            support_threshold_snapshot: SupportThresholdSnapshot {
+                minimum_surviving_support: 1,
+                require_authorization: true,
+            },
+            promotion_proposal_revision_id: RevisionId::new_v7(),
+            promotion_validator_revision: 1,
+            applicability_contract_hash: [2; 32],
+            created_at_us: 1,
+        }
+    }
+
     #[test]
     fn reducer_rejects_unknown_or_omitted_terminal_support_partitions() {
         let support = RevisionId::new_v7();
@@ -926,5 +971,49 @@ mod tests {
                 GlobalSupportState::Invalidated,
             ),
         );
+    }
+
+    #[test]
+    fn successor_support_states_builds_one_worst_state_lookup() {
+        let successor_ref = RevisionId::new_v7().to_string();
+        let valid_contract_id = RevisionId::new_v7();
+        let invalid_contract_id = RevisionId::new_v7();
+        let mut state = S23State::default();
+        state.contracts.insert(
+            valid_contract_id,
+            (support_contract(valid_contract_id, &successor_ref), 1),
+        );
+        state.contracts.insert(
+            invalid_contract_id,
+            (support_contract(invalid_contract_id, &successor_ref), 2),
+        );
+        let validation = |contract_id, support_state| GlobalSupportValidationEvent {
+            validation_revision_id: RevisionId::new_v7(),
+            support_contract_ref: contract_id,
+            successor_ref: successor_ref.clone(),
+            dependency_generation: 1,
+            state: support_state,
+            provenance_degraded: false,
+            surviving_support_refs: Vec::new(),
+            invalid_or_missing_refs: Vec::new(),
+            trigger_refs: Vec::new(),
+            validator_revision: 1,
+            created_at_us: 1,
+        };
+        state.current_validations.insert(
+            valid_contract_id,
+            (validation(valid_contract_id, GlobalSupportState::Valid), 3),
+        );
+        state.current_validations.insert(
+            invalid_contract_id,
+            (
+                validation(invalid_contract_id, GlobalSupportState::Invalidated),
+                4,
+            ),
+        );
+
+        let lookup = state.successor_support_states();
+        assert_eq!(lookup.len(), 1);
+        assert_eq!(lookup.get(&successor_ref), Some(&"invalidated"));
     }
 }

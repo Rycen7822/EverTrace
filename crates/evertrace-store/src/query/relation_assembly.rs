@@ -373,6 +373,8 @@ pub(super) fn add_semantic(
             SemanticRelationKind::SupportContractAuthorizesRevision => {
                 "support_contract_authorizes_revision"
             }
+            SemanticRelationKind::ProcedureRevisionSuccessor => "procedure_revision_successor",
+            SemanticRelationKind::ProcedureSupportsRevision => "procedure_supports_revision",
         };
         out.insert(RelationProjectionRow::edge(
             kind,

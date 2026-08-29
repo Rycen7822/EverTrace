@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod evidence;
 pub mod ids;
+pub mod procedure;
 pub mod query;
 pub mod recall;
 pub mod repository;

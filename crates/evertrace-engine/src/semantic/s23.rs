@@ -54,12 +54,31 @@ pub(crate) fn global_atom_support_payloads(
     {
         return Err(SemanticServiceError::InvalidInput);
     }
-    let support_contract_ref = RevisionId::new_v7();
     let support_refs = atom.supports_revision_refs.clone();
-    if support_refs.is_empty() || support_refs.contains(&atom.revision_id) {
+    validate_current_support_refs(view, &support_refs, atom.revision_id)?;
+    global_support_payloads(
+        atom.revision_id.to_string(),
+        support_refs,
+        proposal,
+        serde_json::to_string(&atom.applicability_expr)
+            .map_err(|_| SemanticServiceError::InvalidInput)?,
+        SupportThresholdSnapshot {
+            minimum_surviving_support: 1,
+            require_authorization: true,
+        },
+        occurred_at_us,
+    )
+}
+
+pub(crate) fn validate_current_support_refs(
+    view: &SemanticCurrentView,
+    support_refs: &[RevisionId],
+    successor: RevisionId,
+) -> Result<(), SemanticServiceError> {
+    if support_refs.is_empty() || support_refs.contains(&successor) {
         return Err(SemanticServiceError::InvalidInput);
     }
-    for support_ref in &support_refs {
+    for support_ref in support_refs {
         let support = view
             .atom_revisions
             .get(support_ref)
@@ -73,25 +92,37 @@ pub(crate) fn global_atom_support_payloads(
             return Err(SemanticServiceError::InvalidInput);
         }
     }
+    Ok(())
+}
+
+pub(crate) fn global_support_payloads(
+    successor_ref: String,
+    support_refs: Vec<RevisionId>,
+    proposal: &RevisionProposal,
+    applicability_json: String,
+    threshold: SupportThresholdSnapshot,
+    occurred_at_us: i64,
+) -> Result<Vec<JournalPayload>, SemanticServiceError> {
+    threshold
+        .validate()
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+    if support_refs.len() < usize::from(threshold.minimum_surviving_support) {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    let support_contract_ref = RevisionId::new_v7();
     let contract = GlobalSuccessorSupportContract {
         support_contract_revision_id: support_contract_ref,
-        successor_revision_or_membership_ref: atom.revision_id.to_string(),
+        successor_revision_or_membership_ref: successor_ref.clone(),
         evidence_cohort_hash: digest_revisions("evertrace.support.cohort", &support_refs)?,
         applicability_contract_hash: sha256(
             "evertrace.support.applicability",
             1,
-            &CanonicalValue::String(
-                serde_json::to_string(&atom.applicability_expr)
-                    .map_err(|_| SemanticServiceError::InvalidInput)?,
-            ),
+            &CanonicalValue::String(applicability_json),
         )
         .map_err(|_| SemanticServiceError::InvalidInput)?,
         support_revision_refs: support_refs.clone(),
         authorization_revision_refs: vec![proposal.proposal_revision_id],
-        support_threshold_snapshot: SupportThresholdSnapshot {
-            minimum_surviving_support: 1,
-            require_authorization: true,
-        },
+        support_threshold_snapshot: threshold,
         promotion_proposal_revision_id: proposal.proposal_revision_id,
         promotion_validator_revision: 1,
         created_at_us: occurred_at_us,
@@ -99,7 +130,7 @@ pub(crate) fn global_atom_support_payloads(
     let validation = GlobalSupportValidationEvent {
         validation_revision_id: RevisionId::new_v7(),
         support_contract_ref,
-        successor_ref: atom.revision_id.to_string(),
+        successor_ref,
         dependency_generation: 1,
         state: GlobalSupportState::Valid,
         provenance_degraded: false,

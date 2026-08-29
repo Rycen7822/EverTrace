@@ -2862,16 +2862,7 @@ fn worktree_and_global_atom_proposals_remain_manual_but_unacceptable_in_s18() {
 }
 
 #[test]
-fn serde_models_reject_unknown_fields_and_future_targets_cannot_be_accepted() {
-    let temp = TempDir::new().unwrap();
-    let scope = scope_fixture(temp.path());
-    let (acceptance_receipt, acceptance_observation) = user_source(
-        "future-target-review",
-        "review future target",
-        scope.task.task_id,
-        scope.repository.repository_id,
-        scope.worktree.worktree_instance_id,
-    );
+fn serde_models_reject_unknown_fields_and_reserved_procedure_payloads() {
     let payload = ProposalPayload::ReservedTarget {
         schema_version: 1,
         summary: "future procedure candidate".into(),
@@ -2897,24 +2888,8 @@ fn serde_models_reject_unknown_fields_and_future_targets_cannot_be_accepted() {
         created_by: ProposalCreatedBy::Agent,
     };
     let service = RevisionProposalService;
-    let ProposalResolution::Revision { value, .. } = service
-        .submit(&SemanticCurrentView::default(), command_context(1), request)
-        .unwrap()
-    else {
-        panic!("future target may be represented in the inbox");
-    };
-    let mut view = SemanticCurrentView::default();
-    view.proposals.insert(value.proposal_id, (*value).clone());
     assert!(matches!(
-        service.accept(
-            &view,
-            command_context(2),
-            value.proposal_id,
-            AtomAcceptanceContext::ObjectiveEvidence {
-                observation: Box::new(acceptance_observation),
-                receipt: Box::new(acceptance_receipt),
-            },
-        ),
-        Err(SemanticServiceError::UnsupportedTarget)
+        service.submit(&SemanticCurrentView::default(), command_context(1), request),
+        Err(SemanticServiceError::InvalidInput)
     ));
 }

@@ -14,6 +14,9 @@ pub use proposal::{
     AcceptedProposalCommand, AtomAcceptanceContext, ProposalCommandContext, ProposalResolution,
     RevisionProposalService, SubmitProposalRequest,
 };
+pub(crate) use proposal::{
+    ProposalAcceptanceAudit, accepted_proposal_successor, accepted_proposal_successor_with_audit,
+};
 pub use resolver::{
     CurrentPolicyBinding, DescriptiveFactResolver, DescriptiveResolution,
     DescriptiveResolutionState, NormativeInstructionResolver, NormativeResolution,
@@ -23,6 +26,7 @@ pub use s23::{
     AcceptedCoreMembershipCommand, CoreGovernanceDecision, CoreMembershipAcceptanceContext,
     ScenarioCompiler, accept_core_membership, mark_support_pending, submit_core_conflict_proposal,
 };
+pub(crate) use s23::{global_support_payloads, validate_current_support_refs};
 
 #[derive(Debug, Error)]
 pub enum SemanticServiceError {

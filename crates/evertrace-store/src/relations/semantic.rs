@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use evertrace_domain::procedure::ProcedureRevision;
 use evertrace_domain::semantic::{
     Atom, CoreMembership, GlobalSuccessorSupportContract, ProposalStatus, ProposalTargetId,
     RevisionProposal,
@@ -22,6 +23,48 @@ pub enum SemanticRelationKind {
     CoreMembershipSuccessor,
     SupportContractSupportsRevision,
     SupportContractAuthorizesRevision,
+    ProcedureRevisionSuccessor,
+    ProcedureSupportsRevision,
+}
+
+pub fn build_procedure_relation_rows(
+    procedures: &[ProcedureRevision],
+    atoms: &[Atom],
+) -> Result<Vec<SemanticRelationRow>, StoreError> {
+    let procedure_revisions = procedures
+        .iter()
+        .map(|value| value.revision_id)
+        .collect::<BTreeSet<_>>();
+    let atom_revisions = atoms
+        .iter()
+        .map(|value| value.revision_id)
+        .collect::<BTreeSet<_>>();
+    if procedure_revisions.len() != procedures.len() {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut rows = BTreeSet::new();
+    for procedure in procedures {
+        procedure.validate().map_err(|_| StoreError::InvalidInput)?;
+        if let Some(parent) = procedure.parent_revision_id {
+            require_target(&procedure_revisions, parent)?;
+            insert(
+                &mut rows,
+                SemanticRelationKind::ProcedureRevisionSuccessor,
+                procedure.revision_id,
+                parent,
+            );
+        }
+        for support in &procedure.draft.support_revision_refs {
+            require_target(&atom_revisions, *support)?;
+            insert(
+                &mut rows,
+                SemanticRelationKind::ProcedureSupportsRevision,
+                procedure.revision_id,
+                *support,
+            );
+        }
+    }
+    Ok(rows.into_iter().collect())
 }
 
 pub fn build_core_support_relation_rows(

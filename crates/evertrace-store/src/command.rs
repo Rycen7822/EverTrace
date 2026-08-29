@@ -8,6 +8,7 @@ use evertrace_domain::{
         SourceRevisionMode,
     },
     ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
+    procedure::{ProcedureRevision, ProcedureStateEvent},
     recall::RecallLedgerEvent,
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
@@ -526,6 +527,8 @@ pub enum JournalPayload {
     WorkArtifactRecorded(Box<WorkArtifact>),
     AtomRecorded(Box<Atom>),
     RevisionProposalRecorded(Box<RevisionProposal>),
+    ProcedureRevisionRecorded(Box<ProcedureRevision>),
+    ProcedureStateRecorded(Box<ProcedureStateEvent>),
     ScenarioRecorded(Box<Scenario>),
     CoreMembershipRecorded(Box<CoreMembership>),
     GlobalSupportContractRecorded(Box<GlobalSuccessorSupportContract>),
@@ -580,6 +583,8 @@ impl JournalPayload {
             Self::WorkArtifactRecorded(_) => "work_artifact_recorded_v1",
             Self::AtomRecorded(_) => ATOM_RECORDED_EVENT_TYPE,
             Self::RevisionProposalRecorded(_) => "revision_proposal_recorded_v1",
+            Self::ProcedureRevisionRecorded(_) => "procedure_revision_recorded_v1",
+            Self::ProcedureStateRecorded(_) => "procedure_state_recorded_v1",
             Self::ScenarioRecorded(_) => "scenario_recorded_v1",
             Self::CoreMembershipRecorded(_) => "core_membership_recorded_v1",
             Self::GlobalSupportContractRecorded(_) => "global_support_contract_recorded_v1",
@@ -625,6 +630,8 @@ impl JournalPayload {
             | Self::WorkArtifactRecorded(_)
             | Self::AtomRecorded(_)
             | Self::RevisionProposalRecorded(_)
+            | Self::ProcedureRevisionRecorded(_)
+            | Self::ProcedureStateRecorded(_)
             | Self::ScenarioRecorded(_)
             | Self::CoreMembershipRecorded(_)
             | Self::GlobalSupportContractRecorded(_)
@@ -783,6 +790,12 @@ impl JournalPayload {
             }
             Self::AtomRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
             Self::RevisionProposalRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::ProcedureRevisionRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::ProcedureStateRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::ScenarioRecorded(value) => value.validate().map_err(|_| StoreError::InvalidInput),
@@ -953,6 +966,10 @@ impl JournalPayload {
             Self::RevisionProposalRecorded(value) => {
                 tagged_json("revision_proposal_recorded", value)
             }
+            Self::ProcedureRevisionRecorded(value) => {
+                tagged_json("procedure_revision_recorded", value)
+            }
+            Self::ProcedureStateRecorded(value) => tagged_json("procedure_state_recorded", value),
             Self::ScenarioRecorded(value) => tagged_json("scenario_recorded", value),
             Self::CoreMembershipRecorded(value) => tagged_json("core_membership_recorded", value),
             Self::GlobalSupportContractRecorded(value) => {
@@ -1200,73 +1217,188 @@ fn validate_semantic_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
             .acceptance
             .as_ref()
             .ok_or(StoreError::InvalidInput)?;
-        let (successor_ref, expected_support_refs, expected_contract_ref) =
-            match acceptance.accepted_target {
-                evertrace_domain::semantic::AcceptedProposalTarget::Atom {
-                    atom_id,
-                    atom_revision_id,
-                    ..
-                } => {
-                    let matching_atoms = events
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, event)| {
+        let (successor_ref, expected_support_refs, expected_contract_ref) = match acceptance
+            .accepted_target
+            .clone()
+        {
+            evertrace_domain::semantic::AcceptedProposalTarget::Atom {
+                atom_id,
+                atom_revision_id,
+                ..
+            } => {
+                let matching_atoms = events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, event)| {
+                        if index > proposal_index
+                            && let JournalPayload::AtomRecorded(atom) = &event.payload
+                            && atom.atom_id == atom_id
+                            && atom.revision_id == atom_revision_id
+                            && atom.accepted_proposal_id == Some(proposal.proposal_id)
+                            && atom.accepted_proposal_revision_id
+                                == Some(proposal.proposal_revision_id)
+                        {
+                            Some(atom.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let [atom] = matching_atoms.as_slice() else {
+                    return Err(StoreError::InvalidInput);
+                };
+                (
+                    atom_revision_id.to_string(),
+                    matches!(atom.scope, evertrace_domain::semantic::AtomScope::Global)
+                        .then(|| atom.supports_revision_refs.clone()),
+                    None,
+                )
+            }
+            evertrace_domain::semantic::AcceptedProposalTarget::CoreMembership {
+                core_membership_id,
+                membership_revision_id,
+            } => {
+                let matching = events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, event)| match &event.payload {
+                        JournalPayload::CoreMembershipRecorded(value)
                             if index > proposal_index
-                                && let JournalPayload::AtomRecorded(atom) = &event.payload
-                                && atom.atom_id == atom_id
-                                && atom.revision_id == atom_revision_id
-                                && atom.accepted_proposal_id == Some(proposal.proposal_id)
-                                && atom.accepted_proposal_revision_id
-                                    == Some(proposal.proposal_revision_id)
-                            {
-                                Some(atom.as_ref())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let [atom] = matching_atoms.as_slice() else {
-                        return Err(StoreError::InvalidInput);
-                    };
-                    (
-                        atom_revision_id.to_string(),
-                        matches!(atom.scope, evertrace_domain::semantic::AtomScope::Global)
-                            .then(|| atom.supports_revision_refs.clone()),
-                        None,
-                    )
+                                && value.core_membership_id == core_membership_id
+                                && value.membership_revision_id == membership_revision_id
+                                && value.created_by_acceptance_ref
+                                    == proposal.proposal_revision_id
+                                && value.authorization_revision_refs
+                                    == vec![proposal.proposal_revision_id] =>
+                        {
+                            Some(value.as_ref())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [membership] = matching.as_slice() else {
+                    return Err(StoreError::InvalidInput);
+                };
+                (
+                    membership_revision_id.to_string(),
+                    Some(vec![membership.atom_revision_id]),
+                    Some(membership.support_contract_ref),
+                )
+            }
+            evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
+                procedure_id,
+                procedure_revision_id,
+                ..
+            } => {
+                let matching = events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, event)| match &event.payload {
+                        JournalPayload::ProcedureRevisionRecorded(value)
+                            if index > proposal_index
+                                && value.procedure_id == procedure_id
+                                && value.revision_id == procedure_revision_id =>
+                        {
+                            Some(value.as_ref())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [procedure] = matching.as_slice() else {
+                    return Err(StoreError::InvalidInput);
+                };
+                let evertrace_domain::semantic::ProposalPayload::Procedure(payload) =
+                    &proposal.payload
+                else {
+                    return Err(StoreError::InvalidInput);
+                };
+                if procedure.draft != *payload.draft() {
+                    return Err(StoreError::InvalidInput);
                 }
-                evertrace_domain::semantic::AcceptedProposalTarget::CoreMembership {
-                    core_membership_id,
-                    membership_revision_id,
-                } => {
-                    let matching = events
+                match (&proposal.payload, proposal.operation) {
+                    (
+                        evertrace_domain::semantic::ProposalPayload::Procedure(payload),
+                        evertrace_domain::semantic::ProposalOperation::Create,
+                    ) if matches!(
+                        payload.as_ref(),
+                        evertrace_domain::semantic::ProcedureProposalPayload::Create { .. }
+                    ) && proposal.target_id.is_none()
+                        && proposal.base_revision_id.is_none()
+                        && procedure.parent_revision_id.is_none()
+                        && procedure.revision_generation == 1 => {}
+                    (
+                        evertrace_domain::semantic::ProposalPayload::Procedure(payload),
+                        evertrace_domain::semantic::ProposalOperation::Replace,
+                    ) if matches!(
+                        payload.as_ref(),
+                        evertrace_domain::semantic::ProcedureProposalPayload::Replace { .. }
+                    ) && proposal.target_id
+                        == Some(evertrace_domain::semantic::ProposalTargetId::Procedure(
+                            procedure.procedure_id,
+                        ))
+                        && proposal.base_revision_id == procedure.parent_revision_id
+                        && procedure.revision_generation > 1 => {}
+                    _ => return Err(StoreError::InvalidInput),
+                }
+                let target_states = events
+                    .iter()
+                    .filter_map(|event| match &event.payload {
+                        JournalPayload::ProcedureStateRecorded(value)
+                            if value.procedure_revision_id == procedure_revision_id =>
+                        {
+                            Some(value.as_ref())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [initial_state] = target_states.as_slice() else {
+                    return Err(StoreError::InvalidInput);
+                };
+                if initial_state.from_state.is_some()
+                    || initial_state.to_state
+                        != evertrace_domain::procedure::ProcedurePublicationState::ActiveProbationary
+                    || initial_state.reason
+                        != evertrace_domain::procedure::ProcedureStateReason::Accepted
+                    || initial_state.resume_state.is_some()
+                {
+                    return Err(StoreError::InvalidInput);
+                }
+                if let Some(parent_revision_id) = procedure.parent_revision_id {
+                    let parent_states = events
                         .iter()
-                        .enumerate()
-                        .filter_map(|(index, event)| match &event.payload {
-                            JournalPayload::CoreMembershipRecorded(value)
-                                if index > proposal_index
-                                    && value.core_membership_id == core_membership_id
-                                    && value.membership_revision_id == membership_revision_id
-                                    && value.created_by_acceptance_ref
-                                        == proposal.proposal_revision_id
-                                    && value.authorization_revision_refs
-                                        == vec![proposal.proposal_revision_id] =>
+                        .filter_map(|event| match &event.payload {
+                            JournalPayload::ProcedureStateRecorded(value)
+                                if value.procedure_revision_id == parent_revision_id =>
                             {
                                 Some(value.as_ref())
                             }
                             _ => None,
                         })
                         .collect::<Vec<_>>();
-                    let [membership] = matching.as_slice() else {
+                    let [superseded_parent] = parent_states.as_slice() else {
                         return Err(StoreError::InvalidInput);
                     };
-                    (
-                        membership_revision_id.to_string(),
-                        Some(vec![membership.atom_revision_id]),
-                        Some(membership.support_contract_ref),
-                    )
+                    if superseded_parent.from_state.is_none()
+                        || superseded_parent.to_state
+                            != evertrace_domain::procedure::ProcedurePublicationState::Superseded
+                        || superseded_parent.reason
+                            != evertrace_domain::procedure::ProcedureStateReason::Replaced
+                        || superseded_parent.resume_state.is_some()
+                    {
+                        return Err(StoreError::InvalidInput);
+                    }
                 }
-            };
+                (
+                    procedure_revision_id.to_string(),
+                    matches!(
+                        procedure.draft.scope,
+                        evertrace_domain::procedure::ProcedureScope::Global
+                    )
+                    .then(|| procedure.draft.support_revision_refs.clone()),
+                    None,
+                )
+            }
+        };
         let Some(expected_support_refs) = expected_support_refs else {
             continue;
         };
@@ -1338,6 +1470,28 @@ fn validate_semantic_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
             .count()
             != 1
         {
+            return Err(StoreError::InvalidInput);
+        }
+    }
+    for procedure in events.iter().filter_map(|event| match &event.payload {
+        JournalPayload::ProcedureRevisionRecorded(value) => Some(value.as_ref()),
+        _ => None,
+    }) {
+        let matching_acceptances = events
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload, JournalPayload::RevisionProposalRecorded(proposal)
+                    if proposal.status == evertrace_domain::semantic::ProposalStatus::Accepted
+                        && matches!(proposal.acceptance.as_ref().map(|value| &value.accepted_target),
+                            Some(evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
+                                procedure_id,
+                                procedure_revision_id,
+                                ..
+                            }) if *procedure_id == procedure.procedure_id
+                                && *procedure_revision_id == procedure.revision_id))
+            })
+            .count();
+        if matching_acceptances != 1 {
             return Err(StoreError::InvalidInput);
         }
     }
