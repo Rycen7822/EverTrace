@@ -11,6 +11,7 @@ pub enum Command {
     ConfigCheck,
     ConfigShowEffective,
     Doctor,
+    Mcp,
 }
 
 impl Args {
@@ -27,6 +28,8 @@ impl Args {
         };
         let command = if command == "doctor" {
             Command::Doctor
+        } else if command == "mcp" {
+            Command::Mcp
         } else if command == "config" {
             match values.next().as_deref().and_then(|value| value.to_str()) {
                 Some("check") => Command::ConfigCheck,
@@ -48,5 +51,5 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|doctor"
+    "usage: evertrace [--config PATH] config check|config show --effective|doctor|mcp"
 }

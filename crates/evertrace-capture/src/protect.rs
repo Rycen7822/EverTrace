@@ -242,6 +242,37 @@ pub fn recovery_content_token(input: &[u8], key: &DeviceKey) -> Result<[u8; 32],
     .map_err(|_| ProtectError::Digest)
 }
 
+/// Authenticates one canonical MCP call without exposing the device key or
+/// creating a durable claim artifact.
+pub fn mcp_call_auth_tag(input: &[u8], key: &DeviceKey) -> Result<[u8; 32], ProtectError> {
+    hmac_sha256(
+        key.bytes(),
+        "evertrace.mcp_canonical_call",
+        1,
+        &CanonicalValue::Bytes(input.to_vec()),
+    )
+    .map_err(|_| ProtectError::Digest)
+}
+
+/// Verifies the canonical MCP call tag without a timing-sensitive comparison
+/// at the daemon boundary.
+pub fn verify_mcp_call_auth_tag(
+    input: &[u8],
+    key: &DeviceKey,
+    provided: &[u8; 32],
+) -> Result<bool, ProtectError> {
+    let encoded = encode(
+        "evertrace.mcp_canonical_call",
+        1,
+        &CanonicalValue::Bytes(input.to_vec()),
+    )
+    .map_err(|_| ProtectError::Digest)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.bytes()).expect("HMAC-SHA-256 accepts device keys");
+    mac.update(&encoded);
+    Ok(mac.verify_slice(provided).is_ok())
+}
+
 /// Authenticates the single canonical S16 bundle-application ticket claims.
 /// This is intentionally not a general-purpose key or signing API.
 pub fn recovery_ticket_auth_tag(

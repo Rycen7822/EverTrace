@@ -298,10 +298,18 @@ fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
     if filter.current_only {
         clauses.push("currentness = 'current'".into());
     }
-    for (column, value) in [
+    let scope = [
         ("task_id", filter.task_id.as_ref()),
         ("repository_id", filter.repository_id.as_ref()),
         ("worktree_id", filter.worktree_id.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(column, value)| value.map(|value| format!("{column} = {}", sql_literal(value))))
+    .collect::<Vec<_>>();
+    if !scope.is_empty() {
+        clauses.push(format!("({})", scope.join(" OR ")));
+    }
+    for (column, value) in [
         ("source_kind", filter.source_kind.as_ref()),
         ("source_role", filter.source_role.as_ref()),
         ("authority", filter.authority.as_ref()),

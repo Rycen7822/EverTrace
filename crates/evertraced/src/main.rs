@@ -4,19 +4,21 @@
 use std::{env, fs, path::PathBuf, sync::Arc};
 
 use evertrace_engine::{
-    EngineService, HealthDispatchError, RecoveryActionOutcome, RecoveryActionService,
-    RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
-    RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason, RuntimeMode,
-    open_writer, publish_recovery_runtime, spawn_writer,
+    EngineService, HealthDispatchError, McpActionService, McpBindingAuthority, McpBindingIssue,
+    McpServiceAction, McpServiceRequest, McpServiceResult, McpServiceStatus, RecoveryActionOutcome,
+    RecoveryActionService, RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService,
+    RecoveryError, RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason,
+    RuntimeMode, open_writer, publish_recovery_runtime, spawn_writer,
 };
 use evertrace_protocol::{
     LocalServer, ServerOptions,
     command::Command as ProtocolCommand,
-    dto::{HealthMode, PROTOCOL_VERSION},
+    dto::{ClientKind, HealthMode, PROTOCOL_VERSION},
+    envelope::{McpItem, McpItems, McpResultEnvelope, McpStatus},
     error::ErrorCode,
     resolve_data_dir,
     response::{
-        HealthResponse, RecoveryActionResponse, RecoveryTerminalResponse,
+        HealthResponse, McpBindingIssuedResponse, RecoveryActionResponse, RecoveryTerminalResponse,
         RecoveryUnsupportedReason, Response,
     },
 };
@@ -45,6 +47,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_snapshot = publish_recovery_runtime(&data_dir, engine.effective_config(), None)?;
     let writer = open_writer(&data_dir).await?;
     let (writer_handle, mut writer_task) = spawn_writer(writer, 64)?;
+    let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
+    let mcp_service = McpActionService::open(
+        mcp_bindings.clone(),
+        &data_dir,
+        writer_handle.clone(),
+        runtime_snapshot.clone(),
+    )
+    .await?;
     let recovery_service =
         RecoveryBarrierService::new(runtime_snapshot.clone(), writer_handle.clone());
     let recovery_action_service = RecoveryActionService::new(
@@ -70,11 +80,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handler_engine = Arc::clone(&engine);
     let handler_recovery_action_service = recovery_action_service.clone();
-    let mut task = tokio::spawn(
-        server.run_dispatch(shutdown_rx, move |request_id, command| {
+    let handler_mcp_bindings = mcp_bindings;
+    let handler_mcp_service = mcp_service;
+    let mut task = tokio::spawn(server.run_dispatch_with_context(
+        shutdown_rx,
+        move |context, request_id, command| {
             let handler_engine = Arc::clone(&handler_engine);
             let recovery_service = recovery_service.clone();
             let recovery_action_service = handler_recovery_action_service.clone();
+            let mcp_bindings = handler_mcp_bindings.clone();
+            let mcp_service = handler_mcp_service.clone();
             async move {
                 match command {
                     ProtocolCommand::Health => {
@@ -137,10 +152,60 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         Ok(Response::RecoveryAction(response))
                     }
+                    ProtocolCommand::IssueMcpBinding(issue) => {
+                        if context.client_kind != ClientKind::Hook {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        let grant = mcp_bindings
+                            .issue(McpBindingIssue {
+                                session_id: issue.session_id,
+                                turn_id: issue.turn_id,
+                                tool_use_id: issue.tool_use_id,
+                                agent_id: issue.agent_id,
+                                action: issue.original_input.action.as_str().into(),
+                                workspace: issue.original_input.workspace,
+                                input: issue.original_input.input,
+                                refs: issue.original_input.refs,
+                                launcher_protocol_revision: issue.launcher_protocol_revision,
+                            })
+                            .map_err(|_| ErrorCode::Untrusted)?;
+                        Ok(Response::McpBindingIssued(McpBindingIssuedResponse {
+                            bound_workspace: grant.bound_workspace,
+                            expires_at_us: grant.expires_at_us,
+                        }))
+                    }
+                    ProtocolCommand::McpCall(call) => {
+                        if context.client_kind != ClientKind::Mcp {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        let action = match call.input.action {
+                            evertrace_protocol::mcp::McpAction::Search => McpServiceAction::Search,
+                            evertrace_protocol::mcp::McpAction::Get => McpServiceAction::Get,
+                            evertrace_protocol::mcp::McpAction::Add => McpServiceAction::Add,
+                            evertrace_protocol::mcp::McpAction::Organize => {
+                                McpServiceAction::Organize
+                            }
+                        };
+                        let result = mcp_service
+                            .handle(
+                                &context.connection_id,
+                                McpServiceRequest {
+                                    request_id,
+                                    action,
+                                    workspace: call.input.workspace,
+                                    input: call.input.input,
+                                    refs: call.input.refs,
+                                    client_cwd: call.client_cwd,
+                                },
+                            )
+                            .await
+                            .map_err(|_| ErrorCode::Internal)?;
+                        Ok(Response::McpResult(Box::new(map_mcp_result(result))))
+                    }
                 }
             }
-        }),
-    );
+        },
+    ));
     tokio::select! {
         result = &mut task => {
             let server_result = result;
@@ -170,6 +235,62 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             writer_task.await??;
             Ok(())
         }
+    }
+}
+
+fn map_mcp_result(result: McpServiceResult) -> McpResultEnvelope {
+    let status = match result.status {
+        McpServiceStatus::Ok => McpStatus::Ok,
+        McpServiceStatus::NoMatch => McpStatus::NoMatch,
+        McpServiceStatus::NoRecallNeeded => McpStatus::NoRecallNeeded,
+        McpServiceStatus::Partial => McpStatus::Partial,
+        McpServiceStatus::DegradedIndex => McpStatus::DegradedIndex,
+        McpServiceStatus::ScopeUnresolved => McpStatus::ScopeUnresolved,
+        McpServiceStatus::Conflict => McpStatus::Conflict,
+        McpServiceStatus::InvalidInput => McpStatus::InvalidInput,
+        McpServiceStatus::NotFound => McpStatus::NotFound,
+    };
+    McpResultEnvelope {
+        schema_version: 1,
+        request_id: result.request_id,
+        status,
+        scope: result.scope,
+        freshness: result.freshness,
+        completeness: result.completeness,
+        items: {
+            let mut partitions = McpItems::default();
+            for item in result.items {
+                let partition = item.partition;
+                let item = McpItem {
+                    kind: item.kind,
+                    object_ref: item.object_ref,
+                    object_revision_ref: item.object_revision_ref,
+                    source_revision_ref: item.source_revision_ref,
+                    scope: item.scope,
+                    applicability: item.applicability,
+                    authority: item.authority,
+                    text: item.text,
+                    content_trust: item.content_trust,
+                    capture_completeness: item.capture_completeness,
+                    instruction_authority: item.instruction_authority,
+                };
+                match partition {
+                    evertrace_engine::McpItemPartition::NormativeConstraint => {
+                        partitions.normative_constraints.push(item)
+                    }
+                    evertrace_engine::McpItemPartition::Procedure => {
+                        partitions.procedures.push(item)
+                    }
+                    evertrace_engine::McpItemPartition::Evidence => partitions.evidence.push(item),
+                    evertrace_engine::McpItemPartition::Warning => partitions.warnings.push(item),
+                }
+            }
+            partitions
+        },
+        warnings: result.warnings,
+        truncated: result.truncated,
+        next_refs: result.next_refs,
+        audit_ref: None,
     }
 }
 

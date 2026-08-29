@@ -9,6 +9,7 @@ pub mod envelope;
 pub mod error;
 pub mod frame;
 pub mod handshake;
+pub mod mcp;
 pub mod notification;
 pub mod response;
 
@@ -135,18 +136,37 @@ impl LocalServer {
                 Command::Health => health_handler().map(Response::Health),
                 Command::RecoveryBarrier(_) => Err(ErrorCode::InvalidInput),
                 Command::RequestRecovery(_) => Err(ErrorCode::InvalidInput),
+                Command::IssueMcpBinding(_) | Command::McpCall(_) => Err(ErrorCode::InvalidInput),
             })
         })
         .await
     }
 
     pub async fn run_dispatch<F, Fut>(
+        self,
+        shutdown: watch::Receiver<bool>,
+        command_handler: F,
+    ) -> Result<(), ProtocolError>
+    where
+        F: Fn(evertrace_domain::ids::RequestId, Command) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Response, ErrorCode>> + Send + 'static,
+    {
+        self.run_dispatch_with_context(shutdown, move |_context, request_id, command| {
+            command_handler(request_id, command)
+        })
+        .await
+    }
+
+    pub async fn run_dispatch_with_context<F, Fut>(
         mut self,
         mut shutdown: watch::Receiver<bool>,
         command_handler: F,
     ) -> Result<(), ProtocolError>
     where
-        F: Fn(evertrace_domain::ids::RequestId, Command) -> Fut + Send + Sync + 'static,
+        F: Fn(dto::ConnectionContext, evertrace_domain::ids::RequestId, Command) -> Fut
+            + Send
+            + Sync
+            + 'static,
         Fut: std::future::Future<Output = Result<Response, ErrorCode>> + Send + 'static,
     {
         let semaphore = Arc::new(Semaphore::new(self.options.connection_limit.max(1)));
@@ -173,6 +193,7 @@ impl LocalServer {
                     let options = Arc::clone(&self.options);
                     let command_handler = Arc::clone(&command_handler);
                     let connection_shutdown = shutdown.clone();
+                    let connection_id = uuid::Uuid::now_v7().to_string();
                     tasks.spawn(async move {
                         let _permit = permit;
                         let _ = handle_connection(
@@ -180,6 +201,7 @@ impl LocalServer {
                             &options,
                             command_handler.as_ref(),
                             connection_shutdown,
+                            connection_id,
                         )
                         .await;
                     });
@@ -238,9 +260,10 @@ async fn handle_connection<F, Fut>(
     options: &ServerOptions,
     command_handler: &F,
     mut shutdown: watch::Receiver<bool>,
+    connection_id: String,
 ) -> Result<(), ProtocolError>
 where
-    F: Fn(evertrace_domain::ids::RequestId, Command) -> Fut + ?Sized,
+    F: Fn(dto::ConnectionContext, evertrace_domain::ids::RequestId, Command) -> Fut + ?Sized,
     Fut: std::future::Future<Output = Result<Response, ErrorCode>> + Send,
 {
     let first = match read_frame::<ClientEnvelope>(
@@ -294,6 +317,10 @@ where
         return Err(ProtocolError::InvalidNegotiation);
     }
     let negotiated_max = handshake.max_frame.min(MAX_FRAME_SIZE as u32);
+    let connection_context = dto::ConnectionContext {
+        connection_id,
+        client_kind: handshake.client_kind,
+    };
     let ack = ServerEnvelope::HandshakeAck(HandshakeAck {
         protocol_version: PROTOCOL_VERSION,
         build_id: options.build_id.clone(),
@@ -369,7 +396,13 @@ where
                 .await;
                 continue;
             }
-            let dispatched = match command_handler(command.request_id, command.command).await {
+            let dispatched = match command_handler(
+                connection_context.clone(),
+                command.request_id,
+                command.command,
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(code) => {
                     let _ = send_wire_error(
@@ -431,6 +464,95 @@ fn frame_error_code(error: &FrameError) -> ErrorCode {
 }
 
 #[cfg(feature = "runtime")]
+pub struct LocalClient {
+    stream: UnixStream,
+    negotiated_max: usize,
+    frame_timeout: Duration,
+}
+
+#[cfg(feature = "runtime")]
+impl LocalClient {
+    pub async fn connect(
+        socket_path: &Path,
+        build_id: impl Into<String>,
+        client_kind: dto::ClientKind,
+        frame_timeout: Duration,
+    ) -> Result<Self, ProtocolError> {
+        let build_id = build_id.into();
+        if !valid_build_id(&build_id) {
+            return Err(ProtocolError::InvalidBuildId);
+        }
+        let mut stream = timeout(frame_timeout, UnixStream::connect(socket_path))
+            .await
+            .map_err(|_| ProtocolError::Timeout)?
+            .map_err(ProtocolError::Connect)?;
+        write_frame(
+            &mut stream,
+            &ClientEnvelope::Handshake(handshake::Handshake {
+                protocol_version: PROTOCOL_VERSION,
+                client_kind,
+                build_id,
+                max_frame: MAX_FRAME_SIZE as u32,
+            }),
+            MAX_FRAME_SIZE,
+            frame_timeout,
+        )
+        .await?;
+        let negotiated_max =
+            match read_frame::<ServerEnvelope>(&mut stream, MAX_FRAME_SIZE, frame_timeout).await? {
+                ServerEnvelope::HandshakeAck(ack)
+                    if ack.protocol_version == PROTOCOL_VERSION
+                        && ack.max_frame != 0
+                        && ack.max_frame <= MAX_FRAME_SIZE as u32
+                        && valid_build_id(&ack.build_id) =>
+                {
+                    ack.max_frame as usize
+                }
+                ServerEnvelope::HandshakeAck(_) => return Err(ProtocolError::InvalidNegotiation),
+                ServerEnvelope::Error(error) => return Err(ProtocolError::Wire(error.code)),
+                _ => return Err(ProtocolError::UnexpectedMessage),
+            };
+        Ok(Self {
+            stream,
+            negotiated_max,
+            frame_timeout,
+        })
+    }
+
+    pub async fn request(
+        &mut self,
+        request_id: evertrace_domain::ids::RequestId,
+        command: Command,
+    ) -> Result<Response, ProtocolError> {
+        write_frame(
+            &mut self.stream,
+            &ClientEnvelope::Command(command::CommandEnvelope {
+                request_id,
+                command,
+            }),
+            self.negotiated_max,
+            self.frame_timeout,
+        )
+        .await?;
+        match read_frame::<ServerEnvelope>(
+            &mut self.stream,
+            self.negotiated_max,
+            self.frame_timeout,
+        )
+        .await?
+        {
+            ServerEnvelope::Response(value) if value.request_id == request_id => Ok(value.response),
+            ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
+            ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
+                Err(ProtocolError::Wire(error.code))
+            }
+            ServerEnvelope::Error(_) => Err(ProtocolError::RequestIdMismatch),
+            _ => Err(ProtocolError::UnexpectedMessage),
+        }
+    }
+}
+
+#[cfg(feature = "runtime")]
 pub async fn request_health(
     socket_path: &Path,
     build_id: impl Into<String>,
@@ -476,9 +598,10 @@ pub async fn request_health(
         ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
             Response::Health(health) if valid_health(&health) => Ok(health),
             Response::Health(_) => Err(ProtocolError::InvalidHealth),
-            Response::RecoveryTerminal(_) | Response::RecoveryAction(_) => {
-                Err(ProtocolError::UnexpectedMessage)
-            }
+            Response::RecoveryTerminal(_)
+            | Response::RecoveryAction(_)
+            | Response::McpBindingIssued(_)
+            | Response::McpResult(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
@@ -545,9 +668,10 @@ pub async fn request_recovery(
         ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
             Response::RecoveryAction(response) if response.validate() => Ok(response),
             Response::RecoveryAction(_) => Err(ProtocolError::InvalidRecoveryAction),
-            Response::Health(_) | Response::RecoveryTerminal(_) => {
-                Err(ProtocolError::UnexpectedMessage)
-            }
+            Response::Health(_)
+            | Response::RecoveryTerminal(_)
+            | Response::McpBindingIssued(_)
+            | Response::McpResult(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
@@ -559,19 +683,23 @@ pub async fn request_recovery(
 }
 
 #[cfg(unix)]
-pub fn request_recovery_barrier_sync(
+struct SyncHookConnection {
+    stream: StdUnixStream,
+    deadline: Instant,
+    socket_identity: (u64, u64, u32),
+    negotiated_max: usize,
+}
+
+#[cfg(unix)]
+fn connect_sync_hook(
     socket_path: &Path,
     build_id: &str,
-    locator: command::RecoveryBarrierLocator,
     timeout_limit: Duration,
-) -> Result<response::RecoveryTerminalResponse, error::SyncProtocolError> {
+) -> Result<SyncHookConnection, error::SyncProtocolError> {
     use error::SyncProtocolError;
     use frame::{read_frame_sync, write_frame_sync};
 
-    if !handshake::valid_build_id(build_id)
-        || timeout_limit < Duration::from_millis(1)
-        || !locator.validate()
-    {
+    if !handshake::valid_build_id(build_id) || timeout_limit < Duration::from_millis(1) {
         return Err(SyncProtocolError::InvalidInput);
     }
     let deadline = Instant::now()
@@ -583,15 +711,19 @@ pub fn request_recovery_barrier_sync(
         return Err(SyncProtocolError::Connect);
     }
     set_sync_deadline(&stream, deadline)?;
-    let handshake = envelope::ClientEnvelope::Handshake(handshake::Handshake {
-        protocol_version: dto::PROTOCOL_VERSION,
-        client_kind: dto::ClientKind::Hook,
-        build_id: build_id.to_owned(),
-        max_frame: dto::MAX_FRAME_SIZE as u32,
-    });
-    write_frame_sync(&mut stream, &handshake, dto::MAX_FRAME_SIZE).map_err(map_sync_frame_error)?;
+    write_frame_sync(
+        &mut stream,
+        &envelope::ClientEnvelope::Handshake(handshake::Handshake {
+            protocol_version: dto::PROTOCOL_VERSION,
+            client_kind: dto::ClientKind::Hook,
+            build_id: build_id.to_owned(),
+            max_frame: dto::MAX_FRAME_SIZE as u32,
+        }),
+        dto::MAX_FRAME_SIZE,
+    )
+    .map_err(map_sync_frame_error)?;
     set_sync_deadline(&stream, deadline)?;
-    let negotiated =
+    let negotiated_max =
         match read_frame_sync::<envelope::ServerEnvelope>(&mut stream, dto::MAX_FRAME_SIZE)
             .map_err(map_sync_frame_error)?
         {
@@ -612,6 +744,33 @@ pub fn request_recovery_barrier_sync(
             }
             _ => return Err(SyncProtocolError::Negotiation),
         };
+    Ok(SyncHookConnection {
+        stream,
+        deadline,
+        socket_identity,
+        negotiated_max,
+    })
+}
+
+#[cfg(unix)]
+pub fn request_recovery_barrier_sync(
+    socket_path: &Path,
+    build_id: &str,
+    locator: command::RecoveryBarrierLocator,
+    timeout_limit: Duration,
+) -> Result<response::RecoveryTerminalResponse, error::SyncProtocolError> {
+    use error::SyncProtocolError;
+    use frame::{read_frame_sync, write_frame_sync};
+
+    if !locator.validate() {
+        return Err(SyncProtocolError::InvalidInput);
+    }
+    let SyncHookConnection {
+        mut stream,
+        deadline,
+        socket_identity,
+        negotiated_max: negotiated,
+    } = connect_sync_hook(socket_path, build_id, timeout_limit)?;
     let request_id = evertrace_domain::ids::RequestId::from_uuid(uuid::Uuid::now_v7())
         .map_err(|_| SyncProtocolError::InvalidInput)?;
     let command = envelope::ClientEnvelope::Command(command::CommandEnvelope {
@@ -646,6 +805,56 @@ pub fn request_recovery_barrier_sync(
             } else {
                 SyncProtocolError::Wire
             })
+        }
+        _ => Err(SyncProtocolError::InvalidResponse),
+    }
+}
+
+#[cfg(unix)]
+pub fn request_mcp_binding_sync(
+    socket_path: &Path,
+    build_id: &str,
+    request: command::McpBindingIssueCommand,
+    timeout_limit: Duration,
+) -> Result<response::McpBindingIssuedResponse, error::SyncProtocolError> {
+    use error::SyncProtocolError;
+    use frame::{read_frame_sync, write_frame_sync};
+
+    let SyncHookConnection {
+        mut stream,
+        deadline,
+        socket_identity,
+        negotiated_max: negotiated,
+    } = connect_sync_hook(socket_path, build_id, timeout_limit)?;
+    let request_id = evertrace_domain::ids::RequestId::from_uuid(uuid::Uuid::now_v7())
+        .map_err(|_| SyncProtocolError::InvalidInput)?;
+    set_sync_deadline(&stream, deadline)?;
+    write_frame_sync(
+        &mut stream,
+        &envelope::ClientEnvelope::Command(command::CommandEnvelope {
+            request_id,
+            command: command::Command::IssueMcpBinding(request),
+        }),
+        negotiated,
+    )
+    .map_err(map_sync_frame_error)?;
+    set_sync_deadline(&stream, deadline)?;
+    match read_frame_sync::<envelope::ServerEnvelope>(&mut stream, negotiated)
+        .map_err(map_sync_frame_error)?
+    {
+        envelope::ServerEnvelope::Response(value) if value.request_id == request_id => {
+            match value.response {
+                response::Response::McpBindingIssued(response) => {
+                    if checked_sync_socket(socket_path)? != socket_identity {
+                        return Err(SyncProtocolError::Connect);
+                    }
+                    Ok(response)
+                }
+                _ => Err(SyncProtocolError::InvalidResponse),
+            }
+        }
+        envelope::ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
+            Err(SyncProtocolError::Wire)
         }
         _ => Err(SyncProtocolError::InvalidResponse),
     }

@@ -1829,6 +1829,7 @@ dependencies = [
  "evertrace-protocol",
  "evertrace-store",
  "evertrace-tui",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

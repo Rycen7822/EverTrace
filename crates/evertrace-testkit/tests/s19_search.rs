@@ -833,6 +833,15 @@ async fn l0002_real_fts_latest_delta_deletion_first_and_diagnostic_gates() {
             .iter()
             .all(|candidate| !candidate.text.contains("exact-19"))
     );
+    assert!(!denied.omitted_refs.contains(&exact_candidate));
+    let mut excluded_context = context("retrieval", &["exact-19"], current.clone());
+    excluded_context
+        .query_facets
+        .explicit_exclusions
+        .push(exact_candidate.clone());
+    excluded_context.budget.tokens_remaining = 1;
+    let excluded = service.search(excluded_context).await.unwrap();
+    assert!(!excluded.omitted_refs.contains(&exact_candidate));
     let diagnostic = DiagnosticRetrieval::for_characterization();
     let mut user_surface_context = context("Rust memory retrieval", &[], current.clone());
     user_surface_context.query_facets.source_boundary = Some(SourceBoundary::User);

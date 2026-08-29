@@ -5,6 +5,8 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::mcp::McpToolInput;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandEnvelope {
@@ -18,6 +20,49 @@ pub enum Command {
     Health,
     RecoveryBarrier(RecoveryBarrierLocator),
     RequestRecovery(RequestRecoveryCommand),
+    IssueMcpBinding(McpBindingIssueCommand),
+    McpCall(McpCallCommand),
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpBindingIssueCommand {
+    pub session_id: String,
+    pub turn_id: String,
+    pub tool_use_id: String,
+    pub agent_id: Option<String>,
+    pub original_input: McpToolInput,
+    pub launcher_protocol_revision: u32,
+}
+
+impl std::fmt::Debug for McpBindingIssueCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpBindingIssueCommand")
+            .field("binding_fields_redacted", &true)
+            .field(
+                "launcher_protocol_revision",
+                &self.launcher_protocol_revision,
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCallCommand {
+    pub input: McpToolInput,
+    pub client_cwd: String,
+}
+
+impl std::fmt::Debug for McpCallCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpCallCommand")
+            .field("action", &self.input.action)
+            .field("private_fields_redacted", &true)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

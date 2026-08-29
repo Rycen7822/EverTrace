@@ -1,6 +1,13 @@
 use evertrace_domain::{config::EffectiveConfig, revision::AlgorithmRevision};
 use thiserror::Error;
 
+mod actions;
+mod binding;
+mod scope;
+pub use actions::*;
+pub use binding::*;
+pub use scope::McpQueryAnchor;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeMode {
     Normal,

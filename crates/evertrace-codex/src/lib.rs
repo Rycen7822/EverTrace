@@ -4,6 +4,7 @@
 //! Strict Codex adapter manifest and deterministic host probes.
 
 pub mod adapter_manifest;
+pub mod binding;
 pub mod capability;
 pub mod hook_input;
 pub mod install;
