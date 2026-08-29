@@ -207,6 +207,10 @@ pub fn is_persisted_relation_kind(kind: &str) -> bool {
             | "proposal_reviewed_revision"
             | "proposal_targets_atom"
             | "proposal_accepted_atom_revision"
+            | "core_membership_to_atom_revision"
+            | "core_membership_successor"
+            | "support_contract_supports_revision"
+            | "support_contract_authorizes_revision"
     )
 }
 
@@ -252,6 +256,10 @@ pub(crate) fn relations_batch(rows: &[RelationProjectionRow]) -> Result<RecordBa
 }
 
 pub async fn read_relation_rows(table: &Table) -> Result<Vec<RelationProjectionRow>, StoreError> {
+    table
+        .checkout_latest()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
     let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
     if schema.as_ref() != relations_schema().as_ref() {
         return Err(StoreError::StoreCorrupt);

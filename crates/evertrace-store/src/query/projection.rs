@@ -9,10 +9,10 @@ use lancedb::Table;
 use crate::{
     JournalPayload, ObjectRowKind, ProjectionSnapshot, StoreError,
     journal::{read_journal_after, read_journal_frontier},
-    projections::{recall_need, recall_trigger_contract, validate_delta},
+    projections::{l3_core_projection, recall_need, recall_trigger_contract, validate_delta},
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
-        build_capture_relation_rows, build_episode_relation_rows,
+        build_capture_relation_rows, build_core_support_relation_rows, build_episode_relation_rows,
         build_operation_burst_relation_rows, build_physical_relation_rows,
         build_recovery_application_relation_rows, build_recovery_relation_rows,
         build_repository_relation_rows, build_segmentation_correction_relation_rows,
@@ -229,11 +229,16 @@ pub fn derive_l0002_projections(
     let mut artifacts = BTreeMap::new();
     let mut atoms = BTreeMap::new();
     let mut proposals = BTreeMap::new();
+    let mut core_memberships = BTreeMap::new();
+    let mut support_contracts = BTreeMap::new();
     let mut exact_rows = BTreeMap::new();
     let mut endpoint_seqs = BTreeMap::<String, u64>::new();
     let mut current_revisions = BTreeMap::<String, (u64, String)>::new();
     for row in objects.data_rows() {
-        if recall_trigger_contract(row)?.is_some() || recall_need(row)?.is_some() {
+        if recall_trigger_contract(row)?.is_some()
+            || recall_need(row)?.is_some()
+            || l3_core_projection(row)?
+        {
             continue;
         }
         if let (Some(object_id), Some(revision_id)) =
@@ -250,7 +255,10 @@ pub fn derive_l0002_projections(
     }
 
     for row in objects.data_rows() {
-        if recall_trigger_contract(row)?.is_some() || recall_need(row)?.is_some() {
+        if recall_trigger_contract(row)?.is_some()
+            || recall_need(row)?.is_some()
+            || l3_core_projection(row)?
+        {
             continue;
         }
         for endpoint in [row.object_id.as_ref(), row.current_revision_id.as_ref()]
@@ -429,6 +437,16 @@ pub fn derive_l0002_projections(
             JournalPayload::RevisionProposalRecorded(value) => {
                 proposals.insert(value.proposal_revision_id, (*value, row.source_event_seq));
             }
+            JournalPayload::CoreMembershipRecorded(value) => {
+                core_memberships
+                    .insert(value.membership_revision_id, (*value, row.source_event_seq));
+            }
+            JournalPayload::GlobalSupportContractRecorded(value) => {
+                support_contracts.insert(
+                    value.support_contract_revision_id,
+                    (*value, row.source_event_seq),
+                );
+            }
             _ => {}
         }
         let is_current = row.object_id.as_ref().is_some_and(|object_id| {
@@ -526,6 +544,14 @@ pub fn derive_l0002_projections(
     add_semantic(
         &mut relations,
         build_semantic_relation_rows(&all_values(&atoms), &all_values(&proposals))?,
+        &endpoint_seqs,
+    );
+    add_semantic(
+        &mut relations,
+        build_core_support_relation_rows(
+            &all_values(&core_memberships),
+            &all_values(&support_contracts),
+        )?,
         &endpoint_seqs,
     );
     relations.insert(RelationProjectionRow::checkpoint(objects.frontier));

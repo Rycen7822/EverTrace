@@ -282,6 +282,7 @@ uuid_id!(RevisionProposalId, "proposal");
 uuid_id!(CoreMembershipId, "coremem");
 digest_id!(WikiProjectionId, "wiki");
 digest_id!(CoreProjectionId, "core");
+digest_id!(ScenarioId, "scenario");
 uuid_id!(WorkArtifactId, "art");
 uuid_id!(DuplicateGroupId, "dup");
 uuid_id!(RecallNeedId, "need");
@@ -329,6 +330,7 @@ impl_new_v7!(
     ResultEvidenceId,
     AtomId,
     RevisionProposalId,
+    CoreMembershipId,
     WorkArtifactId,
     RecallNeedId,
     PresentationAttemptId,
@@ -367,6 +369,7 @@ pub enum AnyPublicId {
     CoreMembership(CoreMembershipId),
     WikiProjection(WikiProjectionId),
     CoreProjection(CoreProjectionId),
+    Scenario(ScenarioId),
     WorkArtifact(WorkArtifactId),
     DuplicateGroup(DuplicateGroupId),
     Cas(CasId),
@@ -424,6 +427,7 @@ impl AnyPublicId {
             Self::CoreMembership(_) => "coremem",
             Self::WikiProjection(_) => "wiki",
             Self::CoreProjection(_) => "core",
+            Self::Scenario(_) => "scenario",
             Self::WorkArtifact(_) => "art",
             Self::DuplicateGroup(_) => "dup",
             Self::Cas(_) => "cas",
@@ -470,6 +474,7 @@ impl FromStr for AnyPublicId {
             "coremem" => Ok(Self::CoreMembership(value.parse()?)),
             "wiki" => Ok(Self::WikiProjection(value.parse()?)),
             "core" => Ok(Self::CoreProjection(value.parse()?)),
+            "scenario" => Ok(Self::Scenario(value.parse()?)),
             "art" => Ok(Self::WorkArtifact(value.parse()?)),
             "dup" => Ok(Self::DuplicateGroup(value.parse()?)),
             "cas" => Ok(Self::Cas(value.parse()?)),

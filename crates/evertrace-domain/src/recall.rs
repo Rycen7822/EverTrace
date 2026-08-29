@@ -540,6 +540,7 @@ impl FutureCueContract {
 pub fn compile_atom_future_cue(
     atom: &Atom,
     is_current: bool,
+    global_support_valid: bool,
     source_watermark: u64,
 ) -> Result<FutureCueContract, FutureCueDiagnostic> {
     atom.validate()
@@ -564,7 +565,7 @@ pub fn compile_atom_future_cue(
         }
         _ => return Err(FutureCueDiagnostic::AuthorityUnverified),
     }
-    if matches!(atom.scope, crate::semantic::AtomScope::Global) {
+    if matches!(atom.scope, crate::semantic::AtomScope::Global) && !global_support_valid {
         return Err(FutureCueDiagnostic::GlobalSupportUnavailable);
     }
     if atom.validity_interval.valid_until_us.is_some() {
@@ -821,7 +822,7 @@ mod tests {
             value: ConstraintValue::Text("deliver".into()),
         });
         source.validate().unwrap();
-        let contract = compile_atom_future_cue(&source, true, 7).unwrap();
+        let contract = compile_atom_future_cue(&source, true, false, 7).unwrap();
         assert_eq!(
             contract.match_expr,
             match &source.applicability_expr {
@@ -862,33 +863,33 @@ mod tests {
         let mut missing_lifecycle = source.clone();
         missing_lifecycle.future_cue_lifecycle_exprs = None;
         assert_eq!(
-            compile_atom_future_cue(&missing_lifecycle, true, 7),
+            compile_atom_future_cue(&missing_lifecycle, true, false, 7),
             Err(FutureCueDiagnostic::SuppressResolveSourceUnavailable)
         );
         assert_eq!(
-            compile_atom_future_cue(&source, true, 0),
+            compile_atom_future_cue(&source, true, false, 0),
             Err(FutureCueDiagnostic::InvalidSource)
         );
         assert_eq!(
-            compile_atom_future_cue(&source, false, 7),
+            compile_atom_future_cue(&source, false, false, 7),
             Err(FutureCueDiagnostic::SourceNotCurrent)
         );
         let mut inactive = source.clone();
         inactive.lifecycle_status = AtomLifecycleStatus::Deprecated;
         assert_eq!(
-            compile_atom_future_cue(&inactive, true, 7),
+            compile_atom_future_cue(&inactive, true, false, 7),
             Err(FutureCueDiagnostic::SourceInactive)
         );
         let mut finite = source.clone();
         finite.validity_interval.valid_until_us = Some(9);
         assert_eq!(
-            compile_atom_future_cue(&finite, true, 7),
+            compile_atom_future_cue(&finite, true, false, 7),
             Err(FutureCueDiagnostic::FiniteValidityUnsupported)
         );
         let mut unstructured = source.clone();
         unstructured.applicability_expr = ApplicabilityExpr::Always;
         assert_eq!(
-            compile_atom_future_cue(&unstructured, true, 7),
+            compile_atom_future_cue(&unstructured, true, false, 7),
             Err(FutureCueDiagnostic::UnstructuredCondition)
         );
         let mut global = source.clone();
@@ -899,7 +900,7 @@ mod tests {
             .unwrap()
             .authorized_scope_ceiling = AtomScope::Global;
         assert_eq!(
-            compile_atom_future_cue(&global, true, 7),
+            compile_atom_future_cue(&global, true, false, 7),
             Err(FutureCueDiagnostic::GlobalSupportUnavailable)
         );
         let mut policy = source.clone();
@@ -919,7 +920,7 @@ mod tests {
             adapter_manifest_id: "adapter_manifest_1".into(),
         });
         assert_eq!(
-            compile_atom_future_cue(&policy, true, 7),
+            compile_atom_future_cue(&policy, true, false, 7),
             Err(FutureCueDiagnostic::ProjectPolicyProofUnavailable)
         );
     }
@@ -931,7 +932,7 @@ mod tests {
             value: ConstraintValue::Text("assistant".into()),
         });
         assert_eq!(
-            compile_atom_future_cue(&overloaded, true, 1),
+            compile_atom_future_cue(&overloaded, true, false, 1),
             Err(FutureCueDiagnostic::FieldNotAllowed)
         );
         let expr = ConstraintExpr::Eq {

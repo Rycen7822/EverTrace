@@ -2162,11 +2162,12 @@ async fn task_and_repository_acceptance_are_atomic_restart_safe_and_four_table_o
         if let JournalPayload::RevisionProposalRecorded(proposal) = payload
             && proposal.status == ProposalStatus::Accepted
         {
-            proposal
-                .acceptance
-                .as_mut()
-                .unwrap()
-                .accepted_structure_hash = forged_structure_hash.unwrap();
+            let evertrace_domain::semantic::AcceptedProposalTarget::Atom { structure_hash, .. } =
+                &mut proposal.acceptance.as_mut().unwrap().accepted_target
+            else {
+                panic!("expected atom acceptance")
+            };
+            *structure_hash = forged_structure_hash.unwrap();
         }
     }
     assert!(
@@ -2381,7 +2382,12 @@ async fn task_and_repository_acceptance_are_atomic_restart_safe_and_four_table_o
                     repository_instance_id: scope.repository.repository_id,
                 },
             };
-            acceptance.accepted_structure_hash = forged_atom_hash.unwrap();
+            let evertrace_domain::semantic::AcceptedProposalTarget::Atom { structure_hash, .. } =
+                &mut acceptance.accepted_target
+            else {
+                panic!("expected atom acceptance")
+            };
+            *structure_hash = forged_atom_hash.unwrap();
         }
     }
     assert!(

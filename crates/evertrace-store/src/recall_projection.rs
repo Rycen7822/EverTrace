@@ -14,11 +14,17 @@ use crate::{
 pub(crate) const RECALL_TRIGGER_INDEX_KIND: &str = "recall_trigger_index";
 const PROJECTION_GENERATION: u64 = 1;
 
-pub(crate) fn rows(atoms: &BTreeMap<AtomId, (Atom, u64)>) -> Result<Vec<ObjectRow>, StoreError> {
+pub(crate) fn rows(
+    atoms: &BTreeMap<AtomId, (Atom, u64)>,
+    eligible: impl Fn(&Atom) -> bool,
+) -> Result<Vec<ObjectRow>, StoreError> {
     atoms
         .values()
         .filter_map(|(atom, source_event_seq)| {
-            compile_atom_future_cue(atom, true, *source_event_seq)
+            if !eligible(atom) {
+                return None;
+            }
+            compile_atom_future_cue(atom, true, true, *source_event_seq)
                 .ok()
                 .map(|contract| row(atom, contract, *source_event_seq))
         })
@@ -37,20 +43,22 @@ pub(crate) fn contract(row: &ObjectRow) -> Result<Option<FutureCueContract>, Sto
         || row.authority.as_deref() != Some("user_explicit")
         || row.epistemic.is_some()
         || row.publication_state.is_some()
-        || row.support_state.is_some()
         || row.project_id.is_some()
         || row.workstream_id.is_some()
         || row.session_id.is_some()
         || row.source_event_seq == 0
         || row.projection_generation != PROJECTION_GENERATION
-        || !matches!(
-            (
-                row.task_id.as_ref(),
-                row.repository_id.as_ref(),
-                row.worktree_id.as_ref()
-            ),
-            (Some(_), None, None) | (None, Some(_), None) | (None, Some(_), Some(_))
-        )
+        || !match (
+            row.task_id.as_ref(),
+            row.repository_id.as_ref(),
+            row.worktree_id.as_ref(),
+        ) {
+            (Some(_), None, None) | (None, Some(_), None) | (None, Some(_), Some(_)) => {
+                row.support_state.is_none()
+            }
+            (None, None, None) => row.support_state.as_deref() == Some("valid"),
+            _ => false,
+        }
     {
         return Err(StoreError::StoreCorrupt);
     }
@@ -109,7 +117,7 @@ fn row(
         epistemic: None,
         authority: Some(atom.authority.as_str().into()),
         publication_state: None,
-        support_state: None,
+        support_state: matches!(atom.scope, AtomScope::Global).then(|| "valid".into()),
         project_id: None,
         repository_id,
         worktree_id,

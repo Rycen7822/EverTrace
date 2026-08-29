@@ -238,6 +238,7 @@ fn authority_fields(
                 AtomScope::Repository {
                     repository_instance_id,
                 } if receipt.repository_instance_id == Some(*repository_instance_id) => {}
+                AtomScope::Global if matches!(authorized_scope_ceiling, AtomScope::Global) => {}
                 _ => return Err(SemanticServiceError::InvalidInput),
             }
             Ok((

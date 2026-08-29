@@ -3,10 +3,11 @@ use evertrace_domain::{
     ids::{CommandId, RevisionProposalId},
     revision::RevisionId,
     semantic::{
-        Atom, AtomLifecycleStatus, AtomProposalPayload, AtomScope, ProposalAcceptance,
-        ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-        ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind, ProposalWaitingOn,
-        RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF, tui_acceptance_event_payload,
+        AcceptedProposalTarget, Atom, AtomLifecycleStatus, AtomProposalPayload, AtomScope,
+        ProposalAcceptance, ProposalAcceptanceAuthority, ProposalCreatedBy, ProposalEligibility,
+        ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId, ProposalTargetKind,
+        ProposalWaitingOn, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        tui_acceptance_event_payload,
     },
 };
 use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload, SemanticCurrentView};
@@ -68,6 +69,10 @@ pub enum AtomAcceptanceContext {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
     },
+    GlobalTui {
+        observation: Box<SourceObservation>,
+        receipt: Box<SourceReceipt>,
+    },
     ObjectiveEvidence {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
@@ -80,19 +85,20 @@ impl AtomAcceptanceContext {
             Self::CurrentTaskExactMessage { observation, .. }
             | Self::RepositoryTui { observation, .. }
             | Self::TaskTui { observation, .. }
+            | Self::GlobalTui { observation, .. }
             | Self::ObjectiveEvidence { observation, .. } => observation,
         }
     }
 
-    fn acceptance_event_ref(&self) -> String {
+    pub(crate) fn acceptance_event_ref(&self) -> String {
         self.observation().source_observation_id.to_string()
     }
 
-    fn reviewer_identity(&self) -> String {
+    pub(crate) fn reviewer_identity(&self) -> String {
         format!("user_source:{}", self.observation().source_observation_id)
     }
 
-    fn validate(
+    pub(crate) fn validate(
         &self,
         proposal: &RevisionProposal,
         accepted_at_us: i64,
@@ -116,6 +122,10 @@ impl AtomAcceptanceContext {
                 observation,
                 receipt,
             }
+            | Self::GlobalTui {
+                observation,
+                receipt,
+            }
             | Self::ObjectiveEvidence {
                 observation,
                 receipt,
@@ -124,7 +134,9 @@ impl AtomAcceptanceContext {
         Ok(())
     }
 
-    fn authority_basis(&self) -> Result<ProposalAcceptanceAuthority, SemanticServiceError> {
+    pub(crate) fn authority_basis(
+        &self,
+    ) -> Result<ProposalAcceptanceAuthority, SemanticServiceError> {
         Ok(match self {
             Self::CurrentTaskExactMessage { observation, .. } => {
                 ProposalAcceptanceAuthority::CurrentTaskExactMessage {
@@ -153,6 +165,10 @@ impl AtomAcceptanceContext {
                     task_id: receipt.task_id.ok_or(SemanticServiceError::InvalidInput)?,
                 },
             },
+            Self::GlobalTui { observation, .. } => ProposalAcceptanceAuthority::TuiAcceptance {
+                user_source_observation_ref: observation.source_observation_id,
+                authorized_scope_ceiling: AtomScope::Global,
+            },
             Self::ObjectiveEvidence { observation, .. } => {
                 ProposalAcceptanceAuthority::ObjectiveEvidence {
                     user_source_observation_ref: observation.source_observation_id,
@@ -160,6 +176,90 @@ impl AtomAcceptanceContext {
             }
         })
     }
+}
+
+pub(crate) fn accepted_proposal_successor(
+    current: &RevisionProposal,
+    context: &ProposalCommandContext,
+    acceptance_context: &AtomAcceptanceContext,
+    accepted_revision_id: RevisionId,
+    accepted_target: AcceptedProposalTarget,
+) -> Result<(RevisionProposal, Vec<JournalPayload>), SemanticServiceError> {
+    acceptance_context.validate(current, context.occurred_at_us)?;
+    accepted_proposal_successor_with_audit(
+        current,
+        context,
+        accepted_revision_id,
+        accepted_target,
+        ProposalAcceptanceAudit {
+            reviewer_identity: acceptance_context.reviewer_identity(),
+            acceptance_event_ref: acceptance_context.acceptance_event_ref(),
+            authority_basis: acceptance_context.authority_basis()?,
+        },
+    )
+}
+
+pub(crate) struct ProposalAcceptanceAudit {
+    pub reviewer_identity: String,
+    pub acceptance_event_ref: String,
+    pub authority_basis: ProposalAcceptanceAuthority,
+}
+
+pub(crate) fn accepted_proposal_successor_with_audit(
+    current: &RevisionProposal,
+    context: &ProposalCommandContext,
+    accepted_revision_id: RevisionId,
+    accepted_target: AcceptedProposalTarget,
+    audit: ProposalAcceptanceAudit,
+) -> Result<(RevisionProposal, Vec<JournalPayload>), SemanticServiceError> {
+    let mut payloads = Vec::new();
+    let parent_revision_id = if current.status == ProposalStatus::Pending {
+        let mut validating = current.clone();
+        validating.proposal_revision_id = RevisionId::new_v7();
+        validating.parent_proposal_revision_id = Some(current.proposal_revision_id);
+        validating.status = ProposalStatus::Validating;
+        validating.created_at_us = context.occurred_at_us;
+        current
+            .validate_successor(&validating)
+            .map_err(|_| SemanticServiceError::ImmutableConflict)?;
+        let parent = validating.proposal_revision_id;
+        payloads.push(JournalPayload::RevisionProposalRecorded(Box::new(
+            validating,
+        )));
+        parent
+    } else {
+        current.proposal_revision_id
+    };
+    let mut accepted = current.clone();
+    accepted.proposal_revision_id = accepted_revision_id;
+    accepted.parent_proposal_revision_id = Some(parent_revision_id);
+    accepted.status = ProposalStatus::Accepted;
+    accepted.waiting_on.clear();
+    accepted.review_reason = Some("manual_acceptance".into());
+    accepted.acceptance = Some(ProposalAcceptance {
+        reviewer_identity: audit.reviewer_identity,
+        acceptance_event_ref: audit.acceptance_event_ref,
+        reviewed_proposal_revision_id: current.proposal_revision_id,
+        reviewed_fingerprint: current.fingerprint,
+        accepted_target,
+        authority_basis: audit.authority_basis,
+        accepted_at_us: context.occurred_at_us,
+    });
+    accepted.created_at_us = context.occurred_at_us;
+    accepted.reviewed_at_us = Some(context.occurred_at_us);
+    if let Some(JournalPayload::RevisionProposalRecorded(validating)) = payloads.last() {
+        validating
+            .validate_successor(&accepted)
+            .map_err(|_| SemanticServiceError::ImmutableConflict)?;
+    } else {
+        current
+            .validate_successor(&accepted)
+            .map_err(|_| SemanticServiceError::ImmutableConflict)?;
+    }
+    payloads.push(JournalPayload::RevisionProposalRecorded(Box::new(
+        accepted.clone(),
+    )));
+    Ok((accepted, payloads))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -407,17 +507,18 @@ impl RevisionProposalService {
                     return Err(SemanticServiceError::UnsupportedTarget);
                 }
             },
-            ProposalPayload::ReservedTarget { .. } => {
+            ProposalPayload::CoreMembership(_) | ProposalPayload::ReservedTarget { .. } => {
                 return Err(SemanticServiceError::UnsupportedTarget);
             }
         };
+        let global_tui = matches!(acceptance_context, AtomAcceptanceContext::GlobalTui { .. });
         if !matches!(
             requested_scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
-        ) {
+        ) && !(matches!(requested_scope, AtomScope::Global) && global_tui)
+        {
             return Err(SemanticServiceError::UnsupportedTarget);
         }
-        acceptance_context.validate(current, context.occurred_at_us)?;
         if current.operation == ProposalOperation::Deprecate
             && !matches!(
                 &acceptance_context,
@@ -468,66 +569,33 @@ impl RevisionProposalService {
         if !matches!(
             atom.scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
-        ) {
+        ) && !(matches!(atom.scope, AtomScope::Global) && global_tui)
+        {
             return Err(SemanticServiceError::UnsupportedTarget);
         }
 
-        let mut payloads = Vec::new();
-        let parent_revision_id = if current.status == ProposalStatus::Pending {
-            let mut validating = current.clone();
-            validating.proposal_revision_id = RevisionId::new_v7();
-            validating.parent_proposal_revision_id = Some(current.proposal_revision_id);
-            validating.status = ProposalStatus::Validating;
-            validating.created_at_us = context.occurred_at_us;
-            current
-                .validate_successor(&validating)
-                .map_err(|_| SemanticServiceError::ImmutableConflict)?;
-            let parent = validating.proposal_revision_id;
-            payloads.push(JournalPayload::RevisionProposalRecorded(Box::new(
-                validating,
-            )));
-            parent
-        } else {
-            current.proposal_revision_id
-        };
-        let mut accepted = current.clone();
-        accepted.proposal_revision_id = accepted_revision_id;
-        accepted.parent_proposal_revision_id = Some(parent_revision_id);
-        accepted.status = ProposalStatus::Accepted;
-        accepted.waiting_on.clear();
-        accepted.review_reason = Some("manual_acceptance".into());
-        accepted.acceptance = Some(ProposalAcceptance {
-            reviewer_identity: acceptance_context.reviewer_identity(),
-            acceptance_event_ref: acceptance_context.acceptance_event_ref(),
-            reviewed_proposal_revision_id: current.proposal_revision_id,
-            reviewed_fingerprint: current.fingerprint,
-            accepted_atom_id: atom.atom_id,
-            accepted_atom_revision_id: atom.revision_id,
-            accepted_structure_hash: atom
-                .semantic_structure_hash()
-                .map_err(|_| SemanticServiceError::InvalidInput)?,
-            authority_basis: acceptance_context.authority_basis()?,
-            accepted_at_us: context.occurred_at_us,
-        });
-        accepted.created_at_us = context.occurred_at_us;
-        accepted.reviewed_at_us = Some(context.occurred_at_us);
-        if current.status == ProposalStatus::Pending {
-            let validating = match payloads.last() {
-                Some(JournalPayload::RevisionProposalRecorded(value)) => value.as_ref(),
-                _ => return Err(SemanticServiceError::InvalidInput),
-            };
-            validating
-                .validate_successor(&accepted)
-                .map_err(|_| SemanticServiceError::ImmutableConflict)?;
-        } else {
-            current
-                .validate_successor(&accepted)
-                .map_err(|_| SemanticServiceError::ImmutableConflict)?;
-        }
-        payloads.push(JournalPayload::RevisionProposalRecorded(Box::new(
-            accepted.clone(),
-        )));
+        let (accepted, mut payloads) = accepted_proposal_successor(
+            current,
+            &context,
+            &acceptance_context,
+            accepted_revision_id,
+            AcceptedProposalTarget::Atom {
+                atom_id: atom.atom_id,
+                atom_revision_id: atom.revision_id,
+                structure_hash: atom
+                    .semantic_structure_hash()
+                    .map_err(|_| SemanticServiceError::InvalidInput)?,
+            },
+        )?;
         payloads.push(JournalPayload::AtomRecorded(Box::new(atom.clone())));
+        if matches!(atom.scope, AtomScope::Global) {
+            payloads.extend(super::s23::global_atom_support_payloads(
+                view,
+                &atom,
+                &accepted,
+                context.occurred_at_us,
+            )?);
+        }
         let command = payload_command(context, payloads)?;
         Ok(AcceptedProposalCommand {
             proposal: Box::new(accepted),
@@ -628,7 +696,7 @@ fn accepted_draft(
                 Err(SemanticServiceError::UnsupportedTarget)
             }
         }?,
-        ProposalPayload::ReservedTarget { .. } => {
+        ProposalPayload::CoreMembership(_) | ProposalPayload::ReservedTarget { .. } => {
             return Err(SemanticServiceError::UnsupportedTarget);
         }
     };
@@ -685,6 +753,17 @@ fn acceptance_basis(
                     receipt.clone(),
                     AtomScope::Task { task_id },
                 ),
+            ))
+        }
+        AtomAcceptanceContext::GlobalTui {
+            observation,
+            receipt,
+        } => {
+            if !matches!(draft.scope, AtomScope::Global) {
+                return Err(SemanticServiceError::UnsupportedTarget);
+            }
+            Ok(AtomAuthorityBasis::TuiAcceptance(
+                VerifiedTuiAcceptance::new(observation.clone(), receipt.clone(), AtomScope::Global),
             ))
         }
         AtomAcceptanceContext::ObjectiveEvidence { .. } => {

@@ -3,6 +3,7 @@ use thiserror::Error;
 mod emission;
 mod proposal;
 mod resolver;
+mod s23;
 
 pub use emission::{
     AtomAuthorityBasis, AtomEmissionDecision, AtomEmissionGate, AtomMaterialization,
@@ -17,6 +18,10 @@ pub use resolver::{
     CurrentPolicyBinding, DescriptiveFactResolver, DescriptiveResolution,
     DescriptiveResolutionState, NormativeInstructionResolver, NormativeResolution,
     NormativeResolutionState, ResolverContext,
+};
+pub use s23::{
+    AcceptedCoreMembershipCommand, CoreGovernanceDecision, CoreMembershipAcceptanceContext,
+    ScenarioCompiler, accept_core_membership, mark_support_pending, submit_core_conflict_proposal,
 };
 
 #[derive(Debug, Error)]

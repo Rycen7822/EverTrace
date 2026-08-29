@@ -19,8 +19,9 @@ pub mod work;
 
 pub use ingest::{DrainProgress, EvidenceIngestor, IngestError};
 pub use jobs::{
-    JobResultDisposition, RecoveryAction, WriterActorError, WriterHandle, classify_job_result,
-    expired_leases, open_writer, pending_dirty, pending_outbox, spawn_writer,
+    JobResultDisposition, RecoveryAction, SupportClosureAction, WriterActorError, WriterHandle,
+    classify_job_result, expired_leases, open_writer, pending_dirty, pending_outbox, spawn_writer,
+    support_closure_result,
 };
 pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
 pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};

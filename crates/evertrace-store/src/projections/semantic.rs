@@ -12,10 +12,11 @@ use evertrace_domain::{
     repository::{RepositoryInstance, WorktreeInstance},
     revision::RevisionId,
     semantic::{
-        Atom, AtomAuthority, AtomLifecycleStatus, AtomScope, EpistemicStatus,
-        ProposalAcceptanceAuthority, ProposalOperation, ProposalStatus, ProposalTargetId,
-        ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        UserAuthorizationMode, VerifierStatus, tui_acceptance_event_payload,
+        Atom, AtomAuthority, AtomLifecycleStatus, AtomScope, CoreMembershipProposalPayload,
+        EpistemicStatus, ProposalAcceptanceAuthority, ProposalEligibility, ProposalOperation,
+        ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
+        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, UserAuthorizationMode, VerifierStatus,
+        tui_acceptance_event_payload,
     },
     work::{ArtifactPayloadStatus, Task, WorkArtifact},
 };
@@ -329,9 +330,6 @@ pub(crate) fn validate_command_boundary<'a>(
         _ => None,
     }) {
         if proposal.target_kind != ProposalTargetKind::Atom {
-            if proposal.status == ProposalStatus::Accepted {
-                return Err(error);
-            }
             continue;
         }
         match (proposal.target_id, proposal.base_revision_id) {
@@ -356,14 +354,18 @@ pub(crate) fn validate_command_boundary<'a>(
         _ => None,
     }) {
         let acceptance = accepted.acceptance.as_ref().ok_or(error)?;
+        let Some((accepted_atom_id, accepted_atom_revision_id, _)) = acceptance.accepted_atom()
+        else {
+            continue;
+        };
         if payloads
             .iter()
             .filter(|payload| {
                 matches!(
                     payload,
                     JournalPayload::AtomRecorded(atom)
-                        if atom.atom_id == acceptance.accepted_atom_id
-                            && atom.revision_id == acceptance.accepted_atom_revision_id
+                        if atom.atom_id == accepted_atom_id
+                            && atom.revision_id == accepted_atom_revision_id
                             && atom.accepted_proposal_id == Some(accepted.proposal_id)
                             && atom.accepted_proposal_revision_id
                                 == Some(accepted.proposal_revision_id)
@@ -490,6 +492,8 @@ fn validate_atom_relations(
                 AtomScope::Repository {
                     repository_instance_id,
                 } if receipt.repository_instance_id == Some(*repository_instance_id) => {}
+                AtomScope::Global if matches!(user.authorized_scope_ceiling, AtomScope::Global) => {
+                }
                 _ => return Err(StoreError::StoreCorrupt),
             },
             UserAuthorizationMode::UserStatement => {
@@ -566,11 +570,13 @@ fn validate_atom_relations(
                 .acceptance
                 .as_ref()
                 .ok_or(StoreError::StoreCorrupt)?;
+            let (accepted_atom_id, accepted_atom_revision_id, accepted_structure_hash) =
+                acceptance.accepted_atom().ok_or(StoreError::StoreCorrupt)?;
             if proposal.proposal_id != proposal_id
                 || proposal.status != ProposalStatus::Accepted
-                || acceptance.accepted_atom_id != atom.atom_id
-                || acceptance.accepted_atom_revision_id != atom.revision_id
-                || acceptance.accepted_structure_hash
+                || accepted_atom_id != atom.atom_id
+                || accepted_atom_revision_id != atom.revision_id
+                || accepted_structure_hash
                     != atom
                         .semantic_structure_hash()
                         .map_err(|_| StoreError::StoreCorrupt)?
@@ -598,10 +604,58 @@ fn validate_proposal_relations(
             return Err(StoreError::StoreCorrupt);
         }
     }
-    if proposal.target_kind != ProposalTargetKind::Atom {
-        if proposal.status == ProposalStatus::Accepted {
+    if proposal.target_kind == ProposalTargetKind::CoreMembership {
+        if proposal.target_id.is_some()
+            || proposal.base_revision_id.is_some()
+            || proposal.operation != ProposalOperation::Create
+        {
             return Err(StoreError::StoreCorrupt);
         }
+        if proposal.status == ProposalStatus::Accepted {
+            if !matches!(
+                proposal.payload,
+                evertrace_domain::semantic::ProposalPayload::CoreMembership(ref payload)
+                    if matches!(payload.as_ref(), CoreMembershipProposalPayload::Create { .. })
+            ) {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let sources = validate_acceptance_sources(proposal, input)?;
+            let acceptance = proposal
+                .acceptance
+                .as_ref()
+                .ok_or(StoreError::StoreCorrupt)?;
+            let ProposalAcceptanceAuthority::TuiAcceptance {
+                user_source_observation_ref,
+                authorized_scope_ceiling,
+            } = &acceptance.authority_basis
+            else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            if *user_source_observation_ref != sources.observation_id {
+                return Err(StoreError::StoreCorrupt);
+            }
+            match authorized_scope_ceiling {
+                AtomScope::Repository {
+                    repository_instance_id,
+                } if sources.receipt.repository_instance_id == Some(*repository_instance_id) => {}
+                AtomScope::Global => {}
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+            match proposal.eligibility {
+                ProposalEligibility::ManualRequired => validate_tui_acceptance_event(
+                    proposal,
+                    acceptance,
+                    sources.reviewed.created_at_us,
+                    sources.observation,
+                    sources.receipt,
+                )?,
+                ProposalEligibility::AutoEligibleFull => {}
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        return Ok(());
+    }
+    if proposal.target_kind != ProposalTargetKind::Atom {
         return Ok(());
     }
     match (proposal.target_id, proposal.base_revision_id) {
@@ -623,82 +677,24 @@ fn validate_proposal_relations(
             .acceptance
             .as_ref()
             .ok_or(StoreError::StoreCorrupt)?;
-        let acceptance_observation_id = acceptance
-            .acceptance_event_ref
-            .parse::<SourceObservationId>()
-            .map_err(|_| StoreError::StoreCorrupt)?;
-        let acceptance_observation = &input
-            .source_observations
-            .get(&acceptance_observation_id)
-            .ok_or(StoreError::StoreCorrupt)?
-            .0;
-        if acceptance_observation.source_role != SourceRole::User
-            || acceptance_observation.content_trust != ContentTrust::UserStatement
-            || acceptance_observation.observation_role != ObservationRole::Message
-            || acceptance.reviewer_identity != format!("user_source:{acceptance_observation_id}")
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-        let reviewed = &input
-            .proposal_revisions
-            .get(&acceptance.reviewed_proposal_revision_id)
-            .ok_or(StoreError::StoreCorrupt)?
-            .0;
-        let direct_review_parent =
-            proposal.parent_proposal_revision_id == Some(acceptance.reviewed_proposal_revision_id);
-        let validating_review_parent = proposal
-            .parent_proposal_revision_id
-            .and_then(|parent| input.proposal_revisions.get(&parent))
-            .is_some_and(|(validating, _)| {
-                validating.proposal_id == proposal.proposal_id
-                    && validating.status == ProposalStatus::Validating
-                    && validating.parent_proposal_revision_id
-                        == Some(acceptance.reviewed_proposal_revision_id)
-                    && validating.fingerprint == acceptance.reviewed_fingerprint
-            });
-        if reviewed.proposal_id != proposal.proposal_id
-            || reviewed.fingerprint != acceptance.reviewed_fingerprint
-            || !matches!(
-                reviewed.status,
-                ProposalStatus::Pending | ProposalStatus::Validating
-            )
-            || !(direct_review_parent || validating_review_parent)
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
+        let sources = validate_acceptance_sources(proposal, input)?;
+        let acceptance_observation_id = sources.observation_id;
+        let acceptance_observation = sources.observation;
+        let reviewed = sources.reviewed;
+        let (_, accepted_atom_revision_id, _) =
+            acceptance.accepted_atom().ok_or(StoreError::StoreCorrupt)?;
         let atom = &input
             .atom_revisions
-            .get(&acceptance.accepted_atom_revision_id)
+            .get(&accepted_atom_revision_id)
             .ok_or(StoreError::StoreCorrupt)?
             .0;
         if !matches!(
             atom.scope,
-            AtomScope::Task { .. } | AtomScope::Repository { .. }
+            AtomScope::Task { .. } | AtomScope::Repository { .. } | AtomScope::Global
         ) {
             return Err(StoreError::StoreCorrupt);
         }
-        let acceptance_receipt = &input
-            .source_receipts
-            .get(&acceptance_observation.source_receipt_ref)
-            .ok_or(StoreError::StoreCorrupt)?
-            .0;
-        if acceptance_receipt.observation_role != ObservationRole::Message
-            || acceptance_observation.capture_completeness != CaptureCompleteness::Complete
-            || acceptance_receipt.capture_completeness != CaptureCompleteness::Complete
-            || acceptance_observation.source_observation_id
-                != acceptance_receipt.source_observation_id
-            || acceptance_observation.source_instance_id != acceptance_receipt.source_instance_id
-            || acceptance_observation.source_revision != acceptance_receipt.source_revision
-            || acceptance_observation.source_record_identity
-                != acceptance_receipt.source_record_identity
-            || acceptance_observation.adapter_revision != acceptance_receipt.adapter_revision
-            || acceptance_observation.canonicalization_revision
-                != acceptance_receipt.canonicalization_revision
-            || acceptance_observation.correlation.adapter_manifest_ref
-                != acceptance_receipt.adapter_manifest_ref
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
+        let acceptance_receipt = sources.receipt;
         match &acceptance.authority_basis {
             ProposalAcceptanceAuthority::CurrentTaskExactMessage {
                 user_source_observation_ref,
@@ -725,6 +721,7 @@ fn validate_proposal_relations(
                         repository_instance_id,
                     } if acceptance_receipt.repository_instance_id
                         == Some(*repository_instance_id) => {}
+                    AtomScope::Global if matches!(atom.scope, AtomScope::Global) => {}
                     _ => return Err(StoreError::StoreCorrupt),
                 }
                 validate_tui_acceptance_event(
@@ -750,7 +747,9 @@ fn validate_proposal_relations(
                 )?;
             }
         }
-        if atom.atom_id != acceptance.accepted_atom_id
+        let (accepted_atom_id, _, _) =
+            acceptance.accepted_atom().ok_or(StoreError::StoreCorrupt)?;
+        if atom.atom_id != accepted_atom_id
             || atom.accepted_proposal_id != Some(proposal.proposal_id)
             || atom.accepted_proposal_revision_id != Some(proposal.proposal_revision_id)
         {
@@ -803,6 +802,90 @@ fn validate_proposal_relations(
         }
     }
     Ok(())
+}
+
+struct AcceptanceSources<'a> {
+    observation_id: SourceObservationId,
+    observation: &'a SourceObservation,
+    receipt: &'a SourceReceipt,
+    reviewed: &'a RevisionProposal,
+}
+
+fn validate_acceptance_sources<'a>(
+    proposal: &RevisionProposal,
+    input: &'a SemanticRelationInputs<'a>,
+) -> Result<AcceptanceSources<'a>, StoreError> {
+    let acceptance = proposal
+        .acceptance
+        .as_ref()
+        .ok_or(StoreError::StoreCorrupt)?;
+    let observation_id = acceptance
+        .acceptance_event_ref
+        .parse::<SourceObservationId>()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let observation = &input
+        .source_observations
+        .get(&observation_id)
+        .ok_or(StoreError::StoreCorrupt)?
+        .0;
+    if observation.source_role != SourceRole::User
+        || observation.content_trust != ContentTrust::UserStatement
+        || observation.observation_role != ObservationRole::Message
+        || acceptance.reviewer_identity != format!("user_source:{observation_id}")
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let reviewed = &input
+        .proposal_revisions
+        .get(&acceptance.reviewed_proposal_revision_id)
+        .ok_or(StoreError::StoreCorrupt)?
+        .0;
+    let direct_review_parent =
+        proposal.parent_proposal_revision_id == Some(acceptance.reviewed_proposal_revision_id);
+    let validating_review_parent = proposal
+        .parent_proposal_revision_id
+        .and_then(|parent| input.proposal_revisions.get(&parent))
+        .is_some_and(|(validating, _)| {
+            validating.proposal_id == proposal.proposal_id
+                && validating.status == ProposalStatus::Validating
+                && validating.parent_proposal_revision_id
+                    == Some(acceptance.reviewed_proposal_revision_id)
+                && validating.fingerprint == acceptance.reviewed_fingerprint
+        });
+    if reviewed.proposal_id != proposal.proposal_id
+        || reviewed.fingerprint != acceptance.reviewed_fingerprint
+        || !matches!(
+            reviewed.status,
+            ProposalStatus::Pending | ProposalStatus::Validating
+        )
+        || !(direct_review_parent || validating_review_parent)
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let receipt = &input
+        .source_receipts
+        .get(&observation.source_receipt_ref)
+        .ok_or(StoreError::StoreCorrupt)?
+        .0;
+    if receipt.observation_role != ObservationRole::Message
+        || observation.capture_completeness != CaptureCompleteness::Complete
+        || receipt.capture_completeness != CaptureCompleteness::Complete
+        || observation.source_observation_id != receipt.source_observation_id
+        || observation.source_instance_id != receipt.source_instance_id
+        || observation.source_revision != receipt.source_revision
+        || observation.source_record_identity != receipt.source_record_identity
+        || observation.adapter_revision != receipt.adapter_revision
+        || observation.canonicalization_revision != receipt.canonicalization_revision
+        || observation.correlation.adapter_manifest_ref != receipt.adapter_manifest_ref
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(AcceptanceSources {
+        observation_id,
+        observation,
+        receipt,
+        reviewed,
+    })
 }
 
 fn validate_accepted_authority(
