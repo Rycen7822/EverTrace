@@ -8,6 +8,13 @@ pub const MAX_FRAME_SIZE: usize = 1_048_576;
 pub enum ClientKind {
     Cli,
     Hook,
+    Mcp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionContext {
+    pub connection_id: String,
+    pub client_kind: ClientKind,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

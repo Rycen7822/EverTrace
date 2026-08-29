@@ -6,6 +6,7 @@ use evertrace_domain::{
 use serde::{Deserialize, Serialize};
 
 use crate::dto::HealthMode;
+use crate::envelope::McpResultEnvelope;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +21,25 @@ pub enum Response {
     Health(HealthResponse),
     RecoveryTerminal(RecoveryTerminalResponse),
     RecoveryAction(RecoveryActionResponse),
+    McpBindingIssued(McpBindingIssuedResponse),
+    McpResult(Box<McpResultEnvelope>),
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpBindingIssuedResponse {
+    pub bound_workspace: String,
+    pub expires_at_us: i64,
+}
+
+impl std::fmt::Debug for McpBindingIssuedResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpBindingIssuedResponse")
+            .field("bound_workspace_redacted", &true)
+            .field("expires_at_us", &self.expires_at_us)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

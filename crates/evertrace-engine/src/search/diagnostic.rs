@@ -461,6 +461,12 @@ fn push_candidate(
     result.candidates.push(SearchCandidate {
         candidate_id,
         source_ref: row.source_ref.clone().ok_or(SearchError::Corrupt)?,
+        row_variant: match row.row_variant.as_str() {
+            "object" => evertrace_domain::query::SearchCandidateVariant::Object,
+            "evidence_surface" => evertrace_domain::query::SearchCandidateVariant::EvidenceSurface,
+            _ => return Err(SearchError::Corrupt),
+        },
+        object_kind: row.object_kind.clone(),
         text: row.text.clone(),
         source_role: row.source_role.clone(),
         content_trust: row.content_trust.clone(),

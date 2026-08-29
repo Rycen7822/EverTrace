@@ -23,4 +23,9 @@ pub use jobs::{
 };
 pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
 pub use recovery::*;
-pub use service::{EngineError, EngineService, HealthDispatchError, HealthSnapshot, RuntimeMode};
+pub use service::{
+    EngineError, EngineService, HealthDispatchError, HealthSnapshot, McpActionService,
+    McpBindingAuthority, McpBindingError, McpBindingGrant, McpBindingIssue, McpItemPartition,
+    McpResolvedScope, McpScopeMechanism, McpServiceAction, McpServiceError, McpServiceItem,
+    McpServiceRequest, McpServiceResult, McpServiceStatus, RuntimeMode,
+};

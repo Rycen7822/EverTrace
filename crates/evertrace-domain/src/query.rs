@@ -473,10 +473,19 @@ impl SearchContext {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchCandidateVariant {
+    Object,
+    EvidenceSurface,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchCandidate {
     pub candidate_id: String,
     pub source_ref: String,
+    pub row_variant: SearchCandidateVariant,
+    pub object_kind: Option<String>,
     pub text: String,
     pub source_role: Option<String>,
     pub content_trust: Option<String>,

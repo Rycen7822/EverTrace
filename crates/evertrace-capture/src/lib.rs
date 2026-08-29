@@ -28,9 +28,9 @@ pub use frame::{
 };
 pub use key::{DeviceKey, DeviceKeyError, DeviceKeyStore};
 pub use protect::{
-    ArchiveMode, ProtectError, ProtectedPayload, RedactionSpan, SecretKind, protect,
-    recovery_content_token, recovery_path_token, recovery_ticket_auth_tag,
-    verify_recovery_ticket_auth_tag,
+    ArchiveMode, ProtectError, ProtectedPayload, RedactionSpan, SecretKind, mcp_call_auth_tag,
+    protect, recovery_content_token, recovery_path_token, recovery_ticket_auth_tag,
+    verify_mcp_call_auth_tag, verify_recovery_ticket_auth_tag,
 };
 pub use runtime_snapshot::{
     RUNTIME_SNAPSHOT_VERSION, RecoveryGateMode, RecoverySnapshotSettings, RuntimeSnapshot,

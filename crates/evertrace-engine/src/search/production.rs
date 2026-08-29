@@ -132,12 +132,17 @@ impl ProductionSearch {
             .unwrap_or(context.budget.candidates_remaining)
             .min(context.budget.candidates_remaining);
         let limit = usize::try_from(requested_limit).map_err(|_| SearchError::Unsupported)?;
+        let fetch_limit = if limit >= 32 {
+            limit
+        } else {
+            limit.saturating_mul(4).min(32)
+        };
         let mut exact_identifiers = context.query_facets.exact_identifiers.clone();
         exact_identifiers.push(context.raw_query.clone());
         exact_identifiers.sort();
         exact_identifiers.dedup();
         let structured = match deadline
-            .run(snapshot.structured(&exact_identifiers, &filter, limit))
+            .run(snapshot.structured(&exact_identifiers, &filter, fetch_limit))
             .await
         {
             Ok(Ok(rows)) => rows,
@@ -156,7 +161,7 @@ impl ProductionSearch {
             Err(StoreError::LanceDb)
         } else {
             match deadline
-                .run(snapshot.fts(&context.raw_query, &filter, limit))
+                .run(snapshot.fts(&context.raw_query, &filter, fetch_limit))
                 .await
             {
                 Ok(result) => result,
@@ -183,7 +188,8 @@ impl ProductionSearch {
         rows.sort();
         rows.dedup_by(|left, right| left.row_id == right.row_id);
         let mut selected = BTreeMap::<String, (u8, SearchCandidate, &SearchProjectionRow)>::new();
-        for row in &rows {
+        let mut omitted_refs = BTreeSet::new();
+        for (row_index, row) in rows.iter().enumerate() {
             if row.candidate_id.is_none() || !hard_compatible(row, &context)? {
                 continue;
             }
@@ -210,15 +216,44 @@ impl ProductionSearch {
                 .consume_candidate_text(row.text.len())
                 .is_err()
             {
+                for value in &rows[row_index..] {
+                    if value.candidate_id.is_none() || !hard_compatible(value, &context)? {
+                        continue;
+                    }
+                    let exact = context
+                        .query_facets
+                        .exact_identifiers
+                        .iter()
+                        .any(|identifier| {
+                            value.candidate_id.as_deref() == Some(identifier)
+                                || value.text.contains(identifier)
+                        });
+                    let stable = value
+                        .candidate_id
+                        .as_deref()
+                        .is_some_and(|id| id == context.raw_query);
+                    if exact || stable || fts_ids.contains(&value.row_id) {
+                        omitted_refs.extend(value.candidate_id.clone());
+                    }
+                }
                 break;
             }
             let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
+            let row_variant = match row.row_variant.as_str() {
+                "object" => evertrace_domain::query::SearchCandidateVariant::Object,
+                "evidence_surface" => {
+                    evertrace_domain::query::SearchCandidateVariant::EvidenceSurface
+                }
+                _ => return Err(SearchError::Corrupt),
+            };
             let entry = selected.entry(candidate_id.clone()).or_insert_with(|| {
                 (
                     if exact || stable { 0 } else { 3 },
                     SearchCandidate {
                         candidate_id,
                         source_ref: row.source_ref.clone().unwrap_or_default(),
+                        row_variant,
+                        object_kind: row.object_kind.clone(),
                         text: row.text.clone(),
                         source_role: row.source_role.clone(),
                         content_trust: row.content_trust.clone(),
@@ -239,6 +274,14 @@ impl ProductionSearch {
                 .cmp(&right.0)
                 .then_with(|| left.1.candidate_id.cmp(&right.1.candidate_id))
         });
+        if candidates.len() > limit {
+            omitted_refs.extend(
+                candidates[limit..]
+                    .iter()
+                    .map(|(_, candidate, _)| candidate.candidate_id.clone()),
+            );
+            candidates.truncate(limit);
+        }
         let conflicted = mark_conservative_conflicts(&mut candidates, &context);
         let temporal_partial = temporal_is_partial(&candidates, &context, &mut degraded_reasons);
         let mut completeness = if conflicted {
@@ -271,7 +314,7 @@ impl ProductionSearch {
                 .collect(),
             completeness,
             degraded_reasons,
-            omitted_refs: BTreeSet::new(),
+            omitted_refs,
             budget: context.budget,
         })
     }
@@ -358,15 +401,19 @@ pub(super) fn hard_compatible(
     {
         return Ok(false);
     }
-    if context
+    let has_route = context.task_id.is_some()
+        || context.repository_id.is_some()
+        || context.worktree_id.is_some();
+    let route_matches = context
         .task_id
-        .is_some_and(|id| row.task_id.as_deref() != Some(id.to_string().as_str()))
+        .is_some_and(|id| row.task_id.as_deref() == Some(id.to_string().as_str()))
         || context
             .repository_id
-            .is_some_and(|id| row.repository_id.as_deref() != Some(id.to_string().as_str()))
+            .is_some_and(|id| row.repository_id.as_deref() == Some(id.to_string().as_str()))
         || context
             .worktree_id
-            .is_some_and(|id| row.worktree_id.as_deref() != Some(id.to_string().as_str()))
+            .is_some_and(|id| row.worktree_id.as_deref() == Some(id.to_string().as_str()));
+    if has_route && !route_matches
         || !source_compatible(row, context.query_facets.source_boundary)
         || row.row_variant == "object"
             && context.intent != evertrace_domain::query::SearchIntent::HistoryLookup
@@ -399,7 +446,11 @@ pub(super) fn hard_compatible(
             .query_facets
             .explicit_exclusions
             .iter()
-            .any(|value| row.text.contains(value))
+            .any(|value| {
+                row.candidate_id.as_deref() == Some(value)
+                    || row.source_ref.as_deref() == Some(value)
+                    || row.text.contains(value)
+            })
         || !temporal_compatible(row, context)
         || context
             .suppression

@@ -15,6 +15,11 @@ use evertrace_capture::{
     RecoveryPreflightCandidate, RuntimeSnapshot,
 };
 use evertrace_codex::{
+    binding::{
+        BINDING_PROTOCOL_REVISION, CanonicalBindingCall, NativeHookSpecificOutput,
+        NativePermissionDecision, NativePreToolUse, NativePreToolUseEvent, NativePreToolUseOutput,
+        PublicWorkspace, validated_bound_workspace,
+    },
     hook_input::{CaptureHookInput, HookEventKind, MAX_CAPTURE_HOOK_INPUT},
     install::StableLauncher,
     recovery::classify_codex_pretool_candidate,
@@ -28,7 +33,11 @@ use evertrace_domain::{
     repository::DestructiveDetectionStatus,
     revision::RevisionId,
 };
-use evertrace_protocol::{command::RecoveryBarrierLocator, request_recovery_barrier_sync};
+use evertrace_protocol::{
+    command::{McpBindingIssueCommand, RecoveryBarrierLocator},
+    mcp::McpToolInput,
+    request_mcp_binding_sync, request_recovery_barrier_sync,
+};
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(2);
 const RECOVERY_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
@@ -46,10 +55,14 @@ fn run() -> Result<(), ()> {
         return Err(());
     }
     let bytes = read_input()?;
-    let input = CaptureHookInput::from_json(&bytes).map_err(|_| ())?;
     match mode.to_str() {
-        Some("--runtime-snapshot") => capture(Path::new(&path), input, started),
-        Some("--launcher-root") => launch(Path::new(&path), &bytes, &input, started),
+        Some("--runtime-snapshot") => capture(
+            Path::new(&path),
+            CaptureHookInput::from_json(&bytes).map_err(|_| ())?,
+            started,
+        ),
+        Some("--binding-runtime-snapshot") => binding_rewrite(Path::new(&path), &bytes),
+        Some("--launcher-root") => launch(Path::new(&path), &bytes, started),
         _ => Err(()),
     }
 }
@@ -189,25 +202,82 @@ fn recovery_preflight(
     })
 }
 
-fn launch(root: &Path, bytes: &[u8], input: &CaptureHookInput, started: Instant) -> Result<(), ()> {
+fn binding_rewrite(snapshot_path: &Path, bytes: &[u8]) -> Result<(), ()> {
+    let mut native = NativePreToolUse::<McpToolInput>::from_json(bytes).map_err(|_| ())?;
+    native.validate_host_fields().map_err(|_| ())?;
+    if !native.targets_evertrace() || !native.tool_input.validate() {
+        return Ok(());
+    }
+    PublicWorkspace::parse(&native.tool_input.workspace).map_err(|_| ())?;
+    let original_call = CanonicalBindingCall {
+        action: native.tool_input.action.as_str().into(),
+        workspace: native.tool_input.workspace.clone(),
+        input: native.tool_input.input.clone(),
+        refs: native.tool_input.refs.clone(),
+    };
+    let snapshot = RuntimeSnapshot::load(snapshot_path).map_err(|_| ())?;
+    let issued = request_mcp_binding_sync(
+        &snapshot.recovery_socket_path,
+        env!("CARGO_PKG_VERSION"),
+        McpBindingIssueCommand {
+            session_id: native.session_id,
+            turn_id: native.turn_id,
+            tool_use_id: native.tool_use_id,
+            agent_id: native.agent_id,
+            original_input: native.tool_input.clone(),
+            launcher_protocol_revision: BINDING_PROTOCOL_REVISION,
+        },
+        CHILD_TIMEOUT,
+    )
+    .map_err(|_| ())?;
+    native.tool_input.workspace =
+        validated_bound_workspace(&original_call, &issued.bound_workspace).map_err(|_| ())?;
+    let output = NativePreToolUseOutput {
+        hook_specific_output: NativeHookSpecificOutput {
+            hook_event_name: NativePreToolUseEvent::PreToolUse,
+            permission_decision: NativePermissionDecision::Allow,
+            updated_input: native.tool_input,
+        },
+    };
+    io::stdout()
+        .write_all(&output.to_json().map_err(|_| ())?)
+        .map_err(|_| ())
+}
+
+fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
+    let capture_input = CaptureHookInput::from_json(bytes).ok();
+    let native_input = NativePreToolUse::<McpToolInput>::from_json(bytes).ok();
+    let (session_id, binding_mode) = match (&capture_input, &native_input) {
+        (Some(input), None) => (input.session_id.as_str(), false),
+        (None, Some(input)) => (input.session_id.as_str(), true),
+        _ => return Err(()),
+    };
     let launcher = StableLauncher::open(root).map_err(|_| ())?;
-    let generation = launcher
-        .resolve_for_session(&input.session_id)
-        .map_err(|_| ())?;
+    let generation = launcher.resolve_for_session(session_id).map_err(|_| ())?;
     let snapshot = RuntimeSnapshot::load(&generation.runtime_snapshot).map_err(|_| ())?;
-    let child_timeout = launcher_child_timeout(
-        recovery_candidate_matches(&snapshot, input),
-        snapshot.recovery_preflight_timeout_ms,
-    );
+    let child_timeout = capture_input.as_ref().map_or(CHILD_TIMEOUT, |input| {
+        launcher_child_timeout(
+            recovery_candidate_matches(&snapshot, input),
+            snapshot.recovery_preflight_timeout_ms,
+        )
+    });
     let deadline = started.checked_add(child_timeout).ok_or(())?;
     if Instant::now() >= deadline {
         return Err(());
     }
     let mut child = Command::new(generation.executable)
-        .arg("--runtime-snapshot")
+        .arg(if binding_mode {
+            "--binding-runtime-snapshot"
+        } else {
+            "--runtime-snapshot"
+        })
         .arg(generation.runtime_snapshot)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(if binding_mode {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| ())?;

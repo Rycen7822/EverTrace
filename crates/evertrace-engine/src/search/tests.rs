@@ -59,6 +59,8 @@ mod tests {
             candidates: vec![SearchCandidate {
                 candidate_id: BASE_REVISION.into(),
                 source_ref: BASE_ENTITY.into(),
+                row_variant: evertrace_domain::query::SearchCandidateVariant::Object,
+                object_kind: Some("atom_revision".into()),
                 text: "needle base".into(),
                 source_role: None,
                 content_trust: None,
@@ -319,6 +321,8 @@ mod tests {
             result.candidates.push(SearchCandidate {
                 candidate_id: candidate.clone(),
                 source_ref: candidate,
+                row_variant: evertrace_domain::query::SearchCandidateVariant::Object,
+                object_kind: Some("atom_revision".into()),
                 text: "needle".into(),
                 source_role: None,
                 content_trust: None,
