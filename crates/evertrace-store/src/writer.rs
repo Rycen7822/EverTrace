@@ -105,6 +105,18 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
+    pub const fn frontier(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
+    pub fn recall_current_contexts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::RecallCurrentContext>, StoreError> {
+        self.admission_state
+            .recall_current_contexts(self.next_seq.saturating_sub(1), limit)
+    }
+
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
         let lock = SiblingWriterLock::acquire(data_dir)?;
         let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)

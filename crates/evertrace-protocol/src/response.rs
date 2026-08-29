@@ -23,6 +23,14 @@ pub enum Response {
     RecoveryAction(RecoveryActionResponse),
     McpBindingIssued(McpBindingIssuedResponse),
     McpResult(Box<McpResultEnvelope>),
+    RecallCue(RecallCueResponse),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecallCueResponse {
+    Authorized,
+    OutcomeAccepted,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]

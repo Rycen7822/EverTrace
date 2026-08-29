@@ -681,6 +681,9 @@ mod replacement_proof {
             recovery_max_bundle_bytes: 1 << 20,
             recovery_max_untracked_file_bytes: 1 << 16,
             recovery_max_untracked_total_bytes: 1 << 18,
+            recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+            recall_cue_adapter_manifest_id: None,
+            recall_cues: Vec::new(),
         };
         let locator = RecoveryBarrierLocator {
             spool_record_id: "spool-replacement".into(),

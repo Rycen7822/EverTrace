@@ -8,28 +8,7 @@ impl McpActionService {
         query: String,
     ) -> Result<McpServiceResult, McpServiceError> {
         if query == "@due" {
-            return Ok(
-                if matches!(
-                    scope.anchor.mechanism,
-                    McpScopeMechanism::ExactClaim | McpScopeMechanism::ConnectionScoped
-                ) {
-                    empty_result(
-                        request_id,
-                        McpServiceStatus::NoRecallNeeded,
-                        &scope_label(&scope),
-                        "current",
-                        [],
-                    )
-                } else {
-                    empty_result(
-                        request_id,
-                        McpServiceStatus::ScopeUnresolved,
-                        &scope_label(&scope),
-                        "unknown",
-                        ["scope_unresolved"],
-                    )
-                },
-            );
+            return self.search_due(request_id, scope).await;
         }
         let context = SearchContext {
             intent: SearchIntent::StageAssistance,
@@ -123,6 +102,223 @@ impl McpActionService {
         })
     }
 
+    async fn search_due(
+        &self,
+        request_id: RequestId,
+        mut scope: McpRequestScope,
+    ) -> Result<McpServiceResult, McpServiceError> {
+        if !matches!(
+            scope.anchor.mechanism,
+            McpScopeMechanism::ExactClaim | McpScopeMechanism::ConnectionScoped
+        ) || scope.anchor.session_id.is_none()
+            || scope.anchor.execution_lane_id.is_none()
+            || scope.anchor.episode_revision_id.is_none()
+        {
+            return Ok(empty_result(
+                request_id,
+                McpServiceStatus::ScopeUnresolved,
+                &scope_label(&scope),
+                "unknown",
+                ["scope_unresolved"],
+            ));
+        }
+        let now = unix_time_us_for_mcp();
+        let request_ref = request_id.to_string();
+        let mut stale_retries = 0;
+        for _ in 0..3 {
+            let matching = scope
+                .snapshot
+                .data_rows()
+                .filter(|row| {
+                    row.object_kind.as_deref() == Some("recall_need")
+                        && row.session_id.as_deref() == scope.anchor.session_id.as_deref()
+                })
+                .map(evertrace_store::projections::recall_need)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| McpServiceError::Store)?
+                .into_iter()
+                .flatten()
+                .filter(|need| {
+                    Some(need.session_id.as_str()) == scope.anchor.session_id.as_deref()
+                        && Some(need.execution_lane_id) == scope.anchor.execution_lane_id
+                        && Some(need.episode_revision_id) == scope.anchor.episode_revision_id
+                        && need.obligation_state == RecallObligationState::Active
+                        && need
+                            .obligation_expires_at_us
+                            .is_none_or(|expiry| expiry > now)
+                        && (need.agent_response == RecallAgentResponse::NotRetrieved
+                            || need.active_retrieval_request_id.as_deref()
+                                == Some(request_ref.as_str())
+                                && matches!(
+                                    need.agent_response,
+                                    RecallAgentResponse::RetrievalClaimed
+                                        | RecallAgentResponse::RetrievalReturned
+                                ))
+                })
+                .take(3)
+                .collect::<Vec<_>>();
+            let Some(need) = (matching.len() == 1).then(|| matching[0].clone()) else {
+                return Ok(if matching.is_empty() {
+                    empty_result(
+                        request_id,
+                        McpServiceStatus::NoRecallNeeded,
+                        &scope_label(&scope),
+                        "current",
+                        [],
+                    )
+                } else {
+                    empty_result(
+                        request_id,
+                        McpServiceStatus::ScopeUnresolved,
+                        &scope_label(&scope),
+                        "current",
+                        ["ambiguous_recall_need"],
+                    )
+                });
+            };
+            match crate::recall::revalidate_need(&scope.snapshot, &need, now)
+                .map_err(|_| McpServiceError::Store)?
+            {
+                crate::recall::RecallNeedValidity::Valid => {}
+                crate::recall::RecallNeedValidity::Unavailable => {
+                    return Ok(empty_result(
+                        request_id,
+                        McpServiceStatus::NoRecallNeeded,
+                        &scope_label(&scope),
+                        "current",
+                        ["recall_need_not_current"],
+                    ));
+                }
+                crate::recall::RecallNeedValidity::Terminal(state) => {
+                    let event = crate::recall::terminal_need_event(&need, state)
+                        .map_err(|_| McpServiceError::Store)?;
+                    let command = recall_ledger_command(
+                        event,
+                        now,
+                        self.runtime_snapshot.effective_config_hash,
+                    )?;
+                    match self
+                        .writer
+                        .commit_if_frontier(command, now, scope.snapshot.frontier)
+                        .await
+                    {
+                        Ok(_) => {
+                            return Ok(empty_result(
+                                request_id,
+                                McpServiceStatus::NoRecallNeeded,
+                                &scope_label(&scope),
+                                "current",
+                                [],
+                            ));
+                        }
+                        Err(WriterActorError::StaleFrontier) if stale_retries == 0 => {
+                            stale_retries += 1;
+                            scope.snapshot = self
+                                .writer
+                                .project()
+                                .await
+                                .map_err(|_| McpServiceError::Store)?;
+                            continue;
+                        }
+                        Err(_) => return Err(McpServiceError::Store),
+                    }
+                }
+            }
+            if need.active_retrieval_request_id.as_deref() == Some(request_ref.as_str()) {
+                if need.agent_response == RecallAgentResponse::RetrievalReturned {
+                    return self.due_result(request_id, &scope, need).await;
+                }
+                let result = match self.due_result(request_id, &scope, need.clone()).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let unknown = evertrace_domain::recall::RecallRetrievalOutcome {
+                            request_id: request_ref.clone(),
+                            recall_need_id: need.recall_need_id,
+                            recall_need_hash: need.recall_need_hash,
+                            state: RetrievalOutcomeState::Unknown,
+                            occurred_at_us: now,
+                        };
+                        if let Ok(command) = recall_retrieval_command(
+                            unknown,
+                            now,
+                            self.runtime_snapshot.effective_config_hash,
+                        ) {
+                            let _ = self
+                                .writer
+                                .commit_if_frontier(command, now, scope.snapshot.frontier)
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                };
+                let returned = evertrace_domain::recall::RecallRetrievalOutcome {
+                    request_id: request_ref.clone(),
+                    recall_need_id: need.recall_need_id,
+                    recall_need_hash: need.recall_need_hash,
+                    state: RetrievalOutcomeState::Returned,
+                    occurred_at_us: now,
+                };
+                let command = recall_retrieval_command(
+                    returned,
+                    now,
+                    self.runtime_snapshot.effective_config_hash,
+                )?;
+                match self
+                    .writer
+                    .commit_if_frontier(command, now, scope.snapshot.frontier)
+                    .await
+                {
+                    Ok(_) => return Ok(result),
+                    Err(WriterActorError::StaleFrontier) if stale_retries == 0 => {
+                        stale_retries += 1;
+                        scope.snapshot = self
+                            .writer
+                            .project()
+                            .await
+                            .map_err(|_| McpServiceError::Store)?;
+                        continue;
+                    }
+                    Err(_) => return Err(McpServiceError::Store),
+                }
+            }
+            let outcome = evertrace_domain::recall::RecallRetrievalOutcome {
+                request_id: request_ref.clone(),
+                recall_need_id: need.recall_need_id,
+                recall_need_hash: need.recall_need_hash,
+                state: RetrievalOutcomeState::Claimed,
+                occurred_at_us: now,
+            };
+            let command = recall_retrieval_command(
+                outcome,
+                now,
+                self.runtime_snapshot.effective_config_hash,
+            )?;
+            match self
+                .writer
+                .commit_if_frontier(command, now, scope.snapshot.frontier)
+                .await
+            {
+                Ok(_) => {
+                    scope.snapshot = self
+                        .writer
+                        .project()
+                        .await
+                        .map_err(|_| McpServiceError::Store)?;
+                }
+                Err(WriterActorError::StaleFrontier) if stale_retries == 0 => {
+                    stale_retries += 1;
+                    scope.snapshot = self
+                        .writer
+                        .project()
+                        .await
+                        .map_err(|_| McpServiceError::Store)?;
+                }
+                Err(_) => return Err(McpServiceError::Store),
+            }
+        }
+        Err(McpServiceError::Store)
+    }
+
     pub(super) async fn get(
         &self,
         request_id: RequestId,
@@ -175,6 +371,144 @@ impl McpActionService {
             next_refs: Vec::new(),
         })
     }
+}
+
+impl McpActionService {
+    async fn due_result(
+        &self,
+        request_id: RequestId,
+        scope: &McpRequestScope,
+        need: evertrace_domain::recall::RecallNeed,
+    ) -> Result<McpServiceResult, McpServiceError> {
+        let plan_text =
+            serde_json::to_string(&need.recall_plan).map_err(|_| McpServiceError::Store)?;
+        let mut items = vec![McpServiceItem {
+            partition: McpItemPartition::Evidence,
+            kind: "recall_brief".into(),
+            object_ref: Some(need.recall_need_id.to_string()),
+            object_revision_ref: Some(need.revision_id.to_string()),
+            source_revision_ref: need.source_revision_ids.first().map(ToString::to_string),
+            scope: Some(scope_label(scope)),
+            applicability: Some("revalidated_current".into()),
+            authority: Some("derived_runtime_ledger".into()),
+            content_trust: ContentTrust::Observed,
+            capture_completeness: Some("complete".into()),
+            instruction_authority: InstructionAuthority::None,
+            text: Some(plan_text),
+        }];
+        let exact_identifiers = need
+            .source_revision_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let query = exact_identifiers.join(" ");
+        let supplemental = ProductionSearch::new(self.search_index.clone())
+            .search(SearchContext {
+                intent: SearchIntent::FailureRecovery,
+                raw_query: query,
+                query_facets: QueryFacetSet {
+                    parse_status: FacetParseStatus::Complete,
+                    exact_identifiers,
+                    condition_literals: Vec::new(),
+                    relation_requirements: Vec::new(),
+                    polarity: Polarity::Positive,
+                    explicit_exclusions: Vec::new(),
+                    temporal_mode: TemporalMode::Current,
+                    temporal_qualifiers: Vec::new(),
+                    quantity_constraints: vec![QuantityConstraint::ResultLimit { limit: 2 }],
+                    scope_boundary: None,
+                    source_boundary: None,
+                    answer_shape: None,
+                    lifecycle_boundary: LifecycleBoundary::Active,
+                },
+                task_id: scope.anchor.task_id,
+                repository_id: scope.anchor.repository_id,
+                worktree_id: scope.anchor.worktree_id,
+                suppression: SuppressionSnapshot::Current {
+                    generation: PRE_DELETION_SUPPRESSION_GENERATION,
+                    ref_hashes: BTreeSet::new(),
+                },
+                budget: RetrievalBudget {
+                    candidates_remaining: 2,
+                    tokens_remaining: 600,
+                    latency_us_remaining: 250_000,
+                    hops_remaining: 0,
+                    follow_ups_remaining: 0,
+                },
+            })
+            .await;
+        let mut warnings = Vec::new();
+        let mut next_refs = need.recall_plan.supporting_evidence_refs;
+        let mut completeness = "complete";
+        match supplemental {
+            Ok(found) => {
+                let now = unix_time_us_for_mcp();
+                for candidate in found.candidates.into_iter().take(2) {
+                    if let Some(item) = classify_search_candidate(scope, &candidate, now) {
+                        items.push(item);
+                    } else {
+                        next_refs.push(candidate.candidate_id);
+                        completeness = "partial";
+                    }
+                }
+                if !found.degraded_reasons.is_empty() || !found.omitted_refs.is_empty() {
+                    completeness = "partial";
+                }
+                warnings.extend(found.degraded_reasons);
+                next_refs.extend(found.omitted_refs);
+            }
+            Err(_) => {
+                completeness = "partial";
+                warnings.push("recall_supplement_unavailable".into());
+            }
+        }
+        next_refs.sort();
+        next_refs.dedup();
+        Ok(McpServiceResult {
+            request_id,
+            status: if completeness == "complete" {
+                McpServiceStatus::Ok
+            } else {
+                McpServiceStatus::Partial
+            },
+            scope: scope_label(scope),
+            freshness: "current".into(),
+            completeness: completeness.into(),
+            items,
+            warnings,
+            truncated: !next_refs.is_empty(),
+            next_refs,
+        })
+    }
+}
+
+fn recall_retrieval_command(
+    outcome: evertrace_domain::recall::RecallRetrievalOutcome,
+    now: i64,
+    config_hash: [u8; 32],
+) -> Result<JournalCommand, McpServiceError> {
+    recall_ledger_command(
+        RecallLedgerEvent::RetrievalOutcome { outcome },
+        now,
+        config_hash,
+    )
+}
+
+fn recall_ledger_command(
+    event: RecallLedgerEvent,
+    now: i64,
+    config_hash: [u8; 32],
+) -> Result<JournalCommand, McpServiceError> {
+    JournalCommand::new(
+        CommandId::new_v7(),
+        vec![JournalEventDraft::runtime(
+            now,
+            config_hash,
+            "s22-recall-v1",
+            JournalPayload::RecallLedgerRecorded(Box::new(event)),
+        )],
+    )
+    .map_err(|_| McpServiceError::Store)
 }
 
 fn classify_search_candidate(

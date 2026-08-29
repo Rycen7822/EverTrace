@@ -1,15 +1,444 @@
 use crate::{
     canonical::{CanonicalValue, sha256},
+    ids::{
+        AttemptId, ExecutionLaneId, PresentationAttemptId, RecallNeedId, RepositoryId,
+        ScopeEffectId, TaskId, WorkBindingRevisionId, WorkstreamId, WorktreeId, WorktreeSnapshotId,
+    },
     revision::RevisionId,
     semantic::{
         ApplicabilityExpr, Atom, AtomAuthority, AtomLifecycleStatus, ConstraintExpr,
         ConstraintField, ConstraintState, ConstraintTruth, ConstraintValue, UserAuthorizationMode,
     },
+    work::{CheckpointVerifierState, PhaseKind},
 };
 use serde::{Deserialize, Serialize};
 
 pub const FUTURE_CUE_FIELD_REGISTRY_VERSION: u32 = 1;
 pub const FUTURE_CUE_COMPILER_VERSION: u32 = 1;
+const MAX_RECALL_REFS: usize = 32;
+const MAX_RECALL_TEXT: usize = 512;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallDeliveryState {
+    Detected,
+    Scheduled,
+    ClaimedForBoundary,
+    Emitted,
+    HostPresented,
+    PresentationUnknown,
+    FailedPreEmit,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallAgentResponse {
+    NotRetrieved,
+    RetrievalClaimed,
+    RetrievalReturned,
+    RetrievalUnknown,
+    Adopted,
+    Ignored,
+    Dismissed,
+    Unobservable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallObligationState {
+    Active,
+    Resolved,
+    Superseded,
+    Canceled,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationAttemptState {
+    ClaimedForBoundary,
+    FailedPreEmit,
+    Emitted,
+    HostPresented,
+    PresentationUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalOutcomeState {
+    Claimed,
+    Returned,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallCueSnapshot {
+    pub session_id: String,
+    pub execution_lane_id: ExecutionLaneId,
+    pub host_lane_key: String,
+    pub adapter_manifest_id: String,
+    pub runtime_generation: u64,
+    pub recall_need_hash: [u8; 32],
+    pub presentation_attempt_id: PresentationAttemptId,
+    pub expires_at_us: i64,
+    pub checksum: [u8; 32],
+}
+
+impl RecallCueSnapshot {
+    pub fn seal(mut self) -> Result<Self, crate::canonical::CanonicalError> {
+        self.checksum = recall_cue_checksum(&self)?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> bool {
+        !self.session_id.is_empty()
+            && self.session_id.len() <= MAX_RECALL_TEXT
+            && !self.session_id.chars().any(char::is_control)
+            && !self.host_lane_key.is_empty()
+            && self.host_lane_key.len() <= MAX_RECALL_TEXT
+            && !self.host_lane_key.chars().any(char::is_control)
+            && !self.adapter_manifest_id.is_empty()
+            && self.adapter_manifest_id.len() <= MAX_RECALL_TEXT
+            && !self.adapter_manifest_id.chars().any(char::is_control)
+            && self.runtime_generation > 0
+            && self.expires_at_us > 0
+            && recall_cue_checksum(self).ok() == Some(self.checksum)
+    }
+}
+
+fn recall_cue_checksum(
+    snapshot: &RecallCueSnapshot,
+) -> Result<[u8; 32], crate::canonical::CanonicalError> {
+    sha256(
+        "recall_cue_snapshot_v2",
+        2,
+        &CanonicalValue::Sequence(vec![
+            CanonicalValue::String(snapshot.session_id.clone()),
+            CanonicalValue::String(snapshot.execution_lane_id.to_string()),
+            CanonicalValue::String(snapshot.host_lane_key.clone()),
+            CanonicalValue::String(snapshot.adapter_manifest_id.clone()),
+            CanonicalValue::Integer(i128::from(snapshot.runtime_generation)),
+            CanonicalValue::Bytes(snapshot.recall_need_hash.to_vec()),
+            CanonicalValue::String(snapshot.presentation_attempt_id.to_string()),
+            CanonicalValue::Integer(i128::from(snapshot.expires_at_us)),
+        ]),
+    )
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallPlan {
+    pub reason: String,
+    pub normative_constraint_refs: Vec<String>,
+    pub relevant_episode_revision: Option<RevisionId>,
+    pub applicable_procedure_revision: Option<RevisionId>,
+    pub open_loops: Vec<String>,
+    pub stale_delivered_objects: Vec<String>,
+    pub supporting_evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallTriggerState {
+    pub phase_kind: PhaseKind,
+    pub verifier_state: CheckpointVerifierState,
+    pub attempt_ids: Vec<AttemptId>,
+    pub worktree_snapshot_id: Option<WorktreeSnapshotId>,
+    pub binding_revision_id: Option<WorkBindingRevisionId>,
+    pub scope_effect_refs: Vec<ScopeEffectId>,
+}
+
+impl RecallTriggerState {
+    pub fn validate(&self) -> bool {
+        self.attempt_ids.len() <= MAX_RECALL_REFS
+            && self.attempt_ids.windows(2).all(|pair| pair[0] < pair[1])
+            && self.scope_effect_refs.len() <= MAX_RECALL_REFS
+            && self
+                .scope_effect_refs
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+    }
+}
+
+impl RecallPlan {
+    pub fn validate(&self) -> bool {
+        let lists = [
+            &self.normative_constraint_refs,
+            &self.open_loops,
+            &self.stale_delivered_objects,
+            &self.supporting_evidence_refs,
+        ];
+        !self.reason.is_empty()
+            && self.reason.len() <= MAX_RECALL_TEXT
+            && !self.reason.chars().any(char::is_control)
+            && lists.iter().all(|values| {
+                values.len() <= MAX_RECALL_REFS
+                    && values.windows(2).all(|pair| pair[0] < pair[1])
+                    && values.iter().all(|value| {
+                        !value.is_empty()
+                            && value.len() <= MAX_RECALL_TEXT
+                            && !value.chars().any(char::is_control)
+                    })
+            })
+            && (!self.normative_constraint_refs.is_empty()
+                || self.relevant_episode_revision.is_some()
+                || !self.open_loops.is_empty()
+                || !self.stale_delivered_objects.is_empty())
+    }
+
+    pub fn fingerprint(&self) -> Result<[u8; 32], crate::canonical::CanonicalError> {
+        sha256("recall_plan_v1", 1, &plan_canonical(self))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallNeed {
+    pub recall_need_id: RecallNeedId,
+    pub revision_id: RevisionId,
+    pub parent_revision_id: Option<RevisionId>,
+    pub recall_need_hash: [u8; 32],
+    pub trigger_family: TriggerFamily,
+    pub source_revision_ids: Vec<RevisionId>,
+    pub matched_contract_ids: Vec<[u8; 32]>,
+    pub session_id: String,
+    pub execution_lane_id: ExecutionLaneId,
+    pub task_id: TaskId,
+    pub workstream_id: WorkstreamId,
+    pub episode_revision_id: RevisionId,
+    pub repository_id: Option<RepositoryId>,
+    pub worktree_id: Option<WorktreeId>,
+    pub boundary_event_ref: String,
+    pub trigger_state: RecallTriggerState,
+    pub source_watermark: u64,
+    pub recall_plan_fingerprint: [u8; 32],
+    pub recall_plan: RecallPlan,
+    pub delivery_state: RecallDeliveryState,
+    pub agent_response: RecallAgentResponse,
+    pub obligation_state: RecallObligationState,
+    pub created_at_us: i64,
+    pub presentation_expires_at_us: i64,
+    pub obligation_expires_at_us: Option<i64>,
+    pub active_presentation_attempt_id: Option<PresentationAttemptId>,
+    pub active_retrieval_request_id: Option<String>,
+}
+
+impl RecallNeed {
+    pub fn seal(mut self) -> Result<Self, crate::canonical::CanonicalError> {
+        self.recall_plan_fingerprint = self.recall_plan.fingerprint()?;
+        self.recall_need_hash = recall_need_hash(&self)?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> bool {
+        self.source_watermark > 0
+            && self.created_at_us >= 0
+            && self.presentation_expires_at_us > self.created_at_us
+            && self
+                .obligation_expires_at_us
+                .is_none_or(|value| value > self.created_at_us)
+            && !self.session_id.is_empty()
+            && self.session_id.len() <= MAX_RECALL_TEXT
+            && !self.boundary_event_ref.is_empty()
+            && self.boundary_event_ref.len() <= MAX_RECALL_TEXT
+            && self.trigger_state.validate()
+            && self.source_revision_ids.len() <= MAX_RECALL_REFS
+            && !self.source_revision_ids.is_empty()
+            && self
+                .source_revision_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && self.matched_contract_ids.len() <= MAX_RECALL_REFS
+            && self
+                .matched_contract_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && self
+                .active_retrieval_request_id
+                .as_ref()
+                .is_none_or(|value| {
+                    !value.is_empty()
+                        && value.len() <= MAX_RECALL_TEXT
+                        && !value.chars().any(char::is_control)
+                })
+            && self.active_presentation_attempt_id.is_some()
+                == !matches!(
+                    self.delivery_state,
+                    RecallDeliveryState::Detected
+                        | RecallDeliveryState::Scheduled
+                        | RecallDeliveryState::FailedPreEmit
+                )
+            && self.active_retrieval_request_id.is_some()
+                == (self.agent_response != RecallAgentResponse::NotRetrieved)
+            && self.recall_plan.validate()
+            && self.recall_plan.fingerprint().ok() == Some(self.recall_plan_fingerprint)
+            && recall_need_hash(self).ok() == Some(self.recall_need_hash)
+            && (self.parent_revision_id.is_none()
+                || self.parent_revision_id != Some(self.revision_id))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallPresentationAttempt {
+    pub presentation_attempt_id: PresentationAttemptId,
+    pub recall_need_id: RecallNeedId,
+    pub recall_need_hash: [u8; 32],
+    pub boundary_event_ref: String,
+    pub state: PresentationAttemptState,
+    pub occurred_at_us: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallRetrievalOutcome {
+    pub request_id: String,
+    pub recall_need_id: RecallNeedId,
+    pub recall_need_hash: [u8; 32],
+    pub state: RetrievalOutcomeState,
+    pub occurred_at_us: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecallLedgerEvent {
+    NeedRecorded { need: Box<RecallNeed> },
+    PresentationAttempt { attempt: RecallPresentationAttempt },
+    RetrievalOutcome { outcome: RecallRetrievalOutcome },
+}
+
+impl RecallLedgerEvent {
+    pub fn validate(&self) -> bool {
+        match self {
+            Self::NeedRecorded { need } => need.validate(),
+            Self::PresentationAttempt { attempt } => {
+                !attempt.boundary_event_ref.is_empty()
+                    && attempt.boundary_event_ref.len() <= MAX_RECALL_TEXT
+                    && attempt.occurred_at_us >= 0
+            }
+            Self::RetrievalOutcome { outcome } => {
+                !outcome.request_id.is_empty()
+                    && outcome.request_id.len() <= MAX_RECALL_TEXT
+                    && outcome.occurred_at_us >= 0
+            }
+        }
+    }
+}
+
+pub fn recall_need_hash(need: &RecallNeed) -> Result<[u8; 32], crate::canonical::CanonicalError> {
+    sha256(
+        "recall_need_v1",
+        1,
+        &CanonicalValue::Sequence(vec![
+            CanonicalValue::String(need.session_id.clone()),
+            CanonicalValue::String(need.execution_lane_id.to_string()),
+            CanonicalValue::String(need.trigger_family.as_str().to_owned()),
+            CanonicalValue::Sequence(
+                need.source_revision_ids
+                    .iter()
+                    .map(|value| CanonicalValue::String(value.to_string()))
+                    .collect(),
+            ),
+            CanonicalValue::Sequence(
+                need.matched_contract_ids
+                    .iter()
+                    .map(|value| CanonicalValue::Bytes(value.to_vec()))
+                    .collect(),
+            ),
+            CanonicalValue::String(need.task_id.to_string()),
+            CanonicalValue::String(need.workstream_id.to_string()),
+            CanonicalValue::String(need.episode_revision_id.to_string()),
+            need.repository_id.map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_string())
+            }),
+            need.worktree_id.map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_string())
+            }),
+            CanonicalValue::String(need.boundary_event_ref.clone()),
+            trigger_state_canonical(&need.trigger_state),
+            CanonicalValue::Integer(i128::from(need.source_watermark)),
+            CanonicalValue::Bytes(need.recall_plan_fingerprint.to_vec()),
+        ]),
+    )
+}
+
+fn plan_canonical(plan: &RecallPlan) -> CanonicalValue {
+    let strings = |values: &[String]| {
+        CanonicalValue::Sequence(
+            values
+                .iter()
+                .map(|value| CanonicalValue::String(value.clone()))
+                .collect(),
+        )
+    };
+    CanonicalValue::Sequence(vec![
+        CanonicalValue::String(plan.reason.clone()),
+        strings(&plan.normative_constraint_refs),
+        plan.applicable_procedure_revision
+            .map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_string())
+            }),
+        plan.relevant_episode_revision
+            .map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_string())
+            }),
+        strings(&plan.open_loops),
+        strings(&plan.stale_delivered_objects),
+        strings(&plan.supporting_evidence_refs),
+    ])
+}
+
+fn trigger_state_canonical(state: &RecallTriggerState) -> CanonicalValue {
+    let phase = match state.phase_kind {
+        PhaseKind::Orient => "orient",
+        PhaseKind::Inspect => "inspect",
+        PhaseKind::Reproduce => "reproduce",
+        PhaseKind::Diagnose => "diagnose",
+        PhaseKind::Design => "design",
+        PhaseKind::Implement => "implement",
+        PhaseKind::Verify => "verify",
+        PhaseKind::Execute => "execute",
+        PhaseKind::Analyze => "analyze",
+        PhaseKind::Recover => "recover",
+        PhaseKind::Deliver => "deliver",
+        PhaseKind::Unknown => "unknown",
+    };
+    let verifier = match state.verifier_state {
+        CheckpointVerifierState::Unverified => "unverified",
+        CheckpointVerifierState::Passed => "passed",
+        CheckpointVerifierState::Failed => "failed",
+        CheckpointVerifierState::Inconclusive => "inconclusive",
+    };
+    CanonicalValue::Sequence(vec![
+        CanonicalValue::String(phase.into()),
+        CanonicalValue::String(verifier.into()),
+        CanonicalValue::Sequence(
+            state
+                .attempt_ids
+                .iter()
+                .map(|value| CanonicalValue::String(value.to_string()))
+                .collect(),
+        ),
+        state
+            .worktree_snapshot_id
+            .map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_string())
+            }),
+        state
+            .binding_revision_id
+            .map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_string())
+            }),
+        CanonicalValue::Sequence(
+            state
+                .scope_effect_refs
+                .iter()
+                .map(|value| CanonicalValue::String(value.to_string()))
+                .collect(),
+        ),
+    ])
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +446,16 @@ pub enum TriggerFamily {
     ExplicitOrRecovery,
     ProspectiveObligation,
     RuntimeAnomaly,
+}
+
+impl TriggerFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitOrRecovery => "explicit_or_recovery",
+            Self::ProspectiveObligation => "prospective_obligation",
+            Self::RuntimeAnomaly => "runtime_anomaly",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -296,7 +735,10 @@ fn future_cue_fields_allowed(expr: &ConstraintExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ids::{AtomId, RepositoryId, RevisionProposalId, SourceObservationId, TaskId},
+        ids::{
+            AtomId, ExecutionLaneId, RepositoryId, RevisionProposalId, SourceObservationId, TaskId,
+            WorkstreamId,
+        },
         revision::RevisionId,
         semantic::{
             ApplicabilityExpr, AtomAuthority, AtomKind, AtomLifecycleStatus, AtomProvenance,
@@ -500,5 +942,79 @@ mod tests {
             expr.evaluate(&ConstraintState::default(), None),
             ConstraintTruth::Unknown
         );
+    }
+
+    #[test]
+    fn recall_need_and_cue_checksums_bind_immutable_identity() {
+        let source_revision = RevisionId::new_v7();
+        let mut need = RecallNeed {
+            recall_need_id: RecallNeedId::new_v7(),
+            revision_id: RevisionId::new_v7(),
+            parent_revision_id: None,
+            recall_need_hash: [0; 32],
+            trigger_family: TriggerFamily::ProspectiveObligation,
+            source_revision_ids: vec![source_revision],
+            matched_contract_ids: vec![[3; 32]],
+            session_id: "session-s22".into(),
+            execution_lane_id: ExecutionLaneId::new_v7(),
+            task_id: TaskId::new_v7(),
+            workstream_id: WorkstreamId::new_v7(),
+            episode_revision_id: RevisionId::new_v7(),
+            repository_id: None,
+            worktree_id: None,
+            boundary_event_ref: "boundary:s22".into(),
+            trigger_state: RecallTriggerState {
+                phase_kind: PhaseKind::Deliver,
+                verifier_state: CheckpointVerifierState::Passed,
+                attempt_ids: Vec::new(),
+                worktree_snapshot_id: None,
+                binding_revision_id: None,
+                scope_effect_refs: Vec::new(),
+            },
+            source_watermark: 7,
+            recall_plan_fingerprint: [0; 32],
+            recall_plan: RecallPlan {
+                reason: "prospective_obligation".into(),
+                normative_constraint_refs: vec![source_revision.to_string()],
+                relevant_episode_revision: None,
+                applicable_procedure_revision: None,
+                open_loops: Vec::new(),
+                stale_delivered_objects: Vec::new(),
+                supporting_evidence_refs: Vec::new(),
+            },
+            delivery_state: RecallDeliveryState::Detected,
+            agent_response: RecallAgentResponse::NotRetrieved,
+            obligation_state: RecallObligationState::Active,
+            created_at_us: 1,
+            presentation_expires_at_us: 10,
+            obligation_expires_at_us: None,
+            active_presentation_attempt_id: None,
+            active_retrieval_request_id: None,
+        }
+        .seal()
+        .unwrap();
+        assert!(need.validate());
+        let mut trigger_tamper = need.clone();
+        trigger_tamper.trigger_state.verifier_state = CheckpointVerifierState::Failed;
+        assert!(!trigger_tamper.validate());
+        need.boundary_event_ref.push_str("-tampered");
+        assert!(!need.validate());
+
+        let mut cue = RecallCueSnapshot {
+            session_id: "session-s22".into(),
+            execution_lane_id: need.execution_lane_id,
+            host_lane_key: "lane:test".into(),
+            adapter_manifest_id: "adapter:test".into(),
+            runtime_generation: 1,
+            recall_need_hash: [5; 32],
+            presentation_attempt_id: PresentationAttemptId::new_v7(),
+            expires_at_us: 10,
+            checksum: [0; 32],
+        }
+        .seal()
+        .unwrap();
+        assert!(cue.validate());
+        cue.expires_at_us = 11;
+        assert!(!cue.validate());
     }
 }

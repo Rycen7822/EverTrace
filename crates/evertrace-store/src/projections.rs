@@ -48,6 +48,7 @@ use crate::{
 };
 
 mod autoresearch;
+mod recall_ledger;
 #[path = "recall_projection.rs"]
 mod recall_projection;
 mod recovery;
@@ -74,6 +75,12 @@ pub fn recall_trigger_contract(
     recall_projection::contract(row)
 }
 
+pub fn recall_need(
+    row: &ObjectRow,
+) -> Result<Option<evertrace_domain::recall::RecallNeed>, StoreError> {
+    recall_ledger::need(row)
+}
+
 const PROJECTION_GENERATION: u64 = 1;
 // S10 fail-closed safety ceiling. Pagination/cursors belong to the later S23 owner.
 const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
@@ -82,6 +89,28 @@ const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
 pub struct ProjectionSnapshot {
     pub frontier: u64,
     pub rows: Vec<ObjectRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecallCurrentContext {
+    pub frontier: u64,
+    pub task: Task,
+    pub workstream: Workstream,
+    pub execution_lane: ExecutionLane,
+    pub episode: WorkEpisode,
+    pub checkpoint: WorkCheckpoint,
+    pub previous_checkpoint: Option<WorkCheckpoint>,
+    pub binding: WorkBindingRevision,
+    pub atoms: Vec<RecallCurrentAtom>,
+    pub needs: Vec<evertrace_domain::recall::RecallNeed>,
+    pub last_presentation_attempts:
+        BTreeMap<evertrace_domain::ids::RecallNeedId, evertrace_domain::ids::PresentationAttemptId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecallCurrentAtom {
+    pub atom: Atom,
+    pub source_event_seq: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1253,6 +1282,7 @@ struct ReducerState {
     atom_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Atom, u64)>,
     proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
+    recall_ledger: recall_ledger::RecallLedgerState,
 }
 
 #[derive(Clone, Debug)]
@@ -1359,9 +1389,274 @@ pub(crate) struct JournalAdmissionState {
     atom_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (Atom, u64)>,
     proposals: BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
     proposal_revisions: BTreeMap<evertrace_domain::revision::RevisionId, (RevisionProposal, u64)>,
+    recall_ledger: recall_ledger::RecallLedgerState,
+}
+
+fn recall_scope_matches(
+    scope: &evertrace_domain::semantic::AtomScope,
+    episode: &WorkEpisode,
+) -> bool {
+    match scope {
+        evertrace_domain::semantic::AtomScope::Task { task_id } => *task_id == episode.task_id,
+        evertrace_domain::semantic::AtomScope::Repository {
+            repository_instance_id,
+        } => Some(*repository_instance_id) == episode.repository_instance_id,
+        evertrace_domain::semantic::AtomScope::Worktree {
+            repository_instance_id,
+            worktree_instance_id,
+        } => {
+            Some(*repository_instance_id) == episode.repository_instance_id
+                && Some(*worktree_instance_id) == episode.worktree_instance_id
+        }
+        evertrace_domain::semantic::AtomScope::Global => false,
+    }
+}
+
+fn select_episode_checkpoints<'a>(
+    episode_id: evertrace_domain::ids::WorkEpisodeId,
+    episode_generation: u64,
+    checkpoint_refs: &[String],
+    episode_revisions: &'a BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
+    checkpoints: &'a BTreeMap<String, (WorkCheckpoint, u64)>,
+) -> Result<Option<(&'a WorkCheckpoint, Option<&'a WorkCheckpoint>)>, StoreError> {
+    let mut candidates = Vec::with_capacity(checkpoint_refs.len());
+    for reference in checkpoint_refs {
+        let (checkpoint, source_event_seq) =
+            checkpoints.get(reference).ok_or(StoreError::StoreCorrupt)?;
+        let (source_episode, _) = episode_revisions
+            .get(&checkpoint.episode_revision_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if checkpoint.stable_key() != *reference
+            || checkpoint.episode_id != episode_id
+            || source_episode.episode_id != episode_id
+            || source_episode.revision_generation > episode_generation
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        candidates.push((checkpoint, *source_event_seq));
+    }
+    candidates.sort_by_key(|(checkpoint, source_event_seq)| {
+        (checkpoint.source_watermark, *source_event_seq)
+    });
+    if candidates.windows(2).any(|pair| {
+        pair[0].0.source_watermark == pair[1].0.source_watermark && pair[0].1 == pair[1].1
+    }) {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(candidates.last().map(|(latest, _)| {
+        (
+            *latest,
+            candidates.iter().rev().nth(1).map(|(value, _)| *value),
+        )
+    }))
+}
+
+fn select_recall_binding<'a>(
+    bindings: impl Iterator<Item = (&'a WorkBindingRevision, u64)>,
+    operation_ids: &[OperationId],
+    task_id: TaskId,
+    workstream_id: WorkstreamId,
+    episode_id: evertrace_domain::ids::WorkEpisodeId,
+) -> Result<Option<&'a WorkBindingRevision>, StoreError> {
+    let mut selected = None;
+    for (candidate, candidate_seq) in bindings.filter(|(binding, _)| {
+        operation_ids.contains(&binding.operation_id)
+            && binding.assignment_status == AssignmentStatus::Resolved
+            && binding.primary_binding.task_id == Some(task_id)
+            && binding.primary_binding.workstream_id == Some(workstream_id)
+            && binding.primary_binding.episode_id == Some(episode_id)
+    }) {
+        if let Some((_, selected_seq)) = selected {
+            if candidate_seq == selected_seq {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if candidate_seq < selected_seq {
+                continue;
+            }
+        }
+        selected = Some((candidate, candidate_seq));
+    }
+    Ok(selected.map(|(binding, _)| binding))
 }
 
 impl JournalAdmissionState {
+    pub(crate) fn recall_current_contexts(
+        &self,
+        frontier: u64,
+        limit: usize,
+    ) -> Result<Vec<RecallCurrentContext>, StoreError> {
+        if limit == 0 || limit > 32 {
+            return Err(StoreError::InvalidInput);
+        }
+        let active_operation_ids = self
+            .episodes
+            .values()
+            .filter(|(episode, _)| {
+                episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
+            })
+            .flat_map(|(episode, _)| {
+                episode.execution_lane_ids.iter().filter_map(|lane_id| {
+                    self.execution_lanes.get(lane_id).and_then(|(lane, _)| {
+                        (lane.status == LaneStatus::Active
+                            && episode.session_ids.contains(&lane.host_session_id))
+                        .then_some(lane.operation_ids.iter())
+                    })
+                })
+            })
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut current_bindings = BTreeMap::<OperationId, (&WorkBindingRevision, u64)>::new();
+        for (binding, source_seq) in self.work_bindings.values() {
+            if !active_operation_ids.contains(&binding.operation_id) {
+                continue;
+            }
+            match current_bindings.entry(binding.operation_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((binding, *source_seq));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let (current, current_seq) = *entry.get();
+                    if current.revision_generation == binding.revision_generation {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    if (current.revision_generation, current_seq)
+                        < (binding.revision_generation, *source_seq)
+                    {
+                        entry.insert((binding, *source_seq));
+                    }
+                }
+            }
+        }
+        let mut contexts = Vec::new();
+        for (episode, _) in self.episodes.values().filter(|(episode, _)| {
+            episode.lifecycle_status == evertrace_domain::work::EpisodeLifecycle::Open
+        }) {
+            for lane_id in &episode.execution_lane_ids {
+                let Some((lane, _)) = self.execution_lanes.get(lane_id).filter(|(lane, _)| {
+                    lane.status == LaneStatus::Active
+                        && episode.session_ids.contains(&lane.host_session_id)
+                }) else {
+                    continue;
+                };
+                let session_id = &lane.host_session_id;
+                let Some((task, _)) = self.tasks.get(&episode.task_id).filter(|(task, _)| {
+                    task.lifecycle == evertrace_domain::work::TaskLifecycle::Active
+                }) else {
+                    continue;
+                };
+                let Some((workstream, _)) =
+                    self.workstreams
+                        .get(&episode.workstream_id)
+                        .filter(|(stream, _)| {
+                            stream.status == evertrace_domain::work::WorkstreamStatus::Active
+                                && stream.task_id == episode.task_id
+                                && stream.execution_lane_ids.contains(lane_id)
+                        })
+                else {
+                    continue;
+                };
+                let Some((checkpoint, previous_checkpoint)) = select_episode_checkpoints(
+                    episode.episode_id,
+                    episode.revision_generation,
+                    &episode.checkpoint_refs,
+                    &self.episode_revisions,
+                    &self.checkpoints,
+                )?
+                else {
+                    continue;
+                };
+                let previous_checkpoint = previous_checkpoint.cloned();
+                let Some(binding) = select_recall_binding(
+                    current_bindings.values().copied(),
+                    &lane.operation_ids,
+                    episode.task_id,
+                    episode.workstream_id,
+                    episode.episode_id,
+                )?
+                else {
+                    continue;
+                };
+                let mut atoms = self
+                    .atoms
+                    .values()
+                    .filter_map(|(atom, source_event_seq)| {
+                        (atom.lifecycle_status
+                            == evertrace_domain::semantic::AtomLifecycleStatus::Active
+                            && atom.kind.is_normative()
+                            && recall_scope_matches(&atom.scope, episode))
+                        .then_some(RecallCurrentAtom {
+                            atom: atom.clone(),
+                            source_event_seq: *source_event_seq,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                atoms.sort_by_key(|value| value.atom.revision_id);
+                if atoms.len() > 256 {
+                    return Err(StoreError::ReconciliationDependencyOverflow);
+                }
+                let mut needs = self
+                    .recall_ledger
+                    .values()
+                    .filter(|need| {
+                        need.session_id == *session_id
+                            && need.execution_lane_id == *lane_id
+                            && need.episode_revision_id == episode.revision_id
+                            && need.obligation_state
+                                == evertrace_domain::recall::RecallObligationState::Active
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                needs.sort_by_key(|need| need.recall_need_id);
+                if needs.len() > 2 {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                let last_presentation_attempts = needs
+                    .iter()
+                    .filter_map(|need| {
+                        self.recall_ledger
+                            .last_presentation_attempt(need.recall_need_id)
+                            .map(|attempt| (need.recall_need_id, attempt))
+                    })
+                    .collect();
+                contexts.push(RecallCurrentContext {
+                    frontier,
+                    task: task.clone(),
+                    workstream: workstream.clone(),
+                    execution_lane: lane.clone(),
+                    episode: episode.clone(),
+                    checkpoint: checkpoint.clone(),
+                    previous_checkpoint,
+                    binding: binding.clone(),
+                    atoms,
+                    needs,
+                    last_presentation_attempts,
+                });
+                if contexts.len() > limit {
+                    return Err(StoreError::ReconciliationDependencyOverflow);
+                }
+            }
+        }
+        contexts.sort_by(|left, right| {
+            left.execution_lane
+                .host_session_id
+                .cmp(&right.execution_lane.host_session_id)
+                .then(
+                    left.execution_lane
+                        .execution_lane_id
+                        .cmp(&right.execution_lane.execution_lane_id),
+                )
+        });
+        if contexts.windows(2).any(|pair| {
+            pair[0].execution_lane.host_session_id == pair[1].execution_lane.host_session_id
+                && pair[0].execution_lane.execution_lane_id
+                    == pair[1].execution_lane.execution_lane_id
+        }) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(contexts)
+    }
+
     pub(crate) fn from_journal_rows(rows: &[JournalRow]) -> Result<Self, StoreError> {
         let mut state = Self::default();
         for batch in ordered_command_batches(rows)? {
@@ -1718,6 +2013,9 @@ impl JournalAdmissionState {
                 seq,
                 StoreError::StoreCorrupt,
             )?,
+            JournalPayload::RecallLedgerRecorded(value) => {
+                self.recall_ledger.apply(*value, seq)?;
+            }
             _ => {}
         }
         Ok(())
@@ -1835,8 +2133,70 @@ impl JournalAdmissionState {
             worktrees: &self.worktrees,
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
-        })
+        })?;
+        validate_recall_relations(
+            self.recall_ledger.values(),
+            &self.execution_lanes,
+            &self.tasks,
+            &self.workstreams,
+            &self.episode_revisions,
+            &self.atom_revisions,
+        )?;
+        Ok(())
     }
+}
+
+fn validate_recall_ledger_relations(state: &ReducerState) -> Result<(), StoreError> {
+    validate_recall_relations(
+        state.recall_ledger.values(),
+        &state.execution_lanes,
+        &state.tasks,
+        &state.workstreams,
+        &state.episode_revisions,
+        &state.atom_revisions,
+    )
+}
+
+fn validate_recall_relations<'a>(
+    needs: impl Iterator<Item = &'a evertrace_domain::recall::RecallNeed>,
+    execution_lanes: &BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    tasks: &BTreeMap<TaskId, (Task, u64)>,
+    workstreams: &BTreeMap<WorkstreamId, (Workstream, u64)>,
+    episode_revisions: &BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
+    atom_revisions: &BTreeMap<evertrace_domain::revision::RevisionId, (Atom, u64)>,
+) -> Result<(), StoreError> {
+    for need in needs {
+        let lane = execution_lanes
+            .get(&need.execution_lane_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        tasks.get(&need.task_id).ok_or(StoreError::StoreCorrupt)?;
+        let workstream = workstreams
+            .get(&need.workstream_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        let episode = episode_revisions
+            .get(&need.episode_revision_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if lane.0.host_session_id != need.session_id
+            || workstream.0.task_id != need.task_id
+            || !workstream
+                .0
+                .execution_lane_ids
+                .contains(&need.execution_lane_id)
+            || episode.0.task_id != need.task_id
+            || episode.0.workstream_id != need.workstream_id
+            || !episode
+                .0
+                .execution_lane_ids
+                .contains(&need.execution_lane_id)
+            || !episode.0.session_ids.contains(&need.session_id)
+            || need.source_revision_ids.iter().any(|revision| {
+                !atom_revisions.contains_key(revision) && !episode_revisions.contains_key(revision)
+            })
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    Ok(())
 }
 
 fn ordered_command_batches(rows: &[JournalRow]) -> Result<Vec<Vec<&JournalRow>>, StoreError> {
@@ -2465,6 +2825,9 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             row.seq,
             StoreError::StoreCorrupt,
         )?,
+        JournalPayload::RecallLedgerRecorded(value) => {
+            state.recall_ledger.apply(*value, row.seq)?;
+        }
     }
     Ok(())
 }
@@ -3403,6 +3766,10 @@ impl ReducerState {
             if recall_projection::contract(row)?.is_some() {
                 continue;
             }
+            if let Some(need) = recall_ledger::need(row)? {
+                state.recall_ledger.restore(row, need)?;
+                continue;
+            }
             let payload_json = row
                 .payload_json
                 .as_deref()
@@ -4164,6 +4531,7 @@ impl ReducerState {
                     .insert(value.proposal_revision_id, (value, row.source_event_seq))
                     .is_some()
             }
+            JournalPayload::RecallLedgerRecorded(_) => return Err(StoreError::StoreCorrupt),
         };
         if duplicate {
             return Err(StoreError::StoreCorrupt);
@@ -4182,6 +4550,7 @@ impl ReducerState {
     fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
         let mut rows = Vec::new();
         rows.extend(recall_projection::rows(&self.atoms)?);
+        rows.extend(self.recall_ledger.clone().rows(PROJECTION_GENERATION)?);
         for (migration, (payload, seq)) in self.migrations {
             rows.push(runtime_row(
                 format!("projection:migration:{migration}"),
@@ -4880,6 +5249,7 @@ impl ReducerState {
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
         })?;
+        validate_recall_ledger_relations(self)?;
         Ok(())
     }
 
@@ -4932,6 +5302,7 @@ impl ReducerState {
             atom_revisions: self.atom_revisions.clone(),
             proposals: self.proposals.clone(),
             proposal_revisions: self.proposal_revisions.clone(),
+            recall_ledger: self.recall_ledger.clone(),
         })
     }
 }
@@ -5557,7 +5928,9 @@ mod tests {
             CaptureOutageIntervalId, CommandId, ExecutionLaneId, HostOccurrenceId, JobId,
             OperationId, SourceObservationId,
         },
-        work::{AdmissionFailureObservability, LaneLifecycleEvidence, LivenessState},
+        work::{
+            AdmissionFailureObservability, LaneLifecycleEvidence, LivenessState, PrimaryWorkBinding,
+        },
     };
 
     use super::*;
@@ -5603,6 +5976,63 @@ mod tests {
         assert_eq!(
             incremental_changed_rows(&expected, &current_by_id, true),
             expected.rows
+        );
+    }
+
+    fn recall_binding(
+        operation_id: OperationId,
+        task_id: TaskId,
+        workstream_id: WorkstreamId,
+        episode_id: WorkEpisodeId,
+    ) -> WorkBindingRevision {
+        WorkBindingRevision {
+            work_binding_revision_id: WorkBindingRevisionId::new_v7(),
+            operation_id,
+            revision_generation: 1,
+            predecessor_revision_id: None,
+            primary_binding: PrimaryWorkBinding {
+                task_id: Some(task_id),
+                workstream_id: Some(workstream_id),
+                episode_id: Some(episode_id),
+                ..PrimaryWorkBinding::default()
+            },
+            secondary_bindings: Vec::new(),
+            scope_effect_refs: Vec::new(),
+            assignment_status: AssignmentStatus::Resolved,
+            evidence_refs: vec!["binding".into()],
+            resolver_version: 1,
+        }
+    }
+
+    #[test]
+    fn recall_context_selects_newest_lane_binding_and_rejects_authority_tie() {
+        let episode_id = WorkEpisodeId::new_v7();
+        let task_id = TaskId::new_v7();
+        let workstream_id = WorkstreamId::new_v7();
+        let first_operation = OperationId::new_v7();
+        let second_operation = OperationId::new_v7();
+        let first = recall_binding(first_operation, task_id, workstream_id, episode_id);
+        let second = recall_binding(second_operation, task_id, workstream_id, episode_id);
+        assert_eq!(
+            select_recall_binding(
+                [(&first, 7), (&second, 9)].into_iter(),
+                &[first_operation, second_operation],
+                task_id,
+                workstream_id,
+                episode_id,
+            )
+            .unwrap(),
+            Some(&second)
+        );
+        assert_eq!(
+            select_recall_binding(
+                [(&first, 9), (&second, 9)].into_iter(),
+                &[first_operation, second_operation],
+                task_id,
+                workstream_id,
+                episode_id,
+            ),
+            Err(StoreError::StoreCorrupt)
         );
     }
 

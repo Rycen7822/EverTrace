@@ -7,11 +7,11 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use evertrace_capture::{
-    CaptureOutcome, CaptureRecordInput, CaptureRuntime, RecoveryGateMode,
+    CaptureOutcome, CaptureRecordInput, CaptureRuntime, RecallCueGateMode, RecoveryGateMode,
     RecoveryPreflightCandidate, RuntimeSnapshot,
 };
 use evertrace_codex::{
@@ -36,11 +36,12 @@ use evertrace_domain::{
 use evertrace_protocol::{
     command::{McpBindingIssueCommand, RecoveryBarrierLocator},
     mcp::McpToolInput,
-    request_mcp_binding_sync, request_recovery_barrier_sync,
+    request_mcp_binding_sync, request_recall_cue_sync, request_recovery_barrier_sync,
 };
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(2);
 const RECOVERY_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
+const RECALL_CUE_CONTEXT: &[u8] = b"{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"EverTrace recall is due. Call evertrace with action=search and input=@due before continuing.\"}}";
 
 fn main() {
     let _ = run();
@@ -85,6 +86,13 @@ fn read_input() -> Result<Vec<u8>, ()> {
 
 fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> Result<(), ()> {
     let snapshot = RuntimeSnapshot::load(snapshot_path).map_err(|_| ())?;
+    let cue_session_id = input.session_id.clone();
+    let cue_adapter_manifest_ref = input.adapter_manifest_ref.clone();
+    let cue_host_lane_key = input
+        .lifecycle
+        .as_ref()
+        .map(|lifecycle| lifecycle.host_lane_key.clone());
+    let cue_boundary = input.event_kind == HookEventKind::PreToolUse;
     let preflight = recovery_preflight(&snapshot, &input);
     let gate = snapshot.recovery_gate;
     let socket = snapshot.recovery_socket_path.clone();
@@ -177,11 +185,88 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
             )
             .is_err()
         });
-        if barrier_failed && let Ok(runtime) = CaptureRuntime::open(snapshot) {
+        if barrier_failed && let Ok(runtime) = CaptureRuntime::open(snapshot.clone()) {
             let _ = runtime.record_recovery_unavailable(&recovery_gap_record);
         }
     }
+    if let Some(cue) = select_recall_cue(
+        &snapshot,
+        &cue_session_id,
+        cue_host_lane_key.as_deref(),
+        &cue_adapter_manifest_ref,
+        cue_boundary,
+    ) {
+        let remaining = Duration::from_millis(250).saturating_sub(started.elapsed());
+        if remaining >= Duration::from_millis(1) {
+            let _ = request_recall_cue_sync(
+                &snapshot.recovery_socket_path,
+                env!("CARGO_PKG_VERSION"),
+                cue,
+                remaining,
+                |_| emit_recall_context(io::stdout().lock()),
+            );
+        }
+    }
     Ok(())
+}
+
+fn select_recall_cue(
+    snapshot: &RuntimeSnapshot,
+    session_id: &str,
+    host_lane_key: Option<&str>,
+    adapter_manifest_id: &str,
+    cue_boundary: bool,
+) -> Option<evertrace_domain::recall::RecallCueSnapshot> {
+    if snapshot.recall_cue_gate != RecallCueGateMode::Active
+        || !cue_boundary
+        || snapshot.recall_cue_adapter_manifest_id.as_deref() != Some(adapter_manifest_id)
+    {
+        return None;
+    }
+    let host_lane_key = host_lane_key?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_micros()).ok())?;
+    let mut matches = snapshot.recall_cues.iter().filter(|cue| {
+        cue.session_id == session_id
+            && cue.host_lane_key == host_lane_key
+            && cue.adapter_manifest_id == adapter_manifest_id
+            && cue.runtime_generation == snapshot.generation
+            && cue.expires_at_us > now
+    });
+    let cue = matches.next()?.clone();
+    matches.next().is_none().then_some(cue)
+}
+
+#[cfg(test)]
+fn recall_cue_enabled(
+    gate: RecallCueGateMode,
+    configured_manifest: Option<&str>,
+    input_manifest: &str,
+    cue_boundary: bool,
+) -> bool {
+    gate == RecallCueGateMode::Active && cue_boundary && configured_manifest == Some(input_manifest)
+}
+
+fn emit_recall_context(
+    mut output: impl Write,
+) -> evertrace_domain::recall::PresentationAttemptState {
+    use evertrace_domain::recall::PresentationAttemptState;
+
+    let mut written = 0;
+    while written < RECALL_CUE_CONTEXT.len() {
+        match output.write(&RECALL_CUE_CONTEXT[written..]) {
+            Ok(0) | Err(_) if written == 0 => return PresentationAttemptState::FailedPreEmit,
+            Ok(0) | Err(_) => return PresentationAttemptState::PresentationUnknown,
+            Ok(count) => written += count,
+        }
+    }
+    if output.flush().is_err() {
+        PresentationAttemptState::PresentationUnknown
+    } else {
+        PresentationAttemptState::Emitted
+    }
 }
 
 fn recovery_preflight(
@@ -373,6 +458,31 @@ const fn unsupported_classification(
 mod budget_proof {
     use super::*;
 
+    struct ProbeWriter {
+        first_write: usize,
+        fail_flush: bool,
+        calls: usize,
+    }
+
+    impl Write for ProbeWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                Ok(self.first_write.min(bytes.len()))
+            } else {
+                Err(io::Error::other("probe"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("probe"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn launcher_and_barrier_budgets_are_bounded_without_sleeping() {
         assert_eq!(launcher_child_timeout(false, 10_000), CHILD_TIMEOUT);
@@ -395,6 +505,105 @@ mod budget_proof {
                 Duration::from_millis(25),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn recall_cue_is_the_fixed_native_additional_context_envelope() {
+        let output = std::str::from_utf8(RECALL_CUE_CONTEXT).unwrap();
+        assert_eq!(
+            output,
+            "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"EverTrace recall is due. Call evertrace with action=search and input=@due before continuing.\"}}"
+        );
+        assert!(!output.contains("recall_need"));
+        assert!(recall_cue_enabled(
+            RecallCueGateMode::Active,
+            Some("manifest:a"),
+            "manifest:a",
+            true,
+        ));
+        assert!(!recall_cue_enabled(
+            RecallCueGateMode::Active,
+            Some("manifest:a"),
+            "manifest:b",
+            true,
+        ));
+        assert!(!recall_cue_enabled(
+            RecallCueGateMode::Disabled,
+            Some("manifest:a"),
+            "manifest:a",
+            true,
+        ));
+        let mut snapshot = RuntimeSnapshot::for_data_dir(
+            Path::new("/tmp/evertrace-hook-cue-test"),
+            3,
+            evertrace_capture::SpoolLimits {
+                high_watermark_bytes: 1024,
+                low_watermark_bytes: 512,
+                max_main_files: 4,
+                emergency_slots: 2,
+            },
+            evertrace_capture::RecoverySnapshotSettings {
+                gate: RecoveryGateMode::Disabled,
+                preflight_timeout_ms: 100,
+                effective_config_hash: [7; 32],
+                adapter_manifest_id: None,
+                classifier_revision: 1,
+                max_bundle_bytes: 4096,
+                max_untracked_file_bytes: 1024,
+                max_untracked_total_bytes: 2048,
+                recall_cue_gate: RecallCueGateMode::Active,
+                recall_cue_adapter_manifest_id: Some("manifest:a".into()),
+            },
+        )
+        .unwrap();
+        snapshot.recall_cues.push(
+            evertrace_domain::recall::RecallCueSnapshot {
+                session_id: "session:a".into(),
+                execution_lane_id: evertrace_domain::ids::ExecutionLaneId::new_v7(),
+                host_lane_key: "lane:a".into(),
+                adapter_manifest_id: "manifest:a".into(),
+                runtime_generation: 3,
+                recall_need_hash: [8; 32],
+                presentation_attempt_id: evertrace_domain::ids::PresentationAttemptId::new_v7(),
+                expires_at_us: i64::MAX,
+                checksum: [0; 32],
+            }
+            .seal()
+            .unwrap(),
+        );
+        assert!(
+            select_recall_cue(&snapshot, "session:a", Some("lane:a"), "manifest:a", true).is_some()
+        );
+        assert!(
+            select_recall_cue(&snapshot, "session:b", Some("lane:a"), "manifest:a", true).is_none()
+        );
+        assert!(
+            select_recall_cue(&snapshot, "session:a", Some("lane:b"), "manifest:a", true).is_none()
+        );
+        assert_eq!(
+            emit_recall_context(ProbeWriter {
+                first_write: 0,
+                fail_flush: false,
+                calls: 0,
+            }),
+            evertrace_domain::recall::PresentationAttemptState::FailedPreEmit
+        );
+        assert_eq!(
+            emit_recall_context(ProbeWriter {
+                first_write: 1,
+                fail_flush: false,
+                calls: 0,
+            }),
+            evertrace_domain::recall::PresentationAttemptState::PresentationUnknown
+        );
+        assert_eq!(
+            emit_recall_context(ProbeWriter {
+                first_write: RECALL_CUE_CONTEXT.len(),
+                fail_flush: true,
+                calls: 0,
+            }),
+            evertrace_domain::recall::PresentationAttemptState::PresentationUnknown
         );
     }
 }

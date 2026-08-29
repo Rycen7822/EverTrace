@@ -33,8 +33,8 @@ pub use protect::{
     verify_mcp_call_auth_tag, verify_recovery_ticket_auth_tag,
 };
 pub use runtime_snapshot::{
-    RUNTIME_SNAPSHOT_VERSION, RecoveryGateMode, RecoverySnapshotSettings, RuntimeSnapshot,
-    RuntimeSnapshotError,
+    RUNTIME_SNAPSHOT_VERSION, RecallCueGateMode, RecoveryGateMode, RecoverySnapshotSettings,
+    RuntimeSnapshot, RuntimeSnapshotError,
 };
 pub use spool::{
     CaptureGapMarker, DurableSpool, GapEvidence, GapReason, PendingGapMarker, PendingQuarantine,

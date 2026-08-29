@@ -118,6 +118,8 @@ fn runtime_snapshot(
             max_bundle_bytes: 4 << 20,
             max_untracked_file_bytes: 1 << 20,
             max_untracked_total_bytes: 2 << 20,
+            recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+            recall_cue_adapter_manifest_id: None,
         },
     )
     .unwrap()
@@ -2949,7 +2951,7 @@ fn application_successors_and_lineage_transfer_are_fail_closed() {
     assert!(!strategy_drift.has_complete_recorded_lineage_transfer_receipts());
 }
 #[test]
-fn runtime_v2_layout_and_spool_lookup_fail_closed() {
+fn runtime_snapshot_layout_and_spool_lookup_fail_closed() {
     let root = TempDir::new().unwrap();
     let limits = SpoolLimits {
         high_watermark_bytes: 1 << 20,

@@ -67,6 +67,9 @@ fn snapshot(root: &Path) -> RuntimeSnapshot {
         recovery_max_bundle_bytes: 4 << 20,
         recovery_max_untracked_file_bytes: 1 << 20,
         recovery_max_untracked_total_bytes: 2 << 20,
+        recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+        recall_cue_adapter_manifest_id: None,
+        recall_cues: Vec::new(),
     }
 }
 
