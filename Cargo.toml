@@ -45,3 +45,9 @@ zstd = "=0.13.3"
 
 [workspace.lints.rust]
 warnings = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
