@@ -32,10 +32,10 @@ use lancedb::Table;
 
 use crate::{
     command::{
-        DirtyTarget, DurableJob, JobStatus, JournalCommand, JournalPayload, NormalizationWatermark,
-        ObjectFamily, OutboxEntry, SourceCloseDecision, SourceCloseReconciliation,
-        SourceIngestWatermark, SourceRevisionRecorded, StoreError, WatermarkAdvanced,
-        source_revision_ref,
+        ATOM_RECORDED_EVENT_TYPE, DirtyTarget, DurableJob, JobStatus, JournalCommand,
+        JournalPayload, NormalizationWatermark, ObjectFamily, OutboxEntry, SourceCloseDecision,
+        SourceCloseReconciliation, SourceIngestWatermark, SourceRevisionRecorded, StoreError,
+        WatermarkAdvanced, source_revision_ref,
     },
     journal::{
         JournalRow, read_all_journal_rows, read_journal_after, read_journal_frontier,
@@ -48,6 +48,8 @@ use crate::{
 };
 
 mod autoresearch;
+#[path = "recall_projection.rs"]
+mod recall_projection;
 mod recovery;
 mod segmentation;
 mod semantic;
@@ -63,6 +65,14 @@ use segmentation::{
     validate_episode_relations,
 };
 pub use semantic::SemanticCurrentView;
+
+pub const RECALL_TRIGGER_INDEX_KIND: &str = recall_projection::RECALL_TRIGGER_INDEX_KIND;
+
+pub fn recall_trigger_contract(
+    row: &ObjectRow,
+) -> Result<Option<evertrace_domain::recall::FutureCueContract>, StoreError> {
+    recall_projection::contract(row)
+}
 
 const PROJECTION_GENERATION: u64 = 1;
 // S10 fail-closed safety ceiling. Pagination/cursors belong to the later S23 owner.
@@ -3390,6 +3400,9 @@ impl ReducerState {
             {
                 return Err(StoreError::StoreCorrupt);
             }
+            if recall_projection::contract(row)?.is_some() {
+                continue;
+            }
             let payload_json = row
                 .payload_json
                 .as_deref()
@@ -4168,6 +4181,7 @@ impl ReducerState {
 
     fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
         let mut rows = Vec::new();
+        rows.extend(recall_projection::rows(&self.atoms)?);
         for (migration, (payload, seq)) in self.migrations {
             rows.push(runtime_row(
                 format!("projection:migration:{migration}"),
@@ -5403,7 +5417,7 @@ impl ProjectionWorker {
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
             }
-            self.commit_rows(&expected.rows).await?;
+            self.commit_rows(&expected.rows, true).await?;
             let persisted = validate_objects_table(&self.objects).await?;
             if persisted != expected.rows {
                 return Err(StoreError::Projection);
@@ -5419,6 +5433,9 @@ impl ProjectionWorker {
                 rows: current,
             });
         }
+        let reconcile_recall = delta
+            .iter()
+            .any(|row| row.event_type == ATOM_RECORDED_EVENT_TYPE);
         let mut admission = state.admission_state()?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
@@ -5432,19 +5449,11 @@ impl ProjectionWorker {
             .iter()
             .map(|row| (row.row_id.as_str(), row))
             .collect::<BTreeMap<_, _>>();
-        let changed = expected
-            .rows
-            .iter()
-            .filter(|row| {
-                row.row_id == OBJECTS_CHECKPOINT_ID
-                    || current_by_id.get(row.row_id.as_str()).copied() != Some(*row)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let changed = incremental_changed_rows(&expected, &current_by_id, reconcile_recall);
         if inject_before_commit_failure {
             return Err(StoreError::Projection);
         }
-        self.commit_rows(&changed).await?;
+        self.commit_rows(&changed, reconcile_recall).await?;
         let persisted = validate_objects_table(&self.objects).await?;
         let persisted_snapshot = ProjectionSnapshot {
             frontier: expected.frontier,
@@ -5465,7 +5474,11 @@ impl ProjectionWorker {
         reduce_journal(&read_all_journal_rows(&self.journal).await?)
     }
 
-    async fn commit_rows(&self, rows: &[ObjectRow]) -> Result<(), StoreError> {
+    async fn commit_rows(
+        &self,
+        rows: &[ObjectRow],
+        reconcile_recall: bool,
+    ) -> Result<(), StoreError> {
         let batch = objects_batch(rows)?;
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
             RecordBatchIterator::new(vec![Ok(batch)], crate::objects::objects_schema()),
@@ -5473,12 +5486,37 @@ impl ProjectionWorker {
         let mut merge = self.objects.merge_insert(&["row_id"]);
         merge.when_matched_update_all(None);
         merge.when_not_matched_insert_all();
+        if reconcile_recall {
+            merge.when_not_matched_by_source_delete(Some(format!(
+                "object_kind = '{}'",
+                recall_projection::RECALL_TRIGGER_INDEX_KIND
+            )));
+        }
         merge
             .execute(reader)
             .await
             .map_err(|_| StoreError::Projection)?;
         Ok(())
     }
+}
+
+fn incremental_changed_rows(
+    expected: &ProjectionSnapshot,
+    current_by_id: &BTreeMap<&str, &ObjectRow>,
+    reconcile_recall: bool,
+) -> Vec<ObjectRow> {
+    expected
+        .rows
+        .iter()
+        .filter(|row| {
+            row.row_id == OBJECTS_CHECKPOINT_ID
+                || reconcile_recall
+                    && row.object_kind.as_deref()
+                        == Some(recall_projection::RECALL_TRIGGER_INDEX_KIND)
+                || current_by_id.get(row.row_id.as_str()).copied() != Some(*row)
+        })
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn validate_delta(
@@ -5532,6 +5570,41 @@ mod tests {
         objects::read_object_rows,
         writer::JournalWriter,
     };
+
+    #[test]
+    fn unrelated_delta_does_not_reconcile_unchanged_recall_rows() {
+        let payload = JournalPayload::MigrationApplied(MigrationApplied {
+            migration_id: "test-recall-boundary".into(),
+        });
+        let mut recall = runtime_row(
+            "projection:recall:test".into(),
+            ObjectRowClass::Projection,
+            &payload,
+            1,
+        )
+        .unwrap();
+        recall.object_kind = Some(recall_projection::RECALL_TRIGGER_INDEX_KIND.into());
+        let current_checkpoint = ObjectRow::checkpoint(1, PROJECTION_GENERATION);
+        let expected_checkpoint = ObjectRow::checkpoint(2, PROJECTION_GENERATION);
+        let current_rows = [current_checkpoint, recall.clone()];
+        let current_by_id = current_rows
+            .iter()
+            .map(|row| (row.row_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        let expected = ProjectionSnapshot {
+            frontier: 2,
+            rows: vec![expected_checkpoint, recall.clone()],
+        };
+
+        assert_eq!(
+            incremental_changed_rows(&expected, &current_by_id, false),
+            vec![expected.rows[0].clone()]
+        );
+        assert_eq!(
+            incremental_changed_rows(&expected, &current_by_id, true),
+            expected.rows
+        );
+    }
 
     fn command_id(value: &str) -> CommandId {
         CommandId::from_str(value).unwrap()
@@ -6209,7 +6282,10 @@ mod tests {
             .unwrap();
         let worker = ProjectionWorker::new(journal, objects);
         worker
-            .commit_rows(&[ObjectRow::checkpoint(10_000, PROJECTION_GENERATION)])
+            .commit_rows(
+                &[ObjectRow::checkpoint(10_000, PROJECTION_GENERATION)],
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));
@@ -6254,7 +6330,7 @@ mod tests {
             .canonical_json()
             .unwrap(),
         );
-        worker.commit_rows(&[migration]).await.unwrap();
+        worker.commit_rows(&[migration], false).await.unwrap();
         assert!(matches!(
             worker.catch_up().await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
@@ -6316,7 +6392,7 @@ mod tests {
             .unwrap();
         let worker = ProjectionWorker::new(journal, objects);
         worker
-            .commit_rows(&[ObjectRow::checkpoint(3, PROJECTION_GENERATION)])
+            .commit_rows(&[ObjectRow::checkpoint(3, PROJECTION_GENERATION)], false)
             .await
             .unwrap();
         assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));

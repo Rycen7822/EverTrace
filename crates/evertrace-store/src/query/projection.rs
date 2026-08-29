@@ -9,7 +9,7 @@ use lancedb::Table;
 use crate::{
     JournalPayload, ObjectRowKind, ProjectionSnapshot, StoreError,
     journal::{read_journal_after, read_journal_frontier},
-    projections::validate_delta,
+    projections::{recall_trigger_contract, validate_delta},
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
         build_capture_relation_rows, build_episode_relation_rows,
@@ -233,6 +233,9 @@ pub fn derive_l0002_projections(
     let mut endpoint_seqs = BTreeMap::<String, u64>::new();
     let mut current_revisions = BTreeMap::<String, (u64, String)>::new();
     for row in objects.data_rows() {
+        if recall_trigger_contract(row)?.is_some() {
+            continue;
+        }
         if let (Some(object_id), Some(revision_id)) =
             (row.object_id.as_ref(), row.current_revision_id.as_ref())
             && current_revisions
@@ -247,6 +250,9 @@ pub fn derive_l0002_projections(
     }
 
     for row in objects.data_rows() {
+        if recall_trigger_contract(row)?.is_some() {
+            continue;
+        }
         for endpoint in [row.object_id.as_ref(), row.current_revision_id.as_ref()]
             .into_iter()
             .flatten()

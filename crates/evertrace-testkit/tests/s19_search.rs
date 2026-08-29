@@ -198,6 +198,7 @@ fn atom_command(
                 applicability_expr: ApplicabilityExpr::Constraint(ConstraintExpr::Exists {
                     field: ConstraintField::Phase,
                 }),
+                future_cue_lifecycle_exprs: None,
                 validity_interval: ValidityInterval {
                     valid_from_us: 1,
                     valid_until_us: Some(100),
@@ -255,6 +256,7 @@ fn atom_successor(record: &str, text: &str, at_us: i64, current: Option<&Atom>) 
                 applicability_expr: ApplicabilityExpr::Constraint(ConstraintExpr::Exists {
                     field: ConstraintField::Phase,
                 }),
+                future_cue_lifecycle_exprs: None,
                 validity_interval: ValidityInterval {
                     valid_from_us: 1,
                     valid_until_us: Some(100),

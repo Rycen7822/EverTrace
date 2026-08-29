@@ -6,7 +6,7 @@ use crate::{
     revision::RevisionId,
 };
 
-use super::{ApplicabilityExpr, SemanticError};
+use super::{ApplicabilityExpr, ConstraintExpr, SemanticError};
 
 const MAX_VALUE_BYTES: usize = 16 * 1024;
 const MAX_TEXT_BYTES: usize = 1024;
@@ -413,12 +413,28 @@ pub struct PolicyAuthorityProvenance {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct FutureCueLifecycleExprs {
+    pub suppress_expr: ConstraintExpr,
+    pub resolve_expr: ConstraintExpr,
+}
+
+impl FutureCueLifecycleExprs {
+    fn validate(&self) -> Result<(), SemanticError> {
+        self.suppress_expr.validate()?;
+        self.resolve_expr.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AtomDraft {
     pub kind: AtomKind,
     pub epistemic_status: EpistemicStatus,
     pub value: AtomValue,
     pub scope: AtomScope,
     pub applicability_expr: ApplicabilityExpr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub future_cue_lifecycle_exprs: Option<FutureCueLifecycleExprs>,
     pub validity_interval: ValidityInterval,
     pub provenance: Vec<AtomProvenance>,
     pub source_observation_refs: Vec<SourceObservationId>,
@@ -432,6 +448,12 @@ impl AtomDraft {
     pub fn validate_unprivileged(&self) -> Result<(), SemanticError> {
         self.value.validate()?;
         self.applicability_expr.validate()?;
+        if let Some(exprs) = &self.future_cue_lifecycle_exprs {
+            if !self.kind.is_normative() {
+                return Err(SemanticError::InvalidAtom);
+            }
+            exprs.validate()?;
+        }
         self.validity_interval.validate()?;
         validate_unprivileged_axes(
             self.kind,
@@ -496,6 +518,8 @@ pub struct Atom {
     pub scope: AtomScope,
     pub condition_ir_version: u32,
     pub applicability_expr: ApplicabilityExpr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub future_cue_lifecycle_exprs: Option<FutureCueLifecycleExprs>,
     pub validity_interval: ValidityInterval,
     pub provenance: Vec<AtomProvenance>,
     pub user_authorization_provenance: Option<UserAuthorizationProvenance>,
@@ -514,6 +538,12 @@ impl Atom {
     pub fn validate(&self) -> Result<(), SemanticError> {
         self.value.validate()?;
         self.applicability_expr.validate()?;
+        if let Some(exprs) = &self.future_cue_lifecycle_exprs {
+            if !self.kind.is_normative() {
+                return Err(SemanticError::InvalidAtom);
+            }
+            exprs.validate()?;
+        }
         self.validity_interval.validate()?;
         validate_references(
             &self.provenance,
@@ -718,6 +748,7 @@ impl Atom {
             || self.value != next.value
             || self.scope != next.scope
             || self.applicability_expr != next.applicability_expr
+            || self.future_cue_lifecycle_exprs != next.future_cue_lifecycle_exprs
             || self.validity_interval != next.validity_interval
             || self.provenance != next.provenance
             || self.user_authorization_provenance != next.user_authorization_provenance
@@ -740,6 +771,7 @@ impl Atom {
             && self.scope == other.scope
             && self.condition_ir_version == other.condition_ir_version
             && self.applicability_expr == other.applicability_expr
+            && self.future_cue_lifecycle_exprs == other.future_cue_lifecycle_exprs
             && self.validity_interval == other.validity_interval
             && self.provenance == other.provenance
             && self.user_authorization_provenance == other.user_authorization_provenance
@@ -758,6 +790,7 @@ impl Atom {
             value: self.value.clone(),
             scope: self.scope.clone(),
             applicability_expr: self.applicability_expr.clone(),
+            future_cue_lifecycle_exprs: self.future_cue_lifecycle_exprs.clone(),
             validity_interval: self.validity_interval.clone(),
             provenance: self.provenance.clone(),
             source_observation_refs: self.source_observation_refs.clone(),

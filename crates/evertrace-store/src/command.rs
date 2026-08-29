@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const JOURNAL_PAYLOAD_SCHEMA: u16 = 1;
+pub(crate) const ATOM_RECORDED_EVENT_TYPE: &str = "atom_recorded_v1";
 const MAX_IDENTIFIER_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -568,7 +569,7 @@ impl JournalPayload {
             Self::ExperimentRunRecorded(_) => "experiment_run_recorded_v1",
             Self::ResultEvidenceRecorded(_) => "result_evidence_recorded_v1",
             Self::WorkArtifactRecorded(_) => "work_artifact_recorded_v1",
-            Self::AtomRecorded(_) => "atom_recorded_v1",
+            Self::AtomRecorded(_) => ATOM_RECORDED_EVENT_TYPE,
             Self::RevisionProposalRecorded(_) => "revision_proposal_recorded_v1",
         }
     }

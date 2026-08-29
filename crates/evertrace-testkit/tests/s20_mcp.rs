@@ -189,6 +189,7 @@ fn atom_command(
                 applicability_expr: ApplicabilityExpr::Constraint(ConstraintExpr::Exists {
                     field: ConstraintField::Phase,
                 }),
+                future_cue_lifecycle_exprs: None,
                 validity_interval: ValidityInterval {
                     valid_from_us: 1,
                     valid_until_us: None,

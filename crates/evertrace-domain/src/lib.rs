@@ -9,6 +9,7 @@ pub mod error;
 pub mod evidence;
 pub mod ids;
 pub mod query;
+pub mod recall;
 pub mod repository;
 pub mod revision;
 pub mod semantic;
