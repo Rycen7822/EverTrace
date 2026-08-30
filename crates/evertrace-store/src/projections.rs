@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
+    canonical::{CanonicalValue, sha256},
     evidence::{
         CaptureGapMarkerEvidence, CaptureOutageInterval, EvidenceSurface, HostOccurrence,
-        Operation, ScopeEffect, SourceObservation, SourceReceipt,
+        Operation, ScopeEffect, SourceObservation, SourceReceipt, hex,
     },
     ids::{
         AtomId, AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
@@ -1390,6 +1391,7 @@ fn json_field_fragment<T: serde::Serialize + ?Sized>(
 
 #[derive(Clone, Default)]
 struct ReducerState {
+    session_imports: BTreeMap<String, crate::session_import::SessionImportCurrent>,
     migrations: BTreeMap<String, (JournalPayload, u64)>,
     dirty: BTreeMap<String, (DirtyTarget, u64)>,
     outbox: BTreeMap<String, (OutboxEntry, u64)>,
@@ -1511,6 +1513,7 @@ impl KnownSourceRange {
 
 #[derive(Clone, Default)]
 pub(crate) struct JournalAdmissionState {
+    session_imports: BTreeMap<String, crate::session_import::SessionImportCurrent>,
     frontier: u64,
     source_ranges: BTreeMap<String, KnownSourceRange>,
     source_observations: BTreeMap<SourceObservationId, (SourceObservation, u64)>,
@@ -2373,6 +2376,15 @@ impl JournalAdmissionState {
             JournalPayload::RecallLedgerRecorded(value) => {
                 self.recall_ledger.apply(*value, seq)?;
             }
+            JournalPayload::SessionImportEventRecorded(value) => {
+                let next = crate::session_import::apply_session_event(
+                    self.session_imports.get(&value.session_id),
+                    &value,
+                    seq,
+                )
+                .map_err(|_| StoreError::InvalidInput)?;
+                self.session_imports.insert(value.session_id.clone(), next);
+            }
             _ => {}
         }
         self.frontier = self.frontier.max(seq);
@@ -2848,8 +2860,8 @@ pub fn reduce_journal(rows: &[JournalRow]) -> Result<ProjectionSnapshot, StoreEr
     let mut frontier = 0;
     for batch in batches {
         admission = admission.apply_row_batch(&batch)?;
-        for row in batch {
-            apply_event(&mut state, row)?;
+        for row in &batch {
+            apply_event(&mut state, row, &batch)?;
             frontier = frontier.max(row.seq);
         }
         state.rebuild_revision_currents()?;
@@ -2858,7 +2870,11 @@ pub fn reduce_journal(rows: &[JournalRow]) -> Result<ProjectionSnapshot, StoreEr
     state.into_snapshot(frontier)
 }
 
-fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreError> {
+fn apply_event(
+    state: &mut ReducerState,
+    row: &JournalRow,
+    command: &[&JournalRow],
+) -> Result<(), StoreError> {
     let payload = row.payload()?;
     payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
     match payload {
@@ -2959,15 +2975,8 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
             }
         }
         JournalPayload::SourceIngestWatermark(value) => {
+            validate_source_ingest_watermark(state, &value, command)?;
             let key = value.stable_key();
-            let receipt_exists = state.source_receipts.values().any(|(receipt, _)| {
-                receipt.source_instance_id == value.source_instance_id
-                    && receipt.source_revision == value.source_revision
-                    && receipt.source_sequence == value.source_sequence
-            });
-            if !receipt_exists {
-                return Err(StoreError::StoreCorrupt);
-            }
             if state
                 .source_watermarks
                 .get(&key)
@@ -3215,8 +3224,116 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         JournalPayload::RecallLedgerRecorded(value) => {
             state.recall_ledger.apply(*value, row.seq)?;
         }
+        JournalPayload::SessionImportEventRecorded(value) => {
+            let next = crate::session_import::apply_session_event(
+                state.session_imports.get(&value.session_id),
+                &value,
+                row.seq,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            state.session_imports.insert(value.session_id.clone(), next);
+        }
     }
     Ok(())
+}
+
+fn validate_source_ingest_watermark(
+    state: &ReducerState,
+    watermark: &SourceIngestWatermark,
+    command: &[&JournalRow],
+) -> Result<(), StoreError> {
+    let codex = validate_confirmed_session_prefix(watermark)?;
+    let key = watermark.stable_key();
+    let current = state.source_watermarks.get(&key).map(|(value, _)| value);
+    let mut receipt = None;
+    for row in command {
+        let JournalPayload::SourceReceiptRecorded(value) = row.payload()? else {
+            continue;
+        };
+        if value.source_instance_id == watermark.source_instance_id
+            && value.source_revision == watermark.source_revision
+            && receipt.replace(*value).is_some()
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    if let Some(current) = current {
+        match watermark.source_sequence.cmp(&current.source_sequence) {
+            std::cmp::Ordering::Less if codex => return Err(StoreError::StoreCorrupt),
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => {
+                if watermark == current && receipt.is_none() {
+                    return Ok(());
+                }
+                if codex {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    let receipt = receipt.ok_or(StoreError::StoreCorrupt)?;
+    if receipt.source_sequence != watermark.source_sequence {
+        return Err(StoreError::StoreCorrupt);
+    }
+    if !codex {
+        return Ok(());
+    }
+    let range = receipt
+        .source_byte_range
+        .as_ref()
+        .ok_or(StoreError::StoreCorrupt)?;
+    let previous = if let Some(current) = current {
+        if range.start != current.source_sequence {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Some(
+            current
+                .confirmed_prefix_digest
+                .clone()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+    } else {
+        if range.start != 0 {
+            return Err(StoreError::StoreCorrupt);
+        }
+        None
+    };
+    if range.end != watermark.source_sequence || range.end <= range.start {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let digest = sha256(
+        "session_import_confirmed_prefix",
+        1,
+        &CanonicalValue::Sequence(vec![
+            CanonicalValue::String(watermark.source_instance_id.as_str().to_owned()),
+            CanonicalValue::String(watermark.source_revision.as_str().to_owned()),
+            CanonicalValue::Integer(i128::from(range.start)),
+            CanonicalValue::Integer(i128::from(range.end)),
+            previous.map_or(CanonicalValue::Null, CanonicalValue::String),
+            CanonicalValue::String(receipt.cas_ref),
+        ]),
+    )
+    .map_err(|_| StoreError::StoreCorrupt)?;
+    let digest = hex(&digest);
+    if watermark.confirmed_prefix_digest.as_deref() != Some(digest.as_str()) {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_confirmed_session_prefix(
+    watermark: &SourceIngestWatermark,
+) -> Result<bool, StoreError> {
+    let codex = watermark
+        .source_instance_id
+        .as_str()
+        .strip_prefix("codex-session:")
+        .is_some();
+    match (codex, watermark.confirmed_prefix_digest.is_some()) {
+        (true, true) | (false, false) => Ok(codex),
+        _ => Err(StoreError::StoreCorrupt),
+    }
 }
 
 fn replace_occurrence(
@@ -4168,6 +4285,16 @@ impl ReducerState {
             if recall_projection::contract(row)?.is_some() {
                 continue;
             }
+            if let Some(value) = crate::session_import::restore_current(row)? {
+                if state
+                    .session_imports
+                    .insert(value.session_id.clone(), value)
+                    .is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                continue;
+            }
             if s23::S23State::restore_projection(row)? {
                 continue;
             }
@@ -4979,6 +5106,9 @@ impl ReducerState {
                 false
             }
             JournalPayload::RecallLedgerRecorded(_) => return Err(StoreError::StoreCorrupt),
+            JournalPayload::SessionImportEventRecorded(_) => {
+                return Err(StoreError::StoreCorrupt);
+            }
         };
         if duplicate {
             return Err(StoreError::StoreCorrupt);
@@ -5000,6 +5130,12 @@ impl ReducerState {
             self.s23.atom_support_eligible(atom.revision_id)
         })?);
         rows.extend(self.recall_ledger.clone().rows(PROJECTION_GENERATION)?);
+        rows.extend(
+            self.session_imports
+                .values()
+                .map(|value| crate::session_import::current_row(value, PROJECTION_GENERATION))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         rows.extend(synthesis::wiki_rows(
             &self.atoms,
             &self.proposals,
@@ -5737,6 +5873,7 @@ impl ReducerState {
 
     fn admission_state(&self, frontier: u64) -> Result<JournalAdmissionState, StoreError> {
         Ok(JournalAdmissionState {
+            session_imports: self.session_imports.clone(),
             frontier,
             source_ranges: current_source_ranges(&self.source_receipts)?,
             source_observations: self.source_observations.clone(),
@@ -6324,8 +6461,8 @@ impl ProjectionWorker {
         let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
-            for row in batch {
-                apply_event(&mut state, row)?;
+            for row in &batch {
+                apply_event(&mut state, row, &batch)?;
             }
             state.validate_evidence_relations()?;
         }
@@ -6498,6 +6635,33 @@ mod tests {
         objects::read_object_rows,
         writer::JournalWriter,
     };
+
+    #[test]
+    fn session_prefix_digest_is_required_only_for_codex_sources() {
+        let codex = SourceIngestWatermark {
+            source_instance_id: SourceInstanceId::parse("codex-session:session-a").unwrap(),
+            source_revision: SourceRevision::parse("revision-a").unwrap(),
+            source_sequence: 1,
+            confirmed_prefix_digest: None,
+        };
+        assert_eq!(
+            validate_confirmed_session_prefix(&codex),
+            Err(StoreError::StoreCorrupt)
+        );
+        let ordinary = SourceIngestWatermark {
+            source_instance_id: SourceInstanceId::parse("ordinary-source").unwrap(),
+            ..codex
+        };
+        assert_eq!(validate_confirmed_session_prefix(&ordinary), Ok(false));
+        let forged_ordinary = SourceIngestWatermark {
+            confirmed_prefix_digest: Some("1".repeat(64)),
+            ..ordinary
+        };
+        assert_eq!(
+            validate_confirmed_session_prefix(&forged_ordinary),
+            Err(StoreError::StoreCorrupt)
+        );
+    }
 
     #[test]
     fn unrelated_delta_does_not_reconcile_unchanged_recall_rows() {
@@ -7250,8 +7414,10 @@ mod tests {
         let mut restored = ReducerState::from_current_rows(&first.rows, first.frontier).unwrap();
         let delta = &rows[first_len..];
         validate_delta(first.frontier, snapshot.frontier, delta).unwrap();
-        for row in delta {
-            apply_event(&mut restored, row).unwrap();
+        for batch in ordered_command_batches(delta).unwrap() {
+            for row in &batch {
+                apply_event(&mut restored, row, &batch).unwrap();
+            }
         }
         assert_eq!(restored.into_snapshot(snapshot.frontier).unwrap(), snapshot);
         assert_eq!(snapshot.frontier, 12);

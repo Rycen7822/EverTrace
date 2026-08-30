@@ -6,12 +6,22 @@ pub struct Args {
     pub command: Command,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     ConfigCheck,
     ConfigShowEffective,
     Doctor,
     Mcp,
+    AdminSession {
+        action: AdminSessionAction,
+        session_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminSessionAction {
+    Queue,
+    Revoke,
 }
 
 impl Args {
@@ -30,6 +40,27 @@ impl Args {
             Command::Doctor
         } else if command == "mcp" {
             Command::Mcp
+        } else if command == "admin" {
+            if values.next().as_deref() != Some(std::ffi::OsStr::new("session")) {
+                return Err(usage());
+            }
+            let action = match values.next().as_deref().and_then(|value| value.to_str()) {
+                Some("queue") => AdminSessionAction::Queue,
+                Some("revoke") => AdminSessionAction::Revoke,
+                _ => return Err(usage()),
+            };
+            let session_id = values
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 256
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+                        })
+                })
+                .ok_or(usage())?;
+            Command::AdminSession { action, session_id }
         } else if command == "config" {
             match values.next().as_deref().and_then(|value| value.to_str()) {
                 Some("check") => Command::ConfigCheck,
@@ -51,5 +82,5 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|doctor|mcp"
+    "usage: evertrace [--config PATH] config check|config show --effective|doctor|mcp|admin session queue|revoke SESSION_ID"
 }

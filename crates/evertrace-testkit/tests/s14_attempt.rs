@@ -442,6 +442,7 @@ fn evidence_command(receipt: SourceReceipt, observation: SourceObservation) -> J
                 source_instance_id: receipt.source_instance_id,
                 source_revision: receipt.source_revision,
                 source_sequence: receipt.source_sequence,
+                confirmed_prefix_digest: None,
             }),
             JournalPayload::DirtyTarget(DirtyTarget {
                 target_kind: DirtyTargetKind::EvidenceSurface,

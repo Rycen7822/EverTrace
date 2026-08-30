@@ -24,6 +24,15 @@ pub enum Response {
     McpBindingIssued(McpBindingIssuedResponse),
     McpResult(Box<McpResultEnvelope>),
     RecallCue(RecallCueResponse),
+    SessionImportAdmin(SessionImportAdminResponse),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionImportAdminResponse {
+    Queued,
+    Revoked,
+    NoDelta,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

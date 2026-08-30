@@ -309,6 +309,7 @@ fn binding_rewrite(snapshot_path: &Path, bytes: &[u8]) -> Result<(), ()> {
             turn_id: native.turn_id,
             tool_use_id: native.tool_use_id,
             agent_id: native.agent_id,
+            transcript_path: native.transcript_path,
             original_input: native.tool_input.clone(),
             launcher_protocol_revision: BINDING_PROTOCOL_REVISION,
         },

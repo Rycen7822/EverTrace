@@ -737,6 +737,7 @@ fn recovery_manifest() -> Result<AdapterCapabilityManifest, RecoveryError> {
         subagent_trace: SubagentTrace::Full,
         trust_readback: TrustReadback::Unavailable,
         project_policy_surfaces: vec![],
+        session_catalog_root_contracts: vec![],
         admission_failure_observability: ManifestObservability::Complete,
         mcp_session_binding: McpSessionBinding::Unavailable,
         mcp_binding_mechanism: McpBindingMechanism::None,

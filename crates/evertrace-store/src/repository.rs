@@ -44,6 +44,9 @@ impl RepositoryCurrentView {
             ..Self::default()
         };
         for row in snapshot.data_rows() {
+            if crate::session_import::restore_current(row)?.is_some() {
+                continue;
+            }
             let Some(payload_json) = row.payload_json.as_deref() else {
                 continue;
             };

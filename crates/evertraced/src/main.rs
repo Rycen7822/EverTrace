@@ -9,21 +9,28 @@ use evertrace_engine::{
     RecallCueService, RecoveryActionOutcome, RecoveryActionService,
     RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
     RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason, RuntimeMode,
-    open_writer, publish_recovery_runtime, recall::spawn_recall_worker, spawn_writer,
+    SessionImportBudget, SessionImportWorker, open_writer, publish_recovery_runtime,
+    recall::spawn_recall_worker,
+    repository::observe_session_catalog_report,
+    session_import::{
+        SessionCatalogService, SessionImportAdminAction as EngineSessionImportAdminAction,
+        SessionImportAdminOutcome, SessionImportAdminService,
+    },
+    spawn_writer,
 };
 use evertrace_protocol::{
     LocalServer, ServerOptions,
-    command::{Command as ProtocolCommand, RecallCueCommand},
+    command::{Command as ProtocolCommand, RecallCueCommand, SessionImportAdminAction},
     dto::{ClientKind, HealthMode, PROTOCOL_VERSION},
     envelope::{McpItem, McpItems, McpResultEnvelope, McpStatus},
     error::ErrorCode,
     resolve_data_dir,
     response::{
         HealthResponse, McpBindingIssuedResponse, RecallCueResponse, RecoveryActionResponse,
-        RecoveryTerminalResponse, RecoveryUnsupportedReason, Response,
+        RecoveryTerminalResponse, RecoveryUnsupportedReason, Response, SessionImportAdminResponse,
     },
 };
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 
 #[tokio::main]
 async fn main() {
@@ -54,6 +61,97 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_dir.clone(),
     );
     let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
+    let current_session_catalog_report = Arc::new(RwLock::new(None));
+    let session_import_admin = SessionImportAdminService::new(
+        writer_handle.clone(),
+        Arc::clone(&current_session_catalog_report),
+        runtime_snapshot.effective_config_hash,
+    );
+    let session_catalog = SessionCatalogService::new(
+        writer_handle.clone(),
+        runtime_snapshot.effective_config_hash,
+    );
+    let session_import_worker = SessionImportWorker::new(
+        writer_handle.clone(),
+        runtime_snapshot.clone(),
+        Arc::clone(&current_session_catalog_report),
+    )?;
+    let (session_import_wakeup_tx, mut session_import_wakeup_rx) = watch::channel(0_u64);
+    let (session_import_shutdown_tx, mut session_import_shutdown_rx) = watch::channel(false);
+    let worker_report = Arc::clone(&current_session_catalog_report);
+    let worker_catalog = session_catalog.clone();
+    let worker_import = session_import_worker.clone();
+    let worker_wakeup = session_import_wakeup_tx.clone();
+    let mut session_import_task = tokio::spawn(async move {
+        let mut retry_at = None;
+        loop {
+            tokio::select! {
+                changed = session_import_shutdown_rx.changed() => {
+                    if changed.is_err() || *session_import_shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+                changed = session_import_wakeup_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let report = Arc::clone(&worker_report).read_owned().await;
+                    let (catalog_changed, imported, retryable) = if let Some(report) = report.as_ref() {
+                        let catalog_changed = match worker_catalog.refresh(report).await {
+                            Ok(changed) => changed,
+                            Err(_) => {
+                                tracing::warn!("bounded session catalog refresh failed");
+                                0
+                            }
+                        };
+                        match worker_import
+                            .process_queued_once(
+                                32,
+                                SessionImportBudget {
+                                    max_bytes: 256 * 1024,
+                                    max_records: 16,
+                                    deadline: std::time::Instant::now()
+                                        + std::time::Duration::from_millis(250),
+                                },
+                            )
+                            .await
+                        {
+                            Ok((processed, retryable)) => {
+                                (catalog_changed, processed, retryable)
+                            }
+                            Err(_) => {
+                                tracing::warn!("bounded session import checkpoint failed");
+                                (catalog_changed, 0, true)
+                            }
+                        }
+                    } else {
+                        (0, 0, false)
+                    };
+                    drop(report);
+                    tokio::task::yield_now().await;
+                    let immediate = catalog_changed != 0 || imported != 0 && retryable;
+                    retry_at = (retryable && !immediate).then(|| {
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+                    });
+                    if immediate {
+                        let next = (*worker_wakeup.borrow()).wrapping_add(1);
+                        worker_wakeup.send_replace(next);
+                    }
+                }
+                _ = async {
+                    if let Some(deadline) = retry_at {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    retry_at = None;
+                    let next = (*worker_wakeup.borrow()).wrapping_add(1);
+                    worker_wakeup.send_replace(next);
+                }
+            }
+        }
+    });
     let mcp_service = McpActionService::open(
         mcp_bindings.clone(),
         &data_dir,
@@ -96,6 +194,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let handler_recovery_action_service = recovery_action_service.clone();
     let handler_mcp_bindings = mcp_bindings;
     let handler_mcp_service = mcp_service;
+    let handler_session_catalog_report = Arc::clone(&current_session_catalog_report);
+    let handler_session_import_admin = session_import_admin;
+    let handler_session_import_wakeup = session_import_wakeup_tx.clone();
     let mut task = tokio::spawn(server.run_dispatch_with_context(
         shutdown_rx,
         move |context, request_id, command| {
@@ -105,6 +206,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mcp_bindings = handler_mcp_bindings.clone();
             let mcp_service = handler_mcp_service.clone();
             let recall_cue_service = recall_cue_service.clone();
+            let session_catalog_report = Arc::clone(&handler_session_catalog_report);
+            let session_import_admin = handler_session_import_admin.clone();
+            let session_import_wakeup = handler_session_import_wakeup.clone();
             async move {
                 match command {
                     ProtocolCommand::Health => {
@@ -171,6 +275,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if context.client_kind != ClientKind::Hook {
                             return Err(ErrorCode::Untrusted);
                         }
+                        let observed = observe_session_catalog_report(
+                            issue.transcript_path.as_deref(),
+                            &issue.session_id,
+                            &issue.tool_use_id,
+                        )
+                        .ok();
                         let grant = mcp_bindings
                             .issue(McpBindingIssue {
                                 session_id: issue.session_id,
@@ -184,6 +294,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 launcher_protocol_revision: issue.launcher_protocol_revision,
                             })
                             .map_err(|_| ErrorCode::Untrusted)?;
+                        *session_catalog_report.write().await = observed;
+                        let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                        session_import_wakeup.send_replace(next);
                         Ok(Response::McpBindingIssued(McpBindingIssuedResponse {
                             bound_workspace: grant.bound_workspace,
                             expires_at_us: grant.expires_at_us,
@@ -217,6 +330,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .map_err(|_| ErrorCode::Internal)?;
                         Ok(Response::McpResult(Box::new(map_mcp_result(result))))
                     }
+                    ProtocolCommand::SessionImportAdmin(command) => {
+                        if context.client_kind != ClientKind::Cli {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        let action = match command.action {
+                            SessionImportAdminAction::QueueImport => {
+                                EngineSessionImportAdminAction::QueueImport
+                            }
+                            SessionImportAdminAction::RevokeAccess => {
+                                EngineSessionImportAdminAction::RevokeAccess
+                            }
+                        };
+                        let occurred_at_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|value| i64::try_from(value.as_micros()).ok())
+                            .ok_or(ErrorCode::Internal)?;
+                        let session_id = command.session_id;
+                        let outcome = session_import_admin
+                            .handle(request_id, &session_id, action, occurred_at_us)
+                            .await
+                            .map_err(|_| ErrorCode::InvalidInput)?;
+                        if outcome == SessionImportAdminOutcome::Queued {
+                            let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                            session_import_wakeup.send_replace(next);
+                        }
+                        Ok(Response::SessionImportAdmin(match outcome {
+                            SessionImportAdminOutcome::Queued => SessionImportAdminResponse::Queued,
+                            SessionImportAdminOutcome::Revoked => {
+                                SessionImportAdminResponse::Revoked
+                            }
+                            SessionImportAdminOutcome::NoDelta => {
+                                SessionImportAdminResponse::NoDelta
+                            }
+                        }))
+                    }
                     ProtocolCommand::RecallCue(command) => {
                         if context.client_kind != ClientKind::Hook {
                             return Err(ErrorCode::Untrusted);
@@ -242,6 +391,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         result = &mut task => {
             let server_result = result;
+            let _ = session_import_shutdown_tx.send(true);
+            session_import_task.await?;
             recovery_action_service.shutdown_and_drain().await;
             recall_worker.abort();
             let _ = (&mut recall_worker).await;
@@ -254,6 +405,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         result = &mut writer_task => {
             let _ = shutdown_tx.send(true);
+            let _ = session_import_shutdown_tx.send(true);
+            session_import_task.await?;
             recovery_action_service.shutdown_and_drain().await;
             recall_worker.abort();
             let _ = (&mut recall_worker).await;
@@ -263,6 +416,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         result = &mut recall_worker => {
             let _ = shutdown_tx.send(true);
+            let _ = session_import_shutdown_tx.send(true);
+            session_import_task.await?;
             recovery_action_service.shutdown_and_drain().await;
             task.await??;
             if let Some(handle) = writer_handle.take() {
@@ -272,11 +427,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             result?;
             Err("recall worker stopped unexpectedly".into())
         }
-        signal = wait_for_signal() => {
-            signal?;
+        result = &mut session_import_task => {
             let _ = shutdown_tx.send(true);
             recovery_action_service.shutdown_and_drain().await;
             task.await??;
+            recall_worker.abort();
+            let _ = (&mut recall_worker).await;
+            if let Some(handle) = writer_handle.take() {
+                handle.shutdown().await?;
+            }
+            writer_task.await??;
+            result?;
+            Err("session import worker stopped unexpectedly".into())
+        }
+        signal = wait_for_signal() => {
+            signal?;
+            let _ = shutdown_tx.send(true);
+            let _ = session_import_shutdown_tx.send(true);
+            recovery_action_service.shutdown_and_drain().await;
+            task.await??;
+            session_import_task.await?;
             recall_worker.abort();
             let _ = (&mut recall_worker).await;
             if let Some(handle) = writer_handle.take() {

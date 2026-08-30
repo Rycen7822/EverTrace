@@ -940,6 +940,7 @@ async fn real_four_table_batch_rebuild_restart_and_fail_closed_relations() {
             source_instance_id: receipt.source_instance_id.clone(),
             source_revision: receipt.source_revision.clone(),
             source_sequence: receipt.source_sequence,
+            confirmed_prefix_digest: None,
         }),
         JournalPayload::DirtyTarget(DirtyTarget {
             target_kind: DirtyTargetKind::EvidenceSurface,

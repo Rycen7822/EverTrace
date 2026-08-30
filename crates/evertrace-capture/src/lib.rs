@@ -18,7 +18,8 @@ pub use admission::{
 };
 pub use cas::{CasDigest, CasError, CasStore};
 pub use confined_read::{
-    ConfinedFile, ConfinedFileIdentity, ConfinedFileMetadata, ConfinedLimitKind, ConfinedReadError,
+    ConfinedDirectoryEntry, ConfinedEntryType, ConfinedFile, ConfinedFileIdentity,
+    ConfinedFileMetadata, ConfinedFileRange, ConfinedLimitKind, ConfinedReadError,
     ConfinedReadLimits, ConfinedRoot,
 };
 pub use frame::{

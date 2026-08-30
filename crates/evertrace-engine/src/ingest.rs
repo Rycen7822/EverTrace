@@ -1,17 +1,22 @@
+use std::collections::BTreeMap;
+
 use evertrace_capture::{CasStore, DurableSpool, RuntimeSnapshot};
 use evertrace_domain::{
-    evidence::{SourceRevisionMode, SourceRole},
+    canonical::{CanonicalValue, sha256},
+    evidence::{SourceInstanceId, SourceRevision, SourceRevisionMode, SourceRole},
     ids::SourceObservationId,
 };
 use evertrace_store::{
     DirtyTarget, DirtyTargetKind, EventScope, JournalCommand, JournalEventDraft, JournalPayload,
-    SourceIngestWatermark, SourceKind, SourceRevisionRecorded,
+    ProjectionSnapshot, SourceIngestWatermark, SourceKind, SourceRevisionRecorded,
 };
 use thiserror::Error;
 
 use crate::{WriterActorError, WriterHandle, capture::verify_capture_frame};
 
 const MAX_SEGMENTS_PER_DRAIN: usize = 16;
+const MAX_SELECTED_OBSERVATIONS: usize = 256;
+const CONFIRMED_PREFIX_TAG: &str = "session_import_confirmed_prefix";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DrainProgress {
@@ -58,7 +63,7 @@ impl EvidenceIngestor {
         observation_ids: &[SourceObservationId],
     ) -> Result<DrainProgress, IngestError> {
         if observation_ids.is_empty()
-            || observation_ids.len() > 16
+            || observation_ids.len() > MAX_SELECTED_OBSERVATIONS
             || observation_ids
                 .iter()
                 .copied()
@@ -103,6 +108,8 @@ impl EvidenceIngestor {
             .sealed_segments(segment_limit)
             .map_err(|_| IngestError::Spool)?;
         let mut progress = DrainProgress::default();
+        let mut prefix_projection = None;
+        let mut prefix_states = BTreeMap::new();
         for segment in segments {
             let mut committed = 0_usize;
             for frame in segment.frames() {
@@ -112,7 +119,91 @@ impl EvidenceIngestor {
                 let verified = verify_capture_frame(frame, &cas)?;
                 let surface_count = usize::from(verified.surface.is_some());
                 let recorded_at_us = verified.body.recorded_at_us;
-                let command = self.command_for(verified)?;
+                let digest = if verified
+                    .body
+                    .source_instance_id
+                    .as_str()
+                    .strip_prefix("codex-session:")
+                    .is_some()
+                {
+                    let range = verified
+                        .receipt
+                        .source_byte_range
+                        .as_ref()
+                        .ok_or(IngestError::InvalidRecord)?;
+                    if range.end != verified.body.source_sequence || range.end <= range.start {
+                        return Err(IngestError::InvalidRecord);
+                    }
+                    let key = (
+                        verified.body.source_instance_id.as_str().to_owned(),
+                        verified.body.source_revision.as_str().to_owned(),
+                    );
+                    if !prefix_states.contains_key(&key) {
+                        if prefix_projection.is_none() {
+                            prefix_projection =
+                                Some(self.writer.project().await.map_err(map_writer_error)?);
+                        }
+                        let projected = projected_confirmed_prefix(
+                            prefix_projection
+                                .as_ref()
+                                .ok_or(IngestError::StoreCorrupt)?,
+                            &verified.body.source_instance_id,
+                            &verified.body.source_revision,
+                        )?;
+                        prefix_states.insert(key.clone(), projected);
+                    }
+                    let state = prefix_states.get(&key).ok_or(IngestError::StoreCorrupt)?;
+                    if verified.body.source_sequence <= state.committed_end {
+                        if state.exact.is_none() {
+                            let exact = projected_exact_prefixes(
+                                prefix_projection
+                                    .as_ref()
+                                    .ok_or(IngestError::StoreCorrupt)?,
+                                &key.0,
+                                &key.1,
+                                state.committed_end,
+                                state.committed_digest.as_deref(),
+                            )?;
+                            prefix_states
+                                .get_mut(&key)
+                                .ok_or(IngestError::StoreCorrupt)?
+                                .exact = Some(exact);
+                        }
+                        let exact = prefix_states
+                            .get(&key)
+                            .and_then(|state| state.exact.as_ref())
+                            .and_then(|exact| exact.get(&verified.body.source_sequence))
+                            .ok_or(IngestError::StoreCorrupt)?;
+                        if exact.start != range.start
+                            || exact.end != range.end
+                            || exact.cas_ref != verified.receipt.cas_ref
+                        {
+                            return Err(IngestError::StoreCorrupt);
+                        }
+                        Some(exact.digest.clone())
+                    } else {
+                        if range.start != state.local_end {
+                            return Err(IngestError::InvalidRecord);
+                        }
+                        let digest = confirmed_prefix_digest(
+                            &key.0,
+                            &key.1,
+                            range.start,
+                            range.end,
+                            state.local_digest.as_deref(),
+                            &verified.receipt.cas_ref,
+                        )?;
+                        let state = prefix_states
+                            .get_mut(&key)
+                            .ok_or(IngestError::StoreCorrupt)?;
+                        state.local_end = range.end;
+                        state.local_digest = Some(digest.clone());
+                        Some(digest)
+                    }
+                } else {
+                    None
+                };
+                let command = self.command_for(verified, digest)?;
                 let outcome = self
                     .writer
                     .commit(command, recorded_at_us)
@@ -139,6 +230,7 @@ impl EvidenceIngestor {
     fn command_for(
         &self,
         verified: crate::capture::VerifiedCapture,
+        confirmed_prefix_digest: Option<String>,
     ) -> Result<JournalCommand, IngestError> {
         let scope = EventScope {
             repository_id: verified
@@ -182,6 +274,7 @@ impl EvidenceIngestor {
                 source_instance_id: verified.body.source_instance_id.clone(),
                 source_revision: verified.body.source_revision.clone(),
                 source_sequence: verified.body.source_sequence,
+                confirmed_prefix_digest,
             },
         ));
         if let Some(surface) = verified.surface {
@@ -223,6 +316,186 @@ impl EvidenceIngestor {
         JournalCommand::new(verified.body.command_id, events)
             .map_err(|_| IngestError::InvalidRecord)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfirmedPrefixState {
+    committed_end: u64,
+    committed_digest: Option<String>,
+    exact: Option<BTreeMap<u64, ProjectedExactPrefix>>,
+    local_end: u64,
+    local_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectedExactPrefix {
+    start: u64,
+    end: u64,
+    cas_ref: String,
+    digest: String,
+}
+
+fn projected_confirmed_prefix(
+    snapshot: &ProjectionSnapshot,
+    source_instance: &SourceInstanceId,
+    source_revision: &SourceRevision,
+) -> Result<ConfirmedPrefixState, IngestError> {
+    let key = SourceIngestWatermark {
+        source_instance_id: source_instance.clone(),
+        source_revision: source_revision.clone(),
+        source_sequence: 0,
+        confirmed_prefix_digest: None,
+    }
+    .stable_key();
+    let Some(row) = snapshot.row(&format!("runtime:watermark:source:{key}")) else {
+        return Ok(ConfirmedPrefixState {
+            committed_end: 0,
+            committed_digest: None,
+            exact: None,
+            local_end: 0,
+            local_digest: None,
+        });
+    };
+    let payload: JournalPayload = serde_json::from_str(
+        row.payload_json
+            .as_deref()
+            .ok_or(IngestError::StoreCorrupt)?,
+    )
+    .map_err(|_| IngestError::StoreCorrupt)?;
+    let JournalPayload::SourceIngestWatermark(watermark) = payload else {
+        return Err(IngestError::StoreCorrupt);
+    };
+    if &watermark.source_instance_id != source_instance
+        || &watermark.source_revision != source_revision
+        || watermark.source_sequence == 0
+    {
+        return Err(IngestError::StoreCorrupt);
+    }
+    let digest = watermark
+        .confirmed_prefix_digest
+        .clone()
+        .ok_or(IngestError::StoreCorrupt)?;
+    Ok(ConfirmedPrefixState {
+        committed_end: watermark.source_sequence,
+        committed_digest: Some(digest.clone()),
+        exact: None,
+        local_end: watermark.source_sequence,
+        local_digest: Some(digest),
+    })
+}
+
+fn projected_exact_prefixes(
+    snapshot: &ProjectionSnapshot,
+    source_instance: &str,
+    source_revision: &str,
+    committed_end: u64,
+    expected: Option<&str>,
+) -> Result<BTreeMap<u64, ProjectedExactPrefix>, IngestError> {
+    let expected = expected.ok_or(IngestError::StoreCorrupt)?;
+    let mut receipts = Vec::new();
+    for row in snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+    {
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(IngestError::StoreCorrupt)?,
+        )
+        .map_err(|_| IngestError::StoreCorrupt)?;
+        let JournalPayload::SourceReceiptRecorded(receipt) = payload else {
+            return Err(IngestError::StoreCorrupt);
+        };
+        if receipt.source_instance_id.as_str() != source_instance
+            || receipt.source_revision.as_str() != source_revision
+        {
+            continue;
+        }
+        let range = receipt
+            .source_byte_range
+            .as_ref()
+            .ok_or(IngestError::StoreCorrupt)?;
+        if range.end != receipt.source_sequence || range.end <= range.start {
+            return Err(IngestError::StoreCorrupt);
+        }
+        receipts.push((range.start, range.end, receipt.cas_ref.clone()));
+    }
+    if receipts.is_empty() {
+        return Err(IngestError::StoreCorrupt);
+    }
+    receipts.sort_by_key(|(start, end, _)| (*end, *start));
+    let mut cursor = 0_u64;
+    let mut digest = None;
+    let mut exact = BTreeMap::new();
+    for (start, end, cas_ref) in receipts {
+        if start != cursor || end > committed_end {
+            return Err(IngestError::StoreCorrupt);
+        }
+        let next_digest = confirmed_prefix_digest(
+            source_instance,
+            source_revision,
+            start,
+            end,
+            digest.as_deref(),
+            &cas_ref,
+        )?;
+        if exact
+            .insert(
+                end,
+                ProjectedExactPrefix {
+                    start,
+                    end,
+                    cas_ref,
+                    digest: next_digest.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(IngestError::StoreCorrupt);
+        }
+        digest = Some(next_digest);
+        cursor = end;
+    }
+    if cursor != committed_end || digest.as_deref() != Some(expected) {
+        return Err(IngestError::StoreCorrupt);
+    }
+    Ok(exact)
+}
+
+fn confirmed_prefix_digest(
+    source_instance: &str,
+    source_revision: &str,
+    start: u64,
+    end: u64,
+    previous: Option<&str>,
+    cas_ref: &str,
+) -> Result<String, IngestError> {
+    let digest = sha256(
+        CONFIRMED_PREFIX_TAG,
+        1,
+        &CanonicalValue::Sequence(vec![
+            CanonicalValue::String(source_instance.to_owned()),
+            CanonicalValue::String(source_revision.to_owned()),
+            CanonicalValue::Integer(i128::from(start)),
+            CanonicalValue::Integer(i128::from(end)),
+            previous.map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_owned())
+            }),
+            CanonicalValue::String(cas_ref.to_owned()),
+        ]),
+    )
+    .map_err(|_| IngestError::InvalidRecord)?;
+    Ok(hex_digest(&digest))
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn map_writer_error(error: WriterActorError) -> IngestError {

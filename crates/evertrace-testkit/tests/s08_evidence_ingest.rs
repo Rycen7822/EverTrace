@@ -6,7 +6,7 @@ use evertrace_capture::{
     SpoolLimits, decode_record_body, encode_frame, encode_record_body, scan_frames,
 };
 use evertrace_domain::evidence::{
-    CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
+    CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceByteRange, EvidenceSourceKind,
     HostCorrelationEvidence, IdentityStrength, InstructionAuthority, ObservationRole,
     SourceInstanceId, SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole,
     UnsupportedRecordClassification, payload_fingerprint, source_observation_id,
@@ -376,6 +376,85 @@ async fn replay_after_lost_ack_is_idempotent_and_same_payload_distinct_records_r
         .map(|row| row.object_id.clone().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(observations.len(), 2);
+}
+
+#[tokio::test]
+async fn selected_codex_frame_replays_with_exact_prefix_before_mixed_segment_ack() {
+    let temp = TempDir::new().unwrap();
+    let (snapshot, mut runtime) = prepare(temp.path());
+    let payload = b"codex record";
+    let end = u64::try_from(payload.len() + 1).unwrap();
+    let record_identity = format!("bytes:0-{end}");
+    let mut codex = input(&record_identity, payload);
+    codex.source_instance_id = "codex-session:session-mixed".into();
+    codex.source_revision = "session-revision-a".into();
+    codex.source_record_identity = Some(record_identity.clone());
+    codex.identity_strength = Some(IdentityStrength::StableSourceSequence);
+    codex.source_kind = EvidenceSourceKind::CodexSessionJsonl;
+    codex.identity_domain = "codex-session-jsonl-v1".into();
+    codex.source_ref = "session:session-mixed".into();
+    codex.session_ref = "session-mixed".into();
+    codex.source_sequence = end;
+    codex.source_sequence_origin = Some(0);
+    codex.source_byte_range = Some(EvidenceByteRange { start: 0, end });
+    codex.source_role = SourceRole::Imported;
+    codex.content_trust = ContentTrust::ImportedClaim;
+    codex.adapter_manifest_ref = "codex-session-import-v1".into();
+    codex.eligible_event_manifest_ref = "codex-session-import-events-v1".into();
+    codex.correlation.adapter_manifest_ref = codex.adapter_manifest_ref.clone();
+    runtime.capture(codex).unwrap();
+    runtime
+        .capture(input("hook-record", b"hook record"))
+        .unwrap();
+    drop(runtime);
+
+    let codex_id = source_observation_id(
+        &SourceInstanceId::parse("codex-session:session-mixed").unwrap(),
+        &SourceRevision::parse("session-revision-a").unwrap(),
+        &SourceRecordIdentity::parse(record_identity).unwrap(),
+    )
+    .unwrap();
+    let store_dir = temp.path().join("store");
+    let writer = open_writer(&store_dir).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 8).unwrap();
+    let ingestor =
+        EvidenceIngestor::new(snapshot.clone(), handle.clone(), [7; 32], "s08-v1").unwrap();
+
+    let selected = ingestor.drain_observations_once(&[codex_id]).await.unwrap();
+    assert_eq!(selected.committed_frames, 1);
+    assert_eq!(selected.replayed_frames, 0);
+    assert_eq!(selected.sealed_segments, 0);
+    assert_eq!(sealed_count(&snapshot.spool_dir.join("main")), 1);
+
+    let backlog = ingestor.drain_once().await.unwrap();
+    assert_eq!(backlog.committed_frames, 2);
+    assert_eq!(backlog.replayed_frames, 1);
+    assert_eq!(backlog.sealed_segments, 1);
+    assert_eq!(sealed_count(&snapshot.spool_dir.join("main")), 0);
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let writer = JournalWriter::open(&store_dir).await.unwrap();
+    let rows = writer.object_rows().await.unwrap();
+    assert_eq!(object_kind_count(&rows, "source_receipt"), 2);
+    assert_eq!(object_kind_count(&rows, "source_observation"), 2);
+    let watermarks = rows
+        .iter()
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        .filter_map(|payload| match payload {
+            JournalPayload::SourceIngestWatermark(value) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(watermarks.iter().any(|watermark| {
+        watermark.source_instance_id.as_str() == "codex-session:session-mixed"
+            && watermark.confirmed_prefix_digest.is_some()
+    }));
+    assert!(watermarks.iter().any(|watermark| {
+        watermark.source_instance_id.as_str() == "hook-instance-a"
+            && watermark.confirmed_prefix_digest.is_none()
+    }));
 }
 
 #[tokio::test]

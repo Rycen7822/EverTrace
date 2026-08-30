@@ -1,10 +1,15 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::PathBuf,
+};
 
 use evertrace_codex::{
     HostProbeReport,
     adapter_manifest::{
         AdapterCapabilityManifest, CaptureGuarantee, ManifestError, ObservableCapability,
-        SubagentTrace,
+        SessionCatalogRootKind, SubagentTrace,
     },
     capability::{
         CanaryStatus, HookActivation, HookDiagnostic, McpBindingEvidence, McpBindingMechanism,
@@ -14,11 +19,22 @@ use evertrace_codex::{
     policy::PolicyCandidateOrigin,
     probe::{
         EvidenceSourceKind, GateReason, GateResult, NormalizationCanaryEvidence, ProbeContext,
-        ProbeEvidence,
+        ProbeEvidence, SessionCatalogRootState,
+    },
+    source_catalog::{SessionCatalogRootError, qualify_requested_session_root},
+};
+use evertrace_domain::{
+    config::{ConfigFile, EffectiveConfig},
+    ids::{RepositoryId, WorktreeId},
+    repository::{
+        GitRegistrationState, PathObservation, WorktreeInstance, WorktreeKind, WorktreeLifecycle,
     },
 };
-use evertrace_domain::config::{ConfigFile, EffectiveConfig};
-use evertrace_engine::RecoveryRuntimeSettings;
+use evertrace_engine::{
+    RecoveryRuntimeSettings,
+    repository::{observe_native_session_catalog_root, read_native_repository_trust},
+};
+use evertrace_store::repository::RepositoryCurrentView;
 use serde_json::Value;
 
 #[path = "../src/probe.rs"]
@@ -124,6 +140,19 @@ fn manifest_is_closed_round_trippable_and_relation_checked() {
     assert_eq!(invalid.validate(), Err(ManifestError::InvalidMcpBinding));
     let object = serde_json::from_str::<Value>(&encoded).unwrap();
     assert!(object.get("supported").is_none());
+    assert_eq!(manifest.session_catalog_root_contracts.len(), 1);
+
+    let mut duplicate_root_kind = manifest.clone();
+    let mut duplicate = duplicate_root_kind.session_catalog_root_contracts[0].clone();
+    duplicate.layout_revision = "another_layout".into();
+    duplicate_root_kind
+        .session_catalog_root_contracts
+        .push(duplicate);
+    duplicate_root_kind.session_catalog_root_contracts.sort();
+    assert_eq!(
+        duplicate_root_kind.validate(),
+        Err(ManifestError::InvalidCapabilityRelationship)
+    );
 
     let mut mismatched = manifest.clone();
     mismatched.host_version_range.push_str("-changed");
@@ -131,6 +160,180 @@ fn manifest_is_closed_round_trippable_and_relation_checked() {
     assert_eq!(
         AdapterCapabilityManifest::from_json(&serde_json::to_string(&mismatched).unwrap()),
         Err(ManifestError::InvalidManifestId)
+    );
+}
+
+#[test]
+fn session_root_requires_current_observed_canary_and_pinned_filesystem_identity() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path().join("sessions");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let session_id = "019d0000-0000-7000-8000-000000000028";
+    let dated = root.join("2026/08/30");
+    fs::create_dir_all(&dated).unwrap();
+    let transcript = dated.join(format!("rollout-2026-08-30T10-00-00-{session_id}.jsonl"));
+    fs::write(&transcript, b"BODY_CANARY_MUST_NOT_BE_READ\n").unwrap();
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    let native = serde_json::json!({
+        "cwd": temp.path().to_string_lossy(),
+        "hook_event_name": "PreToolUse",
+        "model": "gpt-5",
+        "permission_mode": "default",
+        "session_id": session_id,
+        "tool_input": {"irrelevant": true},
+        "tool_name": "mcp__evertrace__evertrace",
+        "tool_use_id": "tool-session-root",
+        "transcript_path": transcript,
+        "turn_id": "turn-session-root"
+    });
+    let root_evidence =
+        observe_native_session_catalog_root(&serde_json::to_vec(&native).unwrap()).unwrap();
+    assert_eq!(
+        root_evidence.canonical_absolute_path,
+        root.to_string_lossy()
+    );
+    let repository_path = temp.path().join("repo");
+    let worktree_id = WorktreeId::new_v7();
+    let mut current = RepositoryCurrentView::default();
+    current.worktrees.insert(
+        worktree_id,
+        WorktreeInstance {
+            worktree_instance_id: worktree_id,
+            worktree_revision: 1,
+            predecessor_revision: None,
+            repository_instance_id: RepositoryId::new_v7(),
+            kind: WorktreeKind::Main,
+            lifecycle: WorktreeLifecycle::Active,
+            current_path: Some(repository_path.to_string_lossy().into_owned()),
+            path_history: vec![PathObservation {
+                path: repository_path.to_string_lossy().into_owned(),
+                first_observed_at_us: 1,
+                last_observed_at_us: 1,
+                evidence_refs: vec!["repository-path:1".into()],
+            }],
+            git_admin_path_history: vec![PathObservation {
+                path: repository_path.join(".git").to_string_lossy().into_owned(),
+                first_observed_at_us: 1,
+                last_observed_at_us: 1,
+                evidence_refs: vec!["repository-admin:1".into()],
+            }],
+            git_registration_state: GitRegistrationState::Registered,
+            current_snapshot_id: None,
+            created_event_ref: "repository-created:1".into(),
+            terminal_event_ref: None,
+            recreated_from_worktree_instance_id: None,
+            recorded_at_us: 1,
+        },
+    );
+    assert!(current.worktrees[&worktree_id].validate().is_ok());
+    let config = temp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            repository_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        evertrace_codex::policy::parse_repository_trust(
+            &fs::read(&config).unwrap(),
+            &repository_path.to_string_lossy(),
+        )
+        .unwrap(),
+        evertrace_codex::policy::RepositoryTrustState::Trusted
+    );
+    let trust =
+        read_native_repository_trust(&serde_json::to_vec(&native).unwrap(), &current, worktree_id);
+    assert_eq!(
+        trust.state,
+        evertrace_codex::policy::RepositoryTrustState::Trusted
+    );
+    fs::write(
+        &config,
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+            repository_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        read_native_repository_trust(&serde_json::to_vec(&native).unwrap(), &current, worktree_id,)
+            .state,
+        evertrace_codex::policy::RepositoryTrustState::Untrusted
+    );
+    fs::write(&config, b"not valid toml = [").unwrap();
+    assert_eq!(
+        read_native_repository_trust(&serde_json::to_vec(&native).unwrap(), &current, worktree_id,)
+            .state,
+        evertrace_codex::policy::RepositoryTrustState::Unknown
+    );
+    fs::remove_file(&config).unwrap();
+    let unsafe_config = temp.path().join("unsafe-config.toml");
+    fs::write(&unsafe_config, b"[projects]\n").unwrap();
+    symlink(&unsafe_config, &config).unwrap();
+    assert_eq!(
+        read_native_repository_trust(&serde_json::to_vec(&native).unwrap(), &current, worktree_id,)
+            .state,
+        evertrace_codex::policy::RepositoryTrustState::Unknown
+    );
+    let mut evidence = probe_fixture::fixture("complete");
+    evidence.session_catalog_roots = vec![root_evidence.clone()];
+    let observed = report(&evidence);
+    let qualified =
+        qualify_requested_session_root(&observed, SessionCatalogRootKind::CodexSessions, &root)
+            .unwrap();
+    qualified.revalidate().unwrap();
+
+    let synthetic = HostProbeReport::evaluate(&synthetic_context(), &evidence).unwrap();
+    assert_eq!(
+        synthetic.session_catalog_roots()[0].state,
+        SessionCatalogRootState::Unavailable
+    );
+    assert!(
+        synthetic.session_catalog_roots()[0]
+            .canonical_absolute_path
+            .is_none()
+    );
+
+    let mut changed = evidence.clone();
+    changed.session_catalog_roots[0].layout_revision = "changed".into();
+    let changed = report(&changed);
+    assert_eq!(
+        changed.session_catalog_roots()[0].state,
+        SessionCatalogRootState::HashChanged
+    );
+    assert!(
+        changed.session_catalog_roots()[0]
+            .canonical_absolute_path
+            .is_none()
+    );
+
+    fs::rename(&root, temp.path().join("old-sessions")).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        read_native_repository_trust(&serde_json::to_vec(&native).unwrap(), &current, worktree_id,)
+            .state,
+        evertrace_codex::policy::RepositoryTrustState::Unknown
+    );
+    assert_eq!(
+        qualified.revalidate(),
+        Err(SessionCatalogRootError::UnsafeIdentity)
+    );
+
+    let link = temp.path().join("session-link");
+    symlink(&root, &link).unwrap();
+    let mut linked = root_evidence;
+    linked.canonical_absolute_path = link.to_string_lossy().into_owned();
+    let mut evidence = probe_fixture::fixture("complete");
+    evidence.session_catalog_roots = vec![linked];
+    let linked = report(&evidence);
+    assert_eq!(
+        qualify_requested_session_root(&linked, SessionCatalogRootKind::CodexSessions, &link,),
+        Err(SessionCatalogRootError::UnsafeIdentity)
     );
 }
 

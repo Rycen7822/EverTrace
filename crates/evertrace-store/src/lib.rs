@@ -14,6 +14,7 @@ pub mod relations;
 pub mod repository;
 pub mod schema;
 pub mod search;
+pub mod session_import;
 pub mod writer;
 
 pub use command::*;
@@ -42,4 +43,5 @@ pub use search::{
     SEARCH_CHECKPOINT_ID, SEARCH_TABLE, SearchHardFilter, SearchIndex, SearchProjectionRow,
     SearchSnapshot, read_search_rows, search_schema,
 };
+pub use session_import::*;
 pub use writer::{JournalWriter, SiblingWriterLock};

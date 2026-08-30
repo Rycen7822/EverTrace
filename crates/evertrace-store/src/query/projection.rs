@@ -278,6 +278,7 @@ pub fn derive_l0002_projections(
             || l3_core_projection(row)?
             || wiki_projection(row)?.is_some()
             || procedure_context_effect(row)?.is_some()
+            || crate::session_import::restore_current(row)?.is_some()
         {
             continue;
         }
@@ -299,6 +300,7 @@ pub fn derive_l0002_projections(
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
             || procedure_context_effect(row)?.is_some()
+            || crate::session_import::restore_current(row)?.is_some()
         {
             continue;
         }

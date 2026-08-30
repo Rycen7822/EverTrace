@@ -90,6 +90,26 @@ pub struct ProjectPolicySurface {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SessionCatalogRootKind {
+    CodexSessions,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCatalogLocatorKind {
+    HostResolved,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogRootContract {
+    pub root_kind: SessionCatalogRootKind,
+    pub locator_kind: SessionCatalogLocatorKind,
+    pub layout_revision: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObservableCapability {
     DelegationStart,
     ChildSessionId,
@@ -135,6 +155,8 @@ pub struct AdapterCapabilityManifest {
     pub subagent_trace: SubagentTrace,
     pub trust_readback: TrustReadback,
     pub project_policy_surfaces: Vec<ProjectPolicySurface>,
+    #[serde(default)]
+    pub session_catalog_root_contracts: Vec<SessionCatalogRootContract>,
     pub admission_failure_observability: AdmissionFailureObservability,
     pub mcp_session_binding: crate::capability::McpSessionBinding,
     pub mcp_binding_mechanism: crate::capability::McpBindingMechanism,
@@ -186,6 +208,29 @@ impl AdapterCapabilityManifest {
         require_unique(&self.observable)?;
         require_unique(&self.unavailable_by_design)?;
         require_unique(&self.required_for_full)?;
+        if self.session_catalog_root_contracts.len() > 4
+            || self
+                .session_catalog_root_contracts
+                .iter()
+                .map(|contract| contract.root_kind)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.session_catalog_root_contracts.len()
+            || self.session_catalog_root_contracts.iter().any(|contract| {
+                contract.layout_revision.is_empty()
+                    || contract.layout_revision.len() > 256
+                    || contract
+                        .layout_revision
+                        .bytes()
+                        .any(|byte| byte.is_ascii_control())
+            })
+            || self
+                .session_catalog_root_contracts
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ManifestError::InvalidCapabilityRelationship);
+        }
 
         let observable = self.observable.iter().copied().collect::<BTreeSet<_>>();
         let unavailable = self

@@ -1,13 +1,14 @@
 //! Root-confined, no-follow reads for bounded capture inputs.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use rustix::fd::OwnedFd;
-use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat, fstat, open, openat, statat};
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RawDir, Stat, fstat, open, openat, statat};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfinedReadLimits {
@@ -17,7 +18,7 @@ pub struct ConfinedReadLimits {
     pub deadline: Instant,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ConfinedFileIdentity {
     pub device: u64,
     pub inode: u64,
@@ -44,6 +45,39 @@ pub struct ConfinedFileMetadata {
 pub struct ConfinedFile {
     pub bytes: Vec<u8>,
     pub identity: ConfinedFileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ConfinedEntryType {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ConfinedDirectoryEntry {
+    pub name: String,
+    pub entry_type: ConfinedEntryType,
+    pub identity: ConfinedFileIdentity,
+}
+
+#[derive(Eq, PartialEq)]
+pub struct ConfinedFileRange {
+    pub bytes: Vec<u8>,
+    pub identity: ConfinedFileIdentity,
+    pub next_offset: u64,
+    pub eof: bool,
+}
+
+impl std::fmt::Debug for ConfinedFileRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfinedFileRange")
+            .field("byte_length", &self.bytes.len())
+            .field("identity", &self.identity)
+            .field("next_offset", &self.next_offset)
+            .field("eof", &self.eof)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for ConfinedFile {
@@ -83,6 +117,7 @@ pub struct ConfinedRoot {
     identity: ConfinedFileIdentity,
     owner: u32,
     mode: u32,
+    locator_chain: Option<Vec<(OsString, ConfinedFileIdentity)>>,
 }
 
 impl ConfinedRoot {
@@ -104,6 +139,7 @@ impl ConfinedRoot {
             identity: identity(&stat)?,
             owner: stat.st_uid,
             mode: stat.st_mode,
+            locator_chain: None,
         })
     }
 
@@ -115,15 +151,44 @@ impl ConfinedRoot {
         if !root.is_absolute() {
             return Err(ConfinedReadError::InvalidPath);
         }
-        let fd = open(
-            root,
+        let components = root
+            .components()
+            .map(|component| match component {
+                Component::RootDir => Ok(None),
+                Component::Normal(value) if !value.is_empty() => Ok(Some(value.to_os_string())),
+                _ => Err(ConfinedReadError::InvalidPath),
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            return Err(ConfinedReadError::InvalidPath);
+        }
+        let mut current = open(
+            "/",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|_| ConfinedReadError::Io)?;
+        let mut locator_chain = Vec::with_capacity(components.len());
+        for component in &components {
+            let next = openat(
+                &current,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+            let opened = fstat(&next).map_err(|_| ConfinedReadError::Io)?;
+            if FileType::from_raw_mode(opened.st_mode) != FileType::Directory {
+                return Err(ConfinedReadError::UnsupportedType);
+            }
+            locator_chain.push((component.clone(), identity(&opened)?));
+            current = next;
+        }
+        let fd = current;
         let opened = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
-        let entry =
-            statat(CWD, root, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ConfinedReadError::Io)?;
         let process_fd = open(
             "/proc/self",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -132,15 +197,8 @@ impl ConfinedRoot {
         .map_err(|_| ConfinedReadError::Io)?;
         let process = fstat(&process_fd).map_err(|_| ConfinedReadError::Io)?;
         if FileType::from_raw_mode(opened.st_mode) != FileType::Directory
-            || FileType::from_raw_mode(entry.st_mode) != FileType::Directory
-            || opened.st_dev != entry.st_dev
-            || opened.st_ino != entry.st_ino
-            || opened.st_uid != entry.st_uid
-            || opened.st_mode != entry.st_mode
             || opened.st_uid != process.st_uid
-            || entry.st_uid != process.st_uid
             || opened.st_mode & 0o022 != 0
-            || entry.st_mode & 0o022 != 0
         {
             return Err(ConfinedReadError::UnsupportedType);
         }
@@ -150,6 +208,7 @@ impl ConfinedRoot {
             identity: identity(&opened)?,
             owner: opened.st_uid,
             mode: opened.st_mode,
+            locator_chain: Some(locator_chain),
         })
     }
 
@@ -169,6 +228,194 @@ impl ConfinedRoot {
         limits: ConfinedReadLimits,
     ) -> Result<ConfinedFile, ConfinedReadError> {
         self.read_impl(relative, limits, false, || {})
+    }
+
+    pub fn list_directory(
+        &self,
+        relative: Option<&Path>,
+        max_entries: usize,
+        deadline: Instant,
+    ) -> Result<Vec<ConfinedDirectoryEntry>, ConfinedReadError> {
+        if max_entries == 0 {
+            return Err(ConfinedReadError::InvalidPath);
+        }
+        check_deadline(deadline)?;
+        let components = relative
+            .map(strict_components)
+            .transpose()?
+            .unwrap_or_default();
+        let (directory, identities) = self.open_directory_chain(&components, deadline)?;
+        let before = identity(&fstat(&directory).map_err(|_| ConfinedReadError::Io)?)?;
+        let mut buffer = [MaybeUninit::uninit(); 8192];
+        let mut entries = Vec::new();
+        let mut directory_entries = RawDir::new(&directory, &mut buffer);
+        while let Some(entry) = directory_entries.next() {
+            check_deadline(deadline)?;
+            let entry = entry.map_err(|_| ConfinedReadError::Io)?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let name = std::str::from_utf8(name).map_err(|_| ConfinedReadError::InvalidPath)?;
+            if name.is_empty() || name.as_bytes().contains(&b'/') {
+                return Err(ConfinedReadError::InvalidPath);
+            }
+            let stat = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| ConfinedReadError::Io)?;
+            let entry_type = match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => ConfinedEntryType::File,
+                FileType::Directory => ConfinedEntryType::Directory,
+                _ => return Err(ConfinedReadError::UnsupportedType),
+            };
+            entries.push(ConfinedDirectoryEntry {
+                name: name.to_owned(),
+                entry_type,
+                identity: identity(&stat)?,
+            });
+            if entries.len() > max_entries {
+                return Err(ConfinedReadError::LimitExceeded {
+                    kind: ConfinedLimitKind::Bundle,
+                    metadata: ConfinedFileMetadata { identity: before },
+                });
+            }
+        }
+        entries.sort();
+        let after = identity(&fstat(&directory).map_err(|_| ConfinedReadError::Io)?)?;
+        if before != after {
+            return Err(ConfinedReadError::Changed);
+        }
+        check_deadline(deadline)?;
+        self.validate_directory_chain(&components, &identities, deadline)?;
+        self.revalidate()?;
+        Ok(entries)
+    }
+
+    pub fn read_range(
+        &self,
+        relative: &Path,
+        expected: ConfinedFileIdentity,
+        offset: u64,
+        max_bytes: usize,
+        deadline: Instant,
+    ) -> Result<ConfinedFileRange, ConfinedReadError> {
+        if max_bytes == 0 {
+            return Err(ConfinedReadError::InvalidPath);
+        }
+        check_deadline(deadline)?;
+        let components = strict_components(relative)?;
+        let (leaf, parents) = components
+            .split_last()
+            .ok_or(ConfinedReadError::InvalidPath)?;
+        let (parent, identities) = self.open_directory_chain(parents, deadline)?;
+        let fd = openat(
+            &parent,
+            *leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_open_error)?;
+        let before = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+        if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+            || identity(&before)? != expected
+            || offset > expected.size
+        {
+            return Err(ConfinedReadError::Changed);
+        }
+        let remaining = expected.size - offset;
+        if remaining == 0 {
+            self.validate_directory_chain(parents, &identities, deadline)?;
+            self.revalidate()?;
+            return Ok(ConfinedFileRange {
+                bytes: Vec::new(),
+                identity: expected,
+                next_offset: offset,
+                eof: true,
+            });
+        }
+        let allocation = usize::try_from(remaining.min(max_bytes as u64))
+            .map_err(|_| ConfinedReadError::Arithmetic)?;
+        let mut bytes = vec![0_u8; allocation];
+        let read = rustix::io::pread(&fd, &mut bytes, offset).map_err(|_| ConfinedReadError::Io)?;
+        if read == 0 {
+            return Err(ConfinedReadError::Changed);
+        }
+        bytes.truncate(read);
+        check_deadline(deadline)?;
+        let after = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+        let entry =
+            statat(&parent, *leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ConfinedReadError::Io)?;
+        if identity(&after)? != expected || identity(&entry)? != expected {
+            return Err(ConfinedReadError::Changed);
+        }
+        self.validate_directory_chain(parents, &identities, deadline)?;
+        self.revalidate()?;
+        let next_offset = offset
+            .checked_add(u64::try_from(read).map_err(|_| ConfinedReadError::Arithmetic)?)
+            .ok_or(ConfinedReadError::Arithmetic)?;
+        Ok(ConfinedFileRange {
+            bytes,
+            identity: expected,
+            next_offset,
+            eof: next_offset == expected.size,
+        })
+    }
+
+    fn open_directory_chain(
+        &self,
+        components: &[&OsStr],
+        deadline: Instant,
+    ) -> Result<(OwnedFd, Vec<ConfinedFileIdentity>), ConfinedReadError> {
+        let mut current = openat(
+            &self.fd,
+            OsStr::new("."),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ConfinedReadError::Io)?;
+        let mut identities = Vec::with_capacity(components.len());
+        for component in components {
+            check_deadline(deadline)?;
+            let next = openat(
+                &current,
+                *component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+            identities.push(identity(&fstat(&next).map_err(|_| ConfinedReadError::Io)?)?);
+            current = next;
+        }
+        Ok((current, identities))
+    }
+
+    fn validate_directory_chain(
+        &self,
+        components: &[&OsStr],
+        identities: &[ConfinedFileIdentity],
+        deadline: Instant,
+    ) -> Result<(), ConfinedReadError> {
+        let mut current = &self.fd;
+        let mut opened = Vec::with_capacity(components.len());
+        for (index, component) in components.iter().enumerate() {
+            check_deadline(deadline)?;
+            let entry = statat(current, *component, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| ConfinedReadError::Io)?;
+            let next = openat(
+                current,
+                *component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+            if identity(&entry)? != identities[index]
+                || identity(&fstat(&next).map_err(|_| ConfinedReadError::Io)?)? != identities[index]
+            {
+                return Err(ConfinedReadError::Changed);
+            }
+            opened.push(next);
+            current = opened.last().ok_or(ConfinedReadError::Io)?;
+        }
+        Ok(())
     }
 
     pub const fn identity(&self) -> ConfinedFileIdentity {
@@ -321,6 +568,7 @@ impl ConfinedRoot {
     }
 
     pub fn revalidate(&self) -> Result<(), ConfinedReadError> {
+        self.revalidate_locator_chain()?;
         let current = statat(CWD, &self.locator, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ConfinedReadError::Io)?;
         let opened = fstat(&self.fd).map_err(|_| ConfinedReadError::Io)?;
@@ -331,6 +579,7 @@ impl ConfinedRoot {
     }
 
     pub fn revalidate_stable(&self) -> Result<(), ConfinedReadError> {
+        self.revalidate_locator_chain()?;
         let current = statat(CWD, &self.locator, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ConfinedReadError::Io)?;
         let opened = fstat(&self.fd).map_err(|_| ConfinedReadError::Io)?;
@@ -344,6 +593,39 @@ impl ConfinedRoot {
         Ok(self.matches_root(stat)? && identity(stat)? == self.identity)
     }
 
+    fn revalidate_locator_chain(&self) -> Result<(), ConfinedReadError> {
+        let Some(expected) = &self.locator_chain else {
+            return Ok(());
+        };
+        let mut current = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ConfinedReadError::Io)?;
+        for (component, expected_identity) in expected {
+            let entry = statat(&current, component, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| ConfinedReadError::Io)?;
+            let next = openat(
+                &current,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+            if !same_file_identity(&identity(&entry)?, expected_identity)
+                || !same_file_identity(
+                    &identity(&fstat(&next).map_err(|_| ConfinedReadError::Io)?)?,
+                    expected_identity,
+                )
+            {
+                return Err(ConfinedReadError::Changed);
+            }
+            current = next;
+        }
+        Ok(())
+    }
+
     fn matches_root(&self, stat: &Stat) -> Result<bool, ConfinedReadError> {
         let current = identity(stat)?;
         Ok(FileType::from_raw_mode(stat.st_mode) == FileType::Directory
@@ -352,6 +634,10 @@ impl ConfinedRoot {
             && stat.st_uid == self.owner
             && stat.st_mode == self.mode)
     }
+}
+
+fn same_file_identity(left: &ConfinedFileIdentity, right: &ConfinedFileIdentity) -> bool {
+    left.device == right.device && left.inode == right.inode
 }
 
 fn strict_components(path: &Path) -> Result<Vec<&OsStr>, ConfinedReadError> {
@@ -477,6 +763,103 @@ mod tests {
             })
         ));
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn bounded_listing_is_sorted_and_rejects_overflow_and_symlink() {
+        let root = root();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/b"), b"b").unwrap();
+        std::fs::write(root.join("nested/a"), b"a").unwrap();
+        let confined = ConfinedRoot::open(&root).unwrap();
+        let entries = confined
+            .list_directory(
+                Some(Path::new("nested")),
+                2,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(matches!(
+            confined.list_directory(
+                Some(Path::new("nested")),
+                1,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(ConfinedReadError::LimitExceeded { .. })
+        ));
+        symlink("a", root.join("nested/link")).unwrap();
+        assert_eq!(
+            confined.list_directory(
+                Some(Path::new("nested")),
+                3,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(ConfinedReadError::UnsupportedType)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn range_read_is_offset_bounded_and_identity_pinned() {
+        let root = root();
+        std::fs::write(root.join("file"), b"abcdef").unwrap();
+        let confined = ConfinedRoot::open(&root).unwrap();
+        let identity = confined
+            .list_directory(None, 1, Instant::now() + Duration::from_secs(1))
+            .unwrap()[0]
+            .identity;
+        let first = confined
+            .read_range(
+                Path::new("file"),
+                identity,
+                0,
+                2,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(first.bytes, b"ab");
+        assert_eq!(first.next_offset, 2);
+        assert!(!first.eof);
+        let tail = confined
+            .read_range(
+                Path::new("file"),
+                identity,
+                2,
+                8,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(tail.bytes, b"cdef");
+        assert!(tail.eof);
+        assert_eq!(
+            confined.read_range(
+                Path::new("file"),
+                identity,
+                0,
+                1,
+                Instant::now() - Duration::from_millis(1),
+            ),
+            Err(ConfinedReadError::Deadline)
+        );
+        std::fs::write(root.join("file"), b"changed").unwrap();
+        assert_eq!(
+            confined.read_range(
+                Path::new("file"),
+                identity,
+                0,
+                2,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(ConfinedReadError::Changed)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -615,6 +998,29 @@ mod tests {
         std::fs::remove_dir_all(public_root).expect("cleanup public root");
         std::fs::remove_dir_all(root).expect("cleanup replacement");
         std::fs::remove_dir_all(displaced).expect("cleanup original");
+    }
+
+    #[test]
+    fn owned_private_root_rejects_symlinked_or_replaced_ancestor() {
+        let outer = root();
+        let real_parent = outer.join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let child = real_parent.join("sessions");
+        std::fs::create_dir(&child).unwrap();
+        let alias = outer.join("alias");
+        symlink(&real_parent, &alias).unwrap();
+        assert!(ConfinedRoot::open_owned_private(&alias.join("sessions")).is_err());
+
+        let confined = ConfinedRoot::open_owned_private(&child).unwrap();
+        let displaced = outer.join("displaced");
+        std::fs::rename(&real_parent, &displaced).unwrap();
+        std::fs::create_dir(&real_parent).unwrap();
+        std::fs::create_dir(real_parent.join("sessions")).unwrap();
+        assert_eq!(
+            confined.revalidate_stable(),
+            Err(ConfinedReadError::Changed)
+        );
+        std::fs::remove_dir_all(outer).unwrap();
     }
 
     #[test]

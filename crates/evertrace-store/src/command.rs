@@ -293,6 +293,8 @@ pub struct SourceIngestWatermark {
     pub source_instance_id: SourceInstanceId,
     pub source_revision: SourceRevision,
     pub source_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_prefix_digest: Option<String>,
 }
 
 impl SourceIngestWatermark {
@@ -542,6 +544,7 @@ pub enum JournalPayload {
     SemanticDigestRecorded(Box<SemanticDigest>),
     SemanticDerivationRunRecorded(Box<SemanticDerivationRun>),
     RecallLedgerRecorded(Box<RecallLedgerEvent>),
+    SessionImportEventRecorded(Box<crate::session_import::SessionImportEvent>),
 }
 
 impl JournalPayload {
@@ -603,6 +606,7 @@ impl JournalPayload {
             Self::SemanticDigestRecorded(_) => "semantic_digest_recorded_v1",
             Self::SemanticDerivationRunRecorded(_) => "semantic_derivation_run_recorded_v1",
             Self::RecallLedgerRecorded(_) => "recall_ledger_recorded_v1",
+            Self::SessionImportEventRecorded(_) => "session_import_event_recorded_v1",
         }
     }
 
@@ -655,6 +659,7 @@ impl JournalPayload {
             | Self::SemanticDigestRecorded(_)
             | Self::SemanticDerivationRunRecorded(_)
             | Self::RecallLedgerRecorded(_) => RecordClass::ObjectEvent,
+            Self::SessionImportEventRecorded(_) => RecordClass::RuntimeEvent,
             _ => RecordClass::RuntimeEvent,
         }
     }
@@ -706,6 +711,7 @@ impl JournalPayload {
                 }
                 Ok(())
             }
+            Self::SessionImportEventRecorded(value) => value.validate(),
             Self::SourceReceiptRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
@@ -714,7 +720,20 @@ impl JournalPayload {
             }
             Self::SourceIngestWatermark(value) => {
                 validate_identifier(value.source_instance_id.as_str())?;
-                validate_identifier(value.source_revision.as_str())
+                validate_identifier(value.source_revision.as_str())?;
+                if value
+                    .confirmed_prefix_digest
+                    .as_deref()
+                    .is_some_and(|digest| {
+                        digest.len() != 64
+                            || digest
+                                .bytes()
+                                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+                    })
+                {
+                    return Err(StoreError::InvalidInput);
+                }
+                Ok(())
             }
             Self::EvidenceSurfaceRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
@@ -941,6 +960,9 @@ impl JournalPayload {
                 ],
             ),
             Self::SourceRevisionRecorded(value) => tagged_json("source_revision_recorded", value),
+            Self::SessionImportEventRecorded(value) => {
+                tagged_json("session_import_event_recorded", value)
+            }
             Self::SourceReceiptRecorded(value) => tagged_json("source_receipt_recorded", value),
             Self::SourceObservationRecorded(value) => {
                 tagged_json("source_observation_recorded", value)
@@ -1998,6 +2020,25 @@ fn validate_evidence_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
             _ => None,
         })
         .collect::<Vec<_>>();
+    if receipts.is_empty()
+        && observations.is_empty()
+        && watermarks.len() == 1
+        && surfaces.is_empty()
+        && surface_dirty.is_empty()
+        && normalization_dirty.is_empty()
+        && events.iter().any(|event| match &event.payload {
+            JournalPayload::SessionImportEventRecorded(session) => {
+                watermarks[0]
+                    .source_instance_id
+                    .as_str()
+                    .strip_prefix("codex-session:")
+                    == Some(session.session_id.as_str())
+            }
+            _ => false,
+        })
+    {
+        return Ok(());
+    }
     if receipts.len() != 1
         || observations.len() != 1
         || watermarks.len() != 1

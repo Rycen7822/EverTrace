@@ -541,6 +541,7 @@ async fn persist_source(
                         source_instance_id: receipt.source_instance_id.clone(),
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
+                        confirmed_prefix_digest: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -661,6 +662,7 @@ async fn seed_store_with_lifecycle(path: &std::path::Path, lifecycle: EpisodeLif
                         source_instance_id: receipt.source_instance_id.clone(),
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
+                        confirmed_prefix_digest: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
