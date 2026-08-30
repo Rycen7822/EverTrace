@@ -2,7 +2,16 @@ use std::str::FromStr;
 
 use evertrace_capture::{CasDigest, CasStore};
 use evertrace_domain::{
-    ids::{CasId, CommandId, ResultEvidenceId, SourceReceiptId, WorkArtifactId},
+    evidence::{
+        CaptureCompleteness, ContentTrust, EvidenceSurface, Operation, PairingState,
+        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
+    },
+    ids::{
+        AttemptId, CasId, CommandId, OperationId, ResultEvidenceId, SourceObservationId,
+        SourceReceiptId, WorkArtifactId,
+    },
+    procedure::{ProcedureRevision, ProcedureUsageRevision},
+    repository::{WorktreeInstance, WorktreeSnapshot},
     revision::RevisionId,
     semantic::{
         EvidenceCompleteness, MetricValue, ParserFailureCode, ParserReceipt, ParserStatus,
@@ -10,13 +19,16 @@ use evertrace_domain::{
         VerifierStatus,
     },
     work::{
-        ArtifactActor, ArtifactPayloadStatus, ArtifactRevision, ArtifactScope, Attempt,
-        AttemptBindingStatus, ContractField, ExperimentRun, MultiCasMetricPolicy,
-        RunContractValidity, RunExecutionStatus, RunObservability, RunOrigin, SeedPolicy,
-        VariableDeclaration, WorkArtifact,
+        ArtifactActor, ArtifactPayloadStatus, ArtifactRevision, ArtifactScope, AssignmentStatus,
+        Attempt, AttemptBindingStatus, ContractField, ControlledRunSourceEnvelope, ExperimentRun,
+        MultiCasMetricPolicy, RunContractValidity, RunExecutionStatus, RunObservability, RunOrigin,
+        SeedPolicy, Task, VariableDeclaration, WorkArtifact, WorkBindingRevision, WorkEpisode,
+        Workstream,
     },
 };
-use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload};
+use evertrace_store::{
+    AutoresearchCurrentView, JournalCommand, JournalEventDraft, JournalPayload, ProjectionSnapshot,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -105,6 +117,7 @@ pub fn create_experiment_run(
         metric_extractor_version: input.metric_extractor_version,
         multi_cas_metric_policy: input.multi_cas_metric_policy,
         environment_fingerprint: input.environment_fingerprint,
+        comparison_execution_binding: None,
         work_artifact_refs: Vec::new(),
         terminal_evidence_refs: Vec::new(),
         created_at_us: input.created_at_us,
@@ -135,6 +148,767 @@ pub fn run_command(
         context,
         vec![JournalPayload::ExperimentRunRecorded(Box::new(run.clone()))],
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControlledRunRequest {
+    pub attempt_id: AttemptId,
+    pub procedure_revision_id: RevisionId,
+    pub source_observation_id: SourceObservationId,
+}
+
+#[derive(Debug)]
+pub enum ControlledRunCommand {
+    NoDelta,
+    Declaration {
+        run: Box<ExperimentRun>,
+        bindings: Vec<WorkBindingRevision>,
+        attempt: Option<Box<Attempt>>,
+        command: JournalCommand,
+    },
+    Terminal {
+        run: Box<ExperimentRun>,
+        result: Box<ResultEvidence>,
+        command: JournalCommand,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlledRunResolver {
+    cas: CasStore,
+}
+
+impl ControlledRunResolver {
+    pub const fn new(cas: CasStore) -> Self {
+        Self { cas }
+    }
+
+    pub fn declare(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        request: ControlledRunRequest,
+        context: AutoresearchCommandContext,
+    ) -> Result<ControlledRunCommand, AutoresearchError> {
+        let facts = ControlledFacts::from_snapshot(snapshot)?;
+        let Some(attempt) = facts.attempts.get(&request.attempt_id) else {
+            return Ok(ControlledRunCommand::NoDelta);
+        };
+        if facts
+            .procedures
+            .get(&request.procedure_revision_id)
+            .is_none_or(|procedure| {
+                facts.current_procedures.get(&procedure.procedure_id)
+                    != Some(&procedure.revision_id)
+            })
+        {
+            return Ok(ControlledRunCommand::NoDelta);
+        }
+        let envelope = match self.witness(&facts, request.source_observation_id) {
+            Ok(value) => value,
+            Err(AutoresearchError::EvidenceIncomplete | AutoresearchError::Cas) => {
+                return Ok(ControlledRunCommand::NoDelta);
+            }
+            Err(error) => return Err(error),
+        };
+        let ControlledRunSourceEnvelope::Launch {
+            attempt_id,
+            procedure_revision_id,
+            code_snapshot_id,
+            data_fingerprint,
+            normalized_config,
+            variable_declaration,
+            seed_policy,
+            seed_values,
+            nondeterministic,
+            metric_definition,
+            metric_extractor_version,
+            multi_cas_metric_policy,
+            environment_fingerprint,
+            binding,
+            started_at_us,
+            ..
+        } = envelope
+        else {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        };
+        if attempt_id != request.attempt_id
+            || procedure_revision_id != request.procedure_revision_id
+            || attempt.strategy_contract.search_policy_ref.as_deref()
+                != Some(procedure_revision_id.to_string()).as_deref()
+            || binding
+                .procedure_exposure_revision_id
+                .is_some_and(|value| value != procedure_revision_id)
+            || facts
+                .snapshots
+                .get(&code_snapshot_id)
+                .and_then(|snapshot| snapshot.toolchain_fingerprint.as_deref())
+                != Some(binding.toolchain_revision.as_str())
+        {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        match facts.validate_declaration_anchor(
+            request.procedure_revision_id,
+            attempt,
+            code_snapshot_id,
+        ) {
+            Ok(()) => {}
+            Err(AutoresearchError::EvidenceIncomplete) => {
+                return Ok(ControlledRunCommand::NoDelta);
+            }
+            Err(error) => return Err(error),
+        }
+        let (run_id, binding_successors) = match exact_bound_run(
+            &facts,
+            request.source_observation_id,
+            attempt.attempt_id,
+            attempt.workstream_id,
+        ) {
+            Ok(value) => value,
+            Err(AutoresearchError::EvidenceIncomplete) => {
+                return Ok(ControlledRunCommand::NoDelta);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(existing) = facts.runs.runs.get(&run_id) {
+            return if existing.source_receipt_refs
+                == vec![
+                    facts
+                        .receipt(request.source_observation_id)?
+                        .source_receipt_id,
+                ] {
+                Ok(ControlledRunCommand::NoDelta)
+            } else {
+                Err(AutoresearchError::ImmutableConflict)
+            };
+        }
+        let receipt_id = facts
+            .receipt(request.source_observation_id)?
+            .source_receipt_id;
+        let mut run = ExperimentRun {
+            run_id,
+            revision_id: RevisionId::new_v7(),
+            parent_revision_id: None,
+            workstream_id: attempt.workstream_id,
+            attempt_id: Some(attempt.attempt_id),
+            attempt_binding_status: AttemptBindingStatus::Resolved,
+            strategy_contract_fingerprint: attempt.strategy_contract_fingerprint,
+            origin: RunOrigin::Local,
+            external_system_id: None,
+            external_run_key: None,
+            source_receipt_refs: vec![receipt_id],
+            observability: RunObservability::Declared,
+            execution_status: RunExecutionStatus::Unknown,
+            contract_validity: RunContractValidity::Unknown,
+            experiment_contract_fingerprint: [0; 32],
+            code_snapshot_id,
+            data_fingerprint,
+            normalized_config,
+            variable_declaration,
+            comparison_key: [0; 32],
+            seed_policy,
+            seed_values,
+            nondeterministic,
+            metric_definition,
+            metric_extractor_version,
+            multi_cas_metric_policy,
+            environment_fingerprint,
+            comparison_execution_binding: Some(*binding),
+            work_artifact_refs: Vec::new(),
+            terminal_evidence_refs: Vec::new(),
+            created_at_us: context.occurred_at_us.min(started_at_us),
+            started_at_us: Some(started_at_us),
+            ended_at_us: None,
+        };
+        run.experiment_contract_fingerprint = run
+            .recompute_exact_contract_fingerprint()
+            .map_err(|_| AutoresearchError::InvalidInput)?;
+        run.comparison_key = run
+            .recompute_comparison_key()
+            .map_err(|_| AutoresearchError::InvalidInput)?;
+        run.validate()
+            .map_err(|_| AutoresearchError::InvalidInput)?;
+        let mut payloads = vec![JournalPayload::ExperimentRunRecorded(Box::new(run.clone()))];
+        let mut attempt_successor = None;
+        if !binding_successors.is_empty() {
+            payloads.extend(
+                binding_successors
+                    .iter()
+                    .cloned()
+                    .map(|binding| JournalPayload::WorkBindingRecorded(Box::new(binding))),
+            );
+            let mut next_attempt = attempt.clone();
+            next_attempt.revision_id = RevisionId::new_v7();
+            next_attempt.predecessor_revision_id = Some(attempt.revision_id);
+            next_attempt.revision_generation = attempt.revision_generation.saturating_add(1);
+            next_attempt.work_binding_revision_refs.extend(
+                binding_successors
+                    .iter()
+                    .map(|binding| binding.work_binding_revision_id),
+            );
+            next_attempt.work_binding_revision_refs.sort();
+            next_attempt.work_binding_revision_refs.dedup();
+            next_attempt.source_watermark = next_attempt.source_watermark.saturating_add(1);
+            attempt
+                .validate_successor(&next_attempt)
+                .map_err(|_| AutoresearchError::ImmutableConflict)?;
+            payloads.push(JournalPayload::AttemptRecorded(Box::new(
+                next_attempt.clone(),
+            )));
+            attempt_successor = Some(next_attempt);
+        }
+        let command = payload_command(context, payloads)?;
+        Ok(ControlledRunCommand::Declaration {
+            run: Box::new(run),
+            bindings: binding_successors,
+            attempt: attempt_successor.map(Box::new),
+            command,
+        })
+    }
+
+    pub fn complete(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        run_id: evertrace_domain::ids::ExperimentRunId,
+        terminal_observation_id: SourceObservationId,
+        context: AutoresearchCommandContext,
+    ) -> Result<ControlledRunCommand, AutoresearchError> {
+        let facts = ControlledFacts::from_snapshot(snapshot)?;
+        let Some(current) = facts.runs.runs.get(&run_id) else {
+            return Ok(ControlledRunCommand::NoDelta);
+        };
+        if current.comparison_execution_binding.is_none() {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        }
+        if !current.is_controlled_declaration() {
+            return Ok(ControlledRunCommand::NoDelta);
+        }
+        let envelope = match self.witness(&facts, terminal_observation_id) {
+            Ok(value) => value,
+            Err(AutoresearchError::EvidenceIncomplete | AutoresearchError::Cas) => {
+                return Ok(ControlledRunCommand::NoDelta);
+            }
+            Err(error) => return Err(error),
+        };
+        let ControlledRunSourceEnvelope::Terminal {
+            run_id: observed_run_id,
+            ended_at_us,
+            metric,
+            artifact_refs,
+            ..
+        } = envelope
+        else {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        };
+        if observed_run_id != run_id {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        let Some(attempt) = facts.attempts.get(
+            &current
+                .attempt_id
+                .ok_or(AutoresearchError::ImmutableConflict)?,
+        ) else {
+            return Ok(ControlledRunCommand::NoDelta);
+        };
+        let Some(target_revision_id) = attempt
+            .strategy_contract
+            .search_policy_ref
+            .as_deref()
+            .and_then(|value| value.parse::<RevisionId>().ok())
+        else {
+            return Err(AutoresearchError::ImmutableConflict);
+        };
+        if !facts.procedures.contains_key(&target_revision_id) {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        match require_bound_operations(
+            &facts,
+            terminal_observation_id,
+            false,
+            run_id,
+            attempt.attempt_id,
+            current.workstream_id,
+        ) {
+            Ok(()) => {}
+            Err(AutoresearchError::EvidenceIncomplete) => {
+                return Ok(ControlledRunCommand::NoDelta);
+            }
+            Err(error) => return Err(error),
+        }
+        if artifact_refs
+            .iter()
+            .any(|id| !facts.runs.artifacts.contains_key(id))
+        {
+            return Ok(ControlledRunCommand::NoDelta);
+        }
+        let receipt = facts.receipt(terminal_observation_id)?;
+        let mut next = current.clone();
+        next.revision_id = RevisionId::new_v7();
+        next.parent_revision_id = Some(current.revision_id);
+        next.observability = RunObservability::Full;
+        next.execution_status = RunExecutionStatus::Completed;
+        next.contract_validity = RunContractValidity::Valid;
+        next.work_artifact_refs = artifact_refs.clone();
+        next.terminal_evidence_refs = vec![receipt.source_receipt_id];
+        next.ended_at_us = Some(ended_at_us);
+        next.created_at_us = current.created_at_us;
+        current
+            .validate_successor(&next)
+            .map_err(|_| AutoresearchError::ImmutableConflict)?;
+        let cas = CasId::from_digest(
+            *CasDigest::from_str(&receipt.cas_ref)
+                .map_err(|_| AutoresearchError::Cas)?
+                .as_bytes(),
+        );
+        let result = ResultEvidence {
+            result_evidence_id: ResultEvidenceId::new_v7(),
+            revision_id: RevisionId::new_v7(),
+            parent_revision_id: None,
+            experiment_run_id: run_id,
+            experiment_run_revision_id: next.revision_id,
+            result_scope: ResultScope::Complete,
+            raw_artifact_refs: artifact_refs.clone(),
+            raw_cas_refs: vec![cas],
+            parsed_metric: Some(metric),
+            parser_receipt: ParserReceipt {
+                parser_version: RESULT_PARSER_VERSION.into(),
+                status: ParserStatus::Parsed,
+                failure_code: None,
+                input_artifact_refs: artifact_refs,
+                input_cas_refs: vec![cas],
+            },
+            verifier_receipt: Some(VerifierReceipt {
+                verifier_version: RESULT_VERIFIER_VERSION.into(),
+                status: VerifierStatus::Passed,
+                failure_code: None,
+            }),
+            completeness: EvidenceCompleteness::Complete,
+            failure: None,
+            created_at_us: context.occurred_at_us,
+        };
+        result
+            .validate()
+            .map_err(|_| AutoresearchError::InvalidInput)?;
+        let command = payload_command(
+            context,
+            vec![
+                JournalPayload::ExperimentRunRecorded(Box::new(next.clone())),
+                JournalPayload::ResultEvidenceRecorded(Box::new(result.clone())),
+            ],
+        )?;
+        Ok(ControlledRunCommand::Terminal {
+            run: Box::new(next),
+            result: Box::new(result),
+            command,
+        })
+    }
+
+    fn witness(
+        &self,
+        facts: &ControlledFacts,
+        observation_id: SourceObservationId,
+    ) -> Result<ControlledRunSourceEnvelope, AutoresearchError> {
+        let receipt = facts.receipt(observation_id)?;
+        let observation = facts
+            .observations
+            .get(&observation_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let surface = facts
+            .surfaces
+            .get(&observation_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let bytes = read_cas(
+            &self.cas,
+            &CasId::from_digest(
+                *CasDigest::from_str(&receipt.cas_ref)
+                    .map_err(|_| AutoresearchError::Cas)?
+                    .as_bytes(),
+            ),
+        )?;
+        surface
+            .validate()
+            .map_err(|_| AutoresearchError::UntrustedRunEvidence)?;
+        if bytes != surface.protected_text.as_bytes()
+            || receipt.source_observation_id != observation_id
+            || receipt.capture_completeness != CaptureCompleteness::Complete
+            || observation.capture_completeness != CaptureCompleteness::Complete
+            || surface.capture_completeness != CaptureCompleteness::Complete
+            || receipt.archive_mode != SourceArchiveMode::Exact
+            || receipt.unsupported_record_classification.is_some()
+            || receipt.protected_secret_digest.is_some()
+            || !receipt.redaction_spans.is_empty()
+            || observation.source_receipt_ref != receipt.source_receipt_id
+            || receipt.canonicalization_revision != surface.canonicalization_version
+            || observation.canonicalization_revision != surface.canonicalization_version
+            || observation.source_role != surface.source_role
+            || observation.content_trust != surface.content_trust
+            || !matches!(surface.source_role, SourceRole::Host | SourceRole::Tool)
+            || surface.content_trust != ContentTrust::Observed
+            || receipt.cas_ref != CasDigest::for_protected_bytes(&bytes).to_string()
+            || observation.payload_fingerprint
+                != hex(
+                    &payload_fingerprint(surface.canonicalization_version, &bytes, None)
+                        .map_err(|_| AutoresearchError::UntrustedRunEvidence)?,
+                )
+        {
+            return Err(AutoresearchError::UntrustedRunEvidence);
+        }
+        ControlledRunSourceEnvelope::decode_canonical(&bytes)
+            .map_err(|_| AutoresearchError::UntrustedRunEvidence)
+    }
+}
+
+struct ControlledFacts {
+    runs: AutoresearchCurrentView,
+    attempts: std::collections::BTreeMap<AttemptId, Attempt>,
+    procedures: std::collections::BTreeMap<RevisionId, ProcedureRevision>,
+    current_procedures: std::collections::BTreeMap<evertrace_domain::ids::ProcedureId, RevisionId>,
+    usages:
+        std::collections::BTreeMap<evertrace_domain::ids::ProcedureUsageId, ProcedureUsageRevision>,
+    tasks: std::collections::BTreeMap<evertrace_domain::ids::TaskId, Task>,
+    workstreams: std::collections::BTreeMap<evertrace_domain::ids::WorkstreamId, Workstream>,
+    episodes: std::collections::BTreeMap<RevisionId, WorkEpisode>,
+    current_episodes: std::collections::BTreeMap<evertrace_domain::ids::WorkEpisodeId, RevisionId>,
+    worktrees: std::collections::BTreeMap<evertrace_domain::ids::WorktreeId, WorktreeInstance>,
+    snapshots:
+        std::collections::BTreeMap<evertrace_domain::ids::WorktreeSnapshotId, WorktreeSnapshot>,
+    receipts: std::collections::BTreeMap<SourceReceiptId, SourceReceipt>,
+    observations: std::collections::BTreeMap<SourceObservationId, SourceObservation>,
+    surfaces: std::collections::BTreeMap<SourceObservationId, EvidenceSurface>,
+    operations: std::collections::BTreeMap<OperationId, Operation>,
+    bindings: std::collections::BTreeMap<OperationId, WorkBindingRevision>,
+}
+
+impl ControlledFacts {
+    fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, AutoresearchError> {
+        let mut facts = Self {
+            runs: AutoresearchCurrentView::from_snapshot(snapshot)
+                .map_err(AutoresearchError::Store)?,
+            attempts: Default::default(),
+            procedures: Default::default(),
+            current_procedures: Default::default(),
+            usages: Default::default(),
+            tasks: Default::default(),
+            workstreams: Default::default(),
+            episodes: Default::default(),
+            current_episodes: Default::default(),
+            worktrees: Default::default(),
+            snapshots: Default::default(),
+            receipts: Default::default(),
+            observations: Default::default(),
+            surfaces: Default::default(),
+            operations: Default::default(),
+            bindings: Default::default(),
+        };
+        let mut attempt_seq = std::collections::BTreeMap::new();
+        let mut operation_seq = std::collections::BTreeMap::new();
+        let mut procedure_seq = std::collections::BTreeMap::new();
+        let mut episode_seq = std::collections::BTreeMap::new();
+        let mut task_seq = std::collections::BTreeMap::new();
+        let mut workstream_seq = std::collections::BTreeMap::new();
+        let mut worktree_seq = std::collections::BTreeMap::new();
+        let mut usage_seq = std::collections::BTreeMap::new();
+        for row in snapshot.data_rows() {
+            let Some(payload) = row.payload_json.as_deref() else {
+                continue;
+            };
+            let payload = serde_json::from_str::<JournalPayload>(payload)
+                .map_err(|_| AutoresearchError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+            match payload {
+                JournalPayload::AttemptRecorded(value) => {
+                    if attempt_seq
+                        .get(&value.attempt_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        attempt_seq.insert(value.attempt_id, row.source_event_seq);
+                        facts.attempts.insert(value.attempt_id, *value);
+                    }
+                }
+                JournalPayload::ProcedureRevisionRecorded(value) => {
+                    if procedure_seq
+                        .get(&value.procedure_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        procedure_seq.insert(value.procedure_id, row.source_event_seq);
+                        facts
+                            .current_procedures
+                            .insert(value.procedure_id, value.revision_id);
+                    }
+                    facts.procedures.insert(value.revision_id, *value);
+                }
+                JournalPayload::ProcedureUsageRecorded(value) => {
+                    if usage_seq
+                        .get(&value.procedure_usage_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        usage_seq.insert(value.procedure_usage_id, row.source_event_seq);
+                        facts.usages.insert(value.procedure_usage_id, *value);
+                    }
+                }
+                JournalPayload::TaskRecorded(value) => {
+                    if task_seq
+                        .get(&value.task_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        task_seq.insert(value.task_id, row.source_event_seq);
+                        facts.tasks.insert(value.task_id, *value);
+                    }
+                }
+                JournalPayload::WorkstreamRecorded(value) => {
+                    if workstream_seq
+                        .get(&value.workstream_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        workstream_seq.insert(value.workstream_id, row.source_event_seq);
+                        facts.workstreams.insert(value.workstream_id, *value);
+                    }
+                }
+                JournalPayload::WorkEpisodeRecorded(value) => {
+                    if episode_seq
+                        .get(&value.episode_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        episode_seq.insert(value.episode_id, row.source_event_seq);
+                        facts
+                            .current_episodes
+                            .insert(value.episode_id, value.revision_id);
+                    }
+                    facts.episodes.insert(value.revision_id, *value);
+                }
+                JournalPayload::WorktreeInstanceRecorded(value) => {
+                    if worktree_seq
+                        .get(&value.worktree_instance_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        worktree_seq.insert(value.worktree_instance_id, row.source_event_seq);
+                        facts.worktrees.insert(value.worktree_instance_id, *value);
+                    }
+                }
+                JournalPayload::WorktreeSnapshotRecorded(value) => {
+                    facts.snapshots.insert(value.worktree_snapshot_id, *value);
+                }
+                JournalPayload::SourceReceiptRecorded(value) => {
+                    facts.receipts.insert(value.source_receipt_id, *value);
+                }
+                JournalPayload::SourceObservationRecorded(value) => {
+                    facts
+                        .observations
+                        .insert(value.source_observation_id, *value);
+                }
+                JournalPayload::EvidenceSurfaceRecorded(value) => {
+                    facts
+                        .surfaces
+                        .insert(value.source_observation_revision_ref, *value);
+                }
+                JournalPayload::OperationDerived(value) => {
+                    if operation_seq
+                        .get(&value.operation_id)
+                        .is_none_or(|seq| row.source_event_seq > *seq)
+                    {
+                        operation_seq.insert(value.operation_id, row.source_event_seq);
+                        facts.operations.insert(value.operation_id, *value);
+                    }
+                }
+                JournalPayload::WorkBindingRecorded(value)
+                    if facts
+                        .bindings
+                        .get(&value.operation_id)
+                        .is_none_or(|current| {
+                            value.revision_generation > current.revision_generation
+                        }) =>
+                {
+                    facts.bindings.insert(value.operation_id, *value);
+                }
+                _ => {}
+            }
+        }
+        Ok(facts)
+    }
+
+    fn receipt(
+        &self,
+        observation_id: SourceObservationId,
+    ) -> Result<&SourceReceipt, AutoresearchError> {
+        let observation = self
+            .observations
+            .get(&observation_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        self.receipts
+            .get(&observation.source_receipt_ref)
+            .ok_or(AutoresearchError::EvidenceIncomplete)
+    }
+
+    fn validate_declaration_anchor(
+        &self,
+        procedure_revision_id: RevisionId,
+        attempt: &Attempt,
+        snapshot_id: evertrace_domain::ids::WorktreeSnapshotId,
+    ) -> Result<(), AutoresearchError> {
+        let mut usages = self.usages.values().filter(|usage| {
+            usage.procedure_revision_id == procedure_revision_id
+                && usage.attempt_ids.contains(&attempt.attempt_id)
+        });
+        let usage = usages.next().ok_or(AutoresearchError::EvidenceIncomplete)?;
+        if usages.next().is_some() {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        let episode = self
+            .episodes
+            .get(&usage.exposure_episode_revision_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let task = self
+            .tasks
+            .get(&usage.task_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let workstream = self
+            .workstreams
+            .get(&usage.workstream_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let repository_id = usage
+            .local_context
+            .repository_id
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let worktree_id = usage
+            .local_context
+            .worktree_id
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let snapshot = self
+            .snapshots
+            .get(&snapshot_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        let worktree = self
+            .worktrees
+            .get(&worktree_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        if self.current_episodes.get(&episode.episode_id) != Some(&episode.revision_id)
+            || episode.entry_worktree_snapshot_id != Some(snapshot_id)
+            || episode.task_id != task.task_id
+            || episode.workstream_id != workstream.workstream_id
+            || episode.repository_instance_id != Some(repository_id)
+            || episode.worktree_instance_id != Some(worktree_id)
+            || attempt.task_id != task.task_id
+            || attempt.workstream_id != workstream.workstream_id
+            || attempt.repository_instance_id != Some(repository_id)
+            || !attempt.worktree_instance_ids.contains(&worktree_id)
+            || workstream.task_id != task.task_id
+            || workstream.repository_instance_id != Some(repository_id)
+            || !workstream.worktree_instance_ids.contains(&worktree_id)
+            || snapshot.worktree_instance_id != worktree_id
+            || worktree.repository_instance_id != repository_id
+        {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        Ok(())
+    }
+}
+
+fn exact_bound_run(
+    facts: &ControlledFacts,
+    observation_id: SourceObservationId,
+    attempt_id: AttemptId,
+    workstream_id: evertrace_domain::ids::WorkstreamId,
+) -> Result<
+    (
+        evertrace_domain::ids::ExperimentRunId,
+        Vec<WorkBindingRevision>,
+    ),
+    AutoresearchError,
+> {
+    let mut selected = Vec::new();
+    for operation in facts.operations.values().filter(|operation| {
+        operation
+            .input_source_observation_refs
+            .contains(&observation_id)
+    }) {
+        if operation.pairing_state != PairingState::Paired {
+            return Err(AutoresearchError::EvidenceIncomplete);
+        }
+        let binding = facts
+            .bindings
+            .get(&operation.operation_id)
+            .ok_or(AutoresearchError::EvidenceIncomplete)?;
+        if binding.assignment_status != AssignmentStatus::Resolved
+            || binding.primary_binding.attempt_id != Some(attempt_id)
+            || binding.primary_binding.workstream_id != Some(workstream_id)
+        {
+            return Err(AutoresearchError::ImmutableConflict);
+        }
+        selected.push(binding);
+    }
+    if selected.is_empty() {
+        return Err(AutoresearchError::EvidenceIncomplete);
+    }
+    let existing = selected
+        .iter()
+        .filter_map(|binding| binding.primary_binding.experiment_run_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if existing.len() > 1 || !existing.is_empty() && existing.len() != selected.len() {
+        return Err(AutoresearchError::ImmutableConflict);
+    }
+    let run_id = existing
+        .first()
+        .copied()
+        .unwrap_or_else(evertrace_domain::ids::ExperimentRunId::new_v7);
+    if existing.is_empty() {
+        let mut successors = Vec::with_capacity(selected.len());
+        for current in selected {
+            let mut next = current.clone();
+            next.work_binding_revision_id = evertrace_domain::ids::WorkBindingRevisionId::new_v7();
+            next.revision_generation = current.revision_generation.saturating_add(1);
+            next.predecessor_revision_id = Some(current.work_binding_revision_id);
+            next.primary_binding.experiment_run_id = Some(run_id);
+            next.evidence_refs.push(observation_id.to_string());
+            next.evidence_refs.sort();
+            next.evidence_refs.dedup();
+            current
+                .validate_successor(&next)
+                .map_err(|_| AutoresearchError::ImmutableConflict)?;
+            successors.push(next);
+        }
+        Ok((run_id, successors))
+    } else {
+        Ok((run_id, Vec::new()))
+    }
+}
+
+fn require_bound_operations(
+    facts: &ControlledFacts,
+    observation_id: SourceObservationId,
+    launch: bool,
+    run_id: evertrace_domain::ids::ExperimentRunId,
+    attempt_id: AttemptId,
+    workstream_id: evertrace_domain::ids::WorkstreamId,
+) -> Result<(), AutoresearchError> {
+    let operations = facts
+        .operations
+        .values()
+        .filter(|operation| {
+            let refs = if launch {
+                &operation.input_source_observation_refs
+            } else {
+                &operation.result_source_observation_refs
+            };
+            refs.contains(&observation_id)
+        })
+        .collect::<Vec<_>>();
+    if operations.is_empty() {
+        return Err(AutoresearchError::EvidenceIncomplete);
+    }
+    if operations.iter().any(|operation| {
+        operation.pairing_state != PairingState::Paired
+            || facts
+                .bindings
+                .get(&operation.operation_id)
+                .is_none_or(|binding| {
+                    binding.assignment_status != AssignmentStatus::Resolved
+                        || binding.primary_binding.experiment_run_id != Some(run_id)
+                        || binding.primary_binding.attempt_id != Some(attempt_id)
+                        || binding.primary_binding.workstream_id != Some(workstream_id)
+                })
+    }) {
+        Err(AutoresearchError::ImmutableConflict)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]

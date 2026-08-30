@@ -14,8 +14,8 @@ use crate::{
     JournalPayload, ObjectRowKind, ProjectionSnapshot, StoreError,
     journal::{read_journal_after, read_journal_frontier},
     projections::{
-        l3_core_projection, recall_need, recall_trigger_contract, synthesis::wiki_render_identity,
-        validate_delta, wiki_projection,
+        l3_core_projection, procedure_context_effect, recall_need, recall_trigger_contract,
+        synthesis::wiki_render_identity, validate_delta, wiki_projection,
     },
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
@@ -277,6 +277,7 @@ pub fn derive_l0002_projections(
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
             || wiki_projection(row)?.is_some()
+            || procedure_context_effect(row)?.is_some()
         {
             continue;
         }
@@ -297,6 +298,7 @@ pub fn derive_l0002_projections(
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
+            || procedure_context_effect(row)?.is_some()
         {
             continue;
         }

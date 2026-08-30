@@ -9,16 +9,18 @@ use evertrace_domain::{
     ids::{
         AtomId, AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
         ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId,
-        OperationId, ProcedureNegativeEvidenceId, ProcedureUsageId, RecoveryApplicationId,
-        RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId, ResultEvidenceId,
-        RevisionProposalId, ScopeEffectId, SourceObservationId, SourceReceiptId, TaskId,
-        WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
+        OperationId, ProcedureId, ProcedureNegativeEvidenceId, ProcedureUsageId,
+        RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId,
+        ResultEvidenceId, RevisionProposalId, ScopeEffectId, SourceObservationId, SourceReceiptId,
+        TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
         WorktreeSnapshotId, WorktreeTransitionId,
     },
+    procedure::{ProcedureRevision, ProcedureUsageRevision},
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
         RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
     },
+    revision::RevisionId,
     semantic::{Atom, ResultEvidence, RevisionProposal},
     work::{
         ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus,
@@ -50,6 +52,7 @@ use crate::{
 
 mod autoresearch;
 mod procedure;
+mod procedure_effect;
 mod procedure_validation;
 mod recall_ledger;
 #[path = "recall_projection.rs"]
@@ -96,6 +99,12 @@ pub(crate) fn wiki_projection(
     synthesis::restore_wiki_projection(row)
 }
 
+pub(crate) fn procedure_context_effect(
+    row: &ObjectRow,
+) -> Result<Option<evertrace_domain::procedure::ProcedureContextEffectProjection>, StoreError> {
+    procedure_effect::restore(row)
+}
+
 const PROJECTION_GENERATION: u64 = 1;
 // S10 fail-closed safety ceiling. Pagination/cursors belong to the later S23 owner.
 const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
@@ -104,6 +113,24 @@ const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
 pub struct ProjectionSnapshot {
     pub frontier: u64,
     pub rows: Vec<ObjectRow>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProcedureEffectCurrentFacts {
+    pub frontier: u64,
+    pub procedures: BTreeMap<evertrace_domain::revision::RevisionId, (ProcedureRevision, u64)>,
+    pub current_procedures: BTreeMap<ProcedureId, evertrace_domain::revision::RevisionId>,
+    pub usages: BTreeMap<ProcedureUsageId, (ProcedureUsageRevision, u64)>,
+    pub tasks: BTreeMap<TaskId, (Task, u64)>,
+    pub attempts: BTreeMap<AttemptId, (Attempt, u64)>,
+    pub runs: BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
+    pub results: BTreeMap<evertrace_domain::revision::RevisionId, (ResultEvidence, u64)>,
+    pub current_results: BTreeMap<ResultEvidenceId, evertrace_domain::revision::RevisionId>,
+    pub episodes: BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
+    pub worktrees: BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    pub snapshots: BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    pub artifacts: BTreeMap<evertrace_domain::revision::RevisionId, (WorkArtifact, u64)>,
+    pub current_artifacts: BTreeMap<WorkArtifactId, evertrace_domain::revision::RevisionId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +236,136 @@ impl ProjectionSnapshot {
 
     pub fn row(&self, row_id: &str) -> Option<&ObjectRow> {
         self.rows.iter().find(|row| row.row_id == row_id)
+    }
+
+    pub fn procedure_effect_current_facts(
+        &self,
+    ) -> Result<ProcedureEffectCurrentFacts, StoreError> {
+        let mut facts = ProcedureEffectCurrentFacts {
+            frontier: self.frontier,
+            ..ProcedureEffectCurrentFacts::default()
+        };
+        let mut current_procedures = BTreeMap::<ProcedureId, (RevisionId, u64)>::new();
+        let mut current_results = BTreeMap::<ResultEvidenceId, (RevisionId, u64)>::new();
+        let mut current_artifacts = BTreeMap::<WorkArtifactId, (RevisionId, u64)>::new();
+        for row in self.data_rows() {
+            if !matches!(
+                row.object_kind.as_deref(),
+                Some(
+                    "procedure_revision"
+                        | "procedure_usage_revision"
+                        | "task"
+                        | "attempt"
+                        | "experiment_run"
+                        | "result_evidence"
+                        | "work_episode"
+                        | "worktree"
+                        | "worktree_snapshot"
+                        | "work_artifact"
+                )
+            ) {
+                continue;
+            }
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            macro_rules! latest {
+                ($map:expr, $key:expr, $value:expr) => {{
+                    let key = $key;
+                    if $map
+                        .get(&key)
+                        .is_none_or(|(_, seq)| *seq < row.source_event_seq)
+                    {
+                        $map.insert(key, ($value, row.source_event_seq));
+                    }
+                }};
+            }
+            match payload {
+                JournalPayload::ProcedureRevisionRecorded(value) => {
+                    let value = *value;
+                    facts
+                        .procedures
+                        .insert(value.revision_id, (value.clone(), row.source_event_seq));
+                    latest!(current_procedures, value.procedure_id, value.revision_id);
+                }
+                JournalPayload::ProcedureUsageRecorded(value) => {
+                    let value = *value;
+                    latest!(facts.usages, value.procedure_usage_id, value);
+                }
+                JournalPayload::TaskRecorded(value) => {
+                    let value = *value;
+                    latest!(facts.tasks, value.task_id, value);
+                }
+                JournalPayload::AttemptRecorded(value) => {
+                    let value = *value;
+                    latest!(facts.attempts, value.attempt_id, value);
+                }
+                JournalPayload::ExperimentRunRecorded(value) => {
+                    let value = *value;
+                    latest!(facts.runs, value.run_id, value);
+                }
+                JournalPayload::ResultEvidenceRecorded(value) => {
+                    let value = *value;
+                    facts
+                        .results
+                        .insert(value.revision_id, (value.clone(), row.source_event_seq));
+                    latest!(current_results, value.result_evidence_id, value.revision_id);
+                }
+                JournalPayload::WorkEpisodeRecorded(value) => {
+                    let value = *value;
+                    facts
+                        .episodes
+                        .insert(value.revision_id, (value, row.source_event_seq));
+                }
+                JournalPayload::WorktreeInstanceRecorded(value) => {
+                    let value = *value;
+                    latest!(facts.worktrees, value.worktree_instance_id, value);
+                }
+                JournalPayload::WorktreeSnapshotRecorded(value) => {
+                    let value = *value;
+                    facts
+                        .snapshots
+                        .insert(value.worktree_snapshot_id, (value, row.source_event_seq));
+                }
+                JournalPayload::WorkArtifactRecorded(value) => {
+                    let value = *value;
+                    facts.artifacts.insert(
+                        value.revision.revision_id,
+                        (value.clone(), row.source_event_seq),
+                    );
+                    latest!(
+                        current_artifacts,
+                        value.work_artifact_id,
+                        value.revision.revision_id
+                    );
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        facts.current_procedures = current_procedures
+            .into_iter()
+            .map(|(id, (revision, _))| (id, revision))
+            .collect();
+        facts.current_results = current_results
+            .into_iter()
+            .map(|(id, (revision, _))| (id, revision))
+            .collect();
+        facts.current_artifacts = current_artifacts
+            .into_iter()
+            .map(|(id, (revision, _))| (id, revision))
+            .collect();
+        Ok(facts)
+    }
+
+    pub fn compile_controlled_procedure_effect(
+        &self,
+        procedure_revision_id: RevisionId,
+    ) -> Result<Vec<evertrace_domain::procedure::ProcedureContextEffectProjection>, StoreError>
+    {
+        procedure_effect::compile_controlled(self, procedure_revision_id)
     }
 
     pub fn reconciliation_frontier(
@@ -1358,6 +1515,7 @@ pub(crate) struct JournalAdmissionState {
     source_ranges: BTreeMap<String, KnownSourceRange>,
     source_observations: BTreeMap<SourceObservationId, (SourceObservation, u64)>,
     source_receipts: BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    evidence_surfaces: BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
@@ -1750,6 +1908,27 @@ impl JournalAdmissionState {
         )?;
         self.validate_procedure_usage_command(command.events().iter().map(|event| &event.payload))
             .map_err(|_| StoreError::InvalidInput)?;
+        autoresearch::validate_controlled_command(
+            autoresearch::ControlledRunAdmissionView {
+                runs: &self.experiment_runs,
+                attempts: &self.attempts,
+                work_bindings: &self.work_bindings,
+                operations: &self.operations,
+                snapshots: &self.worktree_snapshots,
+                receipts: &self.source_receipts,
+                observations: &self.source_observations,
+                surfaces: &self.evidence_surfaces,
+                artifacts: &self.work_artifacts,
+                procedures: &self.procedure,
+                tasks: &self.tasks,
+                workstreams: &self.workstreams,
+                episodes: &self.episodes,
+                episode_revisions: &self.episode_revisions,
+                worktrees: &self.worktrees,
+            },
+            command.events().iter().map(|event| &event.payload),
+            StoreError::InvalidInput,
+        )?;
         self.procedure
             .validate_command_cohort(
                 &self.tasks,
@@ -1847,6 +2026,27 @@ impl JournalAdmissionState {
         self.validate_episode_binding_activation(parsed.iter().map(|(payload, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
         self.validate_procedure_usage_command(parsed.iter().map(|(payload, _)| payload))?;
+        autoresearch::validate_controlled_command(
+            autoresearch::ControlledRunAdmissionView {
+                runs: &self.experiment_runs,
+                attempts: &self.attempts,
+                work_bindings: &self.work_bindings,
+                operations: &self.operations,
+                snapshots: &self.worktree_snapshots,
+                receipts: &self.source_receipts,
+                observations: &self.source_observations,
+                surfaces: &self.evidence_surfaces,
+                artifacts: &self.work_artifacts,
+                procedures: &self.procedure,
+                tasks: &self.tasks,
+                workstreams: &self.workstreams,
+                episodes: &self.episodes,
+                episode_revisions: &self.episode_revisions,
+                worktrees: &self.worktrees,
+            },
+            parsed.iter().map(|(payload, _)| payload),
+            StoreError::StoreCorrupt,
+        )?;
         self.procedure
             .validate_command_cohort(&self.tasks, parsed.iter().map(|(payload, _)| payload))?;
         let synthesis_refs = self.synthesis_ref_set();
@@ -1963,6 +2163,15 @@ impl JournalAdmissionState {
                 if self
                     .source_observations
                     .insert(value.source_observation_id, (*value, seq))
+                    .is_some()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+            }
+            JournalPayload::EvidenceSurfaceRecorded(value) => {
+                if self
+                    .evidence_surfaces
+                    .insert(value.source_observation_revision_ref, (*value, seq))
                     .is_some()
                 {
                     return Err(StoreError::StoreCorrupt);
@@ -3965,6 +4174,9 @@ impl ReducerState {
             if synthesis::restore_wiki_projection(row)?.is_some() {
                 continue;
             }
+            if procedure_effect::restore(row)?.is_some() {
+                continue;
+            }
             if let Some(need) = recall_ledger::need(row)? {
                 state.recall_ledger.restore(row, need)?;
                 continue;
@@ -4796,6 +5008,14 @@ impl ReducerState {
             &self.s23,
         )?);
         rows.extend(self.procedure.rows(PROJECTION_GENERATION, &self.s23)?);
+        rows.extend(self.procedure.effect_rows(
+            &self.episode_revisions,
+            &self.worktree_snapshots,
+            &self.worktrees,
+            &self.result_evidence_revisions,
+            &self.artifact_revisions,
+            PROJECTION_GENERATION,
+        )?);
         rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
         rows.extend(self.synthesis.rows()?);
         for (migration, (payload, seq)) in self.migrations {
@@ -5521,6 +5741,7 @@ impl ReducerState {
             source_ranges: current_source_ranges(&self.source_receipts)?,
             source_observations: self.source_observations.clone(),
             source_receipts: self.source_receipts.clone(),
+            evidence_surfaces: self.evidence_surfaces.clone(),
             host_occurrences: self.host_occurrences.clone(),
             host_occurrence_revisions: self.host_occurrence_revisions.clone(),
             operations: self.operations.clone(),
@@ -6063,7 +6284,8 @@ impl ProjectionWorker {
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
             }
-            self.commit_rows(&expected.rows, true, true, true).await?;
+            self.commit_rows(&expected.rows, true, true, true, true)
+                .await?;
             let persisted = validate_objects_table(&self.objects).await?;
             if persisted != expected.rows {
                 return Err(StoreError::Projection);
@@ -6090,6 +6312,15 @@ impl ProjectionWorker {
         });
         let reconcile_recall = reconcile_core;
         let reconcile_wiki = reconcile_core;
+        let reconcile_procedure_effect = delta.iter().any(|row| {
+            matches!(
+                row.event_type.as_str(),
+                "procedure_usage_recorded_v1"
+                    | "procedure_negative_evidence_recorded_v1"
+                    | "procedure_negative_review_recorded_v1"
+                    | "worktree_snapshot_recorded_v1"
+            )
+        });
         let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
@@ -6109,12 +6340,19 @@ impl ProjectionWorker {
             reconcile_recall,
             reconcile_core,
             reconcile_wiki,
+            reconcile_procedure_effect,
         );
         if inject_before_commit_failure {
             return Err(StoreError::Projection);
         }
-        self.commit_rows(&changed, reconcile_recall, reconcile_core, reconcile_wiki)
-            .await?;
+        self.commit_rows(
+            &changed,
+            reconcile_recall,
+            reconcile_core,
+            reconcile_wiki,
+            reconcile_procedure_effect,
+        )
+        .await?;
         let persisted = validate_objects_table(&self.objects).await?;
         let persisted_snapshot = ProjectionSnapshot {
             frontier: expected.frontier,
@@ -6141,6 +6379,7 @@ impl ProjectionWorker {
         reconcile_recall: bool,
         reconcile_core: bool,
         reconcile_wiki: bool,
+        reconcile_procedure_effect: bool,
     ) -> Result<(), StoreError> {
         let batch = objects_batch(rows)?;
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
@@ -6149,7 +6388,7 @@ impl ProjectionWorker {
         let mut merge = self.objects.merge_insert(&["row_id"]);
         merge.when_matched_update_all(None);
         merge.when_not_matched_insert_all();
-        if reconcile_recall || reconcile_core || reconcile_wiki {
+        if reconcile_recall || reconcile_core || reconcile_wiki || reconcile_procedure_effect {
             let mut predicates = Vec::new();
             if reconcile_recall {
                 predicates.push(format!(
@@ -6165,6 +6404,9 @@ impl ProjectionWorker {
                     "object_kind = '{}'",
                     synthesis::WIKI_PROJECTION_KIND
                 ));
+            }
+            if reconcile_procedure_effect {
+                predicates.push("object_kind = 'procedure_context_effect'".into());
             }
             merge.when_not_matched_by_source_delete(Some(predicates.join(" OR ")));
         }
@@ -6182,6 +6424,7 @@ fn incremental_changed_rows(
     reconcile_recall: bool,
     reconcile_core: bool,
     reconcile_wiki: bool,
+    reconcile_procedure_effect: bool,
 ) -> Vec<ObjectRow> {
     expected
         .rows
@@ -6194,6 +6437,8 @@ fn incremental_changed_rows(
                 || reconcile_core && row.object_kind.as_deref() == Some(s23::CORE_PROJECTION_KIND)
                 || reconcile_wiki
                     && row.object_kind.as_deref() == Some(synthesis::WIKI_PROJECTION_KIND)
+                || reconcile_procedure_effect
+                    && row.object_kind.as_deref() == Some("procedure_context_effect")
                 || current_by_id.get(row.row_id.as_str()).copied() != Some(*row)
         })
         .cloned()
@@ -6280,11 +6525,11 @@ mod tests {
         };
 
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, false, false, false),
+            incremental_changed_rows(&expected, &current_by_id, false, false, false, false),
             vec![expected.rows[0].clone()]
         );
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, true, false, false),
+            incremental_changed_rows(&expected, &current_by_id, true, false, false, false),
             expected.rows
         );
     }
@@ -7111,6 +7356,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -7157,7 +7403,7 @@ mod tests {
             .unwrap(),
         );
         worker
-            .commit_rows(&[migration], false, false, false)
+            .commit_rows(&[migration], false, false, false, false)
             .await
             .unwrap();
         assert!(matches!(
@@ -7223,6 +7469,7 @@ mod tests {
         worker
             .commit_rows(
                 &[ObjectRow::checkpoint(3, PROJECTION_GENERATION)],
+                false,
                 false,
                 false,
                 false,

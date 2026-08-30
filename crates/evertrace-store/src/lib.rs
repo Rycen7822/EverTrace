@@ -24,9 +24,9 @@ pub use objects::{
     OBJECTS_CHECKPOINT_ID, OBJECTS_TABLE, ObjectRow, ObjectRowClass, ObjectRowKind, objects_schema,
 };
 pub use projections::{
-    AttemptCurrentView, EpisodeCurrentView, NamedCurrentDependency, OperationBurstCurrentView,
-    ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom, RecallCurrentContext,
-    ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
+    AttemptCurrentView, AutoresearchCurrentView, EpisodeCurrentView, NamedCurrentDependency,
+    OperationBurstCurrentView, ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom,
+    RecallCurrentContext, ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
     ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
     ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
     SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView,

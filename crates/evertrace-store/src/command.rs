@@ -793,12 +793,7 @@ impl JournalPayload {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::ExperimentRunRecorded(value) => {
-                value.validate().map_err(|_| StoreError::InvalidInput)?;
-                if value.is_declaration_only() {
-                    Ok(())
-                } else {
-                    Err(StoreError::InvalidInput)
-                }
+                value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::ResultEvidenceRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
