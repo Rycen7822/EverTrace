@@ -10,6 +10,7 @@ use crate::{
         WorktreeSnapshotId,
     },
     revision::RevisionId,
+    semantic::MetricValue,
 };
 
 use super::WorkError;
@@ -17,6 +18,106 @@ use super::WorkError;
 const MAX_REFS: usize = 256;
 const MAX_FIELDS: usize = 128;
 const MAX_TEXT: usize = 1024;
+const CONTROLLED_SOURCE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlledRunSourceEnvelope {
+    Launch {
+        version: u32,
+        attempt_id: AttemptId,
+        procedure_revision_id: RevisionId,
+        code_snapshot_id: WorktreeSnapshotId,
+        data_fingerprint: String,
+        normalized_config: Vec<ContractField>,
+        variable_declaration: VariableDeclaration,
+        seed_policy: SeedPolicy,
+        seed_values: Vec<String>,
+        nondeterministic: bool,
+        metric_definition: String,
+        metric_extractor_version: String,
+        multi_cas_metric_policy: MultiCasMetricPolicy,
+        environment_fingerprint: String,
+        binding: Box<ComparisonExecutionBinding>,
+        started_at_us: i64,
+    },
+    Terminal {
+        version: u32,
+        run_id: ExperimentRunId,
+        ended_at_us: i64,
+        metric: MetricValue,
+        artifact_refs: Vec<WorkArtifactId>,
+    },
+}
+
+impl ControlledRunSourceEnvelope {
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, WorkError> {
+        let text = std::str::from_utf8(bytes).map_err(|_| WorkError::InvalidAutoresearch)?;
+        let value = toml::from_str::<Self>(text).map_err(|_| WorkError::InvalidAutoresearch)?;
+        value.validate()?;
+        if toml::to_string(&value)
+            .map_err(|_| WorkError::InvalidAutoresearch)?
+            .as_bytes()
+            != bytes
+        {
+            return Err(WorkError::InvalidAutoresearch);
+        }
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkError> {
+        match self {
+            Self::Launch {
+                version,
+                data_fingerprint,
+                normalized_config,
+                variable_declaration,
+                seed_values,
+                metric_definition,
+                metric_extractor_version,
+                environment_fingerprint,
+                binding,
+                started_at_us,
+                ..
+            } => {
+                if *version != CONTROLLED_SOURCE_VERSION
+                    || *started_at_us < 0
+                    || !valid_text(data_fingerprint)
+                    || !valid_text(metric_definition)
+                    || !valid_text(metric_extractor_version)
+                    || !valid_text(environment_fingerprint)
+                    || normalized_config.len() > MAX_FIELDS
+                    || !normalized_config.iter().all(ContractField::valid)
+                    || !normalized_config
+                        .windows(2)
+                        .all(|pair| pair[0].name < pair[1].name)
+                    || !canonical_texts(seed_values)
+                {
+                    return Err(WorkError::InvalidAutoresearch);
+                }
+                variable_declaration.validate_against(normalized_config)?;
+                binding.validate()
+            }
+            Self::Terminal {
+                version,
+                ended_at_us,
+                metric,
+                artifact_refs,
+                ..
+            } => {
+                if *version != CONTROLLED_SOURCE_VERSION
+                    || *ended_at_us < 0
+                    || !canonical_unique(artifact_refs, MAX_REFS)
+                {
+                    return Err(WorkError::InvalidAutoresearch);
+                }
+                metric
+                    .validate()
+                    .map_err(|_| WorkError::InvalidAutoresearch)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +199,113 @@ impl SeedPolicy {
 pub enum MultiCasMetricPolicy {
     RejectMultipleParsed,
     AllowIdenticalParsed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricDirection {
+    HigherIsBetter,
+    LowerIsBetter,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonExecutionBinding {
+    pub binding_version: u32,
+    pub toolchain_revision: String,
+    pub model_revision: String,
+    pub harness_revision: String,
+    pub algorithm_revision: String,
+    pub budget: u64,
+    pub procedure_exposure_revision_id: Option<RevisionId>,
+    pub metric_direction: MetricDirection,
+    pub metric_unit: String,
+    pub positive_delta_threshold: String,
+    pub negative_delta_threshold: String,
+}
+
+impl ComparisonExecutionBinding {
+    pub fn validate(&self) -> Result<(), WorkError> {
+        if self.binding_version != 1
+            || self.budget == 0
+            || [
+                &self.toolchain_revision,
+                &self.model_revision,
+                &self.harness_revision,
+                &self.algorithm_revision,
+                &self.metric_unit,
+            ]
+            .into_iter()
+            .any(|value| !valid_text(value) || value == "unknown")
+            || !positive_decimal(&self.positive_delta_threshold)
+            || !positive_decimal(&self.negative_delta_threshold)
+        {
+            return Err(WorkError::InvalidAutoresearch);
+        }
+        Ok(())
+    }
+
+    fn canonical(&self, include_exposure: bool) -> CanonicalValue {
+        CanonicalValue::Map(vec![
+            (
+                "algorithm_revision".into(),
+                CanonicalValue::String(self.algorithm_revision.clone()),
+            ),
+            (
+                "binding_version".into(),
+                CanonicalValue::Integer(i128::from(self.binding_version)),
+            ),
+            (
+                "budget".into(),
+                CanonicalValue::Integer(i128::from(self.budget)),
+            ),
+            (
+                "harness_revision".into(),
+                CanonicalValue::String(self.harness_revision.clone()),
+            ),
+            (
+                "metric_direction".into(),
+                CanonicalValue::String(
+                    match self.metric_direction {
+                        MetricDirection::HigherIsBetter => "higher_is_better",
+                        MetricDirection::LowerIsBetter => "lower_is_better",
+                    }
+                    .into(),
+                ),
+            ),
+            (
+                "metric_unit".into(),
+                CanonicalValue::String(self.metric_unit.clone()),
+            ),
+            (
+                "model_revision".into(),
+                CanonicalValue::String(self.model_revision.clone()),
+            ),
+            (
+                "negative_delta_threshold".into(),
+                CanonicalValue::String(self.negative_delta_threshold.clone()),
+            ),
+            (
+                "positive_delta_threshold".into(),
+                CanonicalValue::String(self.positive_delta_threshold.clone()),
+            ),
+            (
+                "procedure_exposure_revision_id".into(),
+                if include_exposure {
+                    self.procedure_exposure_revision_id
+                        .map_or(CanonicalValue::Null, |id| {
+                            CanonicalValue::String(id.to_string())
+                        })
+                } else {
+                    CanonicalValue::Null
+                },
+            ),
+            (
+                "toolchain_revision".into(),
+                CanonicalValue::String(self.toolchain_revision.clone()),
+            ),
+        ])
+    }
 }
 
 impl MultiCasMetricPolicy {
@@ -186,6 +394,8 @@ pub struct ExperimentRun {
     pub metric_extractor_version: String,
     pub multi_cas_metric_policy: MultiCasMetricPolicy,
     pub environment_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_execution_binding: Option<ComparisonExecutionBinding>,
     pub work_artifact_refs: Vec<WorkArtifactId>,
     pub terminal_evidence_refs: Vec<SourceReceiptId>,
     pub created_at_us: i64,
@@ -195,53 +405,67 @@ pub struct ExperimentRun {
 
 impl ExperimentRun {
     pub fn recompute_exact_contract_fingerprint(&self) -> Result<[u8; 32], WorkError> {
+        if let Some(binding) = &self.comparison_execution_binding {
+            binding.validate()?;
+        }
+        let mut fields = vec![
+            (
+                "strategy".into(),
+                CanonicalValue::Bytes(self.strategy_contract_fingerprint.to_vec()),
+            ),
+            (
+                "code_snapshot".into(),
+                CanonicalValue::String(self.code_snapshot_id.to_string()),
+            ),
+            (
+                "data".into(),
+                CanonicalValue::String(self.data_fingerprint.clone()),
+            ),
+            ("config".into(), config_value(&self.normalized_config)),
+            (
+                "variables".into(),
+                variables_value(&self.variable_declaration),
+            ),
+            (
+                "seed_policy".into(),
+                CanonicalValue::String(self.seed_policy.as_str().into()),
+            ),
+            ("seed_values".into(), strings_value(&self.seed_values)),
+            (
+                "nondeterministic".into(),
+                CanonicalValue::Bool(self.nondeterministic),
+            ),
+            (
+                "metric".into(),
+                CanonicalValue::String(self.metric_definition.clone()),
+            ),
+            (
+                "extractor".into(),
+                CanonicalValue::String(self.metric_extractor_version.clone()),
+            ),
+            (
+                "multi_cas".into(),
+                CanonicalValue::String(self.multi_cas_metric_policy.as_str().into()),
+            ),
+            (
+                "environment".into(),
+                CanonicalValue::String(self.environment_fingerprint.clone()),
+            ),
+        ];
+        if let Some(binding) = &self.comparison_execution_binding {
+            fields.push((
+                "comparison_execution_binding".into(),
+                binding.canonical(true),
+            ));
+        }
         sha256(
             "evertrace.experiment_contract.exact",
-            1,
-            &CanonicalValue::Map(vec![
-                (
-                    "strategy".into(),
-                    CanonicalValue::Bytes(self.strategy_contract_fingerprint.to_vec()),
-                ),
-                (
-                    "code_snapshot".into(),
-                    CanonicalValue::String(self.code_snapshot_id.to_string()),
-                ),
-                (
-                    "data".into(),
-                    CanonicalValue::String(self.data_fingerprint.clone()),
-                ),
-                ("config".into(), config_value(&self.normalized_config)),
-                (
-                    "variables".into(),
-                    variables_value(&self.variable_declaration),
-                ),
-                (
-                    "seed_policy".into(),
-                    CanonicalValue::String(self.seed_policy.as_str().into()),
-                ),
-                ("seed_values".into(), strings_value(&self.seed_values)),
-                (
-                    "nondeterministic".into(),
-                    CanonicalValue::Bool(self.nondeterministic),
-                ),
-                (
-                    "metric".into(),
-                    CanonicalValue::String(self.metric_definition.clone()),
-                ),
-                (
-                    "extractor".into(),
-                    CanonicalValue::String(self.metric_extractor_version.clone()),
-                ),
-                (
-                    "multi_cas".into(),
-                    CanonicalValue::String(self.multi_cas_metric_policy.as_str().into()),
-                ),
-                (
-                    "environment".into(),
-                    CanonicalValue::String(self.environment_fingerprint.clone()),
-                ),
-            ]),
+            if self.comparison_execution_binding.is_some() {
+                2
+            } else {
+                1
+            },
+            &CanonicalValue::Map(fields),
         )
         .map_err(|_| WorkError::InvalidAutoresearch)
     }
@@ -253,44 +477,55 @@ impl ExperimentRun {
             .filter(|field| self.variable_declaration.fixed.contains(&field.name))
             .cloned()
             .collect::<Vec<_>>();
+        let mut fields = vec![
+            (
+                "code_snapshot".into(),
+                CanonicalValue::String(self.code_snapshot_id.to_string()),
+            ),
+            (
+                "data".into(),
+                CanonicalValue::String(self.data_fingerprint.clone()),
+            ),
+            ("fixed_config".into(), config_value(&fixed)),
+            (
+                "variables".into(),
+                variables_value(&self.variable_declaration),
+            ),
+            (
+                "seed_policy".into(),
+                CanonicalValue::String(self.seed_policy.as_str().into()),
+            ),
+            (
+                "metric".into(),
+                CanonicalValue::String(self.metric_definition.clone()),
+            ),
+            (
+                "extractor".into(),
+                CanonicalValue::String(self.metric_extractor_version.clone()),
+            ),
+            (
+                "multi_cas".into(),
+                CanonicalValue::String(self.multi_cas_metric_policy.as_str().into()),
+            ),
+            (
+                "environment".into(),
+                CanonicalValue::String(self.environment_fingerprint.clone()),
+            ),
+        ];
+        if let Some(binding) = &self.comparison_execution_binding {
+            fields.push((
+                "comparison_execution_binding".into(),
+                binding.canonical(false),
+            ));
+        }
         sha256(
             "evertrace.experiment_contract.comparison",
-            1,
-            &CanonicalValue::Map(vec![
-                (
-                    "code_snapshot".into(),
-                    CanonicalValue::String(self.code_snapshot_id.to_string()),
-                ),
-                (
-                    "data".into(),
-                    CanonicalValue::String(self.data_fingerprint.clone()),
-                ),
-                ("fixed_config".into(), config_value(&fixed)),
-                (
-                    "variables".into(),
-                    variables_value(&self.variable_declaration),
-                ),
-                (
-                    "seed_policy".into(),
-                    CanonicalValue::String(self.seed_policy.as_str().into()),
-                ),
-                (
-                    "metric".into(),
-                    CanonicalValue::String(self.metric_definition.clone()),
-                ),
-                (
-                    "extractor".into(),
-                    CanonicalValue::String(self.metric_extractor_version.clone()),
-                ),
-                (
-                    "multi_cas".into(),
-                    CanonicalValue::String(self.multi_cas_metric_policy.as_str().into()),
-                ),
-                (
-                    "environment".into(),
-                    CanonicalValue::String(self.environment_fingerprint.clone()),
-                ),
-            ]),
+            if self.comparison_execution_binding.is_some() {
+                2
+            } else {
+                1
+            },
+            &CanonicalValue::Map(fields),
         )
         .map_err(|_| WorkError::InvalidAutoresearch)
     }
@@ -304,7 +539,20 @@ impl ExperimentRun {
             && self.ended_at_us.is_none()
     }
 
+    pub fn is_controlled_declaration(&self) -> bool {
+        self.comparison_execution_binding.is_some()
+            && self.observability == RunObservability::Declared
+            && self.execution_status == RunExecutionStatus::Unknown
+            && self.contract_validity == RunContractValidity::Unknown
+            && self.terminal_evidence_refs.is_empty()
+            && self.started_at_us.is_some()
+            && self.ended_at_us.is_none()
+    }
+
     pub fn validate(&self) -> Result<(), WorkError> {
+        if let Some(binding) = &self.comparison_execution_binding {
+            binding.validate()?;
+        }
         if self.experiment_contract_fingerprint != self.recompute_exact_contract_fingerprint()?
             || self.comparison_key != self.recompute_comparison_key()?
         {
@@ -389,6 +637,7 @@ impl ExperimentRun {
             && self.metric_extractor_version == next.metric_extractor_version
             && self.multi_cas_metric_policy == next.multi_cas_metric_policy
             && self.environment_fingerprint == next.environment_fingerprint
+            && self.comparison_execution_binding == next.comparison_execution_binding
             && next.created_at_us >= self.created_at_us;
         let evidence_progress =
             strict_superset(&self.source_receipt_refs, &next.source_receipt_refs)
@@ -661,6 +910,27 @@ fn validity_progress(current: RunContractValidity, next: RunContractValidity) ->
 
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_TEXT && !value.chars().any(char::is_control)
+}
+
+fn positive_decimal(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 || value.starts_with('-') || value.starts_with('+') {
+        return false;
+    }
+    let mut dot = false;
+    let mut nonzero = false;
+    for byte in value.bytes() {
+        match byte {
+            b'.' if !dot => dot = true,
+            b'0' => {}
+            b'1'..=b'9' => nonzero = true,
+            _ => return false,
+        }
+    }
+    nonzero
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !(value.len() > 1 && value.starts_with('0') && !value.starts_with("0."))
+        && !(dot && value.ends_with('0'))
 }
 
 fn optional_text(value: &Option<String>) -> bool {

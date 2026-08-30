@@ -37,7 +37,8 @@ use evertrace_domain::{
     semantic::{EvidenceCompleteness, ParserStatus, ResultScope, VerifierStatus},
     work::{
         ArtifactActor, ArtifactDerivability, ArtifactPayloadStatus, ArtifactRetention,
-        ArtifactRevision, ArtifactScope, AssignmentStatus, ContractField, CoverageLevel,
+        ArtifactRevision, ArtifactScope, AssignmentStatus, ComparisonExecutionBinding,
+        ContractField, ControlledRunSourceEnvelope, CoverageLevel, MetricDirection,
         MultiCasMetricPolicy, PairingIntegrity, PayloadIntegrity, PhaseContract, PhaseKind,
         PrimaryWorkBinding, RunContractValidity, RunExecutionStatus, RunObservability, SeedPolicy,
         SourceCoverage, StrategyContract, Task, TaskIdentityConfidence, TaskLifecycle,
@@ -130,6 +131,22 @@ fn context(at: i64) -> AutoresearchCommandContext {
         occurred_at_us: at,
         effective_config_hash: CONFIG,
         algorithm_revision: "s17-autoresearch-v2",
+    }
+}
+
+fn comparison_binding(exposure: Option<RevisionId>) -> ComparisonExecutionBinding {
+    ComparisonExecutionBinding {
+        binding_version: 1,
+        toolchain_revision: "rust-1.97.1".into(),
+        model_revision: "model-v1".into(),
+        harness_revision: "harness-v1".into(),
+        algorithm_revision: "algorithm-v1".into(),
+        budget: 500,
+        procedure_exposure_revision_id: exposure,
+        metric_direction: MetricDirection::HigherIsBetter,
+        metric_unit: "ratio".into(),
+        positive_delta_threshold: "0.05".into(),
+        negative_delta_threshold: "0.03".into(),
     }
 }
 
@@ -276,6 +293,124 @@ fn run_contract_hashes_are_deterministic_relaxed_and_authority_free() {
         create_experiment_run(&attempt, overlap),
         Err(AutoresearchError::InvalidInput)
     ));
+}
+
+#[test]
+fn comparison_binding_preserves_v1_and_uses_closed_v2_contracts() {
+    let stream = WorkstreamId::new_v7();
+    let attempt = new_attempt(
+        TaskId::new_v7(),
+        stream,
+        None,
+        vec![],
+        vec![],
+        strategy("known-answer"),
+        1,
+    )
+    .unwrap();
+    let snapshot =
+        WorktreeSnapshotId::from_str("wts:01890f47-6a4a-7cc1-98b9-01890f476a31").unwrap();
+    let legacy = create_experiment_run(
+        &attempt,
+        run_input(stream, receipt(1), snapshot, "0.1", "adam", "7"),
+    )
+    .unwrap();
+    assert_eq!(
+        evertrace_domain::evidence::hex(&legacy.experiment_contract_fingerprint),
+        "3468c74a78543085636b94de15eb029936c9e89cbd6338cfbb64e06333c348d1"
+    );
+    assert_eq!(
+        evertrace_domain::evidence::hex(&legacy.comparison_key),
+        "2b02609a9d28744c20f581404cd03140382ab455f716e5f667539cd0897751d5"
+    );
+    let mut legacy_json = serde_json::to_value(&legacy).unwrap();
+    legacy_json
+        .as_object_mut()
+        .unwrap()
+        .remove("comparison_execution_binding");
+    let rebuilt: evertrace_domain::work::ExperimentRun =
+        serde_json::from_value(legacy_json).unwrap();
+    assert!(rebuilt.comparison_execution_binding.is_none());
+    assert_eq!(rebuilt, legacy);
+    rebuilt.validate().unwrap();
+
+    let exposure = RevisionId::from_str("01890f47-6a4a-7cc1-98b9-01890f476a41").unwrap();
+    let generic = create_experiment_run(
+        &attempt,
+        run_input(stream, receipt(2), snapshot, "0.1", "adam", "7"),
+    )
+    .unwrap();
+    assert!(generic.comparison_execution_binding.is_none());
+    let mut bound = generic.clone();
+    bound.comparison_execution_binding = Some(comparison_binding(Some(exposure)));
+    bound.experiment_contract_fingerprint = bound.recompute_exact_contract_fingerprint().unwrap();
+    bound.comparison_key = bound.recompute_comparison_key().unwrap();
+    assert_eq!(
+        evertrace_domain::evidence::hex(&bound.experiment_contract_fingerprint),
+        "16875fe4dca0d17bd8f0d18fe75f66fd0f416b729ff39545bf7ec1e2fada9300"
+    );
+    assert_eq!(
+        evertrace_domain::evidence::hex(&bound.comparison_key),
+        "47d0907b7af926ec2065eafaa8199af3ccfff4a5b309a533641456566a963f15"
+    );
+    let envelope = ControlledRunSourceEnvelope::Launch {
+        version: 1,
+        attempt_id: attempt.attempt_id,
+        procedure_revision_id: exposure,
+        code_snapshot_id: bound.code_snapshot_id,
+        data_fingerprint: bound.data_fingerprint.clone(),
+        normalized_config: bound.normalized_config.clone(),
+        variable_declaration: bound.variable_declaration.clone(),
+        seed_policy: bound.seed_policy,
+        seed_values: bound.seed_values.clone(),
+        nondeterministic: bound.nondeterministic,
+        metric_definition: bound.metric_definition.clone(),
+        metric_extractor_version: bound.metric_extractor_version.clone(),
+        multi_cas_metric_policy: bound.multi_cas_metric_policy,
+        environment_fingerprint: bound.environment_fingerprint.clone(),
+        binding: Box::new(comparison_binding(Some(exposure))),
+        started_at_us: 2,
+    };
+    let canonical = toml::to_string(&envelope).unwrap();
+    assert_eq!(
+        ControlledRunSourceEnvelope::decode_canonical(canonical.as_bytes()).unwrap(),
+        envelope
+    );
+    assert!(
+        ControlledRunSourceEnvelope::decode_canonical(canonical.replace('\n', "\r\n").as_bytes())
+            .is_err()
+    );
+    assert!(
+        ControlledRunSourceEnvelope::decode_canonical(
+            format!("{canonical}unknown = 1\n").as_bytes()
+        )
+        .is_err()
+    );
+
+    let mut invalid_binding = comparison_binding(Some(exposure));
+    invalid_binding.budget = 0;
+    assert!(invalid_binding.validate().is_err());
+    let mut tampered = bound.clone();
+    tampered.experiment_contract_fingerprint = [0x55; 32];
+    assert!(tampered.validate().is_err());
+    let mut tampered = bound.clone();
+    tampered.comparison_key = [0x66; 32];
+    assert!(tampered.validate().is_err());
+
+    let mut successor = bound.clone();
+    successor.parent_revision_id = Some(bound.revision_id);
+    successor.revision_id = RevisionId::new_v7();
+    successor.source_receipt_refs.push(receipt(9));
+    successor.source_receipt_refs.sort();
+    successor
+        .comparison_execution_binding
+        .as_mut()
+        .unwrap()
+        .algorithm_revision = "algorithm-v2".into();
+    successor.experiment_contract_fingerprint =
+        successor.recompute_exact_contract_fingerprint().unwrap();
+    successor.comparison_key = successor.recompute_comparison_key().unwrap();
+    assert!(bound.validate_successor(&successor).is_err());
 }
 
 #[test]
@@ -899,6 +1034,11 @@ async fn real_four_table_batch_rebuild_restart_and_fail_closed_relations() {
     );
     let view = AutoresearchCurrentView::from_snapshot(&incremental).unwrap();
     assert_eq!(view.runs[&run.run_id], run_with_artifact);
+    assert!(
+        view.runs[&run.run_id]
+            .comparison_execution_binding
+            .is_none()
+    );
     assert_eq!(view.results[&verified.result_evidence_id], verified);
     assert_eq!(view.artifacts[&artifact.work_artifact_id], artifact);
     let journal_len = writer.journal_rows().await.unwrap().len();

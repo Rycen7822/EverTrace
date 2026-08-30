@@ -407,6 +407,7 @@ mod tests {
             metric_extractor_version: "safe-parser-v1".into(),
             multi_cas_metric_policy: MultiCasMetricPolicy::RejectMultipleParsed,
             environment_fingerprint: "safe-environment".into(),
+            comparison_execution_binding: None,
             work_artifact_refs: Vec::new(),
             terminal_evidence_refs: Vec::new(),
             created_at_us: 19,

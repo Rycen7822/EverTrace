@@ -513,8 +513,232 @@ impl ProcedureState {
             .is_ok_and(|revision_id| self.revisions.contains_key(&revision_id))
     }
 
+    pub(super) fn is_current_revision_id(&self, revision_id: RevisionId) -> bool {
+        self.revisions
+            .get(&revision_id)
+            .is_some_and(|(revision, _)| {
+                self.current_revision(revision.procedure_id)
+                    .is_some_and(|current| current.revision_id == revision_id)
+            })
+    }
+
     pub(super) fn revision_refs(&self) -> impl Iterator<Item = &RevisionId> {
         self.revisions.keys()
+    }
+
+    pub(super) fn effect_usages(
+        &self,
+    ) -> impl Iterator<Item = (&evertrace_domain::procedure::ProcedureUsageRevision, u64)> {
+        self.usages.values().map(|(usage, seq)| (usage, *seq))
+    }
+
+    pub(super) fn controlled_usage_anchor(
+        &self,
+        procedure_revision_id: RevisionId,
+        attempt_id: evertrace_domain::ids::AttemptId,
+    ) -> Result<Option<&evertrace_domain::procedure::ProcedureUsageRevision>, StoreError> {
+        let mut matches = self.usages.values().filter_map(|(usage, _)| {
+            (usage.procedure_revision_id == procedure_revision_id
+                && usage.attempt_ids.contains(&attempt_id))
+            .then_some(usage)
+        });
+        let value = matches.next();
+        if matches.next().is_some() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(value)
+    }
+
+    pub(super) fn effect_negative_usage_state(
+        &self,
+    ) -> (BTreeSet<ProcedureUsageId>, BTreeMap<ProcedureUsageId, u64>) {
+        let mut active = BTreeSet::new();
+        let mut watermarks = BTreeMap::new();
+        for (negative_id, (review, review_seq)) in &self.current_negative_reviews {
+            let Some((negative, negative_seq)) = self.negative_evidence.get(negative_id) else {
+                continue;
+            };
+            watermarks
+                .entry(negative.procedure_usage_id)
+                .and_modify(|watermark: &mut u64| {
+                    *watermark = (*watermark).max(*negative_seq).max(*review_seq);
+                })
+                .or_insert((*negative_seq).max(*review_seq));
+            if matches!(
+                review.status,
+                ProcedureNegativeReviewStatus::Pending | ProcedureNegativeReviewStatus::Upheld
+            ) {
+                active.insert(negative.procedure_usage_id);
+            }
+        }
+        (active, watermarks)
+    }
+
+    pub(super) fn effect_rows(
+        &self,
+        episodes: &BTreeMap<RevisionId, (evertrace_domain::work::WorkEpisode, u64)>,
+        snapshots: &BTreeMap<
+            evertrace_domain::ids::WorktreeSnapshotId,
+            (evertrace_domain::repository::WorktreeSnapshot, u64),
+        >,
+        worktrees: &BTreeMap<
+            evertrace_domain::ids::WorktreeId,
+            (evertrace_domain::repository::WorktreeInstance, u64),
+        >,
+        results: &BTreeMap<RevisionId, (evertrace_domain::semantic::ResultEvidence, u64)>,
+        artifacts: &BTreeMap<RevisionId, (evertrace_domain::work::WorkArtifact, u64)>,
+        generation: u64,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
+        use evertrace_domain::{
+            procedure::{
+                ObservationalUsageInput, ProcedureContextAnchor, ProcedureEffectContext,
+                ProcedureTruth,
+            },
+            semantic::{ConstraintBinding, ConstraintField, ConstraintValue},
+        };
+
+        let mut inputs = Vec::new();
+        let mut cohort_watermarks = BTreeMap::new();
+        let (active_negative_usages, negative_usage_watermarks) =
+            self.effect_negative_usage_state();
+        let current_artifacts = current_effect_artifacts(artifacts);
+        for (usage, seq) in self.effect_usages() {
+            let (episode, episode_seq) = episodes
+                .get(&usage.exposure_episode_revision_id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if episode.task_id != usage.task_id
+                || episode.workstream_id != usage.workstream_id
+                || episode.repository_instance_id != usage.local_context.repository_id
+                || episode.worktree_instance_id != usage.local_context.worktree_id
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let outcome_supported = usage.outcome_supported == ProcedureTruth::True;
+            let revision = self
+                .current_revision_by_id(usage.procedure_revision_id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            let fields = revision.draft.applicability_expr.referenced_fields();
+            let mut bindings = Vec::new();
+            if fields.contains(&ConstraintField::Phase) {
+                bindings.push(ConstraintBinding {
+                    field: ConstraintField::Phase,
+                    value: ConstraintValue::Text(effect_phase(usage.local_context.phase).into()),
+                });
+            }
+            if fields.contains(&ConstraintField::FailureSignature)
+                && let Some(value) = &usage.local_context.failure_signature
+            {
+                bindings.push(ConstraintBinding {
+                    field: ConstraintField::FailureSignature,
+                    value: ConstraintValue::Text(value.clone()),
+                });
+            }
+            bindings.sort_by_key(|binding| binding.field);
+            let anchor = match (
+                usage.local_context.repository_id,
+                usage.local_context.worktree_id,
+            ) {
+                (Some(repository_id), Some(worktree_id)) => {
+                    let Some(snapshot_id) = episode.entry_worktree_snapshot_id else {
+                        continue;
+                    };
+                    let snapshot = snapshots
+                        .get(&snapshot_id)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    let worktree = worktrees
+                        .get(&worktree_id)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    if snapshot.0.worktree_instance_id != worktree_id
+                        || worktree.0.repository_instance_id != repository_id
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    ProcedureContextAnchor::Repository {
+                        repository_id,
+                        worktree_id,
+                        worktree_snapshot_id: snapshot_id,
+                        worktree_lineage: worktree_id.to_string(),
+                    }
+                }
+                (None, None) => {
+                    let fixture_refs = observational_effect_refs(
+                        usage,
+                        episode,
+                        results,
+                        artifacts,
+                        &current_artifacts,
+                    );
+                    if fixture_refs.is_empty() {
+                        continue;
+                    }
+                    ProcedureContextAnchor::NonRepository { fixture_refs }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            };
+            let context = ProcedureEffectContext {
+                procedure_revision_id: usage.procedure_revision_id,
+                task_id: usage.task_id,
+                anchor,
+                operands: bindings,
+                phase_kind: usage.local_context.phase,
+                failure_signature: usage.local_context.failure_signature.clone(),
+                toolchain: "unknown".into(),
+                model_revision: "unknown".into(),
+                harness_revision: "unknown".into(),
+                algorithm_revision: "unknown".into(),
+                budget: 0,
+                acceptance_boundary: usage.decision_boundary_ref.clone(),
+            };
+            context.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            let source_watermark = usage
+                .source_watermark
+                .max(seq)
+                .max(*episode_seq)
+                .max(
+                    episode
+                        .entry_worktree_snapshot_id
+                        .and_then(|id| snapshots.get(&id).map(|(_, seq)| *seq))
+                        .unwrap_or(0),
+                )
+                .max(
+                    negative_usage_watermarks
+                        .get(&usage.procedure_usage_id)
+                        .copied()
+                        .unwrap_or(0),
+                );
+            let fingerprint = context
+                .fingerprint()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            cohort_watermarks
+                .entry((usage.procedure_revision_id, fingerprint))
+                .and_modify(|watermark: &mut u64| {
+                    *watermark = (*watermark).max(source_watermark);
+                })
+                .or_insert(source_watermark);
+            if !outcome_supported && !active_negative_usages.contains(&usage.procedure_usage_id) {
+                continue;
+            }
+            inputs.push(ObservationalUsageInput {
+                procedure_usage_id: usage.procedure_usage_id,
+                context,
+                outcome_supported,
+                evidence_refs: usage.evidence_refs.clone(),
+                source_watermark,
+            });
+        }
+        evertrace_domain::procedure::compile_observational_effects(inputs)
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .into_iter()
+            .map(|mut projection| {
+                if let Some(watermark) = cohort_watermarks.get(&(
+                    projection.procedure_revision_id,
+                    projection.context_fingerprint_hash,
+                )) {
+                    projection.source_watermark = projection.source_watermark.max(*watermark);
+                }
+                super::procedure_effect::row(projection, generation)
+            })
+            .collect()
     }
 
     pub(super) fn current_revision(
@@ -526,6 +750,15 @@ impl ProcedureState {
             .map(|(revision, _)| revision)
             .filter(|revision| revision.procedure_id == procedure_id)
             .max_by_key(|revision| revision.revision_generation)
+    }
+
+    pub(super) fn current_revision_by_id(
+        &self,
+        revision_id: RevisionId,
+    ) -> Option<&ProcedureRevision> {
+        self.revisions
+            .get(&revision_id)
+            .map(|(revision, _)| revision)
     }
 
     pub(super) fn apply(&mut self, payload: JournalPayload, seq: u64) -> Result<bool, StoreError> {
@@ -1096,6 +1329,91 @@ pub(super) const fn publication(state: ProcedurePublicationState) -> &'static st
         ProcedurePublicationState::Suspended => "suspended",
         ProcedurePublicationState::RolledBack => "rolled_back",
         ProcedurePublicationState::Superseded => "superseded",
+    }
+}
+
+fn current_effect_artifacts(
+    artifacts: &BTreeMap<RevisionId, (evertrace_domain::work::WorkArtifact, u64)>,
+) -> BTreeMap<evertrace_domain::ids::WorkArtifactId, RevisionId> {
+    let mut current = BTreeMap::<_, (RevisionId, u64)>::new();
+    for (revision_id, (artifact, seq)) in artifacts {
+        current
+            .entry(artifact.work_artifact_id)
+            .and_modify(|value| {
+                if value.1 < *seq {
+                    *value = (*revision_id, *seq);
+                }
+            })
+            .or_insert((*revision_id, *seq));
+    }
+    current
+        .into_iter()
+        .map(|(id, (revision, _))| (id, revision))
+        .collect()
+}
+
+fn observational_effect_refs(
+    usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    episode: &evertrace_domain::work::WorkEpisode,
+    results: &BTreeMap<RevisionId, (evertrace_domain::semantic::ResultEvidence, u64)>,
+    artifacts: &BTreeMap<RevisionId, (evertrace_domain::work::WorkArtifact, u64)>,
+    current_artifacts: &BTreeMap<evertrace_domain::ids::WorkArtifactId, RevisionId>,
+) -> Vec<String> {
+    use evertrace_domain::work::ArtifactActor;
+    let actor = ArtifactActor::WorkEpisode(episode.episode_id);
+    usage
+        .evidence_refs
+        .iter()
+        .filter(|reference| {
+            let explicit = effect_episode_refs(episode).any(|value| value == *reference);
+            let Ok(revision_id) = reference.parse::<RevisionId>() else {
+                return false;
+            };
+            if let Some((artifact, _)) = artifacts.get(&revision_id) {
+                return explicit || effect_artifact_has_actor(artifact, actor);
+            }
+            results.get(&revision_id).is_some_and(|(result, _)| {
+                explicit
+                    || result.raw_artifact_refs.iter().any(|id| {
+                        current_artifacts
+                            .get(id)
+                            .and_then(|revision| artifacts.get(revision))
+                            .is_some_and(|(artifact, _)| effect_artifact_has_actor(artifact, actor))
+                    })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn effect_artifact_has_actor(
+    artifact: &evertrace_domain::work::WorkArtifact,
+    actor: evertrace_domain::work::ArtifactActor,
+) -> bool {
+    artifact.revision.produced_by_refs.contains(&actor)
+        || artifact.revision.consumed_by_refs.contains(&actor)
+}
+
+fn effect_episode_refs(
+    episode: &evertrace_domain::work::WorkEpisode,
+) -> impl Iterator<Item = &String> {
+    episode
+        .completed_outcome_refs
+        .iter()
+        .chain(&episode.selected_outcome_refs)
+        .chain(&episode.verification_refs)
+        .chain(&episode.semantic_digest_refs)
+}
+
+const fn effect_phase(value: evertrace_domain::procedure::ProcedureUsagePhase) -> &'static str {
+    use evertrace_domain::procedure::ProcedureUsagePhase;
+    match value {
+        ProcedureUsagePhase::BeforeEntry => "before_entry",
+        ProcedureUsagePhase::AtEntry => "at_entry",
+        ProcedureUsagePhase::InProgress => "in_progress",
+        ProcedureUsagePhase::RecoverableDeviation => "recoverable_deviation",
+        ProcedureUsagePhase::AlreadyCompleted => "already_completed",
+        ProcedureUsagePhase::Incompatible => "incompatible",
     }
 }
 

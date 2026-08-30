@@ -3729,7 +3729,70 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
     writer.commit(&later_replacement_command, 36).await.unwrap();
     let final_projection = writer.project().await.unwrap();
     assert_eq!(final_projection, writer.full_projection().await.unwrap());
+    let effect_rows = final_projection
+        .rows
+        .iter()
+        .filter(|row| row.object_kind.as_deref() == Some("procedure_context_effect"))
+        .collect::<Vec<_>>();
+    assert!(!effect_rows.is_empty());
+    assert!(effect_rows.iter().all(|row| {
+        serde_json::from_str::<
+            evertrace_domain::procedure::ProcedureContextEffectProjection,
+        >(row.payload_json.as_deref().unwrap())
+        .is_ok_and(|effect| {
+            effect.evidence_class
+                == evertrace_domain::procedure::ProcedureEffectEvidenceClass::ObservationalAssociation
+                && !effect.context.complete_for(&std::collections::BTreeSet::from([
+                    ConstraintField::Phase,
+                ]))
+        })
+    }));
+    let terminal_review_watermark = final_projection
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("procedure_negative_review"))
+        .filter(|row| {
+            serde_json::from_str::<JournalPayload>(row.payload_json.as_deref().unwrap()).is_ok_and(
+                |payload| {
+                    matches!(
+                        payload,
+                        JournalPayload::ProcedureNegativeReviewRecorded(review)
+                            if matches!(
+                                review.status,
+                                ProcedureNegativeReviewStatus::Dismissed
+                                    | ProcedureNegativeReviewStatus::Superseded
+                            )
+                    )
+                },
+            )
+        })
+        .map(|row| row.source_event_seq)
+        .max()
+        .unwrap();
+    assert!(
+        effect_rows
+            .iter()
+            .any(|row| row.source_event_seq >= terminal_review_watermark)
+    );
+    assert!(effect_rows.iter().all(|row| {
+        serde_json::from_str::<evertrace_domain::procedure::ProcedureContextEffectProjection>(
+            row.payload_json.as_deref().unwrap(),
+        )
+        .is_ok_and(|effect| effect.effect != evertrace_domain::procedure::ProcedureEffect::Negative)
+    }));
+    assert!(
+        writer
+            .search_rows()
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| { row.object_kind.as_deref() != Some("procedure_context_effect") })
+    );
     let relation_rows = writer.relation_rows().await.unwrap();
+    assert!(
+        relation_rows.iter().all(|row| {
+            row.relation_kind.as_deref() != Some("procedure_context_effect_authority")
+        })
+    );
     for expected in [
         "procedure_usage_to_revision",
         "procedure_usage_to_task",
