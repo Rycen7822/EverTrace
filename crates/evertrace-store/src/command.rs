@@ -20,7 +20,7 @@ use evertrace_domain::{
     },
     semantic::{
         Atom, CoreMembership, GlobalSuccessorSupportContract, GlobalSupportValidationEvent,
-        ResultEvidence, RevisionProposal, Scenario,
+        ResultEvidence, RevisionProposal, Scenario, SemanticDerivationRun, SemanticDigest,
     },
     work::{
         AdmissionFailureObservability, Attempt, CaptureReceipt, CompetingAttemptGroup,
@@ -539,6 +539,8 @@ pub enum JournalPayload {
     CoreMembershipRecorded(Box<CoreMembership>),
     GlobalSupportContractRecorded(Box<GlobalSuccessorSupportContract>),
     GlobalSupportValidationRecorded(Box<GlobalSupportValidationEvent>),
+    SemanticDigestRecorded(Box<SemanticDigest>),
+    SemanticDerivationRunRecorded(Box<SemanticDerivationRun>),
     RecallLedgerRecorded(Box<RecallLedgerEvent>),
 }
 
@@ -598,6 +600,8 @@ impl JournalPayload {
             Self::CoreMembershipRecorded(_) => "core_membership_recorded_v1",
             Self::GlobalSupportContractRecorded(_) => "global_support_contract_recorded_v1",
             Self::GlobalSupportValidationRecorded(_) => "global_support_validation_recorded_v1",
+            Self::SemanticDigestRecorded(_) => "semantic_digest_recorded_v1",
+            Self::SemanticDerivationRunRecorded(_) => "semantic_derivation_run_recorded_v1",
             Self::RecallLedgerRecorded(_) => "recall_ledger_recorded_v1",
         }
     }
@@ -648,6 +652,8 @@ impl JournalPayload {
             | Self::CoreMembershipRecorded(_)
             | Self::GlobalSupportContractRecorded(_)
             | Self::GlobalSupportValidationRecorded(_)
+            | Self::SemanticDigestRecorded(_)
+            | Self::SemanticDerivationRunRecorded(_)
             | Self::RecallLedgerRecorded(_) => RecordClass::ObjectEvent,
             _ => RecordClass::RuntimeEvent,
         }
@@ -838,6 +844,12 @@ impl JournalPayload {
             Self::GlobalSupportContractRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
+            Self::SemanticDigestRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::SemanticDerivationRunRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
             Self::GlobalSupportValidationRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
@@ -1017,6 +1029,10 @@ impl JournalPayload {
             }
             Self::GlobalSupportValidationRecorded(value) => {
                 tagged_json("global_support_validation_recorded", value)
+            }
+            Self::SemanticDigestRecorded(value) => tagged_json("semantic_digest_recorded", value),
+            Self::SemanticDerivationRunRecorded(value) => {
+                tagged_json("semantic_derivation_run_recorded", value)
             }
             Self::RecallLedgerRecorded(value) => tagged_json("recall_ledger_recorded", value),
         }

@@ -513,6 +513,21 @@ impl ProcedureState {
             .is_ok_and(|revision_id| self.revisions.contains_key(&revision_id))
     }
 
+    pub(super) fn revision_refs(&self) -> impl Iterator<Item = &RevisionId> {
+        self.revisions.keys()
+    }
+
+    pub(super) fn current_revision(
+        &self,
+        procedure_id: evertrace_domain::ids::ProcedureId,
+    ) -> Option<&ProcedureRevision> {
+        self.revisions
+            .values()
+            .map(|(revision, _)| revision)
+            .filter(|revision| revision.procedure_id == procedure_id)
+            .max_by_key(|revision| revision.revision_generation)
+    }
+
     pub(super) fn apply(&mut self, payload: JournalPayload, seq: u64) -> Result<bool, StoreError> {
         match payload {
             JournalPayload::ProcedureRevisionRecorded(value) => {

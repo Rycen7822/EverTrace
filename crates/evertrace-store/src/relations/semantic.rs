@@ -6,7 +6,7 @@ use evertrace_domain::procedure::{
 };
 use evertrace_domain::semantic::{
     Atom, CoreMembership, GlobalSuccessorSupportContract, ProposalStatus, ProposalTargetId,
-    RevisionProposal,
+    RevisionProposal, SemanticDigest, WikiProjection,
 };
 
 use crate::StoreError;
@@ -41,6 +41,11 @@ pub enum SemanticRelationKind {
     ProcedureNegativeToRevision,
     ProcedureNegativeToTask,
     ProcedureReviewToNegative,
+    WikiToSourceAtom,
+    WikiToSourceEpisode,
+    SemanticDigestToEpisode,
+    SemanticDigestToTask,
+    SemanticDigestToDirectSource,
 }
 
 pub fn build_procedure_usage_relation_rows(
@@ -262,6 +267,60 @@ pub struct SemanticRelationRow {
     pub kind: SemanticRelationKind,
     pub source_id: String,
     pub target_id: String,
+}
+
+pub fn build_wiki_relation_rows(
+    projections: &[WikiProjection],
+) -> Result<Vec<SemanticRelationRow>, StoreError> {
+    let mut rows = BTreeSet::new();
+    for projection in projections {
+        projection
+            .validate()
+            .map_err(|_| StoreError::InvalidInput)?;
+        for atom_id in &projection.source_atom_ids {
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::WikiToSourceAtom,
+                source_id: projection.page_id.to_string(),
+                target_id: atom_id.to_string(),
+            });
+        }
+        for episode_id in &projection.source_episode_ids {
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::WikiToSourceEpisode,
+                source_id: projection.page_id.to_string(),
+                target_id: episode_id.to_string(),
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
+pub fn build_semantic_digest_relation_rows(
+    digests: &[SemanticDigest],
+) -> Result<Vec<SemanticRelationRow>, StoreError> {
+    let mut rows = BTreeSet::new();
+    for digest in digests {
+        digest.validate().map_err(|_| StoreError::InvalidInput)?;
+        let source_id = digest.semantic_digest_id.to_string();
+        rows.insert(SemanticRelationRow {
+            kind: SemanticRelationKind::SemanticDigestToEpisode,
+            source_id: source_id.clone(),
+            target_id: digest.episode_id.to_string(),
+        });
+        rows.insert(SemanticRelationRow {
+            kind: SemanticRelationKind::SemanticDigestToTask,
+            source_id: source_id.clone(),
+            target_id: digest.task_id.to_string(),
+        });
+        for reference in &digest.selected_direct_refs {
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::SemanticDigestToDirectSource,
+                source_id: source_id.clone(),
+                target_id: reference.clone(),
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
 }
 
 pub fn build_semantic_relation_rows(

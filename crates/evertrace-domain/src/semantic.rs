@@ -8,6 +8,7 @@ use crate::{
 
 mod atom;
 mod constraint;
+mod derivation;
 mod proposal;
 mod scenario_core;
 
@@ -21,6 +22,12 @@ pub use atom::{
 pub use constraint::{
     ApplicabilityExpr, ConstraintBinding, ConstraintExpr, ConstraintField, ConstraintState,
     ConstraintTruth, ConstraintValue,
+};
+pub use derivation::{
+    DerivationQuotaUsage, DerivationRunStatus, SemanticCandidate, SemanticCompleteness,
+    SemanticDerivationRun, SemanticDigest, SemanticDigestApplication, SemanticDigestStatus,
+    SemanticDigestTrigger, SemanticOmission, SemanticStructuredDelta, WikiProjection,
+    job_fingerprint,
 };
 pub use proposal::{
     AcceptedProposalTarget, AtomProposalPayload, CoreMembershipProposalPayload,

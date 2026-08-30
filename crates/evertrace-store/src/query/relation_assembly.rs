@@ -396,6 +396,13 @@ pub(super) fn add_semantic(
             SemanticRelationKind::ProcedureNegativeToRevision => "procedure_negative_to_revision",
             SemanticRelationKind::ProcedureNegativeToTask => "procedure_negative_to_task",
             SemanticRelationKind::ProcedureReviewToNegative => "procedure_review_to_negative",
+            SemanticRelationKind::WikiToSourceAtom => "wiki_to_source_atom",
+            SemanticRelationKind::WikiToSourceEpisode => "wiki_to_source_episode",
+            SemanticRelationKind::SemanticDigestToEpisode => "semantic_digest_to_episode",
+            SemanticRelationKind::SemanticDigestToTask => "semantic_digest_to_task",
+            SemanticRelationKind::SemanticDigestToDirectSource => {
+                "semantic_digest_to_direct_source"
+            }
         };
         out.insert(RelationProjectionRow::edge(
             kind,

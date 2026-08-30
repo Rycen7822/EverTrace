@@ -12,8 +12,8 @@ use evertrace_domain::{
         source_receipt_id,
     },
     ids::{
-        CaptureReceiptId, CommandId, CompetingAttemptGroupId, ExecutionLaneId, OperationId, TaskId,
-        WorkBindingRevisionId, WorkEpisodeId, WorkstreamId,
+        CaptureReceiptId, CommandId, CompetingAttemptGroupId, ExecutionLaneId, OperationId,
+        SemanticDigestId, TaskId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId,
     },
     revision::RevisionId,
     work::{
@@ -152,6 +152,28 @@ fn source_evidence(sequence: u64) -> (SourceReceipt, SourceObservation) {
         scope_effect_claims: vec![],
     };
     (receipt, observation)
+}
+
+#[test]
+fn semantic_only_episode_successor_advances_only_semantic_fields() {
+    let root = task();
+    let stream = stream(root.task_id, 2);
+    let episode = new_episode(&stream, None, 2).unwrap();
+    let mut successor = episode.clone();
+    successor.revision_id = RevisionId::new_v7();
+    successor.predecessor_revision_id = Some(episode.revision_id);
+    successor.revision_generation += 1;
+    successor.semantic_watermark = episode.source_watermark;
+    successor.pending_semantic_delta = None;
+    successor.semantic_digest_refs = vec![SemanticDigestId::new_v7().to_string()];
+    episode.validate_successor(&successor).unwrap();
+
+    let mut changed = successor.clone();
+    changed.task_id = TaskId::new_v7();
+    assert!(episode.validate_successor(&changed).is_err());
+    let mut skipped = successor;
+    skipped.semantic_watermark = episode.source_watermark.saturating_sub(1);
+    assert!(episode.validate_successor(&skipped).is_err());
 }
 
 fn evidence_command(receipt: SourceReceipt, observation: SourceObservation) -> JournalCommand {

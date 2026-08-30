@@ -371,6 +371,7 @@ impl WorkEpisode {
             refs(&self.verification_refs),
             refs(&self.open_loops),
             refs(&self.checkpoint_refs),
+            refs(&self.semantic_digest_refs),
             ids(&self.capture_receipt_revision_ids),
             refs(&self.capture_gap_refs),
             ids(&self.capture_outage_refs),
@@ -394,7 +395,6 @@ impl WorkEpisode {
             || !all_lists
             || !self.experiment_run_refs.is_empty()
             || !self.work_artifact_refs.is_empty()
-            || !self.semantic_digest_refs.is_empty()
             || (self.lifecycle_status == EpisodeLifecycle::Open
                 && (self.boundary_status == BoundaryStatus::Confirmed
                     || self.exit_worktree_snapshot_id.is_some()))
@@ -417,6 +417,11 @@ impl WorkEpisode {
             .revision_generation
             .checked_add(1)
             .ok_or(WorkError::InvalidWorkIdentity)?;
+        if self.semantic_watermark != next.semantic_watermark
+            || self.semantic_digest_refs != next.semantic_digest_refs
+        {
+            return self.validate_semantic_successor(next, next_generation);
+        }
         let lifecycle_ok = self.lifecycle_status == next.lifecycle_status
             || (self.lifecycle_status == EpisodeLifecycle::Open
                 && matches!(
@@ -482,6 +487,45 @@ impl WorkEpisode {
                 &self.segmentation_correction_refs,
                 &next.segmentation_correction_refs,
             )
+        {
+            return Err(WorkError::InvalidWorkIdentity);
+        }
+        Ok(())
+    }
+
+    fn validate_semantic_successor(
+        &self,
+        next: &Self,
+        next_generation: u64,
+    ) -> Result<(), WorkError> {
+        let mut frozen = next.clone();
+        frozen.revision_id = self.revision_id;
+        frozen.predecessor_revision_id = self.predecessor_revision_id;
+        frozen.revision_generation = self.revision_generation;
+        frozen.semantic_watermark = self.semantic_watermark;
+        frozen.pending_semantic_delta = self.pending_semantic_delta;
+        frozen.semantic_digest_refs = self.semantic_digest_refs.clone();
+        let appended = self
+            .semantic_digest_refs
+            .iter()
+            .all(|reference| next.semantic_digest_refs.binary_search(reference).is_ok())
+            && next.semantic_digest_refs.len() == self.semantic_digest_refs.len() + 1;
+        let pending_ok = if next.semantic_watermark == next.source_watermark {
+            next.pending_semantic_delta.is_none()
+        } else {
+            next.pending_semantic_delta.is_some_and(|interval| {
+                interval.after_watermark == next.semantic_watermark
+                    && interval.through_watermark == next.source_watermark
+            })
+        };
+        if frozen != *self
+            || next.revision_generation != next_generation
+            || next.predecessor_revision_id != Some(self.revision_id)
+            || next.revision_id == self.revision_id
+            || next.semantic_watermark <= self.semantic_watermark
+            || next.semantic_watermark > self.source_watermark
+            || !appended
+            || !pending_ok
         {
             return Err(WorkError::InvalidWorkIdentity);
         }

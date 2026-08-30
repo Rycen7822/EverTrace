@@ -261,6 +261,8 @@ uuid_id!(ScopeEffectId, "se");
 uuid_id!(WorkBindingRevisionId, "wb");
 uuid_id!(ProcedureUsageId, "puse");
 uuid_id!(ProcedureNegativeEvidenceId, "pneg");
+uuid_id!(SemanticDigestId, "sdig");
+uuid_id!(SemanticDerivationRunId, "srun");
 uuid_id!(RepositoryId, "repo");
 uuid_id!(WorktreeId, "wt");
 uuid_id!(WorktreeSnapshotId, "wts");
@@ -315,6 +317,8 @@ impl_new_v7!(
     WorkBindingRevisionId,
     ProcedureUsageId,
     ProcedureNegativeEvidenceId,
+    SemanticDigestId,
+    SemanticDerivationRunId,
     DuplicateGroupId,
     RepositoryId,
     WorktreeId,
@@ -372,6 +376,8 @@ pub enum AnyPublicId {
     Procedure(ProcedureId),
     RevisionProposal(RevisionProposalId),
     CoreMembership(CoreMembershipId),
+    SemanticDigest(SemanticDigestId),
+    SemanticDerivationRun(SemanticDerivationRunId),
     WikiProjection(WikiProjectionId),
     CoreProjection(CoreProjectionId),
     Scenario(ScenarioId),
@@ -430,6 +436,8 @@ impl AnyPublicId {
             Self::Procedure(_) => "proc",
             Self::RevisionProposal(_) => "proposal",
             Self::CoreMembership(_) => "coremem",
+            Self::SemanticDigest(_) => "sdig",
+            Self::SemanticDerivationRun(_) => "srun",
             Self::WikiProjection(_) => "wiki",
             Self::CoreProjection(_) => "core",
             Self::Scenario(_) => "scenario",
@@ -477,6 +485,8 @@ impl FromStr for AnyPublicId {
             "proc" => Ok(Self::Procedure(value.parse()?)),
             "proposal" => Ok(Self::RevisionProposal(value.parse()?)),
             "coremem" => Ok(Self::CoreMembership(value.parse()?)),
+            "sdig" => Ok(Self::SemanticDigest(value.parse()?)),
+            "srun" => Ok(Self::SemanticDerivationRun(value.parse()?)),
             "wiki" => Ok(Self::WikiProjection(value.parse()?)),
             "core" => Ok(Self::CoreProjection(value.parse()?)),
             "scenario" => Ok(Self::Scenario(value.parse()?)),

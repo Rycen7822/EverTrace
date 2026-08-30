@@ -498,6 +498,8 @@ impl SearchProjectionRow {
                             | "global_support_contract"
                             | "global_support_validation"
                             | "procedure_revision"
+                            | "semantic_digest"
+                            | "wiki_projection"
                     )
                 )
                 || !matches!(self.currentness.as_deref(), Some("current" | "historical"))
@@ -602,6 +604,7 @@ fn valid_object_metadata(row: &SearchProjectionRow) -> bool {
                 | "not_applicable"
                 | "unverified"
                 | "supported"
+                | "derived"
                 | "disputed"
                 | "refuted"
         ) | None
