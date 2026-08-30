@@ -10,7 +10,7 @@ use std::{
 use evertrace_domain::{config::EffectiveConfig, error::ErrorCode, ids::RequestId};
 use evertrace_engine::{EngineService, HealthDispatchError, RuntimeMode};
 use evertrace_protocol::{
-    LocalServer, ServerOptions,
+    LocalClient, LocalServer, ServerOptions,
     command::{Command, CommandEnvelope},
     dto::{ClientKind, HealthMode, MAX_FRAME_SIZE, PROTOCOL_VERSION},
     envelope::{ClientEnvelope, ServerEnvelope},
@@ -19,7 +19,7 @@ use evertrace_protocol::{
     handshake::{Handshake, HandshakeAck},
     notification::{Notification, NotificationEnvelope},
     request_health,
-    response::HealthResponse,
+    response::{HealthResponse, Response, ResponseEnvelope},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -544,6 +544,123 @@ async fn negotiated_client_receives_server_stopping_notification() {
         })
     );
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn legacy_request_rejects_notification_before_response() {
+    let temp = TempDir::new().unwrap();
+    let socket = temp.path().join("notification.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: ClientEnvelope = read_frame(&mut stream, MAX_FRAME_SIZE, WAIT).await.unwrap();
+        write_frame(
+            &mut stream,
+            &ServerEnvelope::HandshakeAck(HandshakeAck {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: "server".into(),
+                max_frame: MAX_FRAME_SIZE as u32,
+            }),
+            MAX_FRAME_SIZE,
+            WAIT,
+        )
+        .await
+        .unwrap();
+        let _: ClientEnvelope = read_frame(&mut stream, MAX_FRAME_SIZE, WAIT).await.unwrap();
+        write_frame(
+            &mut stream,
+            &ServerEnvelope::Notification(NotificationEnvelope {
+                notification: Notification::ServerStopping,
+            }),
+            MAX_FRAME_SIZE,
+            WAIT,
+        )
+        .await
+        .unwrap();
+    });
+    let mut client = LocalClient::connect(&socket, "client", ClientKind::Cli, WAIT)
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.request(request_id(), Command::Health).await,
+        Err(ProtocolError::UnexpectedMessage)
+    ));
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn split_receiver_stays_idle_then_receives_server_stopping() {
+    let temp = TempDir::new().unwrap();
+    let socket = temp.path().join("idle-notification.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: ClientEnvelope = read_frame(&mut stream, MAX_FRAME_SIZE, WAIT).await.unwrap();
+        write_frame(
+            &mut stream,
+            &ServerEnvelope::HandshakeAck(HandshakeAck {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: "server".into(),
+                max_frame: MAX_FRAME_SIZE as u32,
+            }),
+            MAX_FRAME_SIZE,
+            WAIT,
+        )
+        .await
+        .unwrap();
+        let ClientEnvelope::Command(command) =
+            read_frame(&mut stream, MAX_FRAME_SIZE, WAIT).await.unwrap()
+        else {
+            panic!("expected command")
+        };
+        write_frame(
+            &mut stream,
+            &ServerEnvelope::Response(ResponseEnvelope {
+                request_id: command.request_id,
+                response: Response::Health(health(HealthMode::Normal)),
+            }),
+            MAX_FRAME_SIZE,
+            WAIT,
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_millis(80)).await;
+        write_frame(
+            &mut stream,
+            &ServerEnvelope::Notification(NotificationEnvelope {
+                notification: Notification::ServerStopping,
+            }),
+            MAX_FRAME_SIZE,
+            WAIT,
+        )
+        .await
+        .unwrap();
+    });
+    let client = LocalClient::connect(
+        &socket,
+        "client",
+        ClientKind::Cli,
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    let (mut sender, mut receiver) = client.into_split();
+    sender
+        .send(CommandEnvelope {
+            request_id: request_id(),
+            command: Command::Health,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        receiver.recv().await.unwrap(),
+        evertrace_protocol::LocalIncoming::Response(_)
+    ));
+    assert_eq!(
+        receiver.recv().await.unwrap(),
+        evertrace_protocol::LocalIncoming::Notification(Notification::ServerStopping)
+    );
+    peer.await.unwrap();
 }
 
 #[tokio::test]

@@ -48,12 +48,7 @@ where
     }
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload).map_err(map_sync_read)?;
-    std::str::from_utf8(&payload).map_err(|_| FrameError::InvalidUtf8)?;
-    let value: T = serde_json::from_slice(&payload).map_err(|_| FrameError::InvalidJson)?;
-    if canonical_json(&value)? != payload {
-        return Err(FrameError::NonCanonical);
-    }
-    Ok(value)
+    decode_payload(payload)
 }
 
 pub fn write_frame_sync<T: Serialize>(
@@ -97,33 +92,79 @@ where
     T: DeserializeOwned + Serialize,
 {
     let mut prefix = [0_u8; 4];
-    match timeout(frame_timeout, reader.read_exact(&mut prefix)).await {
-        Err(_) => return Err(FrameError::Timeout),
-        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(FrameError::Closed);
-        }
-        Ok(Err(error)) => return Err(FrameError::Io(error)),
-        Ok(Ok(_)) => {}
-    }
+    read_exact_timeout(reader, &mut prefix, frame_timeout).await?;
+    read_frame_after_prefix(reader, prefix, max_payload, frame_timeout).await
+}
+
+#[cfg(feature = "runtime")]
+pub(crate) async fn read_frame_after_idle<T>(
+    reader: &mut (impl AsyncRead + Unpin),
+    max_payload: usize,
+    frame_timeout: Duration,
+) -> Result<T, FrameError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let mut prefix = [0_u8; 4];
+    reader
+        .read_exact(&mut prefix[..1])
+        .await
+        .map_err(map_async_read)?;
+    read_exact_timeout(reader, &mut prefix[1..], frame_timeout).await?;
+    read_frame_after_prefix(reader, prefix, max_payload, frame_timeout).await
+}
+
+#[cfg(feature = "runtime")]
+async fn read_frame_after_prefix<T>(
+    reader: &mut (impl AsyncRead + Unpin),
+    prefix: [u8; 4],
+    max_payload: usize,
+    frame_timeout: Duration,
+) -> Result<T, FrameError>
+where
+    T: DeserializeOwned + Serialize,
+{
     let length = u32::from_be_bytes(prefix) as usize;
     if length > max_payload {
         return Err(FrameError::Oversize);
     }
     let mut payload = vec![0_u8; length];
-    match timeout(frame_timeout, reader.read_exact(&mut payload)).await {
-        Err(_) => return Err(FrameError::Timeout),
-        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(FrameError::Closed);
-        }
-        Ok(Err(error)) => return Err(FrameError::Io(error)),
-        Ok(Ok(_)) => {}
-    }
+    read_exact_timeout(reader, &mut payload, frame_timeout).await?;
+    decode_payload(payload)
+}
+
+fn decode_payload<T>(payload: Vec<u8>) -> Result<T, FrameError>
+where
+    T: DeserializeOwned + Serialize,
+{
     std::str::from_utf8(&payload).map_err(|_| FrameError::InvalidUtf8)?;
     let value: T = serde_json::from_slice(&payload).map_err(|_| FrameError::InvalidJson)?;
     if canonical_json(&value)? != payload {
         return Err(FrameError::NonCanonical);
     }
     Ok(value)
+}
+
+#[cfg(feature = "runtime")]
+async fn read_exact_timeout(
+    reader: &mut (impl AsyncRead + Unpin),
+    buffer: &mut [u8],
+    frame_timeout: Duration,
+) -> Result<(), FrameError> {
+    timeout(frame_timeout, reader.read_exact(buffer))
+        .await
+        .map_err(|_| FrameError::Timeout)?
+        .map(|_| ())
+        .map_err(map_async_read)
+}
+
+#[cfg(feature = "runtime")]
+fn map_async_read(error: io::Error) -> FrameError {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        FrameError::Closed
+    } else {
+        FrameError::Io(error)
+    }
 }
 
 #[cfg(feature = "runtime")]

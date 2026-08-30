@@ -5,7 +5,7 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::dto::HealthMode;
+use crate::dto::{HealthMode, PROTOCOL_VERSION};
 use crate::envelope::McpResultEnvelope;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -103,6 +103,20 @@ pub struct HealthResponse {
     pub config_version: u32,
     pub effective_config_hash: String,
     pub algorithm_revision: u32,
+}
+
+impl HealthResponse {
+    pub fn validate(&self) -> bool {
+        self.protocol_version == PROTOCOL_VERSION
+            && self.config_version == 1
+            && self.mode == HealthMode::Normal
+            && self.algorithm_revision != 0
+            && self.effective_config_hash.len() == 64
+            && self
+                .effective_config_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
