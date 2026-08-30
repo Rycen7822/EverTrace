@@ -36,10 +36,10 @@ use lancedb::Table;
 
 use crate::{
     command::{
-        ATOM_RECORDED_EVENT_TYPE, DirtyTarget, DurableJob, JobStatus, JournalCommand,
-        JournalPayload, NormalizationWatermark, ObjectFamily, OutboxEntry, SourceCloseDecision,
-        SourceCloseReconciliation, SourceIngestWatermark, SourceRevisionRecorded, StoreError,
-        WatermarkAdvanced, source_revision_ref,
+        ATOM_RECORDED_EVENT_TYPE, DirtyTarget, DurableJob, JobStatus, JobTerminalReason,
+        JournalCommand, JournalPayload, NormalizationWatermark, ObjectFamily, OutboxEntry,
+        SourceCloseDecision, SourceCloseReconciliation, SourceIngestWatermark,
+        SourceRevisionRecorded, StoreError, WatermarkAdvanced, source_revision_ref,
     },
     journal::{
         JournalRow, read_all_journal_rows, read_journal_after, read_journal_frontier,
@@ -114,6 +114,57 @@ const MAX_S10_RECONCILIATION_DEPENDENCIES: usize = 64;
 pub struct ProjectionSnapshot {
     pub frontier: u64,
     pub rows: Vec<ObjectRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSchedulerView {
+    pub frontier: u64,
+    pub dirty: Vec<DirtyTarget>,
+    pub outbox: Vec<OutboxEntry>,
+    pub jobs: Vec<DurableJob>,
+}
+
+impl RuntimeSchedulerView {
+    pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let mut dirty = BTreeMap::new();
+        let mut outbox = BTreeMap::new();
+        let mut jobs = BTreeMap::new();
+        for row in snapshot.data_rows() {
+            if row.row_class != Some(ObjectRowClass::Runtime) {
+                continue;
+            }
+            let Some(json) = row.payload_json.as_deref() else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let payload: JournalPayload =
+                serde_json::from_str(json).map_err(|_| StoreError::StoreCorrupt)?;
+            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            match payload {
+                JournalPayload::DirtyTarget(value) => {
+                    if dirty.insert(value.stable_key(), value).is_some() {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::OutboxEnqueued(value) => {
+                    if outbox.insert(value.outbox_id.clone(), value).is_some() {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::JobState(value) => {
+                    if jobs.insert(value.job_id, value).is_some() {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            frontier: snapshot.frontier,
+            dirty: dirty.into_values().collect(),
+            outbox: outbox.into_values().collect(),
+            jobs: jobs.into_values().collect(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1575,6 +1626,7 @@ pub(crate) struct JournalAdmissionState {
     s23: s23::S23State,
     procedure: procedure::ProcedureState,
     synthesis: synthesis::SynthesisState,
+    jobs: BTreeMap<evertrace_domain::ids::JobId, DurableJob>,
 }
 
 fn recall_scope_matches(
@@ -1905,6 +1957,13 @@ impl JournalAdmissionState {
         command: &JournalCommand,
         first_seq: u64,
     ) -> Result<Self, StoreError> {
+        self.validate_job_command(
+            command
+                .events()
+                .iter()
+                .map(|event| (&event.payload, event.occurred_at_us)),
+        )
+        .map_err(|_| StoreError::InvalidInput)?;
         self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
@@ -2021,14 +2080,19 @@ impl JournalAdmissionState {
             .map(|row| {
                 let payload = row.payload()?;
                 payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
-                Ok((payload, row.seq))
+                Ok((payload, row.seq, row.occurred_at_us))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-        self.validate_transition_pairs(parsed.iter().map(|(payload, _)| payload))
+        self.validate_job_command(
+            parsed
+                .iter()
+                .map(|(payload, _, occurred_at_us)| (payload, *occurred_at_us)),
+        )?;
+        self.validate_transition_pairs(parsed.iter().map(|(payload, _, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
-        self.validate_episode_binding_activation(parsed.iter().map(|(payload, _)| payload))
+        self.validate_episode_binding_activation(parsed.iter().map(|(payload, _, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
-        self.validate_procedure_usage_command(parsed.iter().map(|(payload, _)| payload))?;
+        self.validate_procedure_usage_command(parsed.iter().map(|(payload, _, _)| payload))?;
         autoresearch::validate_controlled_command(
             autoresearch::ControlledRunAdmissionView {
                 runs: &self.experiment_runs,
@@ -2047,11 +2111,11 @@ impl JournalAdmissionState {
                 episode_revisions: &self.episode_revisions,
                 worktrees: &self.worktrees,
             },
-            parsed.iter().map(|(payload, _)| payload),
+            parsed.iter().map(|(payload, _, _)| payload),
             StoreError::StoreCorrupt,
         )?;
         self.procedure
-            .validate_command_cohort(&self.tasks, parsed.iter().map(|(payload, _)| payload))?;
+            .validate_command_cohort(&self.tasks, parsed.iter().map(|(payload, _, _)| payload))?;
         let synthesis_refs = self.synthesis_ref_set();
         let proposal_evidence_refs = self.synthesis_proposal_evidence_ref_set();
         self.synthesis.validate_command(
@@ -2064,21 +2128,60 @@ impl JournalAdmissionState {
                 refs: &synthesis_refs,
                 proposal_evidence_refs: &proposal_evidence_refs,
             },
-            parsed.iter().map(|(payload, _)| payload),
+            parsed.iter().map(|(payload, _, _)| payload),
         )?;
         semantic::validate_command_boundary(
             &self.atoms,
-            parsed.iter().map(|(payload, _)| payload),
+            parsed.iter().map(|(payload, _, _)| payload),
             StoreError::StoreCorrupt,
         )?;
-        crate::repository::validate_repository_payloads(parsed.iter().map(|(payload, _)| payload))
-            .map_err(|_| StoreError::StoreCorrupt)?;
+        crate::repository::validate_repository_payloads(
+            parsed.iter().map(|(payload, _, _)| payload),
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
         let mut next = self.clone();
-        for (payload, seq) in parsed {
+        for (payload, seq, _) in parsed {
             next.apply_payload(payload, seq)?;
         }
         next.validate_relations()?;
         Ok(next)
+    }
+
+    fn validate_job_command<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = (&'a JournalPayload, i64)>,
+    ) -> Result<(), StoreError> {
+        let mut jobs = self.jobs.clone();
+        for (payload, occurred_at_us) in payloads {
+            match payload {
+                JournalPayload::JobState(next) => {
+                    if let Some(current) = jobs.get(&next.job_id) {
+                        validate_job_successor(current, next, occurred_at_us)?;
+                    } else if next.state != JobStatus::Queued {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    jobs.insert(next.job_id, next.clone());
+                }
+                JournalPayload::JobLease(lease) => {
+                    let job = jobs
+                        .get_mut(&lease.job_id)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    if job.target_generation != lease.target_generation
+                        || job.state != JobStatus::Queued
+                        || job.terminal.is_some()
+                        || job.attempt.checked_add(1) != Some(lease.attempt)
+                        || lease.lease_until_us <= occurred_at_us
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    job.state = JobStatus::Leased;
+                    job.attempt = lease.attempt;
+                    job.lease_until_us = Some(lease.lease_until_us);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn validate_transition_pairs<'a>(
@@ -2152,6 +2255,18 @@ impl JournalAdmissionState {
 
     fn apply_payload(&mut self, payload: JournalPayload, seq: u64) -> Result<(), StoreError> {
         match payload {
+            JournalPayload::JobState(value) => {
+                self.jobs.insert(value.job_id, value);
+            }
+            JournalPayload::JobLease(value) => {
+                let job = self
+                    .jobs
+                    .get_mut(&value.job_id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                job.state = JobStatus::Leased;
+                job.attempt = value.attempt;
+                job.lease_until_us = Some(value.lease_until_us);
+            }
             JournalPayload::SourceReceiptRecorded(value) => {
                 record_known_source(&mut self.source_ranges, &value)?;
                 if self
@@ -2898,6 +3013,11 @@ fn apply_event(
                 .insert(value.outbox_id.clone(), (value, row.seq));
         }
         JournalPayload::JobState(value) => {
+            if let Some((current, _)) = state.jobs.get(&value.job_id) {
+                validate_job_successor(current, &value, row.occurred_at_us)?;
+            } else if value.state != JobStatus::Queued {
+                return Err(StoreError::StoreCorrupt);
+            }
             state.jobs.insert(value.job_id, (value, row.seq));
         }
         JournalPayload::JobLease(value) => {
@@ -2905,7 +3025,12 @@ fn apply_event(
                 .jobs
                 .get_mut(&value.job_id)
                 .ok_or(StoreError::StoreCorrupt)?;
-            if job.target_generation != value.target_generation || value.attempt < job.attempt {
+            if job.target_generation != value.target_generation
+                || job.state != JobStatus::Queued
+                || job.terminal.is_some()
+                || job.attempt.checked_add(1) != Some(value.attempt)
+                || value.lease_until_us <= row.occurred_at_us
+            {
                 return Err(StoreError::StoreCorrupt);
             }
             job.state = JobStatus::Leased;
@@ -3233,6 +3358,60 @@ fn apply_event(
             .map_err(|_| StoreError::StoreCorrupt)?;
             state.session_imports.insert(value.session_id.clone(), next);
         }
+    }
+    Ok(())
+}
+
+fn validate_job_successor(
+    current: &DurableJob,
+    next: &DurableJob,
+    occurred_at_us: i64,
+) -> Result<(), StoreError> {
+    if current.job_id != next.job_id
+        || current.idempotency_key != next.idempotency_key
+        || current.target_revision != next.target_revision
+        || current.target_watermark != next.target_watermark
+        || current.target_generation != next.target_generation
+        || current.kind != next.kind
+        || current.algorithm_revision != next.algorithm_revision
+        || current.model_id != next.model_id
+        || current.priority != next.priority
+        || current.config_hash != next.config_hash
+        || current.budget != next.budget
+        || next.attempt < current.attempt
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let queued_cancellation = current.state == JobStatus::Queued
+        && next.state == JobStatus::Failed
+        && next.attempt == current.attempt
+        && current.lease_until_us.is_none()
+        && next.lease_until_us.is_none()
+        && matches!(
+            next.terminal.as_deref().map(|terminal| terminal.reason),
+            Some(
+                JobTerminalReason::Revoked
+                    | JobTerminalReason::SourceReplaced
+                    | JobTerminalReason::SourceUnavailable
+                    | JobTerminalReason::Unsupported
+                    | JobTerminalReason::StaleGeneration
+            )
+        );
+    let valid = match (current.state, next.state) {
+        (JobStatus::Leased, JobStatus::Succeeded | JobStatus::Failed) => {
+            next.attempt == current.attempt
+        }
+        (JobStatus::Leased, JobStatus::Queued) => next.attempt >= current.attempt,
+        (JobStatus::Failed, JobStatus::Queued) => {
+            next.attempt > current.attempt
+                && current
+                    .backoff_until_us
+                    .is_none_or(|deadline| deadline <= occurred_at_us)
+        }
+        _ => queued_cancellation,
+    };
+    if !valid {
+        return Err(StoreError::StoreCorrupt);
     }
     Ok(())
 }
@@ -5928,6 +6107,11 @@ impl ReducerState {
             s23: self.s23.clone(),
             procedure: self.procedure.clone(),
             synthesis: self.synthesis.clone(),
+            jobs: self
+                .jobs
+                .iter()
+                .map(|(id, (job, _))| (*id, job.clone()))
+                .collect(),
         })
     }
 }
@@ -6628,7 +6812,8 @@ mod tests {
     use super::*;
     use crate::{
         command::{
-            DirtyTargetKind, JobLease, JournalCommand, JournalEventDraft, MigrationApplied,
+            DirtyTargetKind, JobBudget, JobLease, JobTerminalAudit, JobTerminalOutcome,
+            JobTerminalReason, JournalCommand, JournalEventDraft, MigrationApplied,
             PreparedCommand, SourceCloseRange, prepare_command,
         },
         journal::rows_for_append,
@@ -7325,13 +7510,80 @@ mod tests {
             target_watermark: 9,
             target_generation: 1,
             kind: "projection_rebuild".into(),
+            algorithm_revision: "v1".into(),
+            model_id: None,
             priority: 1,
             state: JobStatus::Queued,
             attempt: 1,
             backoff_until_us: None,
             config_hash: [7; 32],
+            budget: JobBudget {
+                max_items: 1,
+                max_bytes: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_calls: None,
+                max_wall_time_ms: 250,
+            },
+            terminal: None,
             lease_until_us: None,
         };
+        let mut forged_initial_lease = job.clone();
+        forged_initial_lease.state = JobStatus::Leased;
+        forged_initial_lease.lease_until_us = Some(100);
+        let mut forged_rows = Vec::new();
+        append(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    0,
+                    [0; 32],
+                    "v1",
+                    JournalPayload::JobState(forged_initial_lease),
+                )],
+            )
+            .unwrap(),
+            1,
+            &mut forged_rows,
+        );
+        assert_eq!(reduce_journal(&forged_rows), Err(StoreError::StoreCorrupt));
+        let mut forged_terminal = job.clone();
+        forged_terminal.state = JobStatus::Succeeded;
+        forged_terminal.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: JobTerminalOutcome::Succeeded,
+            reason: JobTerminalReason::Completed,
+            result_ref: Some("revision-1".into()),
+        }));
+        let mut forged_rows = Vec::new();
+        append(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    0,
+                    [0; 32],
+                    "v1",
+                    JournalPayload::JobState(job.clone()),
+                )],
+            )
+            .unwrap(),
+            1,
+            &mut forged_rows,
+        );
+        append(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    1,
+                    [0; 32],
+                    "v1",
+                    JournalPayload::JobState(forged_terminal),
+                )],
+            )
+            .unwrap(),
+            2,
+            &mut forged_rows,
+        );
+        assert_eq!(reduce_journal(&forged_rows), Err(StoreError::StoreCorrupt));
         let mut rows = Vec::new();
         append(
             JournalCommand::new(

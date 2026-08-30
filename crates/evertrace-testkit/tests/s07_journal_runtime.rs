@@ -12,10 +12,10 @@ use evertrace_engine::{
 };
 use evertrace_store::{
     CommitOutcome, CompatibilityStore, ConfigAudit, DirtyTarget, DirtyTargetKind, DurableJob,
-    JOURNAL_TABLE, JobLease, JobStatus, JournalCommand, JournalEventDraft, JournalPayload,
-    JournalWriter, L0001, MigrationOutcome, OBJECTS_TABLE, ObjectRowKind, OutboxEntry,
-    SiblingWriterLock, StaleGenerationAudit, StoreError, WatermarkAdvanced, WatermarkKind,
-    journal_schema, objects_schema, reduce_journal,
+    JOURNAL_TABLE, JobBudget, JobLease, JobStatus, JournalCommand, JournalEventDraft,
+    JournalPayload, JournalWriter, L0001, MigrationOutcome, OBJECTS_TABLE, ObjectRowKind,
+    OutboxEntry, SiblingWriterLock, StaleGenerationAudit, StoreError, WatermarkAdvanced,
+    WatermarkKind, journal_schema, objects_schema, reduce_journal,
 };
 use tempfile::TempDir;
 
@@ -351,11 +351,22 @@ async fn job_lease_recovery_watermark_config_and_stale_audit_rebuild() {
         target_watermark: 7,
         target_generation: 4,
         kind: "objects_projection".into(),
+        algorithm_revision: "objects_projection_v1".into(),
+        model_id: None,
         priority: 5,
         state: JobStatus::Queued,
         attempt: 1,
         backoff_until_us: Some(40),
         config_hash: CONFIG_HASH,
+        budget: JobBudget {
+            max_items: 1,
+            max_bytes: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            max_calls: None,
+            max_wall_time_ms: 250,
+        },
+        terminal: None,
         lease_until_us: None,
     };
     writer

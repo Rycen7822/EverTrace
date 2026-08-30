@@ -215,7 +215,7 @@ mod tests {
         ids::JobId,
         semantic::{GlobalSupportState, SupportThresholdSnapshot},
     };
-    use evertrace_store::ObjectRowClass;
+    use evertrace_store::{JobBudget, ObjectRowClass};
 
     use super::*;
 
@@ -254,11 +254,22 @@ mod tests {
             target_watermark: 3,
             target_generation: 7,
             kind: "projection".into(),
+            algorithm_revision: "projection_v1".into(),
+            model_id: None,
             priority: 1,
             state: JobStatus::Leased,
             attempt: 2,
             backoff_until_us: None,
             config_hash: [1; 32],
+            budget: JobBudget {
+                max_items: 1,
+                max_bytes: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_calls: None,
+                max_wall_time_ms: 250,
+            },
+            terminal: None,
             lease_until_us: Some(50),
         };
         let rows = vec![
@@ -323,11 +334,22 @@ mod tests {
             target_watermark: 2,
             target_generation: 2,
             kind: "support_closure".into(),
+            algorithm_revision: "support_closure_v1".into(),
+            model_id: None,
             priority: 0,
             state: JobStatus::Queued,
             attempt: 0,
             backoff_until_us: None,
             config_hash: [3; 32],
+            budget: JobBudget {
+                max_items: 1,
+                max_bytes: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_calls: None,
+                max_wall_time_ms: 250,
+            },
+            terminal: None,
             lease_until_us: None,
         };
         let applied = support_closure_result(

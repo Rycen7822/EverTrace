@@ -30,8 +30,8 @@ pub use projections::{
     RecallCurrentContext, ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
     ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
     ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
-    SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView,
-    WorkIdentityCurrentView, reduce_journal,
+    RuntimeSchedulerView, SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView,
+    WorkBindingCurrentView, WorkIdentityCurrentView, reduce_journal,
 };
 pub use query::{L0002ProjectionSnapshot, derive_l0002_projections, object_projection_hash};
 pub use relations::{

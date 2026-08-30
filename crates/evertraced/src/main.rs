@@ -4,12 +4,12 @@
 use std::{env, fs, path::PathBuf, sync::Arc};
 
 use evertrace_engine::{
-    EngineService, HealthDispatchError, McpActionService, McpBindingAuthority, McpBindingIssue,
-    McpServiceAction, McpServiceRequest, McpServiceResult, McpServiceStatus, RecallCueOutcome,
-    RecallCueService, RecoveryActionOutcome, RecoveryActionService,
+    BackgroundScheduler, EngineService, HealthDispatchError, McpActionService, McpBindingAuthority,
+    McpBindingIssue, McpServiceAction, McpServiceRequest, McpServiceResult, McpServiceStatus,
+    RecallCueOutcome, RecallCueService, RecoveryActionOutcome, RecoveryActionService,
     RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
     RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason, RuntimeMode,
-    SessionImportBudget, SessionImportWorker, open_writer, publish_recovery_runtime,
+    SessionImportWorker, SynthesisPlanner, open_writer, publish_recovery_runtime,
     recall::spawn_recall_worker,
     repository::observe_session_catalog_report,
     session_import::{
@@ -76,82 +76,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_snapshot.clone(),
         Arc::clone(&current_session_catalog_report),
     )?;
-    let (session_import_wakeup_tx, mut session_import_wakeup_rx) = watch::channel(0_u64);
-    let (session_import_shutdown_tx, mut session_import_shutdown_rx) = watch::channel(false);
-    let worker_report = Arc::clone(&current_session_catalog_report);
-    let worker_catalog = session_catalog.clone();
-    let worker_import = session_import_worker.clone();
-    let worker_wakeup = session_import_wakeup_tx.clone();
-    let mut session_import_task = tokio::spawn(async move {
-        let mut retry_at = None;
-        loop {
-            tokio::select! {
-                changed = session_import_shutdown_rx.changed() => {
-                    if changed.is_err() || *session_import_shutdown_rx.borrow() {
-                        return;
-                    }
-                }
-                changed = session_import_wakeup_rx.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    let report = Arc::clone(&worker_report).read_owned().await;
-                    let (catalog_changed, imported, retryable) = if let Some(report) = report.as_ref() {
-                        let catalog_changed = match worker_catalog.refresh(report).await {
-                            Ok(changed) => changed,
-                            Err(_) => {
-                                tracing::warn!("bounded session catalog refresh failed");
-                                0
-                            }
-                        };
-                        match worker_import
-                            .process_queued_once(
-                                32,
-                                SessionImportBudget {
-                                    max_bytes: 256 * 1024,
-                                    max_records: 16,
-                                    deadline: std::time::Instant::now()
-                                        + std::time::Duration::from_millis(250),
-                                },
-                            )
-                            .await
-                        {
-                            Ok((processed, retryable)) => {
-                                (catalog_changed, processed, retryable)
-                            }
-                            Err(_) => {
-                                tracing::warn!("bounded session import checkpoint failed");
-                                (catalog_changed, 0, true)
-                            }
-                        }
-                    } else {
-                        (0, 0, false)
-                    };
-                    drop(report);
-                    tokio::task::yield_now().await;
-                    let immediate = catalog_changed != 0 || imported != 0 && retryable;
-                    retry_at = (retryable && !immediate).then(|| {
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
-                    });
-                    if immediate {
-                        let next = (*worker_wakeup.borrow()).wrapping_add(1);
-                        worker_wakeup.send_replace(next);
-                    }
-                }
-                _ = async {
-                    if let Some(deadline) = retry_at {
-                        tokio::time::sleep_until(deadline).await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    retry_at = None;
-                    let next = (*worker_wakeup.borrow()).wrapping_add(1);
-                    worker_wakeup.send_replace(next);
-                }
-            }
-        }
-    });
+    let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
+    let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
+    let scheduler = BackgroundScheduler::new(
+        writer_handle.clone(),
+        session_catalog,
+        session_import_worker,
+        Arc::clone(&current_session_catalog_report),
+        runtime_snapshot.clone(),
+        SynthesisPlanner::new(engine.effective_config().config().llm.clone()),
+        engine.effective_config().config().dreaming.clone(),
+    );
+    let mut background_scheduler_task =
+        tokio::spawn(scheduler.run(session_import_wakeup_rx, session_import_shutdown_rx));
     let mcp_service = McpActionService::open(
         mcp_bindings.clone(),
         &data_dir,
@@ -392,7 +329,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut task => {
             let server_result = result;
             let _ = session_import_shutdown_tx.send(true);
-            session_import_task.await?;
+            background_scheduler_task.await??;
             recovery_action_service.shutdown_and_drain().await;
             recall_worker.abort();
             let _ = (&mut recall_worker).await;
@@ -406,7 +343,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut writer_task => {
             let _ = shutdown_tx.send(true);
             let _ = session_import_shutdown_tx.send(true);
-            session_import_task.await?;
+            background_scheduler_task.await??;
             recovery_action_service.shutdown_and_drain().await;
             recall_worker.abort();
             let _ = (&mut recall_worker).await;
@@ -417,7 +354,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut recall_worker => {
             let _ = shutdown_tx.send(true);
             let _ = session_import_shutdown_tx.send(true);
-            session_import_task.await?;
+            background_scheduler_task.await??;
             recovery_action_service.shutdown_and_drain().await;
             task.await??;
             if let Some(handle) = writer_handle.take() {
@@ -427,7 +364,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             result?;
             Err("recall worker stopped unexpectedly".into())
         }
-        result = &mut session_import_task => {
+        result = &mut background_scheduler_task => {
             let _ = shutdown_tx.send(true);
             recovery_action_service.shutdown_and_drain().await;
             task.await??;
@@ -437,8 +374,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 handle.shutdown().await?;
             }
             writer_task.await??;
-            result?;
-            Err("session import worker stopped unexpectedly".into())
+            result??;
+            Err("background scheduler stopped unexpectedly".into())
         }
         signal = wait_for_signal() => {
             signal?;
@@ -446,7 +383,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let _ = session_import_shutdown_tx.send(true);
             recovery_action_service.shutdown_and_drain().await;
             task.await??;
-            session_import_task.await?;
+            background_scheduler_task.await??;
             recall_worker.abort();
             let _ = (&mut recall_worker).await;
             if let Some(handle) = writer_handle.take() {
