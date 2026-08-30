@@ -36,7 +36,7 @@ use envelope::{ClientEnvelope, ServerEnvelope};
 #[cfg(feature = "runtime")]
 use error::{ErrorCode, ProtocolError, WireError};
 #[cfg(feature = "runtime")]
-use frame::{FrameError, canonical_json, read_frame, write_frame};
+use frame::{FrameError, canonical_json, read_frame, read_frame_after_idle, write_frame};
 #[cfg(feature = "runtime")]
 use handshake::{HandshakeAck, valid_build_id};
 #[cfg(feature = "runtime")]
@@ -45,7 +45,10 @@ use notification::{Notification, NotificationEnvelope};
 use response::{HealthResponse, RecoveryActionResponse, Response};
 #[cfg(feature = "runtime")]
 use tokio::{
-    net::{UnixListener, UnixStream},
+    net::{
+        UnixListener, UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::{Semaphore, watch},
     task::JoinSet,
     time::timeout,
@@ -474,6 +477,62 @@ pub struct LocalClient {
 }
 
 #[cfg(feature = "runtime")]
+pub struct LocalCommandSender {
+    writer: OwnedWriteHalf,
+    negotiated_max: usize,
+    frame_timeout: Duration,
+}
+
+#[cfg(feature = "runtime")]
+pub struct LocalIncomingReceiver {
+    reader: OwnedReadHalf,
+    negotiated_max: usize,
+    frame_timeout: Duration,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalIncoming {
+    Response(response::ResponseEnvelope),
+    Error(WireError),
+    Notification(Notification),
+}
+
+#[cfg(feature = "runtime")]
+impl LocalCommandSender {
+    pub async fn send(&mut self, command: command::CommandEnvelope) -> Result<(), ProtocolError> {
+        write_frame(
+            &mut self.writer,
+            &ClientEnvelope::Command(command),
+            self.negotiated_max,
+            self.frame_timeout,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl LocalIncomingReceiver {
+    pub async fn recv(&mut self) -> Result<LocalIncoming, ProtocolError> {
+        match read_frame_after_idle::<ServerEnvelope>(
+            &mut self.reader,
+            self.negotiated_max,
+            self.frame_timeout,
+        )
+        .await?
+        {
+            ServerEnvelope::Response(value) => Ok(LocalIncoming::Response(value)),
+            ServerEnvelope::Error(value) => Ok(LocalIncoming::Error(value)),
+            ServerEnvelope::Notification(value) => {
+                Ok(LocalIncoming::Notification(value.notification))
+            }
+            ServerEnvelope::HandshakeAck(_) => Err(ProtocolError::UnexpectedMessage),
+        }
+    }
+}
+
+#[cfg(feature = "runtime")]
 impl LocalClient {
     pub async fn connect(
         socket_path: &Path,
@@ -553,6 +612,22 @@ impl LocalClient {
             _ => Err(ProtocolError::UnexpectedMessage),
         }
     }
+
+    pub fn into_split(self) -> (LocalCommandSender, LocalIncomingReceiver) {
+        let (reader, writer) = self.stream.into_split();
+        (
+            LocalCommandSender {
+                writer,
+                negotiated_max: self.negotiated_max,
+                frame_timeout: self.frame_timeout,
+            },
+            LocalIncomingReceiver {
+                reader,
+                negotiated_max: self.negotiated_max,
+                frame_timeout: self.frame_timeout,
+            },
+        )
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -599,7 +674,7 @@ pub async fn request_health(
     write_frame(&mut stream, &command, negotiated_max, frame_timeout).await?;
     match read_frame::<ServerEnvelope>(&mut stream, negotiated_max, frame_timeout).await? {
         ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
-            Response::Health(health) if valid_health(&health) => Ok(health),
+            Response::Health(health) if health.validate() => Ok(health),
             Response::Health(_) => Err(ProtocolError::InvalidHealth),
             Response::RecoveryTerminal(_)
             | Response::RecoveryAction(_)
@@ -1044,19 +1119,6 @@ fn map_sync_frame_error(error: frame::FrameError) -> error::SyncProtocolError {
     } else {
         error::SyncProtocolError::Frame
     }
-}
-
-#[cfg(feature = "runtime")]
-fn valid_health(health: &HealthResponse) -> bool {
-    health.protocol_version == PROTOCOL_VERSION
-        && health.config_version == 1
-        && health.mode == dto::HealthMode::Normal
-        && health.algorithm_revision != 0
-        && health.effective_config_hash.len() == 64
-        && health
-            .effective_config_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(feature = "runtime")]

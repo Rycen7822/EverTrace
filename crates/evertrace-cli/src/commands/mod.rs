@@ -2,6 +2,7 @@ mod admin;
 mod config;
 mod doctor;
 mod mcp;
+mod tui;
 
 use std::error::Error;
 
@@ -13,6 +14,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         Command::ConfigShowEffective => config::show_effective(args.config),
         Command::Doctor => doctor::run(args.config).await,
         Command::Mcp => mcp::run(args.config).await,
+        Command::Tui => tui::run(args.config).await,
         Command::AdminSession { action, session_id } => {
             admin::run(args.config, action, session_id).await
         }

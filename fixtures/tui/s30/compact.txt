@@ -1,0 +1,20 @@
+EverTrace  Inbox / Explorer / System
+┌Inbox─────────────────────────────────────────────────────┐
+│No inbox items                                            │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+◌ connecting pending:0
+1 Inbox  2 Explorer  3 System  r refresh  q quit

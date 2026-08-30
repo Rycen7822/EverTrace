@@ -12,6 +12,7 @@ pub enum Command {
     ConfigShowEffective,
     Doctor,
     Mcp,
+    Tui,
     AdminSession {
         action: AdminSessionAction,
         session_id: String,
@@ -40,6 +41,8 @@ impl Args {
             Command::Doctor
         } else if command == "mcp" {
             Command::Mcp
+        } else if command == "tui" {
+            Command::Tui
         } else if command == "admin" {
             if values.next().as_deref() != Some(std::ffi::OsStr::new("session")) {
                 return Err(usage());
@@ -82,5 +85,5 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|doctor|mcp|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|doctor|mcp|tui|admin session queue|revoke SESSION_ID"
 }
