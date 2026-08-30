@@ -24,6 +24,21 @@ pub enum Command {
     IssueMcpBinding(McpBindingIssueCommand),
     McpCall(McpCallCommand),
     RecallCue(RecallCueCommand),
+    SessionImportAdmin(SessionImportAdminCommand),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionImportAdminCommand {
+    pub session_id: String,
+    pub action: SessionImportAdminAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionImportAdminAction {
+    QueueImport,
+    RevokeAccess,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,6 +60,7 @@ pub struct McpBindingIssueCommand {
     pub turn_id: String,
     pub tool_use_id: String,
     pub agent_id: Option<String>,
+    pub transcript_path: Option<String>,
     pub original_input: McpToolInput,
     pub launcher_protocol_revision: u32,
 }

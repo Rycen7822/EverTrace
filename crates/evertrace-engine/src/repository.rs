@@ -13,6 +13,7 @@
 mod git_probe;
 mod integration;
 mod resolver;
+mod session_catalog;
 
 pub(crate) use git_probe::with_probe_deadline;
 pub use git_probe::{
@@ -28,4 +29,9 @@ pub use integration::{IntegrationEvidence, resolve_integration};
 pub use resolver::{
     PathHint, RepositoryResolution, RepositoryResolveError, RepositoryResolveInput, ResolutionKind,
     correct_transition, resolve_repository,
+};
+pub use session_catalog::{
+    SessionCatalogObservationError, observe_native_session_catalog_root,
+    observe_session_catalog_report, observe_session_catalog_root, read_native_repository_trust,
+    read_report_repository_trust,
 };

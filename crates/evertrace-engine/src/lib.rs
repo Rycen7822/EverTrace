@@ -17,13 +17,15 @@ pub mod search;
 pub mod segmentation;
 pub mod semantic;
 mod service;
+pub mod session_import;
 pub mod work;
 
 pub use ingest::{DrainProgress, EvidenceIngestor, IngestError};
 pub use jobs::{
-    JobResultDisposition, RecoveryAction, SupportClosureAction, WriterActorError, WriterHandle,
-    classify_job_result, expired_leases, open_writer, pending_dirty, pending_outbox, spawn_writer,
-    support_closure_result,
+    JobResultDisposition, RecoveryAction, SessionImportBudget, SessionImportError,
+    SessionImportProgress, SessionImportWorker, SupportClosureAction, WriterActorError,
+    WriterHandle, classify_job_result, expired_leases, open_writer, pending_dirty, pending_outbox,
+    spawn_writer, support_closure_result,
 };
 pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
 pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};

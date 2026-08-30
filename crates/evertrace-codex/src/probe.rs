@@ -8,7 +8,8 @@ use crate::{
     adapter_manifest::{
         AdapterCapabilityManifest, AdapterKind, AdmissionFailureObservability, CaptureGuarantee,
         CueBoundary, EventIdentity, ManifestError, ObservableCapability, ProjectPolicySurface,
-        RecoveryOrdering, SubagentTrace, TrustReadback,
+        RecoveryOrdering, SessionCatalogLocatorKind, SessionCatalogRootContract,
+        SessionCatalogRootKind, SubagentTrace, TrustReadback,
     },
     capability::{
         CanaryStatus, HookProbeResult, McpBindingEvidence, McpProbeResult, McpSessionBinding,
@@ -18,6 +19,8 @@ use crate::{
     policy::{PolicyCandidateOrigin, PolicyEvidence, scope_within},
     source_catalog::{ELIGIBLE_CAPABILITIES, REQUIRED_FOR_FULL},
 };
+
+pub const CODEX_SESSION_LAYOUT_REVISION: &str = "codex_session_jsonl_v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -193,6 +196,39 @@ pub struct NormalizationEvidence {
     pub protected_digest: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogRootEvidence {
+    pub root_kind: SessionCatalogRootKind,
+    pub canonical_absolute_path: String,
+    pub layout_revision: String,
+    pub filesystem_device: u64,
+    pub filesystem_inode: u64,
+    pub canary: CanaryStatus,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCatalogRootState {
+    Unavailable,
+    Ready,
+    HashChanged,
+    CanaryFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogRootResult {
+    pub root_kind: SessionCatalogRootKind,
+    pub state: SessionCatalogRootState,
+    pub canonical_absolute_path: Option<String>,
+    pub layout_revision: String,
+    pub filesystem_device: Option<u64>,
+    pub filesystem_inode: Option<u64>,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProbeEvidence {
@@ -203,6 +239,7 @@ pub struct ProbeEvidence {
     pub mcp: Option<McpBindingEvidence>,
     pub normalization: Option<NormalizationEvidence>,
     pub policy: Option<PolicyEvidence>,
+    pub session_catalog_roots: Vec<SessionCatalogRootEvidence>,
 }
 
 impl ProbeEvidence {
@@ -215,6 +252,7 @@ impl ProbeEvidence {
             mcp: None,
             normalization: None,
             policy: None,
+            session_catalog_roots: Vec::new(),
         }
     }
 
@@ -279,6 +317,7 @@ pub struct HostProbeReport {
     active_search_due: GateReceipt,
     strong_normalization: GateReceipt,
     project_policy: GateReceipt,
+    session_catalog_roots: Vec<SessionCatalogRootResult>,
 }
 
 impl HostProbeReport {
@@ -321,6 +360,10 @@ impl HostProbeReport {
 
     pub const fn project_policy(&self) -> &GateReceipt {
         &self.project_policy
+    }
+
+    pub fn session_catalog_roots(&self) -> &[SessionCatalogRootResult] {
+        &self.session_catalog_roots
     }
 
     /// Verifies that `evidence` is the exact policy evidence used by this
@@ -395,6 +438,11 @@ impl HostProbeReport {
                 context.evidence_source,
                 evidence.policy.as_ref(),
             )?,
+            session_catalog_roots: session_catalog_roots(
+                context.evidence_source,
+                &manifest,
+                &evidence.session_catalog_roots,
+            ),
         })
     }
 }
@@ -567,6 +615,17 @@ fn compile_manifest(
             TrustReadback::Unavailable
         },
         project_policy_surfaces: policy_surface.into_iter().collect(),
+        session_catalog_root_contracts: matches!(
+            context.adapter_kind,
+            AdapterKind::CodexHook | AdapterKind::CodexSessionJsonl
+        )
+        .then(|| SessionCatalogRootContract {
+            root_kind: SessionCatalogRootKind::CodexSessions,
+            locator_kind: SessionCatalogLocatorKind::HostResolved,
+            layout_revision: CODEX_SESSION_LAYOUT_REVISION.into(),
+        })
+        .into_iter()
+        .collect(),
         admission_failure_observability,
         mcp_session_binding: mcp.binding,
         mcp_binding_mechanism: mcp.mechanism,
@@ -577,6 +636,91 @@ fn compile_manifest(
     manifest.bind_content_revision()?;
     manifest.validate()?;
     Ok(manifest)
+}
+
+fn session_catalog_roots(
+    source: EvidenceSourceKind,
+    manifest: &AdapterCapabilityManifest,
+    evidence: &[SessionCatalogRootEvidence],
+) -> Vec<SessionCatalogRootResult> {
+    manifest
+        .session_catalog_root_contracts
+        .iter()
+        .map(|contract| {
+            let matches = evidence
+                .iter()
+                .filter(|value| value.root_kind == contract.root_kind)
+                .collect::<Vec<_>>();
+            let unavailable = || SessionCatalogRootResult {
+                root_kind: contract.root_kind,
+                state: SessionCatalogRootState::Unavailable,
+                canonical_absolute_path: None,
+                layout_revision: contract.layout_revision.clone(),
+                filesystem_device: None,
+                filesystem_inode: None,
+                evidence_refs: Vec::new(),
+            };
+            if source != EvidenceSourceKind::ObservedHostCanary || matches.is_empty() {
+                return unavailable();
+            }
+            if matches.len() != 1 {
+                return SessionCatalogRootResult {
+                    state: SessionCatalogRootState::CanaryFailed,
+                    ..unavailable()
+                };
+            }
+            let value = matches[0];
+            let path = std::path::Path::new(&value.canonical_absolute_path);
+            let refs_valid = !value.evidence_refs.is_empty()
+                && value.evidence_refs.len() <= 32
+                && value
+                    .evidence_refs
+                    .iter()
+                    .all(|item| !item.is_empty() && item.len() <= 512)
+                && value.evidence_refs.windows(2).all(|pair| pair[0] < pair[1]);
+            let path_valid = path.is_absolute()
+                && value.canonical_absolute_path.len() <= 4096
+                && !value
+                    .canonical_absolute_path
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control())
+                && !path.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                });
+            let state = if value.layout_revision != contract.layout_revision {
+                SessionCatalogRootState::HashChanged
+            } else if value.canary == CanaryStatus::Failed
+                || !path_valid
+                || !refs_valid
+                || value.filesystem_device == 0
+                || value.filesystem_inode == 0
+            {
+                SessionCatalogRootState::CanaryFailed
+            } else if value.canary == CanaryStatus::Passed {
+                SessionCatalogRootState::Ready
+            } else {
+                SessionCatalogRootState::Unavailable
+            };
+            if state != SessionCatalogRootState::Ready {
+                return SessionCatalogRootResult {
+                    state,
+                    ..unavailable()
+                };
+            }
+            SessionCatalogRootResult {
+                root_kind: contract.root_kind,
+                state,
+                canonical_absolute_path: Some(value.canonical_absolute_path.clone()),
+                layout_revision: contract.layout_revision.clone(),
+                filesystem_device: Some(value.filesystem_device),
+                filesystem_inode: Some(value.filesystem_inode),
+                evidence_refs: value.evidence_refs.clone(),
+            }
+        })
+        .collect()
 }
 
 fn capture_receipt(

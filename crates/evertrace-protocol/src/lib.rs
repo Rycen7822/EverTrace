@@ -136,9 +136,10 @@ impl LocalServer {
                 Command::Health => health_handler().map(Response::Health),
                 Command::RecoveryBarrier(_) => Err(ErrorCode::InvalidInput),
                 Command::RequestRecovery(_) => Err(ErrorCode::InvalidInput),
-                Command::IssueMcpBinding(_) | Command::McpCall(_) | Command::RecallCue(_) => {
-                    Err(ErrorCode::InvalidInput)
-                }
+                Command::IssueMcpBinding(_)
+                | Command::McpCall(_)
+                | Command::RecallCue(_)
+                | Command::SessionImportAdmin(_) => Err(ErrorCode::InvalidInput),
             })
         })
         .await
@@ -604,7 +605,8 @@ pub async fn request_health(
             | Response::RecoveryAction(_)
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)
-            | Response::RecallCue(_) => Err(ProtocolError::UnexpectedMessage),
+            | Response::RecallCue(_)
+            | Response::SessionImportAdmin(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
@@ -675,7 +677,8 @@ pub async fn request_recovery(
             | Response::RecoveryTerminal(_)
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)
-            | Response::RecallCue(_) => Err(ProtocolError::UnexpectedMessage),
+            | Response::RecallCue(_)
+            | Response::SessionImportAdmin(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {

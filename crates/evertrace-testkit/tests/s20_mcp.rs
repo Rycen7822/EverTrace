@@ -411,6 +411,7 @@ async fn hook_sync_issue_uses_existing_uds_handshake_and_hook_client_kind() {
         turn_id: "turn-wire".into(),
         tool_use_id: "tool-wire".into(),
         agent_id: None,
+        transcript_path: None,
         original_input: tool_input(&original),
         launcher_protocol_revision: BINDING_PROTOCOL_REVISION,
     };

@@ -11,6 +11,7 @@ pub mod install;
 pub mod policy;
 pub mod probe;
 pub mod recovery;
+pub mod session_import;
 pub mod source_catalog;
 
 pub use adapter_manifest::{AdapterCapabilityManifest, ManifestError};

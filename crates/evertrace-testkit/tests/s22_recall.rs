@@ -402,6 +402,7 @@ async fn start_real_recall(root: TempDir) -> RunningRecall {
                     source_instance_id: source_receipt.source_instance_id.clone(),
                     source_revision: source_receipt.source_revision.clone(),
                     source_sequence: 1,
+                    confirmed_prefix_digest: None,
                 }),
                 JournalPayload::DirtyTarget(DirtyTarget {
                     target_kind: DirtyTargetKind::EvidenceSurface,
