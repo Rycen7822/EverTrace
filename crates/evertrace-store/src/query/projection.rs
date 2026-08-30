@@ -3,13 +3,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_array::RecordBatchIterator;
-use evertrace_domain::canonical::{CanonicalValue, sha256};
+use evertrace_domain::{
+    canonical::{CanonicalValue, sha256},
+    revision::RevisionId,
+    semantic::Atom,
+};
 use lancedb::Table;
 
 use crate::{
     JournalPayload, ObjectRowKind, ProjectionSnapshot, StoreError,
     journal::{read_journal_after, read_journal_frontier},
-    projections::{l3_core_projection, recall_need, recall_trigger_contract, validate_delta},
+    projections::{
+        l3_core_projection, recall_need, recall_trigger_contract, synthesis::wiki_render_identity,
+        validate_delta, wiki_projection,
+    },
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
         build_capture_relation_rows, build_core_support_relation_rows, build_episode_relation_rows,
@@ -17,13 +24,14 @@ use crate::{
         build_procedure_relation_rows, build_procedure_usage_relation_rows,
         build_recovery_application_relation_rows, build_recovery_relation_rows,
         build_repository_relation_rows, build_segmentation_correction_relation_rows,
-        build_semantic_relation_rows, build_work_binding_relation_rows,
+        build_semantic_digest_relation_rows, build_semantic_relation_rows,
+        build_wiki_relation_rows, build_work_binding_relation_rows,
         build_work_identity_relation_rows, read_relation_rows, relations_batch,
     },
     search::{SearchProjectionRow, read_search_rows, search_batch},
 };
 
-use super::derive::{exact_identifier_row, surface_row};
+use super::derive::{exact_identifier_row, surface_row, wiki_search_row};
 use super::relation_assembly::{
     add_attempt, add_autoresearch, add_burst, add_capture, add_correction, add_episode,
     add_physical, add_recovery, add_repository, add_semantic, add_work_binding, add_work_identity,
@@ -236,13 +244,39 @@ pub fn derive_l0002_projections(
     let mut procedure_reviews = BTreeMap::new();
     let mut core_memberships = BTreeMap::new();
     let mut support_contracts = BTreeMap::new();
+    let mut wiki_projections = Vec::new();
+    let mut semantic_digests = Vec::new();
     let mut exact_rows = BTreeMap::new();
     let mut endpoint_seqs = BTreeMap::<String, u64>::new();
     let mut current_revisions = BTreeMap::<String, (u64, String)>::new();
+    let mut wiki_atoms_by_revision = BTreeMap::<RevisionId, Atom>::new();
+    for row in objects
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("atom_revision"))
+    {
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        let JournalPayload::AtomRecorded(atom) = payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if row.object_id.as_deref() != Some(&atom.atom_id.to_string())
+            || row.current_revision_id.as_deref() != Some(&atom.revision_id.to_string())
+            || wiki_atoms_by_revision
+                .insert(atom.revision_id, *atom)
+                .is_some()
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
     for row in objects.data_rows() {
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
+            || wiki_projection(row)?.is_some()
         {
             continue;
         }
@@ -264,6 +298,57 @@ pub fn derive_l0002_projections(
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
         {
+            continue;
+        }
+        if let Some(wiki) = wiki_projection(row)? {
+            let source_atoms = wiki
+                .source_atom_ids
+                .iter()
+                .map(|atom_id| {
+                    let (_, revision_id) = current_revisions
+                        .get(&atom_id.to_string())
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    let revision_id = revision_id
+                        .parse::<RevisionId>()
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    let atom = wiki_atoms_by_revision
+                        .get(&revision_id)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    if atom.atom_id != *atom_id || atom.revision_id != revision_id {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    Ok(atom)
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            let (rendered_blob_ref, contradictions) =
+                wiki_render_identity(&wiki.topic, &source_atoms, &wiki.source_episode_ids)?;
+            if rendered_blob_ref != wiki.rendered_blob_ref {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let source_text =
+                source_atoms
+                    .iter()
+                    .flat_map(|atom| {
+                        let mut text = vec![
+                            atom.value.subject.clone(),
+                            atom.value.predicate.clone(),
+                            atom.value.text.clone(),
+                        ];
+                        text.extend(atom.value.object.clone());
+                        text.extend(atom.value.qualifiers.iter().flat_map(|qualifier| {
+                            [qualifier.name.clone(), qualifier.value.clone()]
+                        }));
+                        text
+                    })
+                    .collect::<Vec<_>>();
+            if source_text.is_empty() {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let candidate =
+                wiki_search_row(&wiki, &source_text, &contradictions, row.source_event_seq);
+            exact_rows.insert(candidate.row_id.clone(), candidate);
+            endpoint_seqs.insert(wiki.page_id.to_string(), row.source_event_seq);
+            wiki_projections.push(wiki);
             continue;
         }
         for endpoint in [row.object_id.as_ref(), row.current_revision_id.as_ref()]
@@ -473,6 +558,9 @@ pub fn derive_l0002_projections(
                     (*value, row.source_event_seq),
                 );
             }
+            JournalPayload::SemanticDigestRecorded(value) => {
+                semantic_digests.push(*value);
+            }
             _ => {}
         }
         let is_current = row.object_id.as_ref().is_some_and(|object_id| {
@@ -570,6 +658,16 @@ pub fn derive_l0002_projections(
     add_semantic(
         &mut relations,
         build_semantic_relation_rows(&all_values(&atoms), &all_values(&proposals))?,
+        &endpoint_seqs,
+    );
+    add_semantic(
+        &mut relations,
+        build_wiki_relation_rows(&wiki_projections)?,
+        &endpoint_seqs,
+    );
+    add_semantic(
+        &mut relations,
+        build_semantic_digest_relation_rows(&semantic_digests)?,
         &endpoint_seqs,
     );
     add_semantic(

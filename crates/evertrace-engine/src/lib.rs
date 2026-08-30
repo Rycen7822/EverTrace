@@ -9,6 +9,7 @@ pub mod ingest;
 pub mod jobs;
 pub mod normalize;
 pub mod procedure;
+pub mod provider;
 pub mod recall;
 pub mod recovery;
 pub mod repository;

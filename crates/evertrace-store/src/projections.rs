@@ -58,6 +58,7 @@ mod recovery;
 mod s23;
 mod segmentation;
 mod semantic;
+pub(crate) mod synthesis;
 pub use autoresearch::AutoresearchCurrentView;
 use autoresearch::{record_artifact, record_result, record_run};
 pub use recovery::{RecoveryCurrentState, RecoveryCurrentView};
@@ -87,6 +88,12 @@ pub fn recall_need(
 
 pub(crate) fn l3_core_projection(row: &ObjectRow) -> Result<bool, StoreError> {
     s23::S23State::restore_projection(row)
+}
+
+pub(crate) fn wiki_projection(
+    row: &ObjectRow,
+) -> Result<Option<evertrace_domain::semantic::WikiProjection>, StoreError> {
+    synthesis::restore_wiki_projection(row)
 }
 
 const PROJECTION_GENERATION: u64 = 1;
@@ -1294,6 +1301,7 @@ struct ReducerState {
     recall_ledger: recall_ledger::RecallLedgerState,
     s23: s23::S23State,
     procedure: procedure::ProcedureState,
+    synthesis: synthesis::SynthesisState,
 }
 
 #[derive(Clone, Debug)]
@@ -1405,6 +1413,7 @@ pub(crate) struct JournalAdmissionState {
     recall_ledger: recall_ledger::RecallLedgerState,
     s23: s23::S23State,
     procedure: procedure::ProcedureState,
+    synthesis: synthesis::SynthesisState,
 }
 
 fn recall_scope_matches(
@@ -1495,6 +1504,55 @@ fn select_recall_binding<'a>(
 }
 
 impl JournalAdmissionState {
+    fn synthesis_ref_set(&self) -> std::collections::BTreeSet<String> {
+        let mut refs = std::collections::BTreeSet::new();
+        macro_rules! extend_keys {
+            ($values:expr) => {
+                refs.extend($values.keys().map(ToString::to_string));
+            };
+        }
+        extend_keys!(self.source_observations);
+        extend_keys!(self.source_receipts);
+        extend_keys!(self.host_occurrences);
+        extend_keys!(self.operations);
+        extend_keys!(self.scope_effects);
+        extend_keys!(self.capture_receipt_revisions);
+        extend_keys!(self.tasks);
+        extend_keys!(self.workstreams);
+        extend_keys!(self.work_bindings);
+        extend_keys!(self.attempts);
+        extend_keys!(self.attempt_revisions);
+        extend_keys!(self.episodes);
+        extend_keys!(self.episode_revisions);
+        refs.extend(self.checkpoints.keys().cloned());
+        extend_keys!(self.experiment_runs);
+        extend_keys!(self.experiment_run_revisions);
+        extend_keys!(self.result_evidence);
+        extend_keys!(self.result_evidence_revisions);
+        extend_keys!(self.work_artifacts);
+        extend_keys!(self.artifact_revisions);
+        extend_keys!(self.atoms);
+        extend_keys!(self.atom_revisions);
+        refs.extend(self.procedure.revision_refs().map(ToString::to_string));
+        refs
+    }
+
+    fn synthesis_proposal_evidence_ref_set(&self) -> std::collections::BTreeSet<String> {
+        let mut refs = std::collections::BTreeSet::new();
+        refs.extend(self.source_observations.keys().map(ToString::to_string));
+        refs.extend(self.source_receipts.keys().map(ToString::to_string));
+        refs.extend(self.result_evidence.keys().map(ToString::to_string));
+        refs.extend(
+            self.result_evidence_revisions
+                .keys()
+                .map(ToString::to_string),
+        );
+        refs.extend(self.work_artifacts.keys().map(ToString::to_string));
+        refs.extend(self.artifact_revisions.keys().map(ToString::to_string));
+        refs.extend(self.atom_revisions.keys().map(ToString::to_string));
+        refs
+    }
+
     pub(crate) fn recall_current_contexts(
         &self,
         frontier: u64,
@@ -1698,6 +1756,22 @@ impl JournalAdmissionState {
                 command.events().iter().map(|event| &event.payload),
             )
             .map_err(|_| StoreError::InvalidInput)?;
+        let synthesis_refs = self.synthesis_ref_set();
+        let proposal_evidence_refs = self.synthesis_proposal_evidence_ref_set();
+        self.synthesis
+            .validate_command(
+                synthesis::SynthesisAdmissionView {
+                    episodes: &self.episodes,
+                    proposals: &self.proposals,
+                    atoms: &self.atoms,
+                    procedures: &self.procedure,
+                    s23: &self.s23,
+                    refs: &synthesis_refs,
+                    proposal_evidence_refs: &proposal_evidence_refs,
+                },
+                command.events().iter().map(|event| &event.payload),
+            )
+            .map_err(|_| StoreError::InvalidInput)?;
         semantic::validate_command_boundary(
             &self.atoms,
             command.events().iter().map(|event| &event.payload),
@@ -1775,6 +1849,20 @@ impl JournalAdmissionState {
         self.validate_procedure_usage_command(parsed.iter().map(|(payload, _)| payload))?;
         self.procedure
             .validate_command_cohort(&self.tasks, parsed.iter().map(|(payload, _)| payload))?;
+        let synthesis_refs = self.synthesis_ref_set();
+        let proposal_evidence_refs = self.synthesis_proposal_evidence_ref_set();
+        self.synthesis.validate_command(
+            synthesis::SynthesisAdmissionView {
+                episodes: &self.episodes,
+                proposals: &self.proposals,
+                atoms: &self.atoms,
+                procedures: &self.procedure,
+                s23: &self.s23,
+                refs: &synthesis_refs,
+                proposal_evidence_refs: &proposal_evidence_refs,
+            },
+            parsed.iter().map(|(payload, _)| payload),
+        )?;
         semantic::validate_command_boundary(
             &self.atoms,
             parsed.iter().map(|(payload, _)| payload),
@@ -2069,6 +2157,10 @@ impl JournalAdmissionState {
             | JournalPayload::GlobalSupportValidationRecorded(_)) => {
                 self.s23.apply(payload, seq)?;
             }
+            payload @ (JournalPayload::SemanticDigestRecorded(_)
+            | JournalPayload::SemanticDerivationRunRecorded(_)) => {
+                self.synthesis.apply(payload, seq)?;
+            }
             JournalPayload::RecallLedgerRecorded(value) => {
                 self.recall_ledger.apply(*value, seq)?;
             }
@@ -2190,6 +2282,7 @@ impl JournalAdmissionState {
             worktrees: &self.worktrees,
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
+            semantic_digests: self.synthesis.digests(),
         })?;
         self.validate_procedure_relations()?;
         validate_recall_relations(
@@ -2905,6 +2998,10 @@ fn apply_event(state: &mut ReducerState, row: &JournalRow) -> Result<(), StoreEr
         | JournalPayload::GlobalSupportContractRecorded(_)
         | JournalPayload::GlobalSupportValidationRecorded(_)) => {
             state.s23.apply(payload, row.seq)?;
+        }
+        payload @ (JournalPayload::SemanticDigestRecorded(_)
+        | JournalPayload::SemanticDerivationRunRecorded(_)) => {
+            state.synthesis.apply(payload, row.seq)?;
         }
         JournalPayload::RecallLedgerRecorded(value) => {
             state.recall_ledger.apply(*value, row.seq)?;
@@ -3831,6 +3928,8 @@ impl ReducerState {
         semantic::rebuild_proposals(&mut self.proposals, &self.proposal_revisions)?;
         self.procedure.rebuild()?;
         self.s23.rebuild()?;
+        self.synthesis
+            .rebuild(&self.episodes, &self.episode_revisions)?;
         Ok(())
     }
 
@@ -3861,6 +3960,9 @@ impl ReducerState {
                 continue;
             }
             if s23::S23State::restore_projection(row)? {
+                continue;
+            }
+            if synthesis::restore_wiki_projection(row)?.is_some() {
                 continue;
             }
             if let Some(need) = recall_ledger::need(row)? {
@@ -4659,6 +4761,11 @@ impl ReducerState {
                 self.s23.restore(payload, row.source_event_seq)?;
                 false
             }
+            payload @ (JournalPayload::SemanticDigestRecorded(_)
+            | JournalPayload::SemanticDerivationRunRecorded(_)) => {
+                self.synthesis.restore(payload, row.source_event_seq)?;
+                false
+            }
             JournalPayload::RecallLedgerRecorded(_) => return Err(StoreError::StoreCorrupt),
         };
         if duplicate {
@@ -4681,8 +4788,16 @@ impl ReducerState {
             self.s23.atom_support_eligible(atom.revision_id)
         })?);
         rows.extend(self.recall_ledger.clone().rows(PROJECTION_GENERATION)?);
+        rows.extend(synthesis::wiki_rows(
+            &self.atoms,
+            &self.proposals,
+            &self.episodes,
+            &self.synthesis,
+            &self.s23,
+        )?);
         rows.extend(self.procedure.rows(PROJECTION_GENERATION, &self.s23)?);
         rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
+        rows.extend(self.synthesis.rows()?);
         for (migration, (payload, seq)) in self.migrations {
             rows.push(runtime_row(
                 format!("projection:migration:{migration}"),
@@ -5392,6 +5507,7 @@ impl ReducerState {
             worktrees: &self.worktrees,
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
+            semantic_digests: self.synthesis.digests(),
         })?;
         let admission = self.admission_state(0)?;
         admission.validate_procedure_relations()?;
@@ -5453,6 +5569,7 @@ impl ReducerState {
             recall_ledger: self.recall_ledger.clone(),
             s23: self.s23.clone(),
             procedure: self.procedure.clone(),
+            synthesis: self.synthesis.clone(),
         })
     }
 }
@@ -5946,7 +6063,7 @@ impl ProjectionWorker {
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
             }
-            self.commit_rows(&expected.rows, true, true).await?;
+            self.commit_rows(&expected.rows, true, true, true).await?;
             let persisted = validate_objects_table(&self.objects).await?;
             if persisted != expected.rows {
                 return Err(StoreError::Projection);
@@ -5972,6 +6089,7 @@ impl ProjectionWorker {
             )
         });
         let reconcile_recall = reconcile_core;
+        let reconcile_wiki = reconcile_core;
         let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
@@ -5985,12 +6103,17 @@ impl ProjectionWorker {
             .iter()
             .map(|row| (row.row_id.as_str(), row))
             .collect::<BTreeMap<_, _>>();
-        let changed =
-            incremental_changed_rows(&expected, &current_by_id, reconcile_recall, reconcile_core);
+        let changed = incremental_changed_rows(
+            &expected,
+            &current_by_id,
+            reconcile_recall,
+            reconcile_core,
+            reconcile_wiki,
+        );
         if inject_before_commit_failure {
             return Err(StoreError::Projection);
         }
-        self.commit_rows(&changed, reconcile_recall, reconcile_core)
+        self.commit_rows(&changed, reconcile_recall, reconcile_core, reconcile_wiki)
             .await?;
         let persisted = validate_objects_table(&self.objects).await?;
         let persisted_snapshot = ProjectionSnapshot {
@@ -6017,6 +6140,7 @@ impl ProjectionWorker {
         rows: &[ObjectRow],
         reconcile_recall: bool,
         reconcile_core: bool,
+        reconcile_wiki: bool,
     ) -> Result<(), StoreError> {
         let batch = objects_batch(rows)?;
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
@@ -6025,7 +6149,7 @@ impl ProjectionWorker {
         let mut merge = self.objects.merge_insert(&["row_id"]);
         merge.when_matched_update_all(None);
         merge.when_not_matched_insert_all();
-        if reconcile_recall || reconcile_core {
+        if reconcile_recall || reconcile_core || reconcile_wiki {
             let mut predicates = Vec::new();
             if reconcile_recall {
                 predicates.push(format!(
@@ -6035,6 +6159,12 @@ impl ProjectionWorker {
             }
             if reconcile_core {
                 predicates.push(format!("object_kind = '{}'", s23::CORE_PROJECTION_KIND));
+            }
+            if reconcile_wiki {
+                predicates.push(format!(
+                    "object_kind = '{}'",
+                    synthesis::WIKI_PROJECTION_KIND
+                ));
             }
             merge.when_not_matched_by_source_delete(Some(predicates.join(" OR ")));
         }
@@ -6051,6 +6181,7 @@ fn incremental_changed_rows(
     current_by_id: &BTreeMap<&str, &ObjectRow>,
     reconcile_recall: bool,
     reconcile_core: bool,
+    reconcile_wiki: bool,
 ) -> Vec<ObjectRow> {
     expected
         .rows
@@ -6061,6 +6192,8 @@ fn incremental_changed_rows(
                     && row.object_kind.as_deref()
                         == Some(recall_projection::RECALL_TRIGGER_INDEX_KIND)
                 || reconcile_core && row.object_kind.as_deref() == Some(s23::CORE_PROJECTION_KIND)
+                || reconcile_wiki
+                    && row.object_kind.as_deref() == Some(synthesis::WIKI_PROJECTION_KIND)
                 || current_by_id.get(row.row_id.as_str()).copied() != Some(*row)
         })
         .cloned()
@@ -6147,11 +6280,11 @@ mod tests {
         };
 
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, false, false),
+            incremental_changed_rows(&expected, &current_by_id, false, false, false),
             vec![expected.rows[0].clone()]
         );
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, true, false),
+            incremental_changed_rows(&expected, &current_by_id, true, false, false),
             expected.rows
         );
     }
@@ -6977,6 +7110,7 @@ mod tests {
                 &[ObjectRow::checkpoint(10_000, PROJECTION_GENERATION)],
                 false,
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -7023,7 +7157,7 @@ mod tests {
             .unwrap(),
         );
         worker
-            .commit_rows(&[migration], false, false)
+            .commit_rows(&[migration], false, false, false)
             .await
             .unwrap();
         assert!(matches!(
@@ -7089,6 +7223,7 @@ mod tests {
         worker
             .commit_rows(
                 &[ObjectRow::checkpoint(3, PROJECTION_GENERATION)],
+                false,
                 false,
                 false,
             )

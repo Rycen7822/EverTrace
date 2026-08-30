@@ -28,10 +28,44 @@ pub(super) struct S23State {
 }
 
 impl S23State {
+    pub(super) fn current_scenario(&self, revision_id: RevisionId) -> Option<&Scenario> {
+        self.scenarios
+            .values()
+            .map(|(scenario, _)| scenario)
+            .find(|scenario| scenario.revision_id == revision_id)
+    }
     pub(super) fn atom_support_eligible(&self, revision_id: RevisionId) -> bool {
         self.atom_support_validations(revision_id)
             .into_iter()
             .all(|validation| validation.state == GlobalSupportState::Valid)
+    }
+
+    pub(super) fn global_wiki_support_watermark(&self, revision_id: RevisionId) -> Option<u64> {
+        let memberships = self
+            .memberships
+            .values()
+            .filter(|(membership, _)| {
+                membership.active && membership.atom_revision_id == revision_id
+            })
+            .collect::<Vec<_>>();
+        if memberships.is_empty() {
+            return None;
+        }
+        let mut watermark = 0;
+        for (membership, membership_seq) in memberships {
+            let contract = self.contracts.get(&membership.support_contract_ref)?;
+            let validation = self
+                .current_validations
+                .get(&membership.support_contract_ref)?;
+            if validation.0.state != GlobalSupportState::Valid {
+                return None;
+            }
+            watermark = watermark
+                .max(*membership_seq)
+                .max(contract.1)
+                .max(validation.1);
+        }
+        Some(watermark)
     }
 
     pub(super) fn atom_support_state(&self, revision_id: RevisionId) -> Option<&'static str> {

@@ -1,9 +1,60 @@
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{EvidenceSourceKind, EvidenceSurface, SourceReceipt},
+    revision::RevisionId,
+    semantic::WikiProjection,
 };
 
 use crate::{JournalPayload, StoreError, search::SearchProjectionRow};
+
+pub(super) fn wiki_search_row(
+    projection: &WikiProjection,
+    source_text: &[String],
+    contradictions: &[[RevisionId; 2]],
+    source_event_seq: u64,
+) -> SearchProjectionRow {
+    let mut fields = vec![format!("topic:{}", projection.topic)];
+    fields.extend(source_text.iter().map(|value| format!("statement:{value}")));
+    fields.extend(
+        projection
+            .source_atom_ids
+            .iter()
+            .map(|id| format!("source_atom:{id}")),
+    );
+    fields.extend(
+        contradictions
+            .iter()
+            .flat_map(|pair| pair.iter().map(|id| format!("contradiction:{id}"))),
+    );
+    SearchProjectionRow {
+        row_id: format!("search:object:wiki:{}", projection.page_id),
+        row_variant: "object".into(),
+        candidate_id: Some(projection.page_id.to_string()),
+        source_ref: Some(projection.page_id.to_string()),
+        source_kind: Some("object_projection".into()),
+        text: bounded_search_text(&projection.page_id.to_string(), &fields),
+        source_role: None,
+        content_trust: None,
+        capture_completeness: None,
+        instruction_authority: "none".into(),
+        object_kind: Some("wiki_projection".into()),
+        currentness: Some("current".into()),
+        lifecycle: Some("active".into()),
+        epistemic: Some("derived".into()),
+        authority: Some("none".into()),
+        task_id: None,
+        repository_id: None,
+        worktree_id: None,
+        event_time_us: 0,
+        recorded_at_us: 0,
+        source_sequence: projection.source_watermark,
+        time_domain: "source_sequence".into(),
+        retrieval_completeness: "complete".into(),
+        suppression_ref_hash: None,
+        source_event_seq,
+        projection_generation: 1,
+    }
+}
 
 pub(super) fn exact_identifier_row(
     row: &crate::ObjectRow,
@@ -125,6 +176,23 @@ fn allowlisted_object_text(
             text.extend(value.open_loops.iter().cloned());
             text.extend(value.completed_outcomes.iter().cloned());
             Some((text, 0))
+        }
+        JournalPayload::SemanticDigestRecorded(value) => {
+            let mut text = Vec::new();
+            for delta in [
+                &value.application.progress_delta,
+                &value.application.decision_delta,
+                &value.application.failed_routes,
+                &value.application.resolved_items,
+                &value.application.open_loops,
+                &value.application.outcome_delta,
+            ] {
+                for item in delta {
+                    text.push(item.label.clone());
+                    text.push(item.value.clone());
+                }
+            }
+            Some((text, value.created_at_us))
         }
         JournalPayload::ProcedureRevisionRecorded(value) => {
             Some((value.route_text_fields(max_text_bytes), value.created_at_us))

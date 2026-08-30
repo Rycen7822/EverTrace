@@ -6,8 +6,8 @@ use evertrace_domain::{
         SourceRole, hex, payload_fingerprint,
     },
     ids::{
-        AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SourceObservationId,
-        SourceReceiptId, TaskId, WorkArtifactId, WorktreeId,
+        AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
+        SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId, WorktreeId,
     },
     procedure::ProcedureScope,
     repository::{RepositoryInstance, WorktreeInstance},
@@ -308,6 +308,8 @@ pub(crate) struct SemanticRelationInputs<'a> {
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
     pub results: &'a BTreeMap<ResultEvidenceId, (evertrace_domain::semantic::ResultEvidence, u64)>,
     pub artifacts: &'a BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
+    pub semantic_digests:
+        &'a BTreeMap<SemanticDigestId, (evertrace_domain::semantic::SemanticDigest, u64)>,
 }
 
 pub(crate) fn validate_relations(input: SemanticRelationInputs<'_>) -> Result<(), StoreError> {
@@ -1127,6 +1129,9 @@ fn evidence_exists(reference: &str, input: &SemanticRelationInputs<'_>) -> bool 
         || reference
             .parse::<RevisionId>()
             .is_ok_and(|id| input.atom_revisions.contains_key(&id))
+        || reference
+            .parse::<SemanticDigestId>()
+            .is_ok_and(|id| input.semantic_digests.contains_key(&id))
 }
 
 fn objective_evidence_exists(reference: &str, input: &SemanticRelationInputs<'_>) -> bool {

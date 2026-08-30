@@ -226,6 +226,11 @@ pub fn is_persisted_relation_kind(kind: &str) -> bool {
             | "procedure_negative_to_revision"
             | "procedure_negative_to_task"
             | "procedure_review_to_negative"
+            | "wiki_to_source_atom"
+            | "wiki_to_source_episode"
+            | "semantic_digest_to_episode"
+            | "semantic_digest_to_task"
+            | "semantic_digest_to_direct_source"
     )
 }
 
