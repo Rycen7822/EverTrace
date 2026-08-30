@@ -21,10 +21,11 @@ use evertrace_domain::{
     ids::{CommandId, RequestId},
 };
 use evertrace_store::{
-    BodyStateReason, EventScope, JobLease, JobStatus, JournalCommand, JournalEventDraft,
-    JournalPayload, SessionAccessDecision, SessionBodyState, SessionImportCurrent,
-    SessionImportCurrentView, SessionImportEvent, SessionImportEventKind, SourceIngestWatermark,
-    SourceKind, WorkspaceResolutionKind, repository::RepositoryCurrentView,
+    BodyStateReason, EventScope, JobLease, JobStatus, JobTerminalAudit, JobTerminalOutcome,
+    JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload, SessionAccessDecision,
+    SessionBodyState, SessionImportCurrent, SessionImportCurrentView, SessionImportEvent,
+    SessionImportEventKind, SourceIngestWatermark, SourceKind, WorkspaceResolutionKind,
+    repository::RepositoryCurrentView,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -112,8 +113,10 @@ impl SessionImportWorker {
         if budget.max_bytes == 0 || budget.max_records == 0 || budget.max_records > MAX_RECORDS {
             return Err(SessionImportError::Budget);
         }
-        let report = Arc::clone(&self.report).read_owned().await;
-        let report = report.as_ref().ok_or(SessionImportError::Unavailable)?;
+        let report_guard = Arc::clone(&self.report).read_owned().await;
+        let report = report_guard
+            .as_ref()
+            .ok_or(SessionImportError::Unavailable)?;
         let snapshot = self
             .writer
             .project()
@@ -643,6 +646,11 @@ impl SessionImportWorker {
         {
             job.state = JobStatus::Failed;
             job.lease_until_us = None;
+            job.terminal = Some(Box::new(terminal_audit(
+                JobTerminalOutcome::Failed,
+                JobTerminalReason::SourceReplaced,
+                &current.session_id,
+            )));
             payloads.push(JournalPayload::JobState(job));
         }
         let events = payloads
@@ -698,6 +706,7 @@ impl SessionImportWorker {
             {
                 job.state = JobStatus::Queued;
                 job.lease_until_us = None;
+                job.terminal = None;
                 payloads.push(JournalPayload::JobState(job));
             }
         } else if matches!(
@@ -723,6 +732,27 @@ impl SessionImportWorker {
                     JobStatus::Failed
                 };
                 job.lease_until_us = None;
+                job.terminal = Some(Box::new(terminal_audit(
+                    if body_state == SessionBodyState::Imported {
+                        JobTerminalOutcome::Succeeded
+                    } else {
+                        JobTerminalOutcome::Failed
+                    },
+                    match reason {
+                        BodyStateReason::Completed => JobTerminalReason::Completed,
+                        BodyStateReason::BudgetExhausted => JobTerminalReason::BudgetExhausted,
+                        BodyStateReason::SourceReplaced => JobTerminalReason::SourceReplaced,
+                        BodyStateReason::ApprovalUnavailable => JobTerminalReason::Revoked,
+                        BodyStateReason::ImportFailed => JobTerminalReason::IntegrityFailure,
+                        BodyStateReason::TrustUnavailable | BodyStateReason::ScopeUnresolved => {
+                            JobTerminalReason::SourceUnavailable
+                        }
+                        BodyStateReason::Requested | BodyStateReason::Started => {
+                            JobTerminalReason::IntegrityFailure
+                        }
+                    },
+                    &current.session_id,
+                )));
                 payloads.push(JournalPayload::JobState(job));
             }
         }
@@ -822,6 +852,18 @@ impl SessionImportWorker {
             return Err(SessionImportError::Changed);
         }
         Ok((root, relative, identity))
+    }
+}
+
+fn terminal_audit(
+    outcome: JobTerminalOutcome,
+    reason: JobTerminalReason,
+    session_id: &str,
+) -> JobTerminalAudit {
+    JobTerminalAudit {
+        outcome,
+        reason,
+        result_ref: Some(format!("session_import:{session_id}")),
     }
 }
 

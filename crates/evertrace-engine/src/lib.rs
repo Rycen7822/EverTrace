@@ -7,6 +7,7 @@ pub mod autoresearch;
 pub mod capture;
 pub mod ingest;
 pub mod jobs;
+pub mod maintenance;
 pub mod normalize;
 pub mod procedure;
 pub mod provider;
@@ -23,9 +24,13 @@ pub mod work;
 pub use ingest::{DrainProgress, EvidenceIngestor, IngestError};
 pub use jobs::{
     JobResultDisposition, RecoveryAction, SessionImportBudget, SessionImportError,
-    SessionImportProgress, SessionImportWorker, SupportClosureAction, WriterActorError,
-    WriterHandle, classify_job_result, expired_leases, open_writer, pending_dirty, pending_outbox,
-    spawn_writer, support_closure_result,
+    SessionImportProgress, SessionImportWorker, SupportClosureAction, SynthesisPlanner,
+    WriterActorError, WriterHandle, classify_job_result, expired_leases, open_writer,
+    pending_dirty, pending_outbox, spawn_writer, support_closure_result,
+};
+pub use maintenance::{
+    BackgroundLane, BackgroundProgress, BackgroundScheduler, BackgroundSchedulerError,
+    ScheduledJob, select_jobs,
 };
 pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
 pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};

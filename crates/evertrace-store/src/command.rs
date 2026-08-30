@@ -166,6 +166,45 @@ pub enum JobStatus {
     Failed,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobBudget {
+    pub max_items: u32,
+    pub max_bytes: Option<u64>,
+    pub max_input_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub max_calls: Option<u32>,
+    pub max_wall_time_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobTerminalOutcome {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobTerminalReason {
+    Completed,
+    StaleGeneration,
+    BudgetExhausted,
+    SourceUnavailable,
+    Unsupported,
+    SourceReplaced,
+    Revoked,
+    IntegrityFailure,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobTerminalAudit {
+    pub outcome: JobTerminalOutcome,
+    pub reason: JobTerminalReason,
+    pub result_ref: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatermarkKind {
@@ -238,11 +277,15 @@ pub struct DurableJob {
     pub target_watermark: u64,
     pub target_generation: u64,
     pub kind: String,
+    pub algorithm_revision: String,
+    pub model_id: Option<String>,
     pub priority: i16,
     pub state: JobStatus,
     pub attempt: u32,
     pub backoff_until_us: Option<i64>,
     pub config_hash: [u8; 32],
+    pub budget: JobBudget,
+    pub terminal: Option<Box<JobTerminalAudit>>,
     pub lease_until_us: Option<i64>,
 }
 
@@ -908,6 +951,8 @@ impl JournalPayload {
                     ("target_watermark", integer(value.target_watermark)),
                     ("target_generation", integer(value.target_generation)),
                     ("kind", text(&value.kind)),
+                    ("algorithm_revision", text(&value.algorithm_revision)),
+                    ("model_id", optional_text(value.model_id.as_deref())),
                     (
                         "priority",
                         CanonicalValue::Integer(i128::from(value.priority)),
@@ -919,6 +964,8 @@ impl JournalPayload {
                         "config_hash",
                         CanonicalValue::Bytes(value.config_hash.to_vec()),
                     ),
+                    ("budget", job_budget_value(&value.budget)),
+                    ("terminal", job_terminal_value(value.terminal.as_deref())),
                     ("lease_until_us", optional_i64(value.lease_until_us)),
                 ],
             ),
@@ -1837,13 +1884,62 @@ fn validate_job(value: &DurableJob) -> Result<(), StoreError> {
         value.idempotency_key.as_str(),
         value.target_revision.as_str(),
         value.kind.as_str(),
+        value.algorithm_revision.as_str(),
     ] {
         validate_identifier(item)?;
     }
+    validate_optional_identifier(value.model_id.as_deref())?;
+    validate_optional_identifier(
+        value
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.result_ref.as_deref()),
+    )?;
+    let synthesis = value.kind == "semantic_synthesis_v1";
+    let import = value.kind == "session_import_v1";
     if value.target_generation == 0
         || value.attempt == 0
         || value.backoff_until_us.is_some_and(|time| time < 0)
         || value.lease_until_us.is_some_and(|time| time <= 0)
+        || (value.state == JobStatus::Leased) != value.lease_until_us.is_some()
+        || value.budget.max_items == 0
+        || value.budget.max_wall_time_ms == 0
+        || value.budget.max_bytes == Some(0)
+        || value.budget.max_input_tokens == Some(0)
+        || value.budget.max_output_tokens == Some(0)
+        || value.budget.max_calls == Some(0)
+        || synthesis != value.model_id.is_some()
+        || synthesis
+            && (value.budget.max_bytes.is_none()
+                || value.budget.max_input_tokens.is_none()
+                || value.budget.max_output_tokens.is_none()
+                || value.budget.max_calls.is_none())
+        || import
+            && (value.budget.max_bytes.is_none()
+                || value.budget.max_input_tokens.is_some()
+                || value.budget.max_output_tokens.is_some()
+                || value.budget.max_calls.is_some())
+        || !synthesis
+            && !import
+            && (value.model_id.is_some()
+                || value.budget.max_input_tokens.is_some()
+                || value.budget.max_output_tokens.is_some()
+                || value.budget.max_calls.is_some())
+        || matches!(value.state, JobStatus::Queued | JobStatus::Leased) != value.terminal.is_none()
+        || matches!(value.state, JobStatus::Succeeded)
+            != matches!(
+                value.terminal.as_ref().map(|terminal| terminal.outcome),
+                Some(JobTerminalOutcome::Succeeded)
+            )
+        || matches!(value.state, JobStatus::Failed)
+            != matches!(
+                value.terminal.as_ref().map(|terminal| terminal.outcome),
+                Some(JobTerminalOutcome::Failed)
+            )
+        || value.terminal.as_deref().is_some_and(|terminal| {
+            (terminal.outcome == JobTerminalOutcome::Succeeded)
+                != (terminal.reason == JobTerminalReason::Completed)
+        })
     {
         return Err(StoreError::InvalidInput);
     }
@@ -2245,6 +2341,71 @@ fn text(value: &str) -> CanonicalValue {
 
 fn optional_text(value: Option<&str>) -> CanonicalValue {
     value.map_or(CanonicalValue::Null, text)
+}
+
+fn job_budget_value(value: &JobBudget) -> CanonicalValue {
+    CanonicalValue::Map(
+        [
+            ("max_items".into(), integer(u64::from(value.max_items))),
+            ("max_bytes".into(), optional_u64(value.max_bytes)),
+            (
+                "max_input_tokens".into(),
+                optional_u64(value.max_input_tokens),
+            ),
+            (
+                "max_output_tokens".into(),
+                optional_u64(value.max_output_tokens),
+            ),
+            (
+                "max_calls".into(),
+                value
+                    .max_calls
+                    .map_or(CanonicalValue::Null, |value| integer(u64::from(value))),
+            ),
+            ("max_wall_time_ms".into(), integer(value.max_wall_time_ms)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn job_terminal_value(value: Option<&JobTerminalAudit>) -> CanonicalValue {
+    value.map_or(CanonicalValue::Null, |value| {
+        CanonicalValue::Map(
+            [
+                (
+                    "outcome".into(),
+                    text(match value.outcome {
+                        JobTerminalOutcome::Succeeded => "succeeded",
+                        JobTerminalOutcome::Failed => "failed",
+                    }),
+                ),
+                (
+                    "reason".into(),
+                    text(match value.reason {
+                        JobTerminalReason::Completed => "completed",
+                        JobTerminalReason::StaleGeneration => "stale_generation",
+                        JobTerminalReason::BudgetExhausted => "budget_exhausted",
+                        JobTerminalReason::SourceUnavailable => "source_unavailable",
+                        JobTerminalReason::Unsupported => "unsupported",
+                        JobTerminalReason::SourceReplaced => "source_replaced",
+                        JobTerminalReason::Revoked => "revoked",
+                        JobTerminalReason::IntegrityFailure => "integrity_failure",
+                    }),
+                ),
+                (
+                    "result_ref".into(),
+                    optional_text(value.result_ref.as_deref()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    })
+}
+
+fn optional_u64(value: Option<u64>) -> CanonicalValue {
+    value.map_or(CanonicalValue::Null, integer)
 }
 
 fn optional_i64(value: Option<i64>) -> CanonicalValue {

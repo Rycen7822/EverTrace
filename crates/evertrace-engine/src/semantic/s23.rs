@@ -20,9 +20,9 @@ use evertrace_domain::{
     },
 };
 use evertrace_store::{
-    DirtyTarget, DirtyTargetKind, DurableJob, JobStatus, JournalCommand, JournalEventDraft,
-    JournalPayload, ObjectRowKind, OutboxEntry, ProjectionSnapshot, SemanticCurrentView,
-    StoreError,
+    DirtyTarget, DirtyTargetKind, DurableJob, JobBudget, JobStatus, JournalCommand,
+    JournalEventDraft, JournalPayload, ObjectRowKind, OutboxEntry, ProjectionSnapshot,
+    SemanticCurrentView, StoreError,
 };
 
 use super::{
@@ -735,11 +735,22 @@ pub fn mark_support_pending(
         target_watermark: generation,
         target_generation: generation,
         kind: "support_closure".into(),
+        algorithm_revision: S23_ALGORITHM.into(),
+        model_id: None,
         priority: 0,
         state: JobStatus::Queued,
         attempt: 1,
         backoff_until_us: None,
         config_hash,
+        budget: JobBudget {
+            max_items: 1,
+            max_bytes: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            max_calls: None,
+            max_wall_time_ms: 250,
+        },
+        terminal: None,
         lease_until_us: None,
     };
     Ok(vec![

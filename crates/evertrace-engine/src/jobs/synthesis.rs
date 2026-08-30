@@ -1,6 +1,8 @@
+use std::str::FromStr;
+
 use evertrace_domain::{
     config::LlmConfig,
-    ids::{CommandId, SemanticDerivationRunId, SemanticDigestId},
+    ids::{CommandId, JobId, SemanticDerivationRunId, SemanticDigestId},
     procedure::{ProcedureDraft, ProcedureScope},
     revision::RevisionId,
     semantic::{
@@ -10,15 +12,17 @@ use evertrace_domain::{
         SemanticDerivationRun, SemanticDigest, SemanticDigestApplication, SemanticDigestStatus,
         SemanticDigestTrigger, ValidityInterval,
     },
-    work::{EpisodeLifecycle, PendingSemanticInterval, WorkEpisode},
+    work::{AssignmentStatus, EpisodeLifecycle, PendingSemanticInterval, WorkEpisode},
 };
 use evertrace_store::{
-    JournalCommand, JournalEventDraft, JournalPayload, ProjectionSnapshot, SemanticCurrentView,
+    DurableJob, EventScope, JobBudget, JobStatus, JobTerminalAudit, JobTerminalOutcome,
+    JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload, ProjectionSnapshot,
+    SegmentationCurrentView, SemanticCurrentView, SourceKind,
 };
 
 use crate::{
     provider::{
-        OpenAiCompatibleProvider, ProtectedDeltaItem, ProtectedSemanticInput,
+        OpenAiCompatibleProvider, ProtectedDeltaItem, ProtectedDeltaKind, ProtectedSemanticInput,
         ProviderAtomOperation, ProviderError, ProviderProcedureOperation,
         ProviderSemanticApplication, ProviderSemanticCandidate, SEMANTIC_SCHEMA_VERSION,
         canonical_prompt_hash,
@@ -31,12 +35,16 @@ use crate::{
 const DAY_US: i64 = 86_400_000_000;
 
 struct SnapshotRefIndex {
-    kinds: std::collections::BTreeMap<String, String>,
+    kinds: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 impl SnapshotRefIndex {
-    fn new(snapshot: &ProjectionSnapshot) -> Self {
-        let mut kinds = std::collections::BTreeMap::new();
+    fn new(snapshot: &ProjectionSnapshot, selected_refs: &[String]) -> Self {
+        let selected = selected_refs
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut kinds =
+            std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
         for row in snapshot.data_rows() {
             let Some(kind) = row.object_kind.as_ref() else {
                 continue;
@@ -44,32 +52,41 @@ impl SnapshotRefIndex {
             for reference in [row.object_id.as_ref(), row.current_revision_id.as_ref()]
                 .into_iter()
                 .flatten()
+                .filter(|reference| selected.contains(reference))
             {
-                kinds.insert(reference.clone(), kind.clone());
+                kinds
+                    .entry(reference.clone())
+                    .or_default()
+                    .insert(kind.clone());
             }
         }
         Self { kinds }
     }
 
     fn direct_source(&self, reference: &str) -> bool {
-        self.kinds.get(reference).is_some_and(|kind| {
-            !matches!(
-                kind.as_str(),
-                "semantic_digest" | "semantic_derivation_run" | "scenario" | "wiki_projection"
-            )
+        self.kinds.get(reference).is_some_and(|kinds| {
+            kinds.iter().any(|kind| {
+                !matches!(
+                    kind.as_str(),
+                    "semantic_digest" | "semantic_derivation_run" | "scenario" | "wiki_projection"
+                )
+            })
         })
     }
 
     fn proposal_evidence(&self, reference: &str) -> bool {
-        self.kinds.get(reference).is_some_and(|kind| {
-            matches!(
-                kind.as_str(),
-                "source_receipt"
-                    | "source_observation"
-                    | "result_evidence"
-                    | "work_artifact"
-                    | "atom_revision"
-            )
+        self.kinds.get(reference).is_some_and(|kinds| {
+            kinds.iter().any(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "source_receipt"
+                        | "source_observation"
+                        | "evidence_surface"
+                        | "result_evidence"
+                        | "work_artifact"
+                        | "atom_revision"
+                )
+            })
         })
     }
 }
@@ -100,6 +117,7 @@ pub enum SynthesisResolution {
     },
 }
 
+#[derive(Clone)]
 pub struct SynthesisPlanner {
     llm: LlmConfig,
     provider: Option<OpenAiCompatibleProvider>,
@@ -116,12 +134,271 @@ impl SynthesisPlanner {
         }
     }
 
+    pub fn durable_jobs(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        effective_config_hash: [u8; 32],
+        covered: &std::collections::BTreeSet<(String, u64, [u8; 32])>,
+        limit: usize,
+        max_wall_time: std::time::Duration,
+    ) -> Result<Vec<DurableJob>, crate::semantic::SemanticServiceError> {
+        if limit == 0 || limit > 32 {
+            return Err(crate::semantic::SemanticServiceError::InvalidInput);
+        }
+        let budget = self.durable_budget(max_wall_time)?;
+        let mut episodes = current_synthesis_episodes(snapshot)?
+            .into_values()
+            .filter(|episode| synthesis_trigger(episode).is_some())
+            .filter(|episode| {
+                !covered.contains(&(
+                    format!(
+                        "semantic_synthesis:{}:{}:{}",
+                        episode.revision_id, episode.semantic_watermark, episode.source_watermark
+                    ),
+                    episode.revision_generation,
+                    effective_config_hash,
+                ))
+            })
+            .collect::<Vec<_>>();
+        episodes.sort_by_key(|episode| {
+            (
+                episode.lifecycle_status != EpisodeLifecycle::Closed,
+                episode.source_watermark,
+                episode.revision_id,
+            )
+        });
+        episodes.truncate(limit);
+        episodes
+            .into_iter()
+            .map(|episode| {
+                Ok(DurableJob {
+                    job_id: JobId::new_v7(),
+                    idempotency_key: format!(
+                        "semantic_synthesis:{}:{}:{}",
+                        episode.revision_id, episode.semantic_watermark, episode.source_watermark
+                    ),
+                    target_revision: episode.revision_id.to_string(),
+                    target_watermark: episode.source_watermark,
+                    target_generation: episode.revision_generation,
+                    kind: "semantic_synthesis_v1".into(),
+                    algorithm_revision: "semantic_synthesis_v1".into(),
+                    model_id: Some(self.llm.model.clone()),
+                    priority: if episode.lifecycle_status == EpisodeLifecycle::Closed {
+                        0
+                    } else {
+                        10
+                    },
+                    state: JobStatus::Queued,
+                    attempt: 1,
+                    backoff_until_us: None,
+                    config_hash: effective_config_hash,
+                    budget: budget.clone(),
+                    terminal: None,
+                    lease_until_us: None,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn execute_durable_job(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        job: &DurableJob,
+        effective_config_hash: [u8; 32],
+        occurred_at_us: i64,
+        max_wall_time: std::time::Duration,
+    ) -> Result<JournalCommand, crate::semantic::SemanticServiceError> {
+        let expected_budget = self.durable_budget(max_wall_time)?;
+        if job.state != JobStatus::Leased
+            || !self.job_is_current(job, effective_config_hash, &expected_budget)
+        {
+            return Err(crate::semantic::SemanticServiceError::InvalidInput);
+        }
+        let (episode, trigger, direct_delta, selected_direct_refs) =
+            scheduled_input(snapshot, job)?;
+        if direct_delta.is_empty() {
+            let mut terminal = job.clone();
+            terminal.state = JobStatus::Failed;
+            terminal.lease_until_us = None;
+            terminal.terminal = Some(Box::new(JobTerminalAudit {
+                outcome: JobTerminalOutcome::Failed,
+                reason: JobTerminalReason::Unsupported,
+                result_ref: Some(job.target_revision.clone()),
+            }));
+            return JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft {
+                    occurred_at_us,
+                    source_kind: SourceKind::System,
+                    scope: EventScope {
+                        task_id: Some(episode.task_id.to_string()),
+                        workstream_id: Some(episode.workstream_id.to_string()),
+                        ..EventScope::default()
+                    },
+                    causation_id: None,
+                    correlation_id: None,
+                    effective_config_hash: job.config_hash,
+                    algorithm_revision: job.algorithm_revision.clone(),
+                    payload: JournalPayload::JobState(terminal),
+                }],
+            )
+            .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput);
+        }
+        let resolution = self
+            .execute(SynthesisRequest {
+                snapshot,
+                episode_revision_id: episode.revision_id,
+                trigger,
+                direct_delta,
+                selected_direct_refs,
+                command_id: CommandId::new_v7(),
+                occurred_at_us,
+                algorithm_revision: job.algorithm_revision.clone(),
+                effective_config_hash: job.config_hash,
+            })
+            .await?;
+        let (mut events, outcome, reason, result_ref) = match resolution {
+            SynthesisResolution::NoDelta => (
+                Vec::new(),
+                JobTerminalOutcome::Succeeded,
+                JobTerminalReason::Completed,
+                Some(job.target_revision.clone()),
+            ),
+            SynthesisResolution::Audit { run, command } => {
+                let reason = match run.status {
+                    DerivationRunStatus::BudgetExhausted => JobTerminalReason::BudgetExhausted,
+                    DerivationRunStatus::ProviderUnavailable
+                    | DerivationRunStatus::ProviderFailed => JobTerminalReason::SourceUnavailable,
+                    DerivationRunStatus::PlannerNotAdmitted
+                    | DerivationRunStatus::SchemaRejected => JobTerminalReason::Unsupported,
+                    DerivationRunStatus::Succeeded => JobTerminalReason::IntegrityFailure,
+                };
+                (
+                    command.events().to_vec(),
+                    JobTerminalOutcome::Failed,
+                    reason,
+                    Some(run.derivation_run_id.to_string()),
+                )
+            }
+            SynthesisResolution::Success {
+                digest, command, ..
+            } => (
+                command.events().to_vec(),
+                JobTerminalOutcome::Succeeded,
+                JobTerminalReason::Completed,
+                Some(digest.semantic_digest_id.to_string()),
+            ),
+        };
+        let mut terminal = job.clone();
+        terminal.state = match outcome {
+            JobTerminalOutcome::Succeeded => JobStatus::Succeeded,
+            JobTerminalOutcome::Failed => JobStatus::Failed,
+        };
+        terminal.lease_until_us = None;
+        terminal.terminal = Some(Box::new(JobTerminalAudit {
+            outcome,
+            reason,
+            result_ref,
+        }));
+        events.push(JournalEventDraft {
+            occurred_at_us,
+            source_kind: SourceKind::System,
+            scope: EventScope {
+                task_id: Some(episode.task_id.to_string()),
+                workstream_id: Some(episode.workstream_id.to_string()),
+                ..EventScope::default()
+            },
+            causation_id: None,
+            correlation_id: None,
+            effective_config_hash: job.config_hash,
+            algorithm_revision: job.algorithm_revision.clone(),
+            payload: JournalPayload::JobState(terminal),
+        });
+        JournalCommand::new(CommandId::new_v7(), events)
+            .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)
+    }
+
+    pub(crate) fn job_identity_is_current(
+        &self,
+        job: &DurableJob,
+        effective_config_hash: [u8; 32],
+    ) -> bool {
+        job.kind == "semantic_synthesis_v1"
+            && job.algorithm_revision == "semantic_synthesis_v1"
+            && job.model_id.as_deref() == Some(self.llm.model.as_str())
+            && job.config_hash == effective_config_hash
+    }
+
+    pub(crate) fn job_is_current(
+        &self,
+        job: &DurableJob,
+        effective_config_hash: [u8; 32],
+        budget: &JobBudget,
+    ) -> bool {
+        self.job_identity_is_current(job, effective_config_hash) && job.budget == *budget
+    }
+
+    pub(crate) fn durable_budget(
+        &self,
+        max_wall_time: std::time::Duration,
+    ) -> Result<JobBudget, crate::semantic::SemanticServiceError> {
+        if max_wall_time.is_zero() {
+            return Err(crate::semantic::SemanticServiceError::InvalidInput);
+        }
+        let max_wall_time_ms = self
+            .llm
+            .timeout
+            .seconds()
+            .saturating_mul(1_000)
+            .min(u64::try_from(max_wall_time.as_millis()).unwrap_or(u64::MAX))
+            .min(
+                self.llm
+                    .daily_wall_time_budget
+                    .seconds()
+                    .saturating_mul(1_000),
+            );
+        if max_wall_time_ms == 0 {
+            return Err(crate::semantic::SemanticServiceError::InvalidInput);
+        }
+        Ok(JobBudget {
+            max_items: 64,
+            max_bytes: Some(256 * 1024),
+            max_input_tokens: Some(self.llm.daily_input_token_budget.max(1)),
+            max_output_tokens: Some(self.llm.daily_output_token_budget.max(1)),
+            max_calls: Some(1),
+            max_wall_time_ms,
+        })
+    }
+
+    pub(crate) fn remaining_daily_wall_time(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        occurred_at_us: i64,
+    ) -> Result<std::time::Duration, crate::semantic::SemanticServiceError> {
+        if occurred_at_us < 0 {
+            return Err(crate::semantic::SemanticServiceError::InvalidInput);
+        }
+        let today = occurred_at_us / DAY_US;
+        let used_wall_time_us = prior_runs(snapshot)?
+            .into_iter()
+            .filter(|run| run.created_at_us / DAY_US == today)
+            .fold(0_u64, |total, run| {
+                total.saturating_add(run.quota_usage.wall_time_us)
+            });
+        Ok(std::time::Duration::from_micros(
+            self.llm
+                .daily_wall_time_budget
+                .seconds()
+                .saturating_mul(1_000_000)
+                .saturating_sub(used_wall_time_us),
+        ))
+    }
+
     pub async fn execute(
         &self,
         mut request: SynthesisRequest<'_>,
     ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError> {
         let original_ref_count = request.selected_direct_refs.len();
-        let ref_index = SnapshotRefIndex::new(request.snapshot);
         request.selected_direct_refs.sort();
         request.selected_direct_refs.dedup();
         if request.selected_direct_refs.is_empty()
@@ -147,6 +424,7 @@ impl SynthesisPlanner {
         {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
+        let ref_index = SnapshotRefIndex::new(request.snapshot, &request.selected_direct_refs);
         let flattened = request
             .direct_delta
             .iter()
@@ -462,6 +740,160 @@ impl SynthesisPlanner {
             command,
         })
     }
+}
+
+fn current_synthesis_episodes(
+    snapshot: &ProjectionSnapshot,
+) -> Result<
+    std::collections::BTreeMap<evertrace_domain::ids::WorkEpisodeId, WorkEpisode>,
+    crate::semantic::SemanticServiceError,
+> {
+    let mut current =
+        std::collections::BTreeMap::<evertrace_domain::ids::WorkEpisodeId, WorkEpisode>::new();
+    for row in snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("work_episode"))
+    {
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?,
+        )
+        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+        let JournalPayload::WorkEpisodeRecorded(episode) = payload else {
+            return Err(crate::semantic::SemanticServiceError::InvalidInput);
+        };
+        match current.get(&episode.episode_id) {
+            Some(existing) if existing.revision_generation == episode.revision_generation => {
+                return Err(crate::semantic::SemanticServiceError::ImmutableConflict);
+            }
+            Some(existing) if existing.revision_generation > episode.revision_generation => {}
+            _ => {
+                current.insert(episode.episode_id, *episode);
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn synthesis_trigger(episode: &WorkEpisode) -> Option<SemanticDigestTrigger> {
+    episode.pending_semantic_delta?;
+    if episode.lifecycle_status == EpisodeLifecycle::Closed {
+        let valuable = episode.pending_delta_stats.high_value_signal_count != 0
+            || !episode.failure_refs.is_empty()
+            || !episode.completed_outcome_refs.is_empty()
+            || !episode.selected_outcome_refs.is_empty()
+            || !episode.verification_refs.is_empty()
+            || !episode.open_loops.is_empty()
+            || !episode.experiment_run_refs.is_empty();
+        return valuable.then_some(SemanticDigestTrigger::EpisodeFinalization);
+    }
+    (episode.lifecycle_status == EpisodeLifecycle::Open
+        && (episode.pending_delta_stats.selected_token_count >= 1024
+            || episode.pending_delta_stats.meaningful_burst_count >= 4))
+        .then_some(SemanticDigestTrigger::BudgetBackstop)
+}
+
+fn scheduled_input(
+    snapshot: &ProjectionSnapshot,
+    job: &DurableJob,
+) -> Result<
+    (
+        WorkEpisode,
+        SemanticDigestTrigger,
+        Vec<ProtectedDeltaItem>,
+        Vec<String>,
+    ),
+    crate::semantic::SemanticServiceError,
+> {
+    let revision_id = RevisionId::from_str(&job.target_revision)
+        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+    let episode = current_episode(snapshot, revision_id)?;
+    let trigger =
+        synthesis_trigger(&episode).ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
+    if job.target_watermark != episode.source_watermark
+        || job.target_generation != episode.revision_generation
+    {
+        return Err(crate::semantic::SemanticServiceError::BaseConflict);
+    }
+    let task_id = episode.task_id.to_string();
+    let authority = SegmentationCurrentView::from_snapshot(snapshot)
+        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+    let mut by_ref = std::collections::BTreeMap::new();
+    for row in snapshot.data_rows().filter(|row| {
+        row.source_event_seq > episode.semantic_watermark
+            && row.source_event_seq <= episode.source_watermark
+    }) {
+        if row.object_kind.as_deref() != Some("evidence_surface") {
+            continue;
+        }
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?,
+        )
+        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+        let JournalPayload::EvidenceSurfaceRecorded(surface) = payload else {
+            return Err(crate::semantic::SemanticServiceError::InvalidInput);
+        };
+        surface
+            .validate()
+            .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+        if surface
+            .task_id
+            .map(|task_id| task_id.to_string())
+            .as_deref()
+            != Some(task_id.as_str())
+        {
+            continue;
+        }
+        let reference = surface.source_observation_revision_ref.to_string();
+        let Some(operation) = authority
+            .operation_for_observation(surface.source_observation_revision_ref)
+            .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?
+        else {
+            continue;
+        };
+        let Some(binding) = authority.binding(operation.operation_id) else {
+            continue;
+        };
+        if binding.assignment_status != AssignmentStatus::Resolved
+            || binding.primary_binding.task_id != Some(episode.task_id)
+            || binding.primary_binding.workstream_id != Some(episode.workstream_id)
+            || binding.primary_binding.episode_id != Some(episode.episode_id)
+        {
+            continue;
+        }
+        if by_ref.len() == 64 && !by_ref.contains_key(&reference) {
+            continue;
+        }
+        by_ref.insert(
+            reference,
+            (
+                ProtectedDeltaKind::Progress,
+                bounded_protected_text(&surface.protected_text),
+            ),
+        );
+    }
+    let selected_direct_refs = by_ref.keys().cloned().collect::<Vec<_>>();
+    let direct_delta = by_ref
+        .into_iter()
+        .map(|(reference, (kind, value))| ProtectedDeltaItem {
+            kind,
+            value,
+            direct_refs: vec![reference],
+        })
+        .collect();
+    Ok((episode, trigger, direct_delta, selected_direct_refs))
+}
+
+fn bounded_protected_text(protected_text: &str) -> String {
+    const MAX_BYTES: usize = 4096;
+    let mut end = protected_text.len().min(MAX_BYTES);
+    while !protected_text.is_char_boundary(end) {
+        end -= 1;
+    }
+    protected_text[..end].to_owned()
 }
 
 fn current_episode(

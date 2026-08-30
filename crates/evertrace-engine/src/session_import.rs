@@ -27,8 +27,9 @@ use evertrace_domain::{
     ids::{CommandId, JobId, RequestId},
 };
 use evertrace_store::{
-    BodyStateReason, DurableJob, EventScope, JobStatus, JournalCommand, JournalEventDraft,
-    JournalPayload, MetadataState, SessionAccessDecision, SessionBodyState, SessionImportCurrent,
+    BodyStateReason, DurableJob, EventScope, JobBudget, JobStatus, JobTerminalAudit,
+    JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
+    MetadataState, SessionAccessDecision, SessionBodyState, SessionImportCurrent,
     SessionImportCurrentView, SessionImportEvent, SessionImportEventKind, SessionMetadata,
     SourceKind, WorkspaceResolutionKind, repository::RepositoryCurrentView,
 };
@@ -207,22 +208,36 @@ impl SessionCatalogService {
                 JournalPayload::SessionImportEventRecorded(event)
                     if matches!(
                         event.event,
-                        SessionImportEventKind::BodyStateAdvanced {
-                            body_state: SessionBodyState::SourceReplaced
-                                | SessionBodyState::BlockedScopeUnresolved,
-                            ..
-                        }
+                        SessionImportEventKind::BodyStateAdvanced { .. }
                     ) =>
                 {
-                    Some(event.session_id.clone())
+                    match &event.event {
+                        SessionImportEventKind::BodyStateAdvanced {
+                            body_state: SessionBodyState::SourceReplaced,
+                            ..
+                        } => Some((event.session_id.clone(), JobTerminalReason::SourceReplaced)),
+                        SessionImportEventKind::BodyStateAdvanced {
+                            body_state: SessionBodyState::BlockedScopeUnresolved,
+                            ..
+                        } => Some((
+                            event.session_id.clone(),
+                            JobTerminalReason::SourceUnavailable,
+                        )),
+                        _ => None,
+                    }
                 }
                 _ => None,
             })
-            .collect::<std::collections::BTreeSet<_>>();
-        for session_id in terminal_sessions {
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (session_id, reason) in terminal_sessions {
             if let Some(mut job) = active_import_job(&snapshot, &session_id)? {
                 job.state = JobStatus::Failed;
                 job.lease_until_us = None;
+                job.terminal = Some(Box::new(JobTerminalAudit {
+                    outcome: JobTerminalOutcome::Failed,
+                    reason,
+                    result_ref: Some(format!("session_import:{session_id}")),
+                }));
                 payloads.push(JournalPayload::JobState(job));
             }
         }
@@ -255,11 +270,15 @@ impl SessionCatalogService {
                 target_watermark: current.source_event_seq,
                 target_generation: generation,
                 kind: "session_import_v1".into(),
+                algorithm_revision: "session_import_v1".into(),
+                model_id: None,
                 priority: 0,
                 state: JobStatus::Queued,
                 attempt: 1,
                 backoff_until_us: None,
                 config_hash: self.effective_config_hash,
+                budget: session_import_job_budget(),
+                terminal: None,
                 lease_until_us: None,
             }));
         }
@@ -888,11 +907,15 @@ fn queue_command(
         target_watermark: current.source_event_seq,
         target_generation: revision,
         kind: "session_import_v1".into(),
+        algorithm_revision: "session_import_v1".into(),
+        model_id: None,
         priority: 0,
         state: JobStatus::Queued,
         attempt: 1,
         backoff_until_us: None,
         config_hash,
+        budget: session_import_job_budget(),
+        terminal: None,
         lease_until_us: None,
     }));
     command(
@@ -952,6 +975,11 @@ fn revoke_command(
     if let Some(mut job) = active_job {
         job.state = JobStatus::Failed;
         job.lease_until_us = None;
+        job.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: JobTerminalOutcome::Failed,
+            reason: JobTerminalReason::Revoked,
+            result_ref: Some(format!("session_import:{}", current.session_id)),
+        }));
         payloads.push(JournalPayload::JobState(job));
     }
     command(
@@ -962,6 +990,17 @@ fn revoke_command(
         SourceKind::Manual,
         payloads,
     )
+}
+
+pub(crate) fn session_import_job_budget() -> JobBudget {
+    JobBudget {
+        max_items: 16,
+        max_bytes: Some(256 * 1024),
+        max_input_tokens: None,
+        max_output_tokens: None,
+        max_calls: None,
+        max_wall_time_ms: 250,
+    }
 }
 
 pub(crate) fn active_import_job(

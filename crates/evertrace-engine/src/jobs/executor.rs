@@ -47,11 +47,16 @@ enum WriterRequest {
 pub struct WriterHandle {
     sender: mpsc::Sender<WriterRequest>,
     recall_frontier: watch::Sender<u64>,
+    background_frontier: watch::Sender<u64>,
 }
 
 impl WriterHandle {
     pub fn subscribe_recall_frontier(&self) -> watch::Receiver<u64> {
         self.recall_frontier.subscribe()
+    }
+
+    pub fn subscribe_background_frontier(&self) -> watch::Receiver<u64> {
+        self.background_frontier.subscribe()
     }
 
     pub async fn recall_current_contexts(
@@ -179,11 +184,18 @@ pub fn spawn_writer(
     let frontier = writer.frontier();
     let (sender, receiver) = mpsc::channel(capacity);
     let (recall_frontier, _) = watch::channel(frontier);
-    let task = tokio::spawn(run_writer(writer, receiver, recall_frontier.clone()));
+    let (background_frontier, _) = watch::channel(frontier);
+    let task = tokio::spawn(run_writer(
+        writer,
+        receiver,
+        recall_frontier.clone(),
+        background_frontier.clone(),
+    ));
     Ok((
         WriterHandle {
             sender,
             recall_frontier,
+            background_frontier,
         },
         task,
     ))
@@ -193,6 +205,7 @@ async fn run_writer(
     mut writer: JournalWriter,
     mut receiver: mpsc::Receiver<WriterRequest>,
     recall_frontier: watch::Sender<u64>,
+    background_frontier: watch::Sender<u64>,
 ) -> Result<(), WriterActorError> {
     let mut shutdown_replies = Vec::new();
     while let Some(request) = receiver.recv().await {
@@ -211,6 +224,11 @@ async fn run_writer(
                     .ok()
                     .filter(|_| recall_relevant(&command))
                     .map(|outcome| outcome.last_seq);
+                let background_notify = result
+                    .as_ref()
+                    .ok()
+                    .filter(|_| background_relevant(&command))
+                    .map(|outcome| outcome.last_seq);
                 let fatal = result.as_ref().err().copied().filter(|error| {
                     matches!(
                         error,
@@ -220,6 +238,9 @@ async fn run_writer(
                 let _ = reply.send(result);
                 if let Some(frontier) = notify {
                     recall_frontier.send_replace(frontier);
+                }
+                if let Some(frontier) = background_notify {
+                    background_frontier.send_replace(frontier);
                 }
                 if let Some(error) = fatal {
                     return Err(error);
@@ -240,6 +261,11 @@ async fn run_writer(
                     .ok()
                     .filter(|_| recall_relevant(&command))
                     .map(|outcome| outcome.last_seq);
+                let background_notify = result
+                    .as_ref()
+                    .ok()
+                    .filter(|_| background_relevant(&command))
+                    .map(|outcome| outcome.last_seq);
                 let fatal = result.as_ref().err().copied().filter(|error| {
                     matches!(
                         error,
@@ -249,6 +275,9 @@ async fn run_writer(
                 let _ = reply.send(result);
                 if let Some(frontier) = notify {
                     recall_frontier.send_replace(frontier);
+                }
+                if let Some(frontier) = background_notify {
+                    background_frontier.send_replace(frontier);
                 }
                 if let Some(error) = fatal {
                     return Err(error);
@@ -332,6 +361,21 @@ fn recall_relevant(command: &JournalCommand) -> bool {
     })
 }
 
+fn background_relevant(command: &JournalCommand) -> bool {
+    command.events().iter().any(|event| {
+        matches!(
+            event.payload,
+            evertrace_store::JournalPayload::DirtyTarget(_)
+                | evertrace_store::JournalPayload::OutboxEnqueued(_)
+                | evertrace_store::JournalPayload::JobState(_)
+                | evertrace_store::JournalPayload::JobLease(_)
+                | evertrace_store::JournalPayload::WorkEpisodeRecorded(_)
+                | evertrace_store::JournalPayload::WorkCheckpointRecorded(_)
+                | evertrace_store::JournalPayload::SessionImportEventRecorded(_)
+        )
+    })
+}
+
 fn map_store_error(error: StoreError) -> WriterActorError {
     match error {
         StoreError::InvalidInput => WriterActorError::InvalidInput,
@@ -353,5 +397,52 @@ mod tests {
             WriterActorError::InvalidInput.to_string(),
             "writer actor input is invalid"
         );
+    }
+
+    #[test]
+    fn work_episode_commit_wakes_background_scheduler() {
+        let task_id = evertrace_domain::ids::TaskId::new_v7();
+        let workstream = evertrace_domain::work::Workstream {
+            workstream_id: evertrace_domain::ids::WorkstreamId::new_v7(),
+            revision_id: evertrace_domain::revision::RevisionId::new_v7(),
+            predecessor_revision_id: None,
+            task_id,
+            repository_instance_id: None,
+            worktree_instance_ids: Vec::new(),
+            active_worktree_instance_id: None,
+            worktree_lineage_refs: Vec::new(),
+            parent_workstream_id: None,
+            dependency_workstream_ids: Vec::new(),
+            status: evertrace_domain::work::WorkstreamStatus::Active,
+            root_goal: "background synthesis wake".into(),
+            workstream_goal: "record pending semantic delta".into(),
+            target_family: "semantic digest".into(),
+            hypothesis_or_failure_family: "missed background wake".into(),
+            acceptance_boundary: "episode commit wakes scheduler".into(),
+            phase_contract: evertrace_domain::work::PhaseContract {
+                local_goal: "record pending delta".into(),
+                phase_kind: evertrace_domain::work::PhaseKind::Analyze,
+                phase_label: "analyze".into(),
+                primary_targets: vec!["semantic digest".into()],
+                entry_conditions: vec!["episode active".into()],
+                acceptance_boundary: "background wake".into(),
+                expected_state_transition: "synthesis queued".into(),
+            },
+            active_episode_id: None,
+            execution_lane_ids: Vec::new(),
+            source_watermark: 0,
+        };
+        let episode = crate::work::new_episode(&workstream, None, 1).unwrap();
+        let command = JournalCommand::new(
+            evertrace_domain::ids::CommandId::new_v7(),
+            vec![evertrace_store::JournalEventDraft::runtime(
+                1,
+                [0x29; 32],
+                "s29-work-episode-wake-v1",
+                evertrace_store::JournalPayload::WorkEpisodeRecorded(Box::new(episode)),
+            )],
+        )
+        .unwrap();
+        assert!(background_relevant(&command));
     }
 }
