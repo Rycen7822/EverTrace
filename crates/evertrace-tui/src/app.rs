@@ -35,6 +35,9 @@ impl App {
 
     pub fn handle(&mut self, event: AppEvent) -> UiCommand {
         match event {
+            AppEvent::Key(key) if self.state.repository_purge_confirmation.is_some() => {
+                self.handle_repository_purge_confirmation_key(key)
+            }
             AppEvent::Key(key) if self.state.proposal_edit.is_some() => {
                 self.handle_proposal_edit_key(key)
             }
@@ -43,6 +46,7 @@ impl App {
                 self.state.shell.health = Some(health);
                 self.state.shell.connection = ConnectionState::Connected;
                 self.state.proposal_edit = None;
+                self.state.repository_purge_confirmation = None;
                 self.state.related_context = None;
                 self.state.future_operation_shell = None;
                 UiCommand::Refresh
@@ -66,6 +70,7 @@ impl App {
                     return UiCommand::None;
                 }
                 self.state.proposal_edit = None;
+                self.state.repository_purge_confirmation = None;
                 use evertrace_protocol::dto::HumanGovernanceResponse;
                 match (locator, snapshot) {
                     (
@@ -198,6 +203,7 @@ impl App {
                 }
                 self.state.proposal_edit = None;
                 self.state.proposal_confirmation = None;
+                self.state.repository_purge_confirmation = None;
                 self.state.competing_candidate_selection = 0;
                 self.state.related_context = None;
                 self.state.detail = None;
@@ -228,6 +234,7 @@ impl App {
                 self.state.proposal_edit = None;
                 self.state.write_queued = false;
                 self.state.proposal_confirmation = None;
+                self.state.repository_purge_confirmation = None;
                 self.state.detail = None;
                 self.state.detail_scroll = 0;
                 self.state.recovery_selection = None;
@@ -240,6 +247,7 @@ impl App {
                 self.state.shell.connection = ConnectionState::ServerStopping;
                 self.state.proposal_edit = None;
                 self.state.proposal_confirmation = None;
+                self.state.repository_purge_confirmation = None;
                 self.state.detail = None;
                 self.state.detail_scroll = 0;
                 self.state.recovery_selection = None;
@@ -251,6 +259,54 @@ impl App {
             AppEvent::Shutdown => self.dispatch(UiCommand::Quit),
             AppEvent::Tick | AppEvent::Resize(_, _) => UiCommand::None,
         }
+    }
+
+    fn handle_repository_purge_confirmation_key(&mut self, key: KeyEvent) -> UiCommand {
+        if key.code == KeyCode::Esc {
+            self.state.repository_purge_confirmation = None;
+            return UiCommand::None;
+        }
+        let Some(confirmation) = self.state.repository_purge_confirmation.as_mut() else {
+            return UiCommand::None;
+        };
+        match key.code {
+            KeyCode::Backspace => {
+                confirmation.entered_repository_id.pop();
+                confirmation.error = None;
+            }
+            KeyCode::Char(value)
+                if confirmation.entered_repository_id.len() < 64
+                    && (value.is_ascii_alphanumeric() || matches!(value, '-' | ':')) =>
+            {
+                confirmation.entered_repository_id.push(value);
+                confirmation.error = None;
+            }
+            KeyCode::Enter => {
+                let exact_id = confirmation.entered_repository_id
+                    == confirmation.preview.repository_id.to_string();
+                if !exact_id {
+                    confirmation.error = Some("repository_id_confirmation_mismatch".into());
+                    return UiCommand::None;
+                }
+                if !confirmation.preview.blockers.is_empty() {
+                    confirmation.error = Some("cross_scope_dependency_blocked".into());
+                    return UiCommand::None;
+                }
+                let frontier = confirmation.frozen_frontier;
+                let preview = confirmation.preview.clone();
+                let action = evertrace_protocol::dto::HumanActionRequest::PurgeRepository {
+                    repository_id: preview.repository_id,
+                    repository_confirmation: confirmation.entered_repository_id.clone(),
+                    expected_repository_revision: preview.repository_revision,
+                    expected_deletion_generation: preview.deletion_generation,
+                };
+                self.state.repository_purge_confirmation = None;
+                self.state.proposal_confirmation = Some((frontier, action, None));
+                return UiCommand::ConfirmProposal;
+            }
+            _ => {}
+        }
+        UiCommand::None
     }
 
     fn handle_proposal_edit_key(&mut self, key: KeyEvent) -> UiCommand {
@@ -522,6 +578,18 @@ impl App {
                     self.state.last_action = Some(local_unavailable("object_forget_unavailable"));
                 }
             }
+            UiCommand::PrepareRepositoryPurge => {
+                if self.state.write_queued {
+                    self.state.last_action = Some(local_transport_error());
+                    return command;
+                }
+                self.state.repository_purge_confirmation =
+                    repository_purge_confirmation(&self.state);
+                if self.state.repository_purge_confirmation.is_none() {
+                    self.state.last_action =
+                        Some(local_unavailable("repository_purge_unavailable"));
+                }
+            }
             UiCommand::OpenRelated => {
                 self.state.related_context = related_context(&self.state);
                 if self.state.related_context.is_none() {
@@ -605,13 +673,19 @@ impl App {
             );
         }
         frame.render_widget(components::status_bar(&self.state.shell), shell.status);
-        let hints = if self.state.proposal_edit.is_some() {
+        let hints = if self.state.repository_purge_confirmation.is_some() {
+            "Type the exact Repository ID; block-on-cross-scope is fixed; strict source erasure is unavailable; Enter confirms; Esc cancels".into()
+        } else if self.state.proposal_edit.is_some() {
             "Closed payload edit: Ctrl+S submit for confirmation; Esc cancels".into()
         } else if self.state.future_operation_shell.is_some() {
             "Esc dismisses; no operation will be sent".into()
         } else if self.state.detail.is_some() || self.state.detail_message.is_some() {
             if current_detail(&self.state).is_some_and(|item| item.forget_preview.is_some()) {
                 "Esc back  F forget object  j/k scroll  o related  r refresh  q quit".into()
+            } else if current_detail(&self.state)
+                .is_some_and(|item| item.repository_purge_preview.is_some())
+            {
+                "Esc back  P purge repository  j/k scroll  o related  r refresh  q quit".into()
             } else if future_operation_shell(&self.state).is_some() {
                 "Esc back  g future Forget info  o related  j/k scroll  r refresh  q quit".into()
             } else if current_detail(&self.state).is_some_and(|item| {
@@ -642,7 +716,18 @@ impl App {
             Paragraph::new(hints).style(Style::default().fg(palette.muted)),
             shell.hints,
         );
-        if let Some(edit) = &self.state.proposal_edit {
+        if let Some(confirmation) = &self.state.repository_purge_confirmation {
+            let area = centered(frame.area(), 76, 11);
+            let (clear, modal) = components::modal(format!(
+                "Repository purge\nExpected ID: {}\nRe-enter ID: {}\nPolicy: block_on_cross_scope_dependency\nStrict source erasure: unavailable\nBlockers: {:?}\n{}\nEnter confirms once; Esc cancels",
+                confirmation.preview.repository_id,
+                confirmation.entered_repository_id,
+                confirmation.preview.blockers,
+                confirmation.error.as_deref().unwrap_or(""),
+            ));
+            frame.render_widget(clear, area);
+            frame.render_widget(modal, area);
+        } else if let Some(edit) = &self.state.proposal_edit {
             let area = centered(
                 frame.area(),
                 76,
@@ -1638,6 +1723,23 @@ fn forget_object_action(
     ))
 }
 
+fn repository_purge_confirmation(
+    state: &AppState,
+) -> Option<crate::state::RepositoryPurgeConfirmationState> {
+    let evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { frontier, .. } =
+        state.human.as_ref()?
+    else {
+        return None;
+    };
+    let preview = current_detail(state)?.repository_purge_preview.as_ref()?;
+    Some(crate::state::RepositoryPurgeConfirmationState {
+        frozen_frontier: *frontier,
+        preview: preview.as_ref().clone(),
+        entered_repository_id: String::new(),
+        error: None,
+    })
+}
+
 fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &'static str {
     use evertrace_protocol::dto::{HumanActionRequest, NegativeReviewDecision};
     match action {
@@ -1674,6 +1776,7 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         HumanActionRequest::ResolveCompetingSelected { .. } => "select competing attempt",
         HumanActionRequest::MarkNewAttempt { .. } => "mark new attempt",
         HumanActionRequest::ForgetObject { .. } => "forget object",
+        HumanActionRequest::PurgeRepository { .. } => "purge repository",
         HumanActionRequest::Unavailable { .. } => "unavailable action",
     }
 }
@@ -1787,11 +1890,119 @@ mod tests {
         HumanForgetPreview, HumanGovernanceResponse, HumanItemCategory, HumanItemKind,
         HumanJobBudget, HumanJobDetail, HumanJobState, HumanNegativeReviewMetadata,
         HumanObjectFamily, HumanProposalMetadata, HumanProposalReview, HumanRecoveryDetail,
-        HumanRelationKind, HumanRowClass, HumanSnapshotItem, HumanSnapshotStatus,
-        HumanSystemDetail, HumanWorktreeDetail, NegativeReviewDecision, PROTOCOL_VERSION,
-        ProposalHumanDecision,
+        HumanRelationKind, HumanRepositoryPurgePreview, HumanRowClass, HumanSnapshotItem,
+        HumanSnapshotStatus, HumanSystemDetail, HumanWorktreeDetail, NegativeReviewDecision,
+        PROTOCOL_VERSION, ProposalHumanDecision,
     };
     use evertrace_protocol::response::HealthResponse;
+
+    #[test]
+    fn repository_purge_requires_exact_id_and_never_offers_strict_erasure() {
+        let repository_id = RepositoryId::new_v7();
+        let mut item = snapshot_item("repository", repository_id.to_string());
+        item.category = HumanItemCategory::Repository;
+        item.repository_purge_preview = Some(Box::new(HumanRepositoryPurgePreview {
+            repository_id,
+            repository_revision: 1,
+            deletion_generation: 2,
+            planned_exclusive_cas_count: 3,
+            shared_cas_retained_count: 1,
+            repository_derived_global_dependency_count: 1,
+            affected_session_count: 0,
+            affected_evidence_receipt_capture_count: 0,
+            affected_work_count: 0,
+            affected_atom_count: 0,
+            affected_procedure_count: 0,
+            affected_experiment_run_count: 0,
+            affected_result_evidence_count: 0,
+            affected_artifact_count: 0,
+            affected_recovery_count: 0,
+            affected_recall_derived_count: 0,
+            relationship_only_count: 0,
+            estimated_reclaimable_bytes: None,
+            blockers: vec![
+                evertrace_domain::purge::RepositoryPurgeBlocker::RepositoryDerivedGlobalDependency,
+            ],
+            downstream_support_revalidation_count: 0,
+            dependent_procedure_review_hold_count: 0,
+        }));
+        let mut app = App::new();
+        app.state.human = Some(HumanGovernanceResponse::Snapshot {
+            frontier: 9,
+            status: HumanSnapshotStatus::Ready,
+            degraded_reasons: Vec::new(),
+            items: vec![item.clone()],
+            next_cursor: None,
+        });
+        app.state.detail = Some(item);
+        app.dispatch(UiCommand::PrepareRepositoryPurge);
+        assert!(app.state.proposal_confirmation.is_none());
+        for value in repository_id.to_string().chars() {
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(value),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            UiCommand::None
+        );
+        assert!(app.state.proposal_confirmation.is_none());
+        app.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            !app.state
+                .repository_purge_confirmation
+                .as_ref()
+                .unwrap()
+                .preview
+                .blockers
+                .is_empty()
+        );
+        assert_eq!(
+            app.state
+                .repository_purge_confirmation
+                .as_ref()
+                .unwrap()
+                .entered_repository_id,
+            repository_id.to_string()
+        );
+        assert_eq!(
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            UiCommand::None
+        );
+        app.state
+            .repository_purge_confirmation
+            .as_mut()
+            .unwrap()
+            .preview
+            .blockers
+            .clear();
+        assert_eq!(
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            UiCommand::ConfirmProposal
+        );
+        assert!(matches!(
+            app.state.proposal_confirmation.as_ref(),
+            Some((9, evertrace_protocol::dto::HumanActionRequest::PurgeRepository {
+                repository_id: actual,
+                repository_confirmation,
+                expected_repository_revision: 1,
+                expected_deletion_generation: 2,
+            }, None)) if *actual == repository_id && repository_confirmation == &repository_id.to_string()
+        ));
+    }
 
     #[test]
     fn recovery_requires_explicit_bundle_target_and_one_confirmation() {
@@ -2118,6 +2329,7 @@ mod tests {
             support_detail: None,
             competing_detail: None,
             forget_preview: None,
+            repository_purge_preview: None,
             negative_review: None,
             recovery_detail: None,
             worktree_detail: None,
@@ -2872,6 +3084,7 @@ mod tests {
             support_detail: None,
             competing_detail: None,
             forget_preview: None,
+            repository_purge_preview: None,
             negative_review: None,
             recovery_detail: None,
             worktree_detail: None,

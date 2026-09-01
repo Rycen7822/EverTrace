@@ -318,6 +318,19 @@ pub fn decode_record_body(bytes: &[u8]) -> Result<CaptureRecordBody, SpoolFrameE
     Ok(body)
 }
 
+pub fn decode_validated_record_body(
+    record: &SpoolRecord,
+) -> Result<(CaptureRecordBody, SourceObservationId), SpoolFrameError> {
+    let body = decode_record_body(&record.record_body)?;
+    let observation_id = body.observation_id()?;
+    if record.source_observation_id != observation_id.to_string()
+        || record.cas_refs.as_slice() != [body.cas_ref.as_str()]
+    {
+        return Err(SpoolFrameError::Corrupt);
+    }
+    Ok((body, observation_id))
+}
+
 pub fn encode_frame(record: &SpoolRecord) -> Result<Vec<u8>, SpoolFrameError> {
     validate_record(record)?;
     let payload_length =

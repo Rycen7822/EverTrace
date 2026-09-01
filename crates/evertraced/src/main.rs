@@ -15,14 +15,15 @@ use evertrace_engine::{
     HumanObjectFamily as EngineHumanObjectFamily,
     HumanProposalDecision as EngineHumanProposalDecision,
     HumanRecoveryDetail as EngineHumanRecoveryDetail, HumanRelatedRequest,
-    HumanRelationKind as EngineHumanRelationKind, HumanRowClass as EngineHumanRowClass,
-    HumanSupportDetail as EngineHumanSupportDetail, HumanSurface as EngineHumanSurface,
-    HumanSystemDetail as EngineHumanSystemDetail, McpActionService, McpBindingAuthority,
-    McpBindingIssue, McpServiceAction, McpServiceRequest, McpServiceResult, McpServiceStatus,
-    RecallCueOutcome, RecallCueService, RecoveryActionOutcome, RecoveryActionService,
-    RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
-    RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason, RuntimeMode,
-    SessionImportWorker, SynthesisPlanner, open_writer, publish_recovery_runtime,
+    HumanRelationKind as EngineHumanRelationKind,
+    HumanRepositoryPurgePreview as EngineHumanRepositoryPurgePreview,
+    HumanRowClass as EngineHumanRowClass, HumanSupportDetail as EngineHumanSupportDetail,
+    HumanSurface as EngineHumanSurface, HumanSystemDetail as EngineHumanSystemDetail,
+    McpActionService, McpBindingAuthority, McpBindingIssue, McpServiceAction, McpServiceRequest,
+    McpServiceResult, McpServiceStatus, RecallCueOutcome, RecallCueService, RecoveryActionOutcome,
+    RecoveryActionService, RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService,
+    RecoveryError, RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason,
+    RuntimeMode, SessionImportWorker, SynthesisPlanner, open_writer, publish_recovery_runtime,
     recall::spawn_recall_worker,
     repository::observe_session_catalog_report,
     session_import::{
@@ -41,9 +42,9 @@ use evertrace_protocol::{
         HumanItemKind, HumanJobBudget, HumanJobDetail, HumanJobState, HumanJobTerminalReason,
         HumanNegativeReviewMetadata, HumanObjectFamily, HumanProposalMetadata, HumanProposalReview,
         HumanReadRequest, HumanRecoveryDetail, HumanRecoveryOmissionCount, HumanRelationKind,
-        HumanRowClass, HumanSnapshotItem, HumanSnapshotStatus, HumanSupportDetail, HumanSurface,
-        HumanSystemDetail, HumanWorktreeDetail, NegativeReviewDecision, PROTOCOL_VERSION,
-        ProposalHumanDecision,
+        HumanRepositoryPurgePreview, HumanRowClass, HumanSnapshotItem, HumanSnapshotStatus,
+        HumanSupportDetail, HumanSurface, HumanSystemDetail, HumanWorktreeDetail,
+        NegativeReviewDecision, PROTOCOL_VERSION, ProposalHumanDecision,
     },
     envelope::{McpItem, McpItems, McpResultEnvelope, McpStatus},
     error::ErrorCode,
@@ -574,6 +575,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             )
                                             .await
                                     }
+                                    HumanActionRequest::PurgeRepository {
+                                        repository_id,
+                                        repository_confirmation,
+                                        expected_repository_revision,
+                                        expected_deletion_generation,
+                                    } => {
+                                        human_governance
+                                            .purge_repository(
+                                                request_id,
+                                                expected_frontier,
+                                                repository_id,
+                                                &repository_confirmation,
+                                                expected_repository_revision,
+                                                expected_deletion_generation,
+                                            )
+                                            .await
+                                    }
                                     HumanActionRequest::Unavailable { action } => {
                                         Ok(EngineHumanActionOutcome::Unavailable {
                                             reason: match action {
@@ -901,6 +919,54 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                         shared_source_count,
                         suppressed_source_count,
                         suppression_ref_count,
+                        downstream_support_revalidation_count,
+                        dependent_procedure_review_hold_count,
+                    })
+                }),
+                repository_purge_preview: item.repository_purge_preview.map(|preview| {
+                    let EngineHumanRepositoryPurgePreview {
+                        repository_id,
+                        repository_revision,
+                        deletion_generation,
+                        planned_exclusive_cas_count,
+                        shared_cas_retained_count,
+                        repository_derived_global_dependency_count,
+                        affected_session_count,
+                        affected_evidence_receipt_capture_count,
+                        affected_work_count,
+                        affected_atom_count,
+                        affected_procedure_count,
+                        affected_experiment_run_count,
+                        affected_result_evidence_count,
+                        affected_artifact_count,
+                        affected_recovery_count,
+                        affected_recall_derived_count,
+                        relationship_only_count,
+                        estimated_reclaimable_bytes,
+                        blockers,
+                        downstream_support_revalidation_count,
+                        dependent_procedure_review_hold_count,
+                    } = *preview;
+                    Box::new(HumanRepositoryPurgePreview {
+                        repository_id,
+                        repository_revision,
+                        deletion_generation,
+                        planned_exclusive_cas_count,
+                        shared_cas_retained_count,
+                        repository_derived_global_dependency_count,
+                        affected_session_count,
+                        affected_evidence_receipt_capture_count,
+                        affected_work_count,
+                        affected_atom_count,
+                        affected_procedure_count,
+                        affected_experiment_run_count,
+                        affected_result_evidence_count,
+                        affected_artifact_count,
+                        affected_recovery_count,
+                        affected_recall_derived_count,
+                        relationship_only_count,
+                        estimated_reclaimable_bytes,
+                        blockers,
                         downstream_support_revalidation_count,
                         dependent_procedure_review_hold_count,
                     })

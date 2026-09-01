@@ -3,13 +3,14 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 use evertrace_capture::{
-    CaptureOutcome, CaptureRecordInput, CaptureRuntime, CasDigest, CasStore, DeviceKeyStore,
-    DurableSpool, RecoveryGateMode, RecoveryPreflightCandidate, RuntimeSnapshot, SpoolError,
-    SpoolLimits, SpoolRecord,
+    CaptureOutcome, CaptureRecordInput, CaptureRuntime, CasDigest, CasError, CasStore,
+    DeviceKeyStore, DurableSpool, MaintenanceFence, RecoveryGateMode, RecoveryPreflightCandidate,
+    RuntimeSnapshot, SpoolError, SpoolLimits, SpoolRecord,
 };
 use evertrace_codex::recovery::{
     DestructiveCommandInput, ProtectedPath, ProtectedPathKind, classify_codex_pretool_candidate,
@@ -562,8 +563,10 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
     ];
     for (args, expected) in scenarios {
         let root = TempDir::new().unwrap();
-        std::fs::set_permissions(root.path(), PermissionsExt::from_mode(0o700)).unwrap();
-        DeviceKeyStore::new(root.path().join("keys"))
+        let data = root.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, PermissionsExt::from_mode(0o700)).unwrap();
+        DeviceKeyStore::new(data.join("keys"))
             .load_or_create()
             .unwrap();
         let worktree = root.path().join("worktree");
@@ -606,7 +609,7 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
         std::fs::write(worktree.join("ignored.txt"), b"ignored").unwrap();
 
         let snapshot = runtime_snapshot(
-            root.path(),
+            &data,
             1,
             SpoolLimits {
                 high_watermark_bytes: 1 << 20,
@@ -639,20 +642,50 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
             panic!("clean preflight must be durable")
         };
         drop(runtime);
-        let mut writer = JournalWriter::open(root.path()).await.unwrap();
+        let mut writer = JournalWriter::open(&data).await.unwrap();
         writer
             .commit(&repository_seed_command(&request, &worktree), 1)
             .await
             .unwrap();
         let (handle, task) = spawn_writer(writer, 8).unwrap();
-        let ack = RecoveryBarrierService::new(snapshot, handle.clone())
-            .handle(evertrace_engine::RecoveryBarrierLocator {
-                spool_record_id,
-                recovery_capture_request_id: locator.request_id,
-                pending_revision_id: locator.pending_revision_id,
-            })
-            .await
-            .unwrap();
+        let recovery = RecoveryBarrierService::new(snapshot, handle.clone());
+        let recovery_finished = AtomicBool::new(false);
+        let recover = async {
+            let result = recovery
+                .handle(evertrace_engine::RecoveryBarrierLocator {
+                    spool_record_id,
+                    recovery_capture_request_id: locator.request_id,
+                    pending_revision_id: locator.pending_revision_id,
+                })
+                .await;
+            recovery_finished.store(true, Ordering::Release);
+            result
+        };
+        let observe_exclusive_fence = async {
+            let fence = MaintenanceFence::open(&data).unwrap();
+            loop {
+                if recovery_finished.load(Ordering::Acquire) {
+                    return false;
+                }
+                match fence.exclusive() {
+                    Err(CasError::LockBusy) => return true,
+                    Ok(guard) => drop(guard),
+                    Err(error) => panic!("unexpected maintenance fence error: {error:?}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (ack, observed_exclusive_busy) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(recover, observe_exclusive_fence)
+        })
+        .await
+        .expect("Recovery fence observation must terminate");
+        let ack = ack.unwrap();
+        assert!(
+            observed_exclusive_busy,
+            "Recovery CAS production must exclude physical purge"
+        );
+        drop(MaintenanceFence::open(&data).unwrap().exclusive().unwrap());
         assert_eq!(ack.status, RecoveryRequestStatus::Complete);
         let current = RecoveryCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
         let bundle = &current.state.bundles[&ack.recovery_bundle_id.unwrap()];
@@ -666,7 +699,7 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
                 .unwrap()
                 .contains("/proc/")
         );
-        let cas = CasStore::open(root.path().join("cas")).unwrap();
+        let cas = CasStore::open(data.join("cas")).unwrap();
         let mut restored = bundle
             .untracked_file_blob_refs
             .iter()
@@ -775,7 +808,7 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
                 .map(|value| value.item_ref.clone())
                 .collect(),
         };
-        let keys = DeviceKeyStore::new(root.path().join("keys"));
+        let keys = DeviceKeyStore::new(data.join("keys"));
         let invalid_config_tickets =
             RecoveryTicketService::new(handle.clone(), cas.clone(), keys.clone(), [0; 32]);
         assert!(
@@ -958,7 +991,7 @@ async fn clean_scopes_flow_through_barrier_into_exact_protected_cas_payloads() {
         if args == ["clean", "-fd"] {
             handle.shutdown().await.unwrap();
             task.await.unwrap().unwrap();
-            let restarted = JournalWriter::open(root.path()).await.unwrap();
+            let restarted = JournalWriter::open(&data).await.unwrap();
             assert_eq!(
                 restarted.table_names().await.unwrap(),
                 vec![

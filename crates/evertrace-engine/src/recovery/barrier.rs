@@ -1,6 +1,6 @@
 use super::capture::{PrepareCaptureContext, prepare_capture, tracked_paths};
 use super::{RecoveryError, pending_request_command, terminal_capture_command};
-use evertrace_capture::CasStore;
+use evertrace_capture::{CasError, CasStore, MaintenanceFence};
 use evertrace_domain::{
     ids::{CommandId, RecoveryBundleId},
     repository::{RecoveryCaptureRequest, RecoveryReasonCode, RecoveryRequestStatus},
@@ -638,6 +638,16 @@ impl RecoveryBarrierService {
         &self,
         context: CaptureAndCommitContext<'_>,
     ) -> Result<RecoveryTerminalAck, RecoveryError> {
+        let maintenance_fence =
+            MaintenanceFence::open(self.snapshot.data_dir().map_err(|_| RecoveryError::Cas)?)
+                .map_err(|error| match error {
+                    CasError::LockBusy => RecoveryError::FenceBusy,
+                    _ => RecoveryError::Cas,
+                })?;
+        let _cas_producer = maintenance_fence.shared().map_err(|error| match error {
+            CasError::LockBusy => RecoveryError::FenceBusy,
+            _ => RecoveryError::Cas,
+        })?;
         let CaptureAndCommitContext {
             locator,
             pending,

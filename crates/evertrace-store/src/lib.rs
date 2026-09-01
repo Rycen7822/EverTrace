@@ -34,11 +34,16 @@ pub use projections::{
     ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
     RuntimeSchedulerView, SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView,
     WorkBindingCurrentView, WorkIdentityCurrentView, object_deletion_preview, reduce_journal,
+    repository_scope_purge_preview,
 };
 pub use purge::{
     OBJECT_DELETION_ALGORITHM_REVISION, ObjectDeletionCandidateAdmission,
     ObjectDeletionCurrentView, ObjectDeletionPreview, ObjectDeletionProcedureImpact,
-    ObjectDeletionSupportImpact, pending_object_deletion, purged_object_deletion,
+    ObjectDeletionSupportImpact, REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION,
+    REPOSITORY_SCOPE_PURGE_BATCH_SIZE, REPOSITORY_SCOPE_PURGE_JOB_KIND,
+    RepositoryScopePurgePreview, ScopePurgeCurrentView, advance_repository_scope_purge,
+    pending_object_deletion, pending_repository_scope_purge, purged_object_deletion,
+    terminal_repository_scope_purge_job,
 };
 pub use query::{
     DefaultRetrievalSuppressionGeneration, L0002ProjectionSnapshot,

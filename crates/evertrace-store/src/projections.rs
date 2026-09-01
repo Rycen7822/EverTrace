@@ -1,25 +1,26 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{
         CaptureGapMarkerEvidence, CaptureOutageInterval, EvidenceSurface, HostOccurrence,
-        Operation, ScopeEffect, SourceObservation, SourceReceipt, hex, payload_fingerprint,
+        Operation, ScopeEffect, SourceInstanceId, SourceObservation, SourceReceipt, SourceRevision,
+        hex, payload_fingerprint,
     },
     ids::{
-        AtomId, AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
-        ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId, OperationBurstId,
-        OperationId, ProcedureId, ProcedureNegativeEvidenceId, ProcedureUsageId,
+        AtomId, AttemptId, CaptureOutageIntervalId, CasId, CompetingAttemptGroupId,
+        ExecutionLaneId, ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId,
+        OperationBurstId, OperationId, ProcedureId, ProcedureNegativeEvidenceId, ProcedureUsageId,
         RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId,
         ResultEvidenceId, RevisionProposalId, ScopeEffectId, SourceObservationId, SourceReceiptId,
         TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
         WorktreeSnapshotId, WorktreeTransitionId,
     },
-    procedure::{ProcedureRevision, ProcedureUsageRevision},
+    procedure::{ProcedureRevision, ProcedureScope, ProcedureUsageRevision},
     purge::{
         ObjectDeletionGuards, ObjectDeletionLedgerEvent, ObjectDeletionPhase, ObjectDeletionTarget,
-        ObjectReauthorizationIntent,
+        ObjectReauthorizationIntent, ScopePurgeStage, ScopePurgeTarget,
     },
     repository::{
         IntegrationEvent, LineageAssessment, RecoveryApplication, RecoveryBundle,
@@ -63,7 +64,7 @@ use crate::{
     },
     purge::{
         ObjectDeletionCandidateAdmission, ObjectDeletionRevisionFact, ObjectDeletionSourceContext,
-        ObjectDeletionState, derive_object_deletion_preview, filter_product_rows,
+        ObjectDeletionState, ScopePurgeState, derive_object_deletion_preview, filter_product_rows,
     },
 };
 
@@ -304,6 +305,66 @@ impl ProjectionSnapshot {
 
     pub fn row(&self, row_id: &str) -> Option<&ObjectRow> {
         self.rows.iter().find(|row| row.row_id == row_id)
+    }
+
+    pub fn live_cas_refs_intersect(
+        &self,
+        candidates: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        let mut refs = BTreeSet::new();
+        let mut retain = |value: String| {
+            if candidates.contains(&value) {
+                refs.insert(value);
+            }
+        };
+        for row in self.data_rows() {
+            if recall_projection::contract(row)?.is_some()
+                || crate::session_import::restore_current(row)?.is_some()
+                || s23::S23State::restore_projection(row)?
+                || procedure_effect::restore(row)?.is_some()
+                || recall_ledger::need(row)?.is_some()
+            {
+                continue;
+            }
+            if let Some(wiki) = synthesis::restore_wiki_projection(row)? {
+                retain(cas_ref_string(wiki.rendered_blob_ref));
+                continue;
+            }
+            let payload_json = row
+                .payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?;
+            let payload: JournalPayload =
+                serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            match payload {
+                JournalPayload::SourceReceiptRecorded(value) => retain(value.cas_ref),
+                JournalPayload::WorkArtifactRecorded(value) => {
+                    if let Some(value) = value.revision.content_blob_ref {
+                        retain(cas_ref_string(value));
+                    }
+                }
+                JournalPayload::ResultEvidenceRecorded(value) => {
+                    for value in &value.raw_cas_refs {
+                        retain(cas_ref_string(*value));
+                    }
+                }
+                JournalPayload::RecoveryBundleRecorded(value) => {
+                    let mut bundle_refs = BTreeSet::new();
+                    extend_recovery_bundle_cas_refs(&mut bundle_refs, &value);
+                    for value in bundle_refs {
+                        retain(value);
+                    }
+                }
+                JournalPayload::RecoveryApplicationRecorded(value) => {
+                    for value in &value.selected_cas_refs {
+                        retain(cas_ref_string(*value));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(refs)
     }
 
     pub fn procedure_effect_current_facts(
@@ -1929,6 +1990,8 @@ struct ReducerState {
     procedure: procedure::ProcedureState,
     synthesis: synthesis::SynthesisState,
     deletions: Box<ObjectDeletionState>,
+    scope_purges: Box<ScopePurgeState>,
+    repository_closures: BTreeMap<RepositoryId, RepositoryClosureKeys>,
 }
 
 #[derive(Clone, Debug)]
@@ -1981,6 +2044,7 @@ impl KnownSourceRange {
 
 #[derive(Clone, Default)]
 pub(crate) struct JournalAdmissionState {
+    repository_closures: BTreeMap<RepositoryId, RepositoryClosureKeys>,
     session_imports: BTreeMap<String, crate::session_import::SessionImportCurrent>,
     frontier: u64,
     source_ranges: BTreeMap<String, KnownSourceRange>,
@@ -2045,6 +2109,7 @@ pub(crate) struct JournalAdmissionState {
     synthesis: synthesis::SynthesisState,
     jobs: BTreeMap<evertrace_domain::ids::JobId, DurableJob>,
     deletions: Box<ObjectDeletionState>,
+    scope_purges: Box<ScopePurgeState>,
 }
 
 fn recall_scope_matches(
@@ -2335,6 +2400,78 @@ struct ObjectDeletionPreviewInputs<'a> {
     s23: &'a s23::S23State,
     synthesis: &'a synthesis::SynthesisState,
     deletions: &'a ObjectDeletionState,
+}
+
+struct RepositoryScopePreviewInputs<'a> {
+    session_imports: &'a BTreeMap<String, crate::session_import::SessionImportCurrent>,
+    jobs: Vec<&'a DurableJob>,
+    host_occurrences: &'a BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
+    operations: &'a BTreeMap<OperationId, (Operation, u64)>,
+    scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
+    execution_lanes: &'a BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
+    repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    worktree_snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    capture_receipt_revisions:
+        &'a BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
+    atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
+    proposal_revisions: &'a BTreeMap<RevisionId, (RevisionProposal, u64)>,
+    tasks: &'a BTreeMap<TaskId, (Task, u64)>,
+    workstreams: &'a BTreeMap<WorkstreamId, (Workstream, u64)>,
+    attempts: &'a BTreeMap<AttemptId, (Attempt, u64)>,
+    competing_groups: &'a BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    operation_bursts: &'a BTreeMap<OperationBurstId, (OperationBurst, u64)>,
+    episodes: &'a BTreeMap<WorkEpisodeId, (WorkEpisode, u64)>,
+    episode_revisions: &'a BTreeMap<RevisionId, (WorkEpisode, u64)>,
+    checkpoints: &'a BTreeMap<String, (WorkCheckpoint, u64)>,
+    corrections: &'a BTreeMap<RevisionId, (SegmentationCorrection, u64)>,
+    recovery_request_revisions: &'a BTreeMap<RevisionId, (RecoveryCaptureRequest, u64)>,
+    recovery_bundles: &'a BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
+    recovery_application_revisions: &'a BTreeMap<RevisionId, (RecoveryApplication, u64)>,
+    experiment_run_revisions: &'a BTreeMap<RevisionId, (ExperimentRun, u64)>,
+    result_evidence_revisions: &'a BTreeMap<RevisionId, (ResultEvidence, u64)>,
+    artifact_revisions: &'a BTreeMap<RevisionId, (WorkArtifact, u64)>,
+    recall_ledger: &'a recall_ledger::RecallLedgerState,
+    synthesis: &'a synthesis::SynthesisState,
+    procedure: &'a procedure::ProcedureState,
+    s23: &'a s23::S23State,
+    scope_purges: &'a crate::purge::ScopePurgeState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RepositoryClosureKeys {
+    repository_id: Option<RepositoryId>,
+    session_ids: BTreeSet<String>,
+    target_repository_job_ids: BTreeSet<evertrace_domain::ids::JobId>,
+    worktree_ids: BTreeSet<WorktreeId>,
+    snapshot_ids: BTreeSet<WorktreeSnapshotId>,
+    source_observation_ids: BTreeSet<SourceObservationId>,
+    source_receipt_ids: BTreeSet<SourceReceiptId>,
+    source_revisions: BTreeSet<(SourceInstanceId, SourceRevision)>,
+    host_occurrence_ids: BTreeSet<HostOccurrenceId>,
+    operation_ids: BTreeSet<OperationId>,
+    scope_effect_ids: BTreeSet<ScopeEffectId>,
+    execution_lane_ids: BTreeSet<ExecutionLaneId>,
+    task_ids: BTreeSet<TaskId>,
+    workstream_ids: BTreeSet<WorkstreamId>,
+    attempt_ids: BTreeSet<AttemptId>,
+    competing_group_ids: BTreeSet<CompetingAttemptGroupId>,
+    episode_ids: BTreeSet<WorkEpisodeId>,
+    episode_revision_ids: BTreeSet<RevisionId>,
+    run_ids: BTreeSet<ExperimentRunId>,
+    result_ids: BTreeSet<ResultEvidenceId>,
+    artifact_ids: BTreeSet<WorkArtifactId>,
+    recovery_request_ids: BTreeSet<RecoveryCaptureRequestId>,
+    recovery_bundle_ids: BTreeSet<RecoveryBundleId>,
+    recovery_application_ids: BTreeSet<RecoveryApplicationId>,
+    revision_ids: BTreeSet<RevisionId>,
+    atom_ids: BTreeSet<AtomId>,
+    procedure_ids: BTreeSet<ProcedureId>,
+    membership_ids: BTreeSet<evertrace_domain::ids::CoreMembershipId>,
+    proposal_ids: BTreeSet<RevisionProposalId>,
+    proposal_revision_ids: BTreeSet<RevisionId>,
 }
 
 pub struct ObjectDeletionCandidateAdmissionView {
@@ -2797,6 +2934,45 @@ impl ReducerState {
             deletions: &self.deletions,
         }
     }
+
+    fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_> {
+        RepositoryScopePreviewInputs {
+            session_imports: &self.session_imports,
+            jobs: self.jobs.values().map(|(job, _)| job).collect(),
+            host_occurrences: &self.host_occurrences,
+            operations: &self.operations,
+            scope_effects: &self.scope_effects,
+            execution_lanes: &self.execution_lanes,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            worktree_snapshots: &self.worktree_snapshots,
+            source_receipts: &self.source_receipts,
+            evidence_surfaces: &self.evidence_surfaces,
+            capture_receipt_revisions: &self.capture_receipt_revisions,
+            atom_revisions: &self.atom_revisions,
+            proposal_revisions: &self.proposal_revisions,
+            tasks: &self.tasks,
+            workstreams: &self.workstreams,
+            attempts: &self.attempts,
+            competing_groups: &self.competing_groups,
+            operation_bursts: &self.operation_bursts,
+            episodes: &self.episodes,
+            episode_revisions: &self.episode_revisions,
+            checkpoints: &self.checkpoints,
+            corrections: &self.corrections,
+            recovery_request_revisions: &self.recovery_request_revisions,
+            recovery_bundles: &self.recovery_bundles,
+            recovery_application_revisions: &self.recovery_application_revisions,
+            experiment_run_revisions: &self.experiment_run_revisions,
+            result_evidence_revisions: &self.result_evidence_revisions,
+            artifact_revisions: &self.artifact_revisions,
+            recall_ledger: &self.recall_ledger,
+            synthesis: &self.synthesis,
+            procedure: &self.procedure,
+            s23: &self.s23,
+            scope_purges: &self.scope_purges,
+        }
+    }
 }
 
 impl JournalAdmissionState {
@@ -2832,6 +3008,45 @@ impl JournalAdmissionState {
             s23: &self.s23,
             synthesis: &self.synthesis,
             deletions: &self.deletions,
+        }
+    }
+
+    fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_> {
+        RepositoryScopePreviewInputs {
+            session_imports: &self.session_imports,
+            jobs: self.jobs.values().collect(),
+            host_occurrences: &self.host_occurrences,
+            operations: &self.operations,
+            scope_effects: &self.scope_effects,
+            execution_lanes: &self.execution_lanes,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            worktree_snapshots: &self.worktree_snapshots,
+            source_receipts: &self.source_receipts,
+            evidence_surfaces: &self.evidence_surfaces,
+            capture_receipt_revisions: &self.capture_receipt_revisions,
+            atom_revisions: &self.atom_revisions,
+            proposal_revisions: &self.proposal_revisions,
+            tasks: &self.tasks,
+            workstreams: &self.workstreams,
+            attempts: &self.attempts,
+            competing_groups: &self.competing_groups,
+            operation_bursts: &self.operation_bursts,
+            episodes: &self.episodes,
+            episode_revisions: &self.episode_revisions,
+            checkpoints: &self.checkpoints,
+            corrections: &self.corrections,
+            recovery_request_revisions: &self.recovery_request_revisions,
+            recovery_bundles: &self.recovery_bundles,
+            recovery_application_revisions: &self.recovery_application_revisions,
+            experiment_run_revisions: &self.experiment_run_revisions,
+            result_evidence_revisions: &self.result_evidence_revisions,
+            artifact_revisions: &self.artifact_revisions,
+            recall_ledger: &self.recall_ledger,
+            synthesis: &self.synthesis,
+            procedure: &self.procedure,
+            s23: &self.s23,
+            scope_purges: &self.scope_purges,
         }
     }
 }
@@ -2968,6 +3183,1747 @@ fn derive_object_deletion_preview_from_inputs(
             .checked_add(1)
             .ok_or(StoreError::StoreCorrupt)?,
     )
+}
+
+fn derive_repository_scope_purge_preview(
+    inputs: RepositoryScopePreviewInputs<'_>,
+    repository_id: RepositoryId,
+    expected_repository_revision: u32,
+    existing_allowed: bool,
+) -> Result<crate::purge::RepositoryScopePurgePreview, StoreError> {
+    let repository = &inputs
+        .repositories
+        .get(&repository_id)
+        .ok_or(StoreError::InvalidInput)?
+        .0;
+    if repository.repository_revision != expected_repository_revision
+        || !existing_allowed && inputs.scope_purges.current(repository_id).is_some()
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut cross_scope_dependency = false;
+    let worktree_ids = inputs
+        .worktrees
+        .values()
+        .filter_map(|(worktree, _)| {
+            (worktree.repository_instance_id == repository_id)
+                .then_some(worktree.worktree_instance_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let target_session_ids = inputs
+        .session_imports
+        .values()
+        .filter(|session| {
+            session.metadata.resolved_repository_instance_id == Some(repository_id)
+                || session
+                    .metadata
+                    .resolved_worktree_instance_id
+                    .is_some_and(|id| worktree_ids.contains(&id))
+        })
+        .map(|session| session.session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let target_snapshot_ids = inputs
+        .worktree_snapshots
+        .values()
+        .filter_map(|(snapshot, _)| {
+            worktree_ids
+                .contains(&snapshot.worktree_instance_id)
+                .then_some(snapshot.worktree_snapshot_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let target_receipts = inputs
+        .source_receipts
+        .values()
+        .filter_map(|(receipt, _)| {
+            (receipt.repository_instance_id == Some(repository_id)
+                || receipt
+                    .worktree_instance_id
+                    .is_some_and(|id| worktree_ids.contains(&id)))
+            .then_some(receipt)
+        })
+        .collect::<Vec<_>>();
+    let target_observations = target_receipts
+        .iter()
+        .map(|receipt| receipt.source_observation_id)
+        .collect::<BTreeSet<_>>();
+    let target_receipt_ids = target_receipts
+        .iter()
+        .map(|receipt| receipt.source_receipt_id)
+        .collect::<BTreeSet<_>>();
+    let target_occurrences = inputs
+        .host_occurrences
+        .values()
+        .filter_map(|(occurrence, _)| {
+            occurrence
+                .source_observation_refs
+                .iter()
+                .any(|id| target_observations.contains(id))
+                .then_some(occurrence)
+        })
+        .collect::<Vec<_>>();
+    if target_occurrences.iter().any(|occurrence| {
+        occurrence
+            .source_observation_refs
+            .iter()
+            .any(|id| !target_observations.contains(id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_occurrence_ids = target_occurrences
+        .iter()
+        .map(|occurrence| occurrence.host_occurrence_id)
+        .collect::<BTreeSet<_>>();
+    let target_operations = inputs
+        .operations
+        .values()
+        .filter_map(|(operation, _)| {
+            (target_occurrence_ids.contains(&operation.host_occurrence_id)
+                || operation
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&operation.result_source_observation_refs)
+                    .any(|id| target_observations.contains(id)))
+            .then_some(operation)
+        })
+        .collect::<Vec<_>>();
+    if target_operations.iter().any(|operation| {
+        operation
+            .input_source_observation_refs
+            .iter()
+            .chain(&operation.result_source_observation_refs)
+            .any(|id| !target_observations.contains(id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_operation_ids = target_operations
+        .iter()
+        .map(|operation| operation.operation_id)
+        .collect::<BTreeSet<_>>();
+    let target_scope_effects = inputs
+        .scope_effects
+        .values()
+        .filter_map(|(effect, _)| {
+            (effect.repository_instance_id == Some(repository_id)
+                || effect
+                    .worktree_instance_id
+                    .is_some_and(|id| worktree_ids.contains(&id))
+                || target_operation_ids.contains(&effect.operation_id))
+            .then_some(effect)
+        })
+        .collect::<Vec<_>>();
+    if target_scope_effects.iter().any(|effect| {
+        effect
+            .repository_instance_id
+            .is_some_and(|id| id != repository_id)
+            || effect
+                .worktree_instance_id
+                .is_some_and(|id| !worktree_ids.contains(&id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_scope_effect_ids = target_scope_effects
+        .iter()
+        .map(|effect| effect.scope_effect_id)
+        .collect::<BTreeSet<_>>();
+    let target_lanes = inputs
+        .execution_lanes
+        .values()
+        .filter_map(|(lane, _)| {
+            lane.operation_ids
+                .iter()
+                .any(|id| target_operation_ids.contains(id))
+                .then_some(lane)
+        })
+        .collect::<Vec<_>>();
+    if target_lanes.iter().any(|lane| {
+        lane.operation_ids
+            .iter()
+            .any(|id| !target_operation_ids.contains(id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_lane_ids = target_lanes
+        .iter()
+        .map(|lane| lane.execution_lane_id)
+        .collect::<BTreeSet<_>>();
+    let target_tasks = inputs
+        .tasks
+        .values()
+        .filter_map(|(task, _)| {
+            task.scope_memberships
+                .iter()
+                .any(|membership| membership.repository_instance_id == Some(repository_id))
+                .then_some(task)
+        })
+        .collect::<Vec<_>>();
+    for task in &target_tasks {
+        let target_memberships = task
+            .scope_memberships
+            .iter()
+            .filter(|membership| membership.repository_instance_id == Some(repository_id))
+            .count();
+        if target_memberships != task.scope_memberships.len() {
+            cross_scope_dependency = true;
+        }
+    }
+    let target_task_ids = target_tasks
+        .iter()
+        .map(|task| task.task_id)
+        .collect::<BTreeSet<_>>();
+    let mut target_atom_ids = inputs
+        .atom_revisions
+        .values()
+        .filter_map(|(atom, _)| {
+            atom_scope_repository(&atom.scope, repository_id, &target_task_ids)
+                .then_some(atom.atom_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut target_revision_ids = inputs
+        .atom_revisions
+        .values()
+        .filter_map(|(atom, _)| {
+            target_atom_ids
+                .contains(&atom.atom_id)
+                .then_some(atom.revision_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut target_procedure_ids = inputs
+        .procedure
+        .all_revisions()
+        .filter_map(|revision| {
+            matches!(
+                revision.draft.scope,
+                ProcedureScope::Repository { repository_id: id }
+                    | ProcedureScope::Worktree { repository_id: id, .. }
+                    if id == repository_id
+            )
+            .then_some(revision.procedure_id)
+        })
+        .collect::<BTreeSet<_>>();
+    target_revision_ids.extend(inputs.procedure.all_revisions().filter_map(|revision| {
+        target_procedure_ids
+            .contains(&revision.procedure_id)
+            .then_some(revision.revision_id)
+    }));
+    let (mut membership_ids, membership_revisions) =
+        inputs.s23.repository_membership_revision_ids(repository_id);
+    target_revision_ids.extend(membership_revisions);
+
+    let target_workstreams = inputs
+        .workstreams
+        .values()
+        .filter_map(|(workstream, _)| {
+            (workstream.repository_instance_id == Some(repository_id)
+                || target_task_ids.contains(&workstream.task_id))
+            .then_some(workstream.workstream_id)
+        })
+        .collect::<BTreeSet<_>>();
+    if inputs.workstreams.values().any(|(workstream, _)| {
+        workstream.repository_instance_id != Some(repository_id)
+            && workstream
+                .dependency_workstream_ids
+                .iter()
+                .any(|id| target_workstreams.contains(id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_attempts = inputs
+        .attempts
+        .values()
+        .filter_map(|(attempt, _)| {
+            (attempt.repository_instance_id == Some(repository_id)
+                || target_workstreams.contains(&attempt.workstream_id))
+            .then_some(attempt.attempt_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let target_episodes = inputs
+        .episodes
+        .values()
+        .filter_map(|(episode, _)| {
+            (episode.repository_instance_id == Some(repository_id)
+                || target_workstreams.contains(&episode.workstream_id))
+            .then_some(episode.episode_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let target_episode_revision_ids = inputs
+        .episode_revisions
+        .values()
+        .filter_map(|(episode, _)| {
+            target_episodes
+                .contains(&episode.episode_id)
+                .then_some(episode.revision_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let active_target_repository_jobs = inputs
+        .jobs
+        .iter()
+        .filter(|job| {
+            matches!(job.state, JobStatus::Queued | JobStatus::Leased)
+                && job_targets_repository(
+                    job,
+                    &target_session_ids,
+                    &target_episode_revision_ids,
+                    &target_observations,
+                )
+        })
+        .map(|job| (*job).clone())
+        .collect::<Vec<_>>();
+    let target_corrections = inputs
+        .corrections
+        .values()
+        .filter_map(|(correction, _)| {
+            correction
+                .source_episode_ids
+                .iter()
+                .chain(&correction.replacement_episode_ids)
+                .any(|id| target_episodes.contains(id))
+                .then_some(correction)
+        })
+        .collect::<Vec<_>>();
+    if target_corrections.iter().any(|correction| {
+        correction
+            .source_episode_ids
+            .iter()
+            .chain(&correction.replacement_episode_ids)
+            .any(|id| !target_episodes.contains(id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_competing_groups = inputs
+        .competing_groups
+        .values()
+        .filter_map(|(group, _)| {
+            (target_task_ids.contains(&group.task_id)
+                || group
+                    .member_workstream_ids
+                    .iter()
+                    .any(|id| target_workstreams.contains(id))
+                || group
+                    .member_attempt_ids
+                    .iter()
+                    .any(|id| target_attempts.contains(id)))
+            .then_some(group)
+        })
+        .collect::<Vec<_>>();
+    if target_competing_groups.iter().any(|group| {
+        !target_task_ids.contains(&group.task_id)
+            || group
+                .member_workstream_ids
+                .iter()
+                .any(|id| !target_workstreams.contains(id))
+            || group
+                .member_attempt_ids
+                .iter()
+                .any(|id| !target_attempts.contains(id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_competing_group_ids = target_competing_groups
+        .iter()
+        .map(|group| group.competing_group_id)
+        .collect::<BTreeSet<_>>();
+    let target_bursts = inputs
+        .operation_bursts
+        .values()
+        .filter_map(|(burst, _)| {
+            (burst
+                .attempt_id
+                .is_some_and(|id| target_attempts.contains(&id))
+                || burst
+                    .primary_binding
+                    .workstream_id
+                    .is_some_and(|id| target_workstreams.contains(&id))
+                || target_lane_ids.contains(&burst.execution_lane_id)
+                || burst
+                    .members
+                    .iter()
+                    .any(|member| target_operation_ids.contains(&member.operation_id)))
+            .then_some(burst)
+        })
+        .collect::<Vec<_>>();
+    if target_bursts.iter().any(|burst| {
+        burst
+            .members
+            .iter()
+            .any(|member| !target_operation_ids.contains(&member.operation_id))
+            || burst
+                .competing_group_id
+                .is_some_and(|id| !target_competing_group_ids.contains(&id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_runs = inputs
+        .experiment_run_revisions
+        .values()
+        .filter_map(|(run, _)| {
+            (target_workstreams.contains(&run.workstream_id)
+                || run
+                    .attempt_id
+                    .is_some_and(|id| target_attempts.contains(&id)))
+            .then_some(run.run_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let target_results = inputs
+        .result_evidence_revisions
+        .values()
+        .filter_map(|(result, _)| {
+            target_runs
+                .contains(&result.experiment_run_id)
+                .then_some(result.result_evidence_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let target_recovery_requests = inputs
+        .recovery_request_revisions
+        .values()
+        .filter_map(|(request, _)| {
+            (request.repository_instance_id == repository_id
+                || worktree_ids.contains(&request.worktree_instance_id))
+            .then_some(request)
+        })
+        .collect::<Vec<_>>();
+    let target_recovery_request_ids = target_recovery_requests
+        .iter()
+        .map(|request| request.recovery_capture_request_id)
+        .collect::<BTreeSet<_>>();
+    let target_recovery_bundles = inputs
+        .recovery_bundles
+        .values()
+        .filter_map(|(bundle, _)| {
+            (worktree_ids.contains(&bundle.source_worktree_instance_id)
+                || bundle
+                    .trigger_request_ids
+                    .iter()
+                    .any(|id| target_recovery_request_ids.contains(id)))
+            .then_some(bundle)
+        })
+        .collect::<Vec<_>>();
+    if target_recovery_bundles.iter().any(|bundle| {
+        !worktree_ids.contains(&bundle.source_worktree_instance_id)
+            || bundle
+                .trigger_request_ids
+                .iter()
+                .any(|id| !target_recovery_request_ids.contains(id))
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_recovery_bundle_ids = target_recovery_bundles
+        .iter()
+        .map(|bundle| bundle.recovery_bundle_id)
+        .collect::<BTreeSet<_>>();
+    let target_recovery_application_ids = inputs
+        .recovery_application_revisions
+        .values()
+        .filter_map(|(application, _)| {
+            (worktree_ids.contains(&application.target_worktree_instance_id)
+                || target_recovery_bundle_ids.contains(&application.recovery_bundle_id))
+            .then_some(application.recovery_application_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let target_recovery_applications = inputs
+        .recovery_application_revisions
+        .values()
+        .filter_map(|(application, _)| {
+            target_recovery_application_ids
+                .contains(&application.recovery_application_id)
+                .then_some(application)
+        })
+        .collect::<Vec<_>>();
+    if target_recovery_applications.iter().any(|application| {
+        !worktree_ids.contains(&application.target_worktree_instance_id)
+            || !target_recovery_bundle_ids.contains(&application.recovery_bundle_id)
+    }) {
+        cross_scope_dependency = true;
+    }
+    let target_artifacts = inputs
+        .artifact_revisions
+        .values()
+        .filter_map(|(artifact, _)| {
+            (artifact.revision.scope.repository_id() == Some(repository_id))
+                .then_some(artifact.work_artifact_id)
+        })
+        .collect::<BTreeSet<_>>();
+
+    let directly_scoped_semantic_count = target_atom_ids
+        .len()
+        .checked_add(target_procedure_ids.len())
+        .and_then(|count| count.checked_add(membership_ids.len()))
+        .ok_or(StoreError::InvalidInput)?;
+    extend_repository_semantic_closure(
+        &inputs,
+        &target_observations,
+        &target_receipt_ids,
+        &mut target_atom_ids,
+        &mut target_procedure_ids,
+        &mut membership_ids,
+        &mut target_revision_ids,
+    );
+    let mut target_proposal_ids = BTreeSet::new();
+    let mut target_proposal_revision_ids = BTreeSet::new();
+    let mut global_target_proposal_ids = BTreeSet::new();
+    for (proposal, _) in inputs.proposal_revisions.values() {
+        if proposal_references_repository_closure(
+            proposal,
+            repository_id,
+            &target_task_ids,
+            &target_observations,
+            &target_receipt_ids,
+            &target_revision_ids,
+            &target_atom_ids,
+            &target_procedure_ids,
+            &membership_ids,
+        ) {
+            target_proposal_ids.insert(proposal.proposal_id);
+            target_proposal_revision_ids.insert(proposal.proposal_revision_id);
+            if proposal_targets_outside_repository(
+                proposal,
+                repository_id,
+                &target_task_ids,
+                inputs.atom_revisions,
+            )? {
+                global_target_proposal_ids.insert(proposal.proposal_id);
+            }
+        }
+    }
+    let repository_derived_global_dependency_count = target_atom_ids
+        .len()
+        .checked_add(target_procedure_ids.len())
+        .and_then(|count| count.checked_add(membership_ids.len()))
+        .and_then(|count| count.checked_sub(directly_scoped_semantic_count))
+        .and_then(|count| count.checked_add(global_target_proposal_ids.len()))
+        .ok_or(StoreError::InvalidInput)?;
+
+    if inputs.artifact_revisions.values().any(|(artifact, _)| {
+        !target_artifacts.contains(&artifact.work_artifact_id)
+            && artifact
+                .revision
+                .source_observation_refs
+                .iter()
+                .any(|id| target_observations.contains(id))
+    }) || inputs.experiment_run_revisions.values().any(|(run, _)| {
+        !target_runs.contains(&run.run_id)
+            && (target_snapshot_ids.contains(&run.code_snapshot_id)
+                || run
+                    .source_receipt_refs
+                    .iter()
+                    .any(|id| target_receipt_ids.contains(id))
+                || run
+                    .work_artifact_refs
+                    .iter()
+                    .any(|id| target_artifacts.contains(id)))
+    }) || inputs
+        .result_evidence_revisions
+        .values()
+        .any(|(result, _)| {
+            !target_results.contains(&result.result_evidence_id)
+                && (target_runs.contains(&result.experiment_run_id)
+                    || result
+                        .raw_artifact_refs
+                        .iter()
+                        .any(|id| target_artifacts.contains(id)))
+        })
+    {
+        cross_scope_dependency = true;
+    }
+
+    let mut target_cas = target_receipts
+        .iter()
+        .map(|receipt| receipt.cas_ref.clone())
+        .collect::<BTreeSet<_>>();
+    target_cas.extend(
+        inputs
+            .artifact_revisions
+            .values()
+            .filter_map(|(artifact, _)| {
+                target_artifacts
+                    .contains(&artifact.work_artifact_id)
+                    .then(|| artifact.revision.content_blob_ref.map(cas_ref_string))
+                    .flatten()
+            }),
+    );
+    target_cas.extend(
+        inputs
+            .result_evidence_revisions
+            .values()
+            .filter(|(result, _)| target_results.contains(&result.result_evidence_id))
+            .flat_map(|(result, _)| result.raw_cas_refs.iter().copied().map(cas_ref_string)),
+    );
+    for bundle in &target_recovery_bundles {
+        extend_recovery_bundle_cas_refs(&mut target_cas, bundle);
+    }
+    target_cas.extend(target_recovery_applications.iter().flat_map(|application| {
+        application
+            .selected_cas_refs
+            .iter()
+            .copied()
+            .map(cas_ref_string)
+    }));
+    let mut shared_cas = inputs
+        .source_receipts
+        .values()
+        .filter_map(|(receipt, _)| {
+            (!target_receipt_ids.contains(&receipt.source_receipt_id)
+                && target_cas.contains(&receipt.cas_ref))
+            .then_some(receipt.cas_ref.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    shared_cas.extend(
+        inputs
+            .artifact_revisions
+            .values()
+            .filter_map(|(artifact, _)| {
+                (!target_artifacts.contains(&artifact.work_artifact_id))
+                    .then(|| artifact.revision.content_blob_ref.map(cas_ref_string))
+                    .flatten()
+                    .filter(|reference| target_cas.contains(reference))
+            }),
+    );
+    shared_cas.extend(
+        inputs
+            .result_evidence_revisions
+            .values()
+            .filter(|(result, _)| !target_results.contains(&result.result_evidence_id))
+            .flat_map(|(result, _)| result.raw_cas_refs.iter().copied().map(cas_ref_string))
+            .filter(|reference| target_cas.contains(reference)),
+    );
+    for (bundle, _) in inputs.recovery_bundles.values() {
+        if target_recovery_bundle_ids.contains(&bundle.recovery_bundle_id) {
+            continue;
+        }
+        let mut references = BTreeSet::new();
+        extend_recovery_bundle_cas_refs(&mut references, bundle);
+        shared_cas.extend(
+            references
+                .into_iter()
+                .filter(|reference| target_cas.contains(reference)),
+        );
+    }
+    shared_cas.extend(
+        inputs
+            .recovery_application_revisions
+            .values()
+            .filter(|(application, _)| {
+                !target_recovery_application_ids.contains(&application.recovery_application_id)
+            })
+            .flat_map(|(application, _)| {
+                application
+                    .selected_cas_refs
+                    .iter()
+                    .copied()
+                    .map(cas_ref_string)
+            })
+            .filter(|reference| target_cas.contains(reference)),
+    );
+    let exclusive_cas_refs = target_cas
+        .difference(&shared_cas)
+        .cloned()
+        .collect::<Vec<_>>();
+    let downstream_support_impacts = inputs
+        .s23
+        .scope_purge_support_impacts(&target_revision_ids, &membership_ids)?;
+    let dependent_procedure_impacts = inputs
+        .procedure
+        .deletion_procedure_impacts(&target_revision_ids);
+    let affected_session_count = bounded_aggregate_count(&[target_session_ids.len()])?;
+    let affected_evidence_receipt_capture_count = bounded_aggregate_count(&[
+        target_observations.len(),
+        target_receipt_ids.len(),
+        inputs
+            .evidence_surfaces
+            .keys()
+            .filter(|id| target_observations.contains(id))
+            .count(),
+        inputs
+            .capture_receipt_revisions
+            .values()
+            .filter(|(receipt, _)| target_lane_ids.contains(&receipt.execution_lane_id))
+            .count(),
+    ])?;
+    let affected_work_count = bounded_aggregate_count(&[
+        target_task_ids.len(),
+        target_workstreams.len(),
+        target_attempts.len(),
+        target_competing_group_ids.len(),
+        target_bursts.len(),
+        target_episodes.len(),
+        inputs
+            .checkpoints
+            .values()
+            .filter(|(checkpoint, _)| target_episodes.contains(&checkpoint.episode_id))
+            .count(),
+        target_corrections.len(),
+    ])?;
+    let affected_recovery_count = bounded_aggregate_count(&[
+        target_recovery_request_ids.len(),
+        target_recovery_bundle_ids.len(),
+        target_recovery_applications.len(),
+    ])?;
+    let affected_recall_derived_count = bounded_aggregate_count(&[
+        inputs
+            .recall_ledger
+            .values()
+            .filter(|need| {
+                need.repository_id == Some(repository_id)
+                    || need
+                        .source_revision_ids
+                        .iter()
+                        .any(|id| target_revision_ids.contains(id))
+            })
+            .count(),
+        inputs
+            .synthesis
+            .digests()
+            .values()
+            .filter(|(digest, _)| {
+                digest.repository_id == Some(repository_id)
+                    || target_episodes.contains(&digest.episode_id)
+                    || digest.selected_direct_refs.iter().any(|reference| {
+                        typed_text_references_target(
+                            reference,
+                            &target_observations,
+                            &target_receipt_ids,
+                            &target_revision_ids,
+                        )
+                    })
+            })
+            .count(),
+        inputs
+            .synthesis
+            .runs()
+            .values()
+            .filter(|(run, _)| {
+                target_episodes.contains(&run.episode_id)
+                    || run.selected_direct_refs.iter().any(|reference| {
+                        typed_text_references_target(
+                            reference,
+                            &target_observations,
+                            &target_receipt_ids,
+                            &target_revision_ids,
+                        )
+                    })
+            })
+            .count(),
+    ])?;
+    let affected_atom_count = bounded_aggregate_count(&[target_atom_ids.len()])?;
+    let affected_procedure_count = bounded_aggregate_count(&[target_procedure_ids.len()])?;
+    let affected_experiment_run_count = bounded_aggregate_count(&[target_runs.len()])?;
+    let affected_result_evidence_count = bounded_aggregate_count(&[target_results.len()])?;
+    let affected_artifact_count = bounded_aggregate_count(&[target_artifacts.len()])?;
+    let relationship_only_count = bounded_aggregate_count(&[
+        downstream_support_impacts.len(),
+        dependent_procedure_impacts.len(),
+    ])?;
+    let closure = RepositoryClosureKeys {
+        repository_id: Some(repository_id),
+        session_ids: target_session_ids,
+        target_repository_job_ids: active_target_repository_jobs
+            .iter()
+            .map(|job| job.job_id)
+            .collect(),
+        worktree_ids,
+        snapshot_ids: target_snapshot_ids,
+        source_observation_ids: target_observations,
+        source_receipt_ids: target_receipt_ids,
+        source_revisions: target_receipts
+            .iter()
+            .map(|receipt| {
+                (
+                    receipt.source_instance_id.clone(),
+                    receipt.source_revision.clone(),
+                )
+            })
+            .collect(),
+        host_occurrence_ids: target_occurrence_ids,
+        operation_ids: target_operation_ids,
+        scope_effect_ids: target_scope_effect_ids,
+        execution_lane_ids: target_lane_ids,
+        task_ids: target_task_ids,
+        workstream_ids: target_workstreams,
+        attempt_ids: target_attempts,
+        competing_group_ids: target_competing_group_ids,
+        episode_ids: target_episodes,
+        episode_revision_ids: target_episode_revision_ids,
+        run_ids: target_runs,
+        result_ids: target_results,
+        artifact_ids: target_artifacts,
+        recovery_request_ids: target_recovery_request_ids,
+        recovery_bundle_ids: target_recovery_bundle_ids,
+        recovery_application_ids: target_recovery_applications
+            .iter()
+            .map(|application| application.recovery_application_id)
+            .collect(),
+        revision_ids: target_revision_ids,
+        atom_ids: target_atom_ids,
+        procedure_ids: target_procedure_ids,
+        membership_ids,
+        proposal_ids: target_proposal_ids,
+        proposal_revision_ids: target_proposal_revision_ids,
+    };
+    let mut blockers = Vec::new();
+    if repository_derived_global_dependency_count != 0 {
+        blockers.push(
+            evertrace_domain::purge::RepositoryPurgeBlocker::RepositoryDerivedGlobalDependency,
+        );
+    }
+    if cross_scope_dependency {
+        blockers.push(evertrace_domain::purge::RepositoryPurgeBlocker::CrossScopeDependency);
+    }
+    let mut preview = crate::purge::RepositoryScopePurgePreview {
+        target: ScopePurgeTarget::Repository {
+            repository_id,
+            repository_revision: expected_repository_revision,
+        },
+        deletion_generation: inputs
+            .scope_purges
+            .generation()
+            .checked_add(1)
+            .ok_or(StoreError::InvalidInput)?,
+        exclusive_cas_refs,
+        shared_cas_count: u32::try_from(shared_cas.len()).map_err(|_| StoreError::InvalidInput)?,
+        repository_derived_global_dependency_count: u32::try_from(
+            repository_derived_global_dependency_count,
+        )
+        .map_err(|_| StoreError::InvalidInput)?,
+        affected_session_count,
+        affected_evidence_receipt_capture_count,
+        affected_work_count,
+        affected_atom_count,
+        affected_procedure_count,
+        affected_experiment_run_count,
+        affected_result_evidence_count,
+        affected_artifact_count,
+        affected_recovery_count,
+        affected_recall_derived_count,
+        relationship_only_count,
+        blockers,
+        downstream_support_impacts,
+        dependent_procedure_impacts,
+        closure,
+        active_target_repository_jobs,
+    };
+    if preview.pending_command_event_count().is_err() {
+        preview
+            .blockers
+            .push(evertrace_domain::purge::RepositoryPurgeBlocker::CommandEventCap);
+    }
+    Ok(preview)
+}
+
+fn atom_scope_repository(
+    scope: &evertrace_domain::semantic::AtomScope,
+    repository_id: RepositoryId,
+    task_ids: &BTreeSet<TaskId>,
+) -> bool {
+    match scope {
+        evertrace_domain::semantic::AtomScope::Task { task_id } => task_ids.contains(task_id),
+        evertrace_domain::semantic::AtomScope::Repository {
+            repository_instance_id,
+        }
+        | evertrace_domain::semantic::AtomScope::Worktree {
+            repository_instance_id,
+            ..
+        } => *repository_instance_id == repository_id,
+        evertrace_domain::semantic::AtomScope::Global => false,
+    }
+}
+
+fn bounded_aggregate_count(parts: &[usize]) -> Result<u32, StoreError> {
+    let total = parts.iter().try_fold(0_usize, |total, part| {
+        total.checked_add(*part).ok_or(StoreError::InvalidInput)
+    })?;
+    u32::try_from(total).map_err(|_| StoreError::InvalidInput)
+}
+
+fn typed_text_references_target(
+    reference: &str,
+    observations: &BTreeSet<SourceObservationId>,
+    receipts: &BTreeSet<SourceReceiptId>,
+    revisions: &BTreeSet<RevisionId>,
+) -> bool {
+    reference
+        .parse::<SourceObservationId>()
+        .is_ok_and(|id| observations.contains(&id))
+        || reference
+            .parse::<SourceReceiptId>()
+            .is_ok_and(|id| receipts.contains(&id))
+        || reference
+            .parse::<RevisionId>()
+            .is_ok_and(|id| revisions.contains(&id))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SemanticClosureEntity {
+    Atom(AtomId),
+    Procedure(ProcedureId),
+    Membership(evertrace_domain::ids::CoreMembershipId),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extend_repository_semantic_closure(
+    inputs: &RepositoryScopePreviewInputs<'_>,
+    observations: &BTreeSet<SourceObservationId>,
+    receipts: &BTreeSet<SourceReceiptId>,
+    atom_ids: &mut BTreeSet<AtomId>,
+    procedure_ids: &mut BTreeSet<ProcedureId>,
+    membership_ids: &mut BTreeSet<evertrace_domain::ids::CoreMembershipId>,
+    revision_ids: &mut BTreeSet<RevisionId>,
+) {
+    let mut atom_revisions = BTreeMap::<AtomId, Vec<&Atom>>::new();
+    let mut procedure_revisions = BTreeMap::<ProcedureId, Vec<&ProcedureRevision>>::new();
+    let mut membership_revisions =
+        BTreeMap::<evertrace_domain::ids::CoreMembershipId, Vec<&CoreMembership>>::new();
+    let mut reverse = BTreeMap::<RevisionId, BTreeSet<SemanticClosureEntity>>::new();
+    let no_revisions = BTreeSet::new();
+    let mut seeds = atom_ids
+        .iter()
+        .copied()
+        .map(SemanticClosureEntity::Atom)
+        .chain(
+            procedure_ids
+                .iter()
+                .copied()
+                .map(SemanticClosureEntity::Procedure),
+        )
+        .chain(
+            membership_ids
+                .iter()
+                .copied()
+                .map(SemanticClosureEntity::Membership),
+        )
+        .collect::<BTreeSet<_>>();
+    for (atom, _) in inputs.atom_revisions.values() {
+        atom_revisions.entry(atom.atom_id).or_default().push(atom);
+        let entity = SemanticClosureEntity::Atom(atom.atom_id);
+        if atom
+            .source_observation_refs
+            .iter()
+            .any(|id| observations.contains(id))
+            || atom.evidence_refs.iter().any(|reference| {
+                typed_text_references_target(reference, observations, receipts, &no_revisions)
+            })
+        {
+            seeds.insert(entity);
+        }
+        for dependency in atom
+            .parent_revision_id
+            .iter()
+            .chain(&atom.value.critical_revision_refs)
+            .chain(&atom.supersedes_revision_refs)
+            .chain(&atom.supports_revision_refs)
+            .chain(&atom.contradicts_revision_refs)
+            .copied()
+            .chain(
+                atom.evidence_refs
+                    .iter()
+                    .filter_map(|reference| reference.parse::<RevisionId>().ok()),
+            )
+        {
+            reverse.entry(dependency).or_default().insert(entity);
+        }
+    }
+    for revision in inputs.procedure.all_revisions() {
+        procedure_revisions
+            .entry(revision.procedure_id)
+            .or_default()
+            .push(revision);
+        let entity = SemanticClosureEntity::Procedure(revision.procedure_id);
+        if revision.draft.evidence_refs.iter().any(|reference| {
+            typed_text_references_target(reference, observations, receipts, &no_revisions)
+        }) {
+            seeds.insert(entity);
+        }
+        for dependency in revision
+            .parent_revision_id
+            .iter()
+            .chain(&revision.draft.support_revision_refs)
+            .copied()
+            .chain(
+                revision
+                    .draft
+                    .evidence_refs
+                    .iter()
+                    .filter_map(|reference| reference.parse::<RevisionId>().ok()),
+            )
+        {
+            reverse.entry(dependency).or_default().insert(entity);
+        }
+    }
+    for membership in inputs.s23.all_membership_revisions() {
+        membership_revisions
+            .entry(membership.core_membership_id)
+            .or_default()
+            .push(membership);
+        let entity = SemanticClosureEntity::Membership(membership.core_membership_id);
+        for dependency in std::iter::once(membership.atom_revision_id)
+            .chain(std::iter::once(membership.support_contract_ref))
+            .chain(membership.authorization_revision_refs.iter().copied())
+            .chain(membership.supersedes_membership_revision_id)
+            .chain(std::iter::once(membership.created_by_acceptance_ref))
+        {
+            reverse.entry(dependency).or_default().insert(entity);
+        }
+    }
+
+    let mut queue = seeds.into_iter().collect::<VecDeque<_>>();
+    let mut activated = BTreeSet::new();
+    while let Some(entity) = queue.pop_front() {
+        if !activated.insert(entity) {
+            continue;
+        }
+        let mut added_revisions = Vec::new();
+        match entity {
+            SemanticClosureEntity::Atom(id) => {
+                atom_ids.insert(id);
+                for atom in atom_revisions.get(&id).into_iter().flatten() {
+                    if revision_ids.insert(atom.revision_id) {
+                        added_revisions.push(atom.revision_id);
+                    }
+                }
+            }
+            SemanticClosureEntity::Procedure(id) => {
+                procedure_ids.insert(id);
+                for revision in procedure_revisions.get(&id).into_iter().flatten() {
+                    if revision_ids.insert(revision.revision_id) {
+                        added_revisions.push(revision.revision_id);
+                    }
+                }
+            }
+            SemanticClosureEntity::Membership(id) => {
+                membership_ids.insert(id);
+                for membership in membership_revisions.get(&id).into_iter().flatten() {
+                    if revision_ids.insert(membership.membership_revision_id) {
+                        added_revisions.push(membership.membership_revision_id);
+                    }
+                }
+            }
+        }
+        for revision in added_revisions {
+            if let Some(dependents) = reverse.get(&revision) {
+                queue.extend(dependents.iter().copied());
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proposal_references_repository_closure(
+    proposal: &RevisionProposal,
+    repository_id: RepositoryId,
+    task_ids: &BTreeSet<TaskId>,
+    observations: &BTreeSet<SourceObservationId>,
+    receipts: &BTreeSet<SourceReceiptId>,
+    revisions: &BTreeSet<RevisionId>,
+    atom_ids: &BTreeSet<AtomId>,
+    procedure_ids: &BTreeSet<ProcedureId>,
+    membership_ids: &BTreeSet<evertrace_domain::ids::CoreMembershipId>,
+) -> bool {
+    if proposal
+        .evidence_refs
+        .iter()
+        .chain(&proposal.source_cohort_refs)
+        .any(|reference| typed_text_references_target(reference, observations, receipts, revisions))
+        || proposal
+            .base_revision_id
+            .is_some_and(|id| revisions.contains(&id))
+        || matches!(
+            proposal.target_id,
+            Some(ProposalTargetId::Atom(id)) if atom_ids.contains(&id)
+        )
+        || matches!(
+            proposal.target_id,
+            Some(ProposalTargetId::Procedure(id)) if procedure_ids.contains(&id)
+        )
+        || matches!(
+            proposal.target_id,
+            Some(ProposalTargetId::CoreMembership(id)) if membership_ids.contains(&id)
+        )
+    {
+        return true;
+    }
+    match &proposal.payload {
+        ProposalPayload::Atom(payload) => {
+            let drafts = match payload.as_ref() {
+                AtomProposalPayload::Create { draft }
+                | AtomProposalPayload::Replace { draft }
+                | AtomProposalPayload::Merge { draft, .. }
+                | AtomProposalPayload::Reclassify { draft } => std::slice::from_ref(draft),
+                AtomProposalPayload::Split { drafts } => drafts.as_slice(),
+                AtomProposalPayload::Deprecate { .. } => &[],
+            };
+            drafts.iter().any(|draft| {
+                atom_scope_repository(&draft.scope, repository_id, task_ids)
+                    || draft
+                        .source_observation_refs
+                        .iter()
+                        .any(|id| observations.contains(id))
+                    || draft.evidence_refs.iter().any(|reference| {
+                        typed_text_references_target(reference, observations, receipts, revisions)
+                    })
+                    || draft
+                        .supersedes_revision_refs
+                        .iter()
+                        .chain(&draft.supports_revision_refs)
+                        .chain(&draft.contradicts_revision_refs)
+                        .any(|id| revisions.contains(id))
+            })
+        }
+        ProposalPayload::Procedure(payload) => {
+            let draft = payload.draft();
+            matches!(
+                draft.scope,
+                ProcedureScope::Repository { repository_id: id }
+                    | ProcedureScope::Worktree { repository_id: id, .. }
+                    if id == repository_id
+            ) || draft.evidence_refs.iter().any(|reference| {
+                typed_text_references_target(reference, observations, receipts, revisions)
+            }) || draft
+                .support_revision_refs
+                .iter()
+                .any(|id| revisions.contains(id))
+        }
+        ProposalPayload::CoreMembership(payload) => match payload.as_ref() {
+            CoreMembershipProposalPayload::Create {
+                atom_revision_id,
+                scope_identity,
+            } => {
+                revisions.contains(atom_revision_id)
+                    || matches!(
+                        scope_identity,
+                        evertrace_domain::semantic::CoreScopeIdentity::Repository(id)
+                            if *id == repository_id
+                    )
+            }
+            CoreMembershipProposalPayload::ResolveConflict {
+                left_atom_revision_id,
+                right_atom_revision_id,
+                scope_identity,
+            } => {
+                revisions.contains(left_atom_revision_id)
+                    || revisions.contains(right_atom_revision_id)
+                    || matches!(
+                        scope_identity,
+                        evertrace_domain::semantic::CoreScopeIdentity::Repository(id)
+                            if *id == repository_id
+                    )
+            }
+        },
+        ProposalPayload::ReservedTarget { .. } => false,
+    }
+}
+
+fn proposal_targets_outside_repository(
+    proposal: &RevisionProposal,
+    repository_id: RepositoryId,
+    task_ids: &BTreeSet<TaskId>,
+    atom_revisions: &BTreeMap<RevisionId, (Atom, u64)>,
+) -> Result<bool, StoreError> {
+    let atom_scope_is_local = |scope: &evertrace_domain::semantic::AtomScope| {
+        atom_scope_repository(scope, repository_id, task_ids)
+    };
+    Ok(match &proposal.payload {
+        ProposalPayload::Atom(payload) => match payload.as_ref() {
+            AtomProposalPayload::Create { draft }
+            | AtomProposalPayload::Replace { draft }
+            | AtomProposalPayload::Merge { draft, .. }
+            | AtomProposalPayload::Reclassify { draft } => !atom_scope_is_local(&draft.scope),
+            AtomProposalPayload::Split { drafts } => drafts
+                .iter()
+                .any(|draft| !atom_scope_is_local(&draft.scope)),
+            AtomProposalPayload::Deprecate { .. } => {
+                let base_revision_id = proposal.base_revision_id.ok_or(StoreError::StoreCorrupt)?;
+                let (base, _) = atom_revisions
+                    .get(&base_revision_id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                !atom_scope_is_local(&base.scope)
+            }
+        },
+        ProposalPayload::Procedure(payload) => !matches!(
+            payload.draft().scope,
+            ProcedureScope::Repository { repository_id: id }
+                | ProcedureScope::Worktree { repository_id: id, .. }
+                if id == repository_id
+        ),
+        ProposalPayload::CoreMembership(payload) => {
+            let scope = match payload.as_ref() {
+                CoreMembershipProposalPayload::Create { scope_identity, .. }
+                | CoreMembershipProposalPayload::ResolveConflict { scope_identity, .. } => {
+                    scope_identity
+                }
+            };
+            !matches!(
+                scope,
+                evertrace_domain::semantic::CoreScopeIdentity::Repository(id)
+                    if *id == repository_id
+            )
+        }
+        ProposalPayload::ReservedTarget { .. } => false,
+    })
+}
+
+fn job_targets_repository(
+    job: &DurableJob,
+    session_ids: &BTreeSet<String>,
+    episode_revision_ids: &BTreeSet<RevisionId>,
+    observation_ids: &BTreeSet<SourceObservationId>,
+) -> bool {
+    match job.kind.as_str() {
+        "session_import_v1" => job
+            .idempotency_key
+            .strip_prefix("session_import:")
+            .is_some_and(|session_id| session_ids.contains(session_id)),
+        "semantic_synthesis_v1" => job
+            .target_revision
+            .parse::<RevisionId>()
+            .is_ok_and(|id| episode_revision_ids.contains(&id)),
+        "physical_normalization" | "capture_reconciliation" => job
+            .target_revision
+            .parse::<SourceObservationId>()
+            .is_ok_and(|id| observation_ids.contains(&id)),
+        _ => false,
+    }
+}
+
+impl RepositoryClosureKeys {
+    pub(crate) fn references_non_journal_row(&self, row: &ObjectRow) -> Result<bool, StoreError> {
+        let Some(repository_id) = self.repository_id else {
+            return Ok(false);
+        };
+        if row
+            .repository_id
+            .as_deref()
+            .and_then(|value| value.parse::<RepositoryId>().ok())
+            == Some(repository_id)
+            || row
+                .current_revision_id
+                .as_deref()
+                .and_then(|value| value.parse::<RevisionId>().ok())
+                .is_some_and(|id| self.revision_ids.contains(&id))
+        {
+            return Ok(true);
+        }
+        if let Some(current) = crate::session_import::restore_current(row)? {
+            return Ok(self.session_ids.contains(&current.session_id)
+                || current.metadata.resolved_repository_instance_id == Some(repository_id)
+                || current
+                    .metadata
+                    .resolved_worktree_instance_id
+                    .is_some_and(|id| self.worktree_ids.contains(&id)));
+        }
+        match row.object_kind.as_deref() {
+            Some(s23::CORE_PROJECTION_KIND) => {
+                let value: evertrace_domain::semantic::L3CoreProjection = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+                value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                Ok(value
+                    .atom_revision_ids
+                    .iter()
+                    .chain(&value.active_membership_revision_ids)
+                    .any(|id| self.revision_ids.contains(id)))
+            }
+            Some(synthesis::WIKI_PROJECTION_KIND) => {
+                let value: evertrace_domain::semantic::WikiProjection = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+                value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                Ok(value
+                    .source_atom_ids
+                    .iter()
+                    .any(|id| self.atom_ids.contains(id)))
+            }
+            Some("procedure_context_effect") => Ok(procedure_effect::restore(row)?
+                .is_some_and(|value| self.revision_ids.contains(&value.procedure_revision_id))),
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn references_payload(&self, payload: &JournalPayload) -> bool {
+        let Some(repository_id) = self.repository_id else {
+            return false;
+        };
+        match payload {
+            JournalPayload::ScopePurgeProgressRecorded(_)
+            | JournalPayload::MigrationApplied(_)
+            | JournalPayload::WatermarkAdvanced(_)
+            | JournalPayload::ConfigAudit(_)
+            | JournalPayload::StaleGenerationAudit(_)
+            | JournalPayload::CaptureGapMarkerRecorded(_)
+            | JournalPayload::CaptureOutageIntervalRecorded(_)
+            | JournalPayload::ObjectDeletionLedgerRecorded(_) => false,
+            JournalPayload::JobState(job) => {
+                self.target_repository_job_ids.contains(&job.job_id)
+                    || job_targets_repository(
+                        job,
+                        &self.session_ids,
+                        &self.episode_revision_ids,
+                        &self.source_observation_ids,
+                    )
+            }
+            JournalPayload::JobLease(lease) => {
+                self.target_repository_job_ids.contains(&lease.job_id)
+            }
+            JournalPayload::SessionImportEventRecorded(event) => {
+                self.session_ids.contains(&event.session_id)
+                    || matches!(
+                        &event.event,
+                        crate::session_import::SessionImportEventKind::MetadataObserved { metadata }
+                            if metadata.resolved_repository_instance_id == Some(repository_id)
+                                || metadata
+                                    .resolved_worktree_instance_id
+                                    .is_some_and(|id| self.worktree_ids.contains(&id))
+                    )
+            }
+            JournalPayload::SourceRevisionRecorded(value) => self.source_revisions.contains(&(
+                value.source_instance_id.clone(),
+                value.source_revision.clone(),
+            )),
+            JournalPayload::SourceIngestWatermark(value) => self.source_revisions.contains(&(
+                value.source_instance_id.clone(),
+                value.source_revision.clone(),
+            )),
+            JournalPayload::SourceReceiptRecorded(value) => {
+                self.source_receipt_ids.contains(&value.source_receipt_id)
+                    || self
+                        .source_observation_ids
+                        .contains(&value.source_observation_id)
+                    || value.repository_instance_id == Some(repository_id)
+                    || value
+                        .worktree_instance_id
+                        .is_some_and(|id| self.worktree_ids.contains(&id))
+            }
+            JournalPayload::SourceObservationRecorded(value) => self
+                .source_observation_ids
+                .contains(&value.source_observation_id),
+            JournalPayload::EvidenceSurfaceRecorded(value) => {
+                self.source_observation_ids
+                    .contains(&value.source_observation_revision_ref)
+                    || value.repository_instance_id == Some(repository_id)
+                    || value
+                        .worktree_instance_id
+                        .is_some_and(|id| self.worktree_ids.contains(&id))
+            }
+            JournalPayload::NormalizationWatermark(value) => self
+                .source_observation_ids
+                .contains(&value.source_observation_id),
+            JournalPayload::HostOccurrenceNormalized(value) => {
+                self.host_occurrence_ids.contains(&value.host_occurrence_id)
+                    || value
+                        .source_observation_refs
+                        .iter()
+                        .any(|id| self.source_observation_ids.contains(id))
+            }
+            JournalPayload::OperationDerived(value) => {
+                self.operation_ids.contains(&value.operation_id)
+                    || self.host_occurrence_ids.contains(&value.host_occurrence_id)
+                    || value
+                        .input_source_observation_refs
+                        .iter()
+                        .chain(&value.result_source_observation_refs)
+                        .any(|id| self.source_observation_ids.contains(id))
+            }
+            JournalPayload::ScopeEffectDerived(value) => {
+                self.scope_effect_ids.contains(&value.scope_effect_id)
+                    || value.repository_instance_id == Some(repository_id)
+                    || value
+                        .worktree_instance_id
+                        .is_some_and(|id| self.worktree_ids.contains(&id))
+                    || self.operation_ids.contains(&value.operation_id)
+            }
+            JournalPayload::ExecutionLaneRecorded(value) => {
+                self.execution_lane_ids.contains(&value.execution_lane_id)
+                    || value
+                        .operation_ids
+                        .iter()
+                        .any(|id| self.operation_ids.contains(id))
+            }
+            JournalPayload::CaptureReceiptRecorded(value) => {
+                self.execution_lane_ids.contains(&value.execution_lane_id)
+            }
+            JournalPayload::SourceCloseReconciliation(value) => {
+                self.execution_lane_ids.contains(&value.execution_lane_id)
+                    || value.sources.iter().any(|source| {
+                        self.source_revisions.contains(&(
+                            source.source_instance_id.clone(),
+                            source.source_revision.clone(),
+                        ))
+                    })
+            }
+            JournalPayload::DirtyTarget(value)
+            | JournalPayload::OutboxEnqueued(crate::OutboxEntry { dirty: value, .. }) => {
+                if value.target_kind == DirtyTargetKind::RuntimeJob {
+                    value
+                        .target_id
+                        .parse::<JobId>()
+                        .is_ok_and(|id| self.target_repository_job_ids.contains(&id))
+                        || value
+                            .target_id
+                            .strip_prefix("session_import:")
+                            .is_some_and(|session_id| self.session_ids.contains(session_id))
+                } else {
+                    matches!(
+                        value.target_kind,
+                        DirtyTargetKind::EvidenceSurface
+                            | DirtyTargetKind::PhysicalNormalization
+                            | DirtyTargetKind::CaptureReconciliation
+                    ) && value
+                        .target_id
+                        .parse::<SourceObservationId>()
+                        .is_ok_and(|id| self.source_observation_ids.contains(&id))
+                }
+            }
+            JournalPayload::RepositoryInstanceRecorded(value) => {
+                value.repository_id == repository_id
+            }
+            JournalPayload::WorktreeInstanceRecorded(value) => {
+                self.worktree_ids.contains(&value.worktree_instance_id)
+                    || value.repository_instance_id == repository_id
+            }
+            JournalPayload::WorktreeSnapshotRecorded(value) => {
+                self.snapshot_ids.contains(&value.worktree_snapshot_id)
+                    || self.worktree_ids.contains(&value.worktree_instance_id)
+            }
+            JournalPayload::WorktreeTransitionRecorded(value) => {
+                self.worktree_ids.contains(&value.from_worktree_instance_id)
+                    || self.worktree_ids.contains(&value.to_worktree_instance_id)
+            }
+            JournalPayload::IntegrationEventRecorded(value) => {
+                value.repository_instance_id == repository_id
+                    || self
+                        .worktree_ids
+                        .contains(&value.source_worktree_instance_id)
+                    || self
+                        .worktree_ids
+                        .contains(&value.destination_worktree_instance_id)
+            }
+            JournalPayload::TaskRecorded(value) => {
+                self.task_ids.contains(&value.task_id)
+                    || value
+                        .scope_memberships
+                        .iter()
+                        .any(|scope| scope.repository_instance_id == Some(repository_id))
+            }
+            JournalPayload::WorkstreamRecorded(value) => {
+                self.workstream_ids.contains(&value.workstream_id)
+                    || value.repository_instance_id == Some(repository_id)
+                    || self.task_ids.contains(&value.task_id)
+                    || value
+                        .dependency_workstream_ids
+                        .iter()
+                        .any(|id| self.workstream_ids.contains(id))
+            }
+            JournalPayload::WorkBindingRecorded(value) => {
+                value
+                    .primary_binding
+                    .task_id
+                    .is_some_and(|id| self.task_ids.contains(&id))
+                    || value
+                        .primary_binding
+                        .workstream_id
+                        .is_some_and(|id| self.workstream_ids.contains(&id))
+                    || value
+                        .primary_binding
+                        .episode_id
+                        .is_some_and(|id| self.episode_ids.contains(&id))
+            }
+            JournalPayload::AttemptRecorded(value) => {
+                self.attempt_ids.contains(&value.attempt_id)
+                    || value.repository_instance_id == Some(repository_id)
+                    || self.workstream_ids.contains(&value.workstream_id)
+            }
+            JournalPayload::CompetingAttemptGroupRecorded(value) => {
+                self.competing_group_ids.contains(&value.competing_group_id)
+                    || self.task_ids.contains(&value.task_id)
+                    || value
+                        .member_workstream_ids
+                        .iter()
+                        .any(|id| self.workstream_ids.contains(id))
+                    || value
+                        .member_attempt_ids
+                        .iter()
+                        .any(|id| self.attempt_ids.contains(id))
+            }
+            JournalPayload::OperationBurstRecorded(value) => {
+                value
+                    .attempt_id
+                    .is_some_and(|id| self.attempt_ids.contains(&id))
+                    || self.execution_lane_ids.contains(&value.execution_lane_id)
+                    || value
+                        .members
+                        .iter()
+                        .any(|member| self.operation_ids.contains(&member.operation_id))
+                    || value
+                        .primary_binding
+                        .workstream_id
+                        .is_some_and(|id| self.workstream_ids.contains(&id))
+                    || value
+                        .experiment_run_id
+                        .is_some_and(|id| self.run_ids.contains(&id))
+            }
+            JournalPayload::WorkEpisodeRecorded(value) => {
+                self.episode_ids.contains(&value.episode_id)
+                    || value.repository_instance_id == Some(repository_id)
+                    || self.workstream_ids.contains(&value.workstream_id)
+            }
+            JournalPayload::WorkCheckpointRecorded(value) => {
+                self.episode_ids.contains(&value.episode_id)
+            }
+            JournalPayload::SegmentationCorrectionRecorded(value) => value
+                .source_episode_ids
+                .iter()
+                .chain(&value.replacement_episode_ids)
+                .any(|id| self.episode_ids.contains(id)),
+            JournalPayload::RecoveryCaptureRequestRecorded(value) => {
+                self.recovery_request_ids
+                    .contains(&value.recovery_capture_request_id)
+                    || value.repository_instance_id == repository_id
+                    || self.worktree_ids.contains(&value.worktree_instance_id)
+            }
+            JournalPayload::RecoveryBundleRecorded(value) => {
+                self.recovery_bundle_ids.contains(&value.recovery_bundle_id)
+                    || self
+                        .worktree_ids
+                        .contains(&value.source_worktree_instance_id)
+                    || value
+                        .trigger_request_ids
+                        .iter()
+                        .any(|id| self.recovery_request_ids.contains(id))
+            }
+            JournalPayload::RecoveryApplicationRecorded(value) => {
+                self.recovery_application_ids
+                    .contains(&value.recovery_application_id)
+                    || self
+                        .worktree_ids
+                        .contains(&value.target_worktree_instance_id)
+                    || self.recovery_bundle_ids.contains(&value.recovery_bundle_id)
+            }
+            JournalPayload::ExperimentRunRecorded(value) => {
+                self.run_ids.contains(&value.run_id)
+                    || self.workstream_ids.contains(&value.workstream_id)
+                    || value
+                        .attempt_id
+                        .is_some_and(|id| self.attempt_ids.contains(&id))
+                    || self.snapshot_ids.contains(&value.code_snapshot_id)
+                    || value
+                        .source_receipt_refs
+                        .iter()
+                        .any(|id| self.source_receipt_ids.contains(id))
+                    || value
+                        .work_artifact_refs
+                        .iter()
+                        .any(|id| self.artifact_ids.contains(id))
+            }
+            JournalPayload::ResultEvidenceRecorded(value) => {
+                self.result_ids.contains(&value.result_evidence_id)
+                    || self.run_ids.contains(&value.experiment_run_id)
+                    || value
+                        .raw_artifact_refs
+                        .iter()
+                        .any(|id| self.artifact_ids.contains(id))
+            }
+            JournalPayload::WorkArtifactRecorded(value) => {
+                self.artifact_ids.contains(&value.work_artifact_id)
+                    || value.revision.scope.repository_id() == Some(repository_id)
+                    || value
+                        .revision
+                        .source_observation_refs
+                        .iter()
+                        .any(|id| self.source_observation_ids.contains(id))
+            }
+            JournalPayload::AtomRecorded(value) => {
+                self.atom_ids.contains(&value.atom_id)
+                    || self.revision_ids.contains(&value.revision_id)
+                    || atom_scope_repository(&value.scope, repository_id, &self.task_ids)
+                    || value
+                        .source_observation_refs
+                        .iter()
+                        .any(|id| self.source_observation_ids.contains(id))
+                    || value.evidence_refs.iter().any(|reference| {
+                        typed_text_references_target(
+                            reference,
+                            &self.source_observation_ids,
+                            &self.source_receipt_ids,
+                            &self.revision_ids,
+                        )
+                    })
+                    || value
+                        .parent_revision_id
+                        .iter()
+                        .chain(&value.value.critical_revision_refs)
+                        .chain(&value.supersedes_revision_refs)
+                        .chain(&value.supports_revision_refs)
+                        .chain(&value.contradicts_revision_refs)
+                        .any(|id| self.revision_ids.contains(id))
+                    || value
+                        .accepted_proposal_id
+                        .is_some_and(|id| self.proposal_ids.contains(&id))
+                    || value
+                        .accepted_proposal_revision_id
+                        .is_some_and(|id| self.proposal_revision_ids.contains(&id))
+            }
+            JournalPayload::RevisionProposalRecorded(value) => {
+                self.proposal_ids.contains(&value.proposal_id)
+                    || self
+                        .proposal_revision_ids
+                        .contains(&value.proposal_revision_id)
+                    || proposal_references_repository_closure(
+                        value,
+                        repository_id,
+                        &self.task_ids,
+                        &self.source_observation_ids,
+                        &self.source_receipt_ids,
+                        &self.revision_ids,
+                        &self.atom_ids,
+                        &self.procedure_ids,
+                        &self.membership_ids,
+                    )
+            }
+            JournalPayload::ProcedureRevisionRecorded(value) => {
+                self.procedure_ids.contains(&value.procedure_id)
+                    || self.revision_ids.contains(&value.revision_id)
+                    || value.draft.evidence_refs.iter().any(|reference| {
+                        typed_text_references_target(
+                            reference,
+                            &self.source_observation_ids,
+                            &self.source_receipt_ids,
+                            &self.revision_ids,
+                        )
+                    })
+                    || value
+                        .draft
+                        .support_revision_refs
+                        .iter()
+                        .any(|id| self.revision_ids.contains(id))
+                    || value
+                        .parent_revision_id
+                        .is_some_and(|id| self.revision_ids.contains(&id))
+            }
+            JournalPayload::ProcedureStateRecorded(value) => {
+                self.revision_ids.contains(&value.procedure_revision_id)
+            }
+            JournalPayload::ProcedureUsageRecorded(value) => {
+                self.revision_ids.contains(&value.procedure_revision_id)
+            }
+            JournalPayload::ProcedureNegativeEvidenceRecorded(value) => {
+                self.revision_ids.contains(&value.procedure_revision_id)
+            }
+            JournalPayload::ProcedureNegativeReviewRecorded(_) => false,
+            JournalPayload::ScenarioRecorded(value) => {
+                value.scope.repository_instance_id == Some(repository_id)
+                    || value
+                        .scope
+                        .worktree_instance_id
+                        .is_some_and(|id| self.worktree_ids.contains(&id))
+                    || self.task_ids.contains(&value.scope.task_id)
+                    || value
+                        .active_worktree_snapshot_id
+                        .is_some_and(|id| self.snapshot_ids.contains(&id))
+                    || value
+                        .running_experiment_refs
+                        .iter()
+                        .any(|id| self.run_ids.contains(id))
+                    || value
+                        .constraints
+                        .iter()
+                        .chain(&value.decisions)
+                        .any(|id| self.revision_ids.contains(id))
+                    || value
+                        .relevant_artifacts
+                        .iter()
+                        .any(|id| self.artifact_ids.contains(id))
+                    || value
+                        .support_atom_ids
+                        .iter()
+                        .any(|id| self.atom_ids.contains(id))
+            }
+            JournalPayload::CoreMembershipRecorded(value) => {
+                self.membership_ids.contains(&value.core_membership_id)
+                    || self.revision_ids.contains(&value.membership_revision_id)
+                    || self.revision_ids.contains(&value.atom_revision_id)
+                    || self.revision_ids.contains(&value.support_contract_ref)
+                    || value
+                        .authorization_revision_refs
+                        .iter()
+                        .any(|id| self.revision_ids.contains(id))
+                    || value
+                        .supersedes_membership_revision_id
+                        .is_some_and(|id| self.revision_ids.contains(&id))
+                    || self.revision_ids.contains(&value.created_by_acceptance_ref)
+            }
+            JournalPayload::GlobalSupportContractRecorded(value) => {
+                value
+                    .successor_revision_or_membership_ref
+                    .parse::<RevisionId>()
+                    .is_ok_and(|id| self.revision_ids.contains(&id))
+                    || value
+                        .support_revision_refs
+                        .iter()
+                        .chain(&value.authorization_revision_refs)
+                        .any(|id| self.revision_ids.contains(id))
+            }
+            JournalPayload::GlobalSupportValidationRecorded(value) => {
+                self.revision_ids.contains(&value.support_contract_ref)
+            }
+            JournalPayload::SemanticDigestRecorded(value) => {
+                value.repository_id == Some(repository_id)
+                    || self.episode_ids.contains(&value.episode_id)
+                    || value.selected_direct_refs.iter().any(|reference| {
+                        typed_text_references_target(
+                            reference,
+                            &self.source_observation_ids,
+                            &self.source_receipt_ids,
+                            &self.revision_ids,
+                        )
+                    })
+            }
+            JournalPayload::SemanticDerivationRunRecorded(value) => {
+                self.episode_ids.contains(&value.episode_id)
+                    || value.selected_direct_refs.iter().any(|reference| {
+                        typed_text_references_target(
+                            reference,
+                            &self.source_observation_ids,
+                            &self.source_receipt_ids,
+                            &self.revision_ids,
+                        )
+                    })
+            }
+            JournalPayload::RecallLedgerRecorded(value) => matches!(
+                value.as_ref(),
+                evertrace_domain::recall::RecallLedgerEvent::NeedRecorded { need }
+                    if need.repository_id == Some(repository_id)
+                        || need.source_revision_ids.iter().any(|id| self.revision_ids.contains(id))
+            ),
+        }
+    }
+}
+
+fn cas_ref_string(value: CasId) -> String {
+    hex(&value.as_digest())
+}
+
+fn extend_recovery_bundle_cas_refs(references: &mut BTreeSet<String>, bundle: &RecoveryBundle) {
+    for content in bundle
+        .tracked_diff_blob_refs
+        .iter()
+        .chain(&bundle.tracked_file_blob_refs)
+        .chain(&bundle.index_state_refs)
+        .chain(&bundle.untracked_file_blob_refs)
+    {
+        references.insert(content.payload.cas_ref.clone());
+        if let Some(path) = &content.protected_relative_path {
+            references.insert(path.cas_ref.clone());
+        }
+    }
+    references.extend(
+        bundle
+            .attempt_anchor_claims
+            .iter()
+            .map(|claim| claim.affected_relative_path.cas_ref.clone()),
+    );
 }
 
 fn other_live_source_observations(
@@ -3504,6 +5460,17 @@ impl JournalAdmissionState {
             }),
             StoreError::InvalidInput,
         )?;
+        let pending_repository_closure = self.validate_scope_purge_payloads(
+            command.events().iter().map(|event| {
+                (
+                    &event.payload,
+                    event.source_kind,
+                    event.occurred_at_us,
+                    event.effective_config_hash,
+                )
+            }),
+            StoreError::InvalidInput,
+        )?;
         self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
@@ -3599,6 +5566,10 @@ impl JournalAdmissionState {
             next.apply_payload(event.payload.clone(), seq)
                 .map_err(|_| StoreError::InvalidInput)?;
         }
+        if let Some(closure) = pending_repository_closure {
+            let repository_id = closure.repository_id.ok_or(StoreError::InvalidInput)?;
+            next.repository_closures.insert(repository_id, closure);
+        }
         next.validate_relations()
             .map_err(|_| StoreError::InvalidInput)?;
         Ok(next)
@@ -3659,6 +5630,19 @@ impl JournalAdmissionState {
                 .map(|(payload, _, occurred_at_us)| (payload, *occurred_at_us)),
         )?;
         self.validate_object_deletion_command(rows, &parsed)?;
+        let pending_repository_closure = self.validate_scope_purge_payloads(
+            rows.iter()
+                .zip(parsed.iter())
+                .map(|(row, (payload, _, occurred_at_us))| {
+                    (
+                        payload,
+                        row.source_kind,
+                        *occurred_at_us,
+                        row.effective_config_hash,
+                    )
+                }),
+            StoreError::StoreCorrupt,
+        )?;
         self.validate_transition_pairs(parsed.iter().map(|(payload, _, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
         self.validate_episode_binding_activation(parsed.iter().map(|(payload, _, _)| payload))
@@ -3738,6 +5722,10 @@ impl JournalAdmissionState {
         let mut next = self.clone();
         for (payload, seq, _) in parsed {
             next.apply_payload(payload, seq)?;
+        }
+        if let Some(closure) = pending_repository_closure {
+            let repository_id = closure.repository_id.ok_or(StoreError::StoreCorrupt)?;
+            next.repository_closures.insert(repository_id, closure);
         }
         next.validate_relations()?;
         Ok(next)
@@ -3902,6 +5890,207 @@ impl JournalAdmissionState {
             }
         }
         Ok(())
+    }
+
+    fn validate_scope_purge_payloads<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = (&'a JournalPayload, SourceKind, i64, [u8; 32])>,
+        error: StoreError,
+    ) -> Result<Option<RepositoryClosureKeys>, StoreError> {
+        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        if payloads.iter().any(|(payload, _, _, _)| {
+            self.repository_closures
+                .values()
+                .any(|closure| closure.references_payload(payload))
+        }) {
+            return Err(error);
+        }
+        let progress = payloads
+            .iter()
+            .filter_map(|(payload, _, _, _)| match payload {
+                JournalPayload::ScopePurgeProgressRecorded(value) => Some(value.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if progress.is_empty() {
+            return Ok(None);
+        }
+        let [progress] = progress.as_slice() else {
+            return Err(error);
+        };
+        let (_, source_kind, occurred_at_us, config_hash) = payloads
+            .iter()
+            .find(|(payload, _, _, _)| {
+                matches!(payload, JournalPayload::ScopePurgeProgressRecorded(_))
+            })
+            .copied()
+            .ok_or(error)?;
+        if payloads
+            .iter()
+            .any(|(_, event_source, _, _)| *event_source != source_kind)
+        {
+            return Err(error);
+        }
+        match progress.stage {
+            ScopePurgeStage::Pending => {
+                if source_kind != SourceKind::Manual
+                    || progress.confirmation_frontier != self.frontier
+                    || self
+                        .scope_purges
+                        .current(progress.target.repository_id())
+                        .is_some()
+                {
+                    return Err(error);
+                }
+                let preview = derive_repository_scope_purge_preview(
+                    self.repository_scope_preview_inputs(),
+                    progress.target.repository_id(),
+                    progress.target.repository_revision(),
+                    false,
+                )
+                .map_err(|_| error)?;
+                let jobs = payloads
+                    .iter()
+                    .filter_map(|(payload, _, _, _)| match payload {
+                        JournalPayload::JobState(job)
+                            if job.kind == crate::purge::REPOSITORY_SCOPE_PURGE_JOB_KIND =>
+                        {
+                            Some(job)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [job] = jobs.as_slice() else {
+                    return Err(error);
+                };
+                let (expected_progress, expected_job, expected_revoked_target_jobs) =
+                    crate::purge::pending_repository_scope_purge(
+                        &preview,
+                        progress.purge_job_id,
+                        self.frontier,
+                        occurred_at_us,
+                        config_hash,
+                    )
+                    .map_err(|_| error)?;
+                if *progress != &expected_progress || *job != &expected_job {
+                    return Err(error);
+                }
+                let revoked_target_jobs = payloads
+                    .iter()
+                    .filter_map(|(payload, _, _, _)| match payload {
+                        JournalPayload::JobState(job)
+                            if job.kind != crate::purge::REPOSITORY_SCOPE_PURGE_JOB_KIND =>
+                        {
+                            Some((*job).clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if revoked_target_jobs != expected_revoked_target_jobs {
+                    return Err(error);
+                }
+                let command_payloads = payloads
+                    .iter()
+                    .map(|(payload, _, _, _)| *payload)
+                    .collect::<Vec<_>>();
+                self.s23.validate_deletion_support_fanout(
+                    &preview.downstream_support_impacts,
+                    occurred_at_us,
+                    config_hash,
+                    &command_payloads,
+                    error,
+                )?;
+                self.procedure.validate_deletion_review_holds(
+                    &preview.dependent_procedure_impacts,
+                    occurred_at_us,
+                    &command_payloads,
+                    error,
+                )?;
+                let expected_count =
+                    usize::from(preview.pending_command_event_count().map_err(|_| error)?);
+                if payloads.len() != expected_count {
+                    return Err(error);
+                }
+                return Ok(Some(preview.closure));
+            }
+            ScopePurgeStage::ProjectionClosed | ScopePurgeStage::PhysicalDeleting => {
+                if source_kind != SourceKind::System || payloads.len() != 2 {
+                    return Err(error);
+                }
+                let current = self
+                    .scope_purges
+                    .current(progress.target.repository_id())
+                    .ok_or(error)?;
+                if !current.validate_successor(progress)
+                    || progress.stage == ScopePurgeStage::ProjectionClosed
+                        && current.stage != ScopePurgeStage::Pending
+                    || progress.stage == ScopePurgeStage::PhysicalDeleting
+                        && !matches!(
+                            current.stage,
+                            ScopePurgeStage::ProjectionClosed | ScopePurgeStage::PhysicalDeleting
+                        )
+                {
+                    return Err(error);
+                }
+                let job = self.jobs.get(&progress.purge_job_id).ok_or(error)?;
+                if job.kind != crate::purge::REPOSITORY_SCOPE_PURGE_JOB_KIND
+                    || job.state != JobStatus::Leased
+                    || progress.next_ordinal > u64::from(job.budget.max_items)
+                    || progress.stage == ScopePurgeStage::PhysicalDeleting
+                        && progress.next_ordinal.saturating_sub(current.next_ordinal)
+                            > crate::purge::REPOSITORY_SCOPE_PURGE_BATCH_SIZE
+                {
+                    return Err(error);
+                }
+                let jobs = payloads
+                    .iter()
+                    .filter_map(|(payload, _, _, _)| match payload {
+                        JournalPayload::JobState(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [queued] = jobs.as_slice() else {
+                    return Err(error);
+                };
+                let mut expected = job.clone();
+                expected.state = JobStatus::Queued;
+                expected.lease_until_us = None;
+                expected.backoff_until_us = None;
+                if *queued != &expected {
+                    return Err(error);
+                }
+            }
+            ScopePurgeStage::Purged => {
+                if source_kind != SourceKind::System || payloads.len() != 2 {
+                    return Err(error);
+                }
+                let current = self
+                    .scope_purges
+                    .current(progress.target.repository_id())
+                    .ok_or(error)?;
+                if !current.validate_successor(progress) {
+                    return Err(error);
+                }
+                let leased = self.jobs.get(&progress.purge_job_id).ok_or(error)?;
+                let expected_job =
+                    crate::purge::terminal_repository_scope_purge_job(current, leased)
+                        .map_err(|_| error)?;
+                let jobs = payloads
+                    .iter()
+                    .filter_map(|(payload, _, _, _)| match payload {
+                        JournalPayload::JobState(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [job] = jobs.as_slice() else {
+                    return Err(error);
+                };
+                if *job != &expected_job {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn validate_competing_selected_command<'a>(
@@ -4623,6 +6812,10 @@ impl JournalAdmissionState {
                 self.deletions
                     .apply(*value, seq, StoreError::StoreCorrupt)?;
             }
+            JournalPayload::ScopePurgeProgressRecorded(value) => {
+                self.scope_purges
+                    .apply(*value, seq, StoreError::StoreCorrupt)?;
+            }
             JournalPayload::RecallLedgerRecorded(value) => {
                 self.recall_ledger.apply(*value, seq)?;
             }
@@ -5167,6 +7360,23 @@ pub fn object_deletion_preview(
     derive_object_deletion_preview_from_inputs(state.object_deletion_inputs(), target)
 }
 
+pub fn repository_scope_purge_preview(
+    snapshot: &ProjectionSnapshot,
+    repository_id: RepositoryId,
+    expected_repository_revision: u32,
+) -> Result<crate::purge::RepositoryScopePurgePreview, StoreError> {
+    if snapshot.frontier == 0 {
+        return Err(StoreError::InvalidInput);
+    }
+    let state = ReducerState::from_current_rows(&snapshot.rows, snapshot.frontier)?;
+    derive_repository_scope_purge_preview(
+        state.repository_scope_preview_inputs(),
+        repository_id,
+        expected_repository_revision,
+        false,
+    )
+}
+
 fn apply_event(
     state: &mut ReducerState,
     row: &JournalRow,
@@ -5531,6 +7741,22 @@ fn apply_event(
         JournalPayload::ObjectDeletionLedgerRecorded(value) => {
             state
                 .deletions
+                .apply(*value, row.seq, StoreError::StoreCorrupt)?;
+        }
+        JournalPayload::ScopePurgeProgressRecorded(value) => {
+            if value.stage == ScopePurgeStage::Pending {
+                let preview = derive_repository_scope_purge_preview(
+                    state.repository_scope_preview_inputs(),
+                    value.target.repository_id(),
+                    value.target.repository_revision(),
+                    false,
+                )?;
+                state
+                    .repository_closures
+                    .insert(value.target.repository_id(), preview.closure);
+            }
+            state
+                .scope_purges
                 .apply(*value, row.seq, StoreError::StoreCorrupt)?;
         }
         JournalPayload::RecallLedgerRecorded(value) => {
@@ -6840,6 +9066,7 @@ impl ReducerState {
             state.restore_row(row, payload)?;
         }
         state.deletions.validate_restored()?;
+        state.scope_purges.validate_restored()?;
         state.rebuild_revision_currents()?;
         state.validate_evidence_relations()?;
         let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
@@ -7624,6 +9851,10 @@ impl ReducerState {
                 self.deletions.restore(row, *value)?;
                 false
             }
+            JournalPayload::ScopePurgeProgressRecorded(value) => {
+                self.scope_purges.restore(row, *value)?;
+                false
+            }
             JournalPayload::RecallLedgerRecorded(_) => return Err(StoreError::StoreCorrupt),
             JournalPayload::SessionImportEventRecorded(_) => {
                 return Err(StoreError::StoreCorrupt);
@@ -7645,6 +9876,11 @@ impl ReducerState {
 
     fn into_rows(mut self) -> Result<Vec<ObjectRow>, StoreError> {
         self.close_deleted_product_state();
+        let repository_closures = self
+            .repository_closures
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut rows = Vec::new();
         rows.extend(recall_projection::rows(&self.atoms, |atom| {
             self.s23.atom_support_eligible(atom.revision_id)
@@ -8193,7 +10429,13 @@ impl ReducerState {
             )?);
         }
         rows.extend(self.deletions.rows()?);
-        filter_product_rows(rows, &self.deletions)
+        rows.extend(self.scope_purges.rows()?);
+        filter_product_rows(
+            rows,
+            &self.deletions,
+            &self.scope_purges,
+            &repository_closures,
+        )
     }
 
     fn close_deleted_product_state(&mut self) {
@@ -8473,6 +10715,7 @@ impl ReducerState {
 
     fn admission_state(&self, frontier: u64) -> Result<JournalAdmissionState, StoreError> {
         Ok(JournalAdmissionState {
+            repository_closures: BTreeMap::new(),
             session_imports: self.session_imports.clone(),
             frontier,
             source_ranges: current_source_ranges(&self.source_receipts)?,
@@ -8529,6 +10772,7 @@ impl ReducerState {
             procedure: self.procedure.clone(),
             synthesis: self.synthesis.clone(),
             deletions: self.deletions.clone(),
+            scope_purges: self.scope_purges.clone(),
             jobs: self
                 .jobs
                 .iter()
@@ -9064,9 +11308,20 @@ impl ProjectionWorker {
                     | "worktree_snapshot_recorded_v1"
             )
         });
-        let reconcile_all = delta
-            .iter()
-            .any(|row| row.event_type == "object_deletion_ledger_recorded_v1");
+        let reconcile_all = delta.iter().try_fold(false, |reconcile, row| {
+            if row.event_type == "object_deletion_ledger_recorded_v1" {
+                return Ok::<_, StoreError>(true);
+            }
+            if row.event_type != "scope_purge_progress_recorded_v1" {
+                return Ok(reconcile);
+            }
+            let payload: JournalPayload =
+                serde_json::from_str(&row.payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::ScopePurgeProgressRecorded(progress) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            Ok(reconcile || progress.stage == ScopePurgeStage::Pending)
+        })?;
         let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
@@ -9120,6 +11375,21 @@ impl ProjectionWorker {
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
         reduce_journal(&read_all_journal_rows(&self.journal).await?)
+    }
+
+    pub async fn project_at_frontier(
+        &self,
+        frontier: u64,
+    ) -> Result<ProjectionSnapshot, StoreError> {
+        let rows = read_all_journal_rows(&self.journal).await?;
+        if frontier > rows.last().map_or(0, |row| row.seq) {
+            return Err(StoreError::InvalidInput);
+        }
+        let end = rows.partition_point(|row| row.seq <= frontier);
+        if frontier > 0 && rows.get(end.saturating_sub(1)).map(|row| row.seq) != Some(frontier) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        reduce_journal(&rows[..end])
     }
 
     async fn commit_rows(
@@ -9473,6 +11743,61 @@ mod tests {
             created_at_us: 2,
         };
         result.validate().unwrap();
+        let referenced_artifact_id = WorkArtifactId::new_v7();
+        let repository_id = RepositoryId::new_v7();
+        let closure = RepositoryClosureKeys {
+            repository_id: Some(repository_id),
+            snapshot_ids: BTreeSet::from([run.code_snapshot_id]),
+            source_receipt_ids: BTreeSet::from([source_receipt_id]),
+            artifact_ids: BTreeSet::from([referenced_artifact_id]),
+            ..RepositoryClosureKeys::default()
+        };
+        let mut run_by_snapshot = run.clone();
+        run_by_snapshot.source_receipt_refs = vec![SourceReceiptId::from_digest([4; 32])];
+        run_by_snapshot.work_artifact_refs.clear();
+        run_by_snapshot.experiment_contract_fingerprint = run_by_snapshot
+            .recompute_exact_contract_fingerprint()
+            .unwrap();
+        run_by_snapshot.comparison_key = run_by_snapshot.recompute_comparison_key().unwrap();
+        run_by_snapshot.validate().unwrap();
+        let mut run_by_receipt = run.clone();
+        run_by_receipt.code_snapshot_id = WorktreeSnapshotId::new_v7();
+        run_by_receipt.work_artifact_refs.clear();
+        run_by_receipt.experiment_contract_fingerprint = run_by_receipt
+            .recompute_exact_contract_fingerprint()
+            .unwrap();
+        run_by_receipt.comparison_key = run_by_receipt.recompute_comparison_key().unwrap();
+        run_by_receipt.validate().unwrap();
+        let mut run_with_artifact = run.clone();
+        run_with_artifact.code_snapshot_id = WorktreeSnapshotId::new_v7();
+        run_with_artifact.source_receipt_refs = vec![SourceReceiptId::from_digest([5; 32])];
+        run_with_artifact.work_artifact_refs = vec![referenced_artifact_id];
+        run_with_artifact.experiment_contract_fingerprint = run_with_artifact
+            .recompute_exact_contract_fingerprint()
+            .unwrap();
+        run_with_artifact.comparison_key = run_with_artifact.recompute_comparison_key().unwrap();
+        run_with_artifact.validate().unwrap();
+        let mut result_with_artifact = result.clone();
+        result_with_artifact.raw_artifact_refs = vec![referenced_artifact_id];
+        result_with_artifact.parser_receipt.input_artifact_refs = vec![referenced_artifact_id];
+        result_with_artifact.validate().unwrap();
+        let successors = [
+            JournalPayload::ExperimentRunRecorded(Box::new(run_by_snapshot)),
+            JournalPayload::ExperimentRunRecorded(Box::new(run_by_receipt)),
+            JournalPayload::ExperimentRunRecorded(Box::new(run_with_artifact)),
+            JournalPayload::ResultEvidenceRecorded(Box::new(result_with_artifact)),
+        ];
+        let mut admission = JournalAdmissionState::default();
+        admission.repository_closures.insert(repository_id, closure);
+        for successor in &successors {
+            assert_eq!(
+                admission.validate_scope_purge_payloads(
+                    [(successor, SourceKind::System, 3, [0; 32])],
+                    StoreError::InvalidInput,
+                ),
+                Err(StoreError::InvalidInput)
+            );
+        }
         let object_row = |kind: &str,
                           row_id: String,
                           object_id: String,

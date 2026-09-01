@@ -27,7 +27,7 @@ use evertrace_domain::{
     },
     purge::{
         ObjectDeletionLedgerEvent, ObjectDeletionTarget, ObjectReauthorizationIntent,
-        ObjectReauthorizationRef,
+        ObjectReauthorizationRef, RepositoryPurgeBlocker,
     },
     repository::{
         DestructiveClass, GitRegistrationState, LineageAssessment,
@@ -69,7 +69,10 @@ use crate::{
         ProcedureUsageCurrentView, accept_procedure, accept_procedure_edited,
         request_procedure_revision, review_procedure_negative,
     },
-    purge::{ObjectForgetLookup, pending_object_forget_command, select_object_forget},
+    purge::{
+        ObjectForgetLookup, RepositoryPurgeLookup, pending_object_forget_command,
+        pending_repository_purge_command, select_object_forget, select_repository_purge,
+    },
     semantic::{
         AtomAcceptanceContext, CoreMembershipAcceptanceContext, ProposalCommandContext,
         ProposalResolution, RevisionProposalService, SubmitProposalRequest, SupportAtomAcceptance,
@@ -220,6 +223,7 @@ pub struct HumanSummary {
     pub support_detail: Option<HumanSupportDetail>,
     pub competing_detail: Option<HumanCompetingDetail>,
     pub forget_preview: Option<Box<HumanForgetPreview>>,
+    pub repository_purge_preview: Option<Box<HumanRepositoryPurgePreview>>,
     pub negative_review: Option<HumanNegativeReviewSummary>,
     pub recovery_detail: Option<HumanRecoveryDetail>,
     pub worktree_detail: Option<HumanWorktreeDetail>,
@@ -482,6 +486,31 @@ pub struct HumanForgetPreview {
     pub shared_source_count: u32,
     pub suppressed_source_count: u32,
     pub suppression_ref_count: u32,
+    pub downstream_support_revalidation_count: u32,
+    pub dependent_procedure_review_hold_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanRepositoryPurgePreview {
+    pub repository_id: RepositoryId,
+    pub repository_revision: u32,
+    pub deletion_generation: u64,
+    pub planned_exclusive_cas_count: u32,
+    pub shared_cas_retained_count: u32,
+    pub repository_derived_global_dependency_count: u32,
+    pub affected_session_count: u32,
+    pub affected_evidence_receipt_capture_count: u32,
+    pub affected_work_count: u32,
+    pub affected_atom_count: u32,
+    pub affected_procedure_count: u32,
+    pub affected_experiment_run_count: u32,
+    pub affected_result_evidence_count: u32,
+    pub affected_artifact_count: u32,
+    pub affected_recovery_count: u32,
+    pub affected_recall_derived_count: u32,
+    pub relationship_only_count: u32,
+    pub estimated_reclaimable_bytes: Option<u64>,
+    pub blockers: Vec<RepositoryPurgeBlocker>,
     pub downstream_support_revalidation_count: u32,
     pub dependent_procedure_review_hold_count: u32,
 }
@@ -830,7 +859,17 @@ impl HumanGovernanceService {
             .map_err(|_| HumanGovernanceError::Store)?;
         let items = matching
             .into_iter()
-            .map(|row| summary(&snapshot, row, &semantic_view, &usage_view, surface, true))
+            .map(|row| {
+                summary(
+                    &snapshot,
+                    row,
+                    &semantic_view,
+                    &usage_view,
+                    self.runtime_snapshot.as_ref(),
+                    surface,
+                    true,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
@@ -937,6 +976,7 @@ impl HumanGovernanceService {
                         row,
                         &semantic_view,
                         &usage_view,
+                        None,
                         HumanSurface::Explorer,
                         false,
                     )
@@ -2588,6 +2628,151 @@ impl HumanGovernanceService {
         })
     }
 
+    pub async fn purge_repository(
+        &self,
+        request_id: RequestId,
+        expected_frontier: u64,
+        repository_id: RepositoryId,
+        repository_confirmation: &str,
+        expected_repository_revision: u32,
+        expected_deletion_generation: u64,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        if repository_confirmation.parse::<RepositoryId>().ok() != Some(repository_id) {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        if let Some(committed) = self
+            .writer
+            .committed_command(command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            let matches = committed
+                .payloads
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, payload)| match payload {
+                    JournalPayload::ScopePurgeProgressRecorded(progress)
+                        if progress.stage == evertrace_domain::purge::ScopePurgeStage::Pending
+                            && progress.target.repository_id() == repository_id
+                            && progress.target.repository_revision()
+                                == expected_repository_revision
+                            && progress.confirmation_frontier == expected_frontier
+                            && progress.deletion_generation == expected_deletion_generation =>
+                    {
+                        Some((ordinal, progress))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [(ordinal, progress)] = matches.as_slice() else {
+                return Err(HumanGovernanceError::Store);
+            };
+            return Ok(HumanActionOutcome::Applied {
+                current_revision_ref: scope_purge_revision_ref(progress),
+                audit_event_ref: committed
+                    .event_ids
+                    .get(*ordinal)
+                    .cloned()
+                    .ok_or(HumanGovernanceError::Store)?,
+            });
+        }
+        let snapshot = self
+            .writer
+            .project()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != expected_frontier {
+            return Ok(HumanActionOutcome::Conflict {
+                current_revision_ref: current_repository_purge_revision(&snapshot, repository_id),
+            });
+        }
+        let preview =
+            match select_repository_purge(&snapshot, repository_id, expected_repository_revision)
+                .map_err(|_| HumanGovernanceError::Store)?
+            {
+                RepositoryPurgeLookup::Available(preview) => preview,
+                RepositoryPurgeLookup::NoDelta(progress) => {
+                    return Ok(HumanActionOutcome::NoDelta {
+                        current_revision_ref: scope_purge_revision_ref(&progress),
+                    });
+                }
+                RepositoryPurgeLookup::Unavailable => {
+                    return Ok(HumanActionOutcome::Unavailable {
+                        reason: "repository_purge_unavailable",
+                    });
+                }
+            };
+        if preview.deletion_generation != expected_deletion_generation
+            || preview.target.repository_revision() != expected_repository_revision
+        {
+            return Ok(HumanActionOutcome::Conflict {
+                current_revision_ref: Some(expected_repository_revision.to_string()),
+            });
+        }
+        if !preview.permits_pending() {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "repository_purge_cross_scope_dependency_blocked",
+            });
+        }
+        let occurred_at_us = now_us()?;
+        let command = pending_repository_purge_command(
+            request_id,
+            &preview,
+            expected_deletion_generation,
+            occurred_at_us,
+            snapshot.frontier,
+            self.effective_config_hash,
+        )
+        .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let ordinals = command
+            .events()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, event)| {
+                matches!(
+                    &event.payload,
+                    JournalPayload::ScopePurgeProgressRecorded(value)
+                        if value.stage == evertrace_domain::purge::ScopePurgeStage::Pending
+                            && value.target.repository_id() == repository_id
+                )
+                .then_some(ordinal)
+            })
+            .collect::<Vec<_>>();
+        let [audit_ordinal] = ordinals.as_slice() else {
+            return Err(HumanGovernanceError::Store);
+        };
+        let outcome = match self
+            .writer
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(crate::WriterActorError::StaleFrontier) => {
+                let latest = self
+                    .writer
+                    .project()
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                return Ok(HumanActionOutcome::Conflict {
+                    current_revision_ref: current_repository_purge_revision(&latest, repository_id),
+                });
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        };
+        Ok(HumanActionOutcome::Applied {
+            current_revision_ref: format!(
+                "repository-purge-generation-{expected_deletion_generation}"
+            ),
+            audit_event_ref: outcome
+                .event_ids
+                .get(*audit_ordinal)
+                .cloned()
+                .ok_or(HumanGovernanceError::Store)?,
+        })
+    }
+
     pub async fn review_negative(
         &self,
         request_id: RequestId,
@@ -2795,7 +2980,17 @@ fn page(
         degraded_reasons,
         items: selected
             .into_iter()
-            .map(|row| summary(snapshot, row, &semantic_view, &usage_view, surface, false))
+            .map(|row| {
+                summary(
+                    snapshot,
+                    row,
+                    &semantic_view,
+                    &usage_view,
+                    None,
+                    surface,
+                    false,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?,
         next_cursor,
     })
@@ -3295,6 +3490,7 @@ fn summary(
     row: &ObjectRow,
     semantic_view: &SemanticCurrentView,
     usage_view: &ProcedureUsageCurrentView,
+    runtime_snapshot: Option<&RuntimeSnapshot>,
     surface: HumanSurface,
     include_detail: bool,
 ) -> Result<HumanSummary, HumanGovernanceError> {
@@ -3462,6 +3658,77 @@ fn summary(
     } else {
         None
     };
+    let repository_purge_preview = if include_detail
+        && surface == HumanSurface::Explorer
+        && row.object_kind.as_deref() == Some("repository")
+    {
+        let repository_id = row
+            .object_id
+            .as_deref()
+            .ok_or(HumanGovernanceError::Store)?
+            .parse::<RepositoryId>()
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let repository_revision = row
+            .current_revision_id
+            .as_deref()
+            .ok_or(HumanGovernanceError::Store)?
+            .strip_prefix(&format!("{repository_id}@"))
+            .ok_or(HumanGovernanceError::Store)?
+            .parse::<u32>()
+            .map_err(|_| HumanGovernanceError::Store)?;
+        match select_repository_purge(snapshot, repository_id, repository_revision)
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            RepositoryPurgeLookup::Available(preview) => {
+                let estimated_reclaimable_bytes = runtime_snapshot.and_then(|runtime| {
+                    let cas = CasStore::open(runtime.cas_dir.clone()).ok()?;
+                    preview
+                        .exclusive_cas_refs
+                        .iter()
+                        .try_fold(0_u64, |total, reference| {
+                            let digest = CasDigest::from_str(reference).ok()?;
+                            total.checked_add(cas.encoded_blob_length(&digest).ok()?)
+                        })
+                });
+                Some(Box::new(HumanRepositoryPurgePreview {
+                    repository_id,
+                    repository_revision,
+                    deletion_generation: preview.deletion_generation,
+                    planned_exclusive_cas_count: preview
+                        .physical_item_count()
+                        .map_err(|_| HumanGovernanceError::Store)?,
+                    shared_cas_retained_count: preview.shared_cas_count,
+                    repository_derived_global_dependency_count: preview
+                        .repository_derived_global_dependency_count,
+                    affected_session_count: preview.affected_session_count,
+                    affected_evidence_receipt_capture_count: preview
+                        .affected_evidence_receipt_capture_count,
+                    affected_work_count: preview.affected_work_count,
+                    affected_atom_count: preview.affected_atom_count,
+                    affected_procedure_count: preview.affected_procedure_count,
+                    affected_experiment_run_count: preview.affected_experiment_run_count,
+                    affected_result_evidence_count: preview.affected_result_evidence_count,
+                    affected_artifact_count: preview.affected_artifact_count,
+                    affected_recovery_count: preview.affected_recovery_count,
+                    affected_recall_derived_count: preview.affected_recall_derived_count,
+                    relationship_only_count: preview.relationship_only_count,
+                    estimated_reclaimable_bytes,
+                    blockers: preview.blockers,
+                    downstream_support_revalidation_count: u32::try_from(
+                        preview.downstream_support_impacts.len(),
+                    )
+                    .map_err(|_| HumanGovernanceError::Store)?,
+                    dependent_procedure_review_hold_count: u32::try_from(
+                        preview.dependent_procedure_impacts.len(),
+                    )
+                    .map_err(|_| HumanGovernanceError::Store)?,
+                }))
+            }
+            RepositoryPurgeLookup::NoDelta(_) | RepositoryPurgeLookup::Unavailable => None,
+        }
+    } else {
+        None
+    };
     let negative_review = if row.object_kind.as_deref() == Some("procedure_negative_review") {
         let payload: JournalPayload = serde_json::from_str(
             row.payload_json
@@ -3516,6 +3783,7 @@ fn summary(
         support_detail,
         competing_detail,
         forget_preview,
+        repository_purge_preview,
         negative_review,
         recovery_detail,
         worktree_detail,
@@ -5243,6 +5511,30 @@ fn current_object_deletion_revision(
         ObjectForgetLookup::NoDelta(event) => Some(deletion_revision_ref(&event)),
         ObjectForgetLookup::Unavailable => None,
     }
+}
+
+fn scope_purge_revision_ref(progress: &evertrace_domain::purge::ScopePurgeProgress) -> String {
+    format!(
+        "repository-purge-generation-{}-{}",
+        progress.deletion_generation,
+        match progress.stage {
+            evertrace_domain::purge::ScopePurgeStage::Pending => "pending",
+            evertrace_domain::purge::ScopePurgeStage::ProjectionClosed => "projection-closed",
+            evertrace_domain::purge::ScopePurgeStage::PhysicalDeleting => "physical-deleting",
+            evertrace_domain::purge::ScopePurgeStage::Purged => "purged",
+        }
+    )
+}
+
+fn current_repository_purge_revision(
+    snapshot: &ProjectionSnapshot,
+    repository_id: RepositoryId,
+) -> Option<String> {
+    let current = evertrace_store::ScopePurgeCurrentView::from_snapshot(snapshot).ok()?;
+    current
+        .events
+        .get(&repository_id)
+        .map(scope_purge_revision_ref)
 }
 
 fn now_us() -> Result<i64, HumanGovernanceError> {

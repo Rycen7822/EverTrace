@@ -85,7 +85,43 @@ impl S23State {
             evertrace_domain::purge::ObjectDeletionTarget::Atom { .. }
             | evertrace_domain::purge::ObjectDeletionTarget::Procedure { .. } => BTreeSet::new(),
         };
-        let owned = self.deletion_owned_contracts(revision_ids, &membership_ids);
+        self.scope_purge_support_impacts(revision_ids, &membership_ids)
+    }
+
+    pub(super) fn repository_membership_revision_ids(
+        &self,
+        repository_id: evertrace_domain::ids::RepositoryId,
+    ) -> (BTreeSet<CoreMembershipId>, BTreeSet<RevisionId>) {
+        let memberships = self
+            .membership_revisions
+            .values()
+            .filter_map(|(membership, _)| {
+                matches!(
+                    membership.scope_identity,
+                    evertrace_domain::semantic::CoreScopeIdentity::Repository(id)
+                        if id == repository_id
+                )
+                .then_some((
+                    membership.core_membership_id,
+                    membership.membership_revision_id,
+                ))
+            })
+            .collect::<Vec<_>>();
+        (
+            memberships.iter().map(|(id, _)| *id).collect(),
+            memberships
+                .into_iter()
+                .map(|(_, revision)| revision)
+                .collect(),
+        )
+    }
+
+    pub(super) fn scope_purge_support_impacts(
+        &self,
+        revision_ids: &BTreeSet<RevisionId>,
+        membership_ids: &BTreeSet<CoreMembershipId>,
+    ) -> Result<Vec<crate::purge::ObjectDeletionSupportImpact>, StoreError> {
+        let owned = self.deletion_owned_contracts(revision_ids, membership_ids);
         let mut impacts = Vec::new();
         for (contract_id, (contract, _)) in &self.contracts {
             if owned.contains(contract_id) {
@@ -269,6 +305,12 @@ impl S23State {
             .values()
             .map(|(value, _)| value)
             .filter(move |value| value.core_membership_id == membership_id)
+    }
+
+    pub(super) fn all_membership_revisions(&self) -> impl Iterator<Item = &CoreMembership> {
+        self.membership_revisions
+            .values()
+            .map(|(membership, _)| membership)
     }
 
     pub(super) fn validation(

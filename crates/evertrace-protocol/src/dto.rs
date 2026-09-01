@@ -175,6 +175,12 @@ pub enum HumanActionRequest {
         expected_revision_ids: Vec<RevisionId>,
         expected_deletion_generation: u64,
     },
+    PurgeRepository {
+        repository_id: evertrace_domain::ids::RepositoryId,
+        repository_confirmation: String,
+        expected_repository_revision: u32,
+        expected_deletion_generation: u64,
+    },
     Unavailable {
         action: HumanUnavailableAction,
     },
@@ -328,6 +334,32 @@ pub struct HumanForgetPreview {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct HumanRepositoryPurgePreview {
+    pub repository_id: evertrace_domain::ids::RepositoryId,
+    pub repository_revision: u32,
+    pub deletion_generation: u64,
+    pub planned_exclusive_cas_count: u32,
+    pub shared_cas_retained_count: u32,
+    pub repository_derived_global_dependency_count: u32,
+    pub affected_session_count: u32,
+    pub affected_evidence_receipt_capture_count: u32,
+    pub affected_work_count: u32,
+    pub affected_atom_count: u32,
+    pub affected_procedure_count: u32,
+    pub affected_experiment_run_count: u32,
+    pub affected_result_evidence_count: u32,
+    pub affected_artifact_count: u32,
+    pub affected_recovery_count: u32,
+    pub affected_recall_derived_count: u32,
+    pub relationship_only_count: u32,
+    pub estimated_reclaimable_bytes: Option<u64>,
+    pub blockers: Vec<evertrace_domain::purge::RepositoryPurgeBlocker>,
+    pub downstream_support_revalidation_count: u32,
+    pub dependent_procedure_review_hold_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanSnapshotItem {
     pub item_kind: HumanItemKind,
     pub proposal: Option<HumanProposalMetadata>,
@@ -336,6 +368,8 @@ pub struct HumanSnapshotItem {
     pub competing_detail: Option<HumanCompetingDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forget_preview: Option<Box<HumanForgetPreview>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_purge_preview: Option<Box<HumanRepositoryPurgePreview>>,
     pub negative_review: Option<HumanNegativeReviewMetadata>,
     pub recovery_detail: Option<HumanRecoveryDetail>,
     pub worktree_detail: Option<HumanWorktreeDetail>,
@@ -675,6 +709,20 @@ impl HumanActionRequest {
                         .windows(2)
                         .all(|pair| pair[0] < pair[1])
             }
+            Self::PurgeRepository {
+                repository_id,
+                repository_confirmation,
+                expected_repository_revision,
+                expected_deletion_generation,
+                ..
+            } => {
+                repository_confirmation
+                    .parse::<evertrace_domain::ids::RepositoryId>()
+                    .ok()
+                    == Some(*repository_id)
+                    && *expected_repository_revision > 0
+                    && *expected_deletion_generation > 0
+            }
             Self::Unavailable { .. } => true,
         }
     }
@@ -796,6 +844,24 @@ impl HumanSnapshotItem {
                         == Some(preview.current_revision_id.to_string().as_str())
                     && self.object_ref.as_deref() == Some(preview.target.object_ref().as_str())
             })
+            && self
+                .repository_purge_preview
+                .as_ref()
+                .is_none_or(|preview| {
+                    preview.repository_revision > 0
+                        && preview.deletion_generation > 0
+                        && self.object_kind == "repository"
+                        && self.object_ref.as_deref()
+                            == Some(preview.repository_id.to_string().as_str())
+                        && self.revision_ref.as_deref()
+                            == Some(
+                                format!(
+                                    "{}@{}",
+                                    preview.repository_id, preview.repository_revision
+                                )
+                                .as_str(),
+                            )
+                })
             && self.negative_review.as_ref().is_none_or(|review| {
                 self.revision_ref.as_deref()
                     == Some(review.current_review_revision_id.to_string().as_str())

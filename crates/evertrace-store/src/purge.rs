@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
     evidence::{EvidenceSurface, SourceObservation, SourceReceipt},
-    ids::{ProcedureNegativeEvidenceId, SourceObservationId, SourceReceiptId},
+    ids::{JobId, ProcedureNegativeEvidenceId, RepositoryId, SourceObservationId, SourceReceiptId},
     procedure::ProcedureStateEvent,
     purge::{
         OBJECT_DELETION_LEDGER_SCHEMA_VERSION, ObjectDeletionGuards, ObjectDeletionLedgerEvent,
-        ObjectDeletionPhase, ObjectDeletionTarget,
+        ObjectDeletionPhase, ObjectDeletionTarget, RepositoryPurgeBlocker,
+        SCOPE_PURGE_PROGRESS_SCHEMA_VERSION, ScopePurgeProgress, ScopePurgeStage, ScopePurgeTarget,
     },
     recall::RecallLedgerEvent,
     revision::RevisionId,
@@ -21,9 +22,13 @@ use crate::{
 };
 
 pub(crate) const OBJECT_DELETION_LEDGER_KIND: &str = "object_deletion_ledger";
+pub(crate) const SCOPE_PURGE_PROGRESS_KIND: &str = "scope_purge_progress";
 const PROJECTION_GENERATION: u64 = 1;
 pub(crate) const OBJECT_DELETION_JOB_KIND: &str = "object_forget_v1";
 pub const OBJECT_DELETION_ALGORITHM_REVISION: &str = "s32-object-forget-v1";
+pub const REPOSITORY_SCOPE_PURGE_JOB_KIND: &str = "repository_scope_purge_v1";
+pub const REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION: &str = "s33-repository-scope-purge-v1";
+pub const REPOSITORY_SCOPE_PURGE_BATCH_SIZE: u64 = 256;
 const OBJECT_DELETION_LEASE_US: i64 = 30_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +100,184 @@ pub struct ObjectDeletionSupportImpact {
 pub struct ObjectDeletionProcedureImpact {
     pub current_state: ProcedureStateEvent,
     pub trigger_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryScopePurgePreview {
+    pub target: ScopePurgeTarget,
+    pub deletion_generation: u64,
+    pub exclusive_cas_refs: Vec<String>,
+    pub shared_cas_count: u32,
+    pub repository_derived_global_dependency_count: u32,
+    pub affected_session_count: u32,
+    pub affected_evidence_receipt_capture_count: u32,
+    pub affected_work_count: u32,
+    pub affected_atom_count: u32,
+    pub affected_procedure_count: u32,
+    pub affected_experiment_run_count: u32,
+    pub affected_result_evidence_count: u32,
+    pub affected_artifact_count: u32,
+    pub affected_recovery_count: u32,
+    pub affected_recall_derived_count: u32,
+    pub relationship_only_count: u32,
+    pub blockers: Vec<RepositoryPurgeBlocker>,
+    pub downstream_support_impacts: Vec<ObjectDeletionSupportImpact>,
+    pub dependent_procedure_impacts: Vec<ObjectDeletionProcedureImpact>,
+    pub(crate) closure: crate::projections::RepositoryClosureKeys,
+    pub(crate) active_target_repository_jobs: Vec<DurableJob>,
+}
+
+impl RepositoryScopePurgePreview {
+    pub fn physical_item_count(&self) -> Result<u32, StoreError> {
+        u32::try_from(self.exclusive_cas_refs.len()).map_err(|_| StoreError::InvalidInput)
+    }
+
+    pub fn pending_command_event_count(&self) -> Result<u16, StoreError> {
+        repository_scope_purge_command_event_count(
+            self.downstream_support_impacts.len(),
+            self.dependent_procedure_impacts.len(),
+            self.active_target_repository_jobs.len(),
+        )
+    }
+
+    pub fn permits_pending(&self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
+fn repository_scope_purge_command_event_count(
+    support_impact_count: usize,
+    procedure_impact_count: usize,
+    revoked_target_job_count: usize,
+) -> Result<u16, StoreError> {
+    let count = support_impact_count
+        .checked_mul(4)
+        .and_then(|count| count.checked_add(procedure_impact_count))
+        .and_then(|count| count.checked_add(revoked_target_job_count))
+        .and_then(|count| count.checked_add(2))
+        .ok_or(StoreError::ReconciliationDependencyOverflow)?;
+    u16::try_from(count).map_err(|_| StoreError::ReconciliationDependencyOverflow)
+}
+
+pub fn pending_repository_scope_purge(
+    preview: &RepositoryScopePurgePreview,
+    purge_job_id: JobId,
+    confirmation_frontier: u64,
+    recorded_at_us: i64,
+    effective_config_hash: [u8; 32],
+) -> Result<(ScopePurgeProgress, DurableJob, Vec<DurableJob>), StoreError> {
+    if !preview.permits_pending() {
+        return Err(StoreError::InvalidInput);
+    }
+    let progress = ScopePurgeProgress {
+        schema_version: SCOPE_PURGE_PROGRESS_SCHEMA_VERSION,
+        target: preview.target,
+        confirmation_frontier,
+        deletion_generation: preview.deletion_generation,
+        stage: ScopePurgeStage::Pending,
+        next_ordinal: 0,
+        purge_job_id,
+        recorded_at_us,
+        terminal_audit_ref: None,
+    };
+    let job = DurableJob {
+        job_id: purge_job_id,
+        idempotency_key: format!(
+            "repository-scope-purge:{}:{}",
+            preview.target.repository_id(),
+            preview.deletion_generation
+        ),
+        target_revision: format!(
+            "{}@{}",
+            preview.target.repository_id(),
+            preview.target.repository_revision()
+        ),
+        target_watermark: confirmation_frontier,
+        target_generation: preview.deletion_generation,
+        kind: REPOSITORY_SCOPE_PURGE_JOB_KIND.into(),
+        algorithm_revision: REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION.into(),
+        model_id: None,
+        priority: 0,
+        state: JobStatus::Queued,
+        attempt: 1,
+        backoff_until_us: None,
+        config_hash: effective_config_hash,
+        budget: JobBudget {
+            max_items: preview.physical_item_count()?,
+            max_bytes: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            max_calls: None,
+            max_wall_time_ms: 5_000,
+        },
+        terminal: None,
+        lease_until_us: None,
+    };
+    if !progress.validate() {
+        return Err(StoreError::InvalidInput);
+    }
+    let revoked_target_jobs = preview
+        .active_target_repository_jobs
+        .iter()
+        .cloned()
+        .map(|mut job| {
+            job.state = JobStatus::Failed;
+            job.lease_until_us = None;
+            job.backoff_until_us = None;
+            job.terminal = Some(Box::new(JobTerminalAudit {
+                outcome: JobTerminalOutcome::Failed,
+                reason: JobTerminalReason::Revoked,
+                result_ref: Some(job.idempotency_key.clone()),
+            }));
+            job
+        })
+        .collect();
+    Ok((progress, job, revoked_target_jobs))
+}
+
+pub fn advance_repository_scope_purge(
+    current: &ScopePurgeProgress,
+    stage: ScopePurgeStage,
+    next_ordinal: u64,
+    recorded_at_us: i64,
+) -> Result<ScopePurgeProgress, StoreError> {
+    let mut next = current.clone();
+    next.stage = stage;
+    next.next_ordinal = next_ordinal;
+    next.recorded_at_us = recorded_at_us;
+    next.terminal_audit_ref = (stage == ScopePurgeStage::Purged).then_some(current.purge_job_id);
+    if !current.validate_successor(&next) {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(next)
+}
+
+pub fn terminal_repository_scope_purge_job(
+    current: &ScopePurgeProgress,
+    leased_job: &DurableJob,
+) -> Result<DurableJob, StoreError> {
+    if !matches!(
+        current.stage,
+        ScopePurgeStage::ProjectionClosed | ScopePurgeStage::PhysicalDeleting
+    ) || leased_job.job_id != current.purge_job_id
+        || leased_job.state != JobStatus::Leased
+        || leased_job.kind != REPOSITORY_SCOPE_PURGE_JOB_KIND
+        || leased_job.target_generation != current.deletion_generation
+        || leased_job.target_watermark != current.confirmation_frontier
+        || u64::from(leased_job.budget.max_items) != current.next_ordinal
+        || current.stage == ScopePurgeStage::ProjectionClosed && current.next_ordinal != 0
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    let mut terminal = leased_job.clone();
+    terminal.state = JobStatus::Succeeded;
+    terminal.lease_until_us = None;
+    terminal.terminal = Some(Box::new(JobTerminalAudit {
+        outcome: JobTerminalOutcome::Succeeded,
+        reason: JobTerminalReason::Completed,
+        result_ref: Some(leased_job.job_id.to_string()),
+    }));
+    Ok(terminal)
 }
 
 pub fn pending_object_deletion(
@@ -485,7 +668,146 @@ impl ObjectDeletionState {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScopePurgeCurrentView {
+    pub frontier: u64,
+    pub generation: u64,
+    pub events: BTreeMap<RepositoryId, ScopePurgeProgress>,
+}
+
+impl ScopePurgeCurrentView {
+    pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let mut view = Self {
+            frontier: snapshot.frontier,
+            ..Self::default()
+        };
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some(SCOPE_PURGE_PROGRESS_KIND))
+        {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::ScopePurgeProgressRecorded(progress) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            require_scope_purge_row(row, &progress)?;
+            view.generation = view.generation.max(progress.deletion_generation);
+            if view
+                .events
+                .insert(progress.target.repository_id(), *progress)
+                .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(view)
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ScopePurgeState {
+    events: BTreeMap<RepositoryId, (ScopePurgeProgress, u64)>,
+    generation: u64,
+}
+
+impl ScopePurgeState {
+    pub(crate) fn current(&self, repository_id: RepositoryId) -> Option<&ScopePurgeProgress> {
+        self.events.get(&repository_id).map(|(event, _)| event)
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn apply(
+        &mut self,
+        event: ScopePurgeProgress,
+        seq: u64,
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        let repository_id = event.target.repository_id();
+        match self.events.get(&repository_id) {
+            None => {
+                if event.stage != ScopePurgeStage::Pending
+                    || event.deletion_generation != self.generation.checked_add(1).ok_or(error)?
+                {
+                    return Err(error);
+                }
+                self.generation = event.deletion_generation;
+            }
+            Some((current, _)) if !current.validate_successor(&event) => return Err(error),
+            Some(_) => {}
+        }
+        self.events.insert(repository_id, (event, seq));
+        Ok(())
+    }
+
+    pub(crate) fn restore(
+        &mut self,
+        row: &ObjectRow,
+        event: ScopePurgeProgress,
+    ) -> Result<(), StoreError> {
+        require_scope_purge_row(row, &event)?;
+        let repository_id = event.target.repository_id();
+        if self
+            .events
+            .insert(repository_id, (event, row.source_event_seq))
+            .is_some()
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.generation = self
+            .events
+            .values()
+            .map(|(event, _)| event.deletion_generation)
+            .max()
+            .unwrap_or(0);
+        Ok(())
+    }
+
+    pub(crate) fn rows(&self) -> Result<Vec<ObjectRow>, StoreError> {
+        self.events
+            .values()
+            .map(|(event, seq)| scope_purge_row(event, *seq))
+            .collect()
+    }
+
+    pub(crate) fn events(&self) -> impl Iterator<Item = &ScopePurgeProgress> {
+        self.events.values().map(|(event, _)| event)
+    }
+
+    pub(crate) fn validate_restored(&self) -> Result<(), StoreError> {
+        let generations = self
+            .events()
+            .map(|event| event.deletion_generation)
+            .collect::<BTreeSet<_>>();
+        if generations.len() != self.events.len()
+            || generations
+                != (1..=u64::try_from(generations.len()).map_err(|_| StoreError::StoreCorrupt)?)
+                    .collect()
+            || self.generation != u64::try_from(generations.len()).unwrap_or(0)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn filter_product_rows(
+    rows: Vec<ObjectRow>,
+    deletions: &ObjectDeletionState,
+    scope_purges: &ScopePurgeState,
+    repository_closures: &[crate::projections::RepositoryClosureKeys],
+) -> Result<Vec<ObjectRow>, StoreError> {
+    let rows = filter_object_product_rows(rows, deletions)?;
+    filter_repository_product_rows(rows, scope_purges, repository_closures)
+}
+
+fn filter_object_product_rows(
     rows: Vec<ObjectRow>,
     deletions: &ObjectDeletionState,
 ) -> Result<Vec<ObjectRow>, StoreError> {
@@ -575,6 +897,58 @@ pub(crate) fn filter_product_rows(
                 &negative_ids,
                 &owned_support_runtime,
             )?;
+        if !deleted {
+            retained.push(row);
+        }
+    }
+    for row in &retained {
+        row.validate()?;
+    }
+    Ok(retained)
+}
+
+fn filter_repository_product_rows(
+    rows: Vec<ObjectRow>,
+    scope_purges: &ScopePurgeState,
+    repository_closures: &[crate::projections::RepositoryClosureKeys],
+) -> Result<Vec<ObjectRow>, StoreError> {
+    let repository_ids = scope_purges
+        .events()
+        .map(|event| event.target.repository_id())
+        .collect::<BTreeSet<_>>();
+    if repository_ids.is_empty() {
+        return Ok(rows);
+    }
+
+    let mut retained = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.object_kind.as_deref() == Some(SCOPE_PURGE_PROGRESS_KIND) {
+            retained.push(row);
+            continue;
+        }
+        if row
+            .repository_id
+            .as_deref()
+            .and_then(|value| value.parse::<RepositoryId>().ok())
+            .is_some_and(|id| repository_ids.contains(&id))
+        {
+            continue;
+        }
+        let deleted = match journal_payload(&row)? {
+            Some(payload) => repository_closures
+                .iter()
+                .any(|closure| closure.references_payload(&payload)),
+            None => {
+                let mut deleted = false;
+                for closure in repository_closures {
+                    if closure.references_non_journal_row(&row)? {
+                        deleted = true;
+                        break;
+                    }
+                }
+                deleted
+            }
+        };
         if !deleted {
             retained.push(row);
         }
@@ -772,6 +1146,76 @@ fn ledger_row(event: &ObjectDeletionLedgerEvent, seq: u64) -> Result<ObjectRow, 
     Ok(row)
 }
 
+fn scope_purge_row(event: &ScopePurgeProgress, seq: u64) -> Result<ObjectRow, StoreError> {
+    let repository_id = event.target.repository_id();
+    let row = ObjectRow {
+        row_id: format!("projection:scope_purge:repository:{repository_id}"),
+        row_kind: ObjectRowKind::Data,
+        row_class: Some(ObjectRowClass::Projection),
+        object_family: None,
+        object_kind: Some(SCOPE_PURGE_PROGRESS_KIND.into()),
+        object_id: None,
+        current_revision_id: Some(format!(
+            "scope-purge-generation-{}",
+            event.deletion_generation
+        )),
+        lifecycle: Some(
+            match event.stage {
+                ScopePurgeStage::Pending => "purge_pending",
+                ScopePurgeStage::ProjectionClosed => "projection_closed",
+                ScopePurgeStage::PhysicalDeleting => "physical_deleting",
+                ScopePurgeStage::Purged => "purged",
+            }
+            .into(),
+        ),
+        epistemic: None,
+        authority: Some("human".into()),
+        publication_state: None,
+        support_state: None,
+        project_id: None,
+        repository_id: Some(repository_id.to_string()),
+        worktree_id: None,
+        task_id: None,
+        workstream_id: None,
+        session_id: None,
+        payload_json: Some(
+            JournalPayload::ScopePurgeProgressRecorded(Box::new(event.clone())).canonical_json()?,
+        ),
+        source_event_seq: seq,
+        projection_generation: PROJECTION_GENERATION,
+    };
+    require_scope_purge_row(&row, event)?;
+    Ok(row)
+}
+
+fn require_scope_purge_row(row: &ObjectRow, event: &ScopePurgeProgress) -> Result<(), StoreError> {
+    let repository_id = event.target.repository_id();
+    if !event.validate()
+        || row.row_kind != ObjectRowKind::Data
+        || row.row_class != Some(ObjectRowClass::Projection)
+        || row.object_family.is_some()
+        || row.object_kind.as_deref() != Some(SCOPE_PURGE_PROGRESS_KIND)
+        || row.row_id != format!("projection:scope_purge:repository:{repository_id}")
+        || row.object_id.is_some()
+        || row.current_revision_id.as_deref()
+            != Some(format!("scope-purge-generation-{}", event.deletion_generation).as_str())
+        || row.lifecycle.as_deref()
+            != Some(match event.stage {
+                ScopePurgeStage::Pending => "purge_pending",
+                ScopePurgeStage::ProjectionClosed => "projection_closed",
+                ScopePurgeStage::PhysicalDeleting => "physical_deleting",
+                ScopePurgeStage::Purged => "purged",
+            })
+        || row.authority.as_deref() != Some("human")
+        || row.repository_id.as_deref() != Some(repository_id.to_string().as_str())
+        || row.source_event_seq == 0
+        || row.projection_generation != PROJECTION_GENERATION
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
 fn require_ledger_row(
     row: &ObjectRow,
     event: &ObjectDeletionLedgerEvent,
@@ -803,6 +1247,19 @@ fn require_ledger_row(
 mod tests {
     use super::*;
     use evertrace_domain::ids::AtomId;
+
+    #[test]
+    fn repository_scope_purge_command_cap_blocks_overflow() {
+        assert_eq!(repository_scope_purge_command_event_count(0, 0, 0), Ok(2));
+        assert_eq!(
+            repository_scope_purge_command_event_count(16_383, 1, 0),
+            Ok(u16::MAX)
+        );
+        assert_eq!(
+            repository_scope_purge_command_event_count(16_384, 0, 0),
+            Err(StoreError::ReconciliationDependencyOverflow)
+        );
+    }
 
     #[test]
     fn current_guard_is_singleton_while_history_still_closes() {

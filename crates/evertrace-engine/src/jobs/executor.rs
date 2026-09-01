@@ -1,12 +1,13 @@
 use evertrace_store::{
-    CommitOutcome, CommittedCommand, JobStatus, JournalCommand, JournalWriter,
-    ObjectDeletionCurrentView, ProjectionSnapshot, RecallCurrentContext,
+    CommitOutcome, CommittedCommand, DurableJob, JobStatus, JournalCommand, JournalWriter,
+    ObjectDeletionCurrentView, ProjectionSnapshot, ProjectionWorker, RecallCurrentContext,
     ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
-    RuntimeSchedulerView, StoreError,
+    RuntimeSchedulerView, ScopePurgeCurrentView, StoreError,
 };
 use std::{
+    collections::BTreeSet,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
@@ -54,6 +55,7 @@ enum WriterRequest {
 #[derive(Clone)]
 pub struct WriterHandle {
     sender: mpsc::Sender<WriterRequest>,
+    projection_worker: ProjectionWorker,
     recall_frontier: watch::Sender<u64>,
     background_frontier: watch::Sender<u64>,
 }
@@ -202,6 +204,7 @@ pub fn spawn_writer(
         return Err(WriterActorError::InvalidInput);
     }
     let frontier = writer.frontier();
+    let projection_worker = writer.projection_worker();
     let (sender, receiver) = mpsc::channel(capacity);
     let (recall_frontier, _) = watch::channel(frontier);
     let (background_frontier, _) = watch::channel(frontier);
@@ -214,6 +217,7 @@ pub fn spawn_writer(
     Ok((
         WriterHandle {
             sender,
+            projection_worker,
             recall_frontier,
             background_frontier,
         },
@@ -438,6 +442,243 @@ async fn reconcile_object_deletions(
             .map_err(map_store_error)?;
         completed_frontier = Some(outcome.last_seq);
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RepositoryPurgeBatchOutcome {
+    pub committed: bool,
+    pub retryable: bool,
+}
+
+pub(crate) async fn reconcile_repository_scope_purge_batch(
+    writer: &WriterHandle,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    snapshot: ProjectionSnapshot,
+    leased_job: &DurableJob,
+    plans: &std::sync::Mutex<std::collections::BTreeMap<evertrace_domain::ids::JobId, Vec<String>>>,
+) -> Result<RepositoryPurgeBatchOutcome, WriterActorError> {
+    let started = Instant::now();
+    if leased_job.state != JobStatus::Leased
+        || leased_job.kind != evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
+    {
+        return Err(WriterActorError::InvalidInput);
+    }
+    let deadline = started + Duration::from_millis(leased_job.budget.max_wall_time_ms.min(5_000));
+    let progress = ScopePurgeCurrentView::from_snapshot(&snapshot)
+        .map_err(map_store_error)?
+        .events
+        .into_values()
+        .find(|progress| progress.purge_job_id == leased_job.job_id)
+        .ok_or(WriterActorError::StoreCorrupt)?;
+    if progress.stage == evertrace_domain::purge::ScopePurgeStage::Pending {
+        let occurred_at_us = now_us()?;
+        let command = crate::purge::advance_repository_purge_command(
+            evertrace_domain::ids::CommandId::new_v7(),
+            &progress,
+            leased_job,
+            evertrace_domain::purge::ScopePurgeStage::ProjectionClosed,
+            0,
+            occurred_at_us,
+            leased_job.config_hash,
+        )
+        .map_err(map_store_error)?;
+        return commit_purge_batch(writer, command, occurred_at_us, snapshot.frontier).await;
+    }
+    let needs_plan = {
+        let plans = plans.lock().map_err(|_| WriterActorError::Store)?;
+        !plans.contains_key(&leased_job.job_id)
+    };
+    if needs_plan {
+        let confirmation = writer
+            .projection_worker
+            .project_at_frontier(progress.confirmation_frontier)
+            .await
+            .map_err(map_store_error)?;
+        let preview = evertrace_store::repository_scope_purge_preview(
+            &confirmation,
+            progress.target.repository_id(),
+            progress.target.repository_revision(),
+        )
+        .map_err(map_store_error)?;
+        if preview.deletion_generation != progress.deletion_generation
+            || preview.physical_item_count().map_err(map_store_error)?
+                != leased_job.budget.max_items
+        {
+            return Err(WriterActorError::StoreCorrupt);
+        }
+        plans
+            .lock()
+            .map_err(|_| WriterActorError::Store)?
+            .entry(leased_job.job_id)
+            .or_insert(preview.exclusive_cas_refs);
+    }
+    let (next, batch_refs, plan_len) = {
+        let plans = plans.lock().map_err(|_| WriterActorError::Store)?;
+        let plan = plans
+            .get(&leased_job.job_id)
+            .ok_or(WriterActorError::StoreCorrupt)?;
+        let next =
+            usize::try_from(progress.next_ordinal).map_err(|_| WriterActorError::StoreCorrupt)?;
+        if next > plan.len() {
+            return Err(WriterActorError::StoreCorrupt);
+        }
+        let end = next
+            .saturating_add(
+                usize::try_from(evertrace_store::REPOSITORY_SCOPE_PURGE_BATCH_SIZE)
+                    .map_err(|_| WriterActorError::StoreCorrupt)?,
+            )
+            .min(plan.len());
+        (next, plan[next..end].to_vec(), plan.len())
+    };
+    if Instant::now() >= deadline {
+        return Ok(RepositoryPurgeBatchOutcome {
+            committed: false,
+            retryable: true,
+        });
+    }
+    let occurred_at_us = now_us()?;
+    if next == plan_len {
+        let command = crate::purge::complete_repository_purge_command(
+            evertrace_domain::ids::CommandId::new_v7(),
+            &progress,
+            leased_job,
+            occurred_at_us,
+            leased_job.config_hash,
+        )
+        .map_err(map_store_error)?;
+        let outcome =
+            commit_purge_batch(writer, command, occurred_at_us, snapshot.frontier).await?;
+        if outcome.committed {
+            plans
+                .lock()
+                .map_err(|_| WriterActorError::Store)?
+                .remove(&leased_job.job_id);
+        }
+        return Ok(outcome);
+    }
+    let batch = batch_refs
+        .iter()
+        .map(|value| evertrace_capture::CasStore::parse_digest(value))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| WriterActorError::StoreCorrupt)?;
+    let candidate_refs = batch_refs.into_iter().collect::<BTreeSet<_>>();
+    let fence = evertrace_capture::MaintenanceFence::open(
+        runtime.data_dir().map_err(|_| WriterActorError::Store)?,
+    )
+    .map_err(|_| WriterActorError::Store)?;
+    let maintenance = match fence.exclusive() {
+        Ok(maintenance) => maintenance,
+        Err(evertrace_capture::CasError::LockBusy) => {
+            return Ok(RepositoryPurgeBatchOutcome {
+                committed: false,
+                retryable: true,
+            });
+        }
+        Err(_) => return Err(WriterActorError::Store),
+    };
+    let fresh = writer.project().await?;
+    let fresh_progress = ScopePurgeCurrentView::from_snapshot(&fresh)
+        .map_err(map_store_error)?
+        .events
+        .into_values()
+        .find(|value| value.purge_job_id == leased_job.job_id)
+        .filter(|value| value == &progress)
+        .ok_or(WriterActorError::StoreCorrupt)?;
+    let current_job = RuntimeSchedulerView::from_snapshot(&fresh)
+        .map_err(map_store_error)?
+        .jobs
+        .into_iter()
+        .find(|job| job.job_id == leased_job.job_id)
+        .filter(|job| job == leased_job)
+        .ok_or(WriterActorError::StoreCorrupt)?;
+    let pinned = current_cas_pins(&fresh, runtime, &candidate_refs)?;
+    let delete = batch
+        .iter()
+        .filter(|digest| !pinned.contains(&digest.as_hex()))
+        .copied()
+        .collect::<Vec<_>>();
+    match evertrace_capture::CasStore::delete_guarded_batch(&maintenance, &delete) {
+        Ok(_) => {}
+        Err(evertrace_capture::CasError::LockBusy) => {
+            return Ok(RepositoryPurgeBatchOutcome {
+                committed: false,
+                retryable: true,
+            });
+        }
+        Err(_) => return Err(WriterActorError::Store),
+    }
+    let next_ordinal = progress
+        .next_ordinal
+        .checked_add(u64::try_from(batch.len()).map_err(|_| WriterActorError::StoreCorrupt)?)
+        .ok_or(WriterActorError::StoreCorrupt)?;
+    let command = crate::purge::advance_repository_purge_command(
+        evertrace_domain::ids::CommandId::new_v7(),
+        &fresh_progress,
+        &current_job,
+        evertrace_domain::purge::ScopePurgeStage::PhysicalDeleting,
+        next_ordinal,
+        occurred_at_us,
+        leased_job.config_hash,
+    )
+    .map_err(map_store_error)?;
+    let outcome = commit_purge_batch(writer, command, occurred_at_us, fresh.frontier).await;
+    drop(maintenance);
+    outcome
+}
+
+async fn commit_purge_batch(
+    writer: &WriterHandle,
+    command: JournalCommand,
+    occurred_at_us: i64,
+    frontier: u64,
+) -> Result<RepositoryPurgeBatchOutcome, WriterActorError> {
+    match writer
+        .commit_if_frontier(command, occurred_at_us, frontier)
+        .await
+    {
+        Ok(outcome) => Ok(RepositoryPurgeBatchOutcome {
+            committed: !outcome.replayed,
+            retryable: false,
+        }),
+        Err(WriterActorError::StaleFrontier) => Ok(RepositoryPurgeBatchOutcome {
+            committed: false,
+            retryable: true,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn current_cas_pins(
+    snapshot: &ProjectionSnapshot,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    candidates: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, WriterActorError> {
+    let mut refs = snapshot
+        .live_cas_refs_intersect(candidates)
+        .map_err(map_store_error)?;
+    let limits = runtime
+        .spool_limits()
+        .map_err(|_| WriterActorError::Store)?;
+    let spool = evertrace_capture::DurableSpool::open_read_only(runtime.spool_dir.clone(), limits)
+        .map_err(|_| WriterActorError::Store)?;
+    refs.extend(
+        spool
+            .durable_cas_refs_intersect(
+                candidates,
+                usize::try_from(limits.max_main_files).map_err(|_| WriterActorError::Store)?,
+                limits.high_watermark_bytes,
+            )
+            .map_err(|_| WriterActorError::Store)?,
+    );
+    Ok(refs)
+}
+
+fn now_us() -> Result<i64, WriterActorError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+        .ok_or(WriterActorError::Store)
 }
 
 fn recall_relevant(command: &JournalCommand) -> bool {
