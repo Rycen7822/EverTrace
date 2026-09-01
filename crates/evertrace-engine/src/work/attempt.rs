@@ -1,16 +1,25 @@
+use std::collections::BTreeSet;
+
 use evertrace_domain::{
     ids::{
-        AttemptId, ExecutionLaneId, IntegrationEventId, TaskId, WorkstreamId, WorktreeId,
-        WorktreeSnapshotId, WorktreeTransitionId,
+        AttemptId, ExecutionLaneId, IntegrationEventId, ResultEvidenceId, TaskId, WorkstreamId,
+        WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
+    repository::LineageAssessment,
     revision::RevisionId,
+    semantic::{EvidenceCompleteness, ParserStatus, ResultScope, VerifierStatus},
     work::{
-        Attempt, AttemptAdoptionStatus, AttemptExecutionStatus, AttemptLifecycleStatus,
-        AttemptOutcomeState, AttemptVerification, CompetingAttemptGroup, CompetingResolutionStatus,
-        InterruptionReason, ResumeStateAssessment, StrategyContract,
+        Attempt, AttemptAdoptionStatus, AttemptBindingStatus, AttemptExecutionStatus,
+        AttemptLifecycleStatus, AttemptOutcomeState, AttemptVerification, CompetingAttemptGroup,
+        CompetingResolutionStatus, InterruptionReason, ResumeStateAssessment, RunContractValidity,
+        RunExecutionStatus, RunObservability, StrategyContract,
     },
 };
-use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload};
+use evertrace_store::projections::MarkNewAttemptCurrentView;
+use evertrace_store::{
+    AttemptCurrentView, CompetingResolutionEvidenceView, JournalCommand, JournalEventDraft,
+    JournalPayload, ProjectionSnapshot, SourceKind,
+};
 
 use super::{WorkCommandContext, WorkIdentityError};
 
@@ -20,42 +29,112 @@ pub enum AttemptResolution<T> {
     Revision(Box<T>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompetingSelectedCandidate {
+    pub(crate) attempt_id: AttemptId,
+    pub(crate) evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompetingSelectedSelection {
+    pub(crate) group: CompetingAttemptGroup,
+    pub(crate) candidates: Vec<CompetingSelectedCandidate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CompetingSelectedLookup {
+    Available(Box<CompetingSelectedSelection>),
+    Conflict { current_revision_id: RevisionId },
+    Unavailable { reason: &'static str },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CompetingSelectedResolution {
+    Revision {
+        group: Box<CompetingAttemptGroup>,
+        command: JournalCommand,
+    },
+    Conflict {
+        current_revision_id: RevisionId,
+    },
+    Unavailable {
+        reason: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MarkNewAttemptLookup {
+    Available { source: Box<Attempt> },
+    Conflict { current_revision_id: RevisionId },
+    NoDelta { current_revision_id: RevisionId },
+    Unavailable { reason: &'static str },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MarkNewAttemptResolution {
+    Revision {
+        child: Box<Attempt>,
+        command: JournalCommand,
+    },
+    Conflict {
+        current_revision_id: RevisionId,
+    },
+    NoDelta {
+        current_revision_id: RevisionId,
+    },
+    Unavailable {
+        reason: &'static str,
+    },
+}
+
 fn attempt_command(
     context: WorkCommandContext,
     attempt: Attempt,
 ) -> Result<JournalCommand, WorkIdentityError> {
+    attempt_command_with_source(context, attempt, SourceKind::System)
+}
+
+fn attempt_command_with_source(
+    context: WorkCommandContext,
+    attempt: Attempt,
+    source_kind: SourceKind,
+) -> Result<JournalCommand, WorkIdentityError> {
     attempt
         .validate()
         .map_err(|_| WorkIdentityError::InvalidInput)?;
-    JournalCommand::new(
-        context.command_id,
-        vec![JournalEventDraft::runtime(
-            context.occurred_at_us,
-            context.effective_config_hash,
-            context.algorithm_revision,
-            JournalPayload::AttemptRecorded(Box::new(attempt)),
-        )],
-    )
-    .map_err(Into::into)
+    let mut event = JournalEventDraft::runtime(
+        context.occurred_at_us,
+        context.effective_config_hash,
+        context.algorithm_revision,
+        JournalPayload::AttemptRecorded(Box::new(attempt)),
+    );
+    event.source_kind = source_kind;
+    JournalCommand::new(context.command_id, vec![event]).map_err(Into::into)
 }
 
 fn group_command(
     context: WorkCommandContext,
     group: CompetingAttemptGroup,
 ) -> Result<JournalCommand, WorkIdentityError> {
+    group_command_with_source(context, group, SourceKind::System)
+}
+
+fn group_command_with_source(
+    context: WorkCommandContext,
+    group: CompetingAttemptGroup,
+    source_kind: SourceKind,
+) -> Result<JournalCommand, WorkIdentityError> {
     group
         .validate()
         .map_err(|_| WorkIdentityError::InvalidInput)?;
-    JournalCommand::new(
-        context.command_id,
-        vec![JournalEventDraft::runtime(
-            context.occurred_at_us,
-            context.effective_config_hash,
-            context.algorithm_revision,
-            JournalPayload::CompetingAttemptGroupRecorded(Box::new(group)),
-        )],
-    )
-    .map_err(Into::into)
+    let mut event = JournalEventDraft::runtime(
+        context.occurred_at_us,
+        context.effective_config_hash,
+        context.algorithm_revision,
+        JournalPayload::CompetingAttemptGroupRecorded(Box::new(group)),
+    );
+    event.source_kind = source_kind;
+    JournalCommand::new(context.command_id, vec![event]).map_err(Into::into)
 }
 
 pub fn create_attempt(
@@ -357,6 +436,259 @@ pub fn create_competing_group(
         return Err(WorkIdentityError::InvalidInput);
     }
     group_command(context, group)
+}
+
+pub(crate) fn select_mark_new_attempt(
+    snapshot: &ProjectionSnapshot,
+    expected_revision_id: RevisionId,
+) -> Result<MarkNewAttemptLookup, WorkIdentityError> {
+    let current = MarkNewAttemptCurrentView::for_expected_source(snapshot, expected_revision_id)?
+        .ok_or(WorkIdentityError::InvalidInput)?;
+    if current.source.revision_id != expected_revision_id {
+        return Ok(MarkNewAttemptLookup::Conflict {
+            current_revision_id: current.source.revision_id,
+        });
+    }
+    if let Some(child) = current.existing_child {
+        return Ok(MarkNewAttemptLookup::NoDelta {
+            current_revision_id: child.revision_id,
+        });
+    }
+    if current.source.lifecycle_status != AttemptLifecycleStatus::Active
+        || current.source.execution_status != AttemptExecutionStatus::Interrupted
+    {
+        return Ok(MarkNewAttemptLookup::Unavailable {
+            reason: "attempt_not_active_interrupted",
+        });
+    }
+    Ok(MarkNewAttemptLookup::Available {
+        source: Box::new(current.source),
+    })
+}
+
+pub(crate) fn mark_new_attempt(
+    context: WorkCommandContext,
+    snapshot: &ProjectionSnapshot,
+    expected_revision_id: RevisionId,
+) -> Result<MarkNewAttemptResolution, WorkIdentityError> {
+    let source = match select_mark_new_attempt(snapshot, expected_revision_id)? {
+        MarkNewAttemptLookup::Available { source } => source,
+        MarkNewAttemptLookup::Conflict {
+            current_revision_id,
+        } => {
+            return Ok(MarkNewAttemptResolution::Conflict {
+                current_revision_id,
+            });
+        }
+        MarkNewAttemptLookup::NoDelta {
+            current_revision_id,
+        } => {
+            return Ok(MarkNewAttemptResolution::NoDelta {
+                current_revision_id,
+            });
+        }
+        MarkNewAttemptLookup::Unavailable { reason } => {
+            return Ok(MarkNewAttemptResolution::Unavailable { reason });
+        }
+    };
+    let mut child = new_attempt(
+        source.task_id,
+        source.workstream_id,
+        source.repository_instance_id,
+        source.worktree_instance_ids.clone(),
+        Vec::new(),
+        source.strategy_contract.clone(),
+        snapshot.frontier,
+    )?;
+    child.resume_event_refs = vec![source.revision_id.to_string()];
+    let child = create_resume_attempt(child, &source, ResumeStateAssessment::Unknown)?;
+    let command = attempt_command_with_source(context, child.clone(), SourceKind::Manual)?;
+    Ok(MarkNewAttemptResolution::Revision {
+        child: Box::new(child),
+        command,
+    })
+}
+
+pub(crate) fn select_competing_selected(
+    snapshot: &ProjectionSnapshot,
+    expected_revision_id: RevisionId,
+) -> Result<CompetingSelectedLookup, WorkIdentityError> {
+    let group_id =
+        CompetingResolutionEvidenceView::group_id_for_revision(snapshot, expected_revision_id)?
+            .ok_or(WorkIdentityError::InvalidInput)?;
+    let attempts = AttemptCurrentView::for_competing_group(snapshot, group_id)?;
+    let group = attempts
+        .competing_groups
+        .get(&group_id)
+        .ok_or(WorkIdentityError::InvalidInput)?;
+    if expected_revision_id != group.revision_id {
+        return Ok(CompetingSelectedLookup::Conflict {
+            current_revision_id: group.revision_id,
+        });
+    }
+    if !matches!(
+        group.resolution_status,
+        CompetingResolutionStatus::Open | CompetingResolutionStatus::Unresolved
+    ) {
+        return Ok(CompetingSelectedLookup::Unavailable {
+            reason: "competing_group_not_open",
+        });
+    }
+    let member_attempts = group
+        .member_attempt_ids
+        .iter()
+        .map(|attempt_id| attempts.attempts.get(attempt_id))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(WorkIdentityError::InvalidInput)?;
+    let evidence = CompetingResolutionEvidenceView::for_attempts(snapshot, member_attempts)?;
+    let candidates = group
+        .member_attempt_ids
+        .iter()
+        .filter_map(|attempt_id| {
+            let attempt = attempts.attempts.get(attempt_id)?;
+            let evidence_refs = competing_selected_evidence(attempt, &evidence)?;
+            Some(CompetingSelectedCandidate {
+                attempt_id: *attempt_id,
+                evidence_refs,
+            })
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(CompetingSelectedLookup::Unavailable {
+            reason: "competing_group_has_no_objective_candidate",
+        });
+    }
+    Ok(CompetingSelectedLookup::Available(Box::new(
+        CompetingSelectedSelection {
+            group: group.clone(),
+            candidates,
+        },
+    )))
+}
+
+fn competing_selected_evidence(
+    attempt: &Attempt,
+    current: &CompetingResolutionEvidenceView,
+) -> Option<Vec<String>> {
+    if attempt.adoption_status != AttemptAdoptionStatus::Integrated
+        || attempt.verification != AttemptVerification::Passed
+    {
+        return None;
+    }
+    let integration_ids = attempt
+        .integration_event_refs
+        .iter()
+        .filter_map(|id| {
+            current.integrations.get(id).and_then(|event| {
+                (event.assessment == LineageAssessment::Proven
+                    && event.integrated_attempt_ids.contains(&attempt.attempt_id))
+                .then_some(*id)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if integration_ids.is_empty() {
+        return None;
+    }
+    let result_ids = attempt
+        .parent_verification_refs
+        .iter()
+        .filter_map(|reference| reference.parse::<ResultEvidenceId>().ok())
+        .filter_map(|result_id| current.current_results.get(&result_id))
+        .filter(|result| {
+            result.result_scope == ResultScope::Complete
+                && result.completeness == EvidenceCompleteness::Complete
+                && result.parser_receipt.status == ParserStatus::Parsed
+                && result
+                    .verifier_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.status == VerifierStatus::Passed)
+                && current
+                    .run_revisions
+                    .get(&result.experiment_run_revision_id)
+                    .is_some_and(|run| {
+                        run.run_id == result.experiment_run_id
+                            && run.attempt_binding_status == AttemptBindingStatus::Resolved
+                            && run.attempt_id == Some(attempt.attempt_id)
+                            && run.observability == RunObservability::Full
+                            && run.execution_status == RunExecutionStatus::Completed
+                            && run.contract_validity == RunContractValidity::Valid
+                            && run.workstream_id == attempt.workstream_id
+                            && run.strategy_contract_fingerprint
+                                == attempt.strategy_contract_fingerprint
+                    })
+        })
+        .map(|result| result.result_evidence_id)
+        .collect::<BTreeSet<_>>();
+    if result_ids.is_empty() {
+        return None;
+    }
+    let mut evidence_refs = integration_ids
+        .iter()
+        .map(ToString::to_string)
+        .chain(result_ids.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    Some(evidence_refs)
+}
+
+pub(crate) fn resolve_competing_selected(
+    context: WorkCommandContext,
+    snapshot: &ProjectionSnapshot,
+    expected_revision_id: RevisionId,
+    chosen_attempt_id: AttemptId,
+) -> Result<CompetingSelectedResolution, WorkIdentityError> {
+    let selection = match select_competing_selected(snapshot, expected_revision_id)? {
+        CompetingSelectedLookup::Available(selection) => selection,
+        CompetingSelectedLookup::Conflict {
+            current_revision_id,
+        } => {
+            return Ok(CompetingSelectedResolution::Conflict {
+                current_revision_id,
+            });
+        }
+        CompetingSelectedLookup::Unavailable { reason } => {
+            return Ok(CompetingSelectedResolution::Unavailable { reason });
+        }
+    };
+    let candidate = selection
+        .candidates
+        .iter()
+        .find(|candidate| candidate.attempt_id == chosen_attempt_id)
+        .ok_or(WorkIdentityError::InvalidInput)?;
+    let mut evidence_refs = selection.group.resolution_evidence_refs.clone();
+    evidence_refs.extend(candidate.evidence_refs.iter().cloned());
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let command = resolve_competing_group(
+        context,
+        &selection.group,
+        CompetingResolutionStatus::Selected,
+        Some(chosen_attempt_id),
+        Vec::new(),
+        evidence_refs,
+        snapshot
+            .frontier
+            .max(selection.group.source_watermark)
+            .checked_add(1)
+            .ok_or(WorkIdentityError::InvalidInput)?,
+    )?
+    .ok_or(WorkIdentityError::Conflict)?;
+    let group = command
+        .events()
+        .iter()
+        .filter_map(|event| match &event.payload {
+            JournalPayload::CompetingAttemptGroupRecorded(value) => Some(value.as_ref()),
+            _ => None,
+        })
+        .next()
+        .cloned()
+        .ok_or(WorkIdentityError::InvalidInput)?;
+    let command = group_command_with_source(context, group.clone(), SourceKind::Manual)?;
+    Ok(CompetingSelectedResolution::Revision {
+        group: Box::new(group),
+        command,
+    })
 }
 
 pub fn resolve_competing_group(

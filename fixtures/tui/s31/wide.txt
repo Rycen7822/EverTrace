@@ -1,0 +1,30 @@
+EverTrace  Inbox / Explorer / System
+┌────────────────┐┌Inbox─────────────────────────────────────────────┐┌Inspector───────────────────┐
+│> Inbox         ││daemon: Degraded [CurrentJobFailed]               ││daemon: Degraded [CurrentJob│
+│  Explorer      ││target: Atom None                                 ││target: Atom None           │
+│  System        ││operation/base: Create -                          ││operation/base: Create -    │
+│                ││eligibility/status: ManualRequired/Pending        ││eligibility/status: ManualRe│
+│                ││fingerprint: 68cfb7e6202dad34e7237c84dbb27c6405e97││fingerprint: 68cfb7e6202dad3│
+│                ││source cohort (1): source:one                     ││source cohort (1): source:on│
+│                ││plain accept eligible: true                       ││plain accept eligible: true │
+│                ││merge-and-accept eligible: false                  ││merge-and-accept eligible: f│
+│                ││created by: Agent                                 ││created by: Agent           │
+│                ││proposal evidence: ["source:one"]                 ││proposal evidence: ["source:│
+│                ││review payload:                                   ││review payload:             │
+│                ││Atom(                                             ││Atom(                       │
+│                ││    Create {                                      ││    Create {                │
+│                ││        draft: AtomDraft {                        ││        draft: AtomDraft {  │
+│                ││            kind: Constraint,                     ││            kind: Constraint│
+│                ││            epistemic_status: NotApplicable,      ││            epistemic_status│
+│                ││            value: AtomValue {                    ││            value: AtomValue│
+│                ││                text: "keep the reviewed invariant││                text: "keep │
+│                ││                subject: "governance",            ││                subject: "go│
+│                ││                predicate: "preserves",           ││                predicate: "│
+│                ││                object: Some(                     ││                object: Some│
+│                ││                    "evidence",                   ││                    "evidenc│
+│                ││                ),                                ││                ),          │
+│                ││                qualifiers: [                     ││                qualifiers: │
+│                ││                    SemanticQualifier {           ││                    Semantic│
+└────────────────┘└──────────────────────────────────────────────────┘└────────────────────────────┘
+● connected pending:0
+Esc back  j/k scroll  o related  n next page  b first page  r refresh  q quit

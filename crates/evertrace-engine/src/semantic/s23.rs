@@ -3,15 +3,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     config::{GlobalPromotionConfig, PromotionLevel},
-    ids::{CommandId, CoreMembershipId, JobId},
+    ids::{AtomId, CommandId, CoreMembershipId, JobId},
+    procedure::{ProcedureRevision, ProcedureScope},
     revision::RevisionId,
     semantic::{
-        AcceptedProposalTarget, ActiveScenarioLineage, Atom, AtomAuthority, AtomKind,
-        AtomLifecycleStatus, AtomScope, CoreMembership, CoreMembershipProposalPayload,
-        CoreScopeIdentity, EpistemicStatus, GlobalSuccessorSupportContract, GlobalSupportState,
-        GlobalSupportValidationEvent, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
-        ProposalPayload, ProposalTargetKind, RevisionProposal, Scenario, ScenarioScope,
-        ScenarioStatus, ScenarioWorkstream, SupportThresholdSnapshot, UserAuthorizationMode,
+        AcceptedProposalTarget, ActiveScenarioLineage, Atom, AtomAuthority, AtomDraft, AtomKind,
+        AtomLifecycleStatus, AtomProposalPayload, AtomScope, CoreMembership,
+        CoreMembershipProposalPayload, CoreScopeIdentity, EpistemicStatus,
+        GlobalSuccessorSupportContract, GlobalSupportState, GlobalSupportValidationEvent,
+        ProcedureProposalPayload, ProposalCreatedBy, ProposalEligibility, ProposalOperation,
+        ProposalPayload, ProposalTargetId, ProposalTargetKind, RevisionProposal, Scenario,
+        ScenarioScope, ScenarioStatus, ScenarioWorkstream, SupportThresholdSnapshot,
+        UserAuthorizationMode,
     },
     work::{
         Attempt, AttemptAdoptionStatus, AttemptExecutionStatus, AttemptLifecycleStatus,
@@ -25,6 +28,8 @@ use evertrace_store::{
     SemanticCurrentView, StoreError,
 };
 
+use crate::procedure::ProcedureUsageCurrentView;
+
 use super::{
     AtomAcceptanceContext, ProposalCommandContext, ProposalResolution, RevisionProposalService,
     SemanticServiceError, SubmitProposalRequest,
@@ -35,6 +40,396 @@ use super::{
 };
 
 const S23_ALGORITHM: &str = "s23-scenario-core-v1";
+
+#[derive(Clone, Debug)]
+pub(crate) struct SupportReplacementSelection {
+    pub(crate) validation_revision_id: RevisionId,
+    pub(crate) initial_payload: ProposalPayload,
+    pub(crate) target_kind: ProposalTargetKind,
+    pub(crate) target_id: ProposalTargetId,
+    pub(crate) base_revision_id: RevisionId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SupportDeprecateSelection {
+    pub(crate) validation_revision_id: RevisionId,
+    pub(crate) atom_id: AtomId,
+    pub(crate) base_revision_id: RevisionId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SupportAtomAcceptance {
+    pub(crate) validation_revision_id: RevisionId,
+    pub(crate) atom_id: AtomId,
+    pub(crate) base_revision_id: RevisionId,
+    pub(crate) downstream_validations: Vec<GlobalSupportValidationEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SupportReplacementLookup {
+    Available(Box<SupportReplacementSelection>),
+    Conflict { current_revision_id: RevisionId },
+    Unavailable { reason: &'static str },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SupportDeprecateLookup {
+    Available(SupportDeprecateSelection),
+    Conflict { current_revision_id: RevisionId },
+    Unavailable { reason: &'static str },
+}
+
+pub(crate) fn select_support_replacement(
+    snapshot: &ProjectionSnapshot,
+    expected_validation_revision_id: RevisionId,
+) -> Result<SupportReplacementLookup, SemanticServiceError> {
+    let support = SupportProjectionView::from_snapshot(snapshot)?;
+    let validation = support
+        .validations
+        .get(&expected_validation_revision_id)
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    let current = support
+        .current_validations
+        .get(&validation.support_contract_ref)
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    if current.validation_revision_id != expected_validation_revision_id {
+        return Ok(SupportReplacementLookup::Conflict {
+            current_revision_id: current.validation_revision_id,
+        });
+    }
+    let contract = support
+        .contracts
+        .get(&validation.support_contract_ref)
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    if contract.successor_revision_or_membership_ref != validation.successor_ref {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    if validation.state == GlobalSupportState::Valid {
+        return Ok(SupportReplacementLookup::Unavailable {
+            reason: "support_replacement_requires_non_valid_support",
+        });
+    }
+    let successor_revision_id = validation
+        .successor_ref
+        .parse::<RevisionId>()
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+    let semantic = SemanticCurrentView::from_snapshot(snapshot)?;
+    let procedures = ProcedureUsageCurrentView::from_snapshot(snapshot)?;
+    let atom = semantic
+        .atom_revisions
+        .get(&successor_revision_id)
+        .filter(|atom| {
+            atom.scope == AtomScope::Global
+                && atom.lifecycle_status == AtomLifecycleStatus::Active
+                && semantic.atoms.get(&atom.atom_id) == Some(*atom)
+        });
+    let procedure = procedures
+        .current_procedure_by_revision(successor_revision_id)
+        .filter(|procedure| procedure.draft.scope == ProcedureScope::Global);
+    match (atom, procedure) {
+        (Some(atom), None) => Ok(SupportReplacementLookup::Available(Box::new(
+            SupportReplacementSelection {
+                validation_revision_id: expected_validation_revision_id,
+                initial_payload: atom_replacement_payload(atom),
+                target_kind: ProposalTargetKind::Atom,
+                target_id: ProposalTargetId::Atom(atom.atom_id),
+                base_revision_id: atom.revision_id,
+            },
+        ))),
+        (None, Some(procedure)) => Ok(SupportReplacementLookup::Available(Box::new(
+            SupportReplacementSelection {
+                validation_revision_id: expected_validation_revision_id,
+                initial_payload: procedure_replacement_payload(procedure),
+                target_kind: ProposalTargetKind::Procedure,
+                target_id: ProposalTargetId::Procedure(procedure.procedure_id),
+                base_revision_id: procedure.revision_id,
+            },
+        ))),
+        (None, None) => Ok(SupportReplacementLookup::Unavailable {
+            reason: "support_replacement_target_unavailable",
+        }),
+        (Some(_), Some(_)) => Err(SemanticServiceError::InvalidInput),
+    }
+}
+
+pub(crate) fn select_support_deprecate(
+    snapshot: &ProjectionSnapshot,
+    expected_validation_revision_id: RevisionId,
+) -> Result<SupportDeprecateLookup, SemanticServiceError> {
+    match select_support_replacement(snapshot, expected_validation_revision_id)? {
+        SupportReplacementLookup::Available(selection) => {
+            let ProposalTargetId::Atom(atom_id) = selection.target_id else {
+                return Ok(SupportDeprecateLookup::Unavailable {
+                    reason: "support_deprecate_requires_global_atom",
+                });
+            };
+            Ok(SupportDeprecateLookup::Available(
+                SupportDeprecateSelection {
+                    validation_revision_id: selection.validation_revision_id,
+                    atom_id,
+                    base_revision_id: selection.base_revision_id,
+                },
+            ))
+        }
+        SupportReplacementLookup::Conflict {
+            current_revision_id,
+        } => Ok(SupportDeprecateLookup::Conflict {
+            current_revision_id,
+        }),
+        SupportReplacementLookup::Unavailable { reason } => {
+            Ok(SupportDeprecateLookup::Unavailable { reason })
+        }
+    }
+}
+
+pub(crate) fn compose_support_deprecate(
+    view: &SemanticCurrentView,
+    context: ProposalCommandContext,
+    selection: &SupportDeprecateSelection,
+    reason: String,
+) -> Result<ProposalResolution<RevisionProposal>, SemanticServiceError> {
+    let payload = AtomProposalPayload::Deprecate { reason };
+    payload
+        .validate()
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+    let validation_ref = selection.validation_revision_id.to_string();
+    RevisionProposalService.submit(
+        view,
+        context,
+        SubmitProposalRequest {
+            target_kind: ProposalTargetKind::Atom,
+            target_id: Some(ProposalTargetId::Atom(selection.atom_id)),
+            base_revision_id: Some(selection.base_revision_id),
+            operation: ProposalOperation::Deprecate,
+            payload: ProposalPayload::Atom(Box::new(payload)),
+            evidence_refs: vec![validation_ref.clone()],
+            source_cohort_refs: vec![validation_ref],
+            eligibility: ProposalEligibility::ManualRequired,
+            created_by: ProposalCreatedBy::User,
+        },
+    )
+}
+
+pub(crate) fn select_support_atom_acceptance(
+    snapshot: &ProjectionSnapshot,
+    proposal: &RevisionProposal,
+) -> Result<SupportAtomAcceptance, SemanticServiceError> {
+    if proposal.target_kind != ProposalTargetKind::Atom
+        || proposal.eligibility != ProposalEligibility::ManualRequired
+        || proposal.created_by != ProposalCreatedBy::User
+        || proposal.evidence_refs.len() != 1
+        || proposal.evidence_refs != proposal.source_cohort_refs
+        || !matches!(
+            (&proposal.payload, proposal.operation),
+            (ProposalPayload::Atom(payload), ProposalOperation::Replace)
+                if matches!(payload.as_ref(), AtomProposalPayload::Replace { .. })
+        ) && !matches!(
+            (&proposal.payload, proposal.operation),
+            (ProposalPayload::Atom(payload), ProposalOperation::Deprecate)
+                if matches!(payload.as_ref(), AtomProposalPayload::Deprecate { .. })
+        )
+    {
+        return Err(SemanticServiceError::UnsupportedTarget);
+    }
+    let validation_revision_id = proposal.evidence_refs[0]
+        .parse::<RevisionId>()
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+    let selection = match select_support_replacement(snapshot, validation_revision_id)? {
+        SupportReplacementLookup::Available(selection) => selection,
+        SupportReplacementLookup::Conflict { .. }
+        | SupportReplacementLookup::Unavailable { .. } => {
+            return Err(SemanticServiceError::BaseConflict);
+        }
+    };
+    let ProposalTargetId::Atom(atom_id) = selection.target_id else {
+        return Err(SemanticServiceError::UnsupportedTarget);
+    };
+    if proposal.target_id != Some(ProposalTargetId::Atom(atom_id))
+        || proposal.base_revision_id != Some(selection.base_revision_id)
+    {
+        return Err(SemanticServiceError::BaseConflict);
+    }
+    match proposal.operation {
+        ProposalOperation::Replace => selection
+            .initial_payload
+            .validate_closed_edit(&proposal.payload)
+            .map_err(|_| SemanticServiceError::InvalidInput)?,
+        ProposalOperation::Deprecate => {
+            let ProposalPayload::Atom(payload) = &proposal.payload else {
+                return Err(SemanticServiceError::UnsupportedTarget);
+            };
+            payload
+                .validate()
+                .map_err(|_| SemanticServiceError::InvalidInput)?;
+        }
+        _ => return Err(SemanticServiceError::UnsupportedTarget),
+    }
+    let support = SupportProjectionView::from_snapshot(snapshot)?;
+    let mut downstream_validations = Vec::new();
+    for (contract_id, contract) in &support.contracts {
+        if contract
+            .support_revision_refs
+            .binary_search(&selection.base_revision_id)
+            .is_err()
+        {
+            continue;
+        }
+        let current = support
+            .current_validations
+            .get(contract_id)
+            .ok_or(SemanticServiceError::InvalidInput)?;
+        downstream_validations.push(current.clone());
+    }
+    Ok(SupportAtomAcceptance {
+        validation_revision_id,
+        atom_id,
+        base_revision_id: selection.base_revision_id,
+        downstream_validations,
+    })
+}
+
+pub(crate) fn support_successor_fanout_payloads(
+    selection: &SupportAtomAcceptance,
+    config_hash: [u8; 32],
+    occurred_at_us: i64,
+) -> Result<Vec<JournalPayload>, SemanticServiceError> {
+    let mut payloads = Vec::new();
+    let trigger_refs = vec![selection.base_revision_id.to_string()];
+    for validation in &selection.downstream_validations {
+        payloads.extend(mark_support_pending(
+            validation,
+            trigger_refs.clone(),
+            config_hash,
+            occurred_at_us,
+        )?);
+    }
+    Ok(payloads)
+}
+
+pub(crate) fn compose_support_replacement(
+    view: &SemanticCurrentView,
+    context: ProposalCommandContext,
+    selection: &SupportReplacementSelection,
+    edited_payload: ProposalPayload,
+) -> Result<ProposalResolution<RevisionProposal>, SemanticServiceError> {
+    selection
+        .initial_payload
+        .validate_closed_edit(&edited_payload)
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+    let validation_ref = selection.validation_revision_id.to_string();
+    RevisionProposalService.submit(
+        view,
+        context,
+        SubmitProposalRequest {
+            target_kind: selection.target_kind,
+            target_id: Some(selection.target_id),
+            base_revision_id: Some(selection.base_revision_id),
+            operation: ProposalOperation::Replace,
+            payload: edited_payload,
+            evidence_refs: vec![validation_ref.clone()],
+            source_cohort_refs: vec![validation_ref],
+            eligibility: ProposalEligibility::ManualRequired,
+            created_by: ProposalCreatedBy::User,
+        },
+    )
+}
+
+fn atom_replacement_payload(atom: &Atom) -> ProposalPayload {
+    ProposalPayload::Atom(Box::new(AtomProposalPayload::Replace {
+        draft: AtomDraft {
+            kind: atom.kind,
+            epistemic_status: atom.epistemic_status,
+            value: atom.value.clone(),
+            scope: atom.scope.clone(),
+            applicability_expr: atom.applicability_expr.clone(),
+            future_cue_lifecycle_exprs: atom.future_cue_lifecycle_exprs.clone(),
+            validity_interval: atom.validity_interval.clone(),
+            provenance: atom.provenance.clone(),
+            source_observation_refs: atom.source_observation_refs.clone(),
+            evidence_refs: atom.evidence_refs.clone(),
+            supersedes_revision_refs: atom.supersedes_revision_refs.clone(),
+            supports_revision_refs: atom.supports_revision_refs.clone(),
+            contradicts_revision_refs: atom.contradicts_revision_refs.clone(),
+        },
+    }))
+}
+
+fn procedure_replacement_payload(procedure: &ProcedureRevision) -> ProposalPayload {
+    ProposalPayload::Procedure(Box::new(ProcedureProposalPayload::Replace {
+        draft: procedure.draft.clone(),
+    }))
+}
+
+#[derive(Default)]
+struct SupportProjectionView {
+    contracts: BTreeMap<RevisionId, GlobalSuccessorSupportContract>,
+    validations: BTreeMap<RevisionId, GlobalSupportValidationEvent>,
+    current_validations: BTreeMap<RevisionId, GlobalSupportValidationEvent>,
+    current_validation_seqs: BTreeMap<RevisionId, u64>,
+}
+
+impl SupportProjectionView {
+    fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let mut view = Self::default();
+        for row in snapshot.data_rows() {
+            if !matches!(
+                row.object_kind.as_deref(),
+                Some("global_support_contract" | "global_support_validation")
+            ) {
+                continue;
+            }
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            match payload {
+                JournalPayload::GlobalSupportContractRecorded(contract) => {
+                    if row.current_revision_id.as_deref()
+                        != Some(contract.support_contract_revision_id.to_string().as_str())
+                        || view
+                            .contracts
+                            .insert(contract.support_contract_revision_id, *contract)
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::GlobalSupportValidationRecorded(validation) => {
+                    if row.current_revision_id.as_deref()
+                        != Some(validation.validation_revision_id.to_string().as_str())
+                        || view
+                            .validations
+                            .insert(validation.validation_revision_id, (*validation).clone())
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    let replace = match view
+                        .current_validation_seqs
+                        .get(&validation.support_contract_ref)
+                    {
+                        Some(seq) if *seq == row.source_event_seq => {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                        Some(seq) => *seq < row.source_event_seq,
+                        None => true,
+                    };
+                    if replace {
+                        view.current_validation_seqs
+                            .insert(validation.support_contract_ref, row.source_event_seq);
+                        view.current_validations
+                            .insert(validation.support_contract_ref, *validation);
+                    }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        Ok(view)
+    }
+}
 
 pub(crate) fn global_atom_support_payloads(
     view: &SemanticCurrentView,

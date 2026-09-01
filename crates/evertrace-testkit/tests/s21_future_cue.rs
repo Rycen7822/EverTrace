@@ -17,8 +17,8 @@ use evertrace_domain::{
         AtomScope, AtomValue, ConstraintBinding, ConstraintExpr, ConstraintField, ConstraintState,
         ConstraintTruth, ConstraintValue, EpistemicStatus, FutureCueLifecycleExprs,
         ProposalCreatedBy, ProposalEligibility, ProposalOperation, ProposalPayload,
-        ProposalTargetId, ProposalTargetKind, SemanticQualifier, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
-        ValidityInterval, tui_acceptance_event_payload,
+        ProposalTargetId, ProposalTargetKind, RevisionProposal, SemanticQualifier,
+        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, ValidityInterval, tui_acceptance_event_payload,
     },
     work::{Task, TaskIdentityConfidence, TaskLifecycle, TaskScopeMembership},
 };
@@ -211,6 +211,51 @@ fn user_source(
     (receipt, observation)
 }
 
+fn tui_acceptance_source(
+    proposal: &RevisionProposal,
+    payload: &str,
+    scope: &ScopeFixture,
+    recorded_at_us: i64,
+) -> (SourceReceipt, SourceObservation) {
+    let label = proposal.proposal_id.as_uuid().hyphenated().to_string();
+    let (mut receipt, mut observation) = user_source(&label, payload, scope);
+    let instance =
+        SourceInstanceId::parse(format!("tui-acceptance:{}", proposal.proposal_id)).unwrap();
+    let revision = SourceRevision::parse(proposal.proposal_revision_id.to_string()).unwrap();
+    let record = SourceRecordIdentity::parse(format!(
+        "tui-accept-{}-{}",
+        proposal.proposal_id, proposal.proposal_revision_id
+    ))
+    .unwrap();
+    let observation_id = source_observation_id(&instance, &revision, &record).unwrap();
+    let receipt_id = source_receipt_id(&instance, &revision, &record).unwrap();
+    receipt.source_receipt_id = receipt_id;
+    receipt.source_observation_id = observation_id;
+    receipt.source_instance_id = instance.clone();
+    receipt.source_kind = EvidenceSourceKind::Other;
+    receipt.identity_domain = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
+    receipt.source_ref = proposal.proposal_id.to_string();
+    receipt.source_session_ref = "human-governance".into();
+    receipt.source_revision = revision.clone();
+    receipt.source_record_identity = record.clone();
+    receipt.source_sequence_origin = Some(1);
+    receipt.worktree_instance_id = None;
+    receipt.close_watermark = None;
+    receipt.adapter_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
+    receipt.eligible_event_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
+    receipt.event_time_us = 0;
+    receipt.recorded_at_us = recorded_at_us;
+    observation.source_observation_id = observation_id;
+    observation.source_instance_id = instance;
+    observation.source_revision = revision;
+    observation.source_record_identity = record;
+    observation.source_receipt_ref = receipt_id;
+    observation.correlation.adapter_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
+    receipt.validate().unwrap();
+    observation.validate().unwrap();
+    (receipt, observation)
+}
+
 fn command(at: i64, payloads: Vec<JournalPayload>) -> JournalCommand {
     JournalCommand::new(
         CommandId::new_v7(),
@@ -377,11 +422,8 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
         proposal.proposal_revision_id,
         &proposal.fingerprint,
     );
-    let (mut acceptance_receipt, acceptance_observation) =
-        user_source("acceptance", &acceptance_payload, &scope);
-    acceptance_receipt.eligible_event_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
-    acceptance_receipt.event_time_us = 0;
-    acceptance_receipt.recorded_at_us = 3;
+    let (acceptance_receipt, acceptance_observation) =
+        tui_acceptance_source(&proposal, &acceptance_payload, &scope, 3);
     writer
         .commit(
             &command(
@@ -639,11 +681,8 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
         reschedule.proposal_revision_id,
         &reschedule.fingerprint,
     );
-    let (mut reschedule_receipt, reschedule_observation) =
-        user_source("reschedule", &reschedule_payload, &scope);
-    reschedule_receipt.eligible_event_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
-    reschedule_receipt.event_time_us = 0;
-    reschedule_receipt.recorded_at_us = 6;
+    let (reschedule_receipt, reschedule_observation) =
+        tui_acceptance_source(&reschedule, &reschedule_payload, &scope, 6);
     reopened
         .commit(
             &command(
@@ -735,11 +774,8 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
         deprecation.proposal_revision_id,
         &deprecation.fingerprint,
     );
-    let (mut deprecation_receipt, deprecation_observation) =
-        user_source("deprecation", &deprecation_payload, &scope);
-    deprecation_receipt.eligible_event_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
-    deprecation_receipt.event_time_us = 0;
-    deprecation_receipt.recorded_at_us = 9;
+    let (deprecation_receipt, deprecation_observation) =
+        tui_acceptance_source(&deprecation, &deprecation_payload, &scope, 9);
     reopened
         .commit(
             &command(

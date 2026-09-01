@@ -229,8 +229,8 @@ mod controlled_projection_proof {
             source_receipt_id,
         },
         ids::{
-            CasId, ProcedureUsageId, ResultEvidenceId, SourceReceiptId, WorkBindingRevisionId,
-            WorkstreamId,
+            CasId, CompetingAttemptGroupId, IntegrationEventId, ProcedureUsageId, RequestId,
+            ResultEvidenceId, SourceReceiptId, WorkBindingRevisionId, WorkstreamId,
         },
         procedure::{
             ProcedureCorrelationState, ProcedureEligibilityEvidence, ProcedureLocalContext,
@@ -239,24 +239,26 @@ mod controlled_projection_proof {
         },
         repository::{
             FilesystemIdentity, GitObjectFormat, GitOperation, GitRegistrationState,
-            PathObservation, RepositoryInstance, SnapshotCaptureStatus, WorktreeInstance,
-            WorktreeKind, WorktreeLifecycle, WorktreeSnapshot,
+            IntegrationEvent, IntegrationKind, LineageAssessment, PathObservation,
+            RepositoryInstance, SnapshotCaptureStatus, WorktreeInstance, WorktreeKind,
+            WorktreeLifecycle, WorktreeSnapshot,
         },
         semantic::{
             EvidenceCompleteness, MetricValue, ParserReceipt, ParserStatus, ResultEvidence,
             ResultScope, VerifierReceipt, VerifierStatus,
         },
         work::{
-            AssignmentStatus, ComparisonExecutionBinding, ContractField,
-            ControlledRunSourceEnvelope, MetricDirection, MultiCasMetricPolicy, PhaseContract,
-            PhaseKind, PrimaryWorkBinding, RunContractValidity, RunExecutionStatus,
-            RunObservability, SeedPolicy, StrategyContract, Task, TaskIdentityConfidence,
-            TaskLifecycle, TaskScopeMembership, VariableDeclaration, WorkBindingRevision,
-            Workstream, WorkstreamStatus,
+            AssignmentStatus, AttemptAdoptionStatus, AttemptVerification,
+            ComparisonExecutionBinding, CompetingAttemptGroup, CompetingConflictKind,
+            CompetingResolutionStatus, ContractField, ControlledRunSourceEnvelope, MetricDirection,
+            MultiCasMetricPolicy, PhaseContract, PhaseKind, PrimaryWorkBinding,
+            RunContractValidity, RunExecutionStatus, RunObservability, SeedPolicy,
+            StrategyContract, Task, TaskIdentityConfidence, TaskLifecycle, TaskScopeMembership,
+            VariableDeclaration, WorkBindingRevision, Workstream, WorkstreamStatus,
         },
     };
     use evertrace_engine::{
-        EvidenceIngestor,
+        EvidenceIngestor, HumanActionOutcome, HumanGovernanceService, HumanSurface,
         autoresearch::{
             AutoresearchCommandContext, ControlledRunCommand, ControlledRunRequest,
             ControlledRunResolver, RunCreateInput, create_experiment_run,
@@ -277,7 +279,8 @@ mod controlled_projection_proof {
         },
     };
     use evertrace_store::{
-        JournalPayload, ObjectRow, ObjectRowKind, ProjectionSnapshot, SemanticCurrentView,
+        AttemptCurrentView, JournalPayload, ObjectRow, ObjectRowKind, ProjectionSnapshot,
+        SemanticCurrentView, SourceKind,
     };
     use std::path::Path;
 
@@ -2326,8 +2329,237 @@ mod controlled_projection_proof {
             ]
         );
         drop(writer);
-        let reopened = JournalWriter::open(&store_root).await.unwrap();
+        let mut reopened = JournalWriter::open(&store_root).await.unwrap();
         assert_eq!(reopened.project().await.unwrap(), incremental);
+
+        let group_id = CompetingAttemptGroupId::new_v7();
+        let current =
+            AttemptCurrentView::from_snapshot(&reopened.project().await.unwrap()).unwrap();
+        let mut winner = current.attempts[&attempts[0].attempt_id].clone();
+        let mut other = current.attempts[&attempts[1].attempt_id].clone();
+        for attempt in [&mut winner, &mut other] {
+            let predecessor = attempt.clone();
+            attempt.revision_id = RevisionId::new_v7();
+            attempt.predecessor_revision_id = Some(predecessor.revision_id);
+            attempt.revision_generation += 1;
+            attempt.competing_group_ids.push(group_id);
+            attempt.competing_group_ids.sort();
+            attempt.source_watermark = reopened.frontier() + 1;
+            predecessor.validate_successor(attempt).unwrap();
+        }
+        winner.adoption_status = AttemptAdoptionStatus::Selected;
+        current.attempts[&attempts[0].attempt_id]
+            .validate_successor(&winner)
+            .unwrap();
+        let mut member_attempt_ids = vec![winner.attempt_id, other.attempt_id];
+        member_attempt_ids.sort();
+        let group = CompetingAttemptGroup {
+            competing_group_id: group_id,
+            revision_id: RevisionId::new_v7(),
+            predecessor_revision_id: None,
+            revision_generation: 1,
+            task_id: task.task_id,
+            decision_boundary_ref: "decision:s31-controlled".into(),
+            comparison_contract_ref: Some("comparison:s27-controlled".into()),
+            origin_workstream_id: Some(stream.workstream_id),
+            origin_episode_id: None,
+            member_workstream_ids: vec![stream.workstream_id],
+            member_attempt_ids,
+            candidate_snapshot_refs: Vec::new(),
+            target_refs: vec!["target:s27-controlled".into()],
+            conflict_kind: CompetingConflictKind::AlternativeStrategy,
+            resolution_status: CompetingResolutionStatus::Open,
+            selected_attempt_id: None,
+            partially_integrated_attempt_ids: Vec::new(),
+            resolution_evidence_refs: Vec::new(),
+            source_watermark: reopened.frontier() + 1,
+        };
+        group.validate().unwrap();
+        reopened
+            .commit(
+                &journal_command(
+                    150,
+                    vec![
+                        JournalPayload::AttemptRecorded(Box::new(winner.clone())),
+                        JournalPayload::AttemptRecorded(Box::new(other)),
+                        JournalPayload::CompetingAttemptGroupRecorded(Box::new(group.clone())),
+                    ],
+                ),
+                150,
+            )
+            .await
+            .unwrap();
+
+        let integration_id = IntegrationEventId::new_v7();
+        let integration = IntegrationEvent {
+            integration_event_id: integration_id,
+            repository_instance_id: repository_id,
+            source_worktree_instance_id: worktree_id,
+            source_snapshot_id: snapshot_id,
+            destination_worktree_instance_id: worktree_id,
+            destination_snapshot_id: snapshot_id,
+            kind: IntegrationKind::ManualPatch,
+            commit_refs: Vec::new(),
+            patch_equivalence_refs: vec![evidence_receipt_id.to_string()],
+            conflict_resolution_detected: false,
+            integrated_attempt_ids: vec![winner.attempt_id],
+            revalidated_anchor_refs: Vec::new(),
+            evidence_refs: vec![evidence_receipt_id.to_string()],
+            assessment: LineageAssessment::Proven,
+        };
+        integration.validate().unwrap();
+        let selected = winner.clone();
+        winner.revision_id = RevisionId::new_v7();
+        winner.predecessor_revision_id = Some(selected.revision_id);
+        winner.revision_generation += 1;
+        winner.adoption_status = AttemptAdoptionStatus::Integrated;
+        winner.verification = AttemptVerification::Passed;
+        winner.integration_event_refs.push(integration_id);
+        winner.integration_event_refs.sort();
+        winner
+            .parent_verification_refs
+            .push(completed[0].1.result_evidence_id.to_string());
+        winner.parent_verification_refs.sort();
+        winner.source_watermark = reopened.frontier() + 1;
+        selected.validate_successor(&winner).unwrap();
+        reopened
+            .commit(
+                &journal_command(
+                    151,
+                    vec![
+                        JournalPayload::IntegrationEventRecorded(Box::new(integration)),
+                        JournalPayload::AttemptRecorded(Box::new(winner.clone())),
+                    ],
+                ),
+                151,
+            )
+            .await
+            .unwrap();
+        let writer = reopened;
+        let (handle, task_handle) = spawn_writer(writer, 8).unwrap();
+        let service = HumanGovernanceService::new(handle.clone(), [27; 32]);
+        let page = service
+            .list(HumanSurface::Inbox, None, None, 64)
+            .await
+            .unwrap()
+            .unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.object_ref.as_deref() == Some(group_id.to_string().as_str()))
+            .unwrap();
+        let detail = service
+            .detail(
+                HumanSurface::Inbox,
+                &item.stable_key,
+                page.frontier,
+                item.revision_ref.as_deref(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.items[0]
+                .competing_detail
+                .as_ref()
+                .unwrap()
+                .eligible_attempt_ids,
+            vec![winner.attempt_id]
+        );
+        let request_id = RequestId::new_v7();
+        let first = service
+            .resolve_competing_selected(
+                request_id,
+                page.frontier,
+                group.revision_id,
+                winner.attempt_id,
+            )
+            .await
+            .unwrap();
+        let (selected_revision_ref, audit_event_ref) = match &first {
+            HumanActionOutcome::Applied {
+                current_revision_ref,
+                audit_event_ref,
+            } => (current_revision_ref.clone(), audit_event_ref.clone()),
+            _ => panic!("eligible competing winner must be selected"),
+        };
+        let committed = handle
+            .committed_command(CommandId::from_uuid(request_id.as_uuid()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.payloads.len(), 1);
+        assert_eq!(committed.event_ids, vec![audit_event_ref.clone()]);
+        let JournalPayload::CompetingAttemptGroupRecorded(selected_group) = &committed.payloads[0]
+        else {
+            panic!("selected command must contain one group successor")
+        };
+        let mut expected_evidence_refs = vec![
+            integration_id.to_string(),
+            completed[0].1.result_evidence_id.to_string(),
+        ];
+        expected_evidence_refs.sort();
+        assert_eq!(
+            selected_group.resolution_evidence_refs,
+            expected_evidence_refs
+        );
+        let selected_frontier = handle.project().await.unwrap().frontier;
+        assert_eq!(
+            service
+                .resolve_competing_selected(
+                    request_id,
+                    page.frontier,
+                    group.revision_id,
+                    winner.attempt_id,
+                )
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(handle.project().await.unwrap().frontier, selected_frontier);
+        handle.shutdown().await.unwrap();
+        task_handle.await.unwrap().unwrap();
+
+        let reopened = JournalWriter::open(&store_root).await.unwrap();
+        let journal_rows = reopened.journal_rows().await.unwrap().len();
+        let (reopened_handle, reopened_task) = spawn_writer(reopened, 8).unwrap();
+        let reopened_service = HumanGovernanceService::new(reopened_handle.clone(), [27; 32]);
+        assert_eq!(
+            reopened_service
+                .resolve_competing_selected(
+                    request_id,
+                    page.frontier,
+                    group.revision_id,
+                    winner.attempt_id,
+                )
+                .await
+                .unwrap(),
+            HumanActionOutcome::Applied {
+                current_revision_ref: selected_revision_ref,
+                audit_event_ref: audit_event_ref.clone(),
+            }
+        );
+        let reopened_snapshot = reopened_handle.project().await.unwrap();
+        assert_eq!(reopened_snapshot.frontier, selected_frontier);
+        assert_eq!(
+            AttemptCurrentView::from_snapshot(&reopened_snapshot)
+                .unwrap()
+                .competing_groups[&group_id]
+                .resolution_status,
+            CompetingResolutionStatus::Selected
+        );
+        reopened_handle.shutdown().await.unwrap();
+        reopened_task.await.unwrap().unwrap();
+        let final_writer = JournalWriter::open(&store_root).await.unwrap();
+        let final_rows = final_writer.journal_rows().await.unwrap();
+        assert_eq!(final_rows.len(), journal_rows);
+        assert!(final_rows.iter().any(|row| {
+            row.event_id == audit_event_ref && row.source_kind == SourceKind::Manual
+        }));
+        assert_eq!(
+            final_writer.project().await.unwrap(),
+            final_writer.full_projection().await.unwrap()
+        );
     }
 
     #[tokio::test]

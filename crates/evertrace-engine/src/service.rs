@@ -3,9 +3,11 @@ use thiserror::Error;
 
 mod actions;
 mod binding;
+mod human_governance;
 mod scope;
 pub use actions::*;
 pub use binding::*;
+pub use human_governance::*;
 pub use scope::McpQueryAnchor;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

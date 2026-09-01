@@ -11,7 +11,7 @@ use evertrace_domain::{
     semantic::{
         AcceptedProposalTarget, AtomScope, ConstraintState, ConstraintTruth, GlobalSupportState,
         ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalEligibility,
-        ProposalPayload, ProposalTargetId, ProposalTargetKind,
+        ProposalPayload, ProposalTargetId, ProposalTargetKind, RevisionProposal,
     },
 };
 use evertrace_store::{
@@ -20,8 +20,8 @@ use evertrace_store::{
 
 use crate::semantic::{
     AtomAcceptanceContext, ProposalAcceptanceAudit, ProposalCommandContext, SemanticServiceError,
-    accepted_proposal_successor, accepted_proposal_successor_with_audit, global_support_payloads,
-    validate_current_support_refs,
+    accepted_edited_proposal_successor, accepted_proposal_successor,
+    accepted_proposal_successor_with_audit, global_support_payloads, validate_current_support_refs,
 };
 
 const S24_ALGORITHM: &str = "s24-procedure-v1";
@@ -33,9 +33,23 @@ pub enum ProcedureAcceptanceContext {
     AutoFull(ProcedureEligibilityEvidence),
 }
 
+pub(crate) struct EditedProcedureAcceptance<'a> {
+    pub(crate) source: AtomAcceptanceContext,
+    pub(crate) original: &'a RevisionProposal,
+}
+
+enum ProcedureAcceptanceInput<'a> {
+    Standard(ProcedureAcceptanceContext),
+    Edited(EditedProcedureAcceptance<'a>),
+}
+
 #[derive(Debug)]
 pub enum ProcedureAcceptanceResolution {
     NoDelta,
+    AcceptedExisting {
+        proposal: Box<evertrace_domain::semantic::RevisionProposal>,
+        command: JournalCommand,
+    },
     Command {
         proposal: Box<evertrace_domain::semantic::RevisionProposal>,
         procedure: Box<ProcedureRevision>,
@@ -54,10 +68,60 @@ pub fn accept_procedure(
     current_publication: Option<ProcedurePublicationState>,
     global_config: &GlobalPromotionConfig,
 ) -> Result<ProcedureAcceptanceResolution, SemanticServiceError> {
+    accept_procedure_inner(
+        view,
+        context,
+        proposal_id,
+        current,
+        current_publication,
+        global_config,
+        ProcedureAcceptanceInput::Standard(acceptance_context),
+    )
+}
+
+pub(crate) fn accept_procedure_edited(
+    view: &SemanticCurrentView,
+    context: ProposalCommandContext,
+    proposal_id: evertrace_domain::ids::RevisionProposalId,
+    acceptance: EditedProcedureAcceptance<'_>,
+    current: Option<&ProcedureRevision>,
+    current_publication: Option<ProcedurePublicationState>,
+    global_config: &GlobalPromotionConfig,
+) -> Result<ProcedureAcceptanceResolution, SemanticServiceError> {
+    accept_procedure_inner(
+        view,
+        context,
+        proposal_id,
+        current,
+        current_publication,
+        global_config,
+        ProcedureAcceptanceInput::Edited(acceptance),
+    )
+}
+
+fn accept_procedure_inner(
+    view: &SemanticCurrentView,
+    context: ProposalCommandContext,
+    proposal_id: evertrace_domain::ids::RevisionProposalId,
+    current: Option<&ProcedureRevision>,
+    current_publication: Option<ProcedurePublicationState>,
+    global_config: &GlobalPromotionConfig,
+    acceptance: ProcedureAcceptanceInput<'_>,
+) -> Result<ProcedureAcceptanceResolution, SemanticServiceError> {
+    let (acceptance_context, edit_original) = match acceptance {
+        ProcedureAcceptanceInput::Standard(context) => (context, None),
+        ProcedureAcceptanceInput::Edited(edited) => (
+            ProcedureAcceptanceContext::Manual(edited.source),
+            Some(edited.original),
+        ),
+    };
     let proposal = view
         .proposals
         .get(&proposal_id)
         .ok_or(SemanticServiceError::InvalidInput)?;
+    if edit_original.is_some_and(|original| original.validate_edit_candidate(proposal).is_err()) {
+        return Err(SemanticServiceError::InvalidInput);
+    }
     if proposal.target_kind != ProposalTargetKind::Procedure || !proposal.status.is_open() {
         return Err(SemanticServiceError::UnsupportedTarget);
     }
@@ -96,7 +160,67 @@ pub fn accept_procedure(
                 return Err(SemanticServiceError::BaseConflict);
             }
             if current.draft == *draft {
-                return Ok(ProcedureAcceptanceResolution::NoDelta);
+                if !matches!(
+                    publication,
+                    ProcedurePublicationState::ActiveProbationary
+                        | ProcedurePublicationState::ActiveStable
+                ) {
+                    return Err(SemanticServiceError::BaseConflict);
+                }
+                let ProcedureAcceptanceContext::Manual(manual) = acceptance_context else {
+                    return Ok(ProcedureAcceptanceResolution::NoDelta);
+                };
+                let ProposalAcceptanceAuthority::TuiAcceptance {
+                    authorized_scope_ceiling,
+                    ..
+                } = manual.authority_basis()?
+                else {
+                    return Err(SemanticServiceError::InvalidInput);
+                };
+                if !authorized_scope_ceiling.contains(&scope_as_atom(draft.scope)) {
+                    return Err(SemanticServiceError::InvalidInput);
+                }
+                let accepted_target = AcceptedProposalTarget::Procedure {
+                    procedure_id: current.procedure_id,
+                    procedure_revision_id: current.revision_id,
+                    auto_full_audit: None,
+                };
+                let (accepted, payloads) = if let Some(original) = edit_original {
+                    accepted_edited_proposal_successor(
+                        original,
+                        proposal,
+                        &context,
+                        &manual,
+                        RevisionId::new_v7(),
+                        accepted_target,
+                    )?
+                } else {
+                    accepted_proposal_successor(
+                        proposal,
+                        &context,
+                        &manual,
+                        RevisionId::new_v7(),
+                        accepted_target,
+                    )?
+                };
+                let command = JournalCommand::new(
+                    context.command_id,
+                    payloads
+                        .into_iter()
+                        .map(|payload| {
+                            JournalEventDraft::runtime(
+                                context.occurred_at_us,
+                                context.effective_config_hash,
+                                S24_ALGORITHM,
+                                payload,
+                            )
+                        })
+                        .collect(),
+                )?;
+                return Ok(ProcedureAcceptanceResolution::AcceptedExisting {
+                    proposal: Box::new(accepted),
+                    command,
+                });
             }
             (
                 current.procedure_id,
@@ -131,17 +255,29 @@ pub fn accept_procedure(
             if !authorized_scope_ceiling.contains(&scope_as_atom(draft.scope)) {
                 return Err(SemanticServiceError::InvalidInput);
             }
-            accepted_proposal_successor(
-                proposal,
-                &context,
-                &manual,
-                RevisionId::new_v7(),
-                AcceptedProposalTarget::Procedure {
-                    procedure_id,
-                    procedure_revision_id: revision_id,
-                    auto_full_audit: None,
-                },
-            )?
+            let accepted_target = AcceptedProposalTarget::Procedure {
+                procedure_id,
+                procedure_revision_id: revision_id,
+                auto_full_audit: None,
+            };
+            if let Some(original) = edit_original {
+                accepted_edited_proposal_successor(
+                    original,
+                    proposal,
+                    &context,
+                    &manual,
+                    RevisionId::new_v7(),
+                    accepted_target,
+                )?
+            } else {
+                accepted_proposal_successor(
+                    proposal,
+                    &context,
+                    &manual,
+                    RevisionId::new_v7(),
+                    accepted_target,
+                )?
+            }
         }
         ProcedureAcceptanceContext::AutoFull(evidence) => {
             let global = matches!(draft.scope, ProcedureScope::Global);

@@ -1,0 +1,20 @@
+EverTrace  Inbox / Explorer / System
+┌Inbox─────────────────────────────────────────────────────┐
+│proposal / revision_proposal_revision                     │
+│projection frontier: 9                                    │
+│family: RevisionProposal  class: Object                   │
+│object: proposal:01900000-0000-7000-8000-000000000031     │
+│revision: 01900000-0000-7000-8000-000000000032            │
+│lifecycle: pending                                        │
+│epistemic: -                                              │
+│authority: -                                              │
+│publication/support: -/-                                  │
+│scope: -                                                  │
+│source event: 9                                           │
+│audit row: proposal-row                                   │
+│daemon: Degraded [CurrentJobFailed]                       │
+│target: Atom None                                         │
+│operation/base: Create -                                  │
+└──────────────────────────────────────────────────────────┘
+● connected pending:0
+Esc back  j/k scroll  o related  n next page  b first page

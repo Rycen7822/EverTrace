@@ -14,7 +14,7 @@ pub mod spool;
 
 pub use admission::{
     CaptureAdmissionState, CaptureError, CaptureOutcome, CaptureRecordInput, CaptureRuntime,
-    DurableRecoveryPreflight,
+    DurableRecoveryPreflight, IsolatedCaptureOutcome,
 };
 pub use cas::{CasDigest, CasError, CasStore};
 pub use confined_read::{

@@ -10,10 +10,11 @@ use fs2::FileExt;
 use lancedb::{Connection, Table};
 
 use crate::{
-    command::{CommitOutcome, JournalCommand, StoreError, prepare_command},
+    command::{CommitOutcome, JournalCommand, JournalPayload, StoreError, prepare_command},
     journal::{
         JOURNAL_TABLE, append_rows, read_all_journal_rows, read_command_rows,
-        read_journal_frontier, replay_outcome, rows_for_append, validate_journal_table,
+        read_journal_frontier, replay_outcome, rows_for_append, validate_complete_command,
+        validate_journal_table,
     },
     migrations::{L0002, MigrationOutcome},
     objects::{OBJECTS_TABLE, read_object_rows, validate_objects_table},
@@ -25,6 +26,13 @@ use crate::{
     relations::RELATIONS_TABLE,
     search::SEARCH_TABLE,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedCommand {
+    pub command_id: evertrace_domain::ids::CommandId,
+    pub event_ids: Vec<String>,
+    pub payloads: Vec<JournalPayload>,
+}
 
 #[derive(Debug)]
 pub struct SiblingWriterLock {
@@ -196,6 +204,28 @@ impl JournalWriter {
     ) -> Result<CommitOutcome, StoreError> {
         self.commit_inner(command, ingested_at_us, Some(expected_frontier))
             .await
+    }
+
+    pub async fn committed_command(
+        &self,
+        command_id: evertrace_domain::ids::CommandId,
+    ) -> Result<Option<CommittedCommand>, StoreError> {
+        let mut rows = read_command_rows(&self.journal, command_id).await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        validate_complete_command(&rows)?;
+        rows.sort_by_key(|row| row.ordinal);
+        let event_ids = rows.iter().map(|row| row.event_id.clone()).collect();
+        let payloads = rows
+            .iter()
+            .map(|row| row.payload())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(CommittedCommand {
+            command_id,
+            event_ids,
+            payloads,
+        }))
     }
 
     async fn commit_inner(
@@ -569,6 +599,14 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.first_seq, first_seq);
         assert_eq!(replay.last_seq, first_seq);
+        let inspected = reopened
+            .committed_command(command.command_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.command_id, command.command_id());
+        assert_eq!(inspected.event_ids, replay.event_ids);
+        assert_eq!(inspected.payloads.len(), 1);
         assert_eq!(reopened.journal_rows().await.unwrap().len(), 3);
     }
 

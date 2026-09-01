@@ -15,6 +15,7 @@ const MAX_SPLIT_OUTPUTS: usize = 16;
 const MAX_REVIEW_TEXT: usize = 2048;
 
 pub const TUI_ACCEPTANCE_EVENT_MANIFEST_REF: &str = "evertrace_tui_acceptance_v1";
+const PROPOSAL_EDIT_INTENT_SCHEMA_VERSION: u32 = 1;
 
 pub fn tui_acceptance_event_payload(
     proposal_id: RevisionProposalId,
@@ -220,6 +221,14 @@ pub enum CoreMembershipProposalPayload {
 }
 
 impl ProposalPayload {
+    pub fn validate_closed_edit(&self, edited: &Self) -> Result<(), SemanticError> {
+        if valid_closed_edit(self, edited) {
+            Ok(())
+        } else {
+            Err(SemanticError::InvalidProposal)
+        }
+    }
+
     fn validate(&self, target_kind: ProposalTargetKind) -> Result<(), SemanticError> {
         match (target_kind, self) {
             (ProposalTargetKind::Atom, Self::Atom(payload)) => payload.validate(),
@@ -403,7 +412,99 @@ pub struct RevisionProposal {
     pub reviewed_at_us: Option<i64>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClosedProposalEditIntent {
+    schema_version: u32,
+    original_proposal_id: RevisionProposalId,
+    original_proposal_revision_id: RevisionId,
+    original_fingerprint: [u8; 32],
+    new_proposal: RevisionProposal,
+}
+
+impl ClosedProposalEditIntent {
+    fn new(original: &RevisionProposal, new_proposal: RevisionProposal) -> Self {
+        Self {
+            schema_version: PROPOSAL_EDIT_INTENT_SCHEMA_VERSION,
+            original_proposal_id: original.proposal_id,
+            original_proposal_revision_id: original.proposal_revision_id,
+            original_fingerprint: original.fingerprint,
+            new_proposal,
+        }
+    }
+
+    fn validate(&self, original: &RevisionProposal) -> Result<(), SemanticError> {
+        original.validate()?;
+        self.new_proposal.validate()?;
+        if self.schema_version != PROPOSAL_EDIT_INTENT_SCHEMA_VERSION
+            || self.original_proposal_id != original.proposal_id
+            || self.original_proposal_revision_id != original.proposal_revision_id
+            || self.original_fingerprint != original.fingerprint
+            || !original.status.is_open()
+            || self.new_proposal.proposal_id == original.proposal_id
+            || self.new_proposal.proposal_revision_id == original.proposal_revision_id
+            || self.new_proposal.parent_proposal_revision_id.is_some()
+            || !matches!(
+                self.new_proposal.target_kind,
+                ProposalTargetKind::Atom | ProposalTargetKind::Procedure
+            )
+            || self.new_proposal.target_kind != original.target_kind
+            || self.new_proposal.target_id != original.target_id
+            || self.new_proposal.base_revision_id != original.base_revision_id
+            || self.new_proposal.operation != original.operation
+            || self.new_proposal.evidence_refs != original.evidence_refs
+            || self.new_proposal.source_cohort_refs != original.source_cohort_refs
+            || self.new_proposal.source_cohort_hash != original.source_cohort_hash
+            || self.new_proposal.eligibility != ProposalEligibility::ManualRequired
+            || self.new_proposal.status != ProposalStatus::Pending
+            || !self.new_proposal.waiting_on.is_empty()
+            || self.new_proposal.review_reason.is_some()
+            || self.new_proposal.created_by != ProposalCreatedBy::User
+            || self.new_proposal.acceptance.is_some()
+            || self.new_proposal.reviewed_at_us.is_some()
+            || self.new_proposal.fingerprint == original.fingerprint
+            || original
+                .payload
+                .validate_closed_edit(&self.new_proposal.payload)
+                .is_err()
+        {
+            return Err(SemanticError::InvalidProposal);
+        }
+        Ok(())
+    }
+
+    fn canonical_toml(&self) -> Result<String, SemanticError> {
+        toml::to_string(self).map_err(|_| SemanticError::InvalidProposal)
+    }
+
+    fn from_toml(value: &str) -> Result<Self, SemanticError> {
+        toml::from_str(value).map_err(|_| SemanticError::InvalidProposal)
+    }
+}
+
 impl RevisionProposal {
+    pub fn validate_edit_candidate(&self, new_proposal: &Self) -> Result<(), SemanticError> {
+        ClosedProposalEditIntent::new(self, new_proposal.clone()).validate(self)
+    }
+
+    pub fn edit_intent_toml(&self, new_proposal: &Self) -> Result<String, SemanticError> {
+        let intent = ClosedProposalEditIntent::new(self, new_proposal.clone());
+        intent.validate(self)?;
+        intent.canonical_toml()
+    }
+
+    pub fn parse_edit_intent_toml(
+        value: &str,
+    ) -> Result<(RevisionProposalId, RevisionId, [u8; 32], RevisionProposal), SemanticError> {
+        let intent = ClosedProposalEditIntent::from_toml(value)?;
+        Ok((
+            intent.original_proposal_id,
+            intent.original_proposal_revision_id,
+            intent.original_fingerprint,
+            intent.new_proposal,
+        ))
+    }
+
     pub fn validate(&self) -> Result<(), SemanticError> {
         self.payload.validate(self.target_kind)?;
         if self.created_at_us < 0
@@ -659,6 +760,69 @@ impl RevisionProposal {
 
 fn valid_review_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_REVIEW_TEXT && !value.contains('\0')
+}
+
+fn valid_closed_edit(original: &ProposalPayload, edited: &ProposalPayload) -> bool {
+    match (original, edited) {
+        (ProposalPayload::Atom(original), ProposalPayload::Atom(edited)) => {
+            valid_atom_edit(original, edited)
+        }
+        (ProposalPayload::Procedure(original), ProposalPayload::Procedure(edited)) => {
+            valid_procedure_edit(original, edited)
+        }
+        _ => false,
+    }
+}
+
+fn valid_atom_edit(original: &AtomProposalPayload, edited: &AtomProposalPayload) -> bool {
+    match (original, edited) {
+        (
+            AtomProposalPayload::Create { draft: original },
+            AtomProposalPayload::Create { draft: edited },
+        )
+        | (
+            AtomProposalPayload::Replace { draft: original },
+            AtomProposalPayload::Replace { draft: edited },
+        )
+        | (
+            AtomProposalPayload::Reclassify { draft: original },
+            AtomProposalPayload::Reclassify { draft: edited },
+        ) => {
+            original != edited
+                && original.value.critical_revision_refs == edited.value.critical_revision_refs
+                && original.provenance == edited.provenance
+                && original.source_observation_refs == edited.source_observation_refs
+                && original.evidence_refs == edited.evidence_refs
+                && original.supersedes_revision_refs == edited.supersedes_revision_refs
+                && original.supports_revision_refs == edited.supports_revision_refs
+                && original.contradicts_revision_refs == edited.contradicts_revision_refs
+        }
+        (
+            AtomProposalPayload::Deprecate { reason: original },
+            AtomProposalPayload::Deprecate { reason: edited },
+        ) => original != edited,
+        _ => false,
+    }
+}
+
+fn valid_procedure_edit(
+    original: &ProcedureProposalPayload,
+    edited: &ProcedureProposalPayload,
+) -> bool {
+    let (original, edited) = match (original, edited) {
+        (
+            ProcedureProposalPayload::Create { draft: original },
+            ProcedureProposalPayload::Create { draft: edited },
+        )
+        | (
+            ProcedureProposalPayload::Replace { draft: original },
+            ProcedureProposalPayload::Replace { draft: edited },
+        ) => (original, edited),
+        _ => return false,
+    };
+    original != edited
+        && original.evidence_refs == edited.evidence_refs
+        && original.support_revision_refs == edited.support_revision_refs
 }
 
 fn strictly_sorted<T: Ord>(values: &[T]) -> bool {

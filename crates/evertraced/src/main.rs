@@ -4,7 +4,20 @@
 use std::{env, fs, path::PathBuf, sync::Arc};
 
 use evertrace_engine::{
-    BackgroundScheduler, EngineService, HealthDispatchError, McpActionService, McpBindingAuthority,
+    BackgroundScheduler, EngineService, HealthDispatchError,
+    HumanActionOutcome as EngineHumanActionOutcome,
+    HumanCompetingDetail as EngineHumanCompetingDetail,
+    HumanExecutionIntegrityDetail as EngineHumanExecutionIntegrityDetail, HumanGovernanceError,
+    HumanGovernanceService, HumanItemCategory as EngineHumanItemCategory,
+    HumanJobDetail as EngineHumanJobDetail, HumanJobState as EngineHumanJobState,
+    HumanJobTerminalReason as EngineHumanJobTerminalReason,
+    HumanNegativeDecision as EngineHumanNegativeDecision,
+    HumanObjectFamily as EngineHumanObjectFamily,
+    HumanProposalDecision as EngineHumanProposalDecision,
+    HumanRecoveryDetail as EngineHumanRecoveryDetail, HumanRelatedRequest,
+    HumanRelationKind as EngineHumanRelationKind, HumanRowClass as EngineHumanRowClass,
+    HumanSupportDetail as EngineHumanSupportDetail, HumanSurface as EngineHumanSurface,
+    HumanSystemDetail as EngineHumanSystemDetail, McpActionService, McpBindingAuthority,
     McpBindingIssue, McpServiceAction, McpServiceRequest, McpServiceResult, McpServiceStatus,
     RecallCueOutcome, RecallCueService, RecoveryActionOutcome, RecoveryActionService,
     RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService, RecoveryError,
@@ -21,7 +34,17 @@ use evertrace_engine::{
 use evertrace_protocol::{
     LocalServer, ServerOptions,
     command::{Command as ProtocolCommand, RecallCueCommand, SessionImportAdminAction},
-    dto::{ClientKind, HealthMode, PROTOCOL_VERSION},
+    dto::{
+        ClientKind, HealthMode, HumanActionRequest, HumanActionResult, HumanActionStatus,
+        HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail,
+        HumanGovernanceRequest, HumanGovernanceResponse, HumanItemCategory, HumanItemKind,
+        HumanJobBudget, HumanJobDetail, HumanJobState, HumanJobTerminalReason,
+        HumanNegativeReviewMetadata, HumanObjectFamily, HumanProposalMetadata, HumanProposalReview,
+        HumanReadRequest, HumanRecoveryDetail, HumanRecoveryOmissionCount, HumanRelationKind,
+        HumanRowClass, HumanSnapshotItem, HumanSnapshotStatus, HumanSupportDetail, HumanSurface,
+        HumanSystemDetail, HumanWorktreeDetail, NegativeReviewDecision, PROTOCOL_VERSION,
+        ProposalHumanDecision,
+    },
     envelope::{McpItem, McpItems, McpResultEnvelope, McpStatus},
     error::ErrorCode,
     resolve_data_dir,
@@ -76,6 +99,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_snapshot.clone(),
         Arc::clone(&current_session_catalog_report),
     )?;
+    let human_governance = HumanGovernanceService::with_acceptance(
+        writer_handle.clone(),
+        runtime_snapshot.effective_config_hash,
+        runtime_snapshot.clone(),
+        engine.effective_config().config().global_promotion.clone(),
+    );
+    human_governance.reconcile_reserved_once().await?;
     let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
     let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
     let scheduler = BackgroundScheduler::new(
@@ -133,6 +163,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let handler_mcp_service = mcp_service;
     let handler_session_catalog_report = Arc::clone(&current_session_catalog_report);
     let handler_session_import_admin = session_import_admin;
+    let handler_human_governance = human_governance;
     let handler_session_import_wakeup = session_import_wakeup_tx.clone();
     let mut task = tokio::spawn(server.run_dispatch_with_context(
         shutdown_rx,
@@ -145,6 +176,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let recall_cue_service = recall_cue_service.clone();
             let session_catalog_report = Arc::clone(&handler_session_catalog_report);
             let session_import_admin = handler_session_import_admin.clone();
+            let human_governance = handler_human_governance.clone();
             let session_import_wakeup = handler_session_import_wakeup.clone();
             async move {
                 match command {
@@ -179,6 +211,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     ProtocolCommand::RequestRecovery(request) => {
+                        if context.client_kind != ClientKind::Cli {
+                            return Err(ErrorCode::Untrusted);
+                        }
                         let result = recovery_action_service
                             .handle(RecoveryRequest {
                                 request_id,
@@ -302,6 +337,247 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 SessionImportAdminResponse::NoDelta
                             }
                         }))
+                    }
+                    ProtocolCommand::HumanGovernance(command) => {
+                        if context.client_kind != ClientKind::Cli {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        if !command.validate() {
+                            return Err(ErrorCode::InvalidInput);
+                        }
+                        let response = match command {
+                            HumanGovernanceRequest::Read { request } => match request {
+                                HumanReadRequest::List {
+                                    surface,
+                                    expected_frontier,
+                                    after,
+                                    limit,
+                                } => match human_governance
+                                    .list(
+                                        map_human_surface(surface),
+                                        expected_frontier,
+                                        after.as_deref(),
+                                        limit,
+                                    )
+                                    .await
+                                    .map_err(map_human_error)?
+                                {
+                                    Ok(page) => map_human_page(page),
+                                    Err(current_frontier) => {
+                                        HumanGovernanceResponse::Conflict {
+                                            current_frontier,
+                                            current_revision_ref: None,
+                                        }
+                                    }
+                                },
+                                HumanReadRequest::Detail {
+                                    surface,
+                                    object_ref,
+                                    expected_frontier,
+                                    expected_revision_ref,
+                                } => match human_governance
+                                        .detail(
+                                            map_human_surface(surface),
+                                            &object_ref,
+                                            expected_frontier,
+                                            expected_revision_ref.as_deref(),
+                                        )
+                                        .await
+                                        .map_err(map_human_error)?
+                                    {
+                                        Ok(page) => map_human_page(page),
+                                        Err((current_frontier, current_revision_ref)) => {
+                                            HumanGovernanceResponse::Conflict {
+                                                current_frontier,
+                                                current_revision_ref,
+                                            }
+                                        }
+                                    },
+                                HumanReadRequest::Related {
+                                    relation,
+                                    source_stable_key,
+                                    expected_source_revision_ref,
+                                    expected_frontier,
+                                    after,
+                                    limit,
+                                } => match human_governance
+                                    .related(HumanRelatedRequest {
+                                        relation: match relation {
+                                            HumanRelationKind::ProposalEvidence => {
+                                                EngineHumanRelationKind::ProposalEvidence
+                                            }
+                                            HumanRelationKind::SupportDependencies => {
+                                                EngineHumanRelationKind::SupportDependencies
+                                            }
+                                        },
+                                        source_stable_key: &source_stable_key,
+                                        expected_source_revision_ref: &expected_source_revision_ref,
+                                        expected_frontier,
+                                        after: after.as_deref(),
+                                        limit,
+                                    })
+                                    .await
+                                    .map_err(map_human_error)?
+                                {
+                                    Ok(page) => map_human_page(page),
+                                    Err((current_frontier, current_revision_ref)) => {
+                                        HumanGovernanceResponse::Conflict {
+                                            current_frontier,
+                                            current_revision_ref,
+                                        }
+                                    }
+                                },
+                            },
+                            HumanGovernanceRequest::Act {
+                                expected_frontier,
+                                action,
+                            } => {
+                                let outcome = match action {
+                                    HumanActionRequest::Proposal {
+                                        proposal_id,
+                                        expected_revision_id,
+                                        expected_fingerprint,
+                                        decision,
+                                        edited_payload,
+                                    } => {
+                                        let decision = match (decision, edited_payload) {
+                                            (ProposalHumanDecision::Accept, None) => {
+                                                Ok(EngineHumanProposalDecision::Accept)
+                                            }
+                                            (
+                                                ProposalHumanDecision::EditAndAccept,
+                                                Some(payload),
+                                            ) => Ok(EngineHumanProposalDecision::EditAndAccept(
+                                                payload,
+                                            )),
+                                            (ProposalHumanDecision::MergeAndAccept, None) => {
+                                                Ok(EngineHumanProposalDecision::MergeAndAccept)
+                                            }
+                                            (ProposalHumanDecision::Defer, None) => {
+                                                Ok(EngineHumanProposalDecision::Defer)
+                                            }
+                                            (ProposalHumanDecision::Reject, None) => {
+                                                Ok(EngineHumanProposalDecision::Reject)
+                                            }
+                                            _ => Err(HumanGovernanceError::InvalidInput),
+                                        };
+                                        match decision {
+                                            Ok(decision) => {
+                                                human_governance
+                                                    .decide_proposal(
+                                                        request_id,
+                                                        expected_frontier,
+                                                        proposal_id,
+                                                        expected_revision_id,
+                                                        &expected_fingerprint,
+                                                        decision,
+                                                    )
+                                                    .await
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    HumanActionRequest::NegativeReview {
+                                        negative_evidence_id,
+                                        expected_review_revision_id,
+                                        decision,
+                                    } => {
+                                        let decision = match decision {
+                                            NegativeReviewDecision::ResolveAsIneffective => {
+                                                EngineHumanNegativeDecision::ResolveAsIneffective
+                                            }
+                                            NegativeReviewDecision::DismissAttribution => {
+                                                EngineHumanNegativeDecision::DismissAttribution
+                                            }
+                                            NegativeReviewDecision::ConfirmHarm => {
+                                                EngineHumanNegativeDecision::ConfirmHarm
+                                            }
+                                            NegativeReviewDecision::RequestRevision => {
+                                                EngineHumanNegativeDecision::RequestRevision
+                                            }
+                                        };
+                                        human_governance
+                                            .review_negative(
+                                                request_id,
+                                                expected_frontier,
+                                                negative_evidence_id,
+                                                expected_review_revision_id,
+                                                decision,
+                                            )
+                                            .await
+                                    }
+                                    HumanActionRequest::SupportReplacement {
+                                        expected_validation_revision_id,
+                                        edited_payload,
+                                    } => {
+                                        human_governance
+                                            .submit_support_replacement(
+                                                request_id,
+                                                expected_frontier,
+                                                expected_validation_revision_id,
+                                                *edited_payload,
+                                            )
+                                            .await
+                                    }
+                                    HumanActionRequest::SupportDeprecate {
+                                        expected_validation_revision_id,
+                                        reason,
+                                    } => {
+                                        human_governance
+                                            .submit_support_deprecate(
+                                                request_id,
+                                                expected_frontier,
+                                                expected_validation_revision_id,
+                                                reason,
+                                            )
+                                            .await
+                                    }
+                                    HumanActionRequest::ResolveCompetingSelected {
+                                        expected_group_revision_id,
+                                        chosen_attempt_id,
+                                    } => {
+                                        human_governance
+                                            .resolve_competing_selected(
+                                                request_id,
+                                                expected_frontier,
+                                                expected_group_revision_id,
+                                                chosen_attempt_id,
+                                            )
+                                            .await
+                                    }
+                                    HumanActionRequest::MarkNewAttempt {
+                                        expected_attempt_revision_id,
+                                    } => {
+                                        human_governance
+                                            .mark_new_attempt(
+                                                request_id,
+                                                expected_frontier,
+                                                expected_attempt_revision_id,
+                                            )
+                                            .await
+                                    }
+                                    HumanActionRequest::Unavailable { action } => {
+                                        Ok(EngineHumanActionOutcome::Unavailable {
+                                            reason: match action {
+                                                evertrace_protocol::dto::HumanUnavailableAction::SupportGovernance => "support_governance_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::SegmentationCorrection => "segmentation_correction_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::LaneCorrection => "lane_correction_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::ResumeCorrection => "resume_correction_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::LineageCorrection => "lineage_correction_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::ForgetOrPurge => "future_s32",
+                                                evertrace_protocol::dto::HumanUnavailableAction::ConfigurationWrite => "configuration_write_unavailable",
+                                                evertrace_protocol::dto::HumanUnavailableAction::BackupRestoreOrGc => "offline_cli_or_future_s33",
+                                            },
+                                        })
+                                    }
+                                }
+                                .map_err(map_human_error)?;
+                                HumanGovernanceResponse::Action {
+                                    result: map_human_action(outcome),
+                                }
+                            }
+                        };
+                        Ok(Response::HumanGovernance(response))
                     }
                     ProtocolCommand::RecallCue(command) => {
                         if context.client_kind != ClientKind::Hook {
@@ -491,6 +767,523 @@ fn map_recovery_error(error: RecoveryError) -> ErrorCode {
         | RecoveryError::Cas
         | RecoveryError::InvalidBundle
         | RecoveryError::Probe => ErrorCode::Internal,
+    }
+}
+
+fn map_human_surface(surface: HumanSurface) -> EngineHumanSurface {
+    match surface {
+        HumanSurface::Inbox => EngineHumanSurface::Inbox,
+        HumanSurface::Explorer => EngineHumanSurface::Explorer,
+        HumanSurface::System => EngineHumanSurface::System,
+    }
+}
+
+fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse {
+    HumanGovernanceResponse::Snapshot {
+        frontier: page.frontier,
+        status: match page.status {
+            evertrace_engine::HumanSnapshotStatus::Ready => HumanSnapshotStatus::Ready,
+            evertrace_engine::HumanSnapshotStatus::Degraded => HumanSnapshotStatus::Degraded,
+        },
+        degraded_reasons: page
+            .degraded_reasons
+            .into_iter()
+            .map(|reason| match reason {
+                evertrace_engine::HumanDegradedReason::CurrentJobFailed => {
+                    HumanDegradedReason::CurrentJobFailed
+                }
+            })
+            .collect(),
+        items: page
+            .items
+            .into_iter()
+            .map(|item| HumanSnapshotItem {
+                item_kind: if item.proposal.is_some() {
+                    HumanItemKind::RevisionProposal
+                } else {
+                    HumanItemKind::Generic
+                },
+                proposal: item.proposal.map(|proposal| HumanProposalMetadata {
+                    proposal_id: proposal.proposal_id,
+                    current_revision_id: proposal.current_revision_id,
+                    fingerprint: proposal.fingerprint,
+                    target_kind: proposal.target_kind,
+                    target_id: proposal.target_id,
+                    operation: proposal.operation,
+                    base_revision_id: proposal.base_revision_id,
+                    source_cohort_refs: proposal.source_cohort_refs,
+                    eligibility: proposal.eligibility,
+                    status: proposal.status,
+                }),
+                proposal_review: item.proposal_review.map(|review| HumanProposalReview {
+                    proposal: review.proposal,
+                    plain_accept_eligible: review.plain_accept_eligible,
+                    merge_and_accept_eligible: review.merge_and_accept_eligible,
+                }),
+                support_detail: item.support_detail.map(
+                    |EngineHumanSupportDetail {
+                         support_contract_revision_id,
+                         successor_ref,
+                         validation_revision_id,
+                         state,
+                         dependency_generation,
+                         provenance_degraded,
+                         threshold,
+                         support_revision_refs,
+                         authorization_revision_refs,
+                         surviving_support_refs,
+                         invalid_or_missing_refs,
+                         trigger_refs,
+                         initial_replacement_payload,
+                         deprecate_available,
+                     }| HumanSupportDetail {
+                        support_contract_revision_id,
+                        successor_ref,
+                        validation_revision_id,
+                        state,
+                        dependency_generation,
+                        provenance_degraded,
+                        threshold,
+                        support_revision_refs,
+                        authorization_revision_refs,
+                        surviving_support_refs,
+                        invalid_or_missing_refs,
+                        trigger_refs,
+                        initial_replacement_payload,
+                        deprecate_available,
+                    },
+                ),
+                competing_detail: item.competing_detail.map(
+                    |EngineHumanCompetingDetail {
+                         expected_group_revision_id,
+                         eligible_attempt_ids,
+                     }| HumanCompetingDetail {
+                        expected_group_revision_id,
+                        eligible_attempt_ids,
+                    },
+                ),
+                negative_review: item
+                    .negative_review
+                    .map(|review| HumanNegativeReviewMetadata {
+                        negative_evidence_id: review.negative_evidence_id,
+                        current_review_revision_id: review.current_review_revision_id,
+                        status: review.status,
+                        available_decisions: review
+                            .available_decisions
+                            .into_iter()
+                            .map(|decision| match decision {
+                                EngineHumanNegativeDecision::ResolveAsIneffective => {
+                                    NegativeReviewDecision::ResolveAsIneffective
+                                }
+                                EngineHumanNegativeDecision::DismissAttribution => {
+                                    NegativeReviewDecision::DismissAttribution
+                                }
+                                EngineHumanNegativeDecision::ConfirmHarm => {
+                                    NegativeReviewDecision::ConfirmHarm
+                                }
+                                EngineHumanNegativeDecision::RequestRevision => {
+                                    NegativeReviewDecision::RequestRevision
+                                }
+                            })
+                            .collect(),
+                    }),
+                recovery_detail: item.recovery_detail.map(|detail| match detail {
+                    EngineHumanRecoveryDetail::CaptureRequest {
+                        request_id,
+                        revision_id,
+                        repository_id,
+                        worktree_id,
+                        destructive_class,
+                        untracked_scope,
+                        status,
+                        bundle_id,
+                        reason_codes,
+                    } => HumanRecoveryDetail::CaptureRequest {
+                        request_id,
+                        revision_id,
+                        repository_id,
+                        worktree_id,
+                        destructive_class,
+                        untracked_scope,
+                        status,
+                        bundle_id,
+                        reason_codes,
+                    },
+                    EngineHumanRecoveryDetail::Bundle {
+                        bundle_id,
+                        source_worktree_id,
+                        source_snapshot_id,
+                        capture_status,
+                        ordering_integrity,
+                        captured_bytes,
+                        tracked_diff_count,
+                        tracked_file_count,
+                        index_state_count,
+                        untracked_file_count,
+                        untracked_artifact_count,
+                        metadata_artifact_count,
+                        config_run_count,
+                        attempt_anchor_count,
+                        omission_counts,
+                    } => HumanRecoveryDetail::Bundle {
+                        bundle_id,
+                        source_worktree_id,
+                        source_snapshot_id,
+                        capture_status,
+                        ordering_integrity,
+                        captured_bytes,
+                        tracked_diff_count,
+                        tracked_file_count,
+                        index_state_count,
+                        untracked_file_count,
+                        untracked_artifact_count,
+                        metadata_artifact_count,
+                        config_run_count,
+                        attempt_anchor_count,
+                        omission_counts: omission_counts
+                            .into_iter()
+                            .map(|entry| HumanRecoveryOmissionCount {
+                                reason: entry.reason,
+                                count: entry.count,
+                            })
+                            .collect(),
+                    },
+                    EngineHumanRecoveryDetail::Application {
+                        application_id,
+                        revision_id,
+                        bundle_id,
+                        target_worktree_id,
+                        application_kind,
+                        input_delivery_state,
+                        status,
+                        pre_snapshot_id,
+                        post_snapshot_id,
+                        selected_input_count,
+                        result_count,
+                        verifier_count,
+                    } => HumanRecoveryDetail::Application {
+                        application_id,
+                        revision_id,
+                        bundle_id,
+                        target_worktree_id,
+                        application_kind,
+                        input_delivery_state,
+                        status,
+                        pre_snapshot_id,
+                        post_snapshot_id,
+                        selected_input_count,
+                        result_count,
+                        verifier_count,
+                    },
+                }),
+                worktree_detail: item.worktree_detail.map(|detail| HumanWorktreeDetail {
+                    worktree_id: detail.worktree_id,
+                    repository_id: detail.repository_id,
+                    kind: detail.kind,
+                    lifecycle: detail.lifecycle,
+                    registration_state: detail.registration_state,
+                    current_snapshot_id: detail.current_snapshot_id,
+                }),
+                execution_integrity_detail: item.execution_integrity_detail.map(|detail| {
+                    match detail {
+                        EngineHumanExecutionIntegrityDetail::Lane {
+                            execution_lane_id,
+                            lane_revision,
+                            parent_lane_id,
+                            status,
+                            terminal_kind,
+                            liveness_state,
+                            finalized,
+                            event_watermark,
+                            active_capture_receipt_revision_id,
+                            coverage_level,
+                            source_coverage,
+                            pairing_integrity,
+                            payload_integrity,
+                            ordering_integrity,
+                            reasoning_visibility,
+                        } => HumanExecutionIntegrityDetail::Lane {
+                            execution_lane_id,
+                            lane_revision,
+                            parent_lane_id,
+                            status,
+                            terminal_kind,
+                            liveness_state,
+                            finalized,
+                            event_watermark,
+                            active_capture_receipt_revision_id,
+                            coverage_level,
+                            source_coverage,
+                            pairing_integrity,
+                            payload_integrity,
+                            ordering_integrity,
+                            reasoning_visibility,
+                        },
+                        EngineHumanExecutionIntegrityDetail::Receipt {
+                            capture_receipt_revision_id,
+                            execution_lane_id,
+                            predecessor_revision_id,
+                            admission_failure_observability,
+                            identity_strength,
+                            delegation_start_seen,
+                            child_session_linked,
+                            parent_session_end_seen,
+                            lifecycle_end_seen,
+                            terminal_event_kind,
+                            finalized,
+                            first_sequence,
+                            last_sequence,
+                            sequence_gap_count,
+                            outage_count,
+                            tool_call_count,
+                            tool_result_count,
+                            unmatched_tool_call_count,
+                            unmatched_tool_result_count,
+                            truncation_count,
+                            redaction_count,
+                            corrupt_count,
+                            unsupported_count,
+                            import_watermark,
+                            coverage_level,
+                            source_coverage,
+                            pairing_integrity,
+                            payload_integrity,
+                            ordering_integrity,
+                            reasoning_visibility,
+                            exact_byte_replay,
+                            resolver_version,
+                        } => HumanExecutionIntegrityDetail::Receipt {
+                            capture_receipt_revision_id,
+                            execution_lane_id,
+                            predecessor_revision_id,
+                            admission_failure_observability,
+                            identity_strength,
+                            delegation_start_seen,
+                            child_session_linked,
+                            parent_session_end_seen,
+                            lifecycle_end_seen,
+                            terminal_event_kind,
+                            finalized,
+                            first_sequence,
+                            last_sequence,
+                            sequence_gap_count,
+                            outage_count,
+                            tool_call_count,
+                            tool_result_count,
+                            unmatched_tool_call_count,
+                            unmatched_tool_result_count,
+                            truncation_count,
+                            redaction_count,
+                            corrupt_count,
+                            unsupported_count,
+                            import_watermark,
+                            coverage_level,
+                            source_coverage,
+                            pairing_integrity,
+                            payload_integrity,
+                            ordering_integrity,
+                            reasoning_visibility,
+                            exact_byte_replay,
+                            resolver_version,
+                        },
+                    }
+                }),
+                system_detail: item.system_detail.map(|detail| match detail {
+                    EngineHumanSystemDetail::Job { detail } => {
+                        let EngineHumanJobDetail {
+                            job_id,
+                            target_revision,
+                            target_watermark,
+                            target_generation,
+                            job_kind,
+                            algorithm_revision,
+                            model_id,
+                            priority,
+                            state,
+                            attempt,
+                            backoff_until_us,
+                            lease_until_us,
+                            config_hash,
+                            budget,
+                            terminal_reason,
+                            terminal_result_ref,
+                        } = *detail;
+                        HumanSystemDetail::Job {
+                            detail: Box::new(HumanJobDetail {
+                                job_id,
+                                target_revision,
+                                target_watermark,
+                                target_generation,
+                                job_kind,
+                                algorithm_revision,
+                                model_id,
+                                priority,
+                                state: match state {
+                                    EngineHumanJobState::Queued => HumanJobState::Queued,
+                                    EngineHumanJobState::Leased => HumanJobState::Leased,
+                                    EngineHumanJobState::Succeeded => HumanJobState::Succeeded,
+                                    EngineHumanJobState::Failed => HumanJobState::Failed,
+                                },
+                                attempt,
+                                backoff_until_us,
+                                lease_until_us,
+                                config_hash,
+                                budget: HumanJobBudget {
+                                    max_items: budget.max_items,
+                                    max_bytes: budget.max_bytes,
+                                    max_input_tokens: budget.max_input_tokens,
+                                    max_output_tokens: budget.max_output_tokens,
+                                    max_calls: budget.max_calls,
+                                    max_wall_time_ms: budget.max_wall_time_ms,
+                                },
+                                terminal_reason: terminal_reason.map(|reason| match reason {
+                                    EngineHumanJobTerminalReason::Completed => {
+                                        HumanJobTerminalReason::Completed
+                                    }
+                                    EngineHumanJobTerminalReason::StaleGeneration => {
+                                        HumanJobTerminalReason::StaleGeneration
+                                    }
+                                    EngineHumanJobTerminalReason::BudgetExhausted => {
+                                        HumanJobTerminalReason::BudgetExhausted
+                                    }
+                                    EngineHumanJobTerminalReason::SourceUnavailable => {
+                                        HumanJobTerminalReason::SourceUnavailable
+                                    }
+                                    EngineHumanJobTerminalReason::Unsupported => {
+                                        HumanJobTerminalReason::Unsupported
+                                    }
+                                    EngineHumanJobTerminalReason::SourceReplaced => {
+                                        HumanJobTerminalReason::SourceReplaced
+                                    }
+                                    EngineHumanJobTerminalReason::Revoked => {
+                                        HumanJobTerminalReason::Revoked
+                                    }
+                                    EngineHumanJobTerminalReason::IntegrityFailure => {
+                                        HumanJobTerminalReason::IntegrityFailure
+                                    }
+                                }),
+                                terminal_result_ref,
+                            }),
+                        }
+                    }
+                    EngineHumanSystemDetail::Config {
+                        config_version,
+                        effective_config_hash,
+                    } => HumanSystemDetail::Config {
+                        config_version,
+                        effective_config_hash,
+                    },
+                }),
+                stable_key: item.stable_key,
+                row_class: map_human_row_class(item.row_class),
+                family: map_human_object_family(item.family),
+                category: map_human_item_category(item.category),
+                object_kind: item.object_kind,
+                object_ref: item.object_ref,
+                revision_ref: item.revision_ref,
+                lifecycle: item.lifecycle,
+                epistemic: item.epistemic,
+                authority: item.authority,
+                publication_state: item.publication_state,
+                support_state: item.support_state,
+                scope_ref: item.scope_ref,
+                source_event_seq: item.source_event_seq,
+            })
+            .collect(),
+        next_cursor: page.next_cursor,
+    }
+}
+
+fn map_human_row_class(value: EngineHumanRowClass) -> HumanRowClass {
+    match value {
+        EngineHumanRowClass::Object => HumanRowClass::Object,
+        EngineHumanRowClass::Runtime => HumanRowClass::Runtime,
+        EngineHumanRowClass::Projection => HumanRowClass::Projection,
+    }
+}
+
+fn map_human_object_family(value: EngineHumanObjectFamily) -> HumanObjectFamily {
+    match value {
+        EngineHumanObjectFamily::Evidence => HumanObjectFamily::Evidence,
+        EngineHumanObjectFamily::Work => HumanObjectFamily::Work,
+        EngineHumanObjectFamily::Atom => HumanObjectFamily::Atom,
+        EngineHumanObjectFamily::Procedure => HumanObjectFamily::Procedure,
+        EngineHumanObjectFamily::RevisionProposal => HumanObjectFamily::RevisionProposal,
+        EngineHumanObjectFamily::Runtime => HumanObjectFamily::Runtime,
+        EngineHumanObjectFamily::Projection => HumanObjectFamily::Projection,
+    }
+}
+
+fn map_human_item_category(value: EngineHumanItemCategory) -> HumanItemCategory {
+    match value {
+        EngineHumanItemCategory::Proposal => HumanItemCategory::Proposal,
+        EngineHumanItemCategory::Support => HumanItemCategory::Support,
+        EngineHumanItemCategory::NegativeReview => HumanItemCategory::NegativeReview,
+        EngineHumanItemCategory::SegmentationCorrection => {
+            HumanItemCategory::SegmentationCorrection
+        }
+        EngineHumanItemCategory::RecoveryCorrection => HumanItemCategory::RecoveryCorrection,
+        EngineHumanItemCategory::Assignment => HumanItemCategory::Assignment,
+        EngineHumanItemCategory::CompetingResolution => HumanItemCategory::CompetingResolution,
+        EngineHumanItemCategory::AttemptResume => HumanItemCategory::AttemptResume,
+        EngineHumanItemCategory::LaneLifecycle => HumanItemCategory::LaneLifecycle,
+        EngineHumanItemCategory::CaptureIntegrity => HumanItemCategory::CaptureIntegrity,
+        EngineHumanItemCategory::WorktreeLineage => HumanItemCategory::WorktreeLineage,
+        EngineHumanItemCategory::ReviewHold => HumanItemCategory::ReviewHold,
+        EngineHumanItemCategory::Repository => HumanItemCategory::Repository,
+        EngineHumanItemCategory::Work => HumanItemCategory::Work,
+        EngineHumanItemCategory::Semantic => HumanItemCategory::Semantic,
+        EngineHumanItemCategory::Procedure => HumanItemCategory::Procedure,
+        EngineHumanItemCategory::Research => HumanItemCategory::Research,
+        EngineHumanItemCategory::RecoveryEvidence => HumanItemCategory::RecoveryEvidence,
+        EngineHumanItemCategory::Evidence => HumanItemCategory::Evidence,
+        EngineHumanItemCategory::Runtime => HumanItemCategory::Runtime,
+        EngineHumanItemCategory::Projection => HumanItemCategory::Projection,
+        EngineHumanItemCategory::SessionImport => HumanItemCategory::SessionImport,
+        EngineHumanItemCategory::SemanticDerivation => HumanItemCategory::SemanticDerivation,
+    }
+}
+
+fn map_human_action(outcome: EngineHumanActionOutcome) -> HumanActionResult {
+    match outcome {
+        EngineHumanActionOutcome::Applied {
+            current_revision_ref,
+            audit_event_ref,
+        } => HumanActionResult {
+            status: HumanActionStatus::Applied,
+            current_revision_ref: Some(current_revision_ref),
+            audit_event_ref: Some(audit_event_ref),
+            reason: None,
+        },
+        EngineHumanActionOutcome::NoDelta {
+            current_revision_ref,
+        } => HumanActionResult {
+            status: HumanActionStatus::NoDelta,
+            current_revision_ref: Some(current_revision_ref),
+            audit_event_ref: None,
+            reason: None,
+        },
+        EngineHumanActionOutcome::Conflict {
+            current_revision_ref,
+        } => HumanActionResult {
+            status: HumanActionStatus::Conflict,
+            current_revision_ref,
+            audit_event_ref: None,
+            reason: Some("optimistic_conflict".into()),
+        },
+        EngineHumanActionOutcome::Unavailable { reason } => HumanActionResult {
+            status: HumanActionStatus::Unavailable,
+            current_revision_ref: None,
+            audit_event_ref: None,
+            reason: Some(reason.into()),
+        },
+    }
+}
+
+fn map_human_error(error: HumanGovernanceError) -> ErrorCode {
+    match error {
+        HumanGovernanceError::InvalidInput => ErrorCode::InvalidInput,
+        HumanGovernanceError::Store => ErrorCode::Internal,
     }
 }
 

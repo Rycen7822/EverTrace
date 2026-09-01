@@ -15,7 +15,7 @@ mod theme;
 mod views;
 
 pub use app::{App, headless_render, run};
-pub use app_event::AppEvent;
+pub use app_event::{AppEvent, HumanReadLocator};
 pub use command::UiCommand;
 pub use event_sender::AppEventSender;
 pub use state::{AppState, ConnectionState, Route, ShellSnapshot};

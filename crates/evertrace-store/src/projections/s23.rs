@@ -12,7 +12,10 @@ use evertrace_domain::{
     },
 };
 
-use crate::{JournalPayload, ObjectFamily, ObjectRow, ObjectRowClass, ObjectRowKind, StoreError};
+use crate::{
+    DirtyTargetKind, JobStatus, JournalPayload, ObjectFamily, ObjectRow, ObjectRowClass,
+    ObjectRowKind, StoreError,
+};
 
 pub(super) const CORE_PROJECTION_KIND: &str = "l3_core_projection";
 
@@ -28,6 +31,193 @@ pub(super) struct S23State {
 }
 
 impl S23State {
+    pub(super) fn validation(
+        &self,
+        revision_id: RevisionId,
+    ) -> Option<&GlobalSupportValidationEvent> {
+        self.validations.get(&revision_id).map(|(value, _)| value)
+    }
+
+    pub(super) fn current_validation(
+        &self,
+        contract_revision_id: RevisionId,
+    ) -> Option<&GlobalSupportValidationEvent> {
+        self.current_validations
+            .get(&contract_revision_id)
+            .map(|(value, _)| value)
+    }
+
+    pub(super) fn validate_successor_fanout(
+        &self,
+        base_revision_id: RevisionId,
+        replacement_successor: Option<RevisionId>,
+        occurred_at_us: i64,
+        effective_config_hash: [u8; 32],
+        payloads: &[&JournalPayload],
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        let mut expected = Vec::new();
+        for (contract_id, (contract, _)) in &self.contracts {
+            if contract
+                .support_revision_refs
+                .binary_search(&base_revision_id)
+                .is_err()
+            {
+                continue;
+            }
+            expected.push(
+                self.current_validations
+                    .get(contract_id)
+                    .map(|(validation, _)| validation)
+                    .ok_or(error)?,
+            );
+        }
+
+        let mut recorded_contract = None;
+        let mut validations_by_contract = BTreeMap::new();
+        let mut dirty_by_target = BTreeMap::new();
+        let mut outbox_by_id = BTreeMap::new();
+        let mut jobs_by_idempotency = BTreeMap::new();
+        let mut support_closure_job_count = 0usize;
+        for payload in payloads {
+            match payload {
+                JournalPayload::GlobalSupportContractRecorded(value) => {
+                    if recorded_contract.replace(value.as_ref()).is_some() {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::GlobalSupportValidationRecorded(value) => {
+                    if validations_by_contract
+                        .insert(value.support_contract_ref, value.as_ref())
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::DirtyTarget(value)
+                    if value.target_kind == DirtyTargetKind::RuntimeJob =>
+                {
+                    if dirty_by_target
+                        .insert(value.target_id.as_str(), value)
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::OutboxEnqueued(value)
+                    if value.dirty.target_kind == DirtyTargetKind::RuntimeJob =>
+                {
+                    if outbox_by_id
+                        .insert(value.outbox_id.as_str(), value)
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::JobState(value) => {
+                    if value.kind == "support_closure" {
+                        support_closure_job_count =
+                            support_closure_job_count.checked_add(1).ok_or(error)?;
+                    }
+                    if jobs_by_idempotency
+                        .insert(value.idempotency_key.as_str(), value)
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let replacement_contract = match (replacement_successor, recorded_contract) {
+            (Some(revision), Some(contract))
+                if contract.successor_revision_or_membership_ref == revision.to_string() =>
+            {
+                Some(contract)
+            }
+            (None, None) => None,
+            _ => return Err(error),
+        };
+
+        let expected_trigger = vec![base_revision_id.to_string()];
+        for current in &expected {
+            let next_generation = current.dependency_generation.checked_add(1).ok_or(error)?;
+            let pending = *validations_by_contract
+                .get(&current.support_contract_ref)
+                .ok_or(error)?;
+            validate_validation_successor(current, pending).map_err(|_| error)?;
+            if pending.dependency_generation != next_generation
+                || pending.state != GlobalSupportState::RevalidationPending
+                || pending.provenance_degraded != current.provenance_degraded
+                || pending.surviving_support_refs != current.surviving_support_refs
+                || !pending.invalid_or_missing_refs.is_empty()
+                || pending.trigger_refs != expected_trigger
+                || pending.validator_revision != 1
+                || pending.created_at_us != occurred_at_us
+            {
+                return Err(error);
+            }
+            let contract_ref = current.support_contract_ref.to_string();
+            let dirty = *dirty_by_target.get(contract_ref.as_str()).ok_or(error)?;
+            if dirty.source_watermark != next_generation {
+                return Err(error);
+            }
+            let idempotency_key =
+                format!("support:{}:{next_generation}", current.support_contract_ref);
+            let outbox = *outbox_by_id.get(idempotency_key.as_str()).ok_or(error)?;
+            if outbox.dirty != *dirty {
+                return Err(error);
+            }
+            let job = *jobs_by_idempotency
+                .get(idempotency_key.as_str())
+                .ok_or(error)?;
+            if job.target_revision != current.successor_ref
+                || job.target_watermark != next_generation
+                || job.target_generation != next_generation
+                || job.kind != "support_closure"
+                || job.algorithm_revision != dirty.algorithm_revision
+                || job.model_id.is_some()
+                || job.priority != 0
+                || job.state != JobStatus::Queued
+                || job.attempt != 1
+                || job.backoff_until_us.is_some()
+                || job.config_hash != effective_config_hash
+                || job.budget.max_items != 1
+                || job.budget.max_bytes.is_some()
+                || job.budget.max_input_tokens.is_some()
+                || job.budget.max_output_tokens.is_some()
+                || job.budget.max_calls.is_some()
+                || job.budget.max_wall_time_ms != 250
+                || job.terminal.is_some()
+                || job.lease_until_us.is_some()
+            {
+                return Err(error);
+            }
+        }
+
+        let replacement_contract_id =
+            replacement_contract.map(|contract| contract.support_contract_revision_id);
+        if let Some(contract_id) = replacement_contract_id
+            && validations_by_contract
+                .get(&contract_id)
+                .is_none_or(|validation| validation.state != GlobalSupportState::Valid)
+        {
+            return Err(error);
+        }
+        let expected_validations = expected
+            .len()
+            .checked_add(usize::from(replacement_contract_id.is_some()))
+            .ok_or(error)?;
+        if validations_by_contract.len() != expected_validations
+            || dirty_by_target.len() != expected_validations
+            || outbox_by_id.len() != expected_validations
+            || support_closure_job_count != expected.len()
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) fn current_scenario(&self, revision_id: RevisionId) -> Option<&Scenario> {
         self.scenarios
             .values()
@@ -801,7 +991,9 @@ fn scope_repository(value: &CoreScopeIdentity) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use evertrace_domain::semantic::SupportThresholdSnapshot;
+    use evertrace_domain::{ids::JobId, semantic::SupportThresholdSnapshot};
+
+    use crate::{DirtyTarget, DurableJob, JobBudget, OutboxEntry};
 
     use super::*;
 
@@ -824,6 +1016,121 @@ mod tests {
             applicability_contract_hash: [2; 32],
             created_at_us: 1,
         }
+    }
+
+    #[test]
+    fn successor_fanout_requires_exact_pending_cohort_and_contract_polarity() {
+        let base_revision_id = RevisionId::new_v7();
+        let contract_id = RevisionId::new_v7();
+        let mut contract = support_contract(contract_id, &RevisionId::new_v7().to_string());
+        contract.support_revision_refs = vec![base_revision_id];
+        let current = GlobalSupportValidationEvent {
+            validation_revision_id: RevisionId::new_v7(),
+            support_contract_ref: contract_id,
+            successor_ref: contract.successor_revision_or_membership_ref.clone(),
+            dependency_generation: 1,
+            state: GlobalSupportState::Valid,
+            provenance_degraded: false,
+            surviving_support_refs: vec![base_revision_id],
+            invalid_or_missing_refs: Vec::new(),
+            trigger_refs: Vec::new(),
+            validator_revision: 1,
+            created_at_us: 1,
+        };
+        let mut state = S23State::default();
+        state
+            .apply(
+                JournalPayload::GlobalSupportContractRecorded(Box::new(contract)),
+                1,
+            )
+            .unwrap();
+        state
+            .apply(
+                JournalPayload::GlobalSupportValidationRecorded(Box::new(current.clone())),
+                2,
+            )
+            .unwrap();
+
+        let occurred_at_us = 9;
+        let config_hash = [9; 32];
+        let next_generation = current.dependency_generation + 1;
+        let pending = GlobalSupportValidationEvent {
+            validation_revision_id: RevisionId::new_v7(),
+            dependency_generation: next_generation,
+            state: GlobalSupportState::RevalidationPending,
+            trigger_refs: vec![base_revision_id.to_string()],
+            created_at_us: occurred_at_us,
+            ..current.clone()
+        };
+        let dirty = DirtyTarget {
+            target_kind: DirtyTargetKind::RuntimeJob,
+            target_id: contract_id.to_string(),
+            algorithm_revision: "s23-scenario-core-v1".into(),
+            source_watermark: next_generation,
+        };
+        let idempotency_key = format!("support:{contract_id}:{next_generation}");
+        let payloads = vec![
+            JournalPayload::GlobalSupportValidationRecorded(Box::new(pending.clone())),
+            JournalPayload::DirtyTarget(dirty.clone()),
+            JournalPayload::OutboxEnqueued(OutboxEntry {
+                outbox_id: idempotency_key.clone(),
+                dirty: dirty.clone(),
+            }),
+            JournalPayload::JobState(DurableJob {
+                job_id: JobId::new_v7(),
+                idempotency_key,
+                target_revision: current.successor_ref.clone(),
+                target_watermark: next_generation,
+                target_generation: next_generation,
+                kind: "support_closure".into(),
+                algorithm_revision: dirty.algorithm_revision.clone(),
+                model_id: None,
+                priority: 0,
+                state: JobStatus::Queued,
+                attempt: 1,
+                backoff_until_us: None,
+                config_hash,
+                budget: JobBudget {
+                    max_items: 1,
+                    max_bytes: None,
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    max_calls: None,
+                    max_wall_time_ms: 250,
+                },
+                terminal: None,
+                lease_until_us: None,
+            }),
+        ];
+        let validate = |payloads: &[JournalPayload], replacement| {
+            state.validate_successor_fanout(
+                base_revision_id,
+                replacement,
+                occurred_at_us,
+                config_hash,
+                &payloads.iter().collect::<Vec<_>>(),
+                StoreError::InvalidInput,
+            )
+        };
+        assert_eq!(validate(&payloads, None), Ok(()));
+
+        let mut missing = payloads.clone();
+        missing.pop();
+        assert_eq!(validate(&missing, None), Err(StoreError::InvalidInput));
+
+        let mut extra = payloads.clone();
+        extra.push(JournalPayload::GlobalSupportValidationRecorded(Box::new(
+            GlobalSupportValidationEvent {
+                validation_revision_id: RevisionId::new_v7(),
+                support_contract_ref: RevisionId::new_v7(),
+                ..pending
+            },
+        )));
+        assert_eq!(validate(&extra, None), Err(StoreError::InvalidInput));
+        assert_eq!(
+            validate(&payloads, Some(RevisionId::new_v7())),
+            Err(StoreError::InvalidInput)
+        );
     }
 
     #[test]

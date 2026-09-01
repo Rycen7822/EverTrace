@@ -12,8 +12,8 @@ use evertrace_domain::{
     },
     ids::{
         CasId, CommandId, DuplicateGroupId, OperationId, ProcedureNegativeEvidenceId,
-        ProcedureUsageId, RepositoryId, TaskId, WorkBindingRevisionId, WorkstreamId, WorktreeId,
-        WorktreeSnapshotId,
+        ProcedureUsageId, RepositoryId, RequestId, TaskId, WorkBindingRevisionId, WorkstreamId,
+        WorktreeId, WorktreeSnapshotId,
     },
     procedure::{
         ProcedureActions, ProcedureAttributionBasis, ProcedureCorrelationState, ProcedureDone,
@@ -50,7 +50,7 @@ use evertrace_domain::{
     },
 };
 use evertrace_engine::{
-    PhysicalNormalizer,
+    HumanActionOutcome, HumanGovernanceService, HumanNegativeDecision, PhysicalNormalizer,
     autoresearch::{RunCreateInput, create_experiment_run},
     procedure::{
         ProcedureAcceptanceContext, ProcedureAcceptanceResolution, ProcedureCandidate,
@@ -64,6 +64,7 @@ use evertrace_engine::{
         AtomAcceptanceContext, ProposalCommandContext, ProposalResolution, RevisionProposalService,
         SubmitProposalRequest,
     },
+    spawn_writer,
     work::{
         WorkCommandContext,
         attempt::new_attempt,
@@ -87,6 +88,76 @@ fn command(at: i64, payloads: Vec<JournalPayload>) -> JournalCommand {
             .collect(),
     )
     .unwrap()
+}
+
+async fn assert_local_confirm_harm_rejected(
+    writer: &mut JournalWriter,
+    localized_id: ProcedureNegativeEvidenceId,
+    localized: &JournalCommand,
+    post_negative_mismatch: ResultEvidence,
+) {
+    writer
+        .commit(
+            &command(
+                26,
+                vec![JournalPayload::ResultEvidenceRecorded(Box::new(
+                    post_negative_mismatch.clone(),
+                ))],
+            ),
+            26,
+        )
+        .await
+        .unwrap();
+    let local_mismatch_view =
+        ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    let local_selection = local_mismatch_view
+        .select_negative_review(localized_id)
+        .unwrap();
+    assert!(
+        !local_selection
+            .available_decisions
+            .contains(&evertrace_engine::procedure::ProcedureNegativeReviewDecision::ConfirmHarm)
+    );
+    let pending_review = localized
+        .events()
+        .iter()
+        .find_map(|event| match &event.payload {
+            JournalPayload::ProcedureNegativeReviewRecorded(review)
+                if review.negative_evidence_id == localized_id =>
+            {
+                Some(review.as_ref())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let mut forged_confirm = pending_review.clone();
+    forged_confirm.review_event_id = RevisionId::new_v7();
+    forged_confirm.predecessor_review_event_id = Some(pending_review.review_event_id);
+    forged_confirm.review_generation += 1;
+    forged_confirm.status = ProcedureNegativeReviewStatus::Upheld;
+    forged_confirm.reason = "confirm_harm".into();
+    forged_confirm.evidence_refs = vec![post_negative_mismatch.revision_id.to_string()];
+    forged_confirm.created_at_us = 27;
+    assert!(forged_confirm.validate());
+    let before_forged_confirm = writer.project().await.unwrap().frontier;
+    assert!(
+        writer
+            .commit(
+                &command(
+                    27,
+                    vec![JournalPayload::ProcedureNegativeReviewRecorded(Box::new(
+                        forged_confirm,
+                    ))],
+                ),
+                27,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        writer.project().await.unwrap().frontier,
+        before_forged_confirm
+    );
 }
 
 fn source(
@@ -620,12 +691,13 @@ async fn active_procedure_fixture(label: &str, context_unbounded: bool) -> Activ
         proposal.proposal_revision_id,
         &proposal.fingerprint,
     );
-    let (acceptance_receipt, acceptance_observation) = source(
+    let (mut acceptance_receipt, acceptance_observation) = source(
         &format!("{label}-acceptance"),
         &acceptance_payload,
         3,
         repository_id,
     );
+    acceptance_receipt.source_ref = proposal.proposal_id.to_string();
     writer
         .commit(
             &command(
@@ -686,6 +758,7 @@ enum PhysicalEvidenceCase {
 #[derive(Clone, Copy)]
 enum ResultEvidenceCase {
     Passed,
+    PassedIneffective,
     NeutralFailure,
     ReplayViolation,
 }
@@ -935,14 +1008,19 @@ async fn prepare_usage_evidence(
     successful.predecessor_revision_id = Some(adopted.revision_id);
     successful.revision_generation = 3;
     successful.verification = match result_case {
-        ResultEvidenceCase::Passed => AttemptVerification::Passed,
+        ResultEvidenceCase::Passed | ResultEvidenceCase::PassedIneffective => {
+            AttemptVerification::Passed
+        }
         ResultEvidenceCase::NeutralFailure | ResultEvidenceCase::ReplayViolation => {
             AttemptVerification::Failed
         }
     };
     successful.outcome_state = AttemptOutcomeState::Known;
-    successful.failure_signature = (!matches!(result_case, ResultEvidenceCase::Passed))
-        .then(|| "objective_verifier_failed".into());
+    successful.failure_signature = (!matches!(
+        result_case,
+        ResultEvidenceCase::Passed | ResultEvidenceCase::PassedIneffective
+    ))
+    .then(|| "objective_verifier_failed".into());
     successful.work_binding_revision_refs = vec![binding_id];
     successful.source_watermark = adopted.source_watermark + 1;
     let run = create_experiment_run(
@@ -995,11 +1073,13 @@ async fn prepare_usage_evidence(
             failure_code: None,
         },
         verifier_receipt: match result_case {
-            ResultEvidenceCase::Passed => Some(VerifierReceipt {
-                verifier_version: "evertrace.result_reparse.v1".into(),
-                status: VerifierStatus::Passed,
-                failure_code: None,
-            }),
+            ResultEvidenceCase::Passed | ResultEvidenceCase::PassedIneffective => {
+                Some(VerifierReceipt {
+                    verifier_version: "evertrace.result_reparse.v1".into(),
+                    status: VerifierStatus::Passed,
+                    failure_code: None,
+                })
+            }
             ResultEvidenceCase::NeutralFailure => None,
             ResultEvidenceCase::ReplayViolation => Some(VerifierReceipt {
                 verifier_version: "evertrace.result_reparse.v1".into(),
@@ -1007,7 +1087,10 @@ async fn prepare_usage_evidence(
                 failure_code: Some(VerifierFailureCode::DeterministicReparseMismatch),
             }),
         },
-        completeness: if matches!(result_case, ResultEvidenceCase::Passed) {
+        completeness: if matches!(
+            result_case,
+            ResultEvidenceCase::Passed | ResultEvidenceCase::PassedIneffective
+        ) {
             EvidenceCompleteness::Complete
         } else {
             EvidenceCompleteness::Incomplete
@@ -1063,7 +1146,10 @@ async fn prepare_usage_evidence(
         proposal_context(at),
         ProcedureUsageAdvance {
             usage_id: usage.procedure_usage_id,
-            stage: if matches!(result_case, ResultEvidenceCase::Passed) {
+            stage: if matches!(
+                result_case,
+                ResultEvidenceCase::Passed | ResultEvidenceCase::PassedIneffective
+            ) {
                 ProcedureUsageStage::Outcome
             } else {
                 ProcedureUsageStage::Completion
@@ -1622,6 +1708,7 @@ async fn same_continuation_split_and_overlapping_root_tasks_cannot_promote() {
 async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_success() {
     let ActiveProcedureFixture {
         _temp,
+        store_path,
         mut writer,
         repository_id,
         worktree_id,
@@ -1942,18 +2029,214 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
         )
         .await
         .unwrap();
-    let replay_view =
-        ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
-    let dismissed = review_procedure_negative(
-        &replay_view,
-        proposal_context(68),
-        localized_id,
-        ProcedureNegativeReviewProof::ReplayDismissed {
-            result_revision_ids: vec![post_negative_replay.revision_id],
-        },
-    )
-    .unwrap();
-    writer.commit(&dismissed, 68).await.unwrap();
+    let replay_snapshot = writer.project().await.unwrap();
+    let replay_view = ProcedureUsageCurrentView::from_snapshot(&replay_snapshot).unwrap();
+    let selection = replay_view.select_negative_review(localized_id).unwrap();
+    assert_eq!(
+        selection.available_decisions,
+        vec![
+            evertrace_engine::procedure::ProcedureNegativeReviewDecision::DismissAttribution,
+            evertrace_engine::procedure::ProcedureNegativeReviewDecision::RequestRevision,
+        ]
+    );
+    let expected_review_revision = selection.review_revision_id;
+    let (handle, writer_task) = spawn_writer(writer, 8).unwrap();
+    let service = HumanGovernanceService::new(handle.clone(), CONFIG);
+    let request_id = RequestId::new_v7();
+    assert!(matches!(
+        service
+            .review_negative(
+                request_id,
+                replay_snapshot.frontier,
+                localized_id,
+                expected_review_revision,
+                HumanNegativeDecision::RequestRevision,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::Applied { .. }
+    ));
+    let after_request = handle.project().await.unwrap().frontier;
+    assert!(after_request > replay_snapshot.frontier);
+    let request_snapshot = handle.project().await.unwrap();
+    let request_semantic = SemanticCurrentView::from_snapshot(&request_snapshot).unwrap();
+    let request_proposal = request_semantic
+        .proposals
+        .values()
+        .find(|proposal| {
+            proposal.status == evertrace_domain::semantic::ProposalStatus::Pending
+                && proposal.target_id == Some(ProposalTargetId::Procedure(procedure.procedure_id))
+                && proposal.base_revision_id == Some(procedure.revision_id)
+                && proposal.operation == ProposalOperation::Replace
+        })
+        .unwrap();
+    let ProposalPayload::Procedure(request_payload) = &request_proposal.payload else {
+        panic!("revision request must create a Procedure proposal")
+    };
+    let negative_ref = localized_id.to_string();
+    let negative_result_ref = harm_prepared.result.result_evidence_id.to_string();
+    assert!(
+        request_payload
+            .draft()
+            .evidence_refs
+            .contains(&negative_ref)
+    );
+    assert!(request_proposal.evidence_refs.contains(&negative_ref));
+    assert!(
+        request_payload
+            .draft()
+            .evidence_refs
+            .contains(&negative_result_ref)
+    );
+    assert!(
+        request_payload
+            .draft()
+            .evidence_refs
+            .iter()
+            .all(|reference| request_proposal.evidence_refs.contains(reference))
+    );
+    assert_eq!(
+        request_proposal.source_cohort_refs,
+        vec![negative_result_ref]
+    );
+    let missing_negative_ref = ProcedureNegativeEvidenceId::new_v7().to_string();
+    let mut forged_request = request_proposal.clone();
+    forged_request.proposal_id = evertrace_domain::ids::RevisionProposalId::new_v7();
+    forged_request.proposal_revision_id = RevisionId::new_v7();
+    forged_request.parent_proposal_revision_id = None;
+    forged_request
+        .evidence_refs
+        .retain(|value| value != &negative_ref);
+    forged_request
+        .evidence_refs
+        .push(missing_negative_ref.clone());
+    forged_request.evidence_refs.sort();
+    let ProposalPayload::Procedure(payload) = &mut forged_request.payload else {
+        unreachable!()
+    };
+    let ProcedureProposalPayload::Replace { draft } = payload.as_mut() else {
+        unreachable!()
+    };
+    draft.evidence_refs.retain(|value| value != &negative_ref);
+    draft.evidence_refs.push(missing_negative_ref);
+    draft.evidence_refs.sort();
+    forged_request.source_cohort_hash = forged_request.recompute_source_cohort_hash().unwrap();
+    forged_request.fingerprint = forged_request.recompute_fingerprint().unwrap();
+    forged_request.validate().unwrap();
+    assert!(
+        handle
+            .commit_if_frontier(
+                command(
+                    forged_request.created_at_us,
+                    vec![JournalPayload::RevisionProposalRecorded(Box::new(
+                        forged_request,
+                    ))],
+                ),
+                request_proposal.created_at_us,
+                after_request,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(handle.project().await.unwrap().frontier, after_request);
+    assert!(matches!(
+        service
+            .review_negative(
+                RequestId::new_v7(),
+                after_request,
+                localized_id,
+                expected_review_revision,
+                HumanNegativeDecision::RequestRevision,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::NoDelta { .. }
+    ));
+    assert_eq!(handle.project().await.unwrap().frontier, after_request);
+    assert!(matches!(
+        service
+            .review_negative(
+                RequestId::new_v7(),
+                after_request,
+                localized_id,
+                RevisionId::new_v7(),
+                HumanNegativeDecision::RequestRevision,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::Conflict { .. }
+    ));
+    assert_eq!(handle.project().await.unwrap().frontier, after_request);
+    let before_rejected = after_request;
+    assert!(matches!(
+        service
+            .review_negative(
+                RequestId::new_v7(),
+                before_rejected,
+                localized_id,
+                expected_review_revision,
+                HumanNegativeDecision::ConfirmHarm,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::Unavailable { .. }
+    ));
+    assert_eq!(handle.project().await.unwrap().frontier, before_rejected);
+    assert!(matches!(
+        service
+            .review_negative(
+                RequestId::new_v7(),
+                before_rejected - 1,
+                localized_id,
+                expected_review_revision,
+                HumanNegativeDecision::DismissAttribution,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::Conflict { .. }
+    ));
+    assert_eq!(handle.project().await.unwrap().frontier, before_rejected);
+    let request_id = RequestId::new_v7();
+    let current_frontier = handle.project().await.unwrap().frontier;
+    let HumanActionOutcome::Applied {
+        audit_event_ref,
+        current_revision_ref,
+    } = service
+        .review_negative(
+            request_id,
+            current_frontier,
+            localized_id,
+            expected_review_revision,
+            HumanNegativeDecision::DismissAttribution,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("current passed replay must dismiss the negative review")
+    };
+    assert_ne!(current_revision_ref, expected_review_revision.to_string());
+    let committed = handle
+        .committed_command(CommandId::from_uuid(request_id.as_uuid()).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let review_ordinal = committed
+        .payloads
+        .iter()
+        .position(|payload| {
+            matches!(
+                payload,
+                JournalPayload::ProcedureNegativeReviewRecorded(review)
+                    if review.negative_evidence_id == localized_id
+                        && review.status == ProcedureNegativeReviewStatus::Dismissed
+            )
+        })
+        .unwrap();
+    assert_eq!(committed.event_ids[review_ordinal], audit_event_ref);
+    drop(service);
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+    writer = JournalWriter::open(&store_path).await.unwrap();
 
     let (fourth, fourth_command, _) = record_independent_success(
         &mut writer,
@@ -2010,6 +2293,7 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
         ResultEvidenceCase::NeutralFailure,
         ResultEvidenceCase::ReplayViolation,
         ResultEvidenceCase::NeutralFailure,
+        ResultEvidenceCase::PassedIneffective,
     ]
     .into_iter()
     .enumerate()
@@ -2040,6 +2324,71 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
 
     let view = ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
     let ProcedureNegativeResolution::Command {
+        level: ProcedureNegativeLevel::Ineffective,
+        command: ineffective,
+    } = record_procedure_negative(
+        &view,
+        proposal_context(79),
+        ProcedureNegativeRequest {
+            procedure_usage_id: prepared[4].usage.procedure_usage_id,
+            session_id: "session-s25-ineffective".into(),
+            result_revision_ids: vec![prepared[4].result.revision_id],
+        },
+    )
+    .unwrap()
+    else {
+        panic!("a passed attempt without a supported outcome must be typed ineffective")
+    };
+    let ineffective_id = ineffective
+        .events()
+        .iter()
+        .find_map(|event| match &event.payload {
+            JournalPayload::ProcedureNegativeEvidenceRecorded(value) => {
+                Some(value.negative_evidence_id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        !ineffective
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload, JournalPayload::ProcedureStateRecorded(_)))
+    );
+    writer.commit(&ineffective, 79).await.unwrap();
+    let ineffective_view =
+        ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    let selection = ineffective_view
+        .select_negative_review(ineffective_id)
+        .unwrap();
+    assert_eq!(
+        selection.available_decisions,
+        vec![
+            evertrace_engine::procedure::ProcedureNegativeReviewDecision::ResolveAsIneffective,
+            evertrace_engine::procedure::ProcedureNegativeReviewDecision::RequestRevision,
+        ]
+    );
+    let resolved = review_procedure_negative(
+        &ineffective_view,
+        proposal_context(79),
+        ineffective_id,
+        selection
+            .proof(
+                evertrace_engine::procedure::ProcedureNegativeReviewDecision::ResolveAsIneffective,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(resolved.events().iter().any(|event| matches!(
+        &event.payload,
+        JournalPayload::ProcedureNegativeReviewRecorded(value)
+            if value.status == ProcedureNegativeReviewStatus::Dismissed
+                && value.reason == "resolve_as_ineffective"
+    )));
+    writer.commit(&resolved, 79).await.unwrap();
+
+    let view = ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    let ProcedureNegativeResolution::Command {
         level: ProcedureNegativeLevel::SuspectedHarm,
         command: first,
     } = record_procedure_negative(
@@ -2063,6 +2412,16 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
                     && value.reason == ProcedureStateReason::SuspectedHarm
         )
     }));
+    let first_negative_id = first
+        .events()
+        .iter()
+        .find_map(|event| match &event.payload {
+            JournalPayload::ProcedureNegativeEvidenceRecorded(value) => {
+                Some(value.negative_evidence_id)
+            }
+            _ => None,
+        })
+        .unwrap();
     writer.commit(&first, 80).await.unwrap();
 
     let held_view =
@@ -2116,24 +2475,61 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
         writer.full_projection().await.unwrap()
     );
 
+    let mut post_negative_harm_proof = prepared[0].result.clone();
+    post_negative_harm_proof.result_evidence_id = evertrace_domain::ids::ResultEvidenceId::new_v7();
+    post_negative_harm_proof.revision_id = RevisionId::new_v7();
+    post_negative_harm_proof.parent_revision_id = None;
+    post_negative_harm_proof.verifier_receipt = Some(VerifierReceipt {
+        verifier_version: "evertrace.result_reparse.v1".into(),
+        status: VerifierStatus::Failed,
+        failure_code: Some(VerifierFailureCode::DeterministicReparseMismatch),
+    });
+    post_negative_harm_proof.completeness = EvidenceCompleteness::Incomplete;
+    post_negative_harm_proof.failure = Some(ResultFailure::Verifier(
+        VerifierFailureCode::DeterministicReparseMismatch,
+    ));
+    post_negative_harm_proof.created_at_us = 82;
+    post_negative_harm_proof.validate().unwrap();
+    writer
+        .commit(
+            &command(
+                82,
+                vec![JournalPayload::ResultEvidenceRecorded(Box::new(
+                    post_negative_harm_proof.clone(),
+                ))],
+            ),
+            82,
+        )
+        .await
+        .unwrap();
     let held_view =
         ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
-    let ProcedureNegativeResolution::Command {
-        level: ProcedureNegativeLevel::ConfirmedHarm,
-        command: confirmed,
-    } = record_procedure_negative(
+    let selection = held_view.select_negative_review(first_negative_id).unwrap();
+    assert_eq!(
+        selection.available_decisions,
+        vec![
+            evertrace_engine::procedure::ProcedureNegativeReviewDecision::ConfirmHarm,
+            evertrace_engine::procedure::ProcedureNegativeReviewDecision::RequestRevision,
+        ]
+    );
+    let confirmed = review_procedure_negative(
         &held_view,
-        proposal_context(82),
-        ProcedureNegativeRequest {
-            procedure_usage_id: prepared[2].usage.procedure_usage_id,
-            session_id: "session-s25-review-hold-confirmed".into(),
-            result_revision_ids: vec![prepared[2].result.revision_id],
-        },
+        proposal_context(83),
+        first_negative_id,
+        selection
+            .proof(evertrace_engine::procedure::ProcedureNegativeReviewDecision::ConfirmHarm)
+            .unwrap(),
     )
-    .unwrap()
-    else {
-        panic!("confirmed harm must upgrade ReviewHold to Suspended")
-    };
+    .unwrap();
+    assert!(!confirmed.events().iter().any(|event| matches!(
+        event.payload,
+        JournalPayload::ProcedureNegativeEvidenceRecorded(_)
+    )));
+    assert!(confirmed.events().iter().any(|event| matches!(
+        &event.payload,
+        JournalPayload::ProcedureNegativeReviewRecorded(value)
+            if value.status == ProcedureNegativeReviewStatus::Upheld
+    )));
     assert!(confirmed.events().iter().any(|event| {
         matches!(
             &event.payload,
@@ -2142,7 +2538,7 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
                     && value.reason == ProcedureStateReason::ConfirmedHarm
         )
     }));
-    writer.commit(&confirmed, 82).await.unwrap();
+    writer.commit(&confirmed, 83).await.unwrap();
 
     let suspended_view =
         ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
@@ -2151,7 +2547,7 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
         command: after_suspended,
     } = record_procedure_negative(
         &suspended_view,
-        proposal_context(83),
+        proposal_context(84),
         ProcedureNegativeRequest {
             procedure_usage_id: prepared[3].usage.procedure_usage_id,
             session_id: "session-s25-suspended-negative".into(),
@@ -2175,7 +2571,7 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
             .iter()
             .any(|event| { matches!(event.payload, JournalPayload::ProcedureStateRecorded(_)) })
     );
-    writer.commit(&after_suspended, 83).await.unwrap();
+    writer.commit(&after_suspended, 84).await.unwrap();
     assert_eq!(
         writer.project().await.unwrap(),
         writer.full_projection().await.unwrap()
@@ -3394,6 +3790,26 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         dismissed.is_err(),
         "pre-negative replay cannot close review"
     );
+    let mut post_negative_mismatch = result_for(
+        RevisionId::new_v7(),
+        Some(VerifierReceipt {
+            verifier_version: "evertrace.result_reparse.v1".into(),
+            status: VerifierStatus::Failed,
+            failure_code: Some(VerifierFailureCode::DeterministicReparseMismatch),
+        }),
+        Some(ResultFailure::Verifier(
+            VerifierFailureCode::DeterministicReparseMismatch,
+        )),
+    );
+    post_negative_mismatch.created_at_us = 26;
+    post_negative_mismatch.validate().unwrap();
+    assert_local_confirm_harm_rejected(
+        &mut writer,
+        localized_id,
+        &localized,
+        post_negative_mismatch,
+    )
+    .await;
     let post_negative_replay = result_for(
         RevisionId::new_v7(),
         Some(VerifierReceipt {
@@ -3613,12 +4029,13 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         replacement_proposal.proposal_revision_id,
         &replacement_proposal.fingerprint,
     );
-    let (replacement_acceptance_receipt, replacement_acceptance_observation) = source(
+    let (mut replacement_acceptance_receipt, replacement_acceptance_observation) = source(
         "replacement-acceptance",
         &replacement_acceptance_payload,
         32,
         repository_id,
     );
+    replacement_acceptance_receipt.source_ref = replacement_proposal.proposal_id.to_string();
     writer
         .commit(
             &command(

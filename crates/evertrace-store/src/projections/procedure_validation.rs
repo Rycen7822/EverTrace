@@ -1,3 +1,4 @@
+use super::procedure::NegativeReviewActionReason;
 use super::*;
 
 fn procedure_usage_scope_matches(
@@ -695,6 +696,23 @@ impl JournalAdmissionState {
         {
             return Err(StoreError::StoreCorrupt);
         }
+        let action =
+            NegativeReviewActionReason::parse(&review.reason).ok_or(StoreError::StoreCorrupt)?;
+        if action == NegativeReviewActionReason::ResolveAsIneffective {
+            if predecessor.status
+                != evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
+                || negative.level
+                    != evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective
+                || review.status
+                    != evertrace_domain::procedure::ProcedureNegativeReviewStatus::Dismissed
+                || review.successor_usage_revision_id.is_some()
+                || review.evidence_refs != negative.evidence_refs
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            self.validate_procedure_negative(negative, negative_seq, false, history)?;
+            return Ok(());
+        }
         let usage = history
             .usage_before(negative.procedure_usage_id, negative_seq)
             .map(|(usage, _)| usage)
@@ -741,22 +759,42 @@ impl JournalAdmissionState {
             }
             results.push(result);
         }
-        let valid = match review.status {
-            ProcedureNegativeReviewStatus::Dismissed => results.iter().all(|result| {
-                result.failure.is_none()
-                    && result.verifier_receipt.as_ref().is_some_and(|receipt| {
-                        receipt.status == evertrace_domain::semantic::VerifierStatus::Passed
+        let valid = match action {
+            NegativeReviewActionReason::DismissAttribution => {
+                predecessor.status == ProcedureNegativeReviewStatus::Pending
+                    && negative.level
+                        == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                    && review.status == ProcedureNegativeReviewStatus::Dismissed
+                    && review.successor_usage_revision_id.is_none()
+                    && results.iter().all(|result| {
+                        result.completeness
+                            == evertrace_domain::semantic::EvidenceCompleteness::Complete
+                            && result.failure.is_none()
+                            && result.verifier_receipt.as_ref().is_some_and(|receipt| {
+                                receipt.status == evertrace_domain::semantic::VerifierStatus::Passed
+                            })
                     })
-            }),
-            ProcedureNegativeReviewStatus::Upheld => results.iter().all(|result| {
-                matches!(
-                    result.failure,
-                    Some(evertrace_domain::semantic::ResultFailure::Verifier(
-                        evertrace_domain::semantic::VerifierFailureCode::DeterministicReparseMismatch
-                    ))
-                )
-            }),
-            ProcedureNegativeReviewStatus::Superseded => {
+            }
+            NegativeReviewActionReason::ConfirmHarm => {
+                predecessor.status == ProcedureNegativeReviewStatus::Pending
+                    && negative.level
+                        == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                    && negative.local_context.is_none()
+                    && review.status == ProcedureNegativeReviewStatus::Upheld
+                    && review.successor_usage_revision_id.is_none()
+                    && results.iter().all(|result| {
+                        matches!(
+                            result.failure,
+                            Some(evertrace_domain::semantic::ResultFailure::Verifier(
+                                evertrace_domain::semantic::VerifierFailureCode::DeterministicReparseMismatch
+                            ))
+                        )
+                    })
+            }
+            NegativeReviewActionReason::SuccessorSuperseded => {
+                if review.status != ProcedureNegativeReviewStatus::Superseded {
+                    return Err(StoreError::StoreCorrupt);
+                }
                 let old = self
                     .procedure
                     .revision_entry(negative.procedure_revision_id)
@@ -787,7 +825,7 @@ impl JournalAdmissionState {
                             })
                     })
             }
-            ProcedureNegativeReviewStatus::Pending => false,
+            NegativeReviewActionReason::ResolveAsIneffective => false,
         };
         if results.is_empty() || !valid {
             return Err(StoreError::StoreCorrupt);

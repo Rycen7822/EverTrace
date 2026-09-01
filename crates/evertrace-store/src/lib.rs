@@ -25,13 +25,14 @@ pub use objects::{
     OBJECTS_CHECKPOINT_ID, OBJECTS_TABLE, ObjectRow, ObjectRowClass, ObjectRowKind, objects_schema,
 };
 pub use projections::{
-    AttemptCurrentView, AutoresearchCurrentView, EpisodeCurrentView, NamedCurrentDependency,
-    OperationBurstCurrentView, ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom,
-    RecallCurrentContext, ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
-    ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
-    ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
-    RuntimeSchedulerView, SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView,
-    WorkBindingCurrentView, WorkIdentityCurrentView, reduce_journal,
+    AttemptCurrentView, AutoresearchCurrentView, CompetingResolutionEvidenceView,
+    EpisodeCurrentView, NamedCurrentDependency, OperationBurstCurrentView, ProjectionSnapshot,
+    ProjectionWorker, RecallCurrentAtom, RecallCurrentContext, ReconciliationArtifactContext,
+    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
+    ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
+    RecoveryEvidenceCurrentView, RuntimeSchedulerView, SegmentationCurrentState,
+    SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView, WorkIdentityCurrentView,
+    reduce_journal,
 };
 pub use query::{L0002ProjectionSnapshot, derive_l0002_projections, object_projection_hash};
 pub use relations::{
@@ -44,4 +45,4 @@ pub use search::{
     SearchSnapshot, read_search_rows, search_schema,
 };
 pub use session_import::*;
-pub use writer::{JournalWriter, SiblingWriterLock};
+pub use writer::{CommittedCommand, JournalWriter, SiblingWriterLock};
