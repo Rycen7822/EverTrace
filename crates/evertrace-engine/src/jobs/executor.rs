@@ -1,7 +1,7 @@
 use evertrace_store::{
-    CommitOutcome, JournalCommand, JournalWriter, ProjectionSnapshot, RecallCurrentContext,
-    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
-    StoreError,
+    CommitOutcome, CommittedCommand, JournalCommand, JournalWriter, ProjectionSnapshot,
+    RecallCurrentContext, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
+    ReconciliationFrontier, StoreError,
 };
 use std::path::Path;
 use thiserror::Error;
@@ -24,6 +24,10 @@ enum WriterRequest {
     },
     Project {
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
+    },
+    CommittedCommand {
+        command_id: evertrace_domain::ids::CommandId,
+        reply: oneshot::Sender<Result<Option<CommittedCommand>, WriterActorError>>,
     },
     RecallCurrentContexts {
         limit: usize,
@@ -91,6 +95,18 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::Project { reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn committed_command(
+        &self,
+        command_id: evertrace_domain::ids::CommandId,
+    ) -> Result<Option<CommittedCommand>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CommittedCommand { command_id, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -285,6 +301,17 @@ async fn run_writer(
             }
             WriterRequest::Project { reply } => {
                 let result = writer.project().await.map_err(map_store_error);
+                let fatal = result.is_err();
+                let _ = reply.send(result);
+                if fatal {
+                    return Err(WriterActorError::Store);
+                }
+            }
+            WriterRequest::CommittedCommand { command_id, reply } => {
+                let result = writer
+                    .committed_command(command_id)
+                    .await
+                    .map_err(map_store_error);
                 let fatal = result.is_err();
                 let _ = reply.send(result);
                 if fatal {

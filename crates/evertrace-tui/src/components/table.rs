@@ -4,8 +4,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-pub fn table(title: &'static str, empty: &'static str) -> Paragraph<'static> {
-    Paragraph::new(empty)
+pub fn table(title: &'static str, body: String) -> Paragraph<'static> {
+    Paragraph::new(body)
         .style(Style::default().fg(EVER_OS.muted))
         .block(
             Block::default()

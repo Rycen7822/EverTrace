@@ -5,7 +5,7 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::dto::{HealthMode, PROTOCOL_VERSION};
+use crate::dto::{HealthMode, HumanGovernanceResponse, PROTOCOL_VERSION};
 use crate::envelope::McpResultEnvelope;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,6 +25,7 @@ pub enum Response {
     McpResult(Box<McpResultEnvelope>),
     RecallCue(RecallCueResponse),
     SessionImportAdmin(SessionImportAdminResponse),
+    HumanGovernance(HumanGovernanceResponse),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

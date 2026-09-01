@@ -1,9 +1,12 @@
-use crate::{AppEvent, AppEventSender};
+use crate::{AppEvent, AppEventSender, app_event::HumanReadLocator};
 use evertrace_domain::ids::RequestId;
 use evertrace_protocol::{
     LocalClient, LocalIncoming,
-    command::{Command, CommandEnvelope},
-    dto::ClientKind,
+    command::{Command, CommandEnvelope, RequestRecoveryCommand},
+    dto::{
+        ClientKind, HUMAN_PAGE_LIMIT, HumanActionResult, HumanActionStatus, HumanGovernanceRequest,
+        HumanGovernanceResponse, HumanReadRequest, HumanSurface,
+    },
     response::Response,
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
@@ -14,10 +17,43 @@ const PENDING_AFTER: Duration = Duration::from_millis(100);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
 const RECONNECT_DELAYS_MS: [u64; 5] = [250, 500, 1_000, 2_000, 5_000];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClientCommand {
-    Refresh,
+    Refresh(HumanSurface),
+    Human(HumanGovernanceRequest),
+    Recovery(RequestRecoveryCommand),
     Shutdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingKind {
+    Health,
+    HumanRead(HumanSurface, HumanReadLocator),
+    HumanAction,
+    Recovery,
+}
+
+async fn send_recovery(
+    sender: &mut evertrace_protocol::LocalCommandSender,
+    pending: &mut BTreeMap<RequestId, (Instant, PendingKind)>,
+    request: RequestRecoveryCommand,
+) -> Result<(), evertrace_protocol::error::ProtocolError> {
+    if pending.len() >= MAX_PENDING
+        || pending
+            .values()
+            .any(|(_, kind)| matches!(kind, PendingKind::Recovery))
+    {
+        return Ok(());
+    }
+    let request_id = RequestId::new_v7();
+    sender
+        .send(CommandEnvelope {
+            request_id,
+            command: Command::RequestRecovery(request),
+        })
+        .await?;
+    pending.insert(request_id, (Instant::now(), PendingKind::Recovery));
+    Ok(())
 }
 
 pub(crate) fn channel() -> (mpsc::Sender<ClientCommand>, mpsc::Receiver<ClientCommand>) {
@@ -26,7 +62,7 @@ pub(crate) fn channel() -> (mpsc::Sender<ClientCommand>, mpsc::Receiver<ClientCo
 
 async fn send_health(
     sender: &mut evertrace_protocol::LocalCommandSender,
-    pending: &mut BTreeMap<RequestId, Instant>,
+    pending: &mut BTreeMap<RequestId, (Instant, PendingKind)>,
 ) -> Result<(), evertrace_protocol::error::ProtocolError> {
     if !pending.is_empty() {
         return Ok(());
@@ -38,8 +74,173 @@ async fn send_health(
             command: Command::Health,
         })
         .await?;
-    pending.insert(request_id, Instant::now());
+    pending.insert(request_id, (Instant::now(), PendingKind::Health));
     Ok(())
+}
+
+async fn send_human(
+    sender: &mut evertrace_protocol::LocalCommandSender,
+    pending: &mut BTreeMap<RequestId, (Instant, PendingKind)>,
+    request: HumanGovernanceRequest,
+) -> Result<(), evertrace_protocol::error::ProtocolError> {
+    let kind = match &request {
+        HumanGovernanceRequest::Read { request } => match request {
+            HumanReadRequest::List { surface, .. } => {
+                PendingKind::HumanRead(*surface, HumanReadLocator::List)
+            }
+            HumanReadRequest::Detail {
+                surface,
+                object_ref,
+                expected_frontier,
+                expected_revision_ref,
+            } => PendingKind::HumanRead(
+                *surface,
+                HumanReadLocator::Detail {
+                    expected_frontier: *expected_frontier,
+                    stable_key: object_ref.clone(),
+                    expected_revision_ref: expected_revision_ref.clone(),
+                },
+            ),
+            HumanReadRequest::Related {
+                relation,
+                source_stable_key,
+                expected_source_revision_ref,
+                expected_frontier,
+                ..
+            } => PendingKind::HumanRead(
+                HumanSurface::Explorer,
+                HumanReadLocator::Related {
+                    relation: *relation,
+                    source_stable_key: source_stable_key.clone(),
+                    expected_source_revision_ref: expected_source_revision_ref.clone(),
+                    expected_frontier: *expected_frontier,
+                },
+            ),
+        },
+        HumanGovernanceRequest::Act { .. } => PendingKind::HumanAction,
+    };
+    let request_id = RequestId::new_v7();
+    sender
+        .send(CommandEnvelope {
+            request_id,
+            command: Command::HumanGovernance(request),
+        })
+        .await?;
+    pending.insert(request_id, (Instant::now(), kind));
+    Ok(())
+}
+
+fn human_inflight(pending: &BTreeMap<RequestId, (Instant, PendingKind)>) -> bool {
+    pending.values().any(|(_, kind)| {
+        matches!(
+            kind,
+            PendingKind::HumanRead(_, _) | PendingKind::HumanAction
+        )
+    })
+}
+
+fn local_human_rejection(reason: &str) -> AppEvent {
+    AppEvent::HumanAction(HumanGovernanceResponse::Action {
+        result: HumanActionResult {
+            status: HumanActionStatus::Unavailable,
+            current_revision_ref: None,
+            audit_event_ref: None,
+            reason: Some(reason.into()),
+        },
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HumanHandoff {
+    Sent,
+    Queued,
+    RejectedInvalid,
+    RejectedBusy,
+}
+
+fn stage_human(
+    pending: &BTreeMap<RequestId, (Instant, PendingKind)>,
+    queued_action: &mut Option<HumanGovernanceRequest>,
+    latest_read: &mut Option<HumanGovernanceRequest>,
+    request: &HumanGovernanceRequest,
+) -> HumanHandoff {
+    if !request.validate() {
+        return HumanHandoff::RejectedInvalid;
+    }
+    match request {
+        HumanGovernanceRequest::Act { .. } => {
+            let action_inflight = pending
+                .values()
+                .any(|(_, kind)| matches!(kind, PendingKind::HumanAction));
+            if action_inflight || queued_action.is_some() {
+                return HumanHandoff::RejectedBusy;
+            }
+            if human_inflight(pending) {
+                *queued_action = Some(request.clone());
+                return HumanHandoff::Queued;
+            }
+        }
+        HumanGovernanceRequest::Read { .. } => {
+            if human_inflight(pending) {
+                *latest_read = Some(request.clone());
+                return HumanHandoff::Queued;
+            }
+        }
+    }
+    HumanHandoff::Sent
+}
+
+async fn handoff_human(
+    sender: &mut evertrace_protocol::LocalCommandSender,
+    pending: &mut BTreeMap<RequestId, (Instant, PendingKind)>,
+    queued_action: &mut Option<HumanGovernanceRequest>,
+    latest_read: &mut Option<HumanGovernanceRequest>,
+    events: &AppEventSender,
+    request: HumanGovernanceRequest,
+) -> Result<HumanHandoff, evertrace_protocol::error::ProtocolError> {
+    match stage_human(pending, queued_action, latest_read, &request) {
+        HumanHandoff::Sent => {
+            send_human(sender, pending, request).await?;
+            Ok(HumanHandoff::Sent)
+        }
+        HumanHandoff::Queued => Ok(HumanHandoff::Queued),
+        HumanHandoff::RejectedInvalid => {
+            let _ = events
+                .send(local_human_rejection("local_invalid_request"))
+                .await;
+            Ok(HumanHandoff::RejectedInvalid)
+        }
+        HumanHandoff::RejectedBusy => {
+            let _ = events.send(local_human_rejection("local_busy")).await;
+            Ok(HumanHandoff::RejectedBusy)
+        }
+    }
+}
+
+async fn flush_human_handoff(
+    sender: &mut evertrace_protocol::LocalCommandSender,
+    pending: &mut BTreeMap<RequestId, (Instant, PendingKind)>,
+    queued_action: &mut Option<HumanGovernanceRequest>,
+    latest_read: &mut Option<HumanGovernanceRequest>,
+) -> Result<(), evertrace_protocol::error::ProtocolError> {
+    if human_inflight(pending) {
+        return Ok(());
+    }
+    if let Some(request) = queued_action.take().or_else(|| latest_read.take()) {
+        send_human(sender, pending, request).await?;
+    }
+    Ok(())
+}
+
+fn first_page_request(surface: HumanSurface) -> HumanGovernanceRequest {
+    HumanGovernanceRequest::Read {
+        request: HumanReadRequest::List {
+            surface,
+            expected_frontier: None,
+            after: None,
+            limit: HUMAN_PAGE_LIMIT,
+        },
+    }
 }
 
 pub(crate) async fn run(
@@ -60,7 +261,7 @@ pub(crate) async fn run(
             Ok(client) => client,
             Err(_) => {
                 let _ = events.send(AppEvent::Disconnected).await;
-                if wait_or_shutdown(&mut commands, RECONNECT_DELAYS_MS[backoff]).await {
+                if wait_or_shutdown(&mut commands, &events, RECONNECT_DELAYS_MS[backoff]).await {
                     return;
                 }
                 backoff = (backoff + 1).min(RECONNECT_DELAYS_MS.len() - 1);
@@ -86,7 +287,7 @@ pub(crate) async fn run(
             let _ = incoming_tasks.join_next().await;
             let _ = events.send(AppEvent::Pending(0)).await;
             let _ = events.send(AppEvent::Disconnected).await;
-            if wait_or_shutdown(&mut commands, RECONNECT_DELAYS_MS[backoff]).await {
+            if wait_or_shutdown(&mut commands, &events, RECONNECT_DELAYS_MS[backoff]).await {
                 return;
             }
             backoff = (backoff + 1).min(RECONNECT_DELAYS_MS.len() - 1);
@@ -95,25 +296,51 @@ pub(crate) async fn run(
         let mut pending_visible = false;
         let mut healthy = false;
         let mut shutdown_requested = false;
+        let mut queued_action = None;
+        let mut latest_read = None;
 
         loop {
             let pending_deadline = pending
                 .values()
+                .map(|(started, _)| *started)
                 .min()
-                .copied()
                 .map(|started| started + PENDING_AFTER)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
             let response_deadline = pending
                 .values()
+                .map(|(started, _)| *started)
                 .min()
-                .copied()
                 .map(|started| started + RESPONSE_DEADLINE)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
             tokio::select! {
                 command = commands.recv() => {
                     match command {
-                        Some(ClientCommand::Refresh) => {
-                            if send_health(&mut outgoing, &mut pending).await.is_err() {
+                        Some(ClientCommand::Refresh(surface)) => {
+                            if handoff_human(
+                                &mut outgoing,
+                                &mut pending,
+                                &mut queued_action,
+                                &mut latest_read,
+                                &events,
+                                first_page_request(surface),
+                            ).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(ClientCommand::Human(request)) => {
+                            if handoff_human(
+                                &mut outgoing,
+                                &mut pending,
+                                &mut queued_action,
+                                &mut latest_read,
+                                &events,
+                                request,
+                            ).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(ClientCommand::Recovery(request)) => {
+                            if send_recovery(&mut outgoing, &mut pending, request).await.is_err() {
                                 break;
                             }
                         }
@@ -126,20 +353,42 @@ pub(crate) async fn run(
                 message = incoming_messages.recv() => {
                     match message {
                         Some(Ok(LocalIncoming::Response(envelope))) => {
-                            if pending.remove(&envelope.request_id).is_none() {
-                                break;
-                            }
+                            let Some((_, kind)) = pending.remove(&envelope.request_id) else { break; };
                             if pending_visible {
-                                let _ = events.send(AppEvent::Pending(0)).await;
-                                pending_visible = false;
+                                let _ = events.send(AppEvent::Pending(pending.len())).await;
+                                pending_visible = !pending.is_empty();
                             }
-                            match envelope.response {
-                                Response::Health(health) if pending.is_empty() && health.validate() => {
+                            let accepted = match (kind, envelope.response) {
+                                (PendingKind::Health, Response::Health(health)) if health.validate() => {
                                     healthy = true;
                                     backoff = 0;
                                     let _ = events.send(AppEvent::Health(health)).await;
+                                    true
                                 }
-                                _ => break,
+                                (PendingKind::HumanRead(surface, locator), Response::HumanGovernance(response @ (HumanGovernanceResponse::Snapshot { .. } | HumanGovernanceResponse::Conflict { .. }))) if response.validate() => {
+                                    let _ = events.send(AppEvent::HumanRead { surface, locator, response }).await;
+                                    true
+                                }
+                                (PendingKind::HumanAction, Response::HumanGovernance(response @ (HumanGovernanceResponse::Action { .. } | HumanGovernanceResponse::Conflict { .. }))) if response.validate() => {
+                                    let _ = events.send(AppEvent::HumanAction(response)).await;
+                                    true
+                                }
+                                (PendingKind::Recovery, Response::RecoveryAction(response)) if response.validate() => {
+                                    let _ = events.send(AppEvent::Recovery(response)).await;
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if !accepted {
+                                break;
+                            }
+                            if flush_human_handoff(
+                                &mut outgoing,
+                                &mut pending,
+                                &mut queued_action,
+                                &mut latest_read,
+                            ).await.is_err() {
+                                break;
                             }
                         }
                         Some(Ok(LocalIncoming::Error(_))) => break,
@@ -163,24 +412,40 @@ pub(crate) async fn run(
         if shutdown_requested {
             return;
         }
+        if queued_action.take().is_some() {
+            let _ = events
+                .send(local_human_rejection("local_transport_unavailable"))
+                .await;
+        }
         let _ = events.send(AppEvent::Disconnected).await;
         if healthy {
             backoff = 0;
         }
-        if wait_or_shutdown(&mut commands, RECONNECT_DELAYS_MS[backoff]).await {
+        if wait_or_shutdown(&mut commands, &events, RECONNECT_DELAYS_MS[backoff]).await {
             return;
         }
         backoff = (backoff + 1).min(RECONNECT_DELAYS_MS.len() - 1);
     }
 }
 
-async fn wait_or_shutdown(commands: &mut mpsc::Receiver<ClientCommand>, delay_ms: u64) -> bool {
+async fn wait_or_shutdown(
+    commands: &mut mpsc::Receiver<ClientCommand>,
+    events: &AppEventSender,
+    delay_ms: u64,
+) -> bool {
     let delay = tokio::time::sleep(Duration::from_millis(delay_ms));
     tokio::pin!(delay);
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Some(ClientCommand::Refresh) => continue,
+                Some(ClientCommand::Refresh(_)) => continue,
+                Some(ClientCommand::Human(HumanGovernanceRequest::Act { .. })) => {
+                    let _ = events.send(local_human_rejection("local_transport_unavailable")).await;
+                }
+                Some(ClientCommand::Human(HumanGovernanceRequest::Read { .. })) => continue,
+                Some(ClientCommand::Recovery(_)) => {
+                    let _ = events.send(AppEvent::Disconnected).await;
+                }
                 Some(ClientCommand::Shutdown) | None => return true,
             },
             () = &mut delay => return false,
@@ -219,6 +484,86 @@ mod tests {
             effective_config_hash: "0".repeat(64),
             algorithm_revision: 1,
         }
+    }
+
+    fn proposal_action() -> HumanGovernanceRequest {
+        HumanGovernanceRequest::Act {
+            expected_frontier: 1,
+            action: evertrace_protocol::dto::HumanActionRequest::Proposal {
+                proposal_id: evertrace_domain::ids::RevisionProposalId::new_v7(),
+                expected_revision_id: evertrace_domain::revision::RevisionId::new_v7(),
+                expected_fingerprint: "a".repeat(64),
+                decision: evertrace_protocol::dto::ProposalHumanDecision::Defer,
+                edited_payload: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn human_handoff_preserves_one_write_and_latest_read() {
+        let mut pending = BTreeMap::new();
+        pending.insert(
+            RequestId::new_v7(),
+            (
+                Instant::now(),
+                PendingKind::HumanRead(HumanSurface::Inbox, HumanReadLocator::List),
+            ),
+        );
+        let pending_count = pending.len();
+        let mut queued_action = None;
+        let mut latest_read = None;
+
+        let action = proposal_action();
+        assert_eq!(
+            stage_human(&pending, &mut queued_action, &mut latest_read, &action),
+            HumanHandoff::Queued
+        );
+        assert_eq!(pending.len(), pending_count);
+        assert_eq!(queued_action.as_ref(), Some(&action));
+        assert_eq!(
+            stage_human(
+                &pending,
+                &mut queued_action,
+                &mut latest_read,
+                &proposal_action()
+            ),
+            HumanHandoff::RejectedBusy
+        );
+        assert_eq!(queued_action.as_ref(), Some(&action));
+
+        for surface in [HumanSurface::Explorer, HumanSurface::System] {
+            assert_eq!(
+                stage_human(
+                    &pending,
+                    &mut queued_action,
+                    &mut latest_read,
+                    &first_page_request(surface)
+                ),
+                HumanHandoff::Queued
+            );
+        }
+        assert_eq!(latest_read, Some(first_page_request(HumanSurface::System)));
+        assert_eq!(pending.len(), pending_count);
+    }
+
+    #[tokio::test]
+    async fn disconnected_handoff_rejects_unsent_write() {
+        let (commands, mut command_receiver) = channel();
+        let (events, mut event_receiver) = AppEventSender::channel();
+        commands
+            .send(ClientCommand::Human(proposal_action()))
+            .await
+            .unwrap();
+        assert!(!wait_or_shutdown(&mut command_receiver, &events, 25).await);
+        let event = event_receiver.recv().await.unwrap();
+        let AppEvent::HumanAction(HumanGovernanceResponse::Action { result }) = event else {
+            panic!("expected local action rejection");
+        };
+        assert_eq!(result.status, HumanActionStatus::Unavailable);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("local_transport_unavailable")
+        );
     }
 
     fn start_server(

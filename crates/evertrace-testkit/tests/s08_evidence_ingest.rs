@@ -11,6 +11,7 @@ use evertrace_domain::evidence::{
     SourceInstanceId, SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole,
     UnsupportedRecordClassification, payload_fingerprint, source_observation_id,
 };
+use evertrace_domain::ids::CommandId;
 use evertrace_domain::work::{LaneLifecycleEvidence, LivenessState};
 use evertrace_engine::{EvidenceIngestor, IngestError, open_writer, spawn_writer};
 use evertrace_store::{
@@ -123,6 +124,42 @@ fn input(record: &str, payload: &[u8]) -> CaptureRecordInput {
         event_time_us: Some(1),
         raw_payload: payload.to_vec(),
     }
+}
+
+#[test]
+fn isolated_capture_never_mixes_with_the_hook_segment_and_requires_its_claimed_route() {
+    let root = TempDir::new().unwrap();
+    let (snapshot, mut runtime) = prepare(root.path());
+    let mut isolated = input("isolated", b"tui acceptance");
+    isolated.eligible_event_manifest_ref = "evertrace_tui_acceptance_v1".into();
+    runtime
+        .capture_isolated(isolated, CommandId::new_v7(), "tui-test")
+        .unwrap();
+    runtime.capture(input("ordinary", b"hook")).unwrap();
+
+    let (mut spool, _) = evertrace_capture::DurableSpool::open(
+        snapshot.spool_dir.clone(),
+        snapshot.spool_limits().unwrap(),
+    )
+    .unwrap();
+    spool.seal_active(2).unwrap();
+    let ordinary = spool.sealed_segments(16).unwrap();
+    let isolated = spool.isolated_segments(16).unwrap();
+    assert_eq!(ordinary.len(), 1);
+    assert_eq!(ordinary[0].frames().len(), 1);
+    assert_eq!(
+        ordinary[0].frames()[0].record.spool_record_id,
+        "spool-ordinary"
+    );
+    assert_eq!(isolated.len(), 1);
+    assert_eq!(isolated[0].frames().len(), 1);
+    assert_eq!(
+        isolated[0].frames()[0].record.spool_record_id,
+        "spool-isolated"
+    );
+    spool
+        .acknowledge_segment(isolated.into_iter().next().unwrap(), 1)
+        .unwrap();
 }
 
 #[test]

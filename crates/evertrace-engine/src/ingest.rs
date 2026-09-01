@@ -232,90 +232,105 @@ impl EvidenceIngestor {
         verified: crate::capture::VerifiedCapture,
         confirmed_prefix_digest: Option<String>,
     ) -> Result<JournalCommand, IngestError> {
-        let scope = EventScope {
-            repository_id: verified
-                .body
-                .repository_instance_id
-                .map(|value| value.to_string()),
-            worktree_id: verified
-                .body
-                .worktree_instance_id
-                .map(|value| value.to_string()),
-            task_id: verified.body.task_id.map(|value| value.to_string()),
-            session_id: Some(verified.body.source_session_ref.clone()),
-            ..EventScope::default()
-        };
-        let source_kind = match verified.body.source_role {
-            SourceRole::User | SourceRole::Assistant | SourceRole::Tool | SourceRole::Host => {
-                SourceKind::Hook
-            }
-            SourceRole::Imported => SourceKind::Import,
-        };
-        let mut payloads = Vec::new();
-        if verified.body.source_revision_mode == SourceRevisionMode::Replacement {
-            payloads.push(JournalPayload::SourceRevisionRecorded(
-                SourceRevisionRecorded {
-                    source_instance_id: verified.body.source_instance_id.clone(),
-                    source_revision: verified.body.source_revision.clone(),
-                    previous_source_revision: verified.body.previous_source_revision.clone(),
-                    mode: verified.body.source_revision_mode,
-                    recorded_at_us: verified.body.recorded_at_us,
-                },
-            ));
+        let command_id = verified.body.command_id;
+        let events = capture_event_drafts(
+            &verified,
+            confirmed_prefix_digest,
+            self.effective_config_hash,
+            &self.algorithm_revision,
+        )?;
+        JournalCommand::new(command_id, events).map_err(|_| IngestError::InvalidRecord)
+    }
+}
+
+pub(crate) fn capture_event_drafts(
+    verified: &crate::capture::VerifiedCapture,
+    confirmed_prefix_digest: Option<String>,
+    effective_config_hash: [u8; 32],
+    algorithm_revision: &str,
+) -> Result<Vec<JournalEventDraft>, IngestError> {
+    let scope = EventScope {
+        repository_id: verified
+            .body
+            .repository_instance_id
+            .map(|value| value.to_string()),
+        worktree_id: verified
+            .body
+            .worktree_instance_id
+            .map(|value| value.to_string()),
+        task_id: verified.body.task_id.map(|value| value.to_string()),
+        session_id: Some(verified.body.source_session_ref.clone()),
+        ..EventScope::default()
+    };
+    let source_kind = match verified.body.source_role {
+        SourceRole::User | SourceRole::Assistant | SourceRole::Tool | SourceRole::Host => {
+            SourceKind::Hook
         }
-        payloads.push(JournalPayload::SourceReceiptRecorded(Box::new(
-            verified.receipt,
-        )));
-        payloads.push(JournalPayload::SourceObservationRecorded(Box::new(
-            verified.observation.clone(),
-        )));
-        payloads.push(JournalPayload::SourceIngestWatermark(
-            SourceIngestWatermark {
+        SourceRole::Imported => SourceKind::Import,
+    };
+    let mut payloads = Vec::new();
+    if verified.body.source_revision_mode == SourceRevisionMode::Replacement {
+        payloads.push(JournalPayload::SourceRevisionRecorded(
+            SourceRevisionRecorded {
                 source_instance_id: verified.body.source_instance_id.clone(),
                 source_revision: verified.body.source_revision.clone(),
-                source_sequence: verified.body.source_sequence,
-                confirmed_prefix_digest,
+                previous_source_revision: verified.body.previous_source_revision.clone(),
+                mode: verified.body.source_revision_mode,
+                recorded_at_us: verified.body.recorded_at_us,
             },
         ));
-        if let Some(surface) = verified.surface {
-            payloads.push(JournalPayload::EvidenceSurfaceRecorded(Box::new(surface)));
-        }
-        payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
-            target_kind: DirtyTargetKind::EvidenceSurface,
-            target_id: verified.observation.source_observation_id.to_string(),
-            algorithm_revision: self.algorithm_revision.clone(),
-            source_watermark: verified.body.source_sequence,
-        }));
-        payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
-            target_kind: DirtyTargetKind::PhysicalNormalization,
-            target_id: verified.observation.source_observation_id.to_string(),
-            algorithm_revision: self.algorithm_revision.clone(),
-            source_watermark: verified.body.source_sequence,
-        }));
-        if verified.body.lifecycle.is_some() {
-            payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
-                target_kind: DirtyTargetKind::CaptureReconciliation,
-                target_id: verified.observation.source_observation_id.to_string(),
-                algorithm_revision: self.algorithm_revision.clone(),
-                source_watermark: verified.body.source_sequence,
-            }));
-        }
-        let events = payloads
-            .into_iter()
-            .map(|payload| JournalEventDraft {
-                occurred_at_us: verified.body.event_time_us,
-                source_kind,
-                scope: scope.clone(),
-                causation_id: None,
-                correlation_id: None,
-                effective_config_hash: self.effective_config_hash,
-                algorithm_revision: self.algorithm_revision.clone(),
-                payload,
-            })
-            .collect();
-        JournalCommand::new(verified.body.command_id, events)
-            .map_err(|_| IngestError::InvalidRecord)
     }
+    payloads.push(JournalPayload::SourceReceiptRecorded(Box::new(
+        verified.receipt.clone(),
+    )));
+    payloads.push(JournalPayload::SourceObservationRecorded(Box::new(
+        verified.observation.clone(),
+    )));
+    payloads.push(JournalPayload::SourceIngestWatermark(
+        SourceIngestWatermark {
+            source_instance_id: verified.body.source_instance_id.clone(),
+            source_revision: verified.body.source_revision.clone(),
+            source_sequence: verified.body.source_sequence,
+            confirmed_prefix_digest,
+        },
+    ));
+    if let Some(surface) = verified.surface.clone() {
+        payloads.push(JournalPayload::EvidenceSurfaceRecorded(Box::new(surface)));
+    }
+    payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
+        target_kind: DirtyTargetKind::EvidenceSurface,
+        target_id: verified.observation.source_observation_id.to_string(),
+        algorithm_revision: algorithm_revision.to_owned(),
+        source_watermark: verified.body.source_sequence,
+    }));
+    payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
+        target_kind: DirtyTargetKind::PhysicalNormalization,
+        target_id: verified.observation.source_observation_id.to_string(),
+        algorithm_revision: algorithm_revision.to_owned(),
+        source_watermark: verified.body.source_sequence,
+    }));
+    if verified.body.lifecycle.is_some() {
+        payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
+            target_kind: DirtyTargetKind::CaptureReconciliation,
+            target_id: verified.observation.source_observation_id.to_string(),
+            algorithm_revision: algorithm_revision.to_owned(),
+            source_watermark: verified.body.source_sequence,
+        }));
+    }
+    let events = payloads
+        .into_iter()
+        .map(|payload| JournalEventDraft {
+            occurred_at_us: verified.body.event_time_us,
+            source_kind,
+            scope: scope.clone(),
+            causation_id: None,
+            correlation_id: None,
+            effective_config_hash,
+            algorithm_revision: algorithm_revision.to_owned(),
+            payload,
+        })
+        .collect();
+    Ok(events)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

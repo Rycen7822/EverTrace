@@ -23,7 +23,7 @@ use crate::{
     frame::{CaptureRecordBody, RecoveryPreflightCandidate, SpoolRecord, encode_record_body},
     protect,
     runtime_snapshot::RuntimeSnapshot,
-    spool::{CaptureGapMarker, DurableSpool, GapReason, SpoolError},
+    spool::{CaptureGapMarker, DurableSpool, GapReason, SealedSegment, SpoolError},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +32,11 @@ pub enum CaptureAdmissionState {
     Pressure,
     Unavailable,
     Recovering,
+}
+
+pub struct IsolatedCaptureOutcome {
+    pub outcome: CaptureOutcome,
+    pub segment: SealedSegment,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -155,7 +160,22 @@ impl CaptureRuntime {
     }
 
     pub fn capture(&mut self, input: CaptureRecordInput) -> Result<CaptureOutcome, CaptureError> {
-        self.capture_inner(input, None)
+        self.capture_inner(input, None, None, &mut None)
+    }
+
+    pub fn capture_isolated(
+        &mut self,
+        input: CaptureRecordInput,
+        command_id: CommandId,
+        routing_hint: &str,
+    ) -> Result<IsolatedCaptureOutcome, CaptureError> {
+        let mut segment = None;
+        let outcome =
+            self.capture_inner(input, None, Some((command_id, routing_hint)), &mut segment)?;
+        Ok(IsolatedCaptureOutcome {
+            outcome,
+            segment: segment.ok_or(CaptureError::Spool)?,
+        })
     }
 
     pub fn record_recovery_unavailable(
@@ -182,17 +202,21 @@ impl CaptureRuntime {
         input: CaptureRecordInput,
         pending: RecoveryPreflightCandidate,
     ) -> Result<CaptureOutcome, CaptureError> {
-        self.capture_inner(input, Some(pending))
+        self.capture_inner(input, Some(pending), None, &mut None)
     }
 
     fn capture_inner(
         &mut self,
         input: CaptureRecordInput,
         pending: Option<RecoveryPreflightCandidate>,
+        isolated: Option<(CommandId, &str)>,
+        isolated_segment: &mut Option<SealedSegment>,
     ) -> Result<CaptureOutcome, CaptureError> {
         validate_input(&input)?;
         let recorded_at_us = now_us()?;
-        let command_id = CommandId::new_v7();
+        let command_id = isolated
+            .as_ref()
+            .map_or_else(CommandId::new_v7, |(command_id, _)| *command_id);
         let spool_record_id = input
             .spool_record_id
             .clone()
@@ -344,7 +368,29 @@ impl CaptureRuntime {
             cas_refs: vec![cas_digest.clone()],
             record_body: body,
         };
-        match self.spool.append(&record) {
+        if let Some((_, routing_hint)) = isolated {
+            let segment = self
+                .spool
+                .append_isolated_sealed(&record, routing_hint)
+                .map_err(|_| CaptureError::Spool)?;
+            let end_watermark = segment.length();
+            *isolated_segment = Some(segment);
+            if self.state != CaptureAdmissionState::Recovering {
+                self.state = CaptureAdmissionState::Normal;
+            }
+            return Ok(CaptureOutcome::Durable {
+                command_id,
+                spool_record_id,
+                cas_digest,
+                end_watermark,
+                recovery_preflight: pending.map(|intent| DurableRecoveryPreflight {
+                    request_id: intent.recovery_capture_request_id,
+                    pending_revision_id: intent.pending_revision_id,
+                }),
+            });
+        }
+        let write = self.spool.append(&record);
+        match write {
             Ok(written) => {
                 if self.state != CaptureAdmissionState::Recovering {
                     self.state = CaptureAdmissionState::Normal;

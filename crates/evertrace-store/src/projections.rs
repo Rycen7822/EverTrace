@@ -18,16 +18,21 @@ use evertrace_domain::{
     },
     procedure::{ProcedureRevision, ProcedureUsageRevision},
     repository::{
-        IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
-        RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
+        IntegrationEvent, LineageAssessment, RecoveryApplication, RecoveryBundle,
+        RecoveryCaptureRequest, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
+        WorktreeTransition,
     },
     revision::RevisionId,
-    semantic::{Atom, ResultEvidence, RevisionProposal},
+    semantic::{
+        Atom, EvidenceCompleteness, ParserStatus, ResultEvidence, ResultScope, RevisionProposal,
+        VerifierStatus,
+    },
     work::{
-        ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus,
-        AttemptExecutionStatus, AttemptOutcomeState, AttemptVerification, CaptureReceipt,
-        CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane, ExperimentRun, LaneStatus,
-        OperationBurst, ResumeStateAssessment, SegmentationCorrection, SourceCoverage, Task,
+        ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus, AttemptBindingStatus,
+        AttemptExecutionStatus, AttemptLifecycleStatus, AttemptOutcomeState, AttemptVerification,
+        CaptureReceipt, CompetingAttemptGroup, CompetingResolutionStatus, ExecutionLane,
+        ExperimentRun, LaneStatus, OperationBurst, ResumeStateAssessment, RunContractValidity,
+        RunExecutionStatus, RunObservability, SegmentationCorrection, SourceCoverage, Task,
         TaskIdentityConfidence, WorkArtifact, WorkBindingRevision, WorkCheckpoint, WorkEpisode,
         Workstream,
     },
@@ -38,7 +43,7 @@ use crate::{
     command::{
         ATOM_RECORDED_EVENT_TYPE, DirtyTarget, DurableJob, JobStatus, JobTerminalReason,
         JournalCommand, JournalPayload, NormalizationWatermark, ObjectFamily, OutboxEntry,
-        SourceCloseDecision, SourceCloseReconciliation, SourceIngestWatermark,
+        SourceCloseDecision, SourceCloseReconciliation, SourceIngestWatermark, SourceKind,
         SourceRevisionRecorded, StoreError, WatermarkAdvanced, source_revision_ref,
     },
     journal::{
@@ -604,6 +609,59 @@ pub struct AttemptCurrentView {
     pub competing_groups: BTreeMap<CompetingAttemptGroupId, CompetingAttemptGroup>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkNewAttemptCurrentView {
+    pub frontier: u64,
+    pub source: Attempt,
+    pub existing_child: Option<Attempt>,
+}
+
+fn current_attempt_from_lineage(mut revisions: Vec<Attempt>) -> Result<Attempt, StoreError> {
+    revisions.sort_by_key(|value| value.revision_generation);
+    for (index, revision) in revisions.iter().enumerate() {
+        revision.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        let generation = u64::try_from(index + 1).map_err(|_| StoreError::StoreCorrupt)?;
+        let predecessor = index
+            .checked_sub(1)
+            .map(|previous| revisions[previous].revision_id);
+        if revision.revision_generation != generation
+            || revision.predecessor_revision_id != predecessor
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if let Some(previous) = index.checked_sub(1) {
+            revisions[previous]
+                .validate_successor(revision)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+        }
+    }
+    revisions.pop().ok_or(StoreError::StoreCorrupt)
+}
+
+fn current_group_from_lineage(
+    mut revisions: Vec<CompetingAttemptGroup>,
+) -> Result<CompetingAttemptGroup, StoreError> {
+    revisions.sort_by_key(|value| value.revision_generation);
+    for (index, revision) in revisions.iter().enumerate() {
+        revision.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        let generation = u64::try_from(index + 1).map_err(|_| StoreError::StoreCorrupt)?;
+        let predecessor = index
+            .checked_sub(1)
+            .map(|previous| revisions[previous].revision_id);
+        if revision.revision_generation != generation
+            || revision.predecessor_revision_id != predecessor
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if let Some(previous) = index.checked_sub(1) {
+            revisions[previous]
+                .validate_successor(revision)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+        }
+    }
+    revisions.pop().ok_or(StoreError::StoreCorrupt)
+}
+
 impl AttemptCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
         let mut view = Self {
@@ -656,49 +714,396 @@ impl AttemptCurrentView {
                 _ => {}
             }
         }
-        for (id, mut revisions) in attempt_revisions {
-            revisions.sort_by_key(|value| value.revision_generation);
-            for (index, revision) in revisions.iter().enumerate() {
-                revision.validate().map_err(|_| StoreError::StoreCorrupt)?;
-                let generation = u64::try_from(index + 1).map_err(|_| StoreError::StoreCorrupt)?;
-                let predecessor = index
-                    .checked_sub(1)
-                    .map(|previous| revisions[previous].revision_id);
-                if revision.revision_generation != generation
-                    || revision.predecessor_revision_id != predecessor
-                {
-                    return Err(StoreError::StoreCorrupt);
-                }
-                if let Some(previous) = index.checked_sub(1) {
-                    revisions[previous]
-                        .validate_successor(revision)
-                        .map_err(|_| StoreError::StoreCorrupt)?;
-                }
-            }
+        for (id, revisions) in attempt_revisions {
             view.attempts
-                .insert(id, revisions.pop().ok_or(StoreError::StoreCorrupt)?);
+                .insert(id, current_attempt_from_lineage(revisions)?);
         }
-        for (id, mut revisions) in group_revisions {
-            revisions.sort_by_key(|value| value.revision_generation);
-            for (index, revision) in revisions.iter().enumerate() {
-                revision.validate().map_err(|_| StoreError::StoreCorrupt)?;
-                let generation = u64::try_from(index + 1).map_err(|_| StoreError::StoreCorrupt)?;
-                let predecessor = index
-                    .checked_sub(1)
-                    .map(|previous| revisions[previous].revision_id);
-                if revision.revision_generation != generation
-                    || revision.predecessor_revision_id != predecessor
+        for (id, revisions) in group_revisions {
+            view.competing_groups
+                .insert(id, current_group_from_lineage(revisions)?);
+        }
+        Ok(view)
+    }
+
+    pub fn for_competing_group(
+        snapshot: &ProjectionSnapshot,
+        group_id: CompetingAttemptGroupId,
+    ) -> Result<Self, StoreError> {
+        let mut view = Self {
+            frontier: snapshot.frontier,
+            ..Self::default()
+        };
+        let group_ref = group_id.to_string();
+        let mut group_revisions = Vec::new();
+        for row in snapshot.data_rows().filter(|row| {
+            row.object_kind.as_deref() == Some("competing_attempt_group")
+                && row.object_id.as_deref() == Some(group_ref.as_str())
+        }) {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::CompetingAttemptGroupRecorded(value) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            if value.competing_group_id != group_id
+                || row.row_id
+                    != format!("object:work:competing_attempt_group:{}", value.revision_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            group_revisions.push(*value);
+        }
+        let group = current_group_from_lineage(group_revisions)?;
+        let member_ids = group
+            .member_attempt_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut attempt_revisions = BTreeMap::<AttemptId, Vec<Attempt>>::new();
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("attempt"))
+        {
+            let Some(attempt_id) = row
+                .object_id
+                .as_deref()
+                .and_then(|value| value.parse::<AttemptId>().ok())
+            else {
+                continue;
+            };
+            if !member_ids.contains(&attempt_id) {
+                continue;
+            }
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::AttemptRecorded(value) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            if value.attempt_id != attempt_id
+                || row.row_id != format!("object:work:attempt:{}", value.revision_id)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            attempt_revisions
+                .entry(attempt_id)
+                .or_default()
+                .push(*value);
+        }
+        for member_id in member_ids {
+            let revisions = attempt_revisions
+                .remove(&member_id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            view.attempts
+                .insert(member_id, current_attempt_from_lineage(revisions)?);
+        }
+        view.competing_groups.insert(group_id, group);
+        Ok(view)
+    }
+}
+
+impl MarkNewAttemptCurrentView {
+    pub fn for_expected_source(
+        snapshot: &ProjectionSnapshot,
+        expected_revision_id: RevisionId,
+    ) -> Result<Option<Self>, StoreError> {
+        let expected_row_id = format!("object:work:attempt:{expected_revision_id}");
+        let Some(expected_row) = snapshot
+            .data_rows()
+            .find(|row| row.row_id == expected_row_id)
+        else {
+            return Ok(None);
+        };
+        let payload: JournalPayload = serde_json::from_str(
+            expected_row
+                .payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        let JournalPayload::AttemptRecorded(expected_attempt) = payload else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        if expected_row.object_kind.as_deref() != Some("attempt")
+            || expected_row.object_id.as_deref()
+                != Some(expected_attempt.attempt_id.to_string().as_str())
+            || expected_attempt.revision_id != expected_revision_id
+            || expected_attempt.validate().is_err()
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let source_id = expected_attempt.attempt_id;
+        let source_ref = source_id.to_string();
+        let mut source_revisions = Vec::new();
+        let mut child_id: Option<AttemptId> = None;
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("attempt"))
+        {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::AttemptRecorded(value) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            if row.row_id != format!("object:work:attempt:{}", value.revision_id) {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if row.object_id.as_deref() == Some(source_ref.as_str()) {
+                if value.attempt_id != source_id {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                source_revisions.push(*value);
+            } else if value.revision_generation == 1
+                && value.predecessor_revision_id.is_none()
+                && value.resumes_from_attempt_id == Some(source_id)
+            {
+                child_id = Some(
+                    child_id.map_or(value.attempt_id, |current| current.min(value.attempt_id)),
+                );
+            }
+        }
+        let source = current_attempt_from_lineage(source_revisions)?;
+        let existing_child = if let Some(child_id) = child_id {
+            let child_ref = child_id.to_string();
+            let mut revisions = Vec::new();
+            for row in snapshot.data_rows().filter(|row| {
+                row.object_kind.as_deref() == Some("attempt")
+                    && row.object_id.as_deref() == Some(child_ref.as_str())
+            }) {
+                let payload: JournalPayload = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+                let JournalPayload::AttemptRecorded(value) = payload else {
+                    return Err(StoreError::StoreCorrupt);
+                };
+                if value.attempt_id != child_id
+                    || row.row_id != format!("object:work:attempt:{}", value.revision_id)
                 {
                     return Err(StoreError::StoreCorrupt);
                 }
-                if let Some(previous) = index.checked_sub(1) {
-                    revisions[previous]
-                        .validate_successor(revision)
-                        .map_err(|_| StoreError::StoreCorrupt)?;
-                }
+                revisions.push(*value);
             }
-            view.competing_groups
-                .insert(id, revisions.pop().ok_or(StoreError::StoreCorrupt)?);
+            Some(current_attempt_from_lineage(revisions)?)
+        } else {
+            None
+        };
+        Ok(Some(Self {
+            frontier: snapshot.frontier,
+            source,
+            existing_child,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompetingResolutionEvidenceView {
+    pub frontier: u64,
+    pub integrations: BTreeMap<IntegrationEventId, IntegrationEvent>,
+    pub run_revisions: BTreeMap<RevisionId, ExperimentRun>,
+    pub current_results: BTreeMap<ResultEvidenceId, ResultEvidence>,
+}
+
+impl CompetingResolutionEvidenceView {
+    const MAX_MEMBERS: usize = 64;
+    const MAX_FACT_IDS: usize = Self::MAX_MEMBERS * 64;
+
+    pub fn group_id_for_revision(
+        snapshot: &ProjectionSnapshot,
+        expected_revision_id: RevisionId,
+    ) -> Result<Option<CompetingAttemptGroupId>, StoreError> {
+        let expected = expected_revision_id.to_string();
+        let mut selected = None;
+        for row in snapshot.data_rows() {
+            if row.object_kind.as_deref() != Some("competing_attempt_group")
+                || row.current_revision_id.as_deref() != Some(expected.as_str())
+            {
+                continue;
+            }
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::CompetingAttemptGroupRecorded(value) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            if value.revision_id != expected_revision_id
+                || row.object_id.as_deref() != Some(value.competing_group_id.to_string().as_str())
+                || row.row_id
+                    != format!("object:work:competing_attempt_group:{}", value.revision_id)
+                || selected.replace(value.competing_group_id).is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(selected)
+    }
+
+    pub fn for_attempts<'a>(
+        snapshot: &ProjectionSnapshot,
+        attempts: impl IntoIterator<Item = &'a Attempt>,
+    ) -> Result<Self, StoreError> {
+        let attempts = attempts.into_iter().collect::<Vec<_>>();
+        if attempts.len() > Self::MAX_MEMBERS {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let mut integration_ids = BTreeSet::new();
+        let mut result_ids = BTreeSet::new();
+        for attempt in attempts {
+            attempt.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            if attempt.integration_event_refs.len() > Self::MAX_MEMBERS
+                || attempt.parent_verification_refs.len() > Self::MAX_MEMBERS
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            integration_ids.extend(attempt.integration_event_refs.iter().copied());
+            result_ids.extend(
+                attempt
+                    .parent_verification_refs
+                    .iter()
+                    .filter_map(|reference| reference.parse::<ResultEvidenceId>().ok()),
+            );
+            if integration_ids.len() > Self::MAX_FACT_IDS || result_ids.len() > Self::MAX_FACT_IDS {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        let mut view = Self {
+            frontier: snapshot.frontier,
+            ..Self::default()
+        };
+        let mut result_revisions = BTreeMap::<RevisionId, (ResultEvidence, u64)>::new();
+        for row in snapshot.data_rows() {
+            match row.object_kind.as_deref() {
+                Some("integration_event") => {
+                    let Some(id) = row
+                        .object_id
+                        .as_deref()
+                        .and_then(|value| value.parse::<IntegrationEventId>().ok())
+                    else {
+                        continue;
+                    };
+                    if !integration_ids.contains(&id) {
+                        continue;
+                    }
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                    let JournalPayload::IntegrationEventRecorded(value) = payload else {
+                        return Err(StoreError::StoreCorrupt);
+                    };
+                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                    if value.integration_event_id != id
+                        || row.row_id != crate::repository::integration_row_id(&id)
+                        || view.integrations.insert(id, *value).is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                Some("result_evidence") => {
+                    let Some(id) = row
+                        .object_id
+                        .as_deref()
+                        .and_then(|value| value.parse::<ResultEvidenceId>().ok())
+                    else {
+                        continue;
+                    };
+                    if !result_ids.contains(&id) {
+                        continue;
+                    }
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                    let JournalPayload::ResultEvidenceRecorded(value) = payload else {
+                        return Err(StoreError::StoreCorrupt);
+                    };
+                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                    if value.result_evidence_id != id
+                        || row.row_id
+                            != format!("object:work:result_evidence:{}", value.revision_id)
+                        || row.current_revision_id.as_deref()
+                            != Some(value.revision_id.to_string().as_str())
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    if result_revisions.len() >= Self::MAX_FACT_IDS
+                        || result_revisions
+                            .insert(value.revision_id, (*value, row.source_event_seq))
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut current_results = BTreeMap::new();
+        autoresearch::rebuild_results(&mut current_results, &result_revisions)?;
+        view.current_results = current_results
+            .into_iter()
+            .map(|(id, (value, _))| (id, value))
+            .collect();
+        let run_revision_ids = view
+            .current_results
+            .values()
+            .map(|result| result.experiment_run_revision_id)
+            .collect::<BTreeSet<_>>();
+        if run_revision_ids.len() > Self::MAX_FACT_IDS {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let run_revision_refs = run_revision_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        for row in snapshot.data_rows().filter(|row| {
+            row.object_kind.as_deref() == Some("experiment_run")
+                && row
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|id| run_revision_refs.contains(id))
+        }) {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::ExperimentRunRecorded(value) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            if !run_revision_ids.contains(&value.revision_id)
+                || row.row_id != format!("object:work:experiment_run:{}", value.revision_id)
+                || row.object_id.as_deref() != Some(value.run_id.to_string().as_str())
+                || row.current_revision_id.as_deref()
+                    != Some(value.revision_id.to_string().as_str())
+                || view
+                    .run_revisions
+                    .insert(value.revision_id, *value)
+                    .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
         }
         Ok(view)
     }
@@ -1968,6 +2373,20 @@ impl JournalAdmissionState {
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
         )?;
+        self.validate_competing_selected_command(
+            command
+                .events()
+                .iter()
+                .map(|event| (&event.payload, event.source_kind)),
+        )
+        .map_err(|_| StoreError::InvalidInput)?;
+        self.validate_mark_new_attempt_command(
+            command
+                .events()
+                .iter()
+                .map(|event| (&event.payload, event.source_kind)),
+        )
+        .map_err(|_| StoreError::InvalidInput)?;
         self.validate_procedure_usage_command(command.events().iter().map(|event| &event.payload))
             .map_err(|_| StoreError::InvalidInput)?;
         autoresearch::validate_controlled_command(
@@ -1991,9 +2410,24 @@ impl JournalAdmissionState {
             command.events().iter().map(|event| &event.payload),
             StoreError::InvalidInput,
         )?;
+        let accepted_edits = semantic::validate_command_boundary(
+            &self.atoms,
+            &self.proposals,
+            &self.procedure,
+            &self.s23,
+            command.events().iter().map(|event| {
+                (
+                    &event.payload,
+                    event.occurred_at_us,
+                    event.effective_config_hash,
+                )
+            }),
+            StoreError::InvalidInput,
+        )?;
         self.procedure
             .validate_command_cohort(
                 &self.tasks,
+                &accepted_edits,
                 command.events().iter().map(|event| &event.payload),
             )
             .map_err(|_| StoreError::InvalidInput)?;
@@ -2013,11 +2447,6 @@ impl JournalAdmissionState {
                 command.events().iter().map(|event| &event.payload),
             )
             .map_err(|_| StoreError::InvalidInput)?;
-        semantic::validate_command_boundary(
-            &self.atoms,
-            command.events().iter().map(|event| &event.payload),
-            StoreError::InvalidInput,
-        )?;
         crate::repository::validate_repository_payloads(
             command.events().iter().map(|event| &event.payload),
         )?;
@@ -2092,6 +2521,16 @@ impl JournalAdmissionState {
             .map_err(|_| StoreError::StoreCorrupt)?;
         self.validate_episode_binding_activation(parsed.iter().map(|(payload, _, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
+        self.validate_competing_selected_command(
+            rows.iter()
+                .zip(parsed.iter())
+                .map(|(row, (payload, _, _))| (payload, row.source_kind)),
+        )?;
+        self.validate_mark_new_attempt_command(
+            rows.iter()
+                .zip(parsed.iter())
+                .map(|(row, (payload, _, _))| (payload, row.source_kind)),
+        )?;
         self.validate_procedure_usage_command(parsed.iter().map(|(payload, _, _)| payload))?;
         autoresearch::validate_controlled_command(
             autoresearch::ControlledRunAdmissionView {
@@ -2114,8 +2553,23 @@ impl JournalAdmissionState {
             parsed.iter().map(|(payload, _, _)| payload),
             StoreError::StoreCorrupt,
         )?;
-        self.procedure
-            .validate_command_cohort(&self.tasks, parsed.iter().map(|(payload, _, _)| payload))?;
+        let accepted_edits = semantic::validate_command_boundary(
+            &self.atoms,
+            &self.proposals,
+            &self.procedure,
+            &self.s23,
+            rows.iter()
+                .zip(parsed.iter())
+                .map(|(row, (payload, _, _))| {
+                    (payload, row.occurred_at_us, row.effective_config_hash)
+                }),
+            StoreError::StoreCorrupt,
+        )?;
+        self.procedure.validate_command_cohort(
+            &self.tasks,
+            &accepted_edits,
+            parsed.iter().map(|(payload, _, _)| payload),
+        )?;
         let synthesis_refs = self.synthesis_ref_set();
         let proposal_evidence_refs = self.synthesis_proposal_evidence_ref_set();
         self.synthesis.validate_command(
@@ -2130,11 +2584,6 @@ impl JournalAdmissionState {
             },
             parsed.iter().map(|(payload, _, _)| payload),
         )?;
-        semantic::validate_command_boundary(
-            &self.atoms,
-            parsed.iter().map(|(payload, _, _)| payload),
-            StoreError::StoreCorrupt,
-        )?;
         crate::repository::validate_repository_payloads(
             parsed.iter().map(|(payload, _, _)| payload),
         )
@@ -2145,6 +2594,125 @@ impl JournalAdmissionState {
         }
         next.validate_relations()?;
         Ok(next)
+    }
+
+    fn validate_competing_selected_command<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = (&'a JournalPayload, SourceKind)>,
+    ) -> Result<(), StoreError> {
+        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        let manual_selected = payloads
+            .iter()
+            .filter_map(|(payload, source_kind)| match payload {
+                JournalPayload::CompetingAttemptGroupRecorded(value)
+                    if *source_kind == SourceKind::Manual
+                        && value.resolution_status == CompetingResolutionStatus::Selected =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if manual_selected.is_empty() {
+            return Ok(());
+        }
+        if payloads.len() != 1 || manual_selected.len() != 1 {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let selected = manual_selected[0];
+        let (current, _) = self
+            .competing_groups
+            .get(&selected.competing_group_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if !matches!(
+            current.resolution_status,
+            CompetingResolutionStatus::Open | CompetingResolutionStatus::Unresolved
+        ) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        current
+            .validate_successor(selected)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let chosen = selected
+            .selected_attempt_id
+            .filter(|chosen| current.member_attempt_ids.contains(chosen))
+            .ok_or(StoreError::StoreCorrupt)?;
+        let attempt = &self
+            .attempts
+            .get(&chosen)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0;
+        let cohort = derive_competing_selected_cohort(
+            attempt,
+            |id| self.integration_events.get(id).map(|(value, _)| value),
+            |id| self.result_evidence.get(id).map(|(value, _)| value),
+            |id| {
+                self.experiment_run_revisions
+                    .get(id)
+                    .map(|(value, _)| value)
+            },
+        )
+        .ok_or(StoreError::StoreCorrupt)?;
+        if selected.resolution_evidence_refs != competing_selected_resolution_refs(current, &cohort)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+
+    fn validate_mark_new_attempt_command<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = (&'a JournalPayload, SourceKind)>,
+    ) -> Result<(), StoreError> {
+        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        let manual_attempts = payloads
+            .iter()
+            .filter_map(|(payload, source_kind)| match payload {
+                JournalPayload::AttemptRecorded(value) if *source_kind == SourceKind::Manual => {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if manual_attempts.is_empty() {
+            return Ok(());
+        }
+        if payloads.len() != 1 || manual_attempts.len() != 1 {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let child = manual_attempts[0];
+        let source_revision_id = child
+            .resume_event_refs
+            .as_slice()
+            .first()
+            .filter(|_| child.resume_event_refs.len() == 1)
+            .and_then(|value| value.parse::<RevisionId>().ok())
+            .ok_or(StoreError::StoreCorrupt)?;
+        let (source, _) = self
+            .attempt_revisions
+            .get(&source_revision_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if source.revision_id != source_revision_id
+            || child.resumes_from_attempt_id != Some(source.attempt_id)
+            || self
+                .attempts
+                .get(&source.attempt_id)
+                .is_none_or(|(current, _)| current != source)
+            || source.lifecycle_status != AttemptLifecycleStatus::Active
+            || source.execution_status != AttemptExecutionStatus::Interrupted
+            || self.attempt_revisions.values().any(|(attempt, _)| {
+                attempt.revision_generation == 1
+                    && attempt.predecessor_revision_id.is_none()
+                    && attempt.resumes_from_attempt_id == Some(source.attempt_id)
+            })
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let expected = canonical_mark_new_attempt_child(source, child, self.frontier)?;
+        if child != &expected {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
     }
 
     fn validate_job_command<'a>(
@@ -2618,6 +3186,8 @@ impl JournalAdmissionState {
             worktrees: &self.worktrees,
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
+            procedure: &self.procedure,
+            s23: &self.s23,
             semantic_digests: self.synthesis.digests(),
         })?;
         self.validate_procedure_relations()?;
@@ -3807,6 +4377,155 @@ fn validate_work_binding_relations(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CompetingSelectedCohort {
+    typed_evidence_refs: Vec<String>,
+}
+
+fn derive_competing_selected_cohort<'a>(
+    attempt: &Attempt,
+    mut integration: impl FnMut(&IntegrationEventId) -> Option<&'a IntegrationEvent>,
+    mut result: impl FnMut(&ResultEvidenceId) -> Option<&'a ResultEvidence>,
+    mut run: impl FnMut(&RevisionId) -> Option<&'a ExperimentRun>,
+) -> Option<CompetingSelectedCohort> {
+    if attempt.adoption_status != AttemptAdoptionStatus::Integrated
+        || attempt.verification != AttemptVerification::Passed
+        || attempt.validate().is_err()
+    {
+        return None;
+    }
+    let integration_ids = attempt
+        .integration_event_refs
+        .iter()
+        .copied()
+        .filter(|id| {
+            integration(id).is_some_and(|event| {
+                event.validate().is_ok()
+                    && event.assessment == LineageAssessment::Proven
+                    && event.integrated_attempt_ids.contains(&attempt.attempt_id)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if integration_ids.is_empty() {
+        return None;
+    }
+
+    let mut result_ids = BTreeSet::new();
+    for result_id in attempt
+        .parent_verification_refs
+        .iter()
+        .filter_map(|reference| reference.parse::<ResultEvidenceId>().ok())
+    {
+        let Some(result) = result(&result_id) else {
+            continue;
+        };
+        if result.validate().is_err()
+            || result.result_evidence_id != result_id
+            || result.result_scope != ResultScope::Complete
+            || result.completeness != EvidenceCompleteness::Complete
+            || result.parser_receipt.status != ParserStatus::Parsed
+            || result
+                .verifier_receipt
+                .as_ref()
+                .is_none_or(|receipt| receipt.status != VerifierStatus::Passed)
+        {
+            continue;
+        }
+        let Some(run) = run(&result.experiment_run_revision_id) else {
+            continue;
+        };
+        if run.validate().is_err()
+            || run.revision_id != result.experiment_run_revision_id
+            || run.run_id != result.experiment_run_id
+            || run.attempt_binding_status != AttemptBindingStatus::Resolved
+            || run.attempt_id != Some(attempt.attempt_id)
+            || run.observability != RunObservability::Full
+            || run.execution_status != RunExecutionStatus::Completed
+            || run.contract_validity != RunContractValidity::Valid
+            || run.workstream_id != attempt.workstream_id
+            || run.strategy_contract_fingerprint != attempt.strategy_contract_fingerprint
+        {
+            continue;
+        }
+        result_ids.insert(result.result_evidence_id);
+    }
+    if result_ids.is_empty() {
+        return None;
+    }
+
+    let mut typed_evidence_refs = integration_ids
+        .iter()
+        .map(ToString::to_string)
+        .chain(result_ids.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    typed_evidence_refs.sort();
+    typed_evidence_refs.dedup();
+    Some(CompetingSelectedCohort {
+        typed_evidence_refs,
+    })
+}
+
+fn competing_selected_resolution_refs(
+    current: &CompetingAttemptGroup,
+    cohort: &CompetingSelectedCohort,
+) -> Vec<String> {
+    let mut refs = current.resolution_evidence_refs.clone();
+    refs.extend(cohort.typed_evidence_refs.iter().cloned());
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn canonical_mark_new_attempt_child(
+    source: &Attempt,
+    candidate: &Attempt,
+    source_watermark: u64,
+) -> Result<Attempt, StoreError> {
+    let child = Attempt {
+        attempt_id: candidate.attempt_id,
+        revision_id: candidate.revision_id,
+        predecessor_revision_id: None,
+        revision_generation: 1,
+        task_id: source.task_id,
+        workstream_id: source.workstream_id,
+        episode_id: None,
+        repository_instance_id: source.repository_instance_id,
+        worktree_instance_ids: source.worktree_instance_ids.clone(),
+        execution_lane_ids: Vec::new(),
+        competing_group_ids: Vec::new(),
+        experiment_run_ids: Vec::new(),
+        execution_status: AttemptExecutionStatus::Proposed,
+        adoption_status: AttemptAdoptionStatus::None,
+        verification: AttemptVerification::Unverified,
+        lifecycle_status: AttemptLifecycleStatus::Active,
+        strategy_contract: source.strategy_contract.clone(),
+        strategy_contract_fingerprint: source.strategy_contract_fingerprint,
+        resumes_from_attempt_id: Some(source.attempt_id),
+        composed_from_attempt_ids: Vec::new(),
+        resume_event_refs: vec![source.revision_id.to_string()],
+        resume_state_assessment: Some(ResumeStateAssessment::Unknown),
+        resume_source_snapshot_id: None,
+        resume_target_snapshot_id: None,
+        worktree_transition_refs: Vec::new(),
+        integration_event_refs: Vec::new(),
+        recovery_bundle_refs: Vec::new(),
+        recovery_application_refs: Vec::new(),
+        work_binding_revision_refs: Vec::new(),
+        local_outcome_refs: Vec::new(),
+        parent_verification_refs: Vec::new(),
+        outcome_refs: Vec::new(),
+        outcome_state: AttemptOutcomeState::Unknown,
+        interruption_refs: Vec::new(),
+        interruption_reason: None,
+        explicit_abandon_refs: Vec::new(),
+        supersede_evidence_refs: Vec::new(),
+        failure_signature: None,
+        source_watermark,
+    };
+    child.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    Ok(child)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6042,6 +6761,8 @@ impl ReducerState {
             worktrees: &self.worktrees,
             results: &self.result_evidence,
             artifacts: &self.work_artifacts,
+            procedure: &self.procedure,
+            s23: &self.s23,
             semantic_digests: self.synthesis.digests(),
         })?;
         let admission = self.admission_state(0)?;
@@ -6801,11 +7522,21 @@ mod tests {
             ReconciliationProvenance, SourceInstanceId, SourceRevision,
         },
         ids::{
-            CaptureOutageIntervalId, CommandId, ExecutionLaneId, HostOccurrenceId, JobId,
-            OperationId, SourceObservationId,
+            AttemptId, CaptureOutageIntervalId, CasId, CommandId, CompetingAttemptGroupId,
+            ExecutionLaneId, ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId,
+            OperationId, ResultEvidenceId, SourceObservationId, SourceReceiptId, TaskId,
+            WorkstreamId, WorktreeId, WorktreeSnapshotId,
         },
+        repository::{IntegrationKind, LineageAssessment},
+        semantic::{MetricValue, ParserReceipt, VerifierReceipt},
         work::{
-            AdmissionFailureObservability, LaneLifecycleEvidence, LivenessState, PrimaryWorkBinding,
+            AdmissionFailureObservability, AttemptAdoptionStatus, AttemptBindingStatus,
+            AttemptExecutionStatus, AttemptLifecycleStatus, AttemptOutcomeState,
+            AttemptVerification, ComparisonExecutionBinding, CompetingConflictKind,
+            CompetingResolutionStatus, ContractField, LaneLifecycleEvidence, LivenessState,
+            MetricDirection, MultiCasMetricPolicy, PrimaryWorkBinding, RunContractValidity,
+            RunExecutionStatus, RunObservability, RunOrigin, SeedPolicy, StrategyContract,
+            VariableDeclaration,
         },
     };
 
@@ -6844,6 +7575,360 @@ mod tests {
         };
         assert_eq!(
             validate_confirmed_session_prefix(&forged_ordinary),
+            Err(StoreError::StoreCorrupt)
+        );
+    }
+
+    #[test]
+    fn selected_competing_boundary_requires_precommand_exact_typed_cohort() {
+        let group_id = CompetingAttemptGroupId::new_v7();
+        let attempt_id = AttemptId::new_v7();
+        let integration_id = IntegrationEventId::new_v7();
+        let run_id = ExperimentRunId::new_v7();
+        let run_revision_id = RevisionId::new_v7();
+        let result_id = ResultEvidenceId::new_v7();
+        let result_revision_id = RevisionId::new_v7();
+        let workstream_id = WorkstreamId::new_v7();
+        let mut attempt = Attempt {
+            attempt_id,
+            revision_id: RevisionId::new_v7(),
+            predecessor_revision_id: None,
+            revision_generation: 1,
+            task_id: TaskId::new_v7(),
+            workstream_id,
+            episode_id: None,
+            repository_instance_id: None,
+            worktree_instance_ids: Vec::new(),
+            execution_lane_ids: Vec::new(),
+            competing_group_ids: vec![group_id],
+            experiment_run_ids: Vec::new(),
+            execution_status: AttemptExecutionStatus::Proposed,
+            adoption_status: AttemptAdoptionStatus::Integrated,
+            verification: AttemptVerification::Passed,
+            lifecycle_status: AttemptLifecycleStatus::Active,
+            strategy_contract: StrategyContract {
+                hypothesis: "typed cohort".into(),
+                intervention: "select winner".into(),
+                intervention_family: "test".into(),
+                search_policy_ref: None,
+                objective_ref: None,
+                expected_effect: "selected".into(),
+                target_refs: vec!["target:test".into()],
+                acceptance_boundary_ref: "acceptance:test".into(),
+            },
+            strategy_contract_fingerprint: [0; 32],
+            resumes_from_attempt_id: None,
+            composed_from_attempt_ids: Vec::new(),
+            resume_event_refs: Vec::new(),
+            resume_state_assessment: None,
+            resume_source_snapshot_id: None,
+            resume_target_snapshot_id: None,
+            worktree_transition_refs: Vec::new(),
+            integration_event_refs: vec![integration_id],
+            recovery_bundle_refs: Vec::new(),
+            recovery_application_refs: Vec::new(),
+            work_binding_revision_refs: Vec::new(),
+            local_outcome_refs: Vec::new(),
+            parent_verification_refs: vec![result_id.to_string()],
+            outcome_refs: Vec::new(),
+            outcome_state: AttemptOutcomeState::Unknown,
+            interruption_refs: Vec::new(),
+            interruption_reason: None,
+            explicit_abandon_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            failure_signature: None,
+            source_watermark: 1,
+        };
+        attempt.strategy_contract_fingerprint = attempt.strategy_contract.fingerprint().unwrap();
+        attempt.validate().unwrap();
+        let strategy_fingerprint = attempt.strategy_contract_fingerprint;
+        let integration = IntegrationEvent {
+            integration_event_id: integration_id,
+            repository_instance_id: RepositoryId::new_v7(),
+            source_worktree_instance_id: WorktreeId::new_v7(),
+            source_snapshot_id: WorktreeSnapshotId::new_v7(),
+            destination_worktree_instance_id: WorktreeId::new_v7(),
+            destination_snapshot_id: WorktreeSnapshotId::new_v7(),
+            kind: IntegrationKind::ManualPatch,
+            commit_refs: Vec::new(),
+            patch_equivalence_refs: vec!["patch:test".into()],
+            conflict_resolution_detected: false,
+            integrated_attempt_ids: vec![attempt_id],
+            revalidated_anchor_refs: Vec::new(),
+            evidence_refs: vec!["integration:test".into()],
+            assessment: LineageAssessment::Proven,
+        };
+        integration.validate().unwrap();
+        let source_receipt_id = SourceReceiptId::from_digest([1; 32]);
+        let terminal_receipt_id = SourceReceiptId::from_digest([2; 32]);
+        let declaration_revision_id = RevisionId::new_v7();
+        let mut run = ExperimentRun {
+            run_id,
+            revision_id: run_revision_id,
+            parent_revision_id: Some(declaration_revision_id),
+            workstream_id,
+            attempt_id: Some(attempt_id),
+            attempt_binding_status: AttemptBindingStatus::Resolved,
+            strategy_contract_fingerprint: strategy_fingerprint,
+            origin: RunOrigin::Local,
+            external_system_id: None,
+            external_run_key: None,
+            source_receipt_refs: vec![source_receipt_id],
+            observability: RunObservability::Full,
+            execution_status: RunExecutionStatus::Completed,
+            contract_validity: RunContractValidity::Valid,
+            experiment_contract_fingerprint: [0; 32],
+            code_snapshot_id: WorktreeSnapshotId::new_v7(),
+            data_fingerprint: "data:test".into(),
+            normalized_config: Vec::<ContractField>::new(),
+            variable_declaration: VariableDeclaration::default(),
+            comparison_key: [0; 32],
+            seed_policy: SeedPolicy::Unspecified,
+            seed_values: Vec::new(),
+            nondeterministic: false,
+            metric_definition: "score".into(),
+            metric_extractor_version: "test-v1".into(),
+            multi_cas_metric_policy: MultiCasMetricPolicy::RejectMultipleParsed,
+            environment_fingerprint: "environment:test".into(),
+            comparison_execution_binding: Some(ComparisonExecutionBinding {
+                binding_version: 1,
+                toolchain_revision: "rust-1.97.1".into(),
+                model_revision: "model-v1".into(),
+                harness_revision: "harness-v1".into(),
+                algorithm_revision: "algorithm-v1".into(),
+                budget: 100,
+                procedure_exposure_revision_id: None,
+                metric_direction: MetricDirection::HigherIsBetter,
+                metric_unit: "score".into(),
+                positive_delta_threshold: "0.05".into(),
+                negative_delta_threshold: "0.03".into(),
+            }),
+            work_artifact_refs: Vec::new(),
+            terminal_evidence_refs: vec![terminal_receipt_id],
+            created_at_us: 1,
+            started_at_us: Some(1),
+            ended_at_us: Some(2),
+        };
+        run.experiment_contract_fingerprint = run.recompute_exact_contract_fingerprint().unwrap();
+        run.comparison_key = run.recompute_comparison_key().unwrap();
+        run.validate().unwrap();
+        let mut declaration = run.clone();
+        declaration.revision_id = declaration_revision_id;
+        declaration.parent_revision_id = None;
+        declaration.observability = RunObservability::Declared;
+        declaration.execution_status = RunExecutionStatus::Unknown;
+        declaration.contract_validity = RunContractValidity::Unknown;
+        declaration.terminal_evidence_refs.clear();
+        declaration.ended_at_us = None;
+        declaration.validate().unwrap();
+        declaration.validate_successor(&run).unwrap();
+        let mut run_successor = run.clone();
+        run_successor.revision_id = RevisionId::new_v7();
+        run_successor.parent_revision_id = Some(run.revision_id);
+        run_successor
+            .source_receipt_refs
+            .push(SourceReceiptId::from_digest([3; 32]));
+        run_successor.source_receipt_refs.sort();
+        run.validate_successor(&run_successor).unwrap();
+        let cas_id = CasId::from_digest([6; 32]);
+        let result = ResultEvidence {
+            result_evidence_id: result_id,
+            revision_id: result_revision_id,
+            parent_revision_id: None,
+            experiment_run_id: run_id,
+            experiment_run_revision_id: run_revision_id,
+            result_scope: ResultScope::Complete,
+            raw_artifact_refs: Vec::new(),
+            raw_cas_refs: vec![cas_id],
+            parsed_metric: Some(MetricValue {
+                decimal: "1".into(),
+                unit: "score".into(),
+                uncertainty_decimal: None,
+            }),
+            parser_receipt: ParserReceipt {
+                parser_version: "test-v1".into(),
+                input_artifact_refs: Vec::new(),
+                input_cas_refs: vec![cas_id],
+                status: ParserStatus::Parsed,
+                failure_code: None,
+            },
+            verifier_receipt: Some(VerifierReceipt {
+                verifier_version: "test-v1".into(),
+                status: VerifierStatus::Passed,
+                failure_code: None,
+            }),
+            completeness: EvidenceCompleteness::Complete,
+            failure: None,
+            created_at_us: 2,
+        };
+        result.validate().unwrap();
+        let object_row = |kind: &str,
+                          row_id: String,
+                          object_id: String,
+                          revision_id: RevisionId,
+                          payload: &JournalPayload,
+                          seq| {
+            let mut row = runtime_row(row_id, ObjectRowClass::Object, payload, seq).unwrap();
+            row.object_kind = Some(kind.into());
+            row.object_id = Some(object_id);
+            row.current_revision_id = Some(revision_id.to_string());
+            row
+        };
+        let evidence_snapshot = ProjectionSnapshot {
+            frontier: 4,
+            rows: vec![
+                object_row(
+                    "experiment_run",
+                    format!("object:work:experiment_run:{}", declaration.revision_id),
+                    declaration.run_id.to_string(),
+                    declaration.revision_id,
+                    &JournalPayload::ExperimentRunRecorded(Box::new(declaration.clone())),
+                    1,
+                ),
+                object_row(
+                    "experiment_run",
+                    format!("object:work:experiment_run:{}", run.revision_id),
+                    run.run_id.to_string(),
+                    run.revision_id,
+                    &JournalPayload::ExperimentRunRecorded(Box::new(run.clone())),
+                    2,
+                ),
+                object_row(
+                    "experiment_run",
+                    format!("object:work:experiment_run:{}", run_successor.revision_id),
+                    run_successor.run_id.to_string(),
+                    run_successor.revision_id,
+                    &JournalPayload::ExperimentRunRecorded(Box::new(run_successor.clone())),
+                    3,
+                ),
+                object_row(
+                    "result_evidence",
+                    format!("object:work:result_evidence:{}", result.revision_id),
+                    result.result_evidence_id.to_string(),
+                    result.revision_id,
+                    &JournalPayload::ResultEvidenceRecorded(Box::new(result.clone())),
+                    4,
+                ),
+            ],
+        };
+        let evidence_view =
+            CompetingResolutionEvidenceView::for_attempts(&evidence_snapshot, [&attempt]).unwrap();
+        assert_eq!(
+            evidence_view.run_revisions[&result.experiment_run_revision_id],
+            run
+        );
+        assert_eq!(
+            evidence_view.current_results[&result.result_evidence_id],
+            result
+        );
+        let alternate_id = AttemptId::new_v7();
+        let open = CompetingAttemptGroup {
+            competing_group_id: group_id,
+            revision_id: RevisionId::new_v7(),
+            predecessor_revision_id: None,
+            revision_generation: 1,
+            task_id: attempt.task_id,
+            decision_boundary_ref: "decision:test".into(),
+            comparison_contract_ref: None,
+            origin_workstream_id: Some(workstream_id),
+            origin_episode_id: None,
+            member_workstream_ids: vec![workstream_id],
+            member_attempt_ids: {
+                let mut ids = vec![attempt_id, alternate_id];
+                ids.sort();
+                ids
+            },
+            candidate_snapshot_refs: Vec::new(),
+            target_refs: vec!["target:test".into()],
+            conflict_kind: CompetingConflictKind::AlternativeStrategy,
+            resolution_status: CompetingResolutionStatus::Unresolved,
+            selected_attempt_id: None,
+            partially_integrated_attempt_ids: Vec::new(),
+            resolution_evidence_refs: vec!["reason:unresolved".into()],
+            source_watermark: 1,
+        };
+        open.validate().unwrap();
+        let mut evidence_refs = vec![
+            "reason:unresolved".into(),
+            integration_id.to_string(),
+            result_id.to_string(),
+        ];
+        evidence_refs.sort();
+        let selected = CompetingAttemptGroup {
+            revision_id: RevisionId::new_v7(),
+            predecessor_revision_id: Some(open.revision_id),
+            revision_generation: 2,
+            resolution_status: CompetingResolutionStatus::Selected,
+            selected_attempt_id: Some(attempt_id),
+            resolution_evidence_refs: evidence_refs,
+            source_watermark: 2,
+            ..open.clone()
+        };
+        open.validate_successor(&selected).unwrap();
+        let selected_payload = JournalPayload::CompetingAttemptGroupRecorded(Box::new(selected));
+        let mut state = JournalAdmissionState::default();
+        state.attempts.insert(attempt_id, (attempt.clone(), 1));
+        state.competing_groups.insert(group_id, (open.clone(), 1));
+        state
+            .integration_events
+            .insert(integration_id, (integration.clone(), 1));
+        state
+            .experiment_runs
+            .insert(run_id, (run_successor.clone(), 2));
+        state
+            .experiment_run_revisions
+            .insert(declaration.revision_id, (declaration, 1));
+        state
+            .experiment_run_revisions
+            .insert(run.revision_id, (run.clone(), 2));
+        state
+            .experiment_run_revisions
+            .insert(run_successor.revision_id, (run_successor, 3));
+        state.result_evidence.insert(result_id, (result.clone(), 1));
+        state
+            .result_evidence_revisions
+            .insert(result_revision_id, (result.clone(), 1));
+        assert!(
+            state
+                .validate_competing_selected_command([(&selected_payload, SourceKind::Manual)])
+                .is_ok()
+        );
+
+        let mut forged = match &selected_payload {
+            JournalPayload::CompetingAttemptGroupRecorded(value) => value.as_ref().clone(),
+            _ => unreachable!(),
+        };
+        forged.resolution_evidence_refs =
+            vec!["reason:unresolved".into(), integration_id.to_string()];
+        let forged_payload = JournalPayload::CompetingAttemptGroupRecorded(Box::new(forged));
+        assert_eq!(
+            state.validate_competing_selected_command([(&forged_payload, SourceKind::Manual)]),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let mut empty = JournalAdmissionState::default();
+        empty.competing_groups.insert(group_id, (open, 1));
+        assert!(
+            empty
+                .validate_competing_selected_command([(&selected_payload, SourceKind::System,)])
+                .is_ok()
+        );
+        assert_eq!(
+            empty.validate_competing_selected_command([(&selected_payload, SourceKind::Manual,)]),
+            Err(StoreError::StoreCorrupt)
+        );
+        let attempt_payload = JournalPayload::AttemptRecorded(Box::new(attempt));
+        let integration_payload = JournalPayload::IntegrationEventRecorded(Box::new(integration));
+        let run_payload = JournalPayload::ExperimentRunRecorded(Box::new(run));
+        let result_payload = JournalPayload::ResultEvidenceRecorded(Box::new(result));
+        assert_eq!(
+            empty.validate_competing_selected_command([
+                (&attempt_payload, SourceKind::System),
+                (&integration_payload, SourceKind::System),
+                (&run_payload, SourceKind::System),
+                (&result_payload, SourceKind::System),
+                (&selected_payload, SourceKind::Manual),
+            ]),
             Err(StoreError::StoreCorrupt)
         );
     }

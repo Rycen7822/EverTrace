@@ -12,6 +12,26 @@ use evertrace_domain::{
 
 use crate::{JournalPayload, ObjectFamily, ObjectRow, ObjectRowClass, ObjectRowKind, StoreError};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NegativeReviewActionReason {
+    ResolveAsIneffective,
+    DismissAttribution,
+    ConfirmHarm,
+    SuccessorSuperseded,
+}
+
+impl NegativeReviewActionReason {
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "resolve_as_ineffective" => Some(Self::ResolveAsIneffective),
+            "dismiss_attribution" => Some(Self::DismissAttribution),
+            "confirm_harm" => Some(Self::ConfirmHarm),
+            "successor_replay_fixed" => Some(Self::SuccessorSuperseded),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct ProcedureState {
     procedures: BTreeMap<ProcedureId, (ProcedureRevision, u64)>,
@@ -210,9 +230,116 @@ impl ProcedureState {
     pub(super) fn validate_command_cohort<'a>(
         &self,
         tasks: &BTreeMap<evertrace_domain::ids::TaskId, (evertrace_domain::work::Task, u64)>,
+        accepted_edits: &BTreeSet<evertrace_domain::ids::RevisionProposalId>,
         payloads: impl IntoIterator<Item = &'a JournalPayload>,
     ) -> Result<(), StoreError> {
         let payloads = payloads.into_iter().collect::<Vec<_>>();
+        for proposal in payloads.iter().filter_map(|payload| match payload {
+            JournalPayload::RevisionProposalRecorded(value)
+                if value.status == evertrace_domain::semantic::ProposalStatus::Accepted =>
+            {
+                Some(value.as_ref())
+            }
+            _ => None,
+        }) {
+            let Some(evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
+                procedure_id,
+                procedure_revision_id,
+                ..
+            }) = proposal
+                .acceptance
+                .as_ref()
+                .map(|acceptance| &acceptance.accepted_target)
+            else {
+                continue;
+            };
+            let evertrace_domain::semantic::ProposalPayload::Procedure(procedure_payload) =
+                &proposal.payload
+            else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let materialized = payloads
+                .iter()
+                .filter_map(|payload| match payload {
+                    JournalPayload::ProcedureRevisionRecorded(value)
+                        if value.procedure_id == *procedure_id
+                            && value.revision_id == *procedure_revision_id =>
+                    {
+                        Some(value.as_ref())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let edit_command = accepted_edits.contains(&proposal.proposal_id);
+            if edit_command {
+                if payloads
+                    .iter()
+                    .filter(|payload| {
+                        matches!(payload, JournalPayload::ProcedureRevisionRecorded(_))
+                    })
+                    .count()
+                    != materialized.len()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                match materialized.as_slice() {
+                    [revision]
+                        if revision.draft == *procedure_payload.draft()
+                            && match proposal.operation {
+                                evertrace_domain::semantic::ProposalOperation::Create => {
+                                    proposal.target_id.is_none()
+                                        && proposal.base_revision_id.is_none()
+                                        && revision.parent_revision_id.is_none()
+                                        && revision.revision_generation == 1
+                                }
+                                evertrace_domain::semantic::ProposalOperation::Replace => {
+                                    proposal.target_id
+                                        == Some(
+                                            evertrace_domain::semantic::ProposalTargetId::Procedure(
+                                                *procedure_id,
+                                            ),
+                                        )
+                                        && revision.parent_revision_id == proposal.base_revision_id
+                                }
+                                _ => false,
+                            } =>
+                    {
+                        continue;
+                    }
+                    [] => {}
+                    _ => return Err(StoreError::StoreCorrupt),
+                }
+            } else if !materialized.is_empty() {
+                continue;
+            }
+            let current = self
+                .procedures
+                .get(procedure_id)
+                .map(|(revision, _)| revision)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if proposal.operation != evertrace_domain::semantic::ProposalOperation::Replace
+                || !matches!(
+                    procedure_payload.as_ref(),
+                    evertrace_domain::semantic::ProcedureProposalPayload::Replace { .. }
+                )
+                || proposal.target_id
+                    != Some(evertrace_domain::semantic::ProposalTargetId::Procedure(
+                        *procedure_id,
+                    ))
+                || proposal.base_revision_id != Some(*procedure_revision_id)
+                || current.revision_id != *procedure_revision_id
+                || current.draft != *procedure_payload.draft()
+                || !matches!(
+                    self.publication(*procedure_revision_id),
+                    Some(
+                        ProcedurePublicationState::ActiveProbationary
+                            | ProcedurePublicationState::ActiveStable
+                    )
+                )
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
         let mut successful_usages = BTreeMap::<RevisionId, Vec<&ProcedureUsageRevision>>::new();
         for usage in payloads.iter().filter_map(|payload| match payload {
             JournalPayload::ProcedureUsageRecorded(value)
@@ -402,50 +529,133 @@ impl ProcedureState {
                 .get(&review.negative_evidence_id)
                 .map(|(value, _)| value)
                 .ok_or(StoreError::StoreCorrupt)?;
-            let expected = if matches!(
-                review.status,
-                ProcedureNegativeReviewStatus::Dismissed
-                    | ProcedureNegativeReviewStatus::Superseded
-            ) && negative.local_context.is_none()
-                && self
-                    .current_publication
-                    .get(&negative.procedure_revision_id)
-                    .is_some_and(|(event, _)| {
-                        event.to_state == ProcedurePublicationState::ReviewHold
-                    }) {
-                let held = &self.current_publication[&negative.procedure_revision_id].0;
-                Some(
-                    held.resume_state
-                        .filter(|state| {
-                            matches!(
-                                state,
-                                ProcedurePublicationState::ActiveProbationary
-                                    | ProcedurePublicationState::ActiveStable
-                            )
-                        })
-                        .ok_or(StoreError::StoreCorrupt)?,
-                )
-            } else {
-                None
+            let current = self
+                .current_negative_reviews
+                .get(&review.negative_evidence_id)
+                .map(|(value, _)| value)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if review.predecessor_review_event_id != Some(current.review_event_id)
+                || review.review_generation != current.review_generation + 1
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let action = NegativeReviewActionReason::parse(&review.reason)
+                .ok_or(StoreError::StoreCorrupt)?;
+            let held = self
+                .current_publication
+                .get(&negative.procedure_revision_id)
+                .map(|(event, _)| event)
+                .filter(|event| event.to_state == ProcedurePublicationState::ReviewHold);
+            let expected_state = match action {
+                NegativeReviewActionReason::ResolveAsIneffective
+                    if current.status == ProcedureNegativeReviewStatus::Pending
+                        && negative.level
+                            == evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective
+                        && review.status == ProcedureNegativeReviewStatus::Dismissed
+                        && review.successor_usage_revision_id.is_none()
+                        && review.evidence_refs == negative.evidence_refs =>
+                {
+                    None
+                }
+                NegativeReviewActionReason::DismissAttribution
+                    if current.status == ProcedureNegativeReviewStatus::Pending
+                        && negative.level
+                            == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                        && review.status == ProcedureNegativeReviewStatus::Dismissed
+                        && review.successor_usage_revision_id.is_none() =>
+                {
+                    if let Some(held) = held.filter(|_| negative.local_context.is_none()) {
+                        Some((
+                            held.resume_state
+                                .filter(|state| {
+                                    matches!(
+                                        state,
+                                        ProcedurePublicationState::ActiveProbationary
+                                            | ProcedurePublicationState::ActiveStable
+                                    )
+                                })
+                                .ok_or(StoreError::StoreCorrupt)?,
+                            evertrace_domain::procedure::ProcedureStateReason::Manual,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                NegativeReviewActionReason::ConfirmHarm
+                    if current.status == ProcedureNegativeReviewStatus::Pending
+                        && negative.level
+                            == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                        && negative.local_context.is_none()
+                        && review.status == ProcedureNegativeReviewStatus::Upheld
+                        && review.successor_usage_revision_id.is_none() =>
+                {
+                    held.ok_or(StoreError::StoreCorrupt)?;
+                    Some((
+                        ProcedurePublicationState::Suspended,
+                        evertrace_domain::procedure::ProcedureStateReason::ConfirmedHarm,
+                    ))
+                }
+                NegativeReviewActionReason::SuccessorSuperseded
+                    if matches!(
+                        current.status,
+                        ProcedureNegativeReviewStatus::Pending
+                            | ProcedureNegativeReviewStatus::Upheld
+                    ) && review.status == ProcedureNegativeReviewStatus::Superseded =>
+                {
+                    if let Some(held) = held.filter(|_| negative.local_context.is_none()) {
+                        Some((
+                            held.resume_state
+                                .filter(|state| {
+                                    matches!(
+                                        state,
+                                        ProcedurePublicationState::ActiveProbationary
+                                            | ProcedurePublicationState::ActiveStable
+                                    )
+                                })
+                                .ok_or(StoreError::StoreCorrupt)?,
+                            evertrace_domain::procedure::ProcedureStateReason::Manual,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
             };
+            if matches!(
+                action,
+                NegativeReviewActionReason::ResolveAsIneffective
+                    | NegativeReviewActionReason::DismissAttribution
+                    | NegativeReviewActionReason::ConfirmHarm
+            ) && payloads.iter().any(|payload| {
+                matches!(
+                    payload,
+                    JournalPayload::ProcedureNegativeEvidenceRecorded(_)
+                )
+            }) {
+                return Err(StoreError::StoreCorrupt);
+            }
             let states = payloads
                 .iter()
                 .filter_map(|payload| match payload {
                     JournalPayload::ProcedureStateRecorded(event)
                         if event.procedure_revision_id == negative.procedure_revision_id
                             && event.from_state == Some(ProcedurePublicationState::ReviewHold)
-                            && event.reason
-                                == evertrace_domain::procedure::ProcedureStateReason::Manual
                             && event.evidence_refs
                                 == vec![negative.negative_evidence_id.to_string()] =>
                     {
-                        Some(event.to_state)
+                        Some(event.as_ref())
                     }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if states.as_slice() != expected.as_slice() {
-                return Err(StoreError::StoreCorrupt);
+            match (expected_state, states.as_slice()) {
+                (None, []) => {}
+                (Some((to_state, reason)), [state])
+                    if state.to_state == to_state
+                        && state.reason == reason
+                        && state.resume_state.is_none()
+                        && state.created_at_us == review.created_at_us => {}
+                _ => return Err(StoreError::StoreCorrupt),
             }
         }
         for state in payloads.iter().filter_map(|payload| match payload {
@@ -495,12 +705,48 @@ impl ProcedureState {
             }
             _ => None,
         }) {
-            if payloads.iter().filter(|payload| {
+            let new_negative_count = payloads.iter().filter(|payload| {
                 matches!(payload,
                     JournalPayload::ProcedureNegativeEvidenceRecorded(negative)
                         if negative.procedure_revision_id == state.procedure_revision_id
                             && state.evidence_refs == vec![negative.negative_evidence_id.to_string()])
-            }).count() != 1 {
+            }).count();
+            let confirmed_existing_count = state
+                .evidence_refs
+                .first()
+                .and_then(|reference| reference.parse::<ProcedureNegativeEvidenceId>().ok())
+                .filter(|negative_id| {
+                    self.negative_evidence.get(negative_id).is_some_and(|(negative, _)| {
+                        negative.procedure_revision_id == state.procedure_revision_id
+                            && negative.level
+                                == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                            && negative.local_context.is_none()
+                    })
+                })
+                .map_or(0, |negative_id| {
+                    payloads
+                        .iter()
+                        .filter(|payload| {
+                            matches!(payload,
+                                JournalPayload::ProcedureNegativeReviewRecorded(review)
+                                    if review.negative_evidence_id == negative_id
+                                        && review.status == ProcedureNegativeReviewStatus::Upheld
+                                        && NegativeReviewActionReason::parse(&review.reason)
+                                            == Some(NegativeReviewActionReason::ConfirmHarm))
+                        })
+                        .count()
+                });
+            let valid = match state.reason {
+                evertrace_domain::procedure::ProcedureStateReason::SuspectedHarm => {
+                    new_negative_count == 1 && confirmed_existing_count == 0
+                }
+                evertrace_domain::procedure::ProcedureStateReason::ConfirmedHarm => {
+                    (new_negative_count == 1 && confirmed_existing_count == 0)
+                        || (new_negative_count == 0 && confirmed_existing_count == 1)
+                }
+                _ => false,
+            };
+            if !valid {
                 return Err(StoreError::StoreCorrupt);
             }
         }
@@ -745,11 +991,9 @@ impl ProcedureState {
         &self,
         procedure_id: evertrace_domain::ids::ProcedureId,
     ) -> Option<&ProcedureRevision> {
-        self.revisions
-            .values()
+        self.procedures
+            .get(&procedure_id)
             .map(|(revision, _)| revision)
-            .filter(|revision| revision.procedure_id == procedure_id)
-            .max_by_key(|revision| revision.revision_generation)
     }
 
     pub(super) fn current_revision_by_id(

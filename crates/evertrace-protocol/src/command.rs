@@ -6,6 +6,7 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::dto::HumanGovernanceRequest;
 use crate::mcp::McpToolInput;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,6 +26,7 @@ pub enum Command {
     McpCall(McpCallCommand),
     RecallCue(RecallCueCommand),
     SessionImportAdmin(SessionImportAdminCommand),
+    HumanGovernance(HumanGovernanceRequest),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

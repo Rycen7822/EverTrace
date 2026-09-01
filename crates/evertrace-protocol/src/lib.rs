@@ -142,7 +142,8 @@ impl LocalServer {
                 Command::IssueMcpBinding(_)
                 | Command::McpCall(_)
                 | Command::RecallCue(_)
-                | Command::SessionImportAdmin(_) => Err(ErrorCode::InvalidInput),
+                | Command::SessionImportAdmin(_)
+                | Command::HumanGovernance(_) => Err(ErrorCode::InvalidInput),
             })
         })
         .await
@@ -681,7 +682,8 @@ pub async fn request_health(
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)
             | Response::RecallCue(_)
-            | Response::SessionImportAdmin(_) => Err(ProtocolError::UnexpectedMessage),
+            | Response::SessionImportAdmin(_)
+            | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
@@ -753,7 +755,8 @@ pub async fn request_recovery(
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)
             | Response::RecallCue(_)
-            | Response::SessionImportAdmin(_) => Err(ProtocolError::UnexpectedMessage),
+            | Response::SessionImportAdmin(_)
+            | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),
         },
         ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
         ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {

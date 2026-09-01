@@ -13,9 +13,10 @@ use evertrace_domain::{
         AtomProvenance, AtomScope, AtomValue, ConstraintExpr, ConstraintField, ConstraintValue,
         CoreMembershipProposalPayload, CoreScopeIdentity, EpistemicStatus, FutureCueLifecycleExprs,
         GlobalSupportState, GlobalSupportValidationEvent, ProposalCreatedBy, ProposalEligibility,
-        ProposalOperation, ProposalPayload, ProposalTargetKind, Scenario, ScenarioScope,
-        ScenarioStatus, ScenarioWorkstream, SemanticQualifier, SupportThresholdSnapshot,
-        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, ValidityInterval, tui_acceptance_event_payload,
+        ProposalOperation, ProposalPayload, ProposalTargetKind, RevisionProposal, Scenario,
+        ScenarioScope, ScenarioStatus, ScenarioWorkstream, SemanticQualifier,
+        SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF, ValidityInterval,
+        tui_acceptance_event_payload,
     },
     work::{PhaseKind, Task, TaskIdentityConfidence, TaskLifecycle},
 };
@@ -161,6 +162,46 @@ fn source(label: &str, payload: &str, at: i64) -> (SourceReceipt, SourceObservat
         },
         scope_effect_claims: Vec::new(),
     };
+    receipt.validate().unwrap();
+    observation.validate().unwrap();
+    (receipt, observation)
+}
+
+fn tui_source(
+    proposal: &RevisionProposal,
+    payload: &str,
+    at: i64,
+) -> (SourceReceipt, SourceObservation) {
+    let label = proposal.proposal_id.as_uuid().hyphenated().to_string();
+    let (mut receipt, mut observation) = source(&label, payload, at);
+    let instance =
+        SourceInstanceId::parse(format!("tui-acceptance:{}", proposal.proposal_id)).unwrap();
+    let revision = SourceRevision::parse(proposal.proposal_revision_id.to_string()).unwrap();
+    let record = SourceRecordIdentity::parse(format!(
+        "tui-accept-{}-{}",
+        proposal.proposal_id, proposal.proposal_revision_id
+    ))
+    .unwrap();
+    let observation_id = source_observation_id(&instance, &revision, &record).unwrap();
+    let receipt_id = source_receipt_id(&instance, &revision, &record).unwrap();
+    receipt.source_receipt_id = receipt_id;
+    receipt.source_observation_id = observation_id;
+    receipt.source_instance_id = instance.clone();
+    receipt.source_kind = EvidenceSourceKind::Other;
+    receipt.identity_domain = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
+    receipt.source_ref = proposal.proposal_id.to_string();
+    receipt.source_session_ref = "human-governance".into();
+    receipt.source_revision = revision.clone();
+    receipt.source_record_identity = record.clone();
+    receipt.source_sequence_origin = Some(1);
+    receipt.close_watermark = None;
+    receipt.adapter_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
+    observation.source_observation_id = observation_id;
+    observation.source_instance_id = instance;
+    observation.source_revision = revision;
+    observation.source_record_identity = record;
+    observation.source_receipt_ref = receipt_id;
+    observation.correlation.adapter_manifest_ref = TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
     receipt.validate().unwrap();
     observation.validate().unwrap();
     (receipt, observation)
@@ -524,7 +565,7 @@ async fn global_atom_and_independent_core_membership_accept_as_atomic_cohorts() 
         &unsupported_proposal.fingerprint,
     );
     let (unsupported_receipt, unsupported_observation) =
-        source("unsupported-acceptance", &unsupported_acceptance_payload, 2);
+        tui_source(&unsupported_proposal, &unsupported_acceptance_payload, 2);
     writer
         .commit(
             &event_command(
@@ -589,7 +630,7 @@ async fn global_atom_and_independent_core_membership_accept_as_atomic_cohorts() 
         &stale_proposal.fingerprint,
     );
     let (stale_receipt, stale_observation) =
-        source("stale-acceptance", &stale_acceptance_payload, 2);
+        tui_source(&stale_proposal, &stale_acceptance_payload, 2);
     writer
         .commit(
             &event_command(
@@ -649,7 +690,7 @@ async fn global_atom_and_independent_core_membership_accept_as_atomic_cohorts() 
         &atom_proposal.fingerprint,
     );
     let (atom_acceptance_receipt, atom_acceptance_observation) =
-        source("atom-acceptance", &atom_acceptance_payload, 3);
+        tui_source(&atom_proposal, &atom_acceptance_payload, 3);
     writer
         .commit(
             &event_command(
@@ -870,7 +911,7 @@ async fn global_atom_and_independent_core_membership_accept_as_atomic_cohorts() 
         core_proposal.proposal_revision_id,
         &core_proposal.fingerprint,
     );
-    let (core_receipt, core_observation) = source("core-acceptance", &core_acceptance_payload, 7);
+    let (core_receipt, core_observation) = tui_source(&core_proposal, &core_acceptance_payload, 7);
     writer
         .commit(
             &event_command(

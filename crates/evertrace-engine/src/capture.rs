@@ -41,6 +41,7 @@ use thiserror::Error;
 
 use crate::{WriterActorError, WriterHandle, ingest::IngestError};
 
+#[derive(Clone)]
 pub(crate) struct VerifiedCapture {
     pub body: evertrace_capture::CaptureRecordBody,
     pub receipt: SourceReceipt,

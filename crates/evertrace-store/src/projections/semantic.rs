@@ -1,28 +1,33 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
     evidence::{
-        CaptureCompleteness, ContentTrust, ObservationRole, SourceObservation, SourceReceipt,
-        SourceRole, hex, payload_fingerprint,
+        CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
+        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode, SourceRole, hex,
+        payload_fingerprint,
     },
     ids::{
         AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
         SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId, WorktreeId,
     },
-    procedure::ProcedureScope,
+    procedure::{ProcedureRevision, ProcedureScope},
     repository::{RepositoryInstance, WorktreeInstance},
     revision::RevisionId,
     semantic::{
-        Atom, AtomAuthority, AtomLifecycleStatus, AtomScope, CoreMembershipProposalPayload,
-        EpistemicStatus, ProposalAcceptanceAuthority, ProposalEligibility, ProposalOperation,
-        ProposalStatus, ProposalTargetId, ProposalTargetKind, RevisionProposal,
-        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, UserAuthorizationMode, VerifierStatus,
-        tui_acceptance_event_payload,
+        Atom, AtomAuthority, AtomDraft, AtomLifecycleStatus, AtomProposalPayload, AtomScope,
+        CoreMembershipProposalPayload, EpistemicStatus, GlobalSupportState,
+        ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalCreatedBy,
+        ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus, ProposalTargetId,
+        ProposalTargetKind, RevisionProposal, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        UserAuthorizationMode, VerifierStatus, tui_acceptance_event_payload,
     },
     work::{ArtifactPayloadStatus, Task, WorkArtifact},
 };
 
-use crate::{JournalPayload, ObjectRowClass, StoreError, projections::ProjectionSnapshot};
+use crate::{
+    JournalPayload, ObjectRowClass, SourceIngestWatermark, StoreError,
+    projections::ProjectionSnapshot,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SemanticCurrentView {
@@ -308,6 +313,8 @@ pub(crate) struct SemanticRelationInputs<'a> {
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
     pub results: &'a BTreeMap<ResultEvidenceId, (evertrace_domain::semantic::ResultEvidence, u64)>,
     pub artifacts: &'a BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
+    pub procedure: &'a super::procedure::ProcedureState,
+    pub s23: &'a super::s23::S23State,
     pub semantic_digests:
         &'a BTreeMap<SemanticDigestId, (evertrace_domain::semantic::SemanticDigest, u64)>,
 }
@@ -324,10 +331,27 @@ pub(crate) fn validate_relations(input: SemanticRelationInputs<'_>) -> Result<()
 
 pub(crate) fn validate_command_boundary<'a>(
     current_atoms: &BTreeMap<AtomId, (Atom, u64)>,
-    payloads: impl IntoIterator<Item = &'a JournalPayload>,
+    current_proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    current_procedures: &super::procedure::ProcedureState,
+    current_support: &super::s23::S23State,
+    events: impl IntoIterator<Item = (&'a JournalPayload, i64, [u8; 32])>,
     error: StoreError,
-) -> Result<(), StoreError> {
-    let payloads = payloads.into_iter().collect::<Vec<_>>();
+) -> Result<BTreeSet<RevisionProposalId>, StoreError> {
+    let events = events.into_iter().collect::<Vec<_>>();
+    let payloads = events
+        .iter()
+        .map(|(payload, _, _)| *payload)
+        .collect::<Vec<_>>();
+    validate_support_proposal_boundaries(
+        current_atoms,
+        current_procedures,
+        current_support,
+        &payloads,
+        error,
+    )?;
+    let exact_edit_pairs = exact_edit_pairs(current_proposals, &payloads, error)?;
+    let mut validated_edit_pairs = BTreeSet::new();
+    let mut accepted_edits = BTreeSet::new();
     for proposal in payloads.iter().filter_map(|payload| match payload {
         JournalPayload::RevisionProposalRecorded(value) => Some(value.as_ref()),
         _ => None,
@@ -357,13 +381,31 @@ pub(crate) fn validate_command_boundary<'a>(
         _ => None,
     }) {
         let acceptance = accepted.acceptance.as_ref().ok_or(error)?;
+        let expected_original_id =
+            exact_edit_pairs
+                .iter()
+                .find_map(|(original_id, candidate_id)| {
+                    (*candidate_id == accepted.proposal_id).then_some(*original_id)
+                });
+        if let Some(original_id) = validate_accepted_edit_boundary(
+            current_proposals,
+            &payloads,
+            accepted,
+            expected_original_id,
+            error,
+        )? {
+            if !validated_edit_pairs.insert((original_id, accepted.proposal_id)) {
+                return Err(error);
+            }
+            accepted_edits.insert(accepted.proposal_id);
+        }
         let Some((accepted_atom_id, accepted_atom_revision_id, _)) = acceptance.accepted_atom()
         else {
             continue;
         };
-        if payloads
+        let accepted_atoms = events
             .iter()
-            .filter(|payload| {
+            .filter(|(payload, _, _)| {
                 matches!(
                     payload,
                     JournalPayload::AtomRecorded(atom)
@@ -374,10 +416,33 @@ pub(crate) fn validate_command_boundary<'a>(
                                 == Some(accepted.proposal_revision_id)
                 )
             })
-            .count()
-            != 1
-        {
+            .collect::<Vec<_>>();
+        let [(accepted_atom_payload, occurred_at_us, effective_config_hash)] =
+            accepted_atoms.as_slice()
+        else {
             return Err(error);
+        };
+        let JournalPayload::AtomRecorded(accepted_atom) = accepted_atom_payload else {
+            return Err(error);
+        };
+        if support_validation_ref(accepted, current_support, error)?.is_some() {
+            let base_revision_id = accepted.base_revision_id.ok_or(error)?;
+            let replacement_successor = match accepted.operation {
+                ProposalOperation::Replace => Some(accepted_atom.revision_id),
+                ProposalOperation::Deprecate => None,
+                _ => return Err(error),
+            };
+            current_support.validate_successor_fanout(
+                base_revision_id,
+                replacement_successor,
+                *occurred_at_us,
+                *effective_config_hash,
+                &payloads,
+                error,
+            )?;
+        }
+        if accepted.operation == ProposalOperation::Merge {
+            validate_accepted_merge_boundary(current_atoms, &payloads, accepted, error)?;
         }
     }
     for atom in payloads.iter().filter_map(|payload| match payload {
@@ -404,6 +469,589 @@ pub(crate) fn validate_command_boundary<'a>(
             return Err(error);
         }
     }
+    if validated_edit_pairs != exact_edit_pairs {
+        return Err(error);
+    }
+    Ok(accepted_edits)
+}
+
+fn validate_support_proposal_boundaries(
+    current_atoms: &BTreeMap<AtomId, (Atom, u64)>,
+    current_procedures: &super::procedure::ProcedureState,
+    current_support: &super::s23::S23State,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<(), StoreError> {
+    for proposal in payloads.iter().filter_map(|payload| match payload {
+        JournalPayload::RevisionProposalRecorded(value)
+            if value.parent_proposal_revision_id.is_none()
+                && value.status == ProposalStatus::Pending
+                || value.status == ProposalStatus::Accepted =>
+        {
+            Some(value.as_ref())
+        }
+        _ => None,
+    }) {
+        if proposal.evidence_refs.len() == 1
+            && proposal.evidence_refs == proposal.source_cohort_refs
+            && payloads.iter().any(|payload| {
+                matches!(
+                    payload,
+                    JournalPayload::GlobalSupportValidationRecorded(value)
+                        if proposal.evidence_refs[0]
+                            == value.validation_revision_id.to_string()
+                )
+            })
+        {
+            return Err(error);
+        }
+        let Some(validation_revision_id) =
+            support_validation_ref(proposal, current_support, error)?
+        else {
+            continue;
+        };
+        let validation = current_support
+            .validation(validation_revision_id)
+            .ok_or(error)?;
+        if validation.state == GlobalSupportState::Valid
+            || current_support
+                .current_validation(validation.support_contract_ref)
+                .is_none_or(|current| {
+                    current.validation_revision_id != validation.validation_revision_id
+                })
+            || payloads.iter().any(|payload| {
+                matches!(
+                    payload,
+                    JournalPayload::GlobalSupportValidationRecorded(value)
+                        if value.support_contract_ref == validation.support_contract_ref
+                )
+            })
+        {
+            return Err(error);
+        }
+        validate_support_proposal_target(
+            proposal,
+            validation.successor_ref.as_str(),
+            |atom_id, base| {
+                let atom = current_atoms
+                    .get(&atom_id)
+                    .map(|(atom, _)| atom)
+                    .filter(|atom| {
+                        atom.revision_id == base
+                            && atom.scope == AtomScope::Global
+                            && atom.lifecycle_status == AtomLifecycleStatus::Active
+                    })?;
+                (!payloads.iter().any(|payload| {
+                    matches!(payload, JournalPayload::AtomRecorded(value) if value.revision_id == base)
+                }))
+                .then_some(atom_replacement_payload(atom))
+            },
+            |procedure_id, base| {
+                let procedure = current_procedures.current_revision(procedure_id)?;
+                (procedure.revision_id == base
+                    && procedure.draft.scope == ProcedureScope::Global
+                    && !payloads.iter().any(|payload| {
+                        matches!(
+                            payload,
+                            JournalPayload::ProcedureRevisionRecorded(value)
+                                if value.revision_id == base
+                        )
+                    }))
+                .then_some(procedure_replacement_payload(procedure))
+            },
+            error,
+        )?;
+    }
+    Ok(())
+}
+
+fn support_validation_ref(
+    proposal: &RevisionProposal,
+    support: &super::s23::S23State,
+    error: StoreError,
+) -> Result<Option<RevisionId>, StoreError> {
+    let evidence = proposal
+        .evidence_refs
+        .iter()
+        .filter_map(|reference| reference.parse::<RevisionId>().ok())
+        .filter(|revision_id| support.validation(*revision_id).is_some())
+        .collect::<Vec<_>>();
+    let sources = proposal
+        .source_cohort_refs
+        .iter()
+        .filter_map(|reference| reference.parse::<RevisionId>().ok())
+        .filter(|revision_id| support.validation(*revision_id).is_some())
+        .collect::<Vec<_>>();
+    if evidence.is_empty() && sources.is_empty() {
+        return Ok(None);
+    }
+    let ([evidence], [source]) = (evidence.as_slice(), sources.as_slice()) else {
+        return Err(error);
+    };
+    if evidence != source
+        || proposal.evidence_refs != [evidence.to_string()]
+        || proposal.source_cohort_refs != [source.to_string()]
+        || proposal.target_kind
+            != match proposal.target_id {
+                Some(ProposalTargetId::Atom(_)) => ProposalTargetKind::Atom,
+                Some(ProposalTargetId::Procedure(_)) => ProposalTargetKind::Procedure,
+                _ => return Err(error),
+            }
+        || proposal.eligibility != ProposalEligibility::ManualRequired
+        || proposal.created_by != ProposalCreatedBy::User
+    {
+        return Err(error);
+    }
+    match (&proposal.payload, proposal.operation, proposal.target_id) {
+        (
+            ProposalPayload::Atom(payload),
+            ProposalOperation::Replace,
+            Some(ProposalTargetId::Atom(_)),
+        ) if matches!(payload.as_ref(), AtomProposalPayload::Replace { .. }) => {}
+        (
+            ProposalPayload::Procedure(payload),
+            ProposalOperation::Replace,
+            Some(ProposalTargetId::Procedure(_)),
+        ) if matches!(payload.as_ref(), ProcedureProposalPayload::Replace { .. }) => {}
+        (
+            ProposalPayload::Atom(payload),
+            ProposalOperation::Deprecate,
+            Some(ProposalTargetId::Atom(_)),
+        ) if matches!(payload.as_ref(), AtomProposalPayload::Deprecate { .. }) => {}
+        _ => return Err(error),
+    }
+    Ok(Some(*evidence))
+}
+
+fn validate_support_proposal_target(
+    proposal: &RevisionProposal,
+    successor_ref: &str,
+    atom_payload: impl FnOnce(AtomId, RevisionId) -> Option<ProposalPayload>,
+    procedure_payload: impl FnOnce(
+        evertrace_domain::ids::ProcedureId,
+        RevisionId,
+    ) -> Option<ProposalPayload>,
+    error: StoreError,
+) -> Result<(), StoreError> {
+    let base = proposal.base_revision_id.ok_or(error)?;
+    if successor_ref != base.to_string() {
+        return Err(error);
+    }
+    let original = match proposal.target_id {
+        Some(ProposalTargetId::Atom(atom_id)) => atom_payload(atom_id, base),
+        Some(ProposalTargetId::Procedure(procedure_id)) => procedure_payload(procedure_id, base),
+        _ => None,
+    }
+    .ok_or(error)?;
+    match proposal.operation {
+        ProposalOperation::Replace => original
+            .validate_closed_edit(&proposal.payload)
+            .map_err(|_| error),
+        ProposalOperation::Deprecate => match &proposal.payload {
+            ProposalPayload::Atom(payload)
+                if matches!(payload.as_ref(), AtomProposalPayload::Deprecate { .. }) =>
+            {
+                payload.validate().map_err(|_| error)
+            }
+            _ => Err(error),
+        },
+        _ => Err(error),
+    }
+}
+
+fn atom_replacement_payload(atom: &Atom) -> ProposalPayload {
+    ProposalPayload::Atom(Box::new(AtomProposalPayload::Replace {
+        draft: AtomDraft {
+            kind: atom.kind,
+            epistemic_status: atom.epistemic_status,
+            value: atom.value.clone(),
+            scope: atom.scope.clone(),
+            applicability_expr: atom.applicability_expr.clone(),
+            future_cue_lifecycle_exprs: atom.future_cue_lifecycle_exprs.clone(),
+            validity_interval: atom.validity_interval.clone(),
+            provenance: atom.provenance.clone(),
+            source_observation_refs: atom.source_observation_refs.clone(),
+            evidence_refs: atom.evidence_refs.clone(),
+            supersedes_revision_refs: atom.supersedes_revision_refs.clone(),
+            supports_revision_refs: atom.supports_revision_refs.clone(),
+            contradicts_revision_refs: atom.contradicts_revision_refs.clone(),
+        },
+    }))
+}
+
+fn procedure_replacement_payload(procedure: &ProcedureRevision) -> ProposalPayload {
+    ProposalPayload::Procedure(Box::new(ProcedureProposalPayload::Replace {
+        draft: procedure.draft.clone(),
+    }))
+}
+
+fn exact_edit_pairs(
+    current_proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    payloads: &[&JournalPayload],
+    error: StoreError,
+) -> Result<BTreeSet<(RevisionProposalId, RevisionProposalId)>, StoreError> {
+    let mut pending = Vec::new();
+    let mut superseded_by_id = BTreeMap::<RevisionProposalId, Vec<&RevisionProposal>>::new();
+    for payload in payloads {
+        let JournalPayload::RevisionProposalRecorded(value) = payload else {
+            continue;
+        };
+        match value.status {
+            ProposalStatus::Pending => pending.push(value.as_ref()),
+            ProposalStatus::Superseded => superseded_by_id
+                .entry(value.proposal_id)
+                .or_default()
+                .push(value.as_ref()),
+            _ => {}
+        }
+    }
+    if pending.is_empty() || superseded_by_id.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut candidate_ids = BTreeSet::new();
+    let mut pairs = BTreeSet::new();
+    for (original_id, events) in superseded_by_id {
+        let Some((original, _)) = current_proposals.get(&original_id) else {
+            continue;
+        };
+        let superseded = events
+            .iter()
+            .copied()
+            .filter(|value| original.validate_successor(value).is_ok())
+            .collect::<Vec<_>>();
+        if superseded.is_empty() {
+            continue;
+        }
+        let candidates = pending
+            .iter()
+            .copied()
+            .filter(|candidate| original.validate_edit_candidate(candidate).is_ok())
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            continue;
+        }
+        if superseded.len() != 1 {
+            return Err(error);
+        }
+        let [candidate] = candidates.as_slice() else {
+            return Err(error);
+        };
+        if !candidate_ids.insert(candidate.proposal_id) {
+            return Err(error);
+        }
+        pairs.insert((original_id, candidate.proposal_id));
+    }
+    Ok(pairs)
+}
+
+fn validate_accepted_edit_boundary(
+    current_proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    payloads: &[&JournalPayload],
+    accepted: &RevisionProposal,
+    expected_original_id: Option<RevisionProposalId>,
+    error: StoreError,
+) -> Result<Option<RevisionProposalId>, StoreError> {
+    let Some(acceptance) = accepted.acceptance.as_ref() else {
+        return Err(error);
+    };
+    if !matches!(
+        acceptance.authority_basis,
+        ProposalAcceptanceAuthority::TuiAcceptance { .. }
+    ) {
+        return if expected_original_id.is_some() {
+            Err(error)
+        } else {
+            Ok(None)
+        };
+    }
+    let observation_id = acceptance
+        .acceptance_event_ref
+        .parse::<SourceObservationId>()
+        .map_err(|_| error)?;
+    let observations = payloads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, payload)| match payload {
+            JournalPayload::SourceObservationRecorded(value)
+                if value.source_observation_id == observation_id =>
+            {
+                Some((index, value.as_ref()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if observations.is_empty() {
+        return if expected_original_id.is_some() {
+            Err(error)
+        } else {
+            Ok(None)
+        };
+    }
+    let [observation] = observations.as_slice() else {
+        return Err(error);
+    };
+    let receipts = payloads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, payload)| match payload {
+            JournalPayload::SourceReceiptRecorded(value)
+                if value.source_receipt_id == observation.1.source_receipt_ref =>
+            {
+                Some((index, value.as_ref()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [receipt] = receipts.as_slice() else {
+        return Err(error);
+    };
+    if receipt.1.source_ref == accepted.proposal_id.to_string() {
+        return if expected_original_id.is_some() {
+            Err(error)
+        } else {
+            Ok(None)
+        };
+    }
+    let original_id = receipt
+        .1
+        .source_ref
+        .parse::<RevisionProposalId>()
+        .map_err(|_| error)?;
+    if expected_original_id != Some(original_id) {
+        return Err(error);
+    }
+    let original_revision_id = receipt
+        .1
+        .source_revision
+        .as_str()
+        .parse::<RevisionId>()
+        .map_err(|_| error)?;
+    let original = current_proposals
+        .get(&original_id)
+        .filter(|(value, _)| value.proposal_revision_id == original_revision_id)
+        .map(|(value, _)| value)
+        .ok_or(error)?;
+    let reviewed = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::RevisionProposalRecorded(value)
+                if value.proposal_revision_id == acceptance.reviewed_proposal_revision_id
+                    && value.proposal_id == accepted.proposal_id
+                    && value.status == ProposalStatus::Pending =>
+            {
+                Some(value.as_ref())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [reviewed] = reviewed.as_slice() else {
+        return Err(error);
+    };
+    original
+        .validate_edit_candidate(reviewed)
+        .map_err(|_| error)?;
+    let canonical = original.edit_intent_toml(reviewed).map_err(|_| error)?;
+    let expected_fingerprint = hex(&payload_fingerprint(
+        observation.1.canonicalization_revision,
+        canonical.as_bytes(),
+        None,
+    )
+    .map_err(|_| error)?);
+    let expected_record = format!(
+        "tui-accept-{}-{}",
+        original.proposal_id, original.proposal_revision_id
+    );
+    let expected_instance = format!("tui-acceptance:{}", original.proposal_id);
+    if receipt.1.source_instance_id.as_str() != expected_instance
+        || receipt.1.source_revision.as_str() != original.proposal_revision_id.to_string()
+        || receipt.1.source_record_identity.as_str() != expected_record
+        || receipt.1.source_session_ref != "human-governance"
+        || receipt.1.source_sequence != 1
+        || receipt.1.source_sequence_origin != Some(1)
+        || receipt.1.identity_strength != IdentityStrength::StableNative
+        || receipt.1.source_kind != EvidenceSourceKind::Other
+        || receipt.1.identity_domain != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+        || receipt.1.source_revision_mode != SourceRevisionMode::Append
+        || receipt.1.previous_source_revision.is_some()
+        || receipt.1.adapter_revision != 1
+        || receipt.1.adapter_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+        || receipt.1.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+        || receipt.1.parser_revision != 1
+        || receipt.1.canonicalization_revision != 1
+        || receipt.1.capture_completeness != CaptureCompleteness::Complete
+        || receipt.1.archive_mode != SourceArchiveMode::Exact
+        || receipt.1.protected_secret_digest.is_some()
+        || !receipt.1.redaction_spans.is_empty()
+        || receipt.1.protected_length != canonical.len() as u64
+        || receipt.1.original_length != canonical.len() as u64
+        || observation.1.source_role != SourceRole::User
+        || observation.1.content_trust != ContentTrust::UserStatement
+        || observation.1.capture_completeness != CaptureCompleteness::Complete
+        || observation.1.observation_role != ObservationRole::Message
+        || observation.1.payload_fingerprint != expected_fingerprint
+    {
+        return Err(error);
+    }
+    let watermark = SourceIngestWatermark {
+        source_instance_id: receipt.1.source_instance_id.clone(),
+        source_revision: receipt.1.source_revision.clone(),
+        source_sequence: 1,
+        confirmed_prefix_digest: None,
+    };
+    let watermarks = payloads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, payload)| match payload {
+            JournalPayload::SourceIngestWatermark(value) if value == &watermark => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [watermark_index] = watermarks.as_slice() else {
+        return Err(error);
+    };
+    if payloads
+        .iter()
+        .filter(|payload| matches!(payload, JournalPayload::SourceReceiptRecorded(_)))
+        .count()
+        != 1
+        || payloads
+            .iter()
+            .filter(|payload| matches!(payload, JournalPayload::SourceObservationRecorded(_)))
+            .count()
+            != 1
+        || payloads
+            .iter()
+            .filter(|payload| matches!(payload, JournalPayload::SourceIngestWatermark(_)))
+            .count()
+            != 1
+    {
+        return Err(error);
+    }
+    let proposal_events = payloads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, payload)| match payload {
+            JournalPayload::RevisionProposalRecorded(value)
+                if value.proposal_id == original.proposal_id
+                    || value.proposal_id == reviewed.proposal_id =>
+            {
+                Some((index, value.as_ref()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let superseded = proposal_events
+        .iter()
+        .filter(|(_, value)| {
+            value.proposal_id == original.proposal_id && value.status == ProposalStatus::Superseded
+        })
+        .collect::<Vec<_>>();
+    let pending = proposal_events
+        .iter()
+        .filter(|(_, value)| *value == *reviewed)
+        .collect::<Vec<_>>();
+    let validating = proposal_events
+        .iter()
+        .filter(|(_, value)| {
+            value.proposal_id == reviewed.proposal_id && value.status == ProposalStatus::Validating
+        })
+        .collect::<Vec<_>>();
+    let accepted_events = proposal_events
+        .iter()
+        .filter(|(_, value)| {
+            value.proposal_id == reviewed.proposal_id && value.status == ProposalStatus::Accepted
+        })
+        .collect::<Vec<_>>();
+    let ([superseded], [pending], [validating], [accepted_event]) = (
+        superseded.as_slice(),
+        pending.as_slice(),
+        validating.as_slice(),
+        accepted_events.as_slice(),
+    ) else {
+        return Err(error);
+    };
+    if proposal_events.len() != 4
+        || accepted_event.1 != accepted
+        || !(observation.0 < superseded.0
+            && receipt.0 < superseded.0
+            && *watermark_index < superseded.0
+            && superseded.0 < pending.0
+            && pending.0 < validating.0
+            && validating.0 < accepted_event.0)
+        || original.validate_successor(superseded.1).is_err()
+        || reviewed.validate_successor(validating.1).is_err()
+        || validating.1.validate_successor(accepted_event.1).is_err()
+    {
+        return Err(error);
+    }
+    Ok(Some(original_id))
+}
+
+fn validate_accepted_merge_boundary(
+    current_atoms: &BTreeMap<AtomId, (Atom, u64)>,
+    payloads: &[&JournalPayload],
+    proposal: &RevisionProposal,
+    error: StoreError,
+) -> Result<(), StoreError> {
+    let (Some(ProposalTargetId::Atom(target_atom_id)), Some(base_revision_id)) =
+        (proposal.target_id, proposal.base_revision_id)
+    else {
+        return Err(error);
+    };
+    let ProposalPayload::Atom(payload) = &proposal.payload else {
+        return Err(error);
+    };
+    let AtomProposalPayload::Merge {
+        draft,
+        merged_revision_refs,
+    } = payload.as_ref()
+    else {
+        return Err(error);
+    };
+    if merged_revision_refs != &draft.supersedes_revision_refs
+        || !merged_revision_refs.contains(&base_revision_id)
+        || current_atoms
+            .get(&target_atom_id)
+            .is_none_or(|(atom, _)| atom.revision_id != base_revision_id)
+    {
+        return Err(error);
+    }
+    let mut input_atom_ids = BTreeSet::new();
+    for revision_id in merged_revision_refs {
+        let atom = current_atoms
+            .values()
+            .find_map(|(atom, _)| (atom.revision_id == *revision_id).then_some(atom))
+            .ok_or(error)?;
+        if atom.lifecycle_status != AtomLifecycleStatus::Active
+            || atom.kind != draft.kind
+            || !atom.scope.contains(&draft.scope)
+        {
+            return Err(error);
+        }
+        input_atom_ids.insert(atom.atom_id);
+    }
+    if input_atom_ids.len() < 2 {
+        return Err(error);
+    }
+    let result_atoms = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::AtomRecorded(atom) => Some(atom.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [result] = result_atoms.as_slice() else {
+        return Err(error);
+    };
+    if result.atom_id != target_atom_id
+        || result.parent_revision_id != Some(base_revision_id)
+        || result.lifecycle_status != AtomLifecycleStatus::Active
+        || result.kind != draft.kind
+        || result.scope != draft.scope
+        || result.supersedes_revision_refs != *merged_revision_refs
+    {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -426,7 +1074,9 @@ fn validate_atom_relations(
         }
     }
     for evidence_ref in &atom.evidence_refs {
-        if !evidence_exists(evidence_ref, input) {
+        if !evidence_exists(evidence_ref, input)
+            && !support_acceptance_evidence_exists(atom, evidence_ref, input)?
+        {
             return Err(StoreError::StoreCorrupt);
         }
     }
@@ -594,16 +1244,117 @@ fn validate_atom_relations(
     Ok(())
 }
 
+fn support_acceptance_evidence_exists(
+    atom: &Atom,
+    evidence_ref: &str,
+    input: &SemanticRelationInputs<'_>,
+) -> Result<bool, StoreError> {
+    let (Some(proposal_id), Some(proposal_revision_id)) = (
+        atom.accepted_proposal_id,
+        atom.accepted_proposal_revision_id,
+    ) else {
+        return Ok(false);
+    };
+    let Ok(validation_revision_id) = evidence_ref.parse::<RevisionId>() else {
+        return Ok(false);
+    };
+    if input.s23.validation(validation_revision_id).is_none() {
+        return Ok(false);
+    }
+    if atom.parent_revision_id.is_some_and(|parent_revision_id| {
+        input
+            .atom_revisions
+            .get(&parent_revision_id)
+            .is_some_and(|(parent, _)| {
+                parent.atom_id == atom.atom_id
+                    && parent
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| reference == evidence_ref)
+            })
+    }) {
+        return Ok(true);
+    }
+    let Some((proposal, _)) = input.proposal_revisions.get(&proposal_revision_id) else {
+        return Ok(false);
+    };
+    if proposal.proposal_id != proposal_id
+        || proposal.status != ProposalStatus::Accepted
+        || !matches!(atom.scope, AtomScope::Global)
+        || proposal
+            .acceptance
+            .as_ref()
+            .and_then(|acceptance| acceptance.accepted_atom())
+            != Some((
+                atom.atom_id,
+                atom.revision_id,
+                atom.semantic_structure_hash()
+                    .map_err(|_| StoreError::StoreCorrupt)?,
+            ))
+    {
+        return Ok(false);
+    }
+    Ok(
+        support_validation_ref(proposal, input.s23, StoreError::StoreCorrupt)?
+            == Some(validation_revision_id),
+    )
+}
+
 fn validate_proposal_relations(
     proposal: &RevisionProposal,
     input: &SemanticRelationInputs<'_>,
 ) -> Result<(), StoreError> {
-    for reference in proposal
-        .evidence_refs
-        .iter()
-        .chain(&proposal.source_cohort_refs)
-    {
-        if !evidence_exists(reference, input) {
+    let support_validation_ref =
+        support_validation_ref(proposal, input.s23, StoreError::StoreCorrupt)?;
+    if let Some(validation_revision_id) = support_validation_ref {
+        let validation = input
+            .s23
+            .validation(validation_revision_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if validation.state == GlobalSupportState::Valid {
+            return Err(StoreError::StoreCorrupt);
+        }
+        validate_support_proposal_target(
+            proposal,
+            validation.successor_ref.as_str(),
+            |atom_id, base| {
+                input
+                    .atom_revisions
+                    .get(&base)
+                    .map(|(atom, _)| atom)
+                    .filter(|atom| {
+                        atom.atom_id == atom_id
+                            && atom.scope == AtomScope::Global
+                            && atom.lifecycle_status == AtomLifecycleStatus::Active
+                    })
+                    .map(atom_replacement_payload)
+            },
+            |procedure_id, base| {
+                input
+                    .procedure
+                    .revision(base)
+                    .filter(|procedure| {
+                        procedure.procedure_id == procedure_id
+                            && procedure.draft.scope == ProcedureScope::Global
+                    })
+                    .map(procedure_replacement_payload)
+            },
+            StoreError::StoreCorrupt,
+        )?;
+    }
+    let support_validation_ref = support_validation_ref.map(|value| value.to_string());
+    for reference in &proposal.source_cohort_refs {
+        if Some(reference.as_str()) != support_validation_ref.as_deref()
+            && !evidence_exists(reference, input)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    for reference in &proposal.evidence_refs {
+        if Some(reference.as_str()) != support_validation_ref.as_deref()
+            && !evidence_exists(reference, input)
+            && !valid_procedure_negative_reference(proposal, reference, input)
+        {
             return Err(StoreError::StoreCorrupt);
         }
     }
@@ -648,9 +1399,10 @@ fn validate_proposal_relations(
                 ProposalEligibility::ManualRequired => validate_tui_acceptance_event(
                     proposal,
                     acceptance,
-                    sources.reviewed.created_at_us,
+                    sources.reviewed,
                     sources.observation,
                     sources.receipt,
+                    input,
                 )?,
                 ProposalEligibility::AutoEligibleFull => {}
                 _ => return Err(StoreError::StoreCorrupt),
@@ -702,9 +1454,10 @@ fn validate_proposal_relations(
                     validate_tui_acceptance_event(
                         proposal,
                         acceptance,
-                        sources.reviewed.created_at_us,
+                        sources.reviewed,
                         sources.observation,
                         sources.receipt,
+                        input,
                     )?;
                 }
                 ProposalAcceptanceAuthority::ObjectiveEvidence {
@@ -823,9 +1576,10 @@ fn validate_proposal_relations(
                 validate_tui_acceptance_event(
                     proposal,
                     acceptance,
-                    reviewed.created_at_us,
+                    reviewed,
                     acceptance_observation,
                     acceptance_receipt,
+                    input,
                 )?;
             }
             ProposalAcceptanceAuthority::ObjectiveEvidence {
@@ -837,9 +1591,10 @@ fn validate_proposal_relations(
                 validate_tui_acceptance_event(
                     proposal,
                     acceptance,
-                    reviewed.created_at_us,
+                    reviewed,
                     acceptance_observation,
                     acceptance_receipt,
+                    input,
                 )?;
             }
         }
@@ -864,10 +1619,14 @@ fn validate_proposal_relations(
                     .ok_or(StoreError::StoreCorrupt)?
                     .0
                     .clone();
-                if !matches!(
+                let accepted_support_global = proposal.operation == ProposalOperation::Replace
+                    && base.scope == AtomScope::Global
+                    && support_validation_ref.is_some();
+                if !(matches!(
                     base.scope,
                     AtomScope::Task { .. } | AtomScope::Repository { .. }
-                ) || atom.parent_revision_id != Some(base.revision_id)
+                ) || accepted_support_global)
+                    || atom.parent_revision_id != Some(base.revision_id)
                     || atom.atom_id != base.atom_id
                     || proposal.operation == ProposalOperation::Replace && atom.kind != base.kind
                     || atom.lifecycle_status != AtomLifecycleStatus::Active
@@ -881,10 +1640,13 @@ fn validate_proposal_relations(
                     .get(&proposal.base_revision_id.ok_or(StoreError::StoreCorrupt)?)
                     .ok_or(StoreError::StoreCorrupt)?
                     .0;
-                if !matches!(
+                let accepted_support_global =
+                    base.scope == AtomScope::Global && support_validation_ref.is_some();
+                if !(matches!(
                     base.scope,
                     AtomScope::Task { .. } | AtomScope::Repository { .. }
-                ) || atom.parent_revision_id != Some(base.revision_id)
+                ) || accepted_support_global)
+                    || atom.parent_revision_id != Some(base.revision_id)
                     || atom.atom_id != base.atom_id
                     || atom.lifecycle_status != AtomLifecycleStatus::Deprecated
                     || atom.authority != base.authority
@@ -892,9 +1654,53 @@ fn validate_proposal_relations(
                     return Err(StoreError::StoreCorrupt);
                 }
             }
-            ProposalOperation::Merge | ProposalOperation::Split => {
-                return Err(StoreError::StoreCorrupt);
+            ProposalOperation::Merge => {
+                let ProposalPayload::Atom(payload) = &proposal.payload else {
+                    return Err(StoreError::StoreCorrupt);
+                };
+                let AtomProposalPayload::Merge {
+                    draft,
+                    merged_revision_refs,
+                } = payload.as_ref()
+                else {
+                    return Err(StoreError::StoreCorrupt);
+                };
+                let base_revision_id = proposal.base_revision_id.ok_or(StoreError::StoreCorrupt)?;
+                let Some(ProposalTargetId::Atom(target_atom_id)) = proposal.target_id else {
+                    return Err(StoreError::StoreCorrupt);
+                };
+                let mut input_atom_ids = BTreeSet::new();
+                if merged_revision_refs != &draft.supersedes_revision_refs
+                    || !merged_revision_refs.contains(&base_revision_id)
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                for revision_id in merged_revision_refs {
+                    let input = &input
+                        .atom_revisions
+                        .get(revision_id)
+                        .ok_or(StoreError::StoreCorrupt)?
+                        .0;
+                    if input.lifecycle_status != AtomLifecycleStatus::Active
+                        || input.kind != draft.kind
+                        || !input.scope.contains(&draft.scope)
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    input_atom_ids.insert(input.atom_id);
+                }
+                if input_atom_ids.len() < 2
+                    || atom.atom_id != target_atom_id
+                    || atom.parent_revision_id != Some(base_revision_id)
+                    || atom.lifecycle_status != AtomLifecycleStatus::Active
+                    || atom.kind != draft.kind
+                    || atom.scope != draft.scope
+                    || atom.supersedes_revision_refs != *merged_revision_refs
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
+            ProposalOperation::Split => return Err(StoreError::StoreCorrupt),
         }
     }
     Ok(())
@@ -1064,24 +1870,56 @@ fn validate_accepted_authority(
 fn validate_tui_acceptance_event(
     proposal: &RevisionProposal,
     acceptance: &evertrace_domain::semantic::ProposalAcceptance,
-    reviewed_created_at_us: i64,
+    reviewed: &RevisionProposal,
     observation: &SourceObservation,
     receipt: &SourceReceipt,
+    input: &SemanticRelationInputs<'_>,
 ) -> Result<(), StoreError> {
-    let payload = tui_acceptance_event_payload(
+    let plain_payload = tui_acceptance_event_payload(
         proposal.proposal_id,
         acceptance.reviewed_proposal_revision_id,
         &acceptance.reviewed_fingerprint,
     );
-    let expected = payload_fingerprint(
+    let plain_expected = payload_fingerprint(
         observation.canonicalization_revision,
-        payload.as_bytes(),
+        plain_payload.as_bytes(),
         None,
     )
     .map_err(|_| StoreError::StoreCorrupt)?;
+    let expected = if observation.payload_fingerprint == hex(&plain_expected) {
+        plain_expected
+    } else {
+        let original_id = receipt
+            .source_ref
+            .parse::<RevisionProposalId>()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let original_revision_id = receipt
+            .source_revision
+            .as_str()
+            .parse::<RevisionId>()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let original = &input
+            .proposal_revisions
+            .get(&original_revision_id)
+            .filter(|(value, _)| value.proposal_id == original_id)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0;
+        original
+            .validate_edit_candidate(reviewed)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let edit_payload = original
+            .edit_intent_toml(reviewed)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        payload_fingerprint(
+            observation.canonicalization_revision,
+            edit_payload.as_bytes(),
+            None,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?
+    };
     if receipt.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
         || observation.payload_fingerprint != hex(&expected)
-        || receipt.recorded_at_us < reviewed_created_at_us
+        || receipt.recorded_at_us < reviewed.created_at_us
         || acceptance.accepted_at_us < receipt.recorded_at_us
     {
         return Err(StoreError::StoreCorrupt);
@@ -1132,6 +1970,48 @@ fn evidence_exists(reference: &str, input: &SemanticRelationInputs<'_>) -> bool 
         || reference
             .parse::<SemanticDigestId>()
             .is_ok_and(|id| input.semantic_digests.contains_key(&id))
+}
+
+fn valid_procedure_negative_reference(
+    proposal: &RevisionProposal,
+    reference: &str,
+    input: &SemanticRelationInputs<'_>,
+) -> bool {
+    let (
+        ProposalPayload::Procedure(payload),
+        Some(ProposalTargetId::Procedure(procedure_id)),
+        Some(base_revision_id),
+        Ok(negative_id),
+    ) = (
+        &proposal.payload,
+        proposal.target_id,
+        proposal.base_revision_id,
+        reference.parse::<evertrace_domain::ids::ProcedureNegativeEvidenceId>(),
+    )
+    else {
+        return false;
+    };
+    proposal.target_kind == ProposalTargetKind::Procedure
+        && proposal.operation == ProposalOperation::Replace
+        && matches!(
+            payload.as_ref(),
+            evertrace_domain::semantic::ProcedureProposalPayload::Replace { .. }
+        )
+        && payload
+            .draft()
+            .evidence_refs
+            .iter()
+            .any(|value| value == reference)
+        && input
+            .procedure
+            .negative_entry(negative_id)
+            .is_some_and(|(negative, _)| {
+                negative.procedure_revision_id == base_revision_id
+                    && input
+                        .procedure
+                        .revision(base_revision_id)
+                        .is_some_and(|base| base.procedure_id == procedure_id)
+            })
 }
 
 fn objective_evidence_exists(reference: &str, input: &SemanticRelationInputs<'_>) -> bool {

@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::frame::{DecodedFrame, SpoolFrameError, SpoolRecord, encode_frame, scan_frames};
 
 const ACTIVE_NAME: &str = "active.open";
+const ISOLATED_PREFIX: &str = "isolated-";
 const MARKER_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +265,87 @@ impl DurableSpool {
         })
     }
 
+    /// Publishes one complete frame as its own claimed sealed segment without touching
+    /// the ordinary active Hook segment.
+    pub fn append_isolated_sealed(
+        &self,
+        record: &SpoolRecord,
+        routing_hint: &str,
+    ) -> Result<SealedSegment, SpoolError> {
+        if routing_hint.is_empty()
+            || routing_hint.len() > 96
+            || !routing_hint
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(SpoolError::InvalidConfiguration);
+        }
+        self.validate_directories()?;
+        let frame = encode_frame(record)?;
+        let frame_bytes = u64::try_from(frame.len()).map_err(|_| SpoolError::ResourceExhausted)?;
+        let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
+        FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
+        let existing_prefix = format!("{ISOLATED_PREFIX}{routing_hint}-");
+        for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
+            let entry = entry.map_err(map_io)?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&existing_prefix))
+            {
+                return Err(SpoolError::DuplicateRecord);
+            }
+        }
+        let usage = self.main_usage()?;
+        if usage.files >= u64::from(self.limits.max_main_files)
+            || usage.bytes.saturating_add(frame_bytes) > self.limits.high_watermark_bytes
+        {
+            return Err(SpoolError::Pressure);
+        }
+        let destination = unique_path(
+            &self.main_dir,
+            &format!("{ISOLATED_PREFIX}{routing_hint}"),
+            ".sealed",
+        )?;
+        let publish = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .read(true)
+                .mode(0o600)
+                .open(&destination)
+                .map_err(map_write_error)?;
+            file.write_all(&frame).map_err(map_write_error)?;
+            file.sync_data().map_err(map_write_error)?;
+            FileExt::lock_exclusive(&file).map_err(map_io)?;
+            File::open(&self.main_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(map_write_error)?;
+            let metadata = file.metadata().map_err(map_io)?;
+            Ok::<_, SpoolError>((file, metadata))
+        })();
+        let (file, metadata) = match publish {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_file(&destination);
+                let _ = File::open(&self.main_dir).and_then(|directory| directory.sync_all());
+                return Err(error);
+            }
+        };
+        Ok(SealedSegment {
+            path: destination,
+            file,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            frames: vec![SealedFrame {
+                record: record.clone(),
+                byte_start: 0,
+                byte_end: frame_bytes,
+            }],
+        })
+    }
+
     pub fn read_active(&self) -> Result<Vec<DecodedFrame>, SpoolError> {
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::lock_shared(&directory_lock).map_err(map_io)?;
@@ -377,6 +459,18 @@ impl DurableSpool {
     }
 
     pub fn sealed_segments(&self, limit: usize) -> Result<Vec<SealedSegment>, SpoolError> {
+        self.claimed_segments(limit, false)
+    }
+
+    pub fn isolated_segments(&self, limit: usize) -> Result<Vec<SealedSegment>, SpoolError> {
+        self.claimed_segments(limit, true)
+    }
+
+    fn claimed_segments(
+        &self,
+        limit: usize,
+        isolated: bool,
+    ) -> Result<Vec<SealedSegment>, SpoolError> {
         let configured_limit = usize::try_from(self.limits.max_main_files)
             .map_err(|_| SpoolError::InvalidConfiguration)?;
         if limit == 0 || limit > configured_limit.max(64) {
@@ -392,6 +486,13 @@ impl DurableSpool {
             if entry.file_name() == ACTIVE_NAME {
                 continue;
             }
+            let is_isolated = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(ISOLATED_PREFIX));
+            if is_isolated != isolated {
+                continue;
+            }
             let metadata = fs::symlink_metadata(&path).map_err(map_io)?;
             validate_owned_file_metadata(&metadata)?;
             if path.extension().is_none_or(|value| value != "sealed") {
@@ -400,9 +501,11 @@ impl DurableSpool {
             paths.push(path);
         }
         paths.sort();
-        paths.truncate(limit);
         let mut segments = Vec::with_capacity(paths.len());
         for path in paths {
+            if segments.len() == limit {
+                break;
+            }
             let before = fs::symlink_metadata(&path).map_err(map_io)?;
             validate_owned_file_metadata(&before)?;
             if before.len() == 0 || before.len() > self.limits.high_watermark_bytes {
@@ -410,6 +513,11 @@ impl DurableSpool {
             }
             let mut file = File::open(&path).map_err(map_io)?;
             validate_owned_file(&path, &file)?;
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(map_io(error)),
+            }
             let opened = file.metadata().map_err(map_io)?;
             let capacity =
                 usize::try_from(opened.len()).map_err(|_| SpoolError::ResourceExhausted)?;

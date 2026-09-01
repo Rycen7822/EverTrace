@@ -4,6 +4,7 @@ use super::*;
 pub struct ProcedureUsageCurrentView {
     frontier: u64,
     procedures: std::collections::BTreeMap<RevisionId, ProcedureRevision>,
+    current_procedures: std::collections::BTreeMap<ProcedureId, RevisionId>,
     procedure_support: std::collections::BTreeMap<RevisionId, Option<String>>,
     publications: std::collections::BTreeMap<RevisionId, (ProcedureStateEvent, u64)>,
     tasks: std::collections::BTreeMap<evertrace_domain::ids::TaskId, evertrace_domain::work::Task>,
@@ -69,6 +70,15 @@ pub struct ProcedureUsageCurrentView {
 }
 
 impl ProcedureUsageCurrentView {
+    pub(crate) fn current_procedure_by_revision(
+        &self,
+        revision_id: RevisionId,
+    ) -> Option<&ProcedureRevision> {
+        let procedure = self.procedures.get(&revision_id)?;
+        (self.current_procedures.get(&procedure.procedure_id) == Some(&revision_id))
+            .then_some(procedure)
+    }
+
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, SemanticServiceError> {
         let mut view = Self {
             frontier: snapshot.frontier,
@@ -104,8 +114,25 @@ impl ProcedureUsageCurrentView {
                 .map_err(|_| SemanticServiceError::InvalidInput)?;
             match payload {
                 JournalPayload::ProcedureRevisionRecorded(value) => {
+                    let current = view
+                        .current_procedures
+                        .get(&value.procedure_id)
+                        .and_then(|revision_id| view.procedures.get(revision_id));
+                    if current.is_some_and(|current| {
+                        current.revision_generation == value.revision_generation
+                            && current.revision_id != value.revision_id
+                    }) {
+                        return Err(SemanticServiceError::InvalidInput);
+                    }
+                    let replace = current.is_none_or(|current| {
+                        current.revision_generation < value.revision_generation
+                    });
                     view.procedure_support
                         .insert(value.revision_id, row.support_state.clone());
+                    if replace {
+                        view.current_procedures
+                            .insert(value.procedure_id, value.revision_id);
+                    }
                     view.procedures.insert(value.revision_id, *value);
                 }
                 JournalPayload::ProcedureStateRecorded(value) => {
@@ -393,6 +420,9 @@ pub enum ProcedureNegativeResolution {
 
 #[derive(Clone, Debug)]
 pub enum ProcedureNegativeReviewProof {
+    IneffectiveResolved {
+        result_revision_ids: Vec<RevisionId>,
+    },
     ReplayDismissed {
         result_revision_ids: Vec<RevisionId>,
     },
@@ -403,6 +433,321 @@ pub enum ProcedureNegativeReviewProof {
         successor_usage_id: evertrace_domain::ids::ProcedureUsageId,
         result_revision_ids: Vec<RevisionId>,
     },
+    RequestRevision {
+        procedure_revision_id: RevisionId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ProcedureNegativeReviewDecision {
+    ResolveAsIneffective,
+    DismissAttribution,
+    ConfirmHarm,
+    RequestRevision,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcedureNegativeReviewAction {
+    ResolveAsIneffective,
+    DismissAttribution,
+    ConfirmHarm,
+    SuccessorSuperseded,
+}
+
+impl ProcedureNegativeReviewAction {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ResolveAsIneffective => "resolve_as_ineffective",
+            Self::DismissAttribution => "dismiss_attribution",
+            Self::ConfirmHarm => "confirm_harm",
+            Self::SuccessorSuperseded => "successor_replay_fixed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProcedureNegativeReviewSelection {
+    pub review_revision_id: RevisionId,
+    pub review_status: evertrace_domain::procedure::ProcedureNegativeReviewStatus,
+    pub available_decisions: Vec<ProcedureNegativeReviewDecision>,
+    resolve_as_ineffective: Option<ProcedureNegativeReviewProof>,
+    dismiss_attribution: Option<ProcedureNegativeReviewProof>,
+    confirm_harm: Option<ProcedureNegativeReviewProof>,
+    request_revision: Option<ProcedureNegativeReviewProof>,
+}
+
+impl ProcedureNegativeReviewSelection {
+    pub fn proof(
+        &self,
+        decision: ProcedureNegativeReviewDecision,
+    ) -> Option<ProcedureNegativeReviewProof> {
+        match decision {
+            ProcedureNegativeReviewDecision::ResolveAsIneffective => {
+                self.resolve_as_ineffective.clone()
+            }
+            ProcedureNegativeReviewDecision::DismissAttribution => self.dismiss_attribution.clone(),
+            ProcedureNegativeReviewDecision::ConfirmHarm => self.confirm_harm.clone(),
+            ProcedureNegativeReviewDecision::RequestRevision => self.request_revision.clone(),
+        }
+    }
+}
+
+impl ProcedureUsageCurrentView {
+    pub fn select_negative_review(
+        &self,
+        negative_evidence_id: evertrace_domain::ids::ProcedureNegativeEvidenceId,
+    ) -> Result<ProcedureNegativeReviewSelection, SemanticServiceError> {
+        let negative = self
+            .negatives
+            .get(&negative_evidence_id)
+            .ok_or(SemanticServiceError::InvalidInput)?;
+        let review = self
+            .negative_reviews
+            .get(&negative_evidence_id)
+            .ok_or(SemanticServiceError::InvalidInput)?;
+        if matches!(
+            review.status,
+            evertrace_domain::procedure::ProcedureNegativeReviewStatus::Upheld
+                | evertrace_domain::procedure::ProcedureNegativeReviewStatus::Dismissed
+                | evertrace_domain::procedure::ProcedureNegativeReviewStatus::Superseded
+        ) {
+            return Ok(ProcedureNegativeReviewSelection {
+                review_revision_id: review.review_event_id,
+                review_status: review.status,
+                available_decisions: Vec::new(),
+                resolve_as_ineffective: None,
+                dismiss_attribution: None,
+                confirm_harm: None,
+                request_revision: None,
+            });
+        }
+        let usage = self
+            .usages
+            .get(&negative.procedure_usage_id)
+            .ok_or(SemanticServiceError::InvalidInput)?;
+        if !negative.validate()
+            || usage.procedure_revision_id != negative.procedure_revision_id
+            || usage.task_id != negative.task_id
+        {
+            return Err(SemanticServiceError::InvalidInput);
+        }
+        let proof_after = self
+            .negative_seqs
+            .get(&negative_evidence_id)
+            .copied()
+            .zip(
+                self.negative_review_seqs
+                    .get(&negative_evidence_id)
+                    .copied(),
+            )
+            .map(|(negative_seq, review_seq)| negative_seq.max(review_seq))
+            .ok_or(SemanticServiceError::InvalidInput)?;
+        let current_results = self.current_result_heads()?;
+        let result_ids = self.results_for_usage(&current_results, usage, proof_after);
+        let pending =
+            review.status == evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending;
+        let resolve_as_ineffective = (pending
+            && negative.level == evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective)
+            .then(|| self.ineffective_proof(negative, usage))
+            .flatten();
+        let dismiss_attribution = (pending
+            && negative.level
+                == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+            && self.uniform_passed(&result_ids))
+        .then(|| ProcedureNegativeReviewProof::ReplayDismissed {
+            result_revision_ids: result_ids.clone(),
+        });
+        let confirm_harm = (pending
+            && negative.level
+                == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+            && negative.local_context.is_none()
+            && self.uniform_mismatch(&result_ids)
+            && self
+                .publications
+                .get(&negative.procedure_revision_id)
+                .is_some_and(|(state, _)| state.to_state == ProcedurePublicationState::ReviewHold))
+        .then(|| ProcedureNegativeReviewProof::ReplayUpheld {
+            result_revision_ids: result_ids.clone(),
+        });
+        let request_revision = (pending && self.revision_request_ready(negative, usage)).then_some(
+            ProcedureNegativeReviewProof::RequestRevision {
+                procedure_revision_id: negative.procedure_revision_id,
+            },
+        );
+        let mut available_decisions = Vec::with_capacity(4);
+        if resolve_as_ineffective.is_some() {
+            available_decisions.push(ProcedureNegativeReviewDecision::ResolveAsIneffective);
+        }
+        if dismiss_attribution.is_some() {
+            available_decisions.push(ProcedureNegativeReviewDecision::DismissAttribution);
+        }
+        if confirm_harm.is_some() {
+            available_decisions.push(ProcedureNegativeReviewDecision::ConfirmHarm);
+        }
+        if request_revision.is_some() {
+            available_decisions.push(ProcedureNegativeReviewDecision::RequestRevision);
+        }
+        Ok(ProcedureNegativeReviewSelection {
+            review_revision_id: review.review_event_id,
+            review_status: review.status,
+            available_decisions,
+            resolve_as_ineffective,
+            dismiss_attribution,
+            confirm_harm,
+            request_revision,
+        })
+    }
+
+    fn ineffective_proof(
+        &self,
+        negative: &evertrace_domain::procedure::ProcedureNegativeEvidence,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> Option<ProcedureNegativeReviewProof> {
+        let result_revision_ids = self.negative_result_revisions(negative, usage)?;
+        let [attempt_id] = usage.attempt_ids.as_slice() else {
+            return None;
+        };
+        let attempt = self
+            .attempts
+            .get(attempt_id)
+            .filter(|attempt| usage.accepts_adopted_attempt(attempt))?;
+        let results = result_revision_ids
+            .iter()
+            .map(|id| self.results.get(id))
+            .collect::<Option<Vec<_>>>()?;
+        (evertrace_domain::procedure::classify_negative_fact(
+            usage,
+            attempt,
+            &negative.evidence_refs,
+            &results,
+        ) == Some(evertrace_domain::procedure::ProcedureNegativeFact::Ineffective))
+        .then_some(ProcedureNegativeReviewProof::IneffectiveResolved {
+            result_revision_ids,
+        })
+    }
+
+    fn revision_request_ready(
+        &self,
+        negative: &evertrace_domain::procedure::ProcedureNegativeEvidence,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> bool {
+        self.procedures
+            .get(&negative.procedure_revision_id)
+            .is_some_and(|procedure| {
+                self.current_procedures.get(&procedure.procedure_id)
+                    == Some(&negative.procedure_revision_id)
+            })
+            && self.negative_result_revisions(negative, usage).is_some()
+    }
+
+    fn negative_result_revisions(
+        &self,
+        negative: &evertrace_domain::procedure::ProcedureNegativeEvidence,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> Option<Vec<RevisionId>> {
+        let result_revision_ids = negative
+            .evidence_refs
+            .iter()
+            .map(|reference| reference.parse::<RevisionId>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        (!result_revision_ids.is_empty()
+            && result_revision_ids.len() <= MAX_CANDIDATES
+            && result_revision_ids.iter().all(|id| {
+                self.results.get(id).is_some_and(|result| {
+                    self.runs
+                        .get(&result.experiment_run_id)
+                        .is_some_and(|(run, _)| {
+                            run.revision_id == result.experiment_run_revision_id
+                                && run
+                                    .attempt_id
+                                    .is_some_and(|attempt| usage.attempt_ids.contains(&attempt))
+                        })
+                })
+            }))
+        .then_some(result_revision_ids)
+    }
+
+    fn current_result_heads(
+        &self,
+    ) -> Result<Vec<&evertrace_domain::semantic::ResultEvidence>, SemanticServiceError> {
+        let predecessors = self
+            .results
+            .values()
+            .filter_map(|result| result.parent_revision_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut heads = std::collections::BTreeMap::new();
+        for result in self
+            .results
+            .values()
+            .filter(|result| !predecessors.contains(&result.revision_id))
+        {
+            if heads.insert(result.result_evidence_id, result).is_some() {
+                return Err(SemanticServiceError::InvalidInput);
+            }
+        }
+        Ok(heads.into_values().collect())
+    }
+
+    fn results_for_usage(
+        &self,
+        current_results: &[&evertrace_domain::semantic::ResultEvidence],
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+        proof_after: u64,
+    ) -> Vec<RevisionId> {
+        current_results
+            .iter()
+            .filter(|result| {
+                self.result_seqs
+                    .get(&result.revision_id)
+                    .is_some_and(|seq| *seq > proof_after)
+                    && self
+                        .runs
+                        .get(&result.experiment_run_id)
+                        .and_then(|(run, _)| run.attempt_id)
+                        .is_some_and(|attempt| usage.attempt_ids.contains(&attempt))
+            })
+            .map(|result| result.revision_id)
+            .take(MAX_CANDIDATES + 1)
+            .collect()
+    }
+
+    fn uniform_passed(&self, result_ids: &[RevisionId]) -> bool {
+        !result_ids.is_empty()
+            && result_ids.len() <= MAX_CANDIDATES
+            && result_ids.iter().all(|id| {
+                self.results.get(id).is_some_and(|result| {
+                    result.completeness
+                        == evertrace_domain::semantic::EvidenceCompleteness::Complete
+                        && result.failure.is_none()
+                        && result.verifier_receipt.as_ref().is_some_and(|receipt| {
+                            receipt.status == evertrace_domain::semantic::VerifierStatus::Passed
+                        })
+                        && self
+                            .runs
+                            .get(&result.experiment_run_id)
+                            .is_some_and(|(run, _)| {
+                                run.revision_id == result.experiment_run_revision_id
+                            })
+                })
+            })
+    }
+
+    fn uniform_mismatch(&self, result_ids: &[RevisionId]) -> bool {
+        !result_ids.is_empty()
+            && result_ids.len() <= MAX_CANDIDATES
+            && result_ids.iter().all(|id| {
+                self.results.get(id).is_some_and(|result| {
+                    matches!(
+                        result.failure,
+                        Some(evertrace_domain::semantic::ResultFailure::Verifier(
+                            evertrace_domain::semantic::VerifierFailureCode::DeterministicReparseMismatch
+                        ))
+                    ) && self.runs.get(&result.experiment_run_id).is_some_and(|(run, _)| {
+                        run.revision_id == result.experiment_run_revision_id
+                    })
+                })
+            })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -717,20 +1062,28 @@ pub fn review_procedure_negative(
         .usages
         .get(&negative.procedure_usage_id)
         .ok_or(SemanticServiceError::InvalidInput)?;
-    let (status, reason, mut result_revision_ids, successor_usage_id) = match proof {
+    let (action, status, mut result_revision_ids, successor_usage_id) = match proof {
+        ProcedureNegativeReviewProof::IneffectiveResolved {
+            result_revision_ids,
+        } => (
+            ProcedureNegativeReviewAction::ResolveAsIneffective,
+            evertrace_domain::procedure::ProcedureNegativeReviewStatus::Dismissed,
+            result_revision_ids,
+            None,
+        ),
         ProcedureNegativeReviewProof::ReplayDismissed {
             result_revision_ids,
         } => (
+            ProcedureNegativeReviewAction::DismissAttribution,
             evertrace_domain::procedure::ProcedureNegativeReviewStatus::Dismissed,
-            "typed_replay_dismissed",
             result_revision_ids,
             None,
         ),
         ProcedureNegativeReviewProof::ReplayUpheld {
             result_revision_ids,
         } => (
+            ProcedureNegativeReviewAction::ConfirmHarm,
             evertrace_domain::procedure::ProcedureNegativeReviewStatus::Upheld,
-            "typed_replay_upheld",
             result_revision_ids,
             None,
         ),
@@ -738,11 +1091,14 @@ pub fn review_procedure_negative(
             successor_usage_id,
             result_revision_ids,
         } => (
+            ProcedureNegativeReviewAction::SuccessorSuperseded,
             evertrace_domain::procedure::ProcedureNegativeReviewStatus::Superseded,
-            "successor_replay_fixed",
             result_revision_ids,
             Some(successor_usage_id),
         ),
+        ProcedureNegativeReviewProof::RequestRevision { .. } => {
+            return Err(SemanticServiceError::UnsupportedTarget);
+        }
     };
     result_revision_ids.sort();
     result_revision_ids.dedup();
@@ -760,11 +1116,13 @@ pub fn review_procedure_negative(
         )
         .map(|(negative_seq, review_seq)| negative_seq.max(review_seq))
         .ok_or(SemanticServiceError::InvalidInput)?;
-    if result_revision_ids.iter().any(|id| {
-        view.result_seqs
-            .get(id)
-            .is_none_or(|result_seq| *result_seq <= proof_after)
-    }) {
+    if action != ProcedureNegativeReviewAction::ResolveAsIneffective
+        && result_revision_ids.iter().any(|id| {
+            view.result_seqs
+                .get(id)
+                .is_none_or(|result_seq| *result_seq <= proof_after)
+        })
+    {
         return Err(SemanticServiceError::InvalidInput);
     }
     let results = result_revision_ids
@@ -793,26 +1151,58 @@ pub fn review_procedure_negative(
                         .is_some_and(|attempt| proof_usage.attempt_ids.contains(&attempt))
             })
     });
-    let proof_valid = match status {
-        evertrace_domain::procedure::ProcedureNegativeReviewStatus::Dismissed => {
-            results.iter().all(|result| {
-                result.failure.is_none()
-                    && result.verifier_receipt.as_ref().is_some_and(|receipt| {
-                        receipt.status == evertrace_domain::semantic::VerifierStatus::Passed
+    let proof_valid = match action {
+        ProcedureNegativeReviewAction::ResolveAsIneffective => {
+            current.status == evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
+                && negative.level
+                    == evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective
+                && result_revision_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .eq(negative.evidence_refs.iter().cloned())
+                && view
+                    .ineffective_proof(negative, usage)
+                    .is_some_and(|proof| {
+                        matches!(proof,
+                            ProcedureNegativeReviewProof::IneffectiveResolved {
+                                result_revision_ids: expected,
+                            } if expected == result_revision_ids)
                     })
-            })
         }
-        evertrace_domain::procedure::ProcedureNegativeReviewStatus::Upheld => {
-            results.iter().all(|result| {
-                matches!(
-                    result.failure,
-                    Some(evertrace_domain::semantic::ResultFailure::Verifier(
-                        evertrace_domain::semantic::VerifierFailureCode::DeterministicReparseMismatch
-                    ))
-                )
-            })
+        ProcedureNegativeReviewAction::DismissAttribution => {
+            current.status == evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
+                && negative.level
+                    == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                && results.iter().all(|result| {
+                    result.completeness
+                        == evertrace_domain::semantic::EvidenceCompleteness::Complete
+                        && result.failure.is_none()
+                        && result.verifier_receipt.as_ref().is_some_and(|receipt| {
+                            receipt.status == evertrace_domain::semantic::VerifierStatus::Passed
+                        })
+                })
         }
-        evertrace_domain::procedure::ProcedureNegativeReviewStatus::Superseded => {
+        ProcedureNegativeReviewAction::ConfirmHarm => {
+            current.status == evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
+                && negative.level
+                    == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
+                && negative.local_context.is_none()
+                && results.iter().all(|result| {
+                    matches!(
+                        result.failure,
+                        Some(evertrace_domain::semantic::ResultFailure::Verifier(
+                            evertrace_domain::semantic::VerifierFailureCode::DeterministicReparseMismatch
+                        ))
+                    )
+                })
+                && view
+                    .publications
+                    .get(&negative.procedure_revision_id)
+                    .is_some_and(|(state, _)| {
+                        state.to_state == ProcedurePublicationState::ReviewHold
+                    })
+        }
+        ProcedureNegativeReviewAction::SuccessorSuperseded => {
             let old = view
                 .procedures
                 .get(&negative.procedure_revision_id)
@@ -827,9 +1217,9 @@ pub fn review_procedure_negative(
                 && proof_usage.local_context.compatible(&usage.local_context)
                 && successor.procedure_id == old.procedure_id
                 && successor.parent_revision_id == Some(old.revision_id)
-                && result_revision_ids.iter().all(|id| {
-                    proof_usage.evidence_refs.contains(&id.to_string())
-                })
+                && result_revision_ids
+                    .iter()
+                    .all(|id| proof_usage.evidence_refs.contains(&id.to_string()))
                 && results.iter().all(|result| {
                     result.failure.is_none()
                         && result.verifier_receipt.as_ref().is_some_and(|receipt| {
@@ -837,7 +1227,6 @@ pub fn review_procedure_negative(
                         })
                 })
         }
-        evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending => false,
     };
     if context.occurred_at_us < current.created_at_us || !tied || !proof_valid {
         return Err(SemanticServiceError::InvalidInput);
@@ -849,7 +1238,7 @@ pub fn review_procedure_negative(
         review_generation: current.review_generation + 1,
         status,
         successor_usage_revision_id: successor_usage_id.map(|_| proof_usage.usage_revision_id),
-        reason: reason.into(),
+        reason: action.reason().into(),
         evidence_refs: result_revision_ids
             .into_iter()
             .map(|value| value.to_string())
@@ -862,10 +1251,30 @@ pub fn review_procedure_negative(
         &context.algorithm_revision,
         JournalPayload::ProcedureNegativeReviewRecorded(Box::new(event)),
     )];
-    if matches!(
-        status,
-        evertrace_domain::procedure::ProcedureNegativeReviewStatus::Dismissed
-            | evertrace_domain::procedure::ProcedureNegativeReviewStatus::Superseded
+    if action == ProcedureNegativeReviewAction::ConfirmHarm {
+        view.publications
+            .get(&negative.procedure_revision_id)
+            .filter(|(state, _)| state.to_state == ProcedurePublicationState::ReviewHold)
+            .ok_or(SemanticServiceError::InvalidInput)?;
+        events.push(JournalEventDraft::runtime(
+            context.occurred_at_us,
+            context.effective_config_hash,
+            &context.algorithm_revision,
+            JournalPayload::ProcedureStateRecorded(Box::new(ProcedureStateEvent {
+                state_event_id: RevisionId::new_v7(),
+                procedure_revision_id: negative.procedure_revision_id,
+                from_state: Some(ProcedurePublicationState::ReviewHold),
+                to_state: ProcedurePublicationState::Suspended,
+                reason: ProcedureStateReason::ConfirmedHarm,
+                resume_state: None,
+                evidence_refs: vec![negative.negative_evidence_id.to_string()],
+                created_at_us: context.occurred_at_us,
+            })),
+        ));
+    } else if matches!(
+        action,
+        ProcedureNegativeReviewAction::DismissAttribution
+            | ProcedureNegativeReviewAction::SuccessorSuperseded
     ) && negative.local_context.is_none()
     {
         let current_publication = view
@@ -902,6 +1311,130 @@ pub fn review_procedure_negative(
         }
     }
     JournalCommand::new(context.command_id, events).map_err(SemanticServiceError::Store)
+}
+
+#[derive(Debug)]
+pub enum ProcedureRevisionRequestResolution {
+    NoDelta {
+        proposal: Box<RevisionProposal>,
+    },
+    Command {
+        proposal: Box<RevisionProposal>,
+        command: JournalCommand,
+    },
+}
+
+pub fn request_procedure_revision(
+    view: &ProcedureUsageCurrentView,
+    semantic_view: &SemanticCurrentView,
+    context: ProposalCommandContext,
+    negative_evidence_id: evertrace_domain::ids::ProcedureNegativeEvidenceId,
+    proof: ProcedureNegativeReviewProof,
+) -> Result<ProcedureRevisionRequestResolution, SemanticServiceError> {
+    let ProcedureNegativeReviewProof::RequestRevision {
+        procedure_revision_id,
+    } = proof
+    else {
+        return Err(SemanticServiceError::InvalidInput);
+    };
+    let negative = view
+        .negatives
+        .get(&negative_evidence_id)
+        .filter(|negative| negative.procedure_revision_id == procedure_revision_id)
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    let review = view
+        .negative_reviews
+        .get(&negative_evidence_id)
+        .filter(|review| {
+            review.status == evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
+        })
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    let usage = view
+        .usages
+        .get(&negative.procedure_usage_id)
+        .filter(|usage| {
+            usage.procedure_revision_id == negative.procedure_revision_id
+                && usage.task_id == negative.task_id
+        })
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    if context.occurred_at_us < review.created_at_us
+        || !view.revision_request_ready(negative, usage)
+    {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    let current = view
+        .procedures
+        .get(&procedure_revision_id)
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    let mut source_refs = view
+        .negative_result_revisions(negative, usage)
+        .ok_or(SemanticServiceError::InvalidInput)?
+        .into_iter()
+        .map(|revision_id| {
+            view.results
+                .get(&revision_id)
+                .map(|result| result.result_evidence_id.to_string())
+                .ok_or(SemanticServiceError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    source_refs.sort();
+    source_refs.dedup();
+    if source_refs.is_empty() {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    let negative_ref = negative.negative_evidence_id.to_string();
+    let mut draft = current.draft.clone();
+    draft.evidence_refs.extend(source_refs.clone());
+    draft.evidence_refs.push(negative_ref);
+    draft.evidence_refs.sort();
+    draft.evidence_refs.dedup();
+    draft
+        .validate()
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+    let proposal_evidence_refs = draft.evidence_refs.clone();
+    let payload = ProposalPayload::Procedure(Box::new(ProcedureProposalPayload::Replace { draft }));
+    let mut exact = semantic_view.proposals.values().filter(|proposal| {
+        proposal.status == evertrace_domain::semantic::ProposalStatus::Pending
+            && proposal.target_kind == ProposalTargetKind::Procedure
+            && proposal.target_id == Some(ProposalTargetId::Procedure(current.procedure_id))
+            && proposal.base_revision_id == Some(current.revision_id)
+            && proposal.operation == evertrace_domain::semantic::ProposalOperation::Replace
+            && proposal.payload == payload
+            && proposal.evidence_refs == proposal_evidence_refs
+            && proposal.source_cohort_refs == source_refs
+            && proposal.eligibility == ProposalEligibility::ManualRequired
+            && proposal.created_by == evertrace_domain::semantic::ProposalCreatedBy::User
+    });
+    if let Some(existing) = exact.next() {
+        if exact.next().is_some() {
+            return Err(SemanticServiceError::ImmutableConflict);
+        }
+        return Ok(ProcedureRevisionRequestResolution::NoDelta {
+            proposal: Box::new(existing.clone()),
+        });
+    }
+    let request = crate::semantic::SubmitProposalRequest {
+        target_kind: ProposalTargetKind::Procedure,
+        target_id: Some(ProposalTargetId::Procedure(current.procedure_id)),
+        base_revision_id: Some(current.revision_id),
+        operation: evertrace_domain::semantic::ProposalOperation::Replace,
+        payload,
+        evidence_refs: proposal_evidence_refs,
+        source_cohort_refs: source_refs,
+        eligibility: ProposalEligibility::ManualRequired,
+        created_by: evertrace_domain::semantic::ProposalCreatedBy::User,
+    };
+    match crate::semantic::RevisionProposalService.submit(semantic_view, context, request)? {
+        crate::semantic::ProposalResolution::Revision { value, command } => {
+            Ok(ProcedureRevisionRequestResolution::Command {
+                proposal: value,
+                command,
+            })
+        }
+        crate::semantic::ProposalResolution::NoDelta => {
+            Err(SemanticServiceError::ImmutableConflict)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1474,6 +2007,313 @@ fn usage_scope_matches(
             worktree_id,
         } => {
             context.repository_id == Some(repository_id) && context.worktree_id == Some(worktree_id)
+        }
+    }
+}
+
+#[cfg(test)]
+mod negative_review_selection_tests {
+    use super::*;
+    use evertrace_domain::{
+        ids::{
+            AttemptId, ExperimentRunId, ProcedureNegativeEvidenceId, ProcedureUsageId,
+            ResultEvidenceId, TaskId, WorkArtifactId, WorkstreamId, WorktreeSnapshotId,
+        },
+        procedure::{
+            ProcedureAttributionBasis, ProcedureCorrelationState, ProcedureLocalContext,
+            ProcedureNegativeDecisionSource, ProcedureNegativeEvidence, ProcedureNegativeLevel,
+            ProcedureNegativeReviewEvent, ProcedureNegativeReviewStatus, ProcedureTruth,
+            ProcedureUsagePhase, ProcedureUsageRevision, ProcedureUsageRouteDecision,
+            ProcedureUsageStage,
+        },
+        semantic::{
+            EvidenceCompleteness, MetricValue, ParserReceipt, ParserStatus, ResultEvidence,
+            ResultFailure, ResultScope, VerifierFailureCode, VerifierReceipt, VerifierStatus,
+        },
+        work::{
+            AttemptBindingStatus, ContractField, ExperimentRun, MultiCasMetricPolicy,
+            RunContractValidity, RunExecutionStatus, RunObservability, RunOrigin, SeedPolicy,
+            VariableDeclaration,
+        },
+    };
+
+    #[test]
+    fn complete_current_replay_cohort_selects_one_closed_decision() {
+        let (view, negative_id) = review_view(ResultKind::Passed);
+        let selection = view.select_negative_review(negative_id).unwrap();
+        assert_eq!(
+            selection.available_decisions,
+            vec![ProcedureNegativeReviewDecision::DismissAttribution]
+        );
+        let command = review_procedure_negative(
+            &view,
+            ProposalCommandContext {
+                command_id: evertrace_domain::ids::CommandId::new_v7(),
+                occurred_at_us: 20,
+                effective_config_hash: [1; 32],
+                algorithm_revision: "negative-review-test-v1".into(),
+            },
+            negative_id,
+            selection
+                .proof(ProcedureNegativeReviewDecision::DismissAttribution)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(command.events().iter().any(|event| matches!(
+            &event.payload,
+            JournalPayload::ProcedureNegativeReviewRecorded(review)
+                if review.status == ProcedureNegativeReviewStatus::Dismissed
+        )));
+
+        let (view, negative_id) = review_view(ResultKind::Mismatch);
+        let selection = view.select_negative_review(negative_id).unwrap();
+        assert!(selection.available_decisions.is_empty());
+        assert!(
+            selection
+                .proof(ProcedureNegativeReviewDecision::ConfirmHarm)
+                .is_none()
+        );
+        let result_revision_ids = view.results.keys().copied().collect();
+        assert!(
+            review_procedure_negative(
+                &view,
+                ProposalCommandContext {
+                    command_id: evertrace_domain::ids::CommandId::new_v7(),
+                    occurred_at_us: 20,
+                    effective_config_hash: [1; 32],
+                    algorithm_revision: "negative-review-test-v1".into(),
+                },
+                negative_id,
+                ProcedureNegativeReviewProof::ReplayUpheld {
+                    result_revision_ids,
+                },
+            )
+            .is_err()
+        );
+
+        let (mut mixed, negative_id) = review_view(ResultKind::Passed);
+        let attempt_id = mixed.usages.values().next().unwrap().attempt_ids[0];
+        let run_id = mixed.runs.keys().next().copied().unwrap();
+        let run_revision = mixed.runs[&run_id].0.revision_id;
+        let mismatch = result(run_id, run_revision, ResultKind::Mismatch);
+        mixed.result_seqs.insert(mismatch.revision_id, 13);
+        mixed.results.insert(mismatch.revision_id, mismatch);
+        assert!(
+            mixed
+                .select_negative_review(negative_id)
+                .unwrap()
+                .available_decisions
+                .is_empty()
+        );
+        assert_eq!(mixed.runs[&run_id].0.attempt_id, Some(attempt_id));
+
+        let (mut terminal, negative_id) = review_view(ResultKind::Passed);
+        terminal
+            .negative_reviews
+            .get_mut(&negative_id)
+            .unwrap()
+            .status = ProcedureNegativeReviewStatus::Dismissed;
+        let selection = terminal.select_negative_review(negative_id).unwrap();
+        assert_eq!(
+            selection.review_status,
+            ProcedureNegativeReviewStatus::Dismissed
+        );
+        assert!(selection.available_decisions.is_empty());
+        assert!(
+            selection
+                .proof(ProcedureNegativeReviewDecision::DismissAttribution)
+                .is_none()
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResultKind {
+        Passed,
+        Mismatch,
+    }
+
+    fn review_view(kind: ResultKind) -> (ProcedureUsageCurrentView, ProcedureNegativeEvidenceId) {
+        let mut view = ProcedureUsageCurrentView::default();
+        let attempt_id = AttemptId::new_v7();
+        let usage_id = ProcedureUsageId::new_v7();
+        let procedure_revision_id = RevisionId::new_v7();
+        let task_id = TaskId::new_v7();
+        let local_context = ProcedureLocalContext {
+            repository_id: None,
+            worktree_id: None,
+            phase: ProcedureUsagePhase::AtEntry,
+            failure_signature: Some("failure".into()),
+        };
+        let usage = ProcedureUsageRevision {
+            procedure_usage_id: usage_id,
+            usage_revision_id: RevisionId::new_v7(),
+            predecessor_revision_id: None,
+            revision_generation: 1,
+            procedure_revision_id,
+            task_id,
+            workstream_id: WorkstreamId::new_v7(),
+            exposure_episode_revision_id: RevisionId::new_v7(),
+            decision_boundary_ref: "boundary".into(),
+            route_decision: ProcedureUsageRouteDecision::Apply,
+            stage: ProcedureUsageStage::Outcome,
+            attempt_ids: vec![attempt_id],
+            action_episode_revision_ids: vec![RevisionId::new_v7()],
+            verification_episode_revision_ids: vec![RevisionId::new_v7()],
+            action_operation_refs: Vec::new(),
+            verification_operation_refs: Vec::new(),
+            work_binding_revision_refs: Vec::new(),
+            scope_effect_refs: Vec::new(),
+            correlation_state: ProcedureCorrelationState::Resolved,
+            eligible: ProcedureTruth::True,
+            action_aligned: ProcedureTruth::True,
+            verifier_aligned: ProcedureTruth::True,
+            outcome_supported: ProcedureTruth::False,
+            local_context: local_context.clone(),
+            source_watermark: 1,
+            evidence_refs: vec!["usage:evidence".into()],
+            created_at_us: 1,
+        };
+        view.usages.insert(usage_id, usage);
+        let run = run(attempt_id);
+        let evidence = result(run.run_id, run.revision_id, kind);
+        view.runs.insert(run.run_id, (run, 12));
+        view.result_seqs.insert(evidence.revision_id, 12);
+        view.results.insert(evidence.revision_id, evidence);
+        let negative_id = ProcedureNegativeEvidenceId::new_v7();
+        view.negatives.insert(
+            negative_id,
+            ProcedureNegativeEvidence {
+                negative_evidence_id: negative_id,
+                level: ProcedureNegativeLevel::SuspectedHarm,
+                procedure_revision_id,
+                procedure_usage_id: usage_id,
+                task_id,
+                session_id: "session".into(),
+                evidence_refs: vec!["negative:evidence".into()],
+                observed_effect: "failure".into(),
+                expected_effect: "success".into(),
+                confounders: vec!["replay_required".into()],
+                attribution_basis: ProcedureAttributionBasis::ResolvedLocalized,
+                decision_source: ProcedureNegativeDecisionSource::AdoptedAttemptFailed,
+                local_context: Some(local_context),
+                created_at_us: 10,
+            },
+        );
+        let review = ProcedureNegativeReviewEvent {
+            review_event_id: RevisionId::new_v7(),
+            negative_evidence_id: negative_id,
+            predecessor_review_event_id: None,
+            review_generation: 1,
+            status: ProcedureNegativeReviewStatus::Pending,
+            successor_usage_revision_id: None,
+            reason: "review_required".into(),
+            evidence_refs: vec!["negative:evidence".into()],
+            created_at_us: 11,
+        };
+        view.negative_seqs.insert(negative_id, 10);
+        view.negative_review_seqs.insert(negative_id, 11);
+        view.negative_reviews.insert(negative_id, review);
+        (view, negative_id)
+    }
+
+    fn run(attempt_id: AttemptId) -> ExperimentRun {
+        ExperimentRun {
+            run_id: ExperimentRunId::new_v7(),
+            revision_id: RevisionId::new_v7(),
+            parent_revision_id: None,
+            workstream_id: WorkstreamId::new_v7(),
+            attempt_id: Some(attempt_id),
+            attempt_binding_status: AttemptBindingStatus::Resolved,
+            strategy_contract_fingerprint: [1; 32],
+            origin: RunOrigin::Local,
+            external_system_id: None,
+            external_run_key: None,
+            source_receipt_refs: Vec::new(),
+            observability: RunObservability::Full,
+            execution_status: RunExecutionStatus::Completed,
+            contract_validity: RunContractValidity::Valid,
+            experiment_contract_fingerprint: [2; 32],
+            code_snapshot_id: WorktreeSnapshotId::new_v7(),
+            data_fingerprint: "data".into(),
+            normalized_config: vec![ContractField {
+                name: "mode".into(),
+                value: "test".into(),
+            }],
+            variable_declaration: VariableDeclaration {
+                varied: Vec::new(),
+                fixed: vec!["mode".into()],
+                uncontrolled: Vec::new(),
+            },
+            comparison_key: [3; 32],
+            seed_policy: SeedPolicy::Fixed,
+            seed_values: vec!["1".into()],
+            nondeterministic: false,
+            metric_definition: "verification".into(),
+            metric_extractor_version: "parser-v1".into(),
+            multi_cas_metric_policy: MultiCasMetricPolicy::RejectMultipleParsed,
+            environment_fingerprint: "environment".into(),
+            comparison_execution_binding: None,
+            work_artifact_refs: Vec::new(),
+            terminal_evidence_refs: Vec::new(),
+            created_at_us: 1,
+            started_at_us: Some(1),
+            ended_at_us: Some(2),
+        }
+    }
+
+    fn result(
+        run_id: ExperimentRunId,
+        run_revision: RevisionId,
+        kind: ResultKind,
+    ) -> ResultEvidence {
+        let artifact = WorkArtifactId::new_v7();
+        let (verifier_receipt, completeness, failure) = match kind {
+            ResultKind::Passed => (
+                VerifierReceipt {
+                    verifier_version: "verifier-v1".into(),
+                    status: VerifierStatus::Passed,
+                    failure_code: None,
+                },
+                EvidenceCompleteness::Complete,
+                None,
+            ),
+            ResultKind::Mismatch => (
+                VerifierReceipt {
+                    verifier_version: "verifier-v1".into(),
+                    status: VerifierStatus::Failed,
+                    failure_code: Some(VerifierFailureCode::DeterministicReparseMismatch),
+                },
+                EvidenceCompleteness::Incomplete,
+                Some(ResultFailure::Verifier(
+                    VerifierFailureCode::DeterministicReparseMismatch,
+                )),
+            ),
+        };
+        ResultEvidence {
+            result_evidence_id: ResultEvidenceId::new_v7(),
+            revision_id: RevisionId::new_v7(),
+            parent_revision_id: None,
+            experiment_run_id: run_id,
+            experiment_run_revision_id: run_revision,
+            result_scope: ResultScope::Partial,
+            raw_artifact_refs: vec![artifact],
+            raw_cas_refs: Vec::new(),
+            parsed_metric: Some(MetricValue {
+                decimal: "0".into(),
+                unit: "boolean".into(),
+                uncertainty_decimal: None,
+            }),
+            parser_receipt: ParserReceipt {
+                parser_version: "parser-v1".into(),
+                input_artifact_refs: vec![artifact],
+                input_cas_refs: Vec::new(),
+                status: ParserStatus::Parsed,
+                failure_code: None,
+            },
+            verifier_receipt: Some(verifier_receipt),
+            completeness,
+            failure,
+            created_at_us: 12,
         }
     }
 }
