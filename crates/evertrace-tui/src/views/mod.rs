@@ -178,8 +178,17 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
             format!("created by: {:?}", review.proposal.created_by),
             format!("proposal evidence: {:?}", review.proposal.evidence_refs),
             format!("review payload:\n{:#?}", review.proposal.payload),
-            "edit-and-accept: unavailable".into(),
         ]);
+        lines.push("edit-and-accept: unavailable".into());
+        if let Some(reference) = &review.reauthorization {
+            lines.extend([
+                "re-authorize forgotten object: available".into(),
+                format!("forgotten target: {:?}", reference.target),
+                format!("deletion generation: {}", reference.deletion_generation),
+                format!("purge audit ref: {}", reference.purge_job_audit_ref),
+                "R re-authorize forgotten object".into(),
+            ]);
+        }
     }
     if let Some(support) = &item.support_detail {
         lines.extend([

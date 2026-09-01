@@ -41,6 +41,33 @@ pub struct ObjectDeletionPreview {
     pub dependent_procedure_impacts: Vec<ObjectDeletionProcedureImpact>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObjectDeletionCandidateAdmission {
+    Clear,
+    FixedSuppression,
+    HistoricalConflict {
+        deletions: Vec<ObjectDeletionLedgerEvent>,
+    },
+}
+
+impl ObjectDeletionCandidateAdmission {
+    pub fn representative_historical_deletion(&self) -> Option<&ObjectDeletionLedgerEvent> {
+        match self {
+            Self::HistoricalConflict { deletions } => deletions
+                .iter()
+                .filter(|deletion| deletion.phase == ObjectDeletionPhase::Purged)
+                .min_by_key(|deletion| {
+                    (
+                        deletion.recorded_at_us,
+                        deletion.deletion_generation,
+                        deletion.target,
+                    )
+                }),
+            Self::Clear | Self::FixedSuppression => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectDeletionRevisionFact {
     pub revision_id: RevisionId,

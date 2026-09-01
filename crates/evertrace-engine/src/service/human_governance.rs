@@ -25,7 +25,10 @@ use evertrace_domain::{
         ProcedureNegativeReviewEvent, ProcedureNegativeReviewStatus, ProcedurePublicationState,
         ProcedureScope,
     },
-    purge::ObjectDeletionTarget,
+    purge::{
+        ObjectDeletionLedgerEvent, ObjectDeletionTarget, ObjectReauthorizationIntent,
+        ObjectReauthorizationRef,
+    },
     repository::{
         DestructiveClass, GitRegistrationState, LineageAssessment,
         OrderingIntegrity as RecoveryOrderingIntegrity, RecoveryApplicationKind,
@@ -49,7 +52,8 @@ use evertrace_domain::{
     },
 };
 use evertrace_store::{
-    JobStatus, JobTerminalReason, JournalCommand, JournalPayload, ObjectFamily, ObjectRow,
+    JobStatus, JobTerminalReason, JournalCommand, JournalPayload, ObjectDeletionCandidateAdmission,
+    ObjectDeletionCandidateAdmissionView, ObjectDeletionCurrentView, ObjectFamily, ObjectRow,
     ObjectRowClass, ObjectRowKind, ProjectionSnapshot, RecoveryEvidenceCurrentView,
     RuntimeSchedulerView, SemanticCurrentView, SourceIngestWatermark,
 };
@@ -442,6 +446,7 @@ pub struct HumanProposalReview {
     pub proposal: Box<RevisionProposal>,
     pub plain_accept_eligible: bool,
     pub merge_and_accept_eligible: bool,
+    pub reauthorization: Option<ObjectReauthorizationRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -505,6 +510,7 @@ pub enum HumanDegradedReason {
 pub enum HumanProposalDecision {
     Accept,
     EditAndAccept(Box<ProposalPayload>),
+    Reauthorize,
     MergeAndAccept,
     Defer,
     Reject,
@@ -620,6 +626,46 @@ impl HumanGovernanceService {
                 .get(&reviewed_revision)
                 .filter(|value| value.proposal_id == proposal_id)
                 .ok_or(HumanGovernanceError::Store)?;
+            if let Some(reserved) =
+                try_read_reauthorization_intent(&verified, &cas, &snapshot, reviewed)?
+            {
+                let deletion = reserved.deletion;
+                let intent = reserved.intent;
+                let source = reviewed;
+                let canonical = intent
+                    .canonical_toml(&deletion, reviewed)
+                    .ok_or(HumanGovernanceError::Store)?;
+                validate_reauthorization_capture(&verified, source, &canonical)?;
+                if let Some(committed) = self
+                    .writer
+                    .committed_command(verified.body.command_id)
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?
+                {
+                    let accepted = verify_reauthorization_cohort(
+                        &committed.payloads,
+                        &verified,
+                        &deletion,
+                        reviewed,
+                    )?;
+                    if view.proposals.get(&accepted.proposal_id) != Some(&accepted) {
+                        return Err(HumanGovernanceError::Store);
+                    }
+                    spool
+                        .acknowledge_segment(segment, 1)
+                        .map_err(|_| HumanGovernanceError::Store)?;
+                    continue;
+                }
+                if view.proposals.get(&source.proposal_id) != Some(source) {
+                    continue;
+                }
+                let request_id = RequestId::from_uuid(verified.body.command_id.as_uuid())
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                drop(segment);
+                let _ = Box::pin(self.accept_reauthorization(request_id, &snapshot, &view, source))
+                    .await?;
+                continue;
+            }
             if let Some(intent) = try_read_edit_intent(&verified, &cas, reviewed)? {
                 validate_edit_capture(&verified, reviewed, &intent)?;
                 if let Some(committed) = self
@@ -918,9 +964,11 @@ impl HumanGovernanceService {
         }
         if matches!(
             &decision,
-            HumanProposalDecision::Accept | HumanProposalDecision::MergeAndAccept
+            HumanProposalDecision::Accept
+                | HumanProposalDecision::MergeAndAccept
+                | HumanProposalDecision::Reauthorize
         ) {
-            self.reconcile_reserved_once().await?;
+            Box::pin(self.reconcile_reserved_once()).await?;
         }
         let snapshot = self
             .writer
@@ -939,7 +987,22 @@ impl HumanGovernanceService {
                     })
             && let Some(accepted) = accepted_edit_retry(&snapshot, &view, original, edited_payload)?
         {
-            self.reconcile_reserved_once().await?;
+            Box::pin(self.reconcile_reserved_once()).await?;
+            return Ok(HumanActionOutcome::NoDelta {
+                current_revision_ref: accepted.proposal_revision_id.to_string(),
+            });
+        }
+        if let HumanProposalDecision::Reauthorize = &decision
+            && let Some(original) =
+                view.proposal_revisions
+                    .get(&expected_revision_id)
+                    .filter(|value| {
+                        value.proposal_id == proposal_id
+                            && hex(&value.fingerprint) == expected_fingerprint
+                    })
+            && let Some(accepted) = accepted_reauthorization_retry(&snapshot, &view, original)?
+        {
+            Box::pin(self.reconcile_reserved_once()).await?;
             return Ok(HumanActionOutcome::NoDelta {
                 current_revision_ref: accepted.proposal_revision_id.to_string(),
             });
@@ -972,6 +1035,21 @@ impl HumanGovernanceService {
                 current_revision_ref: Some(current.proposal_revision_id.to_string()),
             });
         }
+        let deletion_admission = ObjectDeletionCandidateAdmissionView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?
+            .classify_proposal(current)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if matches!(
+            &decision,
+            HumanProposalDecision::Accept
+                | HumanProposalDecision::EditAndAccept(_)
+                | HumanProposalDecision::MergeAndAccept
+        ) && !matches!(deletion_admission, ObjectDeletionCandidateAdmission::Clear)
+        {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "forgotten_object_requires_explicit_reauthorization",
+            });
+        }
         let next_status = match &decision {
             HumanProposalDecision::Defer => ProposalStatus::Deferred,
             HumanProposalDecision::Reject => ProposalStatus::Rejected,
@@ -1002,6 +1080,21 @@ impl HumanGovernanceService {
                     )
                     .await;
             }
+            HumanProposalDecision::Reauthorize => {
+                if deletion_admission
+                    .representative_historical_deletion()
+                    .is_none()
+                    || current.operation != ProposalOperation::Create
+                {
+                    return Ok(HumanActionOutcome::Unavailable {
+                        reason: "object_reauthorization_unavailable",
+                    });
+                }
+                return Box::pin(
+                    self.accept_reauthorization(request_id, &snapshot, &view, current),
+                )
+                .await;
+            }
             HumanProposalDecision::MergeAndAccept => {
                 let (_, merge_and_accept_eligible) =
                     proposal_acceptance_eligibility(&view, current);
@@ -1027,6 +1120,7 @@ impl HumanGovernanceService {
                     match &decision {
                         HumanProposalDecision::Defer => "human_deferred",
                         HumanProposalDecision::Reject => "human_rejected",
+                        HumanProposalDecision::Reauthorize => unreachable!(),
                         _ => unreachable!(),
                     }
                     .into(),
@@ -1188,37 +1282,6 @@ impl HumanGovernanceService {
             effective_config_hash: self.effective_config_hash,
             algorithm_revision: ALGORITHM_REVISION.into(),
         };
-        let ProposalResolution::Revision {
-            value: superseded,
-            command: supersede_command,
-        } = RevisionProposalService
-            .revise_status(
-                view,
-                command_context.clone(),
-                original.proposal_id,
-                ProposalStatus::Superseded,
-                Vec::new(),
-                Some("human_edit_superseded".into()),
-            )
-            .map_err(|_| HumanGovernanceError::InvalidInput)?
-        else {
-            return Err(HumanGovernanceError::Store);
-        };
-        let (rebuilt_intent, pending_command) = prepare_edit_candidate(
-            view,
-            original,
-            intent.new_proposal.payload.clone(),
-            verified.body.command_id,
-            intent.new_proposal.created_at_us,
-            self.effective_config_hash,
-            Some((
-                intent.new_proposal.proposal_id,
-                intent.new_proposal.proposal_revision_id,
-            )),
-        )?;
-        if rebuilt_intent != intent {
-            return Err(HumanGovernanceError::Store);
-        }
         let mut edited_view = view.clone();
         edited_view
             .proposals
@@ -1228,62 +1291,19 @@ impl HumanGovernanceService {
             intent.new_proposal.clone(),
         );
         let context = acceptance_context(&intent.new_proposal, &edited_view, &verified)?;
-        let (accepted_revision, accepted_command) = match &intent.new_proposal.payload {
-            ProposalPayload::Atom(_) => {
-                let accepted = if let Some(support) = &support {
-                    RevisionProposalService.accept_support_linked_edited(
-                        &edited_view,
-                        command_context,
-                        intent.new_proposal.proposal_id,
-                        context,
-                        original,
-                        support,
-                    )
-                } else {
-                    RevisionProposalService.accept_edited(
-                        &edited_view,
-                        command_context,
-                        intent.new_proposal.proposal_id,
-                        context,
-                        original,
-                    )
-                }
-                .map_err(|_| HumanGovernanceError::InvalidInput)?;
-                (accepted.proposal.proposal_revision_id, accepted.command)
-            }
-            ProposalPayload::Procedure(_) => {
-                let (current, publication) = current_procedure(snapshot, &intent.new_proposal)?;
-                let accepted = accept_procedure_edited(
-                    &edited_view,
-                    command_context,
-                    intent.new_proposal.proposal_id,
-                    EditedProcedureAcceptance {
-                        source: context,
-                        original,
-                    },
-                    current.as_ref(),
-                    publication,
-                    &self.global_promotion,
-                )
-                .map_err(|_| HumanGovernanceError::InvalidInput)?;
-                match accepted {
-                    ProcedureAcceptanceResolution::Command {
-                        proposal, command, ..
-                    }
-                    | ProcedureAcceptanceResolution::AcceptedExisting { proposal, command } => {
-                        (proposal.proposal_revision_id, command)
-                    }
-                    ProcedureAcceptanceResolution::NoDelta => {
-                        return Err(HumanGovernanceError::Store);
-                    }
-                }
-            }
-            ProposalPayload::CoreMembership(_) | ProposalPayload::ReservedTarget { .. } => {
-                return Ok(HumanActionOutcome::Unavailable {
-                    reason: "atomic_edit_and_accept_unavailable",
-                });
-            }
-        };
+        let composed = compose_edited_acceptance(EditedAcceptanceInput {
+            snapshot,
+            view,
+            original,
+            reviewed: &intent.new_proposal,
+            acceptance: context,
+            command_context,
+            effective_config_hash: self.effective_config_hash,
+            global_promotion: &self.global_promotion,
+            support: support.as_ref(),
+        })?;
+        let accepted_revision = composed.accepted_revision;
+        let superseded = composed.superseded;
         let mut events = capture_event_drafts(
             &verified,
             None,
@@ -1291,9 +1311,7 @@ impl HumanGovernanceService {
             ALGORITHM_REVISION,
         )
         .map_err(|_| HumanGovernanceError::Store)?;
-        events.extend(supersede_command.events().iter().cloned());
-        events.extend(pending_command.events().iter().cloned());
-        events.extend(accepted_command.events().iter().cloned());
+        events.extend(composed.events);
         let audit_ordinal = events
             .iter()
             .position(|event| {
@@ -1351,6 +1369,213 @@ impl HumanGovernanceService {
         if committed_superseded.as_ref() != superseded.as_ref()
             || committed_accepted.proposal_revision_id != accepted_revision
         {
+            return Err(HumanGovernanceError::Store);
+        }
+        let audit_event_ref = outcome
+            .event_ids
+            .get(audit_ordinal)
+            .cloned()
+            .ok_or(HumanGovernanceError::Store)?;
+        spool
+            .acknowledge_segment(segment, 1)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        Ok(HumanActionOutcome::Applied {
+            current_revision_ref: accepted_revision.to_string(),
+            audit_event_ref,
+        })
+    }
+
+    async fn accept_reauthorization(
+        &self,
+        request_id: RequestId,
+        snapshot: &ProjectionSnapshot,
+        view: &SemanticCurrentView,
+        original: &RevisionProposal,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let Some(runtime_snapshot) = self.runtime_snapshot.as_ref() else {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "atomic_tui_acceptance_source_unavailable",
+            });
+        };
+        let admission = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?
+            .classify_proposal(original)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let deletion = admission
+            .representative_historical_deletion()
+            .cloned()
+            .ok_or(HumanGovernanceError::InvalidInput)?;
+        let record_id = format!(
+            "tui-reauthorize-{}-{}",
+            original.proposal_id, original.proposal_revision_id
+        );
+        let routing_hint = format!("tui-{}", original.proposal_id.as_uuid().hyphenated());
+        let max_segments = usize::try_from(runtime_snapshot.max_main_files)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let spool = DurableSpool::open_read_only(
+            runtime_snapshot.spool_dir.clone(),
+            runtime_snapshot
+                .spool_limits()
+                .map_err(|_| HumanGovernanceError::Store)?,
+        )
+        .map_err(|_| HumanGovernanceError::Store)?;
+        let cas = CasStore::open(runtime_snapshot.cas_dir.clone())
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let mut claimed = claim_isolated_record(&spool, &record_id, max_segments)?;
+        if claimed.is_none() {
+            let command_id = CommandId::from_uuid(request_id.as_uuid())
+                .map_err(|_| HumanGovernanceError::InvalidInput)?;
+            let intent = ObjectReauthorizationIntent::new(&deletion, original)
+                .ok_or(HumanGovernanceError::InvalidInput)?;
+            let canonical = intent
+                .canonical_toml(&deletion, original)
+                .ok_or(HumanGovernanceError::InvalidInput)?;
+            let scope = acceptance_capture_scope(original, view)?;
+            let mut capture = CaptureRuntime::open(runtime_snapshot.clone())
+                .map_err(|_| HumanGovernanceError::Store)?;
+            let isolated = capture
+                .capture_isolated(
+                    acceptance_capture_input(original, &canonical, &record_id, scope)?,
+                    command_id,
+                    &routing_hint,
+                )
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if !matches!(isolated.outcome, CaptureOutcome::Durable { .. }) {
+                return Err(HumanGovernanceError::Store);
+            }
+            claimed = Some(isolated.segment);
+        }
+        let segment = claimed.ok_or(HumanGovernanceError::Store)?;
+        let frame = segment
+            .frames()
+            .first()
+            .filter(|_| segment.frames().len() == 1)
+            .ok_or(HumanGovernanceError::Store)?;
+        let verified =
+            verify_capture_frame(frame, &cas).map_err(|_| HumanGovernanceError::Store)?;
+        let intent = read_reauthorization_intent(&verified, &cas, &deletion, original)?;
+        let reviewed = original;
+        let canonical = intent
+            .canonical_toml(&deletion, reviewed)
+            .ok_or(HumanGovernanceError::Store)?;
+        validate_reauthorization_capture(&verified, reviewed, &canonical)?;
+        let occurred_at_us = now_us()?;
+        let command_context = ProposalCommandContext {
+            command_id: verified.body.command_id,
+            occurred_at_us,
+            effective_config_hash: self.effective_config_hash,
+            algorithm_revision: ALGORITHM_REVISION.into(),
+        };
+        let mut events = capture_event_drafts(
+            &verified,
+            None,
+            self.effective_config_hash,
+            ALGORITHM_REVISION,
+        )
+        .map_err(|_| HumanGovernanceError::Store)?;
+        let acceptance = reauthorization_acceptance_context(reviewed, view, &verified, canonical)?;
+        let (accepted_revision, accepted_command) = match &reviewed.payload {
+            ProposalPayload::Atom(_) => {
+                let accepted = RevisionProposalService
+                    .accept(view, command_context, reviewed.proposal_id, acceptance)
+                    .map_err(|_| HumanGovernanceError::InvalidInput)?;
+                (accepted.proposal.proposal_revision_id, accepted.command)
+            }
+            ProposalPayload::Procedure(_) => {
+                let result = accept_procedure(
+                    view,
+                    command_context,
+                    reviewed.proposal_id,
+                    ProcedureAcceptanceContext::Manual(acceptance),
+                    None,
+                    None,
+                    &self.global_promotion,
+                )
+                .map_err(|_| HumanGovernanceError::InvalidInput)?;
+                match result {
+                    ProcedureAcceptanceResolution::Command {
+                        proposal, command, ..
+                    } => (proposal.proposal_revision_id, command),
+                    ProcedureAcceptanceResolution::AcceptedExisting { .. }
+                    | ProcedureAcceptanceResolution::NoDelta => {
+                        return Err(HumanGovernanceError::Store);
+                    }
+                }
+            }
+            ProposalPayload::CoreMembership(payload) => {
+                let CoreMembershipProposalPayload::Create {
+                    atom_revision_id, ..
+                } = payload.as_ref()
+                else {
+                    return Err(HumanGovernanceError::InvalidInput);
+                };
+                let atom = view
+                    .atom_revisions
+                    .get(atom_revision_id)
+                    .ok_or(HumanGovernanceError::InvalidInput)?;
+                let membership = accept_core_membership(
+                    view,
+                    command_context,
+                    reviewed.proposal_id,
+                    CoreMembershipAcceptanceContext::Tui(acceptance),
+                    atom,
+                    CoreMembershipId::from_uuid(reviewed.proposal_id.as_uuid())
+                        .map_err(|_| HumanGovernanceError::InvalidInput)?,
+                    SupportThresholdSnapshot {
+                        minimum_surviving_support: 1,
+                        require_authorization: true,
+                    },
+                )
+                .map_err(|_| HumanGovernanceError::InvalidInput)?;
+                (membership.proposal.proposal_revision_id, membership.command)
+            }
+            ProposalPayload::ReservedTarget { .. } => {
+                return Err(HumanGovernanceError::InvalidInput);
+            }
+        };
+        events.extend(accepted_command.events().iter().cloned());
+        let audit_ordinal = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    JournalPayload::RevisionProposalRecorded(value)
+                        if value.proposal_id == reviewed.proposal_id
+                            && value.status == ProposalStatus::Accepted
+                )
+            })
+            .ok_or(HumanGovernanceError::Store)?;
+        let command = JournalCommand::new(verified.body.command_id, events)
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let outcome = match self
+            .writer
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(crate::WriterActorError::StaleFrontier) => {
+                return Ok(HumanActionOutcome::Conflict {
+                    current_revision_ref: current_proposal_revision(
+                        &self
+                            .writer
+                            .project()
+                            .await
+                            .map_err(|_| HumanGovernanceError::Store)?,
+                        original.proposal_id,
+                    ),
+                });
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        };
+        let committed = self
+            .writer
+            .committed_command(verified.body.command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+            .ok_or(HumanGovernanceError::Store)?;
+        let accepted =
+            verify_reauthorization_cohort(&committed.payloads, &verified, &deletion, reviewed)?;
+        if accepted.proposal_revision_id != accepted_revision {
             return Err(HumanGovernanceError::Store);
         }
         let audit_event_ref = outcome
@@ -3073,6 +3298,10 @@ fn summary(
     surface: HumanSurface,
     include_detail: bool,
 ) -> Result<HumanSummary, HumanGovernanceError> {
+    let deletion_admission = include_detail
+        .then(|| ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot))
+        .transpose()
+        .map_err(|_| HumanGovernanceError::Store)?;
     let proposal = (row.object_kind.as_deref() == Some("revision_proposal_revision"))
         .then_some(())
         .and_then(|()| row.object_id.as_deref()?.parse().ok())
@@ -3099,20 +3328,32 @@ fn summary(
             status: value.status,
         });
     let proposal_review = if include_detail {
-        proposal.as_ref().and_then(|summary| {
-            semantic_view
-                .proposals
-                .get(&summary.proposal_id)
-                .map(|value| {
-                    let (plain_accept_eligible, merge_and_accept_eligible) =
-                        proposal_acceptance_eligibility(semantic_view, value);
-                    HumanProposalReview {
-                        proposal: Box::new(value.clone()),
-                        plain_accept_eligible,
-                        merge_and_accept_eligible,
-                    }
+        proposal
+            .as_ref()
+            .and_then(|summary| semantic_view.proposals.get(&summary.proposal_id))
+            .map(|value| {
+                let (plain_accept_eligible, merge_and_accept_eligible) =
+                    proposal_acceptance_eligibility(semantic_view, value);
+                let reauthorization =
+                    if value.status.is_open() && value.operation == ProposalOperation::Create {
+                        deletion_admission
+                            .as_ref()
+                            .ok_or(HumanGovernanceError::Store)?
+                            .classify_proposal(value)
+                            .map_err(|_| HumanGovernanceError::Store)?
+                            .representative_historical_deletion()
+                            .and_then(ObjectReauthorizationRef::from_deletion)
+                    } else {
+                        None
+                    };
+                Ok(HumanProposalReview {
+                    proposal: Box::new(value.clone()),
+                    plain_accept_eligible: plain_accept_eligible && reauthorization.is_none(),
+                    merge_and_accept_eligible,
+                    reauthorization,
                 })
-        })
+            })
+            .transpose()?
     } else {
         None
     };
@@ -3967,6 +4208,34 @@ fn acceptance_context(
     })
 }
 
+fn reauthorization_acceptance_context(
+    proposal: &RevisionProposal,
+    view: &SemanticCurrentView,
+    verified: &crate::capture::VerifiedCapture,
+    canonical_payload: String,
+) -> Result<AtomAcceptanceContext, HumanGovernanceError> {
+    let scope = proposal_scope(proposal, view)?;
+    let authorized_scope_ceiling = match scope {
+        AtomScope::Task { task_id } => AtomScope::Task { task_id },
+        AtomScope::Repository {
+            repository_instance_id,
+        }
+        | AtomScope::Worktree {
+            repository_instance_id,
+            ..
+        } => AtomScope::Repository {
+            repository_instance_id,
+        },
+        AtomScope::Global => AtomScope::Global,
+    };
+    Ok(AtomAcceptanceContext::ReauthorizationTui {
+        observation: Box::new(verified.observation.clone()),
+        receipt: Box::new(verified.receipt.clone()),
+        authorized_scope_ceiling,
+        canonical_payload,
+    })
+}
+
 fn claim_isolated_record(
     spool: &DurableSpool,
     record_id: &str,
@@ -4100,6 +4369,129 @@ fn prepare_edit_candidate(
     Ok((intent, command))
 }
 
+struct EditedAcceptanceInput<'a> {
+    snapshot: &'a ProjectionSnapshot,
+    view: &'a SemanticCurrentView,
+    original: &'a RevisionProposal,
+    reviewed: &'a RevisionProposal,
+    acceptance: AtomAcceptanceContext,
+    command_context: ProposalCommandContext,
+    effective_config_hash: [u8; 32],
+    global_promotion: &'a GlobalPromotionConfig,
+    support: Option<&'a crate::semantic::SupportAtomAcceptance>,
+}
+
+struct EditedAcceptanceCommand {
+    superseded: Box<RevisionProposal>,
+    accepted_revision: RevisionId,
+    events: Vec<evertrace_store::JournalEventDraft>,
+}
+
+fn compose_edited_acceptance(
+    input: EditedAcceptanceInput<'_>,
+) -> Result<EditedAcceptanceCommand, HumanGovernanceError> {
+    let ProposalResolution::Revision {
+        value: superseded,
+        command: supersede,
+    } = RevisionProposalService
+        .revise_status(
+            input.view,
+            input.command_context.clone(),
+            input.original.proposal_id,
+            ProposalStatus::Superseded,
+            Vec::new(),
+            Some("human_edit_superseded".into()),
+        )
+        .map_err(|_| HumanGovernanceError::InvalidInput)?
+    else {
+        return Err(HumanGovernanceError::Store);
+    };
+    let (rebuilt, pending) = prepare_edit_candidate(
+        input.view,
+        input.original,
+        input.reviewed.payload.clone(),
+        input.command_context.command_id,
+        input.reviewed.created_at_us,
+        input.effective_config_hash,
+        Some((
+            input.reviewed.proposal_id,
+            input.reviewed.proposal_revision_id,
+        )),
+    )?;
+    if rebuilt.new_proposal != *input.reviewed {
+        return Err(HumanGovernanceError::Store);
+    }
+    let mut edited_view = input.view.clone();
+    edited_view
+        .proposals
+        .insert(input.reviewed.proposal_id, input.reviewed.clone());
+    edited_view
+        .proposal_revisions
+        .insert(input.reviewed.proposal_revision_id, input.reviewed.clone());
+    let (accepted_revision, accepted) = match &input.reviewed.payload {
+        ProposalPayload::Atom(_) => {
+            let accepted = if let Some(support) = input.support {
+                RevisionProposalService.accept_support_linked_edited(
+                    &edited_view,
+                    input.command_context,
+                    input.reviewed.proposal_id,
+                    input.acceptance,
+                    input.original,
+                    support,
+                )
+            } else {
+                RevisionProposalService.accept_edited(
+                    &edited_view,
+                    input.command_context,
+                    input.reviewed.proposal_id,
+                    input.acceptance,
+                    input.original,
+                )
+            }
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+            (accepted.proposal.proposal_revision_id, accepted.command)
+        }
+        ProposalPayload::Procedure(_) => {
+            let (current, publication) = current_procedure(input.snapshot, input.reviewed)?;
+            let accepted = accept_procedure_edited(
+                &edited_view,
+                input.command_context,
+                input.reviewed.proposal_id,
+                EditedProcedureAcceptance {
+                    source: input.acceptance,
+                    original: input.original,
+                },
+                current.as_ref(),
+                publication,
+                input.global_promotion,
+            )
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+            match accepted {
+                ProcedureAcceptanceResolution::Command {
+                    proposal, command, ..
+                }
+                | ProcedureAcceptanceResolution::AcceptedExisting { proposal, command } => {
+                    (proposal.proposal_revision_id, command)
+                }
+                ProcedureAcceptanceResolution::NoDelta => {
+                    return Err(HumanGovernanceError::Store);
+                }
+            }
+        }
+        ProposalPayload::CoreMembership(_) | ProposalPayload::ReservedTarget { .. } => {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
+    };
+    let mut events = supersede.events().to_vec();
+    events.extend(pending.events().iter().cloned());
+    events.extend(accepted.events().iter().cloned());
+    Ok(EditedAcceptanceCommand {
+        superseded,
+        accepted_revision,
+        events,
+    })
+}
+
 fn read_edit_intent(
     verified: &crate::capture::VerifiedCapture,
     cas: &CasStore,
@@ -4126,6 +4518,64 @@ fn try_read_edit_intent(
         return Err(HumanGovernanceError::Store);
     }
     Ok(Some(intent))
+}
+
+fn read_reauthorization_intent(
+    verified: &crate::capture::VerifiedCapture,
+    cas: &CasStore,
+    deletion: &ObjectDeletionLedgerEvent,
+    reviewed: &RevisionProposal,
+) -> Result<ObjectReauthorizationIntent, HumanGovernanceError> {
+    let digest =
+        CasDigest::from_str(&verified.body.cas_ref).map_err(|_| HumanGovernanceError::Store)?;
+    let bytes = cas.read(&digest).map_err(|_| HumanGovernanceError::Store)?;
+    let value = std::str::from_utf8(&bytes).map_err(|_| HumanGovernanceError::Store)?;
+    let intent =
+        ObjectReauthorizationIntent::from_toml(value).ok_or(HumanGovernanceError::Store)?;
+    let canonical = intent
+        .canonical_toml(deletion, reviewed)
+        .ok_or(HumanGovernanceError::Store)?;
+    if canonical.as_bytes() != bytes.as_slice() {
+        return Err(HumanGovernanceError::Store);
+    }
+    Ok(intent)
+}
+
+struct ReservedReauthorizationIntent {
+    deletion: ObjectDeletionLedgerEvent,
+    intent: ObjectReauthorizationIntent,
+}
+
+fn try_read_reauthorization_intent(
+    verified: &crate::capture::VerifiedCapture,
+    cas: &CasStore,
+    snapshot: &ProjectionSnapshot,
+    reviewed: &RevisionProposal,
+) -> Result<Option<ReservedReauthorizationIntent>, HumanGovernanceError> {
+    let digest =
+        CasDigest::from_str(&verified.body.cas_ref).map_err(|_| HumanGovernanceError::Store)?;
+    let bytes = cas.read(&digest).map_err(|_| HumanGovernanceError::Store)?;
+    let Ok(value) = std::str::from_utf8(&bytes) else {
+        return Ok(None);
+    };
+    let Some(intent) = ObjectReauthorizationIntent::from_toml(value) else {
+        return Ok(None);
+    };
+    let ledger = ObjectDeletionCurrentView::from_snapshot(snapshot)
+        .map_err(|_| HumanGovernanceError::Store)?;
+    let deletion = ledger
+        .events
+        .get(&intent.deletion.target)
+        .filter(|event| event.deletion_generation == intent.deletion.deletion_generation)
+        .cloned()
+        .ok_or(HumanGovernanceError::Store)?;
+    let canonical = intent
+        .canonical_toml(&deletion, reviewed)
+        .ok_or(HumanGovernanceError::Store)?;
+    if canonical.as_bytes() != bytes.as_slice() {
+        return Err(HumanGovernanceError::Store);
+    }
+    Ok(Some(ReservedReauthorizationIntent { deletion, intent }))
 }
 
 fn accepted_edit_retry<'a>(
@@ -4184,6 +4634,83 @@ fn accepted_edit_retry<'a>(
         }
     }
     Ok(None)
+}
+
+fn accepted_reauthorization_retry<'a>(
+    snapshot: &ProjectionSnapshot,
+    view: &'a SemanticCurrentView,
+    original: &RevisionProposal,
+) -> Result<Option<&'a RevisionProposal>, HumanGovernanceError> {
+    let deletion = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)
+        .map_err(|_| HumanGovernanceError::Store)?
+        .classify_proposal(original)
+        .map_err(|_| HumanGovernanceError::Store)?
+        .representative_historical_deletion()
+        .cloned();
+    let Some(deletion) = deletion else {
+        return Ok(None);
+    };
+    let mut evidence = None;
+    let mut matched = None;
+    for accepted in view.proposals.values() {
+        if accepted.status != ProposalStatus::Accepted {
+            continue;
+        }
+        let Some(acceptance) = accepted.acceptance.as_ref() else {
+            continue;
+        };
+        let Some(reviewed) = view
+            .proposal_revisions
+            .get(&acceptance.reviewed_proposal_revision_id)
+        else {
+            continue;
+        };
+        if reviewed != original {
+            continue;
+        }
+        let ProposalAcceptanceAuthority::TuiAcceptance {
+            user_source_observation_ref,
+            ..
+        } = &acceptance.authority_basis
+        else {
+            continue;
+        };
+        if acceptance.acceptance_event_ref != user_source_observation_ref.to_string() {
+            continue;
+        }
+        let intent = ObjectReauthorizationIntent::new(&deletion, reviewed)
+            .ok_or(HumanGovernanceError::Store)?;
+        let canonical = intent
+            .canonical_toml(&deletion, reviewed)
+            .ok_or(HumanGovernanceError::Store)?;
+        if evidence.is_none() {
+            evidence = Some(
+                RecoveryEvidenceCurrentView::from_snapshot(snapshot)
+                    .map_err(|_| HumanGovernanceError::Store)?,
+            );
+        }
+        let evidence = evidence.as_ref().ok_or(HumanGovernanceError::Store)?;
+        let observation = evidence
+            .observation(*user_source_observation_ref)
+            .ok_or(HumanGovernanceError::Store)?;
+        let receipt = evidence
+            .receipt_for_observation(*user_source_observation_ref)
+            .ok_or(HumanGovernanceError::Store)?;
+        let expected_fingerprint = hex(&payload_fingerprint(1, canonical.as_bytes(), None)
+            .map_err(|_| HumanGovernanceError::Store)?);
+        if observation.source_observation_id != *user_source_observation_ref
+            || observation.payload_fingerprint != expected_fingerprint
+            || receipt.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+            || receipt.source_ref != reviewed.proposal_id.to_string()
+            || receipt.source_revision.as_str() != reviewed.proposal_revision_id.to_string()
+        {
+            continue;
+        }
+        if matched.replace(accepted).is_some() {
+            return Err(HumanGovernanceError::Store);
+        }
+    }
+    Ok(matched)
 }
 
 fn verify_edit_acceptance_cohort(
@@ -4450,6 +4977,14 @@ fn verify_acceptance_cohort(
     reviewed: &RevisionProposal,
 ) -> Result<RevisionProposal, HumanGovernanceError> {
     validate_acceptance_capture(verified, reviewed)?;
+    verify_acceptance_payload_cohort(payloads, verified, reviewed)
+}
+
+fn verify_acceptance_payload_cohort(
+    payloads: &[JournalPayload],
+    verified: &crate::capture::VerifiedCapture,
+    reviewed: &RevisionProposal,
+) -> Result<RevisionProposal, HumanGovernanceError> {
     let mut receipt_count = 0;
     let mut observation_count = 0;
     let mut watermark_count = 0;
@@ -4530,6 +5065,21 @@ fn verify_acceptance_cohort(
     Ok((*accepted).clone())
 }
 
+fn verify_reauthorization_cohort(
+    payloads: &[JournalPayload],
+    verified: &crate::capture::VerifiedCapture,
+    deletion: &ObjectDeletionLedgerEvent,
+    reviewed: &RevisionProposal,
+) -> Result<RevisionProposal, HumanGovernanceError> {
+    let intent =
+        ObjectReauthorizationIntent::new(deletion, reviewed).ok_or(HumanGovernanceError::Store)?;
+    let canonical = intent
+        .canonical_toml(deletion, reviewed)
+        .ok_or(HumanGovernanceError::Store)?;
+    validate_reauthorization_capture(verified, reviewed, &canonical)?;
+    verify_acceptance_payload_cohort(payloads, verified, reviewed)
+}
+
 fn validate_acceptance_capture(
     verified: &crate::capture::VerifiedCapture,
     reviewed: &RevisionProposal,
@@ -4539,7 +5089,7 @@ fn validate_acceptance_capture(
         reviewed.proposal_revision_id,
         &reviewed.fingerprint,
     );
-    validate_acceptance_capture_payload(verified, reviewed, &canonical)
+    validate_acceptance_capture_payload(verified, reviewed, &canonical, "tui-accept")
 }
 
 fn validate_edit_capture(
@@ -4549,16 +5099,25 @@ fn validate_edit_capture(
 ) -> Result<(), HumanGovernanceError> {
     intent.validate(original)?;
     let canonical = intent.canonical_toml(original)?;
-    validate_acceptance_capture_payload(verified, original, &canonical)
+    validate_acceptance_capture_payload(verified, original, &canonical, "tui-accept")
+}
+
+fn validate_reauthorization_capture(
+    verified: &crate::capture::VerifiedCapture,
+    source: &RevisionProposal,
+    canonical: &str,
+) -> Result<(), HumanGovernanceError> {
+    validate_acceptance_capture_payload(verified, source, canonical, "tui-reauthorize")
 }
 
 fn validate_acceptance_capture_payload(
     verified: &crate::capture::VerifiedCapture,
     source: &RevisionProposal,
     canonical: &str,
+    record_prefix: &str,
 ) -> Result<(), HumanGovernanceError> {
     let expected_record = format!(
-        "tui-accept-{}-{}",
+        "{record_prefix}-{}-{}",
         source.proposal_id, source.proposal_revision_id
     );
     let expected_instance = format!("tui-acceptance:{}", source.proposal_id);

@@ -6,7 +6,7 @@ use evertrace_domain::{
         RevisionProposalId, WorktreeId, WorktreeSnapshotId,
     },
     procedure::ProcedureNegativeReviewStatus,
-    purge::ObjectDeletionTarget,
+    purge::{ObjectDeletionTarget, ObjectReauthorizationRef},
     repository::{
         DestructiveClass, GitRegistrationState, OrderingIntegrity, RecoveryApplicationKind,
         RecoveryApplicationStatus, RecoveryCaptureStatus, RecoveryInputDeliveryState,
@@ -111,6 +111,7 @@ pub enum HumanReadRequest {
 pub enum ProposalHumanDecision {
     Accept,
     EditAndAccept,
+    Reauthorize,
     MergeAndAccept,
     Defer,
     Reject,
@@ -280,6 +281,8 @@ pub struct HumanProposalReview {
     pub proposal: Box<RevisionProposal>,
     pub plain_accept_eligible: bool,
     pub merge_and_accept_eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauthorization: Option<ObjectReauthorizationRef>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -633,8 +636,14 @@ impl HumanActionRequest {
                 ..
             } => {
                 valid_hex(expected_fingerprint)
-                    && matches!(decision, ProposalHumanDecision::EditAndAccept)
-                        == edited_payload.is_some()
+                    && match decision {
+                        ProposalHumanDecision::EditAndAccept => edited_payload.is_some(),
+                        ProposalHumanDecision::Reauthorize => edited_payload.is_none(),
+                        ProposalHumanDecision::Accept
+                        | ProposalHumanDecision::MergeAndAccept
+                        | ProposalHumanDecision::Defer
+                        | ProposalHumanDecision::Reject => edited_payload.is_none(),
+                    }
             }
             Self::NegativeReview { .. } => true,
             Self::SupportReplacement { edited_payload, .. } => {
@@ -746,6 +755,14 @@ impl HumanSnapshotItem {
                             && review.proposal.status.is_open()
                             && review.proposal.eligibility
                                 != ProposalEligibility::AutoEligibleFull))
+                    && (review.reauthorization.as_ref().is_none_or(|reference| {
+                        reference.deletion_generation > 0
+                            && valid_ref(&reference.purge_job_audit_ref)
+                            && !review.plain_accept_eligible
+                            && review.proposal.operation == ProposalOperation::Create
+                            && review.proposal.status.is_open()
+                            && review.proposal.eligibility == ProposalEligibility::ManualRequired
+                    }))
             })
             && self
                 .support_detail

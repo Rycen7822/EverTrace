@@ -10,7 +10,10 @@ use evertrace_domain::{
         tui_acceptance_event_payload,
     },
 };
-use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload, SemanticCurrentView};
+use evertrace_store::{
+    JournalCommand, JournalEventDraft, JournalPayload, ObjectDeletionCandidateAdmission,
+    ObjectDeletionCandidateAdmissionView, SemanticCurrentView,
+};
 
 use super::{
     AtomAuthorityBasis, AtomMaterialization, SemanticServiceError, VerifiedTuiAcceptance,
@@ -48,6 +51,12 @@ pub enum ProposalResolution<T> {
 }
 
 #[derive(Debug)]
+pub enum DeletionAwareProposalResolution<T> {
+    FixedSuppression,
+    Proposal(ProposalResolution<T>),
+}
+
+#[derive(Debug)]
 pub struct AcceptedProposalCommand {
     pub proposal: Box<RevisionProposal>,
     pub atom: Box<Atom>,
@@ -73,6 +82,12 @@ pub enum AtomAcceptanceContext {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
     },
+    ReauthorizationTui {
+        observation: Box<SourceObservation>,
+        receipt: Box<SourceReceipt>,
+        authorized_scope_ceiling: AtomScope,
+        canonical_payload: String,
+    },
     ObjectiveEvidence {
         observation: Box<SourceObservation>,
         receipt: Box<SourceReceipt>,
@@ -86,6 +101,7 @@ impl AtomAcceptanceContext {
             | Self::RepositoryTui { observation, .. }
             | Self::TaskTui { observation, .. }
             | Self::GlobalTui { observation, .. }
+            | Self::ReauthorizationTui { observation, .. }
             | Self::ObjectiveEvidence { observation, .. } => observation,
         }
     }
@@ -130,6 +146,18 @@ impl AtomAcceptanceContext {
                 observation,
                 receipt,
             } => require_tui_acceptance_source(observation, receipt, proposal, accepted_at_us)?,
+            Self::ReauthorizationTui {
+                observation,
+                receipt,
+                canonical_payload,
+                ..
+            } => require_tui_acceptance_source_payload(
+                observation,
+                receipt,
+                proposal,
+                accepted_at_us,
+                canonical_payload,
+            )?,
         }
         Ok(())
     }
@@ -168,6 +196,14 @@ impl AtomAcceptanceContext {
             Self::GlobalTui { observation, .. } => ProposalAcceptanceAuthority::TuiAcceptance {
                 user_source_observation_ref: observation.source_observation_id,
                 authorized_scope_ceiling: AtomScope::Global,
+            },
+            Self::ReauthorizationTui {
+                observation,
+                authorized_scope_ceiling,
+                ..
+            } => ProposalAcceptanceAuthority::TuiAcceptance {
+                user_source_observation_ref: observation.source_observation_id,
+                authorized_scope_ceiling: authorized_scope_ceiling.clone(),
             },
             Self::ObjectiveEvidence { observation, .. } => {
                 ProposalAcceptanceAuthority::ObjectiveEvidence {
@@ -362,7 +398,25 @@ impl RevisionProposalService {
         context: ProposalCommandContext,
         request: SubmitProposalRequest,
     ) -> Result<ProposalResolution<RevisionProposal>, SemanticServiceError> {
-        self.submit_inner(view, context, request, None)
+        self.submit_inner(view, context, request, None, None)
+            .map(|(resolution, _)| resolution)
+    }
+
+    pub fn submit_with_deletion_admission(
+        &self,
+        view: &SemanticCurrentView,
+        admission: &ObjectDeletionCandidateAdmissionView,
+        context: ProposalCommandContext,
+        request: SubmitProposalRequest,
+    ) -> Result<DeletionAwareProposalResolution<RevisionProposal>, SemanticServiceError> {
+        self.submit_inner(view, context, request, None, Some(admission))
+            .map(|(resolution, fixed)| {
+                if fixed {
+                    DeletionAwareProposalResolution::FixedSuppression
+                } else {
+                    DeletionAwareProposalResolution::Proposal(resolution)
+                }
+            })
     }
 
     pub(crate) fn submit_with_identity(
@@ -378,7 +432,9 @@ impl RevisionProposalService {
             context,
             request,
             Some((proposal_id, proposal_revision_id)),
+            None,
         )
+        .map(|(resolution, _)| resolution)
     }
 
     fn submit_inner(
@@ -387,7 +443,8 @@ impl RevisionProposalService {
         context: ProposalCommandContext,
         mut request: SubmitProposalRequest,
         identity: Option<(RevisionProposalId, RevisionId)>,
-    ) -> Result<ProposalResolution<RevisionProposal>, SemanticServiceError> {
+        deletion_admission: Option<&ObjectDeletionCandidateAdmissionView>,
+    ) -> Result<(ProposalResolution<RevisionProposal>, bool), SemanticServiceError> {
         normalize_refs(&mut request.evidence_refs);
         normalize_refs(&mut request.source_cohort_refs);
         validate_target_base(view, &request)?;
@@ -424,11 +481,32 @@ impl RevisionProposalService {
         candidate
             .validate()
             .map_err(|_| SemanticServiceError::InvalidInput)?;
+        if let Some(admission) = deletion_admission {
+            match admission
+                .classify_proposal(&candidate)
+                .map_err(SemanticServiceError::Store)?
+            {
+                ObjectDeletionCandidateAdmission::Clear => {}
+                ObjectDeletionCandidateAdmission::FixedSuppression => {
+                    return Ok((ProposalResolution::NoDelta, true));
+                }
+                ObjectDeletionCandidateAdmission::HistoricalConflict { .. } => {
+                    candidate.eligibility = ProposalEligibility::ManualRequired;
+                    candidate.review_reason = Some("forgotten_object_historical_conflict".into());
+                    candidate.fingerprint = candidate
+                        .recompute_fingerprint()
+                        .map_err(|_| SemanticServiceError::InvalidInput)?;
+                    candidate
+                        .validate()
+                        .map_err(|_| SemanticServiceError::InvalidInput)?;
+                }
+            }
+        }
         if view.proposals.values().any(|proposal| {
             proposal.status == ProposalStatus::Rejected
                 && proposal.suppression_key() == candidate.suppression_key()
         }) {
-            return Ok(ProposalResolution::NoDelta);
+            return Ok((ProposalResolution::NoDelta, false));
         }
         let mut accepted = view.proposals.values().filter(|proposal| {
             proposal.status == ProposalStatus::Accepted
@@ -438,7 +516,7 @@ impl RevisionProposalService {
             if accepted.next().is_some() {
                 return Err(SemanticServiceError::ImmutableConflict);
             }
-            return Ok(ProposalResolution::NoDelta);
+            return Ok((ProposalResolution::NoDelta, false));
         }
         let mut matching = view.proposals.values().filter(|proposal| {
             matches!(
@@ -451,14 +529,14 @@ impl RevisionProposalService {
                 return Err(SemanticServiceError::ImmutableConflict);
             }
             if current.status == ProposalStatus::Deferred {
-                return Ok(ProposalResolution::NoDelta);
+                return Ok((ProposalResolution::NoDelta, false));
             }
             if candidate
                 .evidence_refs
                 .iter()
                 .all(|reference| current.evidence_refs.contains(reference))
             {
-                return Ok(ProposalResolution::NoDelta);
+                return Ok((ProposalResolution::NoDelta, false));
             }
             candidate.proposal_id = current.proposal_id;
             candidate.proposal_revision_id = RevisionId::new_v7();
@@ -478,10 +556,13 @@ impl RevisionProposalService {
                 candidate.clone(),
             ))],
         )?;
-        Ok(ProposalResolution::Revision {
-            value: Box::new(candidate),
-            command,
-        })
+        Ok((
+            ProposalResolution::Revision {
+                value: Box::new(candidate),
+                command,
+            },
+            false,
+        ))
     }
 
     pub fn revise_status(
@@ -712,7 +793,14 @@ impl RevisionProposalService {
                 return Err(SemanticServiceError::UnsupportedTarget);
             }
         };
-        let global_tui = matches!(acceptance_context, AtomAcceptanceContext::GlobalTui { .. });
+        let global_tui = matches!(acceptance_context, AtomAcceptanceContext::GlobalTui { .. })
+            || matches!(
+                &acceptance_context,
+                AtomAcceptanceContext::ReauthorizationTui {
+                    authorized_scope_ceiling: AtomScope::Global,
+                    ..
+                }
+            );
         if !matches!(
             requested_scope,
             AtomScope::Task { .. } | AtomScope::Repository { .. }
@@ -900,6 +988,17 @@ fn require_tui_acceptance_source(
         proposal.proposal_revision_id,
         &proposal.fingerprint,
     );
+    require_tui_acceptance_source_payload(observation, receipt, proposal, accepted_at_us, &payload)
+}
+
+fn require_tui_acceptance_source_payload(
+    observation: &SourceObservation,
+    receipt: &SourceReceipt,
+    proposal: &RevisionProposal,
+    accepted_at_us: i64,
+    payload: &str,
+) -> Result<(), SemanticServiceError> {
+    require_user_source(observation, receipt)?;
     let expected = payload_fingerprint(
         observation.canonicalization_revision,
         payload.as_bytes(),
@@ -1048,6 +1147,23 @@ fn acceptance_basis(
             }
             Ok(AtomAuthorityBasis::TuiAcceptance(
                 VerifiedTuiAcceptance::new(observation.clone(), receipt.clone(), AtomScope::Global),
+            ))
+        }
+        AtomAcceptanceContext::ReauthorizationTui {
+            observation,
+            receipt,
+            authorized_scope_ceiling,
+            ..
+        } => {
+            if !authorized_scope_ceiling.contains(&draft.scope) {
+                return Err(SemanticServiceError::UnsupportedTarget);
+            }
+            Ok(AtomAuthorityBasis::TuiAcceptance(
+                VerifiedTuiAcceptance::new(
+                    observation.clone(),
+                    receipt.clone(),
+                    authorized_scope_ceiling.clone(),
+                ),
             ))
         }
         AtomAcceptanceContext::ObjectiveEvidence { .. } => {

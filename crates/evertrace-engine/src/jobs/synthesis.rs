@@ -16,8 +16,9 @@ use evertrace_domain::{
 };
 use evertrace_store::{
     DurableJob, EventScope, JobBudget, JobStatus, JobTerminalAudit, JobTerminalOutcome,
-    JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload, ProjectionSnapshot,
-    SegmentationCurrentView, SemanticCurrentView, SourceKind,
+    JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
+    ObjectDeletionCandidateAdmissionView, ProjectionSnapshot, SegmentationCurrentView,
+    SemanticCurrentView, SourceKind,
 };
 
 use crate::{
@@ -28,7 +29,8 @@ use crate::{
         canonical_prompt_hash,
     },
     semantic::{
-        ProposalCommandContext, ProposalResolution, RevisionProposalService, SubmitProposalRequest,
+        DeletionAwareProposalResolution, ProposalCommandContext, ProposalResolution,
+        RevisionProposalService, SubmitProposalRequest,
     },
 };
 
@@ -1216,6 +1218,7 @@ fn proposal_payloads(
     evidence_refs: &[String],
 ) -> Result<Vec<JournalPayload>, crate::semantic::SemanticServiceError> {
     let view = SemanticCurrentView::from_snapshot(snapshot)?;
+    let deletion_admission = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
     let service = RevisionProposalService;
     let mut payloads = Vec::new();
     for candidate in &digest.application.candidates {
@@ -1255,8 +1258,9 @@ fn proposal_payloads(
         if has_unique_existing_exact_proposal(&view, &submit)? {
             continue;
         }
-        match service.submit(
+        match service.submit_with_deletion_admission(
             &view,
+            &deletion_admission,
             ProposalCommandContext {
                 command_id: request.command_id,
                 occurred_at_us: request.occurred_at_us,
@@ -1265,10 +1269,14 @@ fn proposal_payloads(
             },
             submit,
         )? {
-            ProposalResolution::Revision { command, .. } => {
+            DeletionAwareProposalResolution::Proposal(ProposalResolution::Revision {
+                command,
+                ..
+            }) => {
                 payloads.extend(command.events().iter().map(|event| event.payload.clone()));
             }
-            ProposalResolution::NoDelta => {
+            DeletionAwareProposalResolution::FixedSuppression => {}
+            DeletionAwareProposalResolution::Proposal(ProposalResolution::NoDelta) => {
                 return Err(crate::semantic::SemanticServiceError::ImmutableConflict);
             }
         }

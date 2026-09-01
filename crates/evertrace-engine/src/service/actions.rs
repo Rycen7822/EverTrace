@@ -38,7 +38,8 @@ use crate::{
     EvidenceIngestor, WriterActorError, WriterHandle,
     search::ProductionSearch,
     semantic::{
-        ProposalCommandContext, ProposalResolution, RevisionProposalService, SubmitProposalRequest,
+        DeletionAwareProposalResolution, ProposalCommandContext, ProposalResolution,
+        RevisionProposalService, SubmitProposalRequest,
     },
 };
 

@@ -442,6 +442,9 @@ impl App {
                         evertrace_protocol::dto::ProposalHumanDecision::EditAndAccept => {
                             "atomic_edit_and_accept_unavailable"
                         }
+                        evertrace_protocol::dto::ProposalHumanDecision::Reauthorize => {
+                            "object_reauthorization_unavailable"
+                        }
                         evertrace_protocol::dto::ProposalHumanDecision::Defer
                         | evertrace_protocol::dto::ProposalHumanDecision::Reject => {
                             "select_current_proposal"
@@ -705,6 +708,7 @@ fn proposal_edit_state(state: &AppState) -> Result<crate::state::ProposalEditSta
         if !review.proposal.status.is_open()
             || review.proposal.eligibility
                 == evertrace_domain::semantic::ProposalEligibility::AutoEligibleFull
+            || review.reauthorization.is_some()
             || !proposal_payload_edit_supported(&review.proposal.payload)
         {
             return Err("atomic_edit_and_accept_unavailable");
@@ -1429,6 +1433,11 @@ fn proposal_action(
             Some(review.clone())
         }
         evertrace_protocol::dto::ProposalHumanDecision::EditAndAccept => return None,
+        evertrace_protocol::dto::ProposalHumanDecision::Reauthorize => {
+            let review = current_proposal_review(state)?;
+            review.reauthorization.as_ref()?;
+            Some(review.clone())
+        }
         evertrace_protocol::dto::ProposalHumanDecision::Defer
         | evertrace_protocol::dto::ProposalHumanDecision::Reject => None,
     };
@@ -1655,6 +1664,9 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
             evertrace_protocol::dto::ProposalHumanDecision::Reject => "reject proposal",
             evertrace_protocol::dto::ProposalHumanDecision::EditAndAccept => {
                 "edit and accept proposal"
+            }
+            evertrace_protocol::dto::ProposalHumanDecision::Reauthorize => {
+                "re-authorize forgotten object"
             }
         },
         HumanActionRequest::SupportReplacement { .. } => "submit support replacement",
@@ -2183,6 +2195,7 @@ mod tests {
             proposal: Box::new(reviewed.clone()),
             plain_accept_eligible: true,
             merge_and_accept_eligible: false,
+            reauthorization: None,
         });
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
@@ -2502,6 +2515,7 @@ mod tests {
             proposal: Box::new(merge.clone()),
             plain_accept_eligible: false,
             merge_and_accept_eligible: true,
+            reauthorization: None,
         });
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
             frontier: 10,

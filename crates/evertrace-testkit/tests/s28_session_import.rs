@@ -13,7 +13,7 @@ use evertrace_engine::{
     SessionImportBudget, SessionImportWorker, open_writer,
     repository::observe_session_catalog_report,
     session_import::{
-        AgentMemoryMigrationService, SessionCatalogService, SessionImportAdminAction,
+        FrozenMemoryExportMigrationService, SessionCatalogService, SessionImportAdminAction,
         SessionImportAdminOutcome, SessionImportAdminService,
     },
     spawn_writer,
@@ -54,7 +54,7 @@ fn runtime(root: &std::path::Path) -> RuntimeSnapshot {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agentmemory_export_maps_to_l0_pending_proposal_and_provenance() {
+async fn frozen_memory_export_maps_to_l0_pending_proposal_and_provenance() {
     let temp = TempDir::new().unwrap();
     DeviceKeyStore::new(temp.path().join("keys"))
         .load_or_create()
@@ -62,7 +62,8 @@ async fn agentmemory_export_maps_to_l0_pending_proposal_and_provenance() {
     let data_dir = temp.path().join("data");
     let writer = open_writer(&data_dir).await.unwrap();
     let (handle, task) = spawn_writer(writer, 32).unwrap();
-    let service = AgentMemoryMigrationService::new(handle.clone(), runtime(temp.path())).unwrap();
+    let service =
+        FrozenMemoryExportMigrationService::new(handle.clone(), runtime(temp.path())).unwrap();
     let export = serde_json::to_vec(&serde_json::json!({
         "version": "0.9.29",
         "exportedAt": "2026-08-30T00:00:00Z",

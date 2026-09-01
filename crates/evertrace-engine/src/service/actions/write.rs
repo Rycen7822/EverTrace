@@ -272,9 +272,13 @@ impl McpActionService {
             .map_err(|_| McpServiceError::Store)?;
         let view =
             SemanticCurrentView::from_snapshot(&snapshot).map_err(|_| McpServiceError::Store)?;
+        let deletion_admission =
+            evertrace_store::ObjectDeletionCandidateAdmissionView::from_snapshot(&snapshot)
+                .map_err(|_| McpServiceError::Store)?;
         let occurred_at_us = unix_time_us_for_mcp();
-        let resolution = RevisionProposalService.submit(
+        let resolution = RevisionProposalService.submit_with_deletion_admission(
             &view,
+            &deletion_admission,
             ProposalCommandContext {
                 command_id: CommandId::new_v7(),
                 occurred_at_us,
@@ -294,7 +298,8 @@ impl McpActionService {
             },
         );
         let (proposal_id, proposal_revision_id, proposal_status) = match resolution {
-            Ok(ProposalResolution::NoDelta) => {
+            Ok(DeletionAwareProposalResolution::FixedSuppression)
+            | Ok(DeletionAwareProposalResolution::Proposal(ProposalResolution::NoDelta)) => {
                 return Ok(McpServiceResult {
                     request_id,
                     status: McpServiceStatus::Ok,
@@ -307,7 +312,10 @@ impl McpActionService {
                     next_refs: Vec::new(),
                 });
             }
-            Ok(ProposalResolution::Revision { value, command }) => {
+            Ok(DeletionAwareProposalResolution::Proposal(ProposalResolution::Revision {
+                value,
+                command,
+            })) => {
                 self.writer
                     .commit(command, occurred_at_us)
                     .await

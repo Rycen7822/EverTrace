@@ -450,6 +450,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             ) => Ok(EngineHumanProposalDecision::EditAndAccept(
                                                 payload,
                                             )),
+                                            (ProposalHumanDecision::Reauthorize, None) => {
+                                                Ok(EngineHumanProposalDecision::Reauthorize)
+                                            }
                                             (ProposalHumanDecision::MergeAndAccept, None) => {
                                                 Ok(EngineHumanProposalDecision::MergeAndAccept)
                                             }
@@ -834,6 +837,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                     proposal: review.proposal,
                     plain_accept_eligible: review.plain_accept_eligible,
                     merge_and_accept_eligible: review.merge_and_accept_eligible,
+                    reauthorization: review.reauthorization,
                 }),
                 support_detail: item.support_detail.map(
                     |EngineHumanSupportDetail {

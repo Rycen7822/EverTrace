@@ -18,6 +18,7 @@
 ## 修改纪律
 
 - 开发前先读取当前 Program slice、其直接依赖和对应 baseline owner；不得把规划路径、合同或 future slice 误报为已实现能力。
+- 外部项目或供应商名称只可用于必须精确识别的来源说明、Source Lock/fixture证据与外部格式边界；EverTrace内部模块、类型、service、协议字段、持久identity和测试命名必须使用EverTrace自有的中性术语，不得让外部项目名成为内部领域命名，也不得为重命名保留新旧双轨兼容层。
 - 严格按 slice 的 owner scope 修改；不得提前实现后续 slice、添加平行抽象、第二套协议或未经要求的兼容层。
 - 长文档只做窄范围、分段修改；不得大规模重写冻结规范、开发 Program、handoff 或研究资料。
 - baseline checker 永远只读；不得在 canonical baseline 中原地重建 metadata。获授权的 baseline 修订必须使用既定 candidate 与事务式发布流程。

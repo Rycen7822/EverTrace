@@ -348,6 +348,14 @@ impl McpActionService {
             .clone()
             .filter(|payload| payload.len() <= 8_192);
         let payload_omitted = payload.is_none();
+        let retained_forgotten_source = retained_forgotten_source(&scope.snapshot, row)?;
+        let mut warnings = payload_omitted
+            .then_some("payload_available_by_local_object_ref".into())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if retained_forgotten_source {
+            warnings.push("source_retained_object_forgotten".into());
+        }
         Ok(McpServiceResult {
             request_id,
             status: McpServiceStatus::Ok,
@@ -360,14 +368,103 @@ impl McpActionService {
                 is_current,
                 unix_time_us_for_mcp(),
             )],
-            warnings: payload_omitted
-                .then_some("payload_available_by_local_object_ref".into())
-                .into_iter()
-                .collect(),
+            warnings,
             truncated: payload_omitted,
             next_refs: Vec::new(),
         })
     }
+}
+
+fn retained_forgotten_source(
+    snapshot: &ProjectionSnapshot,
+    row: &ObjectRow,
+) -> Result<bool, McpServiceError> {
+    let observation_id = match row.object_kind.as_deref() {
+        Some("evidence_surface") => row
+            .payload_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<JournalPayload>(value).ok())
+            .and_then(|payload| match payload {
+                JournalPayload::EvidenceSurfaceRecorded(surface) => {
+                    Some(surface.source_observation_revision_ref)
+                }
+                _ => None,
+            }),
+        Some("source_observation") => row
+            .object_id
+            .as_deref()
+            .and_then(|value| value.parse().ok()),
+        Some("source_receipt") => row
+            .payload_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<JournalPayload>(value).ok())
+            .and_then(|payload| match payload {
+                JournalPayload::SourceReceiptRecorded(receipt) => {
+                    Some(receipt.source_observation_id)
+                }
+                _ => None,
+            }),
+        _ => None,
+    };
+    let Some(observation_id) = observation_id else {
+        return Ok(false);
+    };
+    let mut surface = None;
+    let mut observation = None;
+    let mut receipt = None;
+    for candidate in snapshot.data_rows() {
+        if !matches!(
+            candidate.object_kind.as_deref(),
+            Some("evidence_surface" | "source_observation" | "source_receipt")
+        ) {
+            continue;
+        }
+        let payload = match candidate.payload_json.as_deref() {
+            Some(value) => {
+                serde_json::from_str::<JournalPayload>(value).map_err(|_| McpServiceError::Store)?
+            }
+            None => continue,
+        };
+        match payload {
+            JournalPayload::EvidenceSurfaceRecorded(value)
+                if value.source_observation_revision_ref == observation_id =>
+            {
+                surface = Some(*value);
+            }
+            JournalPayload::SourceObservationRecorded(value)
+                if value.source_observation_id == observation_id =>
+            {
+                observation = Some(*value);
+            }
+            JournalPayload::SourceReceiptRecorded(value)
+                if value.source_observation_id == observation_id =>
+            {
+                receipt = Some(*value);
+            }
+            _ => {}
+        }
+    }
+    let (Some(surface), Some(observation), Some(receipt)) = (surface, observation, receipt) else {
+        return Ok(false);
+    };
+    if observation.source_receipt_ref != receipt.source_receipt_id {
+        return Err(McpServiceError::Store);
+    }
+    let suppressed = ObjectDeletionCurrentView::from_snapshot(snapshot)
+        .map_err(|_| McpServiceError::Store)?
+        .suppression_ref_hashes();
+    for generation in [
+        evertrace_store::DefaultRetrievalSuppressionGeneration::ObservationSpanV1,
+        evertrace_store::DefaultRetrievalSuppressionGeneration::ContentSpanV2,
+    ] {
+        let reference =
+            evertrace_store::default_retrieval_suppression_ref_hash(&surface, &receipt, generation)
+                .map_err(|_| McpServiceError::Store)?;
+        if suppressed.contains(&reference) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl McpActionService {

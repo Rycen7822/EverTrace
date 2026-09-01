@@ -1,10 +1,10 @@
 //! Bounded, host-probe-qualified session catalog reads.
 
-mod agent_memory;
+mod frozen_memory_export;
 
-pub use agent_memory::{
-    AgentMemoryImportError, AgentMemoryImportOutcome, AgentMemoryMigrationService,
-    AgentMemoryProvenance,
+pub use frozen_memory_export::{
+    FrozenMemoryExportImportError, FrozenMemoryExportImportOutcome,
+    FrozenMemoryExportMigrationService, FrozenMemoryExportProvenance,
 };
 
 use std::{
