@@ -26,8 +26,8 @@ use evertrace_domain::{
     revision::RevisionId,
     semantic::{
         AcceptedProposalTarget, Atom, CoreMembershipProposalPayload, EvidenceCompleteness,
-        ParserStatus, ProposalTargetId, ResultEvidence, ResultScope, RevisionProposal,
-        VerifierStatus,
+        ParserStatus, ProposalStatus, ProposalTargetId, ResultEvidence, ResultScope,
+        RevisionProposal, UserAuthorizationMode, VerifierStatus,
     },
     work::{
         ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus, AttemptBindingStatus,
@@ -2150,6 +2150,111 @@ fn atom_deletion_refs(atom: &Atom) -> Vec<String> {
         .collect()
 }
 
+fn atom_guard_source_refs(
+    atom: &Atom,
+    proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+) -> Result<Vec<String>, StoreError> {
+    match (
+        atom.accepted_proposal_id,
+        atom.accepted_proposal_revision_id,
+    ) {
+        (Some(proposal_id), Some(proposal_revision_id)) => {
+            let proposal = exact_accepted_proposal_for_target(
+                proposals,
+                ObjectDeletionTarget::Atom {
+                    atom_id: atom.atom_id,
+                },
+                atom.revision_id,
+            )?;
+            let acceptance = proposal
+                .acceptance
+                .as_ref()
+                .ok_or(StoreError::StoreCorrupt)?;
+            let (_, _, structure_hash) =
+                acceptance.accepted_atom().ok_or(StoreError::StoreCorrupt)?;
+            if proposal.proposal_id != proposal_id
+                || proposal.proposal_revision_id != proposal_revision_id
+                || structure_hash
+                    != atom
+                        .semantic_structure_hash()
+                        .map_err(|_| StoreError::StoreCorrupt)?
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok(proposal.source_cohort_refs.clone())
+        }
+        (None, None) => {
+            if atom
+                .user_authorization_provenance
+                .as_ref()
+                .is_some_and(|value| value.mode == UserAuthorizationMode::TuiAcceptance)
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok(atom
+                .source_observation_refs
+                .iter()
+                .map(ToString::to_string)
+                .chain(atom.evidence_refs.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect())
+        }
+        _ => Err(StoreError::StoreCorrupt),
+    }
+}
+
+fn exact_accepted_proposal_for_target(
+    proposals: &BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    target: ObjectDeletionTarget,
+    revision_id: RevisionId,
+) -> Result<&RevisionProposal, StoreError> {
+    let candidates = proposals
+        .values()
+        .filter_map(|(proposal, _)| {
+            let acceptance = proposal.acceptance.as_ref()?;
+            let matches = match (&acceptance.accepted_target, target) {
+                (
+                    AcceptedProposalTarget::Atom {
+                        atom_id,
+                        atom_revision_id,
+                        ..
+                    },
+                    ObjectDeletionTarget::Atom { atom_id: target_id },
+                ) => *atom_id == target_id && *atom_revision_id == revision_id,
+                (
+                    AcceptedProposalTarget::Procedure {
+                        procedure_id,
+                        procedure_revision_id,
+                        ..
+                    },
+                    ObjectDeletionTarget::Procedure {
+                        procedure_id: target_id,
+                    },
+                ) => *procedure_id == target_id && *procedure_revision_id == revision_id,
+                (
+                    AcceptedProposalTarget::CoreMembership {
+                        core_membership_id,
+                        membership_revision_id,
+                    },
+                    ObjectDeletionTarget::CoreMembership {
+                        core_membership_id: target_id,
+                    },
+                ) => *core_membership_id == target_id && *membership_revision_id == revision_id,
+                _ => false,
+            };
+            matches.then_some(proposal)
+        })
+        .collect::<Vec<_>>();
+    let [proposal] = candidates.as_slice() else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    if proposal.status != ProposalStatus::Accepted {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(proposal)
+}
+
 fn procedure_deletion_refs(revision: &ProcedureRevision) -> Vec<String> {
     revision
         .draft
@@ -2308,85 +2413,100 @@ fn derive_object_deletion_preview_from_inputs(
     if inputs.deletions.current(target).is_some() {
         return Err(StoreError::InvalidInput);
     }
-    let revisions = match target {
+    let (revisions, current_guard_source_refs) = match target {
         ObjectDeletionTarget::Atom { atom_id } => {
-            let current = inputs
+            let current_atom = &inputs
                 .atoms
                 .get(&atom_id)
                 .ok_or(StoreError::InvalidInput)?
-                .0
-                .revision_id;
-            inputs
-                .atom_revisions
-                .values()
-                .filter(|(atom, _)| atom.atom_id == atom_id)
-                .map(|(atom, _)| {
-                    Ok(ObjectDeletionRevisionFact {
-                        revision_id: atom.revision_id,
-                        canonical_payload: hex(&atom
-                            .semantic_structure_hash()
-                            .map_err(|_| StoreError::StoreCorrupt)?),
-                        semantic_kind: serde_json::to_string(&atom.kind)
-                            .map_err(|_| StoreError::Serialization)?,
-                        scope_identity: serde_json::to_string(&atom.scope)
-                            .map_err(|_| StoreError::Serialization)?,
-                        source_derivation_refs: atom_deletion_refs(atom),
-                        current: atom.revision_id == current,
+                .0;
+            let current_guard_source_refs = atom_guard_source_refs(current_atom, inputs.proposals)?;
+            (
+                inputs
+                    .atom_revisions
+                    .values()
+                    .filter(|(atom, _)| atom.atom_id == atom_id)
+                    .map(|(atom, _)| {
+                        Ok(ObjectDeletionRevisionFact {
+                            revision_id: atom.revision_id,
+                            canonical_payload: hex(&atom
+                                .semantic_structure_hash()
+                                .map_err(|_| StoreError::StoreCorrupt)?),
+                            semantic_kind: serde_json::to_string(&atom.kind)
+                                .map_err(|_| StoreError::Serialization)?,
+                            scope_identity: serde_json::to_string(&atom.scope)
+                                .map_err(|_| StoreError::Serialization)?,
+                            source_derivation_refs: atom_deletion_refs(atom),
+                            current: atom.revision_id == current_atom.revision_id,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, StoreError>>()?
+                    .collect::<Result<Vec<_>, StoreError>>()?,
+                current_guard_source_refs,
+            )
         }
         ObjectDeletionTarget::Procedure { procedure_id } => {
             let current = inputs
                 .procedure
                 .current_revision(procedure_id)
-                .ok_or(StoreError::InvalidInput)?
-                .revision_id;
-            inputs
-                .procedure
-                .revisions_for_deletion(procedure_id)
-                .map(|revision| {
-                    Ok(ObjectDeletionRevisionFact {
-                        revision_id: revision.revision_id,
-                        canonical_payload: serde_json::to_string(&revision.draft)
-                            .map_err(|_| StoreError::Serialization)?,
-                        semantic_kind: serde_json::to_string(&revision.draft.kind)
-                            .map_err(|_| StoreError::Serialization)?,
-                        scope_identity: serde_json::to_string(&revision.draft.scope)
-                            .map_err(|_| StoreError::Serialization)?,
-                        source_derivation_refs: procedure_deletion_refs(revision),
-                        current: revision.revision_id == current,
+                .ok_or(StoreError::InvalidInput)?;
+            let proposal =
+                exact_accepted_proposal_for_target(inputs.proposals, target, current.revision_id)?;
+            (
+                inputs
+                    .procedure
+                    .revisions_for_deletion(procedure_id)
+                    .map(|revision| {
+                        Ok(ObjectDeletionRevisionFact {
+                            revision_id: revision.revision_id,
+                            canonical_payload: serde_json::to_string(&revision.draft)
+                                .map_err(|_| StoreError::Serialization)?,
+                            semantic_kind: serde_json::to_string(&revision.draft.kind)
+                                .map_err(|_| StoreError::Serialization)?,
+                            scope_identity: serde_json::to_string(&revision.draft.scope)
+                                .map_err(|_| StoreError::Serialization)?,
+                            source_derivation_refs: procedure_deletion_refs(revision),
+                            current: revision.revision_id == current.revision_id,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, StoreError>>()?
+                    .collect::<Result<Vec<_>, StoreError>>()?,
+                proposal.source_cohort_refs.clone(),
+            )
         }
         ObjectDeletionTarget::CoreMembership { core_membership_id } => {
             let current = inputs
                 .s23
                 .current_membership(core_membership_id)
-                .ok_or(StoreError::InvalidInput)?
-                .membership_revision_id;
-            inputs
-                .s23
-                .memberships_for_deletion(core_membership_id)
-                .map(|membership| {
-                    Ok(ObjectDeletionRevisionFact {
-                        revision_id: membership.membership_revision_id,
-                        canonical_payload: serde_json::to_string(
-                            &CoreMembershipProposalPayload::Create {
-                                atom_revision_id: membership.atom_revision_id,
-                                scope_identity: membership.scope_identity.clone(),
-                            },
-                        )
-                        .map_err(|_| StoreError::Serialization)?,
-                        semantic_kind: "core_membership".into(),
-                        scope_identity: serde_json::to_string(&membership.scope_identity)
+                .ok_or(StoreError::InvalidInput)?;
+            let proposal = exact_accepted_proposal_for_target(
+                inputs.proposals,
+                target,
+                current.membership_revision_id,
+            )?;
+            (
+                inputs
+                    .s23
+                    .memberships_for_deletion(core_membership_id)
+                    .map(|membership| {
+                        Ok(ObjectDeletionRevisionFact {
+                            revision_id: membership.membership_revision_id,
+                            canonical_payload: serde_json::to_string(
+                                &CoreMembershipProposalPayload::Create {
+                                    atom_revision_id: membership.atom_revision_id,
+                                    scope_identity: membership.scope_identity.clone(),
+                                },
+                            )
                             .map_err(|_| StoreError::Serialization)?,
-                        source_derivation_refs: core_membership_deletion_refs(membership),
-                        current: membership.membership_revision_id == current,
+                            semantic_kind: "core_membership".into(),
+                            scope_identity: serde_json::to_string(&membership.scope_identity)
+                                .map_err(|_| StoreError::Serialization)?,
+                            source_derivation_refs: core_membership_deletion_refs(membership),
+                            current: membership.membership_revision_id
+                                == current.membership_revision_id,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, StoreError>>()?
+                    .collect::<Result<Vec<_>, StoreError>>()?,
+                proposal.source_cohort_refs.clone(),
+            )
         }
     };
     let target_revisions = revisions
@@ -2403,6 +2523,7 @@ fn derive_object_deletion_preview_from_inputs(
     derive_object_deletion_preview(
         target,
         revisions,
+        current_guard_source_refs,
         ObjectDeletionSourceContext {
             other_live_source_refs: &other_live_source_refs,
             source_observations: inputs.source_observations,

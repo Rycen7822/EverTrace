@@ -181,6 +181,7 @@ pub fn purged_object_deletion(
 pub(crate) fn derive_object_deletion_preview(
     target: ObjectDeletionTarget,
     mut revisions: Vec<ObjectDeletionRevisionFact>,
+    current_guard_source_refs: Vec<String>,
     source_context: ObjectDeletionSourceContext<'_>,
     downstream_support_impacts: Vec<ObjectDeletionSupportImpact>,
     dependent_procedure_impacts: Vec<ObjectDeletionProcedureImpact>,
@@ -210,25 +211,13 @@ pub(crate) fn derive_object_deletion_preview(
         return Err(StoreError::StoreCorrupt);
     };
     let exact_revision_ids = revisions.iter().map(|fact| fact.revision_id).collect();
-    let canonical_payloads = revisions
-        .iter()
-        .map(|fact| fact.canonical_payload.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut source_derivation_refs = revisions
-        .iter()
-        .flat_map(|fact| fact.source_derivation_refs.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    source_derivation_refs.sort();
+    let source_derivation_refs = historical_source_derivation_refs(&revisions);
     let guards = ObjectDeletionGuards::derive(
         target,
         &current.semantic_kind,
-        &canonical_payloads,
+        std::slice::from_ref(&current.canonical_payload),
         &current.scope_identity,
-        &source_derivation_refs,
+        &current_guard_source_refs,
     )
     .ok_or(StoreError::StoreCorrupt)?;
     if downstream_support_impacts.windows(2).any(|pair| {
@@ -324,6 +313,15 @@ pub(crate) fn derive_object_deletion_preview(
         downstream_support_impacts,
         dependent_procedure_impacts,
     })
+}
+
+fn historical_source_derivation_refs(revisions: &[ObjectDeletionRevisionFact]) -> Vec<String> {
+    revisions
+        .iter()
+        .flat_map(|fact| fact.source_derivation_refs.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -772,4 +770,104 @@ fn require_ledger_row(
         return Err(StoreError::StoreCorrupt);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evertrace_domain::ids::AtomId;
+
+    #[test]
+    fn current_guard_is_singleton_while_history_still_closes() {
+        let target = ObjectDeletionTarget::Atom {
+            atom_id: AtomId::new_v7(),
+        };
+        let old_revision = RevisionId::new_v7();
+        let current_revision = RevisionId::new_v7();
+        let revisions = vec![
+            ObjectDeletionRevisionFact {
+                revision_id: old_revision,
+                canonical_payload: "old-payload".into(),
+                semantic_kind: "old-kind".into(),
+                scope_identity: "old-scope".into(),
+                source_derivation_refs: vec!["old-source".into()],
+                current: false,
+            },
+            ObjectDeletionRevisionFact {
+                revision_id: current_revision,
+                canonical_payload: "current-payload".into(),
+                semantic_kind: "current-kind".into(),
+                scope_identity: "current-scope".into(),
+                source_derivation_refs: vec!["current-source".into()],
+                current: true,
+            },
+        ];
+        assert_eq!(
+            historical_source_derivation_refs(&revisions),
+            vec!["current-source".to_owned(), "old-source".to_owned()]
+        );
+        let empty_observations = BTreeMap::new();
+        let empty_receipts = BTreeMap::new();
+        let empty_surfaces = BTreeMap::new();
+        let preview = derive_object_deletion_preview(
+            target,
+            revisions,
+            vec!["current-source".into()],
+            ObjectDeletionSourceContext {
+                other_live_source_refs: &BTreeSet::new(),
+                source_observations: &empty_observations,
+                source_receipts: &empty_receipts,
+                evidence_surfaces: &empty_surfaces,
+            },
+            Vec::new(),
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        let expected = ObjectDeletionGuards::derive(
+            target,
+            "current-kind",
+            &["current-payload".into()],
+            "current-scope",
+            &["current-source".into()],
+        )
+        .unwrap();
+        let old_aggregate = ObjectDeletionGuards::derive(
+            target,
+            "current-kind",
+            &["current-payload".into(), "old-payload".into()],
+            "current-scope",
+            &["current-source".into(), "old-source".into()],
+        )
+        .unwrap();
+        let rewritten_payload_same_source = ObjectDeletionGuards::derive(
+            target,
+            "current-kind",
+            &["rewritten-payload".into()],
+            "current-scope",
+            &["current-source".into()],
+        )
+        .unwrap();
+        let changed_cohort = ObjectDeletionGuards::derive(
+            target,
+            "current-kind",
+            &["current-payload".into()],
+            "current-scope",
+            &["different-source".into()],
+        )
+        .unwrap();
+        assert_eq!(preview.guards, expected);
+        assert_ne!(preview.guards, old_aggregate);
+        assert_eq!(
+            preview.guards.source_derivation_guard_hash,
+            rewritten_payload_same_source.source_derivation_guard_hash
+        );
+        assert_ne!(
+            preview.guards.source_derivation_guard_hash,
+            changed_cohort.source_derivation_guard_hash
+        );
+        let mut expected_revisions = vec![old_revision, current_revision];
+        expected_revisions.sort();
+        assert_eq!(preview.exact_revision_ids, expected_revisions);
+    }
 }

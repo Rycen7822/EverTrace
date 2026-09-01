@@ -61,6 +61,23 @@ fn proposal_visible(snapshot: &ProjectionSnapshot, proposal_id: RevisionProposal
     })
 }
 
+fn expected_source_guard(
+    target: ObjectDeletionTarget,
+    semantic_kind: &str,
+    scope_identity: &str,
+    source_cohort_refs: &[String],
+) -> String {
+    ObjectDeletionGuards::derive(
+        target,
+        semantic_kind,
+        &["candidate-payload".into()],
+        scope_identity,
+        source_cohort_refs,
+    )
+    .unwrap()
+    .source_derivation_guard_hash
+}
+
 fn runtime_snapshot(root: &Path) -> RuntimeSnapshot {
     let limits = SpoolLimits {
         high_watermark_bytes: 2 * 1024 * 1024,
@@ -768,6 +785,15 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
     };
     let core_snapshot = handle.project().await.unwrap();
     let core_preview = object_deletion_preview(&core_snapshot, core_target).unwrap();
+    assert_eq!(
+        core_preview.guards.source_derivation_guard_hash,
+        expected_source_guard(
+            core_target,
+            "core_membership",
+            &serde_json::to_string(&CoreScopeIdentity::Repository(repository_id)).unwrap(),
+            &core_proposal.source_cohort_refs,
+        )
+    );
     let core_request = RequestId::new_v7();
     let core_result = service
         .forget_object(
@@ -831,6 +857,15 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
         vec![target_atom.atom_id]
     );
     let atom_preview = object_deletion_preview(&before_pending, atom_target).unwrap();
+    assert_eq!(
+        atom_preview.guards.source_derivation_guard_hash,
+        expected_source_guard(
+            atom_target,
+            &serde_json::to_string(&target_atom.kind).unwrap(),
+            &serde_json::to_string(&target_atom.scope).unwrap(),
+            &target_proposal.source_cohort_refs,
+        )
+    );
     assert_eq!(atom_preview.shared_source_count, 1);
     assert_eq!(atom_preview.suppressed_source_count, 2);
     assert_eq!(atom_preview.suppression_ref_count, 4);
@@ -1150,6 +1185,18 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
     ));
     let current = handle.project().await.unwrap();
     let procedure_preview = object_deletion_preview(&current, procedure_target).unwrap();
+    let ProposalPayload::Procedure(procedure_payload) = &procedure_proposal.payload else {
+        panic!("procedure proposal expected")
+    };
+    assert_eq!(
+        procedure_preview.guards.source_derivation_guard_hash,
+        expected_source_guard(
+            procedure_target,
+            &serde_json::to_string(&procedure_payload.draft().kind).unwrap(),
+            &serde_json::to_string(&procedure_payload.draft().scope).unwrap(),
+            &procedure_proposal.source_cohort_refs,
+        )
+    );
     assert!(matches!(
         restarted_service
             .forget_object(
