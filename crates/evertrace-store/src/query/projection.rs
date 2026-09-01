@@ -577,6 +577,36 @@ pub fn derive_l0002_projections(
         }
     }
 
+    let available_atom_revisions = atoms.keys().copied().collect::<BTreeSet<_>>();
+    let available_procedure_revisions = procedures.keys().copied().collect::<BTreeSet<_>>();
+    let relation_atoms = all_values(&atoms)
+        .into_iter()
+        .map(|mut atom| {
+            atom.parent_revision_id = atom
+                .parent_revision_id
+                .filter(|revision| available_atom_revisions.contains(revision));
+            atom.supersedes_revision_refs
+                .retain(|revision| available_atom_revisions.contains(revision));
+            atom.supports_revision_refs
+                .retain(|revision| available_atom_revisions.contains(revision));
+            atom.contradicts_revision_refs
+                .retain(|revision| available_atom_revisions.contains(revision));
+            atom
+        })
+        .collect::<Vec<_>>();
+    let relation_procedures = all_values(&procedures)
+        .into_iter()
+        .map(|mut procedure| {
+            procedure.parent_revision_id = procedure
+                .parent_revision_id
+                .filter(|revision| available_procedure_revisions.contains(revision));
+            procedure
+                .draft
+                .support_revision_refs
+                .retain(|revision| available_atom_revisions.contains(revision));
+            procedure
+        })
+        .collect::<Vec<_>>();
     let mut relations = BTreeSet::new();
     add_physical(
         &mut relations,
@@ -661,7 +691,7 @@ pub fn derive_l0002_projections(
     );
     add_semantic(
         &mut relations,
-        build_semantic_relation_rows(&all_values(&atoms), &all_values(&proposals))?,
+        build_semantic_relation_rows(&relation_atoms, &all_values(&proposals))?,
         &endpoint_seqs,
     );
     add_semantic(
@@ -676,7 +706,7 @@ pub fn derive_l0002_projections(
     );
     add_semantic(
         &mut relations,
-        build_procedure_relation_rows(&all_values(&procedures), &all_values(&atoms))?,
+        build_procedure_relation_rows(&relation_procedures, &relation_atoms)?,
         &endpoint_seqs,
     );
     add_semantic(

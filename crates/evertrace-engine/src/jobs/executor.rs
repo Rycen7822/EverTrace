@@ -1,9 +1,13 @@
 use evertrace_store::{
-    CommitOutcome, CommittedCommand, JournalCommand, JournalWriter, ProjectionSnapshot,
-    RecallCurrentContext, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
-    ReconciliationFrontier, StoreError,
+    CommitOutcome, CommittedCommand, JobStatus, JournalCommand, JournalWriter,
+    ObjectDeletionCurrentView, ProjectionSnapshot, RecallCurrentContext,
+    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
+    RuntimeSchedulerView, StoreError,
 };
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -201,12 +205,12 @@ pub fn spawn_writer(
     let (sender, receiver) = mpsc::channel(capacity);
     let (recall_frontier, _) = watch::channel(frontier);
     let (background_frontier, _) = watch::channel(frontier);
-    let task = tokio::spawn(run_writer(
+    let task = tokio::spawn(Box::pin(run_writer(
         writer,
         receiver,
         recall_frontier.clone(),
         background_frontier.clone(),
-    ));
+    )));
     Ok((
         WriterHandle {
             sender,
@@ -223,6 +227,10 @@ async fn run_writer(
     recall_frontier: watch::Sender<u64>,
     background_frontier: watch::Sender<u64>,
 ) -> Result<(), WriterActorError> {
+    if let Some(frontier) = Box::pin(reconcile_object_deletions(&mut writer)).await? {
+        recall_frontier.send_replace(frontier);
+        background_frontier.send_replace(frontier);
+    }
     let mut shutdown_replies = Vec::new();
     while let Some(request) = receiver.recv().await {
         match request {
@@ -251,6 +259,7 @@ async fn run_writer(
                         WriterActorError::Store | WriterActorError::StoreCorrupt
                     )
                 });
+                let reconcile = result.is_ok() && object_deletion_relevant(&command);
                 let _ = reply.send(result);
                 if let Some(frontier) = notify {
                     recall_frontier.send_replace(frontier);
@@ -260,6 +269,13 @@ async fn run_writer(
                 }
                 if let Some(error) = fatal {
                     return Err(error);
+                }
+                if reconcile
+                    && let Some(frontier) =
+                        Box::pin(reconcile_object_deletions(&mut writer)).await?
+                {
+                    recall_frontier.send_replace(frontier);
+                    background_frontier.send_replace(frontier);
                 }
             }
             WriterRequest::CommitIfFrontier {
@@ -288,6 +304,7 @@ async fn run_writer(
                         WriterActorError::Store | WriterActorError::StoreCorrupt
                     )
                 });
+                let reconcile = result.is_ok() && object_deletion_relevant(&command);
                 let _ = reply.send(result);
                 if let Some(frontier) = notify {
                     recall_frontier.send_replace(frontier);
@@ -297,6 +314,13 @@ async fn run_writer(
                 }
                 if let Some(error) = fatal {
                     return Err(error);
+                }
+                if reconcile
+                    && let Some(frontier) =
+                        Box::pin(reconcile_object_deletions(&mut writer)).await?
+                {
+                    recall_frontier.send_replace(frontier);
+                    background_frontier.send_replace(frontier);
                 }
             }
             WriterRequest::Project { reply } => {
@@ -372,6 +396,50 @@ async fn run_writer(
     Ok(())
 }
 
+async fn reconcile_object_deletions(
+    writer: &mut JournalWriter,
+) -> Result<Option<u64>, WriterActorError> {
+    let mut completed_frontier = None;
+    loop {
+        let snapshot = writer.project().await.map_err(map_store_error)?;
+        let ledger =
+            ObjectDeletionCurrentView::from_snapshot(&snapshot).map_err(map_store_error)?;
+        let Some(pending) = ledger
+            .events
+            .values()
+            .find(|event| event.phase == evertrace_domain::purge::ObjectDeletionPhase::Pending)
+            .cloned()
+        else {
+            return Ok(completed_frontier);
+        };
+        let runtime = RuntimeSchedulerView::from_snapshot(&snapshot).map_err(map_store_error)?;
+        let job = runtime
+            .jobs
+            .iter()
+            .find(|job| job.job_id == pending.purge_job_id)
+            .filter(|job| job.state == JobStatus::Queued)
+            .ok_or(WriterActorError::StoreCorrupt)?;
+        let occurred_at_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+            .ok_or(WriterActorError::Store)?;
+        let command = crate::purge::complete_object_forget_command(
+            evertrace_domain::ids::CommandId::new_v7(),
+            &pending,
+            job,
+            occurred_at_us,
+            job.config_hash,
+        )
+        .map_err(map_store_error)?;
+        let outcome = writer
+            .commit_if_frontier(&command, occurred_at_us, snapshot.frontier)
+            .await
+            .map_err(map_store_error)?;
+        completed_frontier = Some(outcome.last_seq);
+    }
+}
+
 fn recall_relevant(command: &JournalCommand) -> bool {
     command.events().iter().any(|event| {
         matches!(
@@ -399,6 +467,16 @@ fn background_relevant(command: &JournalCommand) -> bool {
                 | evertrace_store::JournalPayload::WorkEpisodeRecorded(_)
                 | evertrace_store::JournalPayload::WorkCheckpointRecorded(_)
                 | evertrace_store::JournalPayload::SessionImportEventRecorded(_)
+        )
+    })
+}
+
+fn object_deletion_relevant(command: &JournalCommand) -> bool {
+    command.events().iter().any(|event| {
+        matches!(
+            &event.payload,
+            evertrace_store::JournalPayload::ObjectDeletionLedgerRecorded(value)
+                if value.phase == evertrace_domain::purge::ObjectDeletionPhase::Pending
         )
     })
 }

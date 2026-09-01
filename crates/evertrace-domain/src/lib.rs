@@ -9,6 +9,7 @@ pub mod error;
 pub mod evidence;
 pub mod ids;
 pub mod procedure;
+pub mod purge;
 pub mod query;
 pub mod recall;
 pub mod repository;

@@ -31,10 +31,7 @@ impl McpActionService {
             task_id: scope.anchor.task_id,
             repository_id: scope.anchor.repository_id,
             worktree_id: scope.anchor.worktree_id,
-            suppression: SuppressionSnapshot::Current {
-                generation: PRE_DELETION_SUPPRESSION_GENERATION,
-                ref_hashes: BTreeSet::new(),
-            },
+            suppression: deletion_suppression(&scope.snapshot)?,
             budget: RetrievalBudget {
                 candidates_remaining: 3,
                 tokens_remaining: 1_200,
@@ -424,10 +421,7 @@ impl McpActionService {
                 task_id: scope.anchor.task_id,
                 repository_id: scope.anchor.repository_id,
                 worktree_id: scope.anchor.worktree_id,
-                suppression: SuppressionSnapshot::Current {
-                    generation: PRE_DELETION_SUPPRESSION_GENERATION,
-                    ref_hashes: BTreeSet::new(),
-                },
+                suppression: deletion_suppression(&scope.snapshot)?,
                 budget: RetrievalBudget {
                     candidates_remaining: 2,
                     tokens_remaining: 600,
@@ -480,6 +474,17 @@ impl McpActionService {
             next_refs,
         })
     }
+}
+
+fn deletion_suppression(
+    snapshot: &ProjectionSnapshot,
+) -> Result<SuppressionSnapshot, McpServiceError> {
+    let ledger =
+        ObjectDeletionCurrentView::from_snapshot(snapshot).map_err(|_| McpServiceError::Store)?;
+    Ok(SuppressionSnapshot::Current {
+        generation: ledger.generation,
+        ref_hashes: ledger.suppression_ref_hashes(),
+    })
 }
 
 fn recall_retrieval_command(

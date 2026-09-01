@@ -223,6 +223,30 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
             "[/] choose; c stages selected winner; Enter confirms; Esc cancels".into(),
         ]);
     }
+    if let Some(preview) = &item.forget_preview {
+        lines.extend([
+            format!("forget target: {:?}", preview.target),
+            format!("current revision: {}", preview.current_revision_id),
+            format!(
+                "closure: {} revision(s), deletion generation {}",
+                preview.exact_revision_ids.len(),
+                preview.deletion_generation
+            ),
+            format!(
+                "sources: {} shared retained, {} source(s) / {} span key(s) suppressed",
+                preview.shared_source_count,
+                preview.suppressed_source_count,
+                preview.suppression_ref_count
+            ),
+            format!(
+                "dependency fence: {} support revalidation, {} procedure review-hold",
+                preview.downstream_support_revalidation_count,
+                preview.dependent_procedure_review_hold_count
+            ),
+            "Shared source/Evidence is retained by default; this is not source erasure.".into(),
+            "F stages human-only Forget; Enter confirms once; Esc cancels".into(),
+        ]);
+    }
     if let Some(review) = &item.negative_review {
         lines.extend([
             format!("negative evidence: {}", review.negative_evidence_id),

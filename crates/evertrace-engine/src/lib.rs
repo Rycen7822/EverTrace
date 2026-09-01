@@ -11,6 +11,7 @@ pub mod maintenance;
 pub mod normalize;
 pub mod procedure;
 pub mod provider;
+pub mod purge;
 pub mod recall;
 pub mod recovery;
 pub mod repository;
@@ -37,13 +38,13 @@ pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};
 pub use recovery::*;
 pub use service::{
     EngineError, EngineService, HealthDispatchError, HealthSnapshot, HumanActionOutcome,
-    HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail, HumanGovernanceError,
-    HumanGovernanceService, HumanItemCategory, HumanJobBudget, HumanJobDetail, HumanJobState,
-    HumanJobTerminalReason, HumanNegativeDecision, HumanObjectFamily, HumanPage,
-    HumanProposalDecision, HumanProposalReview, HumanRecoveryDetail, HumanRelatedRequest,
-    HumanRelationKind, HumanRowClass, HumanSnapshotStatus, HumanSummary, HumanSupportDetail,
-    HumanSurface, HumanSystemDetail, McpActionService, McpBindingAuthority, McpBindingError,
-    McpBindingGrant, McpBindingIssue, McpItemPartition, McpResolvedScope, McpScopeMechanism,
-    McpServiceAction, McpServiceError, McpServiceItem, McpServiceRequest, McpServiceResult,
-    McpServiceStatus, RuntimeMode,
+    HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail, HumanForgetPreview,
+    HumanGovernanceError, HumanGovernanceService, HumanItemCategory, HumanJobBudget,
+    HumanJobDetail, HumanJobState, HumanJobTerminalReason, HumanNegativeDecision,
+    HumanObjectFamily, HumanPage, HumanProposalDecision, HumanProposalReview, HumanRecoveryDetail,
+    HumanRelatedRequest, HumanRelationKind, HumanRowClass, HumanSnapshotStatus, HumanSummary,
+    HumanSupportDetail, HumanSurface, HumanSystemDetail, McpActionService, McpBindingAuthority,
+    McpBindingError, McpBindingGrant, McpBindingIssue, McpItemPartition, McpResolvedScope,
+    McpScopeMechanism, McpServiceAction, McpServiceError, McpServiceItem, McpServiceRequest,
+    McpServiceResult, McpServiceStatus, RuntimeMode,
 };

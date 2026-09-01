@@ -1313,6 +1313,38 @@ pub fn review_procedure_negative(
     JournalCommand::new(context.command_id, events).map_err(SemanticServiceError::Store)
 }
 
+pub(crate) fn mark_procedure_support_review_hold(
+    impact: &evertrace_store::ObjectDeletionProcedureImpact,
+    occurred_at_us: i64,
+) -> Result<JournalPayload, SemanticServiceError> {
+    let current = &impact.current_state;
+    if !matches!(
+        current.to_state,
+        ProcedurePublicationState::ActiveProbationary | ProcedurePublicationState::ActiveStable
+    ) || impact.trigger_refs.is_empty()
+        || impact
+            .trigger_refs
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    let event = ProcedureStateEvent {
+        state_event_id: RevisionId::new_v7(),
+        procedure_revision_id: current.procedure_revision_id,
+        from_state: Some(current.to_state),
+        to_state: ProcedurePublicationState::ReviewHold,
+        reason: ProcedureStateReason::SupportPending,
+        resume_state: Some(current.to_state),
+        evidence_refs: impact.trigger_refs.clone(),
+        created_at_us: occurred_at_us,
+    };
+    event
+        .validate()
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+    Ok(JournalPayload::ProcedureStateRecorded(Box::new(event)))
+}
+
 #[derive(Debug)]
 pub enum ProcedureRevisionRequestResolution {
     NoDelta {

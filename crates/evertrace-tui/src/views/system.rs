@@ -5,7 +5,7 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
     let mut body = crate::views::page_body(state, "No current system projection facts");
     if !in_detail {
         body.push_str(
-            "\nForget/purge: unavailable (S32)\nBackup/restore/GC: offline CLI or unavailable (S33)\nConfiguration write: unavailable",
+            "\nObject Forget: available in Explorer\nRepository/session purge: unavailable\nBackup/restore/GC: offline CLI or unavailable (S33)\nConfiguration write: unavailable",
         );
     }
     f.render_widget(

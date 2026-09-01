@@ -16,8 +16,8 @@ use evertrace_domain::{
         SourceRevisionMode, SourceRole, hex, payload_fingerprint,
     },
     ids::{
-        AttemptId, CaptureReceiptId, CommandId, ExecutionLaneId, JobId,
-        ProcedureNegativeEvidenceId, RecoveryApplicationId, RecoveryBundleId,
+        AtomId, AttemptId, CaptureReceiptId, CommandId, CoreMembershipId, ExecutionLaneId, JobId,
+        ProcedureId, ProcedureNegativeEvidenceId, RecoveryApplicationId, RecoveryBundleId,
         RecoveryCaptureRequestId, RepositoryId, RequestId, RevisionProposalId, WorktreeId,
         WorktreeSnapshotId,
     },
@@ -25,6 +25,7 @@ use evertrace_domain::{
         ProcedureNegativeReviewEvent, ProcedureNegativeReviewStatus, ProcedurePublicationState,
         ProcedureScope,
     },
+    purge::ObjectDeletionTarget,
     repository::{
         DestructiveClass, GitRegistrationState, LineageAssessment,
         OrderingIntegrity as RecoveryOrderingIntegrity, RecoveryApplicationKind,
@@ -64,6 +65,7 @@ use crate::{
         ProcedureUsageCurrentView, accept_procedure, accept_procedure_edited,
         request_procedure_revision, review_procedure_negative,
     },
+    purge::{ObjectForgetLookup, pending_object_forget_command, select_object_forget},
     semantic::{
         AtomAcceptanceContext, CoreMembershipAcceptanceContext, ProposalCommandContext,
         ProposalResolution, RevisionProposalService, SubmitProposalRequest, SupportAtomAcceptance,
@@ -213,6 +215,7 @@ pub struct HumanSummary {
     pub proposal_review: Option<HumanProposalReview>,
     pub support_detail: Option<HumanSupportDetail>,
     pub competing_detail: Option<HumanCompetingDetail>,
+    pub forget_preview: Option<Box<HumanForgetPreview>>,
     pub negative_review: Option<HumanNegativeReviewSummary>,
     pub recovery_detail: Option<HumanRecoveryDetail>,
     pub worktree_detail: Option<HumanWorktreeDetail>,
@@ -463,6 +466,19 @@ pub struct HumanSupportDetail {
 pub struct HumanCompetingDetail {
     pub expected_group_revision_id: RevisionId,
     pub eligible_attempt_ids: Vec<AttemptId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanForgetPreview {
+    pub target: ObjectDeletionTarget,
+    pub current_revision_id: RevisionId,
+    pub exact_revision_ids: Vec<RevisionId>,
+    pub deletion_generation: u64,
+    pub shared_source_count: u32,
+    pub suppressed_source_count: u32,
+    pub suppression_ref_count: u32,
+    pub downstream_support_revalidation_count: u32,
+    pub dependent_procedure_review_hold_count: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2213,6 +2229,140 @@ impl HumanGovernanceService {
         })
     }
 
+    pub async fn forget_object(
+        &self,
+        request_id: RequestId,
+        expected_frontier: u64,
+        target: ObjectDeletionTarget,
+        expected_revision_ids: Vec<RevisionId>,
+        expected_deletion_generation: u64,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        if let Some(committed) = self
+            .writer
+            .committed_command(command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            let matches = committed
+                .payloads
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, payload)| match payload {
+                    JournalPayload::ObjectDeletionLedgerRecorded(event)
+                        if event.phase == evertrace_domain::purge::ObjectDeletionPhase::Pending
+                            && event.target == target
+                            && event.exact_revision_ids == expected_revision_ids
+                            && event.deletion_generation == expected_deletion_generation =>
+                    {
+                        Some((ordinal, event))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [(ordinal, event)] = matches.as_slice() else {
+                return Err(HumanGovernanceError::Store);
+            };
+            return Ok(HumanActionOutcome::Applied {
+                current_revision_ref: deletion_revision_ref(event),
+                audit_event_ref: committed
+                    .event_ids
+                    .get(*ordinal)
+                    .cloned()
+                    .ok_or(HumanGovernanceError::Store)?,
+            });
+        }
+        let snapshot = self
+            .writer
+            .project()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != expected_frontier {
+            return Ok(HumanActionOutcome::Conflict {
+                current_revision_ref: current_object_deletion_revision(&snapshot, target),
+            });
+        }
+        let preview = match select_object_forget(&snapshot, target)
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            ObjectForgetLookup::Available(preview) => preview,
+            ObjectForgetLookup::NoDelta(event) => {
+                return Ok(HumanActionOutcome::NoDelta {
+                    current_revision_ref: deletion_revision_ref(&event),
+                });
+            }
+            ObjectForgetLookup::Unavailable => {
+                return Ok(HumanActionOutcome::Unavailable {
+                    reason: "object_forget_unavailable",
+                });
+            }
+        };
+        if preview.exact_revision_ids != expected_revision_ids
+            || preview.deletion_generation != expected_deletion_generation
+        {
+            return Ok(HumanActionOutcome::Conflict {
+                current_revision_ref: Some(preview.current_revision_id.to_string()),
+            });
+        }
+        let occurred_at_us = now_us()?;
+        let command = pending_object_forget_command(
+            request_id,
+            &preview,
+            &expected_revision_ids,
+            expected_deletion_generation,
+            occurred_at_us,
+            snapshot.frontier,
+            self.effective_config_hash,
+        )
+        .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let ordinals = command
+            .events()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, event)| {
+                matches!(
+                    &event.payload,
+                    JournalPayload::ObjectDeletionLedgerRecorded(value)
+                        if value.target == target
+                            && value.phase
+                                == evertrace_domain::purge::ObjectDeletionPhase::Pending
+                )
+                .then_some(ordinal)
+            })
+            .collect::<Vec<_>>();
+        let [audit_ordinal] = ordinals.as_slice() else {
+            return Err(HumanGovernanceError::Store);
+        };
+        let outcome = match self
+            .writer
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(crate::WriterActorError::StaleFrontier) => {
+                let latest = self
+                    .writer
+                    .project()
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                return Ok(HumanActionOutcome::Conflict {
+                    current_revision_ref: current_object_deletion_revision(&latest, target),
+                });
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        };
+        let audit_event_ref = outcome
+            .event_ids
+            .get(*audit_ordinal)
+            .cloned()
+            .ok_or(HumanGovernanceError::Store)?;
+        Ok(HumanActionOutcome::Applied {
+            current_revision_ref: format!("deletion-generation-{expected_deletion_generation}"),
+            audit_event_ref,
+        })
+    }
+
     pub async fn review_negative(
         &self,
         request_id: RequestId,
@@ -3035,6 +3185,42 @@ fn summary(
         } else {
             None
         };
+    let forget_preview = if include_detail && surface == HumanSurface::Explorer {
+        forget_target(row)?
+            .map(|target| {
+                let lookup = select_object_forget(snapshot, target)
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                let ObjectForgetLookup::Available(preview) = lookup else {
+                    return Ok(None);
+                };
+                if row.current_revision_id.as_deref()
+                    != Some(preview.current_revision_id.to_string().as_str())
+                {
+                    return Ok(None);
+                }
+                Ok(Some(Box::new(HumanForgetPreview {
+                    target: preview.target,
+                    current_revision_id: preview.current_revision_id,
+                    exact_revision_ids: preview.exact_revision_ids,
+                    deletion_generation: preview.deletion_generation,
+                    shared_source_count: preview.shared_source_count,
+                    suppressed_source_count: preview.suppressed_source_count,
+                    suppression_ref_count: preview.suppression_ref_count,
+                    downstream_support_revalidation_count: u32::try_from(
+                        preview.downstream_support_impacts.len(),
+                    )
+                    .map_err(|_| HumanGovernanceError::Store)?,
+                    dependent_procedure_review_hold_count: u32::try_from(
+                        preview.dependent_procedure_impacts.len(),
+                    )
+                    .map_err(|_| HumanGovernanceError::Store)?,
+                })))
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let negative_review = if row.object_kind.as_deref() == Some("procedure_negative_review") {
         let payload: JournalPayload = serde_json::from_str(
             row.payload_json
@@ -3088,6 +3274,7 @@ fn summary(
         proposal_review,
         support_detail,
         competing_detail,
+        forget_preview,
         negative_review,
         recovery_detail,
         worktree_detail,
@@ -3117,6 +3304,32 @@ fn summary(
             .or_else(|| row.session_id.clone()),
         source_event_seq: row.source_event_seq,
     })
+}
+
+fn forget_target(row: &ObjectRow) -> Result<Option<ObjectDeletionTarget>, HumanGovernanceError> {
+    if row.row_class != Some(ObjectRowClass::Object) {
+        return Ok(None);
+    }
+    let Some(object_ref) = row.object_id.as_deref() else {
+        return Ok(None);
+    };
+    match row.object_kind.as_deref() {
+        Some("atom_revision") => object_ref
+            .parse::<AtomId>()
+            .map(|atom_id| Some(ObjectDeletionTarget::Atom { atom_id }))
+            .map_err(|_| HumanGovernanceError::Store),
+        Some("procedure_revision") => object_ref
+            .parse::<ProcedureId>()
+            .map(|procedure_id| Some(ObjectDeletionTarget::Procedure { procedure_id }))
+            .map_err(|_| HumanGovernanceError::Store),
+        Some("core_membership") => object_ref
+            .parse::<CoreMembershipId>()
+            .map(|core_membership_id| {
+                Some(ObjectDeletionTarget::CoreMembership { core_membership_id })
+            })
+            .map_err(|_| HumanGovernanceError::Store),
+        _ => Ok(None),
+    }
 }
 
 fn proposal_acceptance_eligibility(
@@ -4455,6 +4668,21 @@ fn current_attempt_revision(
         } => Some(current_revision_id.to_string()),
         MarkNewAttemptLookup::Available { source } => Some(source.revision_id.to_string()),
         MarkNewAttemptLookup::Unavailable { .. } => Some(expected_revision_id.to_string()),
+    }
+}
+
+fn deletion_revision_ref(event: &evertrace_domain::purge::ObjectDeletionLedgerEvent) -> String {
+    format!("deletion-generation-{}", event.deletion_generation)
+}
+
+fn current_object_deletion_revision(
+    snapshot: &ProjectionSnapshot,
+    target: ObjectDeletionTarget,
+) -> Option<String> {
+    match select_object_forget(snapshot, target).ok()? {
+        ObjectForgetLookup::Available(preview) => Some(preview.current_revision_id.to_string()),
+        ObjectForgetLookup::NoDelta(event) => Some(deletion_revision_ref(&event)),
+        ObjectForgetLookup::Unavailable => None,
     }
 }
 

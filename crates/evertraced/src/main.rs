@@ -7,10 +7,10 @@ use evertrace_engine::{
     BackgroundScheduler, EngineService, HealthDispatchError,
     HumanActionOutcome as EngineHumanActionOutcome,
     HumanCompetingDetail as EngineHumanCompetingDetail,
-    HumanExecutionIntegrityDetail as EngineHumanExecutionIntegrityDetail, HumanGovernanceError,
-    HumanGovernanceService, HumanItemCategory as EngineHumanItemCategory,
-    HumanJobDetail as EngineHumanJobDetail, HumanJobState as EngineHumanJobState,
-    HumanJobTerminalReason as EngineHumanJobTerminalReason,
+    HumanExecutionIntegrityDetail as EngineHumanExecutionIntegrityDetail,
+    HumanForgetPreview as EngineHumanForgetPreview, HumanGovernanceError, HumanGovernanceService,
+    HumanItemCategory as EngineHumanItemCategory, HumanJobDetail as EngineHumanJobDetail,
+    HumanJobState as EngineHumanJobState, HumanJobTerminalReason as EngineHumanJobTerminalReason,
     HumanNegativeDecision as EngineHumanNegativeDecision,
     HumanObjectFamily as EngineHumanObjectFamily,
     HumanProposalDecision as EngineHumanProposalDecision,
@@ -37,8 +37,8 @@ use evertrace_protocol::{
     dto::{
         ClientKind, HealthMode, HumanActionRequest, HumanActionResult, HumanActionStatus,
         HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail,
-        HumanGovernanceRequest, HumanGovernanceResponse, HumanItemCategory, HumanItemKind,
-        HumanJobBudget, HumanJobDetail, HumanJobState, HumanJobTerminalReason,
+        HumanForgetPreview, HumanGovernanceRequest, HumanGovernanceResponse, HumanItemCategory,
+        HumanItemKind, HumanJobBudget, HumanJobDetail, HumanJobState, HumanJobTerminalReason,
         HumanNegativeReviewMetadata, HumanObjectFamily, HumanProposalMetadata, HumanProposalReview,
         HumanReadRequest, HumanRecoveryDetail, HumanRecoveryOmissionCount, HumanRelationKind,
         HumanRowClass, HumanSnapshotItem, HumanSnapshotStatus, HumanSupportDetail, HumanSurface,
@@ -556,6 +556,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             )
                                             .await
                                     }
+                                    HumanActionRequest::ForgetObject {
+                                        target,
+                                        expected_revision_ids,
+                                        expected_deletion_generation,
+                                    } => {
+                                        human_governance
+                                            .forget_object(
+                                                request_id,
+                                                expected_frontier,
+                                                target,
+                                                expected_revision_ids,
+                                                expected_deletion_generation,
+                                            )
+                                            .await
+                                    }
                                     HumanActionRequest::Unavailable { action } => {
                                         Ok(EngineHumanActionOutcome::Unavailable {
                                             reason: match action {
@@ -564,7 +579,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                                 evertrace_protocol::dto::HumanUnavailableAction::LaneCorrection => "lane_correction_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::ResumeCorrection => "resume_correction_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::LineageCorrection => "lineage_correction_unavailable",
-                                                evertrace_protocol::dto::HumanUnavailableAction::ForgetOrPurge => "future_s32",
+                                                evertrace_protocol::dto::HumanUnavailableAction::ForgetOrPurge => "forget_or_purge_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::ConfigurationWrite => "configuration_write_unavailable",
                                                 evertrace_protocol::dto::HumanUnavailableAction::BackupRestoreOrGc => "offline_cli_or_future_s33",
                                             },
@@ -862,6 +877,30 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                         eligible_attempt_ids,
                     },
                 ),
+                forget_preview: item.forget_preview.map(|preview| {
+                    let EngineHumanForgetPreview {
+                        target,
+                        current_revision_id,
+                        exact_revision_ids,
+                        deletion_generation,
+                        shared_source_count,
+                        suppressed_source_count,
+                        suppression_ref_count,
+                        downstream_support_revalidation_count,
+                        dependent_procedure_review_hold_count,
+                    } = *preview;
+                    Box::new(HumanForgetPreview {
+                        target,
+                        current_revision_id,
+                        exact_revision_ids,
+                        deletion_generation,
+                        shared_source_count,
+                        suppressed_source_count,
+                        suppression_ref_count,
+                        downstream_support_revalidation_count,
+                        dependent_procedure_review_hold_count,
+                    })
+                }),
                 negative_review: item
                     .negative_review
                     .map(|review| HumanNegativeReviewMetadata {

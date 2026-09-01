@@ -20,6 +20,7 @@ pub enum UiCommand {
     SelectCompetingNext,
     PrepareCompetingSelected,
     PrepareMarkNewAttempt,
+    PrepareForgetObject,
     ConfirmProposal,
     PrepareRecovery(RecoveryApplicationKind),
     ConfirmRecovery,

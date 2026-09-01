@@ -509,6 +509,16 @@ impl App {
                         Some(local_unavailable("mark_new_attempt_unavailable"));
                 }
             }
+            UiCommand::PrepareForgetObject => {
+                if self.state.write_queued {
+                    self.state.last_action = Some(local_transport_error());
+                    return command;
+                }
+                self.state.proposal_confirmation = forget_object_action(&self.state);
+                if self.state.proposal_confirmation.is_none() {
+                    self.state.last_action = Some(local_unavailable("object_forget_unavailable"));
+                }
+            }
             UiCommand::OpenRelated => {
                 self.state.related_context = related_context(&self.state);
                 if self.state.related_context.is_none() {
@@ -597,7 +607,9 @@ impl App {
         } else if self.state.future_operation_shell.is_some() {
             "Esc dismisses; no operation will be sent".into()
         } else if self.state.detail.is_some() || self.state.detail_message.is_some() {
-            if future_operation_shell(&self.state).is_some() {
+            if current_detail(&self.state).is_some_and(|item| item.forget_preview.is_some()) {
+                "Esc back  F forget object  j/k scroll  o related  r refresh  q quit".into()
+            } else if future_operation_shell(&self.state).is_some() {
                 "Esc back  g future Forget info  o related  j/k scroll  r refresh  q quit".into()
             } else if current_detail(&self.state).is_some_and(|item| {
                 item.category == evertrace_protocol::dto::HumanItemCategory::AttemptResume
@@ -617,7 +629,7 @@ impl App {
                 selection.recovery_bundle_id, selection.application_kind
             )
         } else if self.state.route == crate::Route::Explorer {
-            "1 Inbox  2 Explorer  3 System  r refresh  p/f/i/M recovery  q quit".into()
+            "1 Inbox  2 Explorer  3 System  Enter detail  F forget  r refresh  p/f/i/M recovery  q quit".into()
         } else if self.state.route == crate::Route::System {
             "1 Inbox  2 Explorer  3 System  g maintenance boundaries  r refresh  q quit".into()
         } else {
@@ -1083,7 +1095,7 @@ fn future_operation_text(operation: &crate::state::FutureOperationShell) -> Stri
 
 fn future_forget_text(kind: &str, object_ref: &str) -> String {
     format!(
-        "Forget requires the future S32 domain preview.\nObject kind: {kind}\nObject ID:\n{object_ref}\nObject Forget is not source erasure.\nNo affected counts or closure are available.\nNo space or support estimate is available.\nNo preview hash, token, or job ID exists.\nNo command will be sent."
+        "No authoritative daemon Forget preview for this object/state.\nObject kind: {kind}\nObject ID:\n{object_ref}\nObject Forget is not source erasure.\nNo affected counts or closure are available.\nNo space or support estimate is available.\nNo preview hash, token, or job ID exists.\nNo command will be sent."
     )
 }
 
@@ -1593,6 +1605,30 @@ fn mark_new_attempt_action(
     ))
 }
 
+fn forget_object_action(
+    state: &AppState,
+) -> Option<(
+    u64,
+    evertrace_protocol::dto::HumanActionRequest,
+    Option<evertrace_protocol::dto::HumanProposalReview>,
+)> {
+    let evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { frontier, .. } =
+        state.human.as_ref()?
+    else {
+        return None;
+    };
+    let preview = current_detail(state)?.forget_preview.as_ref()?;
+    Some((
+        *frontier,
+        evertrace_protocol::dto::HumanActionRequest::ForgetObject {
+            target: preview.target,
+            expected_revision_ids: preview.exact_revision_ids.clone(),
+            expected_deletion_generation: preview.deletion_generation,
+        },
+        None,
+    ))
+}
+
 fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &'static str {
     use evertrace_protocol::dto::{HumanActionRequest, NegativeReviewDecision};
     match action {
@@ -1625,6 +1661,7 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         HumanActionRequest::SupportDeprecate { .. } => "submit support deprecate",
         HumanActionRequest::ResolveCompetingSelected { .. } => "select competing attempt",
         HumanActionRequest::MarkNewAttempt { .. } => "mark new attempt",
+        HumanActionRequest::ForgetObject { .. } => "forget object",
         HumanActionRequest::Unavailable { .. } => "unavailable action",
     }
 }
@@ -1722,10 +1759,12 @@ mod tests {
     use evertrace_domain::{
         ids::{ProcedureNegativeEvidenceId, RepositoryId, WorktreeSnapshotId},
         procedure::ProcedureNegativeReviewStatus,
+        purge::ObjectDeletionTarget,
         repository::{
             GitRegistrationState, OrderingIntegrity, RecoveryCaptureStatus, WorktreeKind,
             WorktreeLifecycle,
         },
+        revision::RevisionId,
         work::{
             CoverageLevel, LaneStatus, LivenessState, OrderingIntegrity as WorkOrderingIntegrity,
             PairingIntegrity, PayloadIntegrity, ReasoningVisibility, SourceCoverage,
@@ -1733,11 +1772,12 @@ mod tests {
     };
     use evertrace_protocol::dto::{
         HealthMode, HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail,
-        HumanGovernanceResponse, HumanItemCategory, HumanItemKind, HumanJobBudget, HumanJobDetail,
-        HumanJobState, HumanNegativeReviewMetadata, HumanObjectFamily, HumanProposalMetadata,
-        HumanProposalReview, HumanRecoveryDetail, HumanRelationKind, HumanRowClass,
-        HumanSnapshotItem, HumanSnapshotStatus, HumanSystemDetail, HumanWorktreeDetail,
-        NegativeReviewDecision, PROTOCOL_VERSION, ProposalHumanDecision,
+        HumanForgetPreview, HumanGovernanceResponse, HumanItemCategory, HumanItemKind,
+        HumanJobBudget, HumanJobDetail, HumanJobState, HumanNegativeReviewMetadata,
+        HumanObjectFamily, HumanProposalMetadata, HumanProposalReview, HumanRecoveryDetail,
+        HumanRelationKind, HumanRowClass, HumanSnapshotItem, HumanSnapshotStatus,
+        HumanSystemDetail, HumanWorktreeDetail, NegativeReviewDecision, PROTOCOL_VERSION,
+        ProposalHumanDecision,
     };
     use evertrace_protocol::response::HealthResponse;
 
@@ -2065,6 +2105,7 @@ mod tests {
             proposal_review: None,
             support_detail: None,
             competing_detail: None,
+            forget_preview: None,
             negative_review: None,
             recovery_detail: None,
             worktree_detail: None,
@@ -2558,6 +2599,7 @@ mod tests {
         assert!(human_request(&app.state, UiCommand::OpenFutureOperationShell).is_none());
         let forget = render_app(&app, 60, 20);
         assert!(forget.contains(&atom_id.to_string()));
+        assert!(forget.contains("No authoritative daemon Forget preview"));
         assert!(forget.contains("Object Forget is not source erasure"));
         assert!(forget.contains("No command will be sent"));
         assert_eq!(
@@ -2571,6 +2613,9 @@ mod tests {
         assert!(app.state.future_operation_shell.is_none());
 
         app.dispatch(UiCommand::Navigate(crate::Route::System));
+        let system = render_app(&app, 60, 20);
+        assert!(system.contains("Object Forget: available in Explorer"));
+        assert!(system.contains("Repository/session purge: unavailable"));
         app.dispatch(UiCommand::OpenFutureOperationShell);
         assert!(human_request(&app.state, UiCommand::OpenFutureOperationShell).is_none());
         let maintenance = render_app(&app, 60, 20);
@@ -2699,6 +2744,58 @@ mod tests {
     }
 
     #[test]
+    fn explorer_forget_uses_only_the_daemon_preview_and_one_confirmation() {
+        let atom_id = AtomId::new_v7();
+        let revision_id = RevisionId::new_v7();
+        let target = ObjectDeletionTarget::Atom { atom_id };
+        let mut item = snapshot_item("atom_revision", target.object_ref());
+        item.family = HumanObjectFamily::Atom;
+        item.category = HumanItemCategory::Semantic;
+        item.revision_ref = Some(revision_id.to_string());
+        item.forget_preview = Some(Box::new(HumanForgetPreview {
+            target,
+            current_revision_id: revision_id,
+            exact_revision_ids: vec![revision_id],
+            deletion_generation: 3,
+            shared_source_count: 1,
+            suppressed_source_count: 2,
+            suppression_ref_count: 4,
+            downstream_support_revalidation_count: 1,
+            dependent_procedure_review_hold_count: 1,
+        }));
+        let mut app = App::new();
+        app.dispatch(UiCommand::Navigate(crate::Route::Explorer));
+        app.handle(AppEvent::HumanRead {
+            surface: evertrace_protocol::dto::HumanSurface::Explorer,
+            locator: HumanReadLocator::List,
+            response: HumanGovernanceResponse::Snapshot {
+                frontier: 12,
+                status: HumanSnapshotStatus::Ready,
+                degraded_reasons: Vec::new(),
+                items: vec![item.clone()],
+                next_cursor: None,
+            },
+        });
+        app.state.detail = Some(item);
+        app.dispatch(UiCommand::PrepareForgetObject);
+        assert!(matches!(
+            app.state.proposal_confirmation,
+            Some((
+                12,
+                evertrace_protocol::dto::HumanActionRequest::ForgetObject {
+                    target: ObjectDeletionTarget::Atom { atom_id: selected },
+                    ref expected_revision_ids,
+                    expected_deletion_generation: 3,
+                },
+                None,
+            )) if selected == atom_id && expected_revision_ids == &[revision_id]
+        ));
+        assert_eq!(app.dispatch(UiCommand::Detail), UiCommand::ConfirmProposal);
+        app.dispatch(UiCommand::CancelModal);
+        assert!(app.state.proposal_confirmation.is_none());
+    }
+
+    #[test]
     fn stale_detail_for_previous_selection_is_ignored() {
         let first = snapshot_item("task", "task:first".into());
         let second = snapshot_item("task", "task:second".into());
@@ -2760,6 +2857,7 @@ mod tests {
             proposal_review: None,
             support_detail: None,
             competing_detail: None,
+            forget_preview: None,
             negative_review: None,
             recovery_detail: None,
             worktree_detail: None,

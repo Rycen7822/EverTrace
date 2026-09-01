@@ -48,6 +48,40 @@ pub(super) struct ProcedureState {
 }
 
 impl ProcedureState {
+    pub(super) fn forget(
+        &mut self,
+        procedure_ids: &BTreeSet<ProcedureId>,
+        revision_ids: &BTreeSet<RevisionId>,
+    ) {
+        self.procedures.retain(|id, _| !procedure_ids.contains(id));
+        self.revisions.retain(|id, _| !revision_ids.contains(id));
+        self.events
+            .retain(|_, (event, _)| !revision_ids.contains(&event.procedure_revision_id));
+        self.current_publication
+            .retain(|id, _| !revision_ids.contains(id));
+        self.usage_revisions
+            .retain(|_, (usage, _)| !revision_ids.contains(&usage.procedure_revision_id));
+        self.usages
+            .retain(|_, (usage, _)| !revision_ids.contains(&usage.procedure_revision_id));
+        let negative_ids = self
+            .negative_evidence
+            .values()
+            .filter_map(|(negative, _)| {
+                revision_ids
+                    .contains(&negative.procedure_revision_id)
+                    .then_some(negative.negative_evidence_id)
+            })
+            .collect::<BTreeSet<_>>();
+        self.negative_evidence
+            .retain(|id, _| !negative_ids.contains(id));
+        self.negative_evidence_by_revision
+            .retain(|id, _| !revision_ids.contains(id));
+        self.negative_reviews
+            .retain(|_, (review, _)| !negative_ids.contains(&review.negative_evidence_id));
+        self.current_negative_reviews
+            .retain(|id, _| !negative_ids.contains(id));
+    }
+
     pub(super) fn revision(&self, id: RevisionId) -> Option<&ProcedureRevision> {
         self.revisions.get(&id).map(|(value, _)| value)
     }
@@ -60,6 +94,92 @@ impl ProcedureState {
         self.current_publication
             .get(&id)
             .map(|(value, _)| value.to_state)
+    }
+
+    pub(super) fn deletion_procedure_impacts(
+        &self,
+        revision_ids: &BTreeSet<RevisionId>,
+    ) -> Vec<crate::purge::ObjectDeletionProcedureImpact> {
+        let mut impacts = self
+            .procedures
+            .values()
+            .filter_map(|(revision, _)| {
+                if revision_ids.contains(&revision.revision_id) {
+                    return None;
+                }
+                let trigger_refs = revision
+                    .draft
+                    .support_revision_refs
+                    .iter()
+                    .filter(|support| revision_ids.contains(support))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                if trigger_refs.is_empty() {
+                    return None;
+                }
+                let current_state = self
+                    .current_publication
+                    .get(&revision.revision_id)?
+                    .0
+                    .clone();
+                matches!(
+                    current_state.to_state,
+                    ProcedurePublicationState::ActiveProbationary
+                        | ProcedurePublicationState::ActiveStable
+                )
+                .then_some(crate::purge::ObjectDeletionProcedureImpact {
+                    current_state,
+                    trigger_refs,
+                })
+            })
+            .collect::<Vec<_>>();
+        impacts.sort_by_key(|impact| impact.current_state.procedure_revision_id);
+        impacts
+    }
+
+    pub(super) fn validate_deletion_review_holds(
+        &self,
+        impacts: &[crate::purge::ObjectDeletionProcedureImpact],
+        occurred_at_us: i64,
+        payloads: &[&JournalPayload],
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        let mut actual = BTreeMap::new();
+        for payload in payloads {
+            let JournalPayload::ProcedureStateRecorded(event) = payload else {
+                continue;
+            };
+            if actual
+                .insert(event.procedure_revision_id, event.as_ref())
+                .is_some()
+            {
+                return Err(error);
+            }
+        }
+        if actual.len() != impacts.len() {
+            return Err(error);
+        }
+        for impact in impacts {
+            let current = &impact.current_state;
+            let event = *actual.get(&current.procedure_revision_id).ok_or(error)?;
+            if self
+                .current_publication
+                .get(&current.procedure_revision_id)
+                .is_none_or(|(state, _)| state != current)
+                || event.state_event_id == current.state_event_id
+                || event.procedure_revision_id != current.procedure_revision_id
+                || event.from_state != Some(current.to_state)
+                || event.to_state != ProcedurePublicationState::ReviewHold
+                || event.reason != evertrace_domain::procedure::ProcedureStateReason::SupportPending
+                || event.resume_state != Some(current.to_state)
+                || event.evidence_refs != impact.trigger_refs
+                || event.created_at_us != occurred_at_us
+                || event.validate().is_err()
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn usage(&self, id: ProcedureUsageId) -> Option<&ProcedureUsageRevision> {
@@ -1003,6 +1123,55 @@ impl ProcedureState {
         self.revisions
             .get(&revision_id)
             .map(|(revision, _)| revision)
+    }
+
+    pub(super) fn revisions_for_deletion(
+        &self,
+        procedure_id: evertrace_domain::ids::ProcedureId,
+    ) -> impl Iterator<Item = &ProcedureRevision> {
+        self.revisions
+            .values()
+            .map(|(revision, _)| revision)
+            .filter(move |revision| revision.procedure_id == procedure_id)
+    }
+
+    pub(super) fn live_source_reference_strings(
+        &self,
+        excluded_revisions: &BTreeSet<RevisionId>,
+    ) -> BTreeSet<String> {
+        let mut refs = BTreeSet::new();
+        for (revision, _) in self.procedures.values() {
+            if !excluded_revisions.contains(&revision.revision_id) {
+                refs.extend(revision.draft.evidence_refs.iter().cloned());
+            }
+        }
+        for (event, _) in self.current_publication.values() {
+            if !excluded_revisions.contains(&event.procedure_revision_id) {
+                refs.extend(event.evidence_refs.iter().cloned());
+            }
+        }
+        for (usage, _) in self.usages.values() {
+            if !excluded_revisions.contains(&usage.procedure_revision_id) {
+                refs.extend(usage.evidence_refs.iter().cloned());
+            }
+        }
+        for (negative, _) in self.negative_evidence.values() {
+            if !excluded_revisions.contains(&negative.procedure_revision_id) {
+                refs.extend(negative.evidence_refs.iter().cloned());
+            }
+        }
+        for (negative_id, (review, _)) in &self.current_negative_reviews {
+            if self
+                .negative_evidence
+                .get(negative_id)
+                .is_some_and(|(negative, _)| {
+                    !excluded_revisions.contains(&negative.procedure_revision_id)
+                })
+            {
+                refs.extend(review.evidence_refs.iter().cloned());
+            }
+        }
+        refs
     }
 
     pub(super) fn apply(&mut self, payload: JournalPayload, seq: u64) -> Result<bool, StoreError> {

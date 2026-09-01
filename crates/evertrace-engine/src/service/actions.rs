@@ -27,8 +27,8 @@ use evertrace_domain::{
     },
 };
 use evertrace_store::{
-    JournalCommand, JournalEventDraft, JournalPayload, ObjectRow, ObjectRowClass, ObjectRowKind,
-    ProjectionSnapshot, SearchIndex, SemanticCurrentView,
+    JournalCommand, JournalEventDraft, JournalPayload, ObjectDeletionCurrentView, ObjectRow,
+    ObjectRowClass, ObjectRowKind, ProjectionSnapshot, SearchIndex, SemanticCurrentView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,10 +49,6 @@ use super::{
 
 mod read;
 mod write;
-
-// S20 predates the durable deletion ledger. This is the sole production
-// representation of the known-empty generation-zero suppression frontier.
-const PRE_DELETION_SUPPRESSION_GENERATION: u64 = 0;
 
 struct McpRequestScope {
     binding: McpResolvedScope,

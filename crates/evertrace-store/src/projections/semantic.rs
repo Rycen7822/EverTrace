@@ -305,6 +305,7 @@ pub(crate) fn rebuild_proposals(
 
 pub(crate) struct SemanticRelationInputs<'a> {
     pub atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
+    pub deleted_revision_ids: &'a BTreeSet<RevisionId>,
     pub proposal_revisions: &'a BTreeMap<RevisionId, (RevisionProposal, u64)>,
     pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
     pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
@@ -1094,7 +1095,10 @@ fn validate_atom_relations(
         .chain(&atom.supports_revision_refs)
         .chain(&atom.contradicts_revision_refs)
     {
-        if !input.atom_revisions.contains_key(revision) {
+        if !input.atom_revisions.contains_key(revision)
+            && (!input.deleted_revision_ids.contains(revision)
+                || input.s23.atom_support_eligible(atom.revision_id))
+        {
             return Err(StoreError::StoreCorrupt);
         }
     }
