@@ -9,6 +9,7 @@ pub mod journal;
 pub mod migrations;
 pub mod objects;
 pub mod projections;
+pub mod purge;
 pub mod query;
 pub mod relations;
 pub mod repository;
@@ -32,9 +33,17 @@ pub use projections::{
     ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
     RecoveryEvidenceCurrentView, RuntimeSchedulerView, SegmentationCurrentState,
     SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView, WorkIdentityCurrentView,
-    reduce_journal,
+    object_deletion_preview, reduce_journal,
 };
-pub use query::{L0002ProjectionSnapshot, derive_l0002_projections, object_projection_hash};
+pub use purge::{
+    OBJECT_DELETION_ALGORITHM_REVISION, ObjectDeletionCurrentView, ObjectDeletionPreview,
+    ObjectDeletionProcedureImpact, ObjectDeletionSupportImpact, pending_object_deletion,
+    purged_object_deletion,
+};
+pub use query::{
+    DefaultRetrievalSuppressionGeneration, L0002ProjectionSnapshot,
+    default_retrieval_suppression_ref_hash, derive_l0002_projections, object_projection_hash,
+};
 pub use relations::{
     RELATIONS_CHECKPOINT_ID, RELATIONS_TABLE, RelationProjectionRow, read_relation_rows,
     relations_schema,

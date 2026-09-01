@@ -17,6 +17,7 @@ use evertrace_domain::{
         WorktreeSnapshotId, WorktreeTransitionId,
     },
     procedure::{ProcedureRevision, ProcedureUsageRevision},
+    purge::{ObjectDeletionPhase, ObjectDeletionTarget},
     repository::{
         IntegrationEvent, LineageAssessment, RecoveryApplication, RecoveryBundle,
         RecoveryCaptureRequest, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
@@ -24,7 +25,8 @@ use evertrace_domain::{
     },
     revision::RevisionId,
     semantic::{
-        Atom, EvidenceCompleteness, ParserStatus, ResultEvidence, ResultScope, RevisionProposal,
+        AcceptedProposalTarget, Atom, CoreMembershipProposalPayload, EvidenceCompleteness,
+        ParserStatus, ProposalTargetId, ResultEvidence, ResultScope, RevisionProposal,
         VerifierStatus,
     },
     work::{
@@ -41,10 +43,10 @@ use lancedb::Table;
 
 use crate::{
     command::{
-        ATOM_RECORDED_EVENT_TYPE, DirtyTarget, DurableJob, JobStatus, JobTerminalReason,
-        JournalCommand, JournalPayload, NormalizationWatermark, ObjectFamily, OutboxEntry,
-        SourceCloseDecision, SourceCloseReconciliation, SourceIngestWatermark, SourceKind,
-        SourceRevisionRecorded, StoreError, WatermarkAdvanced, source_revision_ref,
+        ATOM_RECORDED_EVENT_TYPE, DirtyTarget, DirtyTargetKind, DurableJob, JobStatus,
+        JobTerminalReason, JournalCommand, JournalPayload, NormalizationWatermark, ObjectFamily,
+        OutboxEntry, SourceCloseDecision, SourceCloseReconciliation, SourceIngestWatermark,
+        SourceKind, SourceRevisionRecorded, StoreError, WatermarkAdvanced, source_revision_ref,
     },
     journal::{
         JournalRow, read_all_journal_rows, read_journal_after, read_journal_frontier,
@@ -53,6 +55,10 @@ use crate::{
     objects::{
         OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind, objects_batch,
         validate_objects_table,
+    },
+    purge::{
+        ObjectDeletionRevisionFact, ObjectDeletionSourceContext, ObjectDeletionState,
+        derive_object_deletion_preview, filter_product_rows,
     },
 };
 
@@ -1917,6 +1923,7 @@ struct ReducerState {
     s23: s23::S23State,
     procedure: procedure::ProcedureState,
     synthesis: synthesis::SynthesisState,
+    deletions: Box<ObjectDeletionState>,
 }
 
 #[derive(Clone, Debug)]
@@ -2032,6 +2039,7 @@ pub(crate) struct JournalAdmissionState {
     procedure: procedure::ProcedureState,
     synthesis: synthesis::SynthesisState,
     jobs: BTreeMap<evertrace_domain::ids::JobId, DurableJob>,
+    deletions: Box<ObjectDeletionState>,
 }
 
 fn recall_scope_matches(
@@ -2119,6 +2127,571 @@ fn select_recall_binding<'a>(
         selected = Some((candidate, candidate_seq));
     }
     Ok(selected.map(|(binding, _)| binding))
+}
+
+fn atom_deletion_refs(atom: &Atom) -> Vec<String> {
+    atom.source_observation_refs
+        .iter()
+        .map(ToString::to_string)
+        .chain(atom.evidence_refs.iter().cloned())
+        .chain(
+            atom.supersedes_revision_refs
+                .iter()
+                .map(ToString::to_string),
+        )
+        .chain(atom.supports_revision_refs.iter().map(ToString::to_string))
+        .chain(
+            atom.contradicts_revision_refs
+                .iter()
+                .map(ToString::to_string),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn procedure_deletion_refs(revision: &ProcedureRevision) -> Vec<String> {
+    revision
+        .draft
+        .evidence_refs
+        .iter()
+        .cloned()
+        .chain(
+            revision
+                .draft
+                .support_revision_refs
+                .iter()
+                .map(ToString::to_string),
+        )
+        .chain(revision.parent_revision_id.iter().map(ToString::to_string))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn core_membership_deletion_refs(
+    membership: &evertrace_domain::semantic::CoreMembership,
+) -> Vec<String> {
+    std::iter::once(membership.atom_revision_id.to_string())
+        .chain(std::iter::once(membership.support_contract_ref.to_string()))
+        .chain(
+            membership
+                .authorization_revision_refs
+                .iter()
+                .map(ToString::to_string),
+        )
+        .chain(
+            membership
+                .supersedes_membership_revision_id
+                .iter()
+                .map(ToString::to_string),
+        )
+        .chain(std::iter::once(
+            membership.created_by_acceptance_ref.to_string(),
+        ))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+struct ObjectDeletionPreviewInputs<'a> {
+    source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    host_occurrences: &'a BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
+    operations: &'a BTreeMap<OperationId, (Operation, u64)>,
+    scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
+    repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    worktree_snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktree_transitions: &'a BTreeMap<WorktreeTransitionId, (WorktreeTransition, u64)>,
+    integration_events: &'a BTreeMap<IntegrationEventId, (IntegrationEvent, u64)>,
+    tasks: &'a BTreeMap<TaskId, (Task, u64)>,
+    workstreams: &'a BTreeMap<WorkstreamId, (Workstream, u64)>,
+    work_bindings: &'a BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    attempts: &'a BTreeMap<AttemptId, (Attempt, u64)>,
+    competing_groups: &'a BTreeMap<CompetingAttemptGroupId, (CompetingAttemptGroup, u64)>,
+    operation_bursts: &'a BTreeMap<OperationBurstId, (OperationBurst, u64)>,
+    episodes: &'a BTreeMap<WorkEpisodeId, (WorkEpisode, u64)>,
+    checkpoints: &'a BTreeMap<String, (WorkCheckpoint, u64)>,
+    corrections: &'a BTreeMap<RevisionId, (SegmentationCorrection, u64)>,
+    recovery_applications: &'a BTreeMap<RecoveryApplicationId, (RecoveryApplication, u64)>,
+    experiment_runs: &'a BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
+    work_artifacts: &'a BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
+    atoms: &'a BTreeMap<AtomId, (Atom, u64)>,
+    atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
+    proposals: &'a BTreeMap<RevisionProposalId, (RevisionProposal, u64)>,
+    procedure: &'a procedure::ProcedureState,
+    s23: &'a s23::S23State,
+    synthesis: &'a synthesis::SynthesisState,
+    deletions: &'a ObjectDeletionState,
+}
+
+impl ReducerState {
+    fn object_deletion_inputs(&self) -> ObjectDeletionPreviewInputs<'_> {
+        ObjectDeletionPreviewInputs {
+            source_observations: &self.source_observations,
+            source_receipts: &self.source_receipts,
+            evidence_surfaces: &self.evidence_surfaces,
+            host_occurrences: &self.host_occurrences,
+            operations: &self.operations,
+            scope_effects: &self.scope_effects,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            worktree_snapshots: &self.worktree_snapshots,
+            worktree_transitions: &self.worktree_transitions,
+            integration_events: &self.integration_events,
+            tasks: &self.tasks,
+            workstreams: &self.workstreams,
+            work_bindings: &self.work_bindings,
+            attempts: &self.attempts,
+            competing_groups: &self.competing_groups,
+            operation_bursts: &self.operation_bursts,
+            episodes: &self.episodes,
+            checkpoints: &self.checkpoints,
+            corrections: &self.corrections,
+            recovery_applications: &self.recovery_applications,
+            experiment_runs: &self.experiment_runs,
+            work_artifacts: &self.work_artifacts,
+            atoms: &self.atoms,
+            atom_revisions: &self.atom_revisions,
+            proposals: &self.proposals,
+            procedure: &self.procedure,
+            s23: &self.s23,
+            synthesis: &self.synthesis,
+            deletions: &self.deletions,
+        }
+    }
+}
+
+impl JournalAdmissionState {
+    fn object_deletion_inputs(&self) -> ObjectDeletionPreviewInputs<'_> {
+        ObjectDeletionPreviewInputs {
+            source_observations: &self.source_observations,
+            source_receipts: &self.source_receipts,
+            evidence_surfaces: &self.evidence_surfaces,
+            host_occurrences: &self.host_occurrences,
+            operations: &self.operations,
+            scope_effects: &self.scope_effects,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            worktree_snapshots: &self.worktree_snapshots,
+            worktree_transitions: &self.worktree_transitions,
+            integration_events: &self.integration_events,
+            tasks: &self.tasks,
+            workstreams: &self.workstreams,
+            work_bindings: &self.work_bindings,
+            attempts: &self.attempts,
+            competing_groups: &self.competing_groups,
+            operation_bursts: &self.operation_bursts,
+            episodes: &self.episodes,
+            checkpoints: &self.checkpoints,
+            corrections: &self.corrections,
+            recovery_applications: &self.recovery_applications,
+            experiment_runs: &self.experiment_runs,
+            work_artifacts: &self.work_artifacts,
+            atoms: &self.atoms,
+            atom_revisions: &self.atom_revisions,
+            proposals: &self.proposals,
+            procedure: &self.procedure,
+            s23: &self.s23,
+            synthesis: &self.synthesis,
+            deletions: &self.deletions,
+        }
+    }
+}
+
+fn derive_object_deletion_preview_from_inputs(
+    inputs: ObjectDeletionPreviewInputs<'_>,
+    target: ObjectDeletionTarget,
+) -> Result<crate::purge::ObjectDeletionPreview, StoreError> {
+    if inputs.deletions.current(target).is_some() {
+        return Err(StoreError::InvalidInput);
+    }
+    let revisions = match target {
+        ObjectDeletionTarget::Atom { atom_id } => {
+            let current = inputs
+                .atoms
+                .get(&atom_id)
+                .ok_or(StoreError::InvalidInput)?
+                .0
+                .revision_id;
+            inputs
+                .atom_revisions
+                .values()
+                .filter(|(atom, _)| atom.atom_id == atom_id)
+                .map(|(atom, _)| {
+                    Ok(ObjectDeletionRevisionFact {
+                        revision_id: atom.revision_id,
+                        canonical_payload: hex(&atom
+                            .semantic_structure_hash()
+                            .map_err(|_| StoreError::StoreCorrupt)?),
+                        semantic_kind: serde_json::to_string(&atom.kind)
+                            .map_err(|_| StoreError::Serialization)?,
+                        scope_identity: serde_json::to_string(&atom.scope)
+                            .map_err(|_| StoreError::Serialization)?,
+                        source_derivation_refs: atom_deletion_refs(atom),
+                        current: atom.revision_id == current,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?
+        }
+        ObjectDeletionTarget::Procedure { procedure_id } => {
+            let current = inputs
+                .procedure
+                .current_revision(procedure_id)
+                .ok_or(StoreError::InvalidInput)?
+                .revision_id;
+            inputs
+                .procedure
+                .revisions_for_deletion(procedure_id)
+                .map(|revision| {
+                    Ok(ObjectDeletionRevisionFact {
+                        revision_id: revision.revision_id,
+                        canonical_payload: serde_json::to_string(&revision.draft)
+                            .map_err(|_| StoreError::Serialization)?,
+                        semantic_kind: serde_json::to_string(&revision.draft.kind)
+                            .map_err(|_| StoreError::Serialization)?,
+                        scope_identity: serde_json::to_string(&revision.draft.scope)
+                            .map_err(|_| StoreError::Serialization)?,
+                        source_derivation_refs: procedure_deletion_refs(revision),
+                        current: revision.revision_id == current,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?
+        }
+        ObjectDeletionTarget::CoreMembership { core_membership_id } => {
+            let current = inputs
+                .s23
+                .current_membership(core_membership_id)
+                .ok_or(StoreError::InvalidInput)?
+                .membership_revision_id;
+            inputs
+                .s23
+                .memberships_for_deletion(core_membership_id)
+                .map(|membership| {
+                    Ok(ObjectDeletionRevisionFact {
+                        revision_id: membership.membership_revision_id,
+                        canonical_payload: serde_json::to_string(
+                            &CoreMembershipProposalPayload::Create {
+                                atom_revision_id: membership.atom_revision_id,
+                                scope_identity: membership.scope_identity.clone(),
+                            },
+                        )
+                        .map_err(|_| StoreError::Serialization)?,
+                        semantic_kind: "core_membership".into(),
+                        scope_identity: serde_json::to_string(&membership.scope_identity)
+                            .map_err(|_| StoreError::Serialization)?,
+                        source_derivation_refs: core_membership_deletion_refs(membership),
+                        current: membership.membership_revision_id == current,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?
+        }
+    };
+    let target_revisions = revisions
+        .iter()
+        .map(|fact| fact.revision_id)
+        .collect::<BTreeSet<_>>();
+    let support_impacts = inputs
+        .s23
+        .deletion_support_impacts(target, &target_revisions)?;
+    let procedure_impacts = inputs
+        .procedure
+        .deletion_procedure_impacts(&target_revisions);
+    let other_live_source_refs = other_live_source_observations(&inputs, target, &target_revisions);
+    derive_object_deletion_preview(
+        target,
+        revisions,
+        ObjectDeletionSourceContext {
+            other_live_source_refs: &other_live_source_refs,
+            source_observations: inputs.source_observations,
+            source_receipts: inputs.source_receipts,
+            evidence_surfaces: inputs.evidence_surfaces,
+        },
+        support_impacts,
+        procedure_impacts,
+        inputs
+            .deletions
+            .generation()
+            .checked_add(1)
+            .ok_or(StoreError::StoreCorrupt)?,
+    )
+}
+
+fn other_live_source_observations(
+    inputs: &ObjectDeletionPreviewInputs<'_>,
+    target: ObjectDeletionTarget,
+    target_revisions: &BTreeSet<RevisionId>,
+) -> BTreeSet<SourceObservationId> {
+    let mut excluded_revisions = target_revisions.clone();
+    let mut excluded_atoms = BTreeSet::new();
+    let mut excluded_procedures = BTreeSet::new();
+    let mut excluded_memberships = BTreeSet::new();
+    for event in inputs.deletions.events() {
+        excluded_revisions.extend(event.exact_revision_ids.iter().copied());
+        match event.target {
+            ObjectDeletionTarget::Atom { atom_id } => {
+                excluded_atoms.insert(atom_id);
+            }
+            ObjectDeletionTarget::Procedure { procedure_id } => {
+                excluded_procedures.insert(procedure_id);
+            }
+            ObjectDeletionTarget::CoreMembership { core_membership_id } => {
+                excluded_memberships.insert(core_membership_id);
+            }
+        }
+    }
+    match target {
+        ObjectDeletionTarget::Atom { atom_id } => {
+            excluded_atoms.insert(atom_id);
+        }
+        ObjectDeletionTarget::Procedure { procedure_id } => {
+            excluded_procedures.insert(procedure_id);
+        }
+        ObjectDeletionTarget::CoreMembership { core_membership_id } => {
+            excluded_memberships.insert(core_membership_id);
+        }
+    }
+
+    let mut refs = BTreeSet::new();
+    macro_rules! add_text {
+        ($value:expr) => {
+            add_source_reference(
+                $value,
+                inputs.source_observations,
+                inputs.source_receipts,
+                &mut refs,
+            )
+        };
+    }
+    for (occurrence, _) in inputs.host_occurrences.values() {
+        refs.extend(occurrence.source_observation_refs.iter().copied());
+    }
+    for (operation, _) in inputs.operations.values() {
+        refs.extend(operation.input_source_observation_refs.iter().copied());
+        refs.extend(operation.result_source_observation_refs.iter().copied());
+    }
+    for (effect, _) in inputs.scope_effects.values() {
+        refs.extend(effect.evidence_refs.iter().copied());
+    }
+    for (repository, _) in inputs.repositories.values() {
+        for reference in repository.identity_evidence_refs.iter().chain(
+            repository
+                .path_history
+                .iter()
+                .flat_map(|path| path.evidence_refs.iter()),
+        ) {
+            add_text!(reference);
+        }
+    }
+    for (worktree, _) in inputs.worktrees.values() {
+        for reference in worktree
+            .path_history
+            .iter()
+            .chain(&worktree.git_admin_path_history)
+            .flat_map(|path| path.evidence_refs.iter())
+            .chain(std::iter::once(&worktree.created_event_ref))
+            .chain(worktree.terminal_event_ref.iter())
+        {
+            add_text!(reference);
+        }
+    }
+    for (snapshot, _) in inputs.worktree_snapshots.values() {
+        for reference in &snapshot.evidence_refs {
+            add_text!(reference);
+        }
+    }
+    for (transition, _) in inputs.worktree_transitions.values() {
+        for reference in &transition.evidence_refs {
+            add_text!(reference);
+        }
+    }
+    for (integration, _) in inputs.integration_events.values() {
+        for reference in integration
+            .evidence_refs
+            .iter()
+            .chain(&integration.revalidated_anchor_refs)
+            .chain(&integration.patch_equivalence_refs)
+        {
+            add_text!(reference);
+        }
+    }
+    for (task, _) in inputs.tasks.values() {
+        for reference in &task.request_root_refs {
+            add_text!(reference);
+        }
+    }
+    for (workstream, _) in inputs.workstreams.values() {
+        for reference in &workstream.worktree_lineage_refs {
+            add_text!(reference);
+        }
+    }
+    for (binding, _) in inputs.work_bindings.values() {
+        for reference in &binding.evidence_refs {
+            add_text!(reference);
+        }
+    }
+    for (attempt, _) in inputs.attempts.values() {
+        for reference in attempt
+            .resume_event_refs
+            .iter()
+            .chain(&attempt.local_outcome_refs)
+            .chain(&attempt.parent_verification_refs)
+            .chain(&attempt.outcome_refs)
+            .chain(&attempt.interruption_refs)
+            .chain(&attempt.explicit_abandon_refs)
+            .chain(&attempt.supersede_evidence_refs)
+        {
+            add_text!(reference);
+        }
+    }
+    for (group, _) in inputs.competing_groups.values() {
+        for reference in std::iter::once(&group.decision_boundary_ref)
+            .chain(group.comparison_contract_ref.iter())
+            .chain(&group.target_refs)
+            .chain(&group.resolution_evidence_refs)
+        {
+            add_text!(reference);
+        }
+    }
+    for (burst, _) in inputs.operation_bursts.values() {
+        for member in &burst.members {
+            refs.extend(member.source_observation_refs.iter().copied());
+        }
+        for reference in burst.target_refs.iter().chain(&burst.worktree_lineage_refs) {
+            add_text!(reference);
+        }
+    }
+    for (episode, _) in inputs.episodes.values() {
+        if let Some(candidate) = &episode.boundary_candidate {
+            refs.extend(candidate.evidence_refs.iter().copied());
+        }
+        for reference in episode
+            .failure_refs
+            .iter()
+            .chain(&episode.interruption_refs)
+            .chain(&episode.completed_outcome_refs)
+            .chain(&episode.selected_outcome_refs)
+            .chain(&episode.verification_refs)
+            .chain(&episode.semantic_digest_refs)
+        {
+            add_text!(reference);
+        }
+    }
+    for (checkpoint, _) in inputs.checkpoints.values() {
+        for reference in checkpoint
+            .verifier_refs
+            .iter()
+            .chain(&checkpoint.active_lineage_refs)
+        {
+            add_text!(reference);
+        }
+    }
+    for (correction, _) in inputs.corrections.values() {
+        for reference in &correction.evidence_refs {
+            add_text!(reference);
+        }
+    }
+    for (application, _) in inputs.recovery_applications.values() {
+        refs.extend(application.input_source_observation_ids.iter().copied());
+        refs.extend(application.result_source_observation_ids.iter().copied());
+        refs.extend(
+            application
+                .verifier_receipts
+                .iter()
+                .map(|receipt| receipt.result_source_observation_id),
+        );
+        refs.extend(
+            application
+                .anchor_verifier_receipts
+                .iter()
+                .map(|receipt| receipt.result_source_observation_id),
+        );
+    }
+    for (run, _) in inputs.experiment_runs.values() {
+        for receipt_id in run
+            .source_receipt_refs
+            .iter()
+            .chain(&run.terminal_evidence_refs)
+        {
+            if let Some((receipt, _)) = inputs.source_receipts.get(receipt_id) {
+                refs.insert(receipt.source_observation_id);
+            }
+        }
+    }
+    for (artifact, _) in inputs.work_artifacts.values() {
+        refs.extend(artifact.revision.source_observation_refs.iter().copied());
+    }
+    for (atom, _) in inputs.atoms.values() {
+        if excluded_atoms.contains(&atom.atom_id) || excluded_revisions.contains(&atom.revision_id)
+        {
+            continue;
+        }
+        refs.extend(atom.source_observation_refs.iter().copied());
+        for reference in &atom.evidence_refs {
+            add_text!(reference);
+        }
+    }
+    for (proposal, _) in inputs.proposals.values() {
+        if proposal_targets_deleted(
+            proposal,
+            &excluded_atoms,
+            &excluded_procedures,
+            &excluded_memberships,
+        ) {
+            continue;
+        }
+        for reference in proposal
+            .evidence_refs
+            .iter()
+            .chain(&proposal.source_cohort_refs)
+        {
+            add_text!(reference);
+        }
+        if let Some(acceptance) = &proposal.acceptance {
+            let observation = match acceptance.authority_basis {
+                evertrace_domain::semantic::ProposalAcceptanceAuthority::CurrentTaskExactMessage {
+                    user_source_observation_ref,
+                }
+                | evertrace_domain::semantic::ProposalAcceptanceAuthority::TuiAcceptance {
+                    user_source_observation_ref,
+                    ..
+                }
+                | evertrace_domain::semantic::ProposalAcceptanceAuthority::ObjectiveEvidence {
+                    user_source_observation_ref,
+                } => user_source_observation_ref,
+            };
+            refs.insert(observation);
+        }
+    }
+    for reference in inputs
+        .procedure
+        .live_source_reference_strings(&excluded_revisions)
+    {
+        add_text!(&reference);
+    }
+    for reference in inputs.synthesis.live_source_reference_strings() {
+        add_text!(reference);
+    }
+    refs
+}
+
+fn add_source_reference(
+    value: &str,
+    source_observations: &BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    source_receipts: &BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    refs: &mut BTreeSet<SourceObservationId>,
+) {
+    if let Ok(observation_id) = value.parse::<SourceObservationId>()
+        && source_observations.contains_key(&observation_id)
+    {
+        refs.insert(observation_id);
+    } else if let Ok(receipt_id) = value.parse::<SourceReceiptId>()
+        && let Some((receipt, _)) = source_receipts.get(&receipt_id)
+    {
+        refs.insert(receipt.source_observation_id);
+    }
 }
 
 impl JournalAdmissionState {
@@ -2369,6 +2942,17 @@ impl JournalAdmissionState {
                 .map(|event| (&event.payload, event.occurred_at_us)),
         )
         .map_err(|_| StoreError::InvalidInput)?;
+        self.validate_object_deletion_payloads(
+            command.events().iter().map(|event| {
+                (
+                    &event.payload,
+                    event.source_kind,
+                    event.occurred_at_us,
+                    event.effective_config_hash,
+                )
+            }),
+            StoreError::InvalidInput,
+        )?;
         self.validate_transition_pairs(command.events().iter().map(|event| &event.payload))?;
         self.validate_episode_binding_activation(
             command.events().iter().map(|event| &event.payload),
@@ -2517,6 +3101,7 @@ impl JournalAdmissionState {
                 .iter()
                 .map(|(payload, _, occurred_at_us)| (payload, *occurred_at_us)),
         )?;
+        self.validate_object_deletion_command(rows, &parsed)?;
         self.validate_transition_pairs(parsed.iter().map(|(payload, _, _)| payload))
             .map_err(|_| StoreError::StoreCorrupt)?;
         self.validate_episode_binding_activation(parsed.iter().map(|(payload, _, _)| payload))
@@ -2594,6 +3179,167 @@ impl JournalAdmissionState {
         }
         next.validate_relations()?;
         Ok(next)
+    }
+
+    fn object_deletion_preview(
+        &self,
+        target: ObjectDeletionTarget,
+    ) -> Result<crate::purge::ObjectDeletionPreview, StoreError> {
+        derive_object_deletion_preview_from_inputs(self.object_deletion_inputs(), target)
+    }
+
+    fn validate_object_deletion_command(
+        &self,
+        rows: &[&JournalRow],
+        parsed: &[(JournalPayload, u64, i64)],
+    ) -> Result<(), StoreError> {
+        self.validate_object_deletion_payloads(
+            rows.iter()
+                .zip(parsed)
+                .map(|(row, (payload, _, occurred_at_us))| {
+                    (
+                        payload,
+                        row.source_kind,
+                        *occurred_at_us,
+                        row.effective_config_hash,
+                    )
+                }),
+            StoreError::StoreCorrupt,
+        )
+    }
+
+    fn validate_object_deletion_payloads<'a>(
+        &self,
+        payloads: impl IntoIterator<Item = (&'a JournalPayload, SourceKind, i64, [u8; 32])>,
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        let deletions = payloads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (payload, _, _, _))| match payload {
+                JournalPayload::ObjectDeletionLedgerRecorded(event) => {
+                    Some((index, event.as_ref()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if deletions.is_empty() {
+            return Ok(());
+        }
+        let [(deletion_index, deletion)] = deletions.as_slice() else {
+            return Err(error);
+        };
+        let (_, source_kind, occurred_at_us, effective_config_hash) = payloads[*deletion_index];
+        match deletion.phase {
+            ObjectDeletionPhase::Pending => {
+                if source_kind != SourceKind::Manual
+                    || payloads
+                        .iter()
+                        .any(|(_, source_kind, _, _)| *source_kind != SourceKind::Manual)
+                    || self.deletions.current(deletion.target).is_some()
+                {
+                    return Err(error);
+                }
+                let jobs = payloads
+                    .iter()
+                    .filter_map(|(payload, _, _, _)| match payload {
+                        JournalPayload::JobState(job)
+                            if job.kind == crate::purge::OBJECT_DELETION_JOB_KIND =>
+                        {
+                            Some(job)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [job] = jobs.as_slice() else {
+                    return Err(error);
+                };
+                let preview = self
+                    .object_deletion_preview(deletion.target)
+                    .map_err(|_| error)?;
+                let (expected_event, expected_job) = crate::purge::pending_object_deletion(
+                    &preview,
+                    deletion.purge_job_id,
+                    occurred_at_us,
+                    self.frontier,
+                    effective_config_hash,
+                )
+                .map_err(|_| error)?;
+                if *deletion != &expected_event || *job != &expected_job {
+                    return Err(error);
+                }
+                let event_payloads = payloads
+                    .iter()
+                    .map(|(payload, _, _, _)| *payload)
+                    .collect::<Vec<_>>();
+                self.s23.validate_deletion_support_fanout(
+                    &preview.downstream_support_impacts,
+                    occurred_at_us,
+                    effective_config_hash,
+                    &event_payloads,
+                    error,
+                )?;
+                self.procedure.validate_deletion_review_holds(
+                    &preview.dependent_procedure_impacts,
+                    occurred_at_us,
+                    &event_payloads,
+                    error,
+                )?;
+                let expected_payloads = 2usize
+                    .checked_add(
+                        preview
+                            .downstream_support_impacts
+                            .len()
+                            .checked_mul(4)
+                            .ok_or(error)?,
+                    )
+                    .and_then(|count| count.checked_add(preview.dependent_procedure_impacts.len()))
+                    .ok_or(error)?;
+                if payloads.len() != expected_payloads {
+                    return Err(error);
+                }
+            }
+            ObjectDeletionPhase::Purged => {
+                if payloads.len() != 3
+                    || source_kind != SourceKind::System
+                    || payloads
+                        .iter()
+                        .any(|(_, source_kind, _, _)| *source_kind != SourceKind::System)
+                {
+                    return Err(error);
+                }
+                let pending = self.deletions.current(deletion.target).ok_or(error)?;
+                let queued = self.jobs.get(&pending.purge_job_id).ok_or(error)?;
+                let (expected_event, expected_lease, expected_job) =
+                    crate::purge::purged_object_deletion(pending, queued, occurred_at_us)
+                        .map_err(|_| error)?;
+                let leases = payloads
+                    .iter()
+                    .filter_map(|(payload, _, _, _)| match payload {
+                        JournalPayload::JobLease(lease) => Some(lease),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let jobs = payloads
+                    .iter()
+                    .filter_map(|(payload, _, _, _)| match payload {
+                        JournalPayload::JobState(job) => Some(job),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let ([lease], [job]) = (leases.as_slice(), jobs.as_slice()) else {
+                    return Err(error);
+                };
+                if *deletion != &expected_event
+                    || *lease != &expected_lease
+                    || *job != &expected_job
+                {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_competing_selected_command<'a>(
@@ -3056,6 +3802,10 @@ impl JournalAdmissionState {
             | JournalPayload::SemanticDerivationRunRecorded(_)) => {
                 self.synthesis.apply(payload, seq)?;
             }
+            JournalPayload::ObjectDeletionLedgerRecorded(value) => {
+                self.deletions
+                    .apply(*value, seq, StoreError::StoreCorrupt)?;
+            }
             JournalPayload::RecallLedgerRecorded(value) => {
                 self.recall_ledger.apply(*value, seq)?;
             }
@@ -3176,8 +3926,14 @@ impl JournalAdmissionState {
             source_receipts: &self.source_receipts,
             source_observations: &self.source_observations,
         })?;
+        let deleted_revision_ids = self
+            .deletions
+            .events()
+            .flat_map(|event| event.exact_revision_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
         semantic::validate_relations(semantic::SemanticRelationInputs {
             atom_revisions: &self.atom_revisions,
+            deleted_revision_ids: &deleted_revision_ids,
             proposal_revisions: &self.proposal_revisions,
             source_observations: &self.source_observations,
             source_receipts: &self.source_receipts,
@@ -3201,6 +3957,32 @@ impl JournalAdmissionState {
         )?;
         Ok(())
     }
+}
+
+pub(crate) fn proposal_targets_deleted(
+    proposal: &RevisionProposal,
+    atom_ids: &BTreeSet<AtomId>,
+    procedure_ids: &BTreeSet<ProcedureId>,
+    membership_ids: &BTreeSet<evertrace_domain::ids::CoreMembershipId>,
+) -> bool {
+    let direct = match proposal.target_id {
+        Some(ProposalTargetId::Atom(id)) => atom_ids.contains(&id),
+        Some(ProposalTargetId::Procedure(id)) => procedure_ids.contains(&id),
+        Some(ProposalTargetId::CoreMembership(id)) => membership_ids.contains(&id),
+        None => false,
+    };
+    direct
+        || proposal.acceptance.as_ref().is_some_and(|acceptance| {
+            match &acceptance.accepted_target {
+                AcceptedProposalTarget::Atom { atom_id, .. } => atom_ids.contains(atom_id),
+                AcceptedProposalTarget::Procedure { procedure_id, .. } => {
+                    procedure_ids.contains(procedure_id)
+                }
+                AcceptedProposalTarget::CoreMembership {
+                    core_membership_id, ..
+                } => membership_ids.contains(core_membership_id),
+            }
+        })
 }
 
 fn validate_recall_ledger_relations(state: &ReducerState) -> Result<(), StoreError> {
@@ -3553,6 +4335,17 @@ pub fn reduce_journal(rows: &[JournalRow]) -> Result<ProjectionSnapshot, StoreEr
         state.validate_evidence_relations()?;
     }
     state.into_snapshot(frontier)
+}
+
+pub fn object_deletion_preview(
+    snapshot: &ProjectionSnapshot,
+    target: ObjectDeletionTarget,
+) -> Result<crate::purge::ObjectDeletionPreview, StoreError> {
+    if snapshot.frontier == 0 {
+        return Err(StoreError::InvalidInput);
+    }
+    let state = ReducerState::from_current_rows(&snapshot.rows, snapshot.frontier)?;
+    derive_object_deletion_preview_from_inputs(state.object_deletion_inputs(), target)
 }
 
 fn apply_event(
@@ -3915,6 +4708,11 @@ fn apply_event(
         payload @ (JournalPayload::SemanticDigestRecorded(_)
         | JournalPayload::SemanticDerivationRunRecorded(_)) => {
             state.synthesis.apply(payload, row.seq)?;
+        }
+        JournalPayload::ObjectDeletionLedgerRecorded(value) => {
+            state
+                .deletions
+                .apply(*value, row.seq, StoreError::StoreCorrupt)?;
         }
         JournalPayload::RecallLedgerRecorded(value) => {
             state.recall_ledger.apply(*value, row.seq)?;
@@ -5222,7 +6020,7 @@ impl ReducerState {
             }
             state.restore_row(row, payload)?;
         }
-
+        state.deletions.validate_restored()?;
         state.rebuild_revision_currents()?;
         state.validate_evidence_relations()?;
         let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
@@ -6003,6 +6801,10 @@ impl ReducerState {
                 self.synthesis.restore(payload, row.source_event_seq)?;
                 false
             }
+            JournalPayload::ObjectDeletionLedgerRecorded(value) => {
+                self.deletions.restore(row, *value)?;
+                false
+            }
             JournalPayload::RecallLedgerRecorded(_) => return Err(StoreError::StoreCorrupt),
             JournalPayload::SessionImportEventRecorded(_) => {
                 return Err(StoreError::StoreCorrupt);
@@ -6022,7 +6824,8 @@ impl ReducerState {
         Ok(ProjectionSnapshot { frontier, rows })
     }
 
-    fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
+    fn into_rows(mut self) -> Result<Vec<ObjectRow>, StoreError> {
+        self.close_deleted_product_state();
         let mut rows = Vec::new();
         rows.extend(recall_projection::rows(&self.atoms, |atom| {
             self.s23.atom_support_eligible(atom.revision_id)
@@ -6570,7 +7373,77 @@ impl ReducerState {
                 seq,
             )?);
         }
-        Ok(rows)
+        rows.extend(self.deletions.rows()?);
+        filter_product_rows(rows, &self.deletions)
+    }
+
+    fn close_deleted_product_state(&mut self) {
+        let mut revision_ids = BTreeSet::new();
+        let mut atom_ids = BTreeSet::new();
+        let mut procedure_ids = BTreeSet::new();
+        let mut membership_ids = BTreeSet::new();
+        for event in self.deletions.events() {
+            revision_ids.extend(event.exact_revision_ids.iter().copied());
+            match event.target {
+                ObjectDeletionTarget::Atom { atom_id } => {
+                    atom_ids.insert(atom_id);
+                }
+                ObjectDeletionTarget::Procedure { procedure_id } => {
+                    procedure_ids.insert(procedure_id);
+                }
+                ObjectDeletionTarget::CoreMembership { core_membership_id } => {
+                    membership_ids.insert(core_membership_id);
+                }
+            }
+        }
+        if revision_ids.is_empty() {
+            return;
+        }
+        self.atoms.retain(|id, _| !atom_ids.contains(id));
+        self.atom_revisions.retain(|revision, (atom, _)| {
+            !revision_ids.contains(revision) && !atom_ids.contains(&atom.atom_id)
+        });
+        self.procedure.forget(&procedure_ids, &revision_ids);
+        let owned_support_contracts = self
+            .s23
+            .deletion_owned_contracts(&revision_ids, &membership_ids);
+        let owned_outbox_ids = self
+            .outbox
+            .values()
+            .filter(|(outbox, _)| {
+                outbox.dirty.target_kind == DirtyTargetKind::RuntimeJob
+                    && outbox
+                        .dirty
+                        .target_id
+                        .parse::<RevisionId>()
+                        .is_ok_and(|id| owned_support_contracts.contains(&id))
+            })
+            .map(|(outbox, _)| outbox.outbox_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.dirty.retain(|_, (dirty, _)| {
+            let owned = dirty
+                .target_id
+                .parse::<RevisionId>()
+                .is_ok_and(|id| owned_support_contracts.contains(&id));
+            dirty.target_kind != DirtyTargetKind::RuntimeJob || !owned
+        });
+        self.outbox.retain(|id, _| !owned_outbox_ids.contains(id));
+        self.jobs
+            .retain(|_, (job, _)| !owned_outbox_ids.contains(&job.idempotency_key));
+        self.s23.forget(&revision_ids, &membership_ids);
+
+        let deleted_proposal_ids = self
+            .proposal_revisions
+            .values()
+            .filter_map(|(proposal, _)| {
+                proposal_targets_deleted(proposal, &atom_ids, &procedure_ids, &membership_ids)
+                    .then_some(proposal.proposal_id)
+            })
+            .collect::<BTreeSet<_>>();
+        self.proposals
+            .retain(|id, _| !deleted_proposal_ids.contains(id));
+        self.proposal_revisions
+            .retain(|_, (proposal, _)| !deleted_proposal_ids.contains(&proposal.proposal_id));
     }
 
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
@@ -6751,8 +7624,14 @@ impl ReducerState {
             source_receipts: &self.source_receipts,
             source_observations: &self.source_observations,
         })?;
+        let deleted_revision_ids = self
+            .deletions
+            .events()
+            .flat_map(|event| event.exact_revision_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
         semantic::validate_relations(semantic::SemanticRelationInputs {
             atom_revisions: &self.atom_revisions,
+            deleted_revision_ids: &deleted_revision_ids,
             proposal_revisions: &self.proposal_revisions,
             source_observations: &self.source_observations,
             source_receipts: &self.source_receipts,
@@ -6828,6 +7707,7 @@ impl ReducerState {
             s23: self.s23.clone(),
             procedure: self.procedure.clone(),
             synthesis: self.synthesis.clone(),
+            deletions: self.deletions.clone(),
             jobs: self
                 .jobs
                 .iter()
@@ -7326,7 +8206,7 @@ impl ProjectionWorker {
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
             }
-            self.commit_rows(&expected.rows, true, true, true, true)
+            self.commit_rows(&expected.rows, true, true, true, true, false)
                 .await?;
             let persisted = validate_objects_table(&self.objects).await?;
             if persisted != expected.rows {
@@ -7363,6 +8243,9 @@ impl ProjectionWorker {
                     | "worktree_snapshot_recorded_v1"
             )
         });
+        let reconcile_all = delta
+            .iter()
+            .any(|row| row.event_type == "object_deletion_ledger_recorded_v1");
         let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch(&batch)?;
@@ -7376,23 +8259,26 @@ impl ProjectionWorker {
             .iter()
             .map(|row| (row.row_id.as_str(), row))
             .collect::<BTreeMap<_, _>>();
-        let changed = incremental_changed_rows(
-            &expected,
-            &current_by_id,
-            reconcile_recall,
-            reconcile_core,
-            reconcile_wiki,
-            reconcile_procedure_effect,
-        );
+        let changed = (!reconcile_all).then(|| {
+            incremental_changed_rows(
+                &expected,
+                &current_by_id,
+                reconcile_recall,
+                reconcile_core,
+                reconcile_wiki,
+                reconcile_procedure_effect,
+            )
+        });
         if inject_before_commit_failure {
             return Err(StoreError::Projection);
         }
         self.commit_rows(
-            &changed,
+            changed.as_deref().unwrap_or(&expected.rows),
             reconcile_recall,
             reconcile_core,
             reconcile_wiki,
             reconcile_procedure_effect,
+            reconcile_all,
         )
         .await?;
         let persisted = validate_objects_table(&self.objects).await?;
@@ -7422,6 +8308,7 @@ impl ProjectionWorker {
         reconcile_core: bool,
         reconcile_wiki: bool,
         reconcile_procedure_effect: bool,
+        reconcile_all: bool,
     ) -> Result<(), StoreError> {
         let batch = objects_batch(rows)?;
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
@@ -7430,7 +8317,10 @@ impl ProjectionWorker {
         let mut merge = self.objects.merge_insert(&["row_id"]);
         merge.when_matched_update_all(None);
         merge.when_not_matched_insert_all();
-        if reconcile_recall || reconcile_core || reconcile_wiki || reconcile_procedure_effect {
+        if reconcile_all {
+            merge.when_not_matched_by_source_delete(None);
+        } else if reconcile_recall || reconcile_core || reconcile_wiki || reconcile_procedure_effect
+        {
             let mut predicates = Vec::new();
             if reconcile_recall {
                 predicates.push(format!(
@@ -8860,6 +9750,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -8906,7 +9797,7 @@ mod tests {
             .unwrap(),
         );
         worker
-            .commit_rows(&[migration], false, false, false, false)
+            .commit_rows(&[migration], false, false, false, false, false)
             .await
             .unwrap();
         assert!(matches!(
@@ -8972,6 +9863,7 @@ mod tests {
         worker
             .commit_rows(
                 &[ObjectRow::checkpoint(3, PROJECTION_GENERATION)],
+                false,
                 false,
                 false,
                 false,

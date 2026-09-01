@@ -701,6 +701,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         proposal_review: None,
         support_detail: None,
         competing_detail: None,
+        forget_preview: None,
         negative_review: None,
         recovery_detail: None,
         worktree_detail: None,
@@ -1527,8 +1528,7 @@ async fn mark_new_attempt_creates_one_unknown_child_and_replays_after_reopen() {
     reopened_task.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core() {
+async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() {
     let root = TempDir::new().unwrap();
     let runtime = runtime_snapshot(root.path());
     DeviceKeyStore::new(runtime.device_key_dir.clone())
@@ -4516,4 +4516,9 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core() {
     assert!(!stale_edit_path.exists());
     reopened_handle.shutdown().await.unwrap();
     reopened_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core() {
+    Box::pin(plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner()).await;
 }

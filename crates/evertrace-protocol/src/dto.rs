@@ -6,6 +6,7 @@ use evertrace_domain::{
         RevisionProposalId, WorktreeId, WorktreeSnapshotId,
     },
     procedure::ProcedureNegativeReviewStatus,
+    purge::ObjectDeletionTarget,
     repository::{
         DestructiveClass, GitRegistrationState, OrderingIntegrity, RecoveryApplicationKind,
         RecoveryApplicationStatus, RecoveryCaptureStatus, RecoveryInputDeliveryState,
@@ -168,6 +169,11 @@ pub enum HumanActionRequest {
     MarkNewAttempt {
         expected_attempt_revision_id: RevisionId,
     },
+    ForgetObject {
+        target: ObjectDeletionTarget,
+        expected_revision_ids: Vec<RevisionId>,
+        expected_deletion_generation: u64,
+    },
     Unavailable {
         action: HumanUnavailableAction,
     },
@@ -305,12 +311,28 @@ pub struct HumanCompetingDetail {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct HumanForgetPreview {
+    pub target: ObjectDeletionTarget,
+    pub current_revision_id: RevisionId,
+    pub exact_revision_ids: Vec<RevisionId>,
+    pub deletion_generation: u64,
+    pub shared_source_count: u32,
+    pub suppressed_source_count: u32,
+    pub suppression_ref_count: u32,
+    pub downstream_support_revalidation_count: u32,
+    pub dependent_procedure_review_hold_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanSnapshotItem {
     pub item_kind: HumanItemKind,
     pub proposal: Option<HumanProposalMetadata>,
     pub proposal_review: Option<HumanProposalReview>,
     pub support_detail: Option<HumanSupportDetail>,
     pub competing_detail: Option<HumanCompetingDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forget_preview: Option<Box<HumanForgetPreview>>,
     pub negative_review: Option<HumanNegativeReviewMetadata>,
     pub recovery_detail: Option<HumanRecoveryDetail>,
     pub worktree_detail: Option<HumanWorktreeDetail>,
@@ -632,6 +654,18 @@ impl HumanActionRequest {
             .validate()
             .is_ok(),
             Self::ResolveCompetingSelected { .. } | Self::MarkNewAttempt { .. } => true,
+            Self::ForgetObject {
+                expected_revision_ids,
+                expected_deletion_generation,
+                ..
+            } => {
+                *expected_deletion_generation > 0
+                    && !expected_revision_ids.is_empty()
+                    && expected_revision_ids.len() <= 256
+                    && expected_revision_ids
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1])
+            }
             Self::Unavailable { .. } => true,
         }
     }
@@ -728,6 +762,22 @@ impl HumanSnapshotItem {
                         .eligible_attempt_ids
                         .windows(2)
                         .all(|pair| pair[0] < pair[1])
+            })
+            && self.forget_preview.as_ref().is_none_or(|preview| {
+                preview.deletion_generation > 0
+                    && !preview.exact_revision_ids.is_empty()
+                    && preview.exact_revision_ids.len() <= 256
+                    && preview
+                        .exact_revision_ids
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1])
+                    && preview
+                        .exact_revision_ids
+                        .binary_search(&preview.current_revision_id)
+                        .is_ok()
+                    && self.revision_ref.as_deref()
+                        == Some(preview.current_revision_id.to_string().as_str())
+                    && self.object_ref.as_deref() == Some(preview.target.object_ref().as_str())
             })
             && self.negative_review.as_ref().is_none_or(|review| {
                 self.revision_ref.as_deref()

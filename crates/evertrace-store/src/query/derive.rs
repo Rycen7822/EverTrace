@@ -1,11 +1,54 @@
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
-    evidence::{EvidenceSourceKind, EvidenceSurface, SourceReceipt},
+    evidence::{EvidenceSourceKind, EvidenceSurface, SourceReceipt, payload_fingerprint},
     revision::RevisionId,
     semantic::WikiProjection,
 };
 
 use crate::{JournalPayload, StoreError, search::SearchProjectionRow};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DefaultRetrievalSuppressionGeneration {
+    ObservationSpanV1,
+    ContentSpanV2,
+}
+
+pub fn default_retrieval_suppression_ref_hash(
+    surface: &EvidenceSurface,
+    receipt: &SourceReceipt,
+    generation: DefaultRetrievalSuppressionGeneration,
+) -> Result<String, StoreError> {
+    surface.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    receipt.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    if receipt.source_observation_id != surface.source_observation_revision_ref {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let (version, span_identity) = match generation {
+        DefaultRetrievalSuppressionGeneration::ObservationSpanV1 => (1, surface.span_hash.clone()),
+        DefaultRetrievalSuppressionGeneration::ContentSpanV2 => (
+            2,
+            hex(payload_fingerprint(
+                surface.canonicalization_version,
+                surface.protected_text.as_bytes(),
+                None,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?),
+        ),
+    };
+    sha256(
+        "evertrace_default_retrieval_suppression_ref",
+        version,
+        &CanonicalValue::Sequence(vec![
+            CanonicalValue::String(source_kind(receipt.source_kind).into()),
+            CanonicalValue::String(receipt.identity_domain.clone()),
+            CanonicalValue::String(receipt.source_record_identity.as_str().into()),
+            CanonicalValue::Integer(i128::from(surface.canonicalization_version)),
+            CanonicalValue::String(span_identity),
+        ]),
+    )
+    .map(hex)
+    .map_err(|_| StoreError::StoreCorrupt)
+}
 
 pub(super) fn wiki_search_row(
     projection: &WikiProjection,
@@ -253,18 +296,11 @@ pub(super) fn surface_row(
     if receipt.source_observation_id != surface.source_observation_revision_ref {
         return Err(StoreError::StoreCorrupt);
     }
-    let suppression = sha256(
-        "evertrace_default_retrieval_suppression_ref",
-        1,
-        &CanonicalValue::Sequence(vec![
-            CanonicalValue::String(source_kind(receipt.source_kind).into()),
-            CanonicalValue::String(receipt.identity_domain.clone()),
-            CanonicalValue::String(receipt.source_record_identity.as_str().into()),
-            CanonicalValue::Integer(i128::from(surface.canonicalization_version)),
-            CanonicalValue::String(surface.span_hash.clone()),
-        ]),
-    )
-    .map_err(|_| StoreError::StoreCorrupt)?;
+    let suppression = default_retrieval_suppression_ref_hash(
+        surface,
+        receipt,
+        DefaultRetrievalSuppressionGeneration::ContentSpanV2,
+    )?;
     Ok(SearchProjectionRow {
         row_id: format!(
             "search:evidence:{}:{}",
@@ -323,7 +359,7 @@ pub(super) fn surface_row(
         } else {
             "partial".into()
         },
-        suppression_ref_hash: Some(hex(suppression)),
+        suppression_ref_hash: Some(suppression),
         source_event_seq: seq,
         projection_generation: 1,
     })

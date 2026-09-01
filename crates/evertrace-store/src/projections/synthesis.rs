@@ -377,6 +377,18 @@ pub(crate) fn wiki_render_identity(
 }
 
 impl SynthesisState {
+    pub(super) fn live_source_reference_strings(&self) -> Vec<&str> {
+        self.digests
+            .values()
+            .flat_map(|(digest, _)| digest.selected_direct_refs.iter().map(String::as_str))
+            .chain(
+                self.runs
+                    .values()
+                    .flat_map(|(run, _)| run.selected_direct_refs.iter().map(String::as_str)),
+            )
+            .collect()
+    }
+
     pub(super) fn digests(&self) -> &BTreeMap<SemanticDigestId, (SemanticDigest, u64)> {
         &self.digests
     }

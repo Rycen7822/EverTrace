@@ -12,6 +12,7 @@ use evertrace_domain::{
         ProcedureNegativeEvidence, ProcedureNegativeReviewEvent, ProcedureRevision,
         ProcedureStateEvent, ProcedureUsageRevision,
     },
+    purge::ObjectDeletionLedgerEvent,
     recall::RecallLedgerEvent,
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
@@ -586,6 +587,7 @@ pub enum JournalPayload {
     GlobalSupportValidationRecorded(Box<GlobalSupportValidationEvent>),
     SemanticDigestRecorded(Box<SemanticDigest>),
     SemanticDerivationRunRecorded(Box<SemanticDerivationRun>),
+    ObjectDeletionLedgerRecorded(Box<ObjectDeletionLedgerEvent>),
     RecallLedgerRecorded(Box<RecallLedgerEvent>),
     SessionImportEventRecorded(Box<crate::session_import::SessionImportEvent>),
 }
@@ -648,6 +650,7 @@ impl JournalPayload {
             Self::GlobalSupportValidationRecorded(_) => "global_support_validation_recorded_v1",
             Self::SemanticDigestRecorded(_) => "semantic_digest_recorded_v1",
             Self::SemanticDerivationRunRecorded(_) => "semantic_derivation_run_recorded_v1",
+            Self::ObjectDeletionLedgerRecorded(_) => "object_deletion_ledger_recorded_v1",
             Self::RecallLedgerRecorded(_) => "recall_ledger_recorded_v1",
             Self::SessionImportEventRecorded(_) => "session_import_event_recorded_v1",
         }
@@ -701,6 +704,7 @@ impl JournalPayload {
             | Self::GlobalSupportValidationRecorded(_)
             | Self::SemanticDigestRecorded(_)
             | Self::SemanticDerivationRunRecorded(_)
+            | Self::ObjectDeletionLedgerRecorded(_)
             | Self::RecallLedgerRecorded(_) => RecordClass::ObjectEvent,
             Self::SessionImportEventRecorded(_) => RecordClass::RuntimeEvent,
             _ => RecordClass::RuntimeEvent,
@@ -907,6 +911,13 @@ impl JournalPayload {
             Self::SemanticDerivationRunRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
+            Self::ObjectDeletionLedgerRecorded(value) => {
+                if value.validate() {
+                    Ok(())
+                } else {
+                    Err(StoreError::InvalidInput)
+                }
+            }
             Self::GlobalSupportValidationRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
@@ -1097,6 +1108,9 @@ impl JournalPayload {
             Self::SemanticDigestRecorded(value) => tagged_json("semantic_digest_recorded", value),
             Self::SemanticDerivationRunRecorded(value) => {
                 tagged_json("semantic_derivation_run_recorded", value)
+            }
+            Self::ObjectDeletionLedgerRecorded(value) => {
+                tagged_json("object_deletion_ledger_recorded", value)
             }
             Self::RecallLedgerRecorded(value) => tagged_json("recall_ledger_recorded", value),
         }

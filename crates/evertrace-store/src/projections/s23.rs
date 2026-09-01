@@ -31,6 +31,246 @@ pub(super) struct S23State {
 }
 
 impl S23State {
+    pub(super) fn forget(
+        &mut self,
+        revision_ids: &BTreeSet<RevisionId>,
+        membership_ids: &BTreeSet<CoreMembershipId>,
+    ) {
+        let removed_contracts = self
+            .membership_revisions
+            .values()
+            .filter_map(|(membership, _)| {
+                (membership_ids.contains(&membership.core_membership_id)
+                    || revision_ids.contains(&membership.membership_revision_id)
+                    || revision_ids.contains(&membership.atom_revision_id))
+                .then_some(membership.support_contract_ref)
+            })
+            .chain(self.contracts.iter().filter_map(|(id, (contract, _))| {
+                contract
+                    .successor_revision_or_membership_ref
+                    .parse::<RevisionId>()
+                    .is_ok_and(|revision| revision_ids.contains(&revision))
+                    .then_some(*id)
+            }))
+            .collect::<BTreeSet<_>>();
+        self.memberships.retain(|id, (membership, _)| {
+            !membership_ids.contains(id)
+                && !revision_ids.contains(&membership.membership_revision_id)
+                && !revision_ids.contains(&membership.atom_revision_id)
+        });
+        self.membership_revisions
+            .retain(|revision, (membership, _)| {
+                !revision_ids.contains(revision)
+                    && !membership_ids.contains(&membership.core_membership_id)
+                    && !revision_ids.contains(&membership.atom_revision_id)
+            });
+        self.contracts
+            .retain(|id, _| !removed_contracts.contains(id));
+        self.validations.retain(|_, (validation, _)| {
+            !removed_contracts.contains(&validation.support_contract_ref)
+        });
+        self.current_validations
+            .retain(|id, _| !removed_contracts.contains(id));
+    }
+
+    pub(super) fn deletion_support_impacts(
+        &self,
+        target: evertrace_domain::purge::ObjectDeletionTarget,
+        revision_ids: &BTreeSet<RevisionId>,
+    ) -> Result<Vec<crate::purge::ObjectDeletionSupportImpact>, StoreError> {
+        let membership_ids = match target {
+            evertrace_domain::purge::ObjectDeletionTarget::CoreMembership {
+                core_membership_id,
+            } => BTreeSet::from([core_membership_id]),
+            evertrace_domain::purge::ObjectDeletionTarget::Atom { .. }
+            | evertrace_domain::purge::ObjectDeletionTarget::Procedure { .. } => BTreeSet::new(),
+        };
+        let owned = self.deletion_owned_contracts(revision_ids, &membership_ids);
+        let mut impacts = Vec::new();
+        for (contract_id, (contract, _)) in &self.contracts {
+            if owned.contains(contract_id) {
+                continue;
+            }
+            let trigger_refs = contract
+                .support_revision_refs
+                .iter()
+                .chain(&contract.authorization_revision_refs)
+                .filter(|revision| revision_ids.contains(revision))
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if trigger_refs.is_empty() {
+                continue;
+            }
+            let current_validation = self
+                .current_validations
+                .get(contract_id)
+                .map(|(validation, _)| validation.clone())
+                .ok_or(StoreError::StoreCorrupt)?;
+            impacts.push(crate::purge::ObjectDeletionSupportImpact {
+                current_validation,
+                trigger_refs,
+            });
+        }
+        Ok(impacts)
+    }
+
+    pub(super) fn deletion_owned_contracts(
+        &self,
+        revision_ids: &BTreeSet<RevisionId>,
+        membership_ids: &BTreeSet<CoreMembershipId>,
+    ) -> BTreeSet<RevisionId> {
+        self.membership_revisions
+            .values()
+            .filter_map(|(membership, _)| {
+                (membership_ids.contains(&membership.core_membership_id)
+                    || revision_ids.contains(&membership.membership_revision_id)
+                    || revision_ids.contains(&membership.atom_revision_id))
+                .then_some(membership.support_contract_ref)
+            })
+            .chain(self.contracts.iter().filter_map(|(id, (contract, _))| {
+                contract
+                    .successor_revision_or_membership_ref
+                    .parse::<RevisionId>()
+                    .is_ok_and(|revision| revision_ids.contains(&revision))
+                    .then_some(*id)
+            }))
+            .collect()
+    }
+
+    pub(super) fn validate_deletion_support_fanout(
+        &self,
+        impacts: &[crate::purge::ObjectDeletionSupportImpact],
+        occurred_at_us: i64,
+        effective_config_hash: [u8; 32],
+        payloads: &[&JournalPayload],
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        let mut validations_by_contract = BTreeMap::new();
+        let mut dirty_by_target = BTreeMap::new();
+        let mut outbox_by_id = BTreeMap::new();
+        let mut jobs_by_idempotency = BTreeMap::new();
+        for payload in payloads {
+            match payload {
+                JournalPayload::GlobalSupportValidationRecorded(value) => {
+                    if validations_by_contract
+                        .insert(value.support_contract_ref, value.as_ref())
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::DirtyTarget(value)
+                    if value.target_kind == DirtyTargetKind::RuntimeJob =>
+                {
+                    if dirty_by_target
+                        .insert(value.target_id.as_str(), value)
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::OutboxEnqueued(value)
+                    if value.dirty.target_kind == DirtyTargetKind::RuntimeJob =>
+                {
+                    if outbox_by_id
+                        .insert(value.outbox_id.as_str(), value)
+                        .is_some()
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::JobState(value)
+                    if value.kind == "support_closure"
+                        && jobs_by_idempotency
+                            .insert(value.idempotency_key.as_str(), value)
+                            .is_some() =>
+                {
+                    return Err(error);
+                }
+                _ => {}
+            }
+        }
+        if validations_by_contract.len() != impacts.len()
+            || dirty_by_target.len() != impacts.len()
+            || outbox_by_id.len() != impacts.len()
+            || jobs_by_idempotency.len() != impacts.len()
+        {
+            return Err(error);
+        }
+        for impact in impacts {
+            let current = &impact.current_validation;
+            let pending = *validations_by_contract
+                .get(&current.support_contract_ref)
+                .ok_or(error)?;
+            validate_validation_successor(current, pending).map_err(|_| error)?;
+            let generation = current.dependency_generation.checked_add(1).ok_or(error)?;
+            if pending.state != GlobalSupportState::RevalidationPending
+                || pending.dependency_generation != generation
+                || pending.provenance_degraded != current.provenance_degraded
+                || pending.surviving_support_refs != current.surviving_support_refs
+                || !pending.invalid_or_missing_refs.is_empty()
+                || pending.trigger_refs != impact.trigger_refs
+                || pending.validator_revision != 1
+                || pending.created_at_us != occurred_at_us
+            {
+                return Err(error);
+            }
+            let contract_ref = current.support_contract_ref.to_string();
+            let dirty = *dirty_by_target.get(contract_ref.as_str()).ok_or(error)?;
+            if dirty.source_watermark != generation {
+                return Err(error);
+            }
+            let idempotency_key = format!("support:{}:{generation}", current.support_contract_ref);
+            let outbox = *outbox_by_id.get(idempotency_key.as_str()).ok_or(error)?;
+            let job = *jobs_by_idempotency
+                .get(idempotency_key.as_str())
+                .ok_or(error)?;
+            if outbox.dirty != *dirty
+                || job.target_revision != current.successor_ref
+                || job.target_watermark != generation
+                || job.target_generation != generation
+                || job.kind != "support_closure"
+                || job.algorithm_revision != dirty.algorithm_revision
+                || job.model_id.is_some()
+                || job.priority != 0
+                || job.state != JobStatus::Queued
+                || job.attempt != 1
+                || job.backoff_until_us.is_some()
+                || job.config_hash != effective_config_hash
+                || job.budget.max_items != 1
+                || job.budget.max_bytes.is_some()
+                || job.budget.max_input_tokens.is_some()
+                || job.budget.max_output_tokens.is_some()
+                || job.budget.max_calls.is_some()
+                || job.budget.max_wall_time_ms != 250
+                || job.terminal.is_some()
+                || job.lease_until_us.is_some()
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn current_membership(
+        &self,
+        membership_id: CoreMembershipId,
+    ) -> Option<&CoreMembership> {
+        self.memberships.get(&membership_id).map(|(value, _)| value)
+    }
+
+    pub(super) fn memberships_for_deletion(
+        &self,
+        membership_id: CoreMembershipId,
+    ) -> impl Iterator<Item = &CoreMembership> {
+        self.membership_revisions
+            .values()
+            .map(|(value, _)| value)
+            .filter(move |value| value.core_membership_id == membership_id)
+    }
+
     pub(super) fn validation(
         &self,
         revision_id: RevisionId,
