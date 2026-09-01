@@ -45,6 +45,13 @@ pub(crate) struct ProposalEditState {
     pub(crate) cursor: usize,
     pub(crate) error: Option<String>,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RepositoryPurgeConfirmationState {
+    pub(crate) frozen_frontier: u64,
+    pub(crate) preview: evertrace_protocol::dto::HumanRepositoryPurgePreview,
+    pub(crate) entered_repository_id: String,
+    pub(crate) error: Option<String>,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Route {
     Inbox,
@@ -78,6 +85,7 @@ pub struct AppState {
     pub(crate) related_context: Option<RelatedContext>,
     pub(crate) future_operation_shell: Option<FutureOperationShell>,
     pub proposal_confirmation: Option<(u64, HumanActionRequest, Option<HumanProposalReview>)>,
+    pub(crate) repository_purge_confirmation: Option<RepositoryPurgeConfirmationState>,
     pub competing_candidate_selection: usize,
     pub(crate) proposal_edit: Option<ProposalEditState>,
     pub write_queued: bool,
@@ -105,6 +113,7 @@ impl Default for AppState {
             related_context: None,
             future_operation_shell: None,
             proposal_confirmation: None,
+            repository_purge_confirmation: None,
             competing_candidate_selection: 0,
             proposal_edit: None,
             write_queued: false,

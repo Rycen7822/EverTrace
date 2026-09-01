@@ -1,6 +1,12 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
-use evertrace_capture::{CasStore, DurableSpool, RuntimeSnapshot};
+use evertrace_capture::{
+    CaptureRecordBody, CasDigest, CasStore, DurableSpool, MaintenanceFence, RuntimeSnapshot,
+    SealedSegment, SpoolRecord, decode_validated_record_body,
+};
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{SourceInstanceId, SourceRevision, SourceRevisionMode, SourceRole},
@@ -8,7 +14,8 @@ use evertrace_domain::{
 };
 use evertrace_store::{
     DirtyTarget, DirtyTargetKind, EventScope, JournalCommand, JournalEventDraft, JournalPayload,
-    ProjectionSnapshot, SourceIngestWatermark, SourceKind, SourceRevisionRecorded,
+    ProjectionSnapshot, ScopePurgeCurrentView, SourceIngestWatermark, SourceKind,
+    SourceRevisionRecorded,
 };
 use thiserror::Error;
 
@@ -110,11 +117,30 @@ impl EvidenceIngestor {
         let mut progress = DrainProgress::default();
         let mut prefix_projection = None;
         let mut prefix_states = BTreeMap::new();
+        let mut terminal_segments = Vec::new();
         for segment in segments {
+            let purge_snapshot = self.writer.project().await.map_err(map_writer_error)?;
+            let purge_view = ScopePurgeCurrentView::from_snapshot(&purge_snapshot)
+                .map_err(|_| IngestError::StoreCorrupt)?;
             let mut committed = 0_usize;
+            let mut terminal = Vec::new();
+            let mut shared_maintenance = None;
             for frame in segment.frames() {
                 if selected.is_some_and(|ids| !ids.contains(&frame.record.source_observation_id)) {
                     continue;
+                }
+                let body = canonical_body(&frame.record)?;
+                if capture_is_purged(&body, &purge_view) {
+                    terminal.push(body);
+                    continue;
+                }
+                if shared_maintenance.is_none() {
+                    let data_dir = self
+                        .snapshot
+                        .data_dir()
+                        .map_err(|_| IngestError::Snapshot)?;
+                    let fence = MaintenanceFence::open(data_dir).map_err(|_| IngestError::Cas)?;
+                    shared_maintenance = Some(fence.shared().map_err(|_| IngestError::Cas)?);
                 }
                 let verified = verify_capture_frame(frame, &cas)?;
                 let surface_count = usize::from(verified.surface.is_some());
@@ -217,14 +243,91 @@ impl EvidenceIngestor {
             if committed != 0 {
                 self.writer.project().await.map_err(map_writer_error)?;
             }
-            if selected.is_none() || committed == segment.frames().len() {
-                spool
-                    .acknowledge_segment(segment, committed)
-                    .map_err(|_| IngestError::Acknowledgement)?;
-                progress.sealed_segments += 1;
+            let consumed = committed
+                .checked_add(terminal.len())
+                .ok_or(IngestError::InvalidRecord)?;
+            if selected.is_none() || consumed == segment.frames().len() {
+                if !terminal.is_empty() {
+                    terminal_segments.push((segment, consumed, terminal));
+                } else {
+                    spool
+                        .acknowledge_segment(segment, consumed)
+                        .map_err(|_| IngestError::Acknowledgement)?;
+                    progress.sealed_segments += 1;
+                }
             }
         }
+        let terminal_count = terminal_segments.len();
+        if terminal_count != 0 {
+            self.discard_purged_segments(&spool, terminal_segments)
+                .await?;
+            progress.sealed_segments = progress
+                .sealed_segments
+                .checked_add(terminal_count)
+                .ok_or(IngestError::InvalidRecord)?;
+        }
         Ok(progress)
+    }
+
+    async fn discard_purged_segments(
+        &self,
+        spool: &DurableSpool,
+        terminal_segments: Vec<(SealedSegment, usize, Vec<CaptureRecordBody>)>,
+    ) -> Result<(), IngestError> {
+        let data_dir = self
+            .snapshot
+            .data_dir()
+            .map_err(|_| IngestError::Snapshot)?;
+        let fence = MaintenanceFence::open(data_dir).map_err(|_| IngestError::Cas)?;
+        let guard = fence.exclusive().map_err(|_| IngestError::Cas)?;
+        let snapshot = self.writer.project().await.map_err(map_writer_error)?;
+        let purges = ScopePurgeCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| IngestError::StoreCorrupt)?;
+        if terminal_segments
+            .iter()
+            .flat_map(|(_, _, terminal)| terminal)
+            .any(|body| !capture_is_purged(body, &purges))
+        {
+            return Err(IngestError::StoreCorrupt);
+        }
+
+        let candidates = terminal_segments
+            .iter()
+            .flat_map(|(_, _, terminal)| terminal)
+            .map(|body| body.cas_ref.clone())
+            .collect::<BTreeSet<_>>();
+        let mut retained = snapshot
+            .live_cas_refs_intersect(&candidates)
+            .map_err(|_| IngestError::StoreCorrupt)?;
+        let max_segments =
+            usize::try_from(self.snapshot.max_main_files).map_err(|_| IngestError::Snapshot)?;
+        for record in spool
+            .read_durable_records(max_segments, self.snapshot.main_high_watermark_bytes)
+            .map_err(|_| IngestError::Spool)?
+        {
+            let body = canonical_body(&record)?;
+            if capture_is_purged(&body, &purges) {
+                continue;
+            }
+            retained.extend(
+                record
+                    .cas_refs
+                    .iter()
+                    .filter(|reference| candidates.contains(*reference))
+                    .cloned(),
+            );
+        }
+        let digests = candidates
+            .difference(&retained)
+            .map(|reference| CasDigest::from_str(reference).map_err(|_| IngestError::Cas))
+            .collect::<Result<Vec<_>, _>>()?;
+        CasStore::delete_guarded_batch(&guard, &digests).map_err(|_| IngestError::Cas)?;
+        for (segment, consumed, _) in terminal_segments {
+            spool
+                .acknowledge_segment(segment, consumed)
+                .map_err(|_| IngestError::Acknowledgement)?;
+        }
+        Ok(())
     }
 
     fn command_for(
@@ -241,6 +344,21 @@ impl EvidenceIngestor {
         )?;
         JournalCommand::new(command_id, events).map_err(|_| IngestError::InvalidRecord)
     }
+}
+
+fn canonical_body(record: &SpoolRecord) -> Result<CaptureRecordBody, IngestError> {
+    decode_validated_record_body(record)
+        .map(|(body, _)| body)
+        .map_err(|error| match error {
+            evertrace_capture::SpoolFrameError::LegacyUnsupported => IngestError::LegacyRecord,
+            evertrace_capture::SpoolFrameError::Corrupt => IngestError::IdentityMismatch,
+            _ => IngestError::InvalidRecord,
+        })
+}
+
+fn capture_is_purged(body: &CaptureRecordBody, purges: &ScopePurgeCurrentView) -> bool {
+    body.repository_instance_id
+        .is_some_and(|repository_id| purges.events.contains_key(&repository_id))
 }
 
 pub(crate) fn capture_event_drafts(

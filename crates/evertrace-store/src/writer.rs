@@ -117,6 +117,10 @@ impl JournalWriter {
         self.next_seq.saturating_sub(1)
     }
 
+    pub fn projection_worker(&self) -> ProjectionWorker {
+        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
+    }
+
     pub fn recall_current_contexts(
         &self,
         limit: usize,

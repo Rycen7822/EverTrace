@@ -5,7 +5,7 @@ use std::{
 
 use evertrace_capture::{
     CasDigest, CasStore, DurableSpool, PendingGapMarker, PendingQuarantine, RuntimeSnapshot,
-    SealedFrame, decode_record_body,
+    SealedFrame, decode_validated_record_body,
 };
 use evertrace_codex::{
     adapter_manifest::{
@@ -18,8 +18,7 @@ use evertrace_domain::evidence::{
     CaptureGapMarkerEvidence, CaptureOutageInterval, CaptureOutagePositiveSource,
     EvidenceByteRange, EvidenceSurface, IdentityStrength, ObservationRole,
     ReconciliationProvenance, SourceArchiveMode, SourceInstanceId, SourceObservation,
-    SourceReceipt, SourceRevision, hex, payload_fingerprint, source_observation_id,
-    source_receipt_id,
+    SourceReceipt, SourceRevision, hex, payload_fingerprint, source_receipt_id,
 };
 use evertrace_domain::ids::{
     CaptureOutageIntervalId, CaptureReceiptId, CommandId, ExecutionLaneId, SourceObservationId,
@@ -53,21 +52,12 @@ pub(crate) fn verify_capture_frame(
     frame: &SealedFrame,
     cas: &CasStore,
 ) -> Result<VerifiedCapture, IngestError> {
-    let body = decode_record_body(&frame.record.record_body).map_err(|error| match error {
-        evertrace_capture::SpoolFrameError::LegacyUnsupported => IngestError::LegacyRecord,
-        _ => IngestError::InvalidRecord,
-    })?;
-    let observation_id = source_observation_id(
-        &body.source_instance_id,
-        &body.source_revision,
-        &body.source_record_identity,
-    )
-    .map_err(|_| IngestError::InvalidRecord)?;
-    if frame.record.source_observation_id != observation_id.to_string()
-        || frame.record.cas_refs.as_slice() != [body.cas_ref.as_str()]
-    {
-        return Err(IngestError::IdentityMismatch);
-    }
+    let (body, observation_id) =
+        decode_validated_record_body(&frame.record).map_err(|error| match error {
+            evertrace_capture::SpoolFrameError::LegacyUnsupported => IngestError::LegacyRecord,
+            evertrace_capture::SpoolFrameError::Corrupt => IngestError::IdentityMismatch,
+            _ => IngestError::InvalidRecord,
+        })?;
     let cas_digest = CasDigest::from_str(&body.cas_ref).map_err(|_| IngestError::Cas)?;
     let protected = cas.read(&cas_digest).map_err(|_| IngestError::Cas)?;
     if u64::try_from(protected.len()).map_err(|_| IngestError::InvalidRecord)?

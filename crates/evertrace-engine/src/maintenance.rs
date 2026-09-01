@@ -86,6 +86,7 @@ pub struct BackgroundScheduler {
     synthesis: SynthesisPlanner,
     dreaming: DreamingConfig,
     capture_cursor: Arc<AtomicUsize>,
+    repository_purge_plans: Arc<std::sync::Mutex<BTreeMap<JobId, Vec<String>>>>,
 }
 
 impl BackgroundScheduler {
@@ -107,6 +108,7 @@ impl BackgroundScheduler {
             synthesis,
             dreaming,
             capture_cursor: Arc::new(AtomicUsize::new(0)),
+            repository_purge_plans: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -598,7 +600,10 @@ impl BackgroundScheduler {
             matches!(job.state, JobStatus::Queued | JobStatus::Leased)
                 && matches!(
                     job.kind.as_str(),
-                    "physical_normalization" | "session_import_v1" | "semantic_synthesis_v1"
+                    "physical_normalization"
+                        | "session_import_v1"
+                        | "semantic_synthesis_v1"
+                        | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
                 )
         });
         drop(snapshot);
@@ -669,6 +674,29 @@ impl BackgroundScheduler {
                     Err(WriterActorError::StaleFrontier) => retryable = true,
                     Err(error) => return Err(map_writer(error)),
                 }
+            }
+        }
+        if let Some(selected_job) = selected
+            .iter()
+            .find(|selected| selected.lane == BackgroundLane::Maintenance)
+        {
+            if let Some(claimed) = self.claim_job(&selected_job.job).await? {
+                if claimed.job.kind != evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND {
+                    return Err(BackgroundSchedulerError::Store);
+                }
+                let progress = crate::jobs::reconcile_repository_scope_purge_batch(
+                    &self.writer,
+                    &self.runtime,
+                    claimed.snapshot,
+                    &claimed.job,
+                    &self.repository_purge_plans,
+                )
+                .await
+                .map_err(map_writer)?;
+                completed += usize::from(progress.committed);
+                retryable |= progress.retryable;
+            } else {
+                retryable = true;
             }
         }
         retryable |= self.dreaming.max_llm_tasks_per_run != 0
@@ -1422,6 +1450,7 @@ fn executable_job(job: &DurableJob) -> bool {
             | "capture_reconciliation"
             | "session_import_v1"
             | "semantic_synthesis_v1"
+            | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
     )
 }
 

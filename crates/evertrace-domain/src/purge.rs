@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonical::{CanonicalValue, sha256},
     evidence::hex,
-    ids::{AtomId, CoreMembershipId, JobId, ProcedureId, RevisionProposalId},
+    ids::{AtomId, CoreMembershipId, JobId, ProcedureId, RepositoryId, RevisionProposalId},
     revision::RevisionId,
     semantic::{ProposalOperation, RevisionProposal},
 };
 
 pub const OBJECT_DELETION_LEDGER_SCHEMA_VERSION: u16 = 1;
+pub const SCOPE_PURGE_PROGRESS_SCHEMA_VERSION: u16 = 1;
 const OBJECT_REAUTHORIZATION_INTENT_SCHEMA_VERSION: u16 = 1;
 const MAX_DELETED_REVISIONS: usize = 256;
 const MAX_SUPPRESSION_REFS: usize = 512;
@@ -50,6 +51,120 @@ impl ObjectDeletionTarget {
 pub enum ObjectDeletionPhase {
     Pending,
     Purged,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScopePurgeTarget {
+    Repository {
+        repository_id: RepositoryId,
+        repository_revision: u32,
+    },
+}
+
+impl ScopePurgeTarget {
+    pub const fn repository_id(self) -> RepositoryId {
+        match self {
+            Self::Repository { repository_id, .. } => repository_id,
+        }
+    }
+
+    pub const fn repository_revision(self) -> u32 {
+        match self {
+            Self::Repository {
+                repository_revision,
+                ..
+            } => repository_revision,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopePurgeStage {
+    Pending,
+    ProjectionClosed,
+    PhysicalDeleting,
+    Purged,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryPurgeBlocker {
+    RepositoryDerivedGlobalDependency,
+    CrossScopeDependency,
+    CommandEventCap,
+}
+
+impl ScopePurgeStage {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::ProjectionClosed => 1,
+            Self::PhysicalDeleting => 2,
+            Self::Purged => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopePurgeProgress {
+    pub schema_version: u16,
+    pub target: ScopePurgeTarget,
+    pub confirmation_frontier: u64,
+    pub deletion_generation: u64,
+    pub stage: ScopePurgeStage,
+    pub next_ordinal: u64,
+    pub purge_job_id: JobId,
+    pub recorded_at_us: i64,
+    pub terminal_audit_ref: Option<JobId>,
+}
+
+impl ScopePurgeProgress {
+    pub fn validate(&self) -> bool {
+        self.schema_version == SCOPE_PURGE_PROGRESS_SCHEMA_VERSION
+            && self.target.repository_revision() > 0
+            && self.deletion_generation > 0
+            && self.recorded_at_us >= 0
+            && match self.stage {
+                ScopePurgeStage::Pending | ScopePurgeStage::ProjectionClosed => {
+                    self.next_ordinal == 0 && self.terminal_audit_ref.is_none()
+                }
+                ScopePurgeStage::PhysicalDeleting => self.terminal_audit_ref.is_none(),
+                ScopePurgeStage::Purged => self.terminal_audit_ref == Some(self.purge_job_id),
+            }
+    }
+
+    pub fn validate_successor(&self, next: &Self) -> bool {
+        self.validate()
+            && next.validate()
+            && self.target == next.target
+            && self.confirmation_frontier == next.confirmation_frontier
+            && self.deletion_generation == next.deletion_generation
+            && self.purge_job_id == next.purge_job_id
+            && self.recorded_at_us <= next.recorded_at_us
+            && self.stage != ScopePurgeStage::Purged
+            && match (self.stage, next.stage) {
+                (ScopePurgeStage::Pending, ScopePurgeStage::ProjectionClosed) => {
+                    next.next_ordinal == 0
+                }
+                (ScopePurgeStage::ProjectionClosed, ScopePurgeStage::PhysicalDeleting) => {
+                    next.next_ordinal > 0
+                }
+                (ScopePurgeStage::ProjectionClosed, ScopePurgeStage::Purged) => {
+                    self.next_ordinal == 0 && next.next_ordinal == 0
+                }
+                (ScopePurgeStage::PhysicalDeleting, ScopePurgeStage::PhysicalDeleting) => {
+                    next.next_ordinal > self.next_ordinal
+                }
+                (ScopePurgeStage::PhysicalDeleting, ScopePurgeStage::Purged) => {
+                    next.next_ordinal == self.next_ordinal
+                }
+                _ => false,
+            }
+            && next.stage.rank() >= self.stage.rank()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

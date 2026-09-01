@@ -256,6 +256,52 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
             "F stages human-only Forget; Enter confirms once; Esc cancels".into(),
         ]);
     }
+    if let Some(preview) = &item.repository_purge_preview {
+        lines.extend([
+            format!(
+                "repository purge: {}@{} / generation {}",
+                preview.repository_id, preview.repository_revision, preview.deletion_generation
+            ),
+            format!(
+                "CAS plan: {} exclusive item(s), {} shared item(s) retained",
+                preview.planned_exclusive_cas_count, preview.shared_cas_retained_count
+            ),
+            format!(
+                "typed global dependencies: {}; blockers: {:?}",
+                preview.repository_derived_global_dependency_count, preview.blockers
+            ),
+            format!(
+                "affected: {} session, {} Evidence/receipt/capture, {} work, {} Atom, {} Procedure",
+                preview.affected_session_count,
+                preview.affected_evidence_receipt_capture_count,
+                preview.affected_work_count,
+                preview.affected_atom_count,
+                preview.affected_procedure_count
+            ),
+            format!(
+                "research/recovery: {} run, {} result, {} artifact, {} Recovery, {} Recall/derived",
+                preview.affected_experiment_run_count,
+                preview.affected_result_evidence_count,
+                preview.affected_artifact_count,
+                preview.affected_recovery_count,
+                preview.affected_recall_derived_count
+            ),
+            format!(
+                "relationship-only impacts: {}; estimated reclaimable bytes: {}",
+                preview.relationship_only_count,
+                preview
+                    .estimated_reclaimable_bytes
+                    .map_or_else(|| "unavailable".into(), |value| value.to_string())
+            ),
+            format!(
+                "dependency fence: {} support revalidation, {} procedure review-hold",
+                preview.downstream_support_revalidation_count,
+                preview.dependent_procedure_review_hold_count
+            ),
+            "Shared Evidence/CAS is retained; this is not source erasure.".into(),
+            "P opens stable-ID re-entry; strict source erasure is unavailable; Esc cancels".into(),
+        ]);
+    }
     if let Some(review) = &item.negative_review {
         lines.extend([
             format!("negative evidence: {}", review.negative_evidence_id),

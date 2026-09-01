@@ -1,13 +1,16 @@
 use std::{
+    ffi::OsString,
     fmt,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use fs2::FileExt;
+use rustix::fs::{AtFlags, Mode, OFlags, openat, statat, unlinkat};
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -74,6 +77,144 @@ impl FromStr for CasDigest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CasStore {
     root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CasDeleteOutcome {
+    Deleted,
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceFence {
+    data_dir: PathBuf,
+    parent: PathBuf,
+    path: PathBuf,
+    parent_identity: (u64, u64),
+    data_identity: (u64, u64),
+    lock_identity: (u64, u64, i64, i64),
+}
+
+#[derive(Debug)]
+pub struct MaintenanceGuard {
+    exclusive: bool,
+    lock_file: File,
+    _parent_file: File,
+    data_dir: File,
+    cas_dir: File,
+    blobs_dir: File,
+}
+
+impl MaintenanceFence {
+    pub fn open(data_dir: &Path) -> Result<Self, CasError> {
+        validate_directory(data_dir)?;
+        let parent = data_dir.parent().ok_or(CasError::InvalidPath)?;
+        validate_coordination_parent(parent)?;
+        let mut name = OsString::from(data_dir.file_name().ok_or(CasError::InvalidPath)?);
+        name.push(".maintenance.lock");
+        let path = parent.join(name);
+        let existed = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                validate_lock_metadata(&metadata)?;
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(map_io(error)),
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(map_io)?;
+        validate_lock_file(&path, &file)?;
+        if !existed {
+            file.sync_all().map_err(map_io)?;
+            File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(map_io)?;
+        }
+        Ok(Self {
+            data_dir: data_dir.to_owned(),
+            parent: parent.to_owned(),
+            path,
+            parent_identity: directory_identity(parent)?,
+            data_identity: directory_identity(data_dir)?,
+            lock_identity: file_identity(&file)?,
+        })
+    }
+
+    pub fn shared(&self) -> Result<MaintenanceGuard, CasError> {
+        self.lock(false)
+    }
+
+    pub fn exclusive(&self) -> Result<MaintenanceGuard, CasError> {
+        self.lock(true)
+    }
+
+    fn lock(&self, exclusive: bool) -> Result<MaintenanceGuard, CasError> {
+        self.validate_coordination_identity()?;
+        let parent_file = File::open(&self.parent).map_err(map_io)?;
+        if directory_file_identity(&parent_file)? != self.parent_identity {
+            return Err(CasError::IdentityChanged);
+        }
+        self.validate_coordination_identity()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(map_io)?;
+        validate_lock_file(&self.path, &file)?;
+        try_lock(&file, exclusive)?;
+        validate_lock_file(&self.path, &file)?;
+        if file_identity(&file)? != self.lock_identity {
+            return Err(CasError::IdentityChanged);
+        }
+        self.validate_coordination_identity()?;
+        let data_name = self.data_dir.file_name().ok_or(CasError::InvalidPath)?;
+        let data_dir = open_directory_at(&parent_file, data_name)?;
+        if directory_file_identity(&data_dir)? != self.data_identity {
+            return Err(CasError::IdentityChanged);
+        }
+        let cas_dir = open_directory_at(&data_dir, "cas")?;
+        let blobs_dir = open_directory_at(&cas_dir, "blobs")?;
+        Ok(MaintenanceGuard {
+            exclusive,
+            lock_file: file,
+            _parent_file: parent_file,
+            data_dir,
+            cas_dir,
+            blobs_dir,
+        })
+    }
+
+    pub fn lock_path(&self) -> &Path {
+        &self.path
+    }
+
+    fn validate_coordination_identity(&self) -> Result<(), CasError> {
+        validate_coordination_parent(&self.parent)?;
+        validate_directory(&self.data_dir)?;
+        if directory_identity(&self.parent)? != self.parent_identity
+            || directory_identity(&self.data_dir)? != self.data_identity
+        {
+            return Err(CasError::IdentityChanged);
+        }
+        let lock = fs::symlink_metadata(&self.path).map_err(map_io)?;
+        validate_lock_metadata(&lock)?;
+        if metadata_identity(&lock) != self.lock_identity {
+            return Err(CasError::IdentityChanged);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
 }
 
 impl CasStore {
@@ -178,6 +319,85 @@ impl CasStore {
         Ok(protected)
     }
 
+    pub fn encoded_blob_length(&self, digest: &CasDigest) -> Result<u64, CasError> {
+        self.validate_root()?;
+        let path = self.blob_path(digest);
+        let before = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CasError::NotFound
+            } else {
+                map_io(error)
+            }
+        })?;
+        if before.file_type().is_symlink() || !before.is_file() {
+            return Err(CasError::InvalidType);
+        }
+        if before.uid() != current_uid()? {
+            return Err(CasError::WrongOwner);
+        }
+        if before.len() < HEADER_LENGTH as u64 {
+            return Err(CasError::StoreCorrupt);
+        }
+        let mut file = File::open(&path).map_err(map_io)?;
+        let opened = file.metadata().map_err(map_io)?;
+        if opened.dev() != before.dev() || opened.ino() != before.ino() || !opened.is_file() {
+            return Err(CasError::IdentityChanged);
+        }
+        let mut header = [0_u8; HEADER_LENGTH];
+        file.read_exact(&mut header)
+            .map_err(|_| CasError::StoreCorrupt)?;
+        let decoded = decode_header(&header, digest)?;
+        if before.len()
+            != (HEADER_LENGTH as u64)
+                .checked_add(decoded.compressed_length)
+                .ok_or(CasError::StoreCorrupt)?
+        {
+            return Err(CasError::StoreCorrupt);
+        }
+        Ok(before.len())
+    }
+
+    pub fn delete_guarded_batch(
+        guard: &MaintenanceGuard,
+        digests: &[CasDigest],
+    ) -> Result<Vec<CasDeleteOutcome>, CasError> {
+        if !guard.exclusive {
+            return Err(CasError::ExclusiveMaintenanceRequired);
+        }
+        if directory_file_identity(&guard.data_dir).is_err()
+            || directory_file_identity(&guard.cas_dir).is_err()
+            || directory_file_identity(&guard.blobs_dir).is_err()
+        {
+            return Err(CasError::IdentityChanged);
+        }
+        let mut by_parent = std::collections::BTreeMap::<String, Vec<(usize, CasDigest)>>::new();
+        for (index, digest) in digests.iter().copied().enumerate() {
+            let value = digest.as_hex();
+            by_parent
+                .entry(value[..2].to_owned())
+                .or_default()
+                .push((index, digest));
+        }
+        let mut outcomes = vec![CasDeleteOutcome::Missing; digests.len()];
+        for (prefix, entries) in by_parent {
+            let Some(parent) = open_optional_directory_at(&guard.blobs_dir, &prefix)? else {
+                continue;
+            };
+            try_lock(&parent, true)?;
+            let mut changed = false;
+            for (index, digest) in entries {
+                let value = digest.as_hex();
+                let outcome = delete_from_parent(&parent, &value[2..], &digest)?;
+                changed |= outcome == CasDeleteOutcome::Deleted;
+                outcomes[index] = outcome;
+            }
+            if changed {
+                parent.sync_all().map_err(map_io)?;
+            }
+        }
+        Ok(outcomes)
+    }
+
     pub fn parse_digest(value: &str) -> Result<CasDigest, CasError> {
         value.parse()
     }
@@ -193,6 +413,108 @@ impl CasStore {
     }
 }
 
+fn validate_lock_file(path: &Path, file: &File) -> Result<(), CasError> {
+    let path_metadata = fs::symlink_metadata(path).map_err(map_io)?;
+    let opened = file.metadata().map_err(map_io)?;
+    validate_lock_metadata(&path_metadata)?;
+    validate_lock_metadata(&opened)?;
+    if path_metadata.dev() != opened.dev() || path_metadata.ino() != opened.ino() {
+        return Err(CasError::IdentityChanged);
+    }
+    Ok(())
+}
+
+fn validate_lock_metadata(metadata: &fs::Metadata) -> Result<(), CasError> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CasError::InvalidType);
+    }
+    if metadata.uid() != current_uid()? {
+        return Err(CasError::WrongOwner);
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(CasError::InvalidPermissions);
+    }
+    Ok(())
+}
+
+fn validate_coordination_parent(path: &Path) -> Result<(), CasError> {
+    let metadata = fs::symlink_metadata(path).map_err(map_io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CasError::InvalidType);
+    }
+    Ok(())
+}
+
+fn try_lock(file: &File, exclusive: bool) -> Result<(), CasError> {
+    let result = if exclusive {
+        FileExt::try_lock_exclusive(file)
+    } else {
+        FileExt::try_lock_shared(file)
+    };
+    result.map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            CasError::LockBusy
+        } else {
+            map_io(error)
+        }
+    })
+}
+
+fn open_directory_at(parent: &File, name: impl AsRef<Path>) -> Result<File, CasError> {
+    open_optional_directory_at(parent, name)?.ok_or(CasError::Io)
+}
+
+fn open_optional_directory_at(
+    parent: &File,
+    name: impl AsRef<Path>,
+) -> Result<Option<File>, CasError> {
+    let file = match openat(
+        parent,
+        name.as_ref(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    ) {
+        Ok(file) => File::from(file),
+        Err(Errno::NOENT) => return Ok(None),
+        Err(_) => return Err(CasError::Io),
+    };
+    let metadata = file.metadata().map_err(map_io)?;
+    if !metadata.is_dir() {
+        return Err(CasError::InvalidType);
+    }
+    if metadata.uid() != current_uid()? {
+        return Err(CasError::WrongOwner);
+    }
+    Ok(Some(file))
+}
+
+fn directory_file_identity(file: &File) -> Result<(u64, u64), CasError> {
+    let metadata = file.metadata().map_err(map_io)?;
+    if !metadata.is_dir() {
+        return Err(CasError::InvalidType);
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn directory_identity(path: &Path) -> Result<(u64, u64), CasError> {
+    let metadata = fs::symlink_metadata(path).map_err(map_io)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn file_identity(file: &File) -> Result<(u64, u64, i64, i64), CasError> {
+    let metadata = file.metadata().map_err(map_io)?;
+    Ok(metadata_identity(&metadata))
+}
+
+fn metadata_identity(metadata: &fs::Metadata) -> (u64, u64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
 struct DecodedHeader {
     uncompressed_length: u64,
     compressed_length: u64,
@@ -200,6 +522,8 @@ struct DecodedHeader {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CasError {
+    #[error("CAS path is invalid")]
+    InvalidPath,
     #[error("CAS digest is invalid")]
     InvalidDigest,
     #[error("CAS blob was not found")]
@@ -208,6 +532,12 @@ pub enum CasError {
     InvalidType,
     #[error("CAS path has the wrong owner")]
     WrongOwner,
+    #[error("CAS path has invalid permissions")]
+    InvalidPermissions,
+    #[error("CAS maintenance fence is busy")]
+    LockBusy,
+    #[error("CAS deletion requires an exclusive maintenance fence")]
+    ExclusiveMaintenanceRequired,
     #[error("CAS identity changed during access")]
     IdentityChanged,
     #[error("CAS blob is corrupt")]
@@ -309,6 +639,52 @@ fn create_staging(parent: &Path, envelope: &[u8]) -> Result<PathBuf, CasError> {
         return Ok(path);
     }
     Err(CasError::CreateCollision)
+}
+
+fn delete_from_parent(
+    parent: &File,
+    file_name: &str,
+    digest: &CasDigest,
+) -> Result<CasDeleteOutcome, CasError> {
+    let blob_fd = match openat(
+        parent,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(value) => value,
+        Err(rustix::io::Errno::NOENT) => return Ok(CasDeleteOutcome::Missing),
+        Err(_) => return Err(CasError::Io),
+    };
+    let mut file = File::from(blob_fd);
+    let opened = file.metadata().map_err(map_io)?;
+    if !opened.is_file() {
+        return Err(CasError::InvalidType);
+    }
+    if opened.uid() != current_uid()? {
+        return Err(CasError::WrongOwner);
+    }
+    let mut header = [0_u8; HEADER_LENGTH];
+    file.read_exact(&mut header)
+        .map_err(|_| CasError::StoreCorrupt)?;
+    let decoded = decode_header(&header, digest)?;
+    if opened.len()
+        != (HEADER_LENGTH as u64)
+            .checked_add(decoded.compressed_length)
+            .ok_or(CasError::StoreCorrupt)?
+    {
+        return Err(CasError::StoreCorrupt);
+    }
+    let current = statat(parent, file_name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| CasError::IdentityChanged)?;
+    if current.st_dev != opened.dev()
+        || current.st_ino != opened.ino()
+        || current.st_uid != current_uid()?
+    {
+        return Err(CasError::IdentityChanged);
+    }
+    unlinkat(parent, file_name, AtFlags::empty()).map_err(|_| CasError::Io)?;
+    Ok(CasDeleteOutcome::Deleted)
 }
 
 fn ensure_directory(path: &Path) -> Result<(), CasError> {

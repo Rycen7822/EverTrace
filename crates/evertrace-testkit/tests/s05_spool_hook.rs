@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::PermissionsExt,
@@ -161,6 +162,48 @@ fn versioned_frame_round_trip_preserves_record_identity_and_commit_boundary() {
     let mut corrupt = first_bytes;
     corrupt[24] ^= 1;
     assert!(scan_frames(&corrupt).is_err());
+}
+
+#[test]
+fn durable_pin_scan_rejects_canonical_header_mismatch_and_segment_overflow() {
+    let temp = TempDir::new().unwrap();
+    let mut runtime = prepared_runtime(temp.path(), limits());
+    assert!(matches!(
+        runtime.capture(input("pin-a", "first pin body")).unwrap(),
+        CaptureOutcome::Durable { .. }
+    ));
+    runtime.seal_active().unwrap().unwrap();
+    let (spool, _) = DurableSpool::open(temp.path().join("spool"), limits()).unwrap();
+    let segment = spool.sealed_segments(8).unwrap().remove(0);
+    let original = segment.frames()[0].record.clone();
+    let candidates = BTreeSet::from([original.cas_refs[0].clone()]);
+
+    let mut mismatched = original.clone();
+    mismatched.cas_refs = vec![CasDigest::for_protected_bytes(b"different pin").as_hex()];
+    fs::write(segment.path(), encode_frame(&mismatched).unwrap()).unwrap();
+    assert_eq!(
+        spool.durable_cas_refs_intersect(&candidates, 8, limits().high_watermark_bytes),
+        Err(SpoolError::Corrupt)
+    );
+
+    mismatched = original.clone();
+    mismatched.source_observation_id = "checksum-valid-wrong-observation".into();
+    fs::write(segment.path(), encode_frame(&mismatched).unwrap()).unwrap();
+    assert_eq!(
+        spool.durable_cas_refs_intersect(&candidates, 8, limits().high_watermark_bytes),
+        Err(SpoolError::Corrupt)
+    );
+    fs::write(segment.path(), encode_frame(&original).unwrap()).unwrap();
+
+    assert!(matches!(
+        runtime.capture(input("pin-b", "second pin body")).unwrap(),
+        CaptureOutcome::Durable { .. }
+    ));
+    runtime.seal_active().unwrap().unwrap();
+    assert_eq!(
+        spool.read_durable_records(1, limits().high_watermark_bytes),
+        Err(SpoolError::ResourceExhausted)
+    );
 }
 
 #[test]

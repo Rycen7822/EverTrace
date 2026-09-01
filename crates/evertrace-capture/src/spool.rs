@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::frame::{DecodedFrame, SpoolFrameError, SpoolRecord, encode_frame, scan_frames};
+use crate::frame::{
+    DecodedFrame, SpoolFrameError, SpoolRecord, decode_validated_record_body, encode_frame,
+    scan_frames,
+};
 
 const ACTIVE_NAME: &str = "active.open";
 const ISOLATED_PREFIX: &str = "isolated-";
@@ -392,7 +395,39 @@ impl DurableSpool {
         max_segments: usize,
         max_bytes: u64,
     ) -> Result<Vec<SpoolRecord>, SpoolError> {
-        if max_segments == 0 || max_segments > 64 || max_bytes == 0 {
+        let mut records = Vec::new();
+        self.visit_durable_records(max_segments, max_bytes, |record| {
+            records.push(record.clone());
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    /// Bounded intersection of durable spool CAS references with a caller-owned candidate set.
+    pub fn durable_cas_refs_intersect(
+        &self,
+        candidates: &BTreeSet<String>,
+        max_segments: usize,
+        max_bytes: u64,
+    ) -> Result<BTreeSet<String>, SpoolError> {
+        let mut retained = BTreeSet::new();
+        self.visit_durable_records(max_segments, max_bytes, |record| {
+            let (body, _) = decode_validated_record_body(record)?;
+            if candidates.contains(&body.cas_ref) {
+                retained.insert(body.cas_ref);
+            }
+            Ok(())
+        })?;
+        Ok(retained)
+    }
+
+    fn visit_durable_records(
+        &self,
+        max_segments: usize,
+        max_bytes: u64,
+        mut visit: impl FnMut(&SpoolRecord) -> Result<(), SpoolError>,
+    ) -> Result<(), SpoolError> {
+        if max_segments == 0 || max_bytes == 0 {
             return Err(SpoolError::InvalidConfiguration);
         }
         self.validate_directories()?;
@@ -408,21 +443,29 @@ impl DurableSpool {
             if !is_active && path.extension().is_none_or(|value| value != "sealed") {
                 return Err(SpoolError::Corrupt);
             }
-            paths.push((!is_active, path, metadata.len()));
+            if paths
+                .len()
+                .checked_add(1)
+                .is_none_or(|count| count > max_segments)
+            {
+                return Err(SpoolError::ResourceExhausted);
+            }
+            paths.push((!is_active, path, metadata));
         }
         paths.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        if paths.len() > max_segments {
-            return Err(SpoolError::ResourceExhausted);
-        }
         let mut consumed = 0_u64;
-        let mut records = Vec::new();
         let mut record_ids = BTreeSet::new();
-        for (_, path, length) in paths {
-            consumed = consumed
+        for (_, path, metadata) in paths {
+            let length = metadata.len();
+            let next_consumed = consumed
                 .checked_add(length)
                 .filter(|value| *value <= max_bytes)
                 .ok_or(SpoolError::ResourceExhausted)?;
-            let bytes = read_owned_file(&path)?;
+            let remaining = max_bytes
+                .checked_sub(consumed)
+                .ok_or(SpoolError::ResourceExhausted)?;
+            let bytes = read_owned_file_exact(&path, &metadata, remaining)?;
+            consumed = next_consumed;
             let scan = scan_frames(&bytes)?;
             if scan.incomplete_tail || scan.complete_length != length {
                 return Err(SpoolError::Corrupt);
@@ -431,10 +474,10 @@ impl DurableSpool {
                 if !record_ids.insert(frame.record.spool_record_id.clone()) {
                     return Err(SpoolError::DuplicateRecord);
                 }
-                records.push(frame.record);
+                visit(&frame.record)?;
             }
         }
-        Ok(records)
+        Ok(())
     }
 
     pub fn seal_active(&mut self, generation: u64) -> Result<Option<PathBuf>, SpoolError> {
@@ -1067,6 +1110,33 @@ fn read_owned_file(path: &Path) -> Result<Vec<u8>, SpoolError> {
     Ok(bytes)
 }
 
+fn read_owned_file_exact(
+    path: &Path,
+    expected: &fs::Metadata,
+    remaining: u64,
+) -> Result<Vec<u8>, SpoolError> {
+    validate_owned_file_metadata(expected)?;
+    let expected_length = expected.len();
+    if expected_length > remaining {
+        return Err(SpoolError::ResourceExhausted);
+    }
+    let mut file = File::open(path).map_err(map_io)?;
+    validate_ack_identity(path, &file, expected.dev(), expected.ino(), expected_length)?;
+    let read_limit = expected_length.saturating_add(1).min(remaining);
+    let capacity = usize::try_from(expected_length.min(read_limit))
+        .map_err(|_| SpoolError::ResourceExhausted)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(map_io)?;
+    if u64::try_from(bytes.len()).map_err(|_| SpoolError::ResourceExhausted)? != expected_length {
+        return Err(SpoolError::Corrupt);
+    }
+    validate_ack_identity(path, &file, expected.dev(), expected.ino(), expected_length)?;
+    Ok(bytes)
+}
+
 fn validate_marker(marker: &CaptureGapMarker) -> Result<(), SpoolError> {
     if marker.marker_id.is_empty()
         || marker.source_ref.is_empty()
@@ -1252,4 +1322,64 @@ fn map_write_error(error: io::Error) -> SpoolError {
 
 fn map_io(_: io::Error) -> SpoolError {
     SpoolError::Io
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn test_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "evertrace-spool-exact-reader-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(&root).unwrap();
+        root
+    }
+
+    fn write_owned(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn exact_reader_rejects_growth_and_path_identity_replacement() {
+        let root = test_root();
+        let path = root.join("segment.sealed");
+        write_owned(&path, b"abc");
+        let expected = fs::symlink_metadata(&path).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"d")
+            .unwrap();
+        assert!(matches!(
+            read_owned_file_exact(&path, &expected, 4),
+            Err(SpoolError::Corrupt | SpoolError::IdentityChanged)
+        ));
+
+        fs::remove_file(&path).unwrap();
+        write_owned(&path, b"abc");
+        let expected = fs::symlink_metadata(&path).unwrap();
+        fs::rename(&path, root.join("displaced.sealed")).unwrap();
+        write_owned(&path, b"abc");
+        assert_eq!(
+            read_owned_file_exact(&path, &expected, 4),
+            Err(SpoolError::IdentityChanged)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

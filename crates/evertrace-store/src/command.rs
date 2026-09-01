@@ -12,7 +12,7 @@ use evertrace_domain::{
         ProcedureNegativeEvidence, ProcedureNegativeReviewEvent, ProcedureRevision,
         ProcedureStateEvent, ProcedureUsageRevision,
     },
-    purge::ObjectDeletionLedgerEvent,
+    purge::{ObjectDeletionLedgerEvent, ScopePurgeProgress},
     recall::RecallLedgerEvent,
     repository::{
         IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
@@ -588,6 +588,7 @@ pub enum JournalPayload {
     SemanticDigestRecorded(Box<SemanticDigest>),
     SemanticDerivationRunRecorded(Box<SemanticDerivationRun>),
     ObjectDeletionLedgerRecorded(Box<ObjectDeletionLedgerEvent>),
+    ScopePurgeProgressRecorded(Box<ScopePurgeProgress>),
     RecallLedgerRecorded(Box<RecallLedgerEvent>),
     SessionImportEventRecorded(Box<crate::session_import::SessionImportEvent>),
 }
@@ -651,6 +652,7 @@ impl JournalPayload {
             Self::SemanticDigestRecorded(_) => "semantic_digest_recorded_v1",
             Self::SemanticDerivationRunRecorded(_) => "semantic_derivation_run_recorded_v1",
             Self::ObjectDeletionLedgerRecorded(_) => "object_deletion_ledger_recorded_v1",
+            Self::ScopePurgeProgressRecorded(_) => "scope_purge_progress_recorded_v1",
             Self::RecallLedgerRecorded(_) => "recall_ledger_recorded_v1",
             Self::SessionImportEventRecorded(_) => "session_import_event_recorded_v1",
         }
@@ -705,6 +707,7 @@ impl JournalPayload {
             | Self::SemanticDigestRecorded(_)
             | Self::SemanticDerivationRunRecorded(_)
             | Self::ObjectDeletionLedgerRecorded(_)
+            | Self::ScopePurgeProgressRecorded(_)
             | Self::RecallLedgerRecorded(_) => RecordClass::ObjectEvent,
             Self::SessionImportEventRecorded(_) => RecordClass::RuntimeEvent,
             _ => RecordClass::RuntimeEvent,
@@ -918,6 +921,13 @@ impl JournalPayload {
                     Err(StoreError::InvalidInput)
                 }
             }
+            Self::ScopePurgeProgressRecorded(value) => {
+                if value.validate() {
+                    Ok(())
+                } else {
+                    Err(StoreError::InvalidInput)
+                }
+            }
             Self::GlobalSupportValidationRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
@@ -1111,6 +1121,9 @@ impl JournalPayload {
             }
             Self::ObjectDeletionLedgerRecorded(value) => {
                 tagged_json("object_deletion_ledger_recorded", value)
+            }
+            Self::ScopePurgeProgressRecorded(value) => {
+                tagged_json("scope_purge_progress_recorded", value)
             }
             Self::RecallLedgerRecorded(value) => tagged_json("recall_ledger_recorded", value),
         }
@@ -1973,6 +1986,7 @@ fn validate_job(value: &DurableJob) -> Result<(), StoreError> {
         || value.lease_until_us.is_some_and(|time| time <= 0)
         || (value.state == JobStatus::Leased) != value.lease_until_us.is_some()
         || value.budget.max_items == 0
+            && value.kind != crate::purge::REPOSITORY_SCOPE_PURGE_JOB_KIND
         || value.budget.max_wall_time_ms == 0
         || value.budget.max_bytes == Some(0)
         || value.budget.max_input_tokens == Some(0)

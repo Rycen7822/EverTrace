@@ -702,6 +702,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         support_detail: None,
         competing_detail: None,
         forget_preview: None,
+        repository_purge_preview: None,
         negative_review: None,
         recovery_detail: None,
         worktree_detail: None,

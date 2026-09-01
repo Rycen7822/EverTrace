@@ -122,6 +122,7 @@ pub struct CaptureRuntime {
     snapshot: RuntimeSnapshot,
     cas: CasStore,
     spool: DurableSpool,
+    maintenance_fence: crate::MaintenanceFence,
     state: CaptureAdmissionState,
 }
 
@@ -129,6 +130,7 @@ impl CaptureRuntime {
     pub fn open(snapshot: RuntimeSnapshot) -> Result<Self, CaptureError> {
         snapshot.validate()?;
         let cas = CasStore::open(snapshot.cas_dir.clone())?;
+        let maintenance_fence = crate::MaintenanceFence::open(snapshot.data_dir()?)?;
         let (spool, recovery) =
             DurableSpool::open(snapshot.spool_dir.clone(), snapshot.spool_limits()?)?;
         let state = if recovery.gaps.is_empty()
@@ -143,6 +145,7 @@ impl CaptureRuntime {
             snapshot,
             cas,
             spool,
+            maintenance_fence,
             state,
         })
     }
@@ -265,6 +268,23 @@ impl CaptureRuntime {
         let protected = protect(&input.raw_payload, &key)?;
         let content_digest =
             crate::CasDigest::for_protected_bytes(protected.protected_bytes()).as_hex();
+        // Lock order is maintenance fence, then CAS parent, then spool. The CAS
+        // parent lock is released before spool acquisition, so purge never
+        // observes a published blob before its referencing frame is durable.
+        // A fence failure occurs before CAS publication and is recorded as a
+        // content-free completeness gap through the existing emergency spool.
+        let _maintenance = match self.maintenance_fence.shared() {
+            Ok(maintenance) => maintenance,
+            Err(_) => {
+                self.state = CaptureAdmissionState::Unavailable;
+                return Ok(self.record_gap(
+                    &input,
+                    &spool_record_id,
+                    &content_digest,
+                    GapReason::MainUnavailable,
+                ));
+            }
+        };
         let cas_digest = match self.cas.put(&protected) {
             Ok(value) => value.as_hex(),
             Err(_) => {

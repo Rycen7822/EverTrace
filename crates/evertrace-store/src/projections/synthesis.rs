@@ -393,6 +393,10 @@ impl SynthesisState {
         &self.digests
     }
 
+    pub(super) fn runs(&self) -> &BTreeMap<SemanticDerivationRunId, (SemanticDerivationRun, u64)> {
+        &self.runs
+    }
+
     pub(super) fn has_fingerprint(&self, fingerprint: &[u8; 32]) -> bool {
         self.successful_fingerprints.contains_key(fingerprint)
     }

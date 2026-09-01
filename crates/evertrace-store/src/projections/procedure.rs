@@ -1135,6 +1135,10 @@ impl ProcedureState {
             .filter(move |revision| revision.procedure_id == procedure_id)
     }
 
+    pub(super) fn all_revisions(&self) -> impl Iterator<Item = &ProcedureRevision> {
+        self.revisions.values().map(|(revision, _)| revision)
+    }
+
     pub(super) fn live_source_reference_strings(
         &self,
         excluded_revisions: &BTreeSet<RevisionId>,

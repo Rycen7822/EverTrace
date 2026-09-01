@@ -16,7 +16,9 @@ pub use admission::{
     CaptureAdmissionState, CaptureError, CaptureOutcome, CaptureRecordInput, CaptureRuntime,
     DurableRecoveryPreflight, IsolatedCaptureOutcome,
 };
-pub use cas::{CasDigest, CasError, CasStore};
+pub use cas::{
+    CasDeleteOutcome, CasDigest, CasError, CasStore, MaintenanceFence, MaintenanceGuard,
+};
 pub use confined_read::{
     ConfinedDirectoryEntry, ConfinedEntryType, ConfinedFile, ConfinedFileIdentity,
     ConfinedFileMetadata, ConfinedFileRange, ConfinedLimitKind, ConfinedReadError,
@@ -24,8 +26,8 @@ pub use confined_read::{
 };
 pub use frame::{
     CAPTURE_RECORD_BODY_VERSION, CaptureRecordBody, DecodedFrame, FrameScan,
-    RecoveryPreflightCandidate, SpoolFrameError, SpoolRecord, decode_record_body, encode_frame,
-    encode_record_body, scan_frames,
+    RecoveryPreflightCandidate, SpoolFrameError, SpoolRecord, decode_record_body,
+    decode_validated_record_body, encode_frame, encode_record_body, scan_frames,
 };
 pub use key::{DeviceKey, DeviceKeyError, DeviceKeyStore};
 pub use protect::{
