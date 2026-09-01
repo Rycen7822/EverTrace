@@ -5,7 +5,7 @@ use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{
         CaptureGapMarkerEvidence, CaptureOutageInterval, EvidenceSurface, HostOccurrence,
-        Operation, ScopeEffect, SourceObservation, SourceReceipt, hex,
+        Operation, ScopeEffect, SourceObservation, SourceReceipt, hex, payload_fingerprint,
     },
     ids::{
         AtomId, AttemptId, CaptureOutageIntervalId, CompetingAttemptGroupId, ExecutionLaneId,
@@ -17,7 +17,10 @@ use evertrace_domain::{
         WorktreeSnapshotId, WorktreeTransitionId,
     },
     procedure::{ProcedureRevision, ProcedureUsageRevision},
-    purge::{ObjectDeletionPhase, ObjectDeletionTarget},
+    purge::{
+        ObjectDeletionGuards, ObjectDeletionLedgerEvent, ObjectDeletionPhase, ObjectDeletionTarget,
+        ObjectReauthorizationIntent,
+    },
     repository::{
         IntegrationEvent, LineageAssessment, RecoveryApplication, RecoveryBundle,
         RecoveryCaptureRequest, RepositoryInstance, WorktreeInstance, WorktreeSnapshot,
@@ -25,9 +28,11 @@ use evertrace_domain::{
     },
     revision::RevisionId,
     semantic::{
-        AcceptedProposalTarget, Atom, CoreMembershipProposalPayload, EvidenceCompleteness,
-        ParserStatus, ProposalStatus, ProposalTargetId, ResultEvidence, ResultScope,
-        RevisionProposal, UserAuthorizationMode, VerifierStatus,
+        AcceptedProposalTarget, Atom, AtomProposalPayload, CoreMembership,
+        CoreMembershipProposalPayload, EvidenceCompleteness, ParserStatus,
+        ProcedureProposalPayload, ProposalAcceptanceAuthority, ProposalOperation, ProposalPayload,
+        ProposalStatus, ProposalTargetId, ResultEvidence, ResultScope, RevisionProposal,
+        TUI_ACCEPTANCE_EVENT_MANIFEST_REF, UserAuthorizationMode, VerifierStatus,
     },
     work::{
         ActiveWorkContext, AssignmentStatus, Attempt, AttemptAdoptionStatus, AttemptBindingStatus,
@@ -57,8 +62,8 @@ use crate::{
         validate_objects_table,
     },
     purge::{
-        ObjectDeletionRevisionFact, ObjectDeletionSourceContext, ObjectDeletionState,
-        derive_object_deletion_preview, filter_product_rows,
+        ObjectDeletionCandidateAdmission, ObjectDeletionRevisionFact, ObjectDeletionSourceContext,
+        ObjectDeletionState, derive_object_deletion_preview, filter_product_rows,
     },
 };
 
@@ -2332,6 +2337,431 @@ struct ObjectDeletionPreviewInputs<'a> {
     deletions: &'a ObjectDeletionState,
 }
 
+pub struct ObjectDeletionCandidateAdmissionView {
+    deletions: Vec<ObjectDeletionLedgerEvent>,
+    source_observation_receipts: BTreeMap<SourceObservationId, SourceReceiptId>,
+    source_receipts: BTreeMap<SourceReceiptId, SourceReceipt>,
+    source_suppression_refs: BTreeMap<SourceObservationId, BTreeSet<String>>,
+}
+
+impl ObjectDeletionCandidateAdmissionView {
+    pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        let ledger = crate::purge::ObjectDeletionCurrentView::from_snapshot(snapshot)?;
+        let deletions = ledger.events.into_values().collect::<Vec<_>>();
+        if deletions.is_empty() {
+            return Ok(Self {
+                deletions,
+                source_observation_receipts: BTreeMap::new(),
+                source_receipts: BTreeMap::new(),
+                source_suppression_refs: BTreeMap::new(),
+            });
+        }
+        let mut source_observation_receipts = BTreeMap::new();
+        let mut source_receipts = BTreeMap::new();
+        for row in snapshot.data_rows().filter(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some("source_observation" | "source_receipt")
+            )
+        }) {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            match payload {
+                JournalPayload::SourceObservationRecorded(value) => {
+                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                    if source_observation_receipts
+                        .insert(value.source_observation_id, value.source_receipt_ref)
+                        .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::SourceReceiptRecorded(value) => {
+                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                    if source_receipts
+                        .insert(value.source_receipt_id, *value)
+                        .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        let mut source_suppression_refs = BTreeMap::new();
+        let mut seen_surfaces = BTreeSet::new();
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+        {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let JournalPayload::EvidenceSurfaceRecorded(surface) = payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            surface.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            let observation_id = surface.source_observation_revision_ref;
+            if !seen_surfaces.insert(observation_id) {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let Some(receipt) = source_observation_receipts
+                .get(&observation_id)
+                .and_then(|receipt_id| source_receipts.get(receipt_id))
+                .filter(|receipt| receipt.source_observation_id == observation_id)
+            else {
+                continue;
+            };
+            let references = [
+                crate::DefaultRetrievalSuppressionGeneration::ObservationSpanV1,
+                crate::DefaultRetrievalSuppressionGeneration::ContentSpanV2,
+            ]
+            .into_iter()
+            .map(|generation| {
+                crate::default_retrieval_suppression_ref_hash(&surface, receipt, generation)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+            source_suppression_refs.insert(observation_id, references);
+        }
+        Ok(Self {
+            deletions,
+            source_observation_receipts,
+            source_receipts,
+            source_suppression_refs,
+        })
+    }
+
+    pub fn classify_proposal(
+        &self,
+        proposal: &RevisionProposal,
+    ) -> Result<ObjectDeletionCandidateAdmission, StoreError> {
+        let Some(candidate) = deletion_candidate_from_proposal(proposal)? else {
+            return Ok(ObjectDeletionCandidateAdmission::Clear);
+        };
+        classify_deletion_candidate(
+            self.deletions.iter(),
+            &candidate,
+            CandidateSourceLookup::Compact {
+                observation_receipts: &self.source_observation_receipts,
+                receipts: &self.source_receipts,
+                suppression_refs: &self.source_suppression_refs,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CandidateSourceLookup<'a> {
+    Current {
+        observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+        receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+        surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    },
+    Compact {
+        observation_receipts: &'a BTreeMap<SourceObservationId, SourceReceiptId>,
+        receipts: &'a BTreeMap<SourceReceiptId, SourceReceipt>,
+        suppression_refs: &'a BTreeMap<SourceObservationId, BTreeSet<String>>,
+    },
+}
+
+impl CandidateSourceLookup<'_> {
+    fn observation_for_ref(self, reference: &str) -> Option<SourceObservationId> {
+        let direct_observation =
+            reference
+                .parse::<SourceObservationId>()
+                .ok()
+                .filter(|id| match self {
+                    Self::Current { observations, .. } => observations.contains_key(id),
+                    Self::Compact {
+                        observation_receipts,
+                        ..
+                    } => observation_receipts.contains_key(id),
+                });
+        let receipt_observation =
+            reference
+                .parse::<SourceReceiptId>()
+                .ok()
+                .and_then(|id| match self {
+                    Self::Current { receipts, .. } => receipts
+                        .get(&id)
+                        .map(|(receipt, _)| receipt.source_observation_id),
+                    Self::Compact { receipts, .. } => receipts
+                        .get(&id)
+                        .map(|receipt| receipt.source_observation_id),
+                });
+        match (direct_observation, receipt_observation) {
+            (Some(id), None) | (None, Some(id)) => Some(id),
+            (Some(left), Some(right)) if left == right => Some(left),
+            (None, None) | (Some(_), Some(_)) => None,
+        }
+    }
+
+    fn suppression_refs(
+        self,
+        observation_id: SourceObservationId,
+    ) -> Result<Option<BTreeSet<String>>, StoreError> {
+        match self {
+            Self::Current {
+                observations,
+                receipts,
+                surfaces,
+            } => {
+                let Some(observation) = observations.get(&observation_id).map(|(value, _)| value)
+                else {
+                    return Ok(None);
+                };
+                let Some(receipt) = receipts
+                    .get(&observation.source_receipt_ref)
+                    .map(|(value, _)| value)
+                    .filter(|receipt| receipt.source_observation_id == observation_id)
+                else {
+                    return Ok(None);
+                };
+                let Some(surface) = surfaces.get(&observation_id).map(|(value, _)| value) else {
+                    return Ok(None);
+                };
+                let references = [
+                    crate::DefaultRetrievalSuppressionGeneration::ObservationSpanV1,
+                    crate::DefaultRetrievalSuppressionGeneration::ContentSpanV2,
+                ]
+                .into_iter()
+                .map(|generation| {
+                    crate::default_retrieval_suppression_ref_hash(surface, receipt, generation)
+                })
+                .collect::<Result<_, _>>()?;
+                Ok(Some(references))
+            }
+            Self::Compact {
+                observation_receipts,
+                receipts,
+                suppression_refs,
+            } => {
+                let Some(_) = observation_receipts
+                    .get(&observation_id)
+                    .and_then(|receipt_id| receipts.get(receipt_id))
+                    .filter(|receipt| receipt.source_observation_id == observation_id)
+                else {
+                    return Ok(None);
+                };
+                Ok(suppression_refs.get(&observation_id).cloned())
+            }
+        }
+    }
+}
+
+struct ObjectDeletionCandidate {
+    family: &'static str,
+    canonical_payload: String,
+    semantic_kind: String,
+    scope_identity: String,
+    source_derivation_refs: Vec<String>,
+}
+
+fn deletion_candidate_from_proposal(
+    proposal: &RevisionProposal,
+) -> Result<Option<ObjectDeletionCandidate>, StoreError> {
+    if proposal.operation != ProposalOperation::Create
+        || proposal.target_id.is_some()
+        || proposal.base_revision_id.is_some()
+    {
+        return Ok(None);
+    }
+    let candidate = match &proposal.payload {
+        ProposalPayload::Atom(payload) => {
+            let AtomProposalPayload::Create { draft } = payload.as_ref() else {
+                return Ok(None);
+            };
+            ObjectDeletionCandidate {
+                family: "atom",
+                canonical_payload: hex(&draft
+                    .semantic_digest()
+                    .map_err(|_| StoreError::StoreCorrupt)?),
+                semantic_kind: serde_json::to_string(&draft.kind)
+                    .map_err(|_| StoreError::Serialization)?,
+                scope_identity: serde_json::to_string(&draft.scope)
+                    .map_err(|_| StoreError::Serialization)?,
+                source_derivation_refs: proposal.source_cohort_refs.clone(),
+            }
+        }
+        ProposalPayload::Procedure(payload) => {
+            let ProcedureProposalPayload::Create { draft } = payload.as_ref() else {
+                return Ok(None);
+            };
+            ObjectDeletionCandidate {
+                family: "procedure",
+                canonical_payload: serde_json::to_string(draft)
+                    .map_err(|_| StoreError::Serialization)?,
+                semantic_kind: serde_json::to_string(&draft.kind)
+                    .map_err(|_| StoreError::Serialization)?,
+                scope_identity: serde_json::to_string(&draft.scope)
+                    .map_err(|_| StoreError::Serialization)?,
+                source_derivation_refs: proposal.source_cohort_refs.clone(),
+            }
+        }
+        ProposalPayload::CoreMembership(payload) => {
+            let CoreMembershipProposalPayload::Create { scope_identity, .. } = payload.as_ref()
+            else {
+                return Ok(None);
+            };
+            ObjectDeletionCandidate {
+                family: "core_membership",
+                canonical_payload: serde_json::to_string(payload.as_ref())
+                    .map_err(|_| StoreError::Serialization)?,
+                semantic_kind: "core_membership".into(),
+                scope_identity: serde_json::to_string(scope_identity)
+                    .map_err(|_| StoreError::Serialization)?,
+                source_derivation_refs: proposal.source_cohort_refs.clone(),
+            }
+        }
+        ProposalPayload::ReservedTarget { .. } => return Ok(None),
+    };
+    Ok(Some(candidate))
+}
+
+fn accepted_root_create_matches_procedure(
+    proposal: &RevisionProposal,
+    procedure: &ProcedureRevision,
+) -> bool {
+    proposal.status == ProposalStatus::Accepted
+        && proposal.operation == ProposalOperation::Create
+        && proposal.target_id.is_none()
+        && proposal.base_revision_id.is_none()
+        && matches!(
+            proposal.payload,
+            ProposalPayload::Procedure(ref payload)
+                if matches!(payload.as_ref(), ProcedureProposalPayload::Create { .. })
+        )
+        && proposal.acceptance.as_ref().is_some_and(|acceptance| {
+            matches!(
+                acceptance.accepted_target,
+                AcceptedProposalTarget::Procedure {
+                    procedure_id,
+                    procedure_revision_id,
+                    ..
+                } if procedure_id == procedure.procedure_id
+                    && procedure_revision_id == procedure.revision_id
+            )
+        })
+}
+
+fn accepted_root_create_matches_membership(
+    proposal: &RevisionProposal,
+    membership: &CoreMembership,
+) -> bool {
+    proposal.status == ProposalStatus::Accepted
+        && proposal.operation == ProposalOperation::Create
+        && proposal.target_id.is_none()
+        && proposal.base_revision_id.is_none()
+        && matches!(
+            proposal.payload,
+            ProposalPayload::CoreMembership(ref payload)
+                if matches!(payload.as_ref(), CoreMembershipProposalPayload::Create { .. })
+        )
+        && proposal.acceptance.as_ref().is_some_and(|acceptance| {
+            matches!(
+                acceptance.accepted_target,
+                AcceptedProposalTarget::CoreMembership {
+                    core_membership_id,
+                    membership_revision_id,
+                } if core_membership_id == membership.core_membership_id
+                    && membership_revision_id == membership.membership_revision_id
+            )
+        })
+}
+
+fn classify_deletion_candidate<'a>(
+    deletions: impl IntoIterator<Item = &'a ObjectDeletionLedgerEvent>,
+    candidate: &ObjectDeletionCandidate,
+    source: CandidateSourceLookup<'_>,
+) -> Result<ObjectDeletionCandidateAdmission, StoreError> {
+    let stable_refs = candidate_suppression_refs(&candidate.source_derivation_refs, source)?;
+    let mut family_deletions = deletions
+        .into_iter()
+        .filter(|deletion| deletion.target.kind_name() == candidate.family);
+    let Some(first_deletion) = family_deletions.next() else {
+        return Ok(ObjectDeletionCandidateAdmission::Clear);
+    };
+    let guards = ObjectDeletionGuards::derive(
+        first_deletion.target,
+        &candidate.semantic_kind,
+        std::slice::from_ref(&candidate.canonical_payload),
+        &candidate.scope_identity,
+        &candidate.source_derivation_refs,
+    )
+    .ok_or(StoreError::StoreCorrupt)?;
+    let mut conflicts = Vec::new();
+    for deletion in std::iter::once(first_deletion).chain(family_deletions) {
+        let same_kind_scope = guards.semantic_kind_hash == deletion.semantic_kind_hash
+            && guards.scope_identity_hash == deletion.scope_identity_hash;
+        if !same_kind_scope {
+            continue;
+        }
+        let exact_payload_scope = guards.canonical_payload_hash == deletion.canonical_payload_hash;
+        let same_source_guard =
+            guards.source_derivation_guard_hash == deletion.source_derivation_guard_hash;
+        let stable_suppressed = stable_refs.as_ref().is_some_and(|stable_refs| {
+            !stable_refs.is_empty()
+                && stable_refs.iter().all(|references| {
+                    references.iter().any(|reference| {
+                        deletion
+                            .default_retrieval_suppression_ref_hashes
+                            .binary_search(reference)
+                            .is_ok()
+                    })
+                })
+        });
+        if exact_payload_scope || same_source_guard || stable_suppressed {
+            return Ok(ObjectDeletionCandidateAdmission::FixedSuppression);
+        }
+        conflicts.push(deletion.clone());
+    }
+    if conflicts.is_empty() {
+        Ok(ObjectDeletionCandidateAdmission::Clear)
+    } else {
+        conflicts.sort_by_key(|event| {
+            (
+                event.recorded_at_us,
+                event.deletion_generation,
+                event.target,
+            )
+        });
+        Ok(ObjectDeletionCandidateAdmission::HistoricalConflict {
+            deletions: conflicts,
+        })
+    }
+}
+
+fn candidate_suppression_refs(
+    source_refs: &[String],
+    source: CandidateSourceLookup<'_>,
+) -> Result<Option<Vec<BTreeSet<String>>>, StoreError> {
+    if source_refs.is_empty() {
+        return Ok(None);
+    }
+    let mut observations = Vec::with_capacity(source_refs.len());
+    for reference in source_refs {
+        let Some(observation_id) = source.observation_for_ref(reference) else {
+            return Ok(None);
+        };
+        observations.push(observation_id);
+    }
+    let mut hashes = Vec::new();
+    for observation_id in observations {
+        let Some(observation_hashes) = source.suppression_refs(observation_id)? else {
+            return Ok(None);
+        };
+        hashes.push(observation_hashes);
+    }
+    Ok(Some(hashes))
+}
+
 impl ReducerState {
     fn object_deletion_inputs(&self) -> ObjectDeletionPreviewInputs<'_> {
         ObjectDeletionPreviewInputs {
@@ -3115,6 +3545,12 @@ impl JournalAdmissionState {
             command.events().iter().map(|event| &event.payload),
             StoreError::InvalidInput,
         )?;
+        let command_payloads = command
+            .events()
+            .iter()
+            .map(|event| &event.payload)
+            .collect::<Vec<_>>();
+        self.validate_non_resurrection_command(&command_payloads, StoreError::InvalidInput)?;
         let accepted_edits = semantic::validate_command_boundary(
             &self.atoms,
             &self.proposals,
@@ -3259,6 +3695,11 @@ impl JournalAdmissionState {
             parsed.iter().map(|(payload, _, _)| payload),
             StoreError::StoreCorrupt,
         )?;
+        let command_payloads = parsed
+            .iter()
+            .map(|(payload, _, _)| payload)
+            .collect::<Vec<_>>();
+        self.validate_non_resurrection_command(&command_payloads, StoreError::StoreCorrupt)?;
         let accepted_edits = semantic::validate_command_boundary(
             &self.atoms,
             &self.proposals,
@@ -3578,6 +4019,261 @@ impl JournalAdmissionState {
         let expected = canonical_mark_new_attempt_child(source, child, self.frontier)?;
         if child != &expected {
             return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+
+    fn classify_deletion_proposal(
+        &self,
+        proposal: &RevisionProposal,
+    ) -> Result<ObjectDeletionCandidateAdmission, StoreError> {
+        let Some(candidate) = deletion_candidate_from_proposal(proposal)? else {
+            return Ok(ObjectDeletionCandidateAdmission::Clear);
+        };
+        self.classify_deletion_candidate(&candidate)
+    }
+
+    fn classify_deletion_candidate(
+        &self,
+        candidate: &ObjectDeletionCandidate,
+    ) -> Result<ObjectDeletionCandidateAdmission, StoreError> {
+        classify_deletion_candidate(
+            self.deletions.events(),
+            candidate,
+            CandidateSourceLookup::Current {
+                observations: &self.source_observations,
+                receipts: &self.source_receipts,
+                surfaces: &self.evidence_surfaces,
+            },
+        )
+    }
+
+    fn validate_non_resurrection_command(
+        &self,
+        payloads: &[&JournalPayload],
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        let has_tombstone = self.deletions.events().next().is_some();
+        let accepted_root_creates = if has_tombstone {
+            payloads
+                .iter()
+                .filter_map(|payload| match payload {
+                    JournalPayload::RevisionProposalRecorded(proposal)
+                        if proposal.status == ProposalStatus::Accepted
+                            && proposal.operation == ProposalOperation::Create
+                            && proposal.target_id.is_none()
+                            && proposal.base_revision_id.is_none() =>
+                    {
+                        Some(proposal.as_ref())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for payload in payloads {
+            match payload {
+                JournalPayload::AtomRecorded(atom) => {
+                    if self.deletions.events().any(|deletion| {
+                        deletion.target
+                            == (ObjectDeletionTarget::Atom {
+                                atom_id: atom.atom_id,
+                            })
+                    }) {
+                        return Err(error);
+                    }
+                    if atom.parent_revision_id.is_none()
+                        && atom.accepted_proposal_id.is_none()
+                        && !matches!(
+                            self.classify_direct_atom(atom)?,
+                            ObjectDeletionCandidateAdmission::Clear
+                        )
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::ProcedureRevisionRecorded(procedure) => {
+                    if self.deletions.events().any(|deletion| {
+                        deletion.target
+                            == (ObjectDeletionTarget::Procedure {
+                                procedure_id: procedure.procedure_id,
+                            })
+                    }) {
+                        return Err(error);
+                    }
+                    if has_tombstone
+                        && procedure.parent_revision_id.is_none()
+                        && !matches!(
+                            accepted_root_creates.as_slice(),
+                            [proposal]
+                                if accepted_root_create_matches_procedure(proposal, procedure)
+                        )
+                    {
+                        return Err(error);
+                    }
+                }
+                JournalPayload::CoreMembershipRecorded(membership) => {
+                    if self.deletions.events().any(|deletion| {
+                        deletion.target
+                            == (ObjectDeletionTarget::CoreMembership {
+                                core_membership_id: membership.core_membership_id,
+                            })
+                    }) {
+                        return Err(error);
+                    }
+                    if has_tombstone
+                        && membership.supersedes_membership_revision_id.is_none()
+                        && !matches!(
+                            accepted_root_creates.as_slice(),
+                            [proposal]
+                                if accepted_root_create_matches_membership(proposal, membership)
+                        )
+                    {
+                        return Err(error);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut reauthorized = 0usize;
+        for proposal in payloads.iter().filter_map(|payload| match payload {
+            JournalPayload::RevisionProposalRecorded(value) => Some(value.as_ref()),
+            _ => None,
+        }) {
+            match self.classify_deletion_proposal(proposal)? {
+                ObjectDeletionCandidateAdmission::Clear => {}
+                ObjectDeletionCandidateAdmission::FixedSuppression => return Err(error),
+                admission @ ObjectDeletionCandidateAdmission::HistoricalConflict { .. } => {
+                    if proposal.eligibility
+                        != evertrace_domain::semantic::ProposalEligibility::ManualRequired
+                    {
+                        return Err(error);
+                    }
+                    if proposal.status == ProposalStatus::Accepted {
+                        let deletion = admission
+                            .representative_historical_deletion()
+                            .ok_or(error)?;
+                        self.validate_reauthorization_acceptance(
+                            payloads, proposal, deletion, error,
+                        )?;
+                        reauthorized = reauthorized.checked_add(1).ok_or(error)?;
+                    }
+                }
+            }
+        }
+        if reauthorized > 1 {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn classify_direct_atom(
+        &self,
+        atom: &Atom,
+    ) -> Result<ObjectDeletionCandidateAdmission, StoreError> {
+        let mut source_derivation_refs = atom
+            .source_observation_refs
+            .iter()
+            .map(ToString::to_string)
+            .chain(atom.evidence_refs.iter().cloned())
+            .collect::<Vec<_>>();
+        source_derivation_refs.sort();
+        source_derivation_refs.dedup();
+        let candidate = ObjectDeletionCandidate {
+            family: "atom",
+            canonical_payload: hex(&atom
+                .semantic_structure_hash()
+                .map_err(|_| StoreError::StoreCorrupt)?),
+            semantic_kind: serde_json::to_string(&atom.kind)
+                .map_err(|_| StoreError::Serialization)?,
+            scope_identity: serde_json::to_string(&atom.scope)
+                .map_err(|_| StoreError::Serialization)?,
+            source_derivation_refs,
+        };
+        self.classify_deletion_candidate(&candidate)
+    }
+
+    fn validate_reauthorization_acceptance(
+        &self,
+        payloads: &[&JournalPayload],
+        accepted: &RevisionProposal,
+        deletion: &ObjectDeletionLedgerEvent,
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        let acceptance = accepted.acceptance.as_ref().ok_or(error)?;
+        if !matches!(
+            acceptance.authority_basis,
+            ProposalAcceptanceAuthority::TuiAcceptance { .. }
+        ) {
+            return Err(error);
+        }
+        let reviewed = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                JournalPayload::RevisionProposalRecorded(value)
+                    if value.proposal_revision_id == acceptance.reviewed_proposal_revision_id =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .next()
+            .or_else(|| {
+                self.proposal_revisions
+                    .get(&acceptance.reviewed_proposal_revision_id)
+                    .map(|(value, _)| value)
+            })
+            .filter(|value| {
+                value.proposal_id == accepted.proposal_id
+                    && value.fingerprint == acceptance.reviewed_fingerprint
+            })
+            .ok_or(error)?;
+        let observation_id = acceptance
+            .acceptance_event_ref
+            .parse::<SourceObservationId>()
+            .map_err(|_| error)?;
+        let observation = payloads
+            .iter()
+            .find_map(|payload| match payload {
+                JournalPayload::SourceObservationRecorded(value)
+                    if value.source_observation_id == observation_id =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .ok_or(error)?;
+        let receipt = payloads
+            .iter()
+            .find_map(|payload| match payload {
+                JournalPayload::SourceReceiptRecorded(value)
+                    if value.source_receipt_id == observation.source_receipt_ref
+                        && value.source_observation_id == observation_id =>
+                {
+                    Some(value.as_ref())
+                }
+                _ => None,
+            })
+            .ok_or(error)?;
+        if receipt.source_ref != reviewed.proposal_id.to_string()
+            || receipt.source_revision.as_str() != reviewed.proposal_revision_id.to_string()
+        {
+            return Err(error);
+        }
+        let intent = ObjectReauthorizationIntent::new(deletion, reviewed).ok_or(error)?;
+        let canonical = intent.canonical_toml(deletion, reviewed).ok_or(error)?;
+        let expected = payload_fingerprint(
+            observation.canonicalization_revision,
+            canonical.as_bytes(),
+            None,
+        )
+        .map_err(|_| error)?;
+        if observation.payload_fingerprint != hex(&expected)
+            || receipt.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
+            || acceptance.accepted_at_us < receipt.recorded_at_us
+        {
+            return Err(error);
         }
         Ok(())
     }
@@ -4058,6 +4754,7 @@ impl JournalAdmissionState {
             proposal_revisions: &self.proposal_revisions,
             source_observations: &self.source_observations,
             source_receipts: &self.source_receipts,
+            evidence_surfaces: &self.evidence_surfaces,
             tasks: &self.tasks,
             repositories: &self.repositories,
             worktrees: &self.worktrees,
@@ -4066,6 +4763,7 @@ impl JournalAdmissionState {
             procedure: &self.procedure,
             s23: &self.s23,
             semantic_digests: self.synthesis.digests(),
+            deletions: &self.deletions,
         })?;
         self.validate_procedure_relations()?;
         validate_recall_relations(
@@ -7756,6 +8454,7 @@ impl ReducerState {
             proposal_revisions: &self.proposal_revisions,
             source_observations: &self.source_observations,
             source_receipts: &self.source_receipts,
+            evidence_surfaces: &self.evidence_surfaces,
             tasks: &self.tasks,
             repositories: &self.repositories,
             worktrees: &self.worktrees,
@@ -7764,6 +8463,7 @@ impl ReducerState {
             procedure: &self.procedure,
             s23: &self.s23,
             semantic_digests: self.synthesis.digests(),
+            deletions: &self.deletions,
         })?;
         let admission = self.admission_state(0)?;
         admission.validate_procedure_relations()?;

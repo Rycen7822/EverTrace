@@ -11,8 +11,8 @@ pub use emission::{
     materialize_atom,
 };
 pub use proposal::{
-    AcceptedProposalCommand, AtomAcceptanceContext, ProposalCommandContext, ProposalResolution,
-    RevisionProposalService, SubmitProposalRequest,
+    AcceptedProposalCommand, AtomAcceptanceContext, DeletionAwareProposalResolution,
+    ProposalCommandContext, ProposalResolution, RevisionProposalService, SubmitProposalRequest,
 };
 pub(crate) use proposal::{
     ProposalAcceptanceAudit, accepted_edited_proposal_successor, accepted_proposal_successor,

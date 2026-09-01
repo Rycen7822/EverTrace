@@ -27,18 +27,18 @@ pub use objects::{
 };
 pub use projections::{
     AttemptCurrentView, AutoresearchCurrentView, CompetingResolutionEvidenceView,
-    EpisodeCurrentView, NamedCurrentDependency, OperationBurstCurrentView, ProjectionSnapshot,
-    ProjectionWorker, RecallCurrentAtom, RecallCurrentContext, ReconciliationArtifactContext,
-    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
-    ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
-    RecoveryEvidenceCurrentView, RuntimeSchedulerView, SegmentationCurrentState,
-    SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView, WorkIdentityCurrentView,
-    object_deletion_preview, reduce_journal,
+    EpisodeCurrentView, NamedCurrentDependency, ObjectDeletionCandidateAdmissionView,
+    OperationBurstCurrentView, ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom,
+    RecallCurrentContext, ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
+    ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
+    ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
+    RuntimeSchedulerView, SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView,
+    WorkBindingCurrentView, WorkIdentityCurrentView, object_deletion_preview, reduce_journal,
 };
 pub use purge::{
-    OBJECT_DELETION_ALGORITHM_REVISION, ObjectDeletionCurrentView, ObjectDeletionPreview,
-    ObjectDeletionProcedureImpact, ObjectDeletionSupportImpact, pending_object_deletion,
-    purged_object_deletion,
+    OBJECT_DELETION_ALGORITHM_REVISION, ObjectDeletionCandidateAdmission,
+    ObjectDeletionCurrentView, ObjectDeletionPreview, ObjectDeletionProcedureImpact,
+    ObjectDeletionSupportImpact, pending_object_deletion, purged_object_deletion,
 };
 pub use query::{
     DefaultRetrievalSuppressionGeneration, L0002ProjectionSnapshot,

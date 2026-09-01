@@ -2,15 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
     evidence::{
-        CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
-        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode, SourceRole, hex,
-        payload_fingerprint,
+        CaptureCompleteness, ContentTrust, EvidenceSourceKind, EvidenceSurface, IdentityStrength,
+        ObservationRole, SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode,
+        SourceRole, hex, payload_fingerprint,
     },
     ids::{
         AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
         SourceObservationId, SourceReceiptId, TaskId, WorkArtifactId, WorktreeId,
     },
     procedure::{ProcedureRevision, ProcedureScope},
+    purge::ObjectReauthorizationIntent,
     repository::{RepositoryInstance, WorktreeInstance},
     revision::RevisionId,
     semantic::{
@@ -26,7 +27,7 @@ use evertrace_domain::{
 
 use crate::{
     JournalPayload, ObjectRowClass, SourceIngestWatermark, StoreError,
-    projections::ProjectionSnapshot,
+    projections::ProjectionSnapshot, purge::ObjectDeletionState,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -309,6 +310,7 @@ pub(crate) struct SemanticRelationInputs<'a> {
     pub proposal_revisions: &'a BTreeMap<RevisionId, (RevisionProposal, u64)>,
     pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
     pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    pub evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
     pub tasks: &'a BTreeMap<TaskId, (Task, u64)>,
     pub repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
@@ -318,6 +320,7 @@ pub(crate) struct SemanticRelationInputs<'a> {
     pub s23: &'a super::s23::S23State,
     pub semantic_digests:
         &'a BTreeMap<SemanticDigestId, (evertrace_domain::semantic::SemanticDigest, u64)>,
+    pub deletions: &'a ObjectDeletionState,
 }
 
 pub(crate) fn validate_relations(input: SemanticRelationInputs<'_>) -> Result<(), StoreError> {
@@ -851,13 +854,18 @@ fn validate_accepted_edit_boundary(
     original
         .validate_edit_candidate(reviewed)
         .map_err(|_| error)?;
-    let canonical = original.edit_intent_toml(reviewed).map_err(|_| error)?;
-    let expected_fingerprint = hex(&payload_fingerprint(
+    let edit_canonical = original.edit_intent_toml(reviewed).map_err(|_| error)?;
+    let edit_fingerprint = hex(&payload_fingerprint(
         observation.1.canonicalization_revision,
-        canonical.as_bytes(),
+        edit_canonical.as_bytes(),
         None,
     )
     .map_err(|_| error)?);
+    if observation.1.payload_fingerprint != edit_fingerprint {
+        return Err(error);
+    }
+    let canonical = edit_canonical;
+    let expected_fingerprint = edit_fingerprint;
     let expected_record = format!(
         "tui-accept-{}-{}",
         original.proposal_id, original.proposal_revision_id
@@ -1893,33 +1901,7 @@ fn validate_tui_acceptance_event(
     let expected = if observation.payload_fingerprint == hex(&plain_expected) {
         plain_expected
     } else {
-        let original_id = receipt
-            .source_ref
-            .parse::<RevisionProposalId>()
-            .map_err(|_| StoreError::StoreCorrupt)?;
-        let original_revision_id = receipt
-            .source_revision
-            .as_str()
-            .parse::<RevisionId>()
-            .map_err(|_| StoreError::StoreCorrupt)?;
-        let original = &input
-            .proposal_revisions
-            .get(&original_revision_id)
-            .filter(|(value, _)| value.proposal_id == original_id)
-            .ok_or(StoreError::StoreCorrupt)?
-            .0;
-        original
-            .validate_edit_candidate(reviewed)
-            .map_err(|_| StoreError::StoreCorrupt)?;
-        let edit_payload = original
-            .edit_intent_toml(reviewed)
-            .map_err(|_| StoreError::StoreCorrupt)?;
-        payload_fingerprint(
-            observation.canonicalization_revision,
-            edit_payload.as_bytes(),
-            None,
-        )
-        .map_err(|_| StoreError::StoreCorrupt)?
+        edit_or_reauthorization_fingerprint(reviewed, observation, receipt, input)?
     };
     if receipt.eligible_event_manifest_ref != TUI_ACCEPTANCE_EVENT_MANIFEST_REF
         || observation.payload_fingerprint != hex(&expected)
@@ -1929,6 +1911,74 @@ fn validate_tui_acceptance_event(
         return Err(StoreError::StoreCorrupt);
     }
     Ok(())
+}
+
+fn edit_or_reauthorization_fingerprint(
+    reviewed: &RevisionProposal,
+    observation: &SourceObservation,
+    receipt: &SourceReceipt,
+    input: &SemanticRelationInputs<'_>,
+) -> Result<[u8; 32], StoreError> {
+    let source_id = receipt
+        .source_ref
+        .parse::<RevisionProposalId>()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let source_revision_id = receipt
+        .source_revision
+        .as_str()
+        .parse::<RevisionId>()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    if source_id != reviewed.proposal_id || source_revision_id != reviewed.proposal_revision_id {
+        let original = &input
+            .proposal_revisions
+            .get(&source_revision_id)
+            .filter(|(value, _)| value.proposal_id == source_id)
+            .ok_or(StoreError::StoreCorrupt)?
+            .0;
+        original
+            .validate_edit_candidate(reviewed)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let edit_payload = original
+            .edit_intent_toml(reviewed)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let edit_fingerprint = payload_fingerprint(
+            observation.canonicalization_revision,
+            edit_payload.as_bytes(),
+            None,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        return (observation.payload_fingerprint == hex(&edit_fingerprint))
+            .then_some(edit_fingerprint)
+            .ok_or(StoreError::StoreCorrupt);
+    }
+    let candidate =
+        super::deletion_candidate_from_proposal(reviewed)?.ok_or(StoreError::StoreCorrupt)?;
+    let admission = super::classify_deletion_candidate(
+        input.deletions.events(),
+        &candidate,
+        super::CandidateSourceLookup::Current {
+            observations: input.source_observations,
+            receipts: input.source_receipts,
+            surfaces: input.evidence_surfaces,
+        },
+    )?;
+    let deletion = admission
+        .representative_historical_deletion()
+        .ok_or(StoreError::StoreCorrupt)?;
+    let intent =
+        ObjectReauthorizationIntent::new(deletion, reviewed).ok_or(StoreError::StoreCorrupt)?;
+    let canonical = intent
+        .canonical_toml(deletion, reviewed)
+        .ok_or(StoreError::StoreCorrupt)?;
+    let expected = payload_fingerprint(
+        observation.canonicalization_revision,
+        canonical.as_bytes(),
+        None,
+    )
+    .map_err(|_| StoreError::StoreCorrupt)?;
+    (observation.payload_fingerprint == hex(&expected))
+        .then_some(expected)
+        .ok_or(StoreError::StoreCorrupt)
 }
 
 fn validate_scope(scope: &AtomScope, input: &SemanticRelationInputs<'_>) -> Result<(), StoreError> {

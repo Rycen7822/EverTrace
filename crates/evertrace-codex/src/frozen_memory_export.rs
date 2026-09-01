@@ -1,20 +1,20 @@
-//! Frozen AgentMemory v0.9.29 one-shot export adapter.
+//! Frozen third-party memory export v0.9.29 one-shot adapter.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use thiserror::Error;
 
-pub const AGENT_MEMORY_EXPORT_VERSION: &str = "0.9.29";
-pub const AGENT_MEMORY_MAX_BYTES: usize = 15 * 1024 * 1024;
+pub const FROZEN_MEMORY_EXPORT_VERSION: &str = "0.9.29";
+pub const FROZEN_MEMORY_EXPORT_MAX_BYTES: usize = 15 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum AgentMemoryImportError {
-    #[error("AgentMemory export is oversized")]
+pub enum FrozenMemoryExportParseError {
+    #[error("frozen memory export is oversized")]
     Oversized,
-    #[error("AgentMemory export format is unsupported")]
+    #[error("frozen memory export format is unsupported")]
     Unsupported,
-    #[error("AgentMemory export contains duplicate or inconsistent identities")]
+    #[error("frozen memory export contains duplicate or inconsistent identities")]
     Inconsistent,
 }
 
@@ -24,7 +24,7 @@ const MAX_REFS: usize = 16_384;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentMemorySession {
+pub struct FrozenMemoryExportSession {
     pub id: String,
     pub project: String,
     pub cwd: String,
@@ -32,7 +32,7 @@ pub struct AgentMemorySession {
     pub started_at: String,
     #[serde(rename = "endedAt")]
     pub ended_at: Option<String>,
-    pub status: AgentMemorySessionStatus,
+    pub status: FrozenMemoryExportSessionStatus,
     #[serde(rename = "observationCount")]
     pub observation_count: u64,
     pub model: Option<String>,
@@ -48,7 +48,7 @@ pub struct AgentMemorySession {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentMemorySessionStatus {
+pub enum FrozenMemoryExportSessionStatus {
     Active,
     Completed,
     Abandoned,
@@ -56,13 +56,13 @@ pub enum AgentMemorySessionStatus {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentMemoryObservation {
+pub struct FrozenMemoryExportObservation {
     pub id: String,
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub timestamp: String,
     #[serde(rename = "type")]
-    pub observation_type: AgentMemoryObservationType,
+    pub observation_type: FrozenMemoryExportObservationType,
     pub title: String,
     pub subtitle: Option<String>,
     pub facts: Vec<String>,
@@ -77,14 +77,14 @@ pub struct AgentMemoryObservation {
     pub image_data: Option<String>,
     #[serde(rename = "imageDescription")]
     pub image_description: Option<String>,
-    pub modality: Option<AgentMemoryModality>,
+    pub modality: Option<FrozenMemoryExportModality>,
     #[serde(rename = "agentId")]
     pub agent_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentMemoryObservationType {
+pub enum FrozenMemoryExportObservationType {
     FileRead,
     FileWrite,
     FileEdit,
@@ -104,7 +104,7 @@ pub enum AgentMemoryObservationType {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentMemoryModality {
+pub enum FrozenMemoryExportModality {
     Text,
     Image,
     Mixed,
@@ -112,14 +112,14 @@ pub enum AgentMemoryModality {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentMemoryMemory {
+pub struct FrozenMemoryExportMemory {
     pub id: String,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
     #[serde(rename = "type")]
-    pub memory_type: AgentMemoryMemoryType,
+    pub memory_type: FrozenMemoryExportMemoryType,
     pub title: String,
     pub content: String,
     pub concepts: Vec<String>,
@@ -150,7 +150,7 @@ pub struct AgentMemoryMemory {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentMemoryMemoryType {
+pub enum FrozenMemoryExportMemoryType {
     Pattern,
     Preference,
     Architecture,
@@ -161,10 +161,10 @@ pub enum AgentMemoryMemoryType {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentMemoryGraphNode {
+pub struct FrozenMemoryExportGraphNode {
     pub id: String,
     #[serde(rename = "type")]
-    pub node_type: AgentMemoryGraphNodeType,
+    pub node_type: FrozenMemoryExportGraphNodeType,
     pub name: String,
     pub properties: BTreeMap<String, serde_json::Value>,
     #[serde(rename = "sourceObservationIds")]
@@ -179,7 +179,7 @@ pub struct AgentMemoryGraphNode {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentMemoryGraphNodeType {
+pub enum FrozenMemoryExportGraphNodeType {
     File,
     Function,
     Concept,
@@ -197,10 +197,10 @@ pub enum AgentMemoryGraphNodeType {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentMemoryGraphEdge {
+pub struct FrozenMemoryExportGraphEdge {
     pub id: String,
     #[serde(rename = "type")]
-    pub edge_type: AgentMemoryGraphEdgeType,
+    pub edge_type: FrozenMemoryExportGraphEdgeType,
     #[serde(rename = "sourceNodeId")]
     pub source_node_id: String,
     #[serde(rename = "targetNodeId")]
@@ -214,7 +214,7 @@ pub struct AgentMemoryGraphEdge {
     pub tvalid: Option<String>,
     #[serde(rename = "tvalidEnd")]
     pub tvalid_end: Option<String>,
-    pub context: Option<AgentMemoryEdgeContext>,
+    pub context: Option<FrozenMemoryExportEdgeContext>,
     pub version: Option<u64>,
     #[serde(rename = "supersededBy")]
     pub superseded_by: Option<String>,
@@ -225,7 +225,7 @@ pub struct AgentMemoryGraphEdge {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentMemoryGraphEdgeType {
+pub enum FrozenMemoryExportGraphEdgeType {
     Uses,
     Imports,
     Modifies,
@@ -246,7 +246,7 @@ pub enum AgentMemoryGraphEdgeType {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentMemoryEdgeContext {
+pub struct FrozenMemoryExportEdgeContext {
     pub reasoning: Option<String>,
     pub sentiment: Option<String>,
     pub alternatives: Option<Vec<String>>,
@@ -257,19 +257,19 @@ pub struct AgentMemoryEdgeContext {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExportData {
+struct FrozenMemoryExportEnvelope {
     version: String,
     #[serde(rename = "exportedAt")]
     exported_at: String,
-    sessions: Vec<AgentMemorySession>,
-    observations: BTreeMap<String, Vec<AgentMemoryObservation>>,
-    memories: Vec<AgentMemoryMemory>,
+    sessions: Vec<FrozenMemoryExportSession>,
+    observations: BTreeMap<String, Vec<FrozenMemoryExportObservation>>,
+    memories: Vec<FrozenMemoryExportMemory>,
     summaries: Vec<IgnoredAny>,
     profiles: Option<Vec<IgnoredAny>>,
     #[serde(rename = "graphNodes")]
-    graph_nodes: Option<Vec<AgentMemoryGraphNode>>,
+    graph_nodes: Option<Vec<FrozenMemoryExportGraphNode>>,
     #[serde(rename = "graphEdges")]
-    graph_edges: Option<Vec<AgentMemoryGraphEdge>>,
+    graph_edges: Option<Vec<FrozenMemoryExportGraphEdge>>,
     #[serde(rename = "semanticMemories")]
     semantic_memories: Option<Vec<IgnoredAny>>,
     #[serde(rename = "proceduralMemories")]
@@ -291,26 +291,26 @@ struct ExportData {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct AgentMemoryExport {
+pub struct FrozenMemoryExport {
     pub exported_at: String,
-    pub sessions: Vec<AgentMemorySession>,
-    pub observations: Vec<AgentMemoryObservation>,
-    pub memories: Vec<AgentMemoryMemory>,
-    pub graph_nodes: Vec<AgentMemoryGraphNode>,
-    pub graph_edges: Vec<AgentMemoryGraphEdge>,
+    pub sessions: Vec<FrozenMemoryExportSession>,
+    pub observations: Vec<FrozenMemoryExportObservation>,
+    pub memories: Vec<FrozenMemoryExportMemory>,
+    pub graph_nodes: Vec<FrozenMemoryExportGraphNode>,
+    pub graph_edges: Vec<FrozenMemoryExportGraphEdge>,
     pub dangling_refs: Vec<String>,
 }
 
-pub fn parse_agent_memory_export(
+pub fn parse_frozen_memory_export(
     bytes: &[u8],
-) -> Result<AgentMemoryExport, AgentMemoryImportError> {
-    if bytes.len() > AGENT_MEMORY_MAX_BYTES {
-        return Err(AgentMemoryImportError::Oversized);
+) -> Result<FrozenMemoryExport, FrozenMemoryExportParseError> {
+    if bytes.len() > FROZEN_MEMORY_EXPORT_MAX_BYTES {
+        return Err(FrozenMemoryExportParseError::Oversized);
     }
-    let value: ExportData =
-        serde_json::from_slice(bytes).map_err(|_| AgentMemoryImportError::Unsupported)?;
-    if value.version != AGENT_MEMORY_EXPORT_VERSION {
-        return Err(AgentMemoryImportError::Unsupported);
+    let value: FrozenMemoryExportEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| FrozenMemoryExportParseError::Unsupported)?;
+    if value.version != FROZEN_MEMORY_EXPORT_VERSION {
+        return Err(FrozenMemoryExportParseError::Unsupported);
     }
     if value.sessions.len() > MAX_RECORDS
         || value.memories.len() > MAX_RECORDS
@@ -324,7 +324,7 @@ pub fn parse_agent_memory_export(
             .is_some_and(|v| v.len() > MAX_RECORDS)
         || !valid_text(&value.exported_at)
     {
-        return Err(AgentMemoryImportError::Inconsistent);
+        return Err(FrozenMemoryExportParseError::Inconsistent);
     }
     let _ = (
         &value.summaries,
@@ -355,7 +355,7 @@ pub fn parse_agent_memory_export(
             || u64::try_from(value.observations.get(&session.id).map_or(0, Vec::len)).ok()
                 != Some(session.observation_count)
         {
-            return Err(AgentMemoryImportError::Inconsistent);
+            return Err(FrozenMemoryExportParseError::Inconsistent);
         }
     }
     let mut observations = Vec::new();
@@ -364,7 +364,7 @@ pub fn parse_agent_memory_export(
             || observations.len().saturating_add(items.len()) > MAX_RECORDS
             || items.iter().any(|item| item.session_id != bucket)
         {
-            return Err(AgentMemoryImportError::Inconsistent);
+            return Err(FrozenMemoryExportParseError::Inconsistent);
         }
         for item in &items {
             if !item.importance.is_finite()
@@ -376,7 +376,7 @@ pub fn parse_agent_memory_export(
                 || !bounded_texts(&item.concepts)
                 || !bounded_texts(&item.files)
             {
-                return Err(AgentMemoryImportError::Inconsistent);
+                return Err(FrozenMemoryExportParseError::Inconsistent);
             }
         }
         observations.extend(items);
@@ -398,7 +398,7 @@ pub fn parse_agent_memory_export(
                 .iter()
                 .any(|id| !session_ids.contains(id.as_str()))
         {
-            return Err(AgentMemoryImportError::Inconsistent);
+            return Err(FrozenMemoryExportParseError::Inconsistent);
         }
     }
     let graph_nodes = value.graph_nodes.unwrap_or_default();
@@ -409,7 +409,7 @@ pub fn parse_agent_memory_export(
             || !bounded_texts(&node.source_observation_ids)
             || !bounded_texts(node.aliases.as_deref().unwrap_or_default())
     }) {
-        return Err(AgentMemoryImportError::Inconsistent);
+        return Err(FrozenMemoryExportParseError::Inconsistent);
     }
     let graph_edges = value.graph_edges.unwrap_or_default();
     unique(graph_edges.iter().map(|item| item.id.as_str()))?;
@@ -422,7 +422,7 @@ pub fn parse_agent_memory_export(
                     || !bounded_texts(context.situational_factors.as_deref().unwrap_or_default())
             })
     }) {
-        return Err(AgentMemoryImportError::Inconsistent);
+        return Err(FrozenMemoryExportParseError::Inconsistent);
     }
     let mut dangling = BTreeSet::new();
     for memory in &value.memories {
@@ -462,7 +462,7 @@ pub fn parse_agent_memory_export(
             }
         }
     }
-    Ok(AgentMemoryExport {
+    Ok(FrozenMemoryExport {
         exported_at: value.exported_at,
         sessions: value.sessions,
         observations,
@@ -498,11 +498,11 @@ fn valid_json_value(value: &serde_json::Value) -> bool {
 
 fn unique<'a>(
     values: impl IntoIterator<Item = &'a str>,
-) -> Result<BTreeSet<&'a str>, AgentMemoryImportError> {
+) -> Result<BTreeSet<&'a str>, FrozenMemoryExportParseError> {
     let mut result = BTreeSet::new();
     for value in values {
         if value.is_empty() || !result.insert(value) {
-            return Err(AgentMemoryImportError::Inconsistent);
+            return Err(FrozenMemoryExportParseError::Inconsistent);
         }
     }
     Ok(result)
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn parses_exact_complete_v0_9_29_export() {
         let bytes = serde_json::to_vec(&export()).unwrap();
-        let parsed = parse_agent_memory_export(&bytes).unwrap();
+        let parsed = parse_frozen_memory_export(&bytes).unwrap();
         assert_eq!(parsed.sessions.len(), 1);
         assert_eq!(parsed.observations.len(), 1);
         assert_eq!(parsed.memories.len(), 1);
@@ -572,27 +572,27 @@ mod tests {
                 );
             }
             assert_eq!(
-                parse_agent_memory_export(&serde_json::to_vec(&value).unwrap()),
-                Err(AgentMemoryImportError::Unsupported)
+                parse_frozen_memory_export(&serde_json::to_vec(&value).unwrap()),
+                Err(FrozenMemoryExportParseError::Unsupported)
             );
         }
         let mut wrong = export();
         wrong["version"] = json!("0.9.28");
         assert_eq!(
-            parse_agent_memory_export(&serde_json::to_vec(&wrong).unwrap()),
-            Err(AgentMemoryImportError::Unsupported)
+            parse_frozen_memory_export(&serde_json::to_vec(&wrong).unwrap()),
+            Err(FrozenMemoryExportParseError::Unsupported)
         );
         let mut unknown = export();
         unknown["futureCollection"] = json!([]);
         assert_eq!(
-            parse_agent_memory_export(&serde_json::to_vec(&unknown).unwrap()),
-            Err(AgentMemoryImportError::Unsupported)
+            parse_frozen_memory_export(&serde_json::to_vec(&unknown).unwrap()),
+            Err(FrozenMemoryExportParseError::Unsupported)
         );
         let mut wrong_collection = export();
         wrong_collection["profiles"] = json!("not-an-array");
         assert_eq!(
-            parse_agent_memory_export(&serde_json::to_vec(&wrong_collection).unwrap()),
-            Err(AgentMemoryImportError::Unsupported)
+            parse_frozen_memory_export(&serde_json::to_vec(&wrong_collection).unwrap()),
+            Err(FrozenMemoryExportParseError::Unsupported)
         );
     }
 
@@ -604,15 +604,15 @@ mod tests {
             duplicate["sessions"][0].clone()
         ]);
         assert_eq!(
-            parse_agent_memory_export(&serde_json::to_vec(&duplicate).unwrap()),
-            Err(AgentMemoryImportError::Inconsistent)
+            parse_frozen_memory_export(&serde_json::to_vec(&duplicate).unwrap()),
+            Err(FrozenMemoryExportParseError::Inconsistent)
         );
 
         let mut mismatch = export();
         mismatch["observations"]["session-a"][0]["sessionId"] = json!("session-b");
         assert_eq!(
-            parse_agent_memory_export(&serde_json::to_vec(&mismatch).unwrap()),
-            Err(AgentMemoryImportError::Inconsistent)
+            parse_frozen_memory_export(&serde_json::to_vec(&mismatch).unwrap()),
+            Err(FrozenMemoryExportParseError::Inconsistent)
         );
 
         let mut dangling = export();
@@ -622,7 +622,7 @@ mod tests {
             "sourceObservationIds": ["missing-observation"],
             "createdAt": "2026-08-30T00:00:04Z"
         }]);
-        let parsed = parse_agent_memory_export(&serde_json::to_vec(&dangling).unwrap()).unwrap();
+        let parsed = parse_frozen_memory_export(&serde_json::to_vec(&dangling).unwrap()).unwrap();
         assert_eq!(
             parsed.dangling_refs,
             ["node:missing", "observation:missing-observation"]
@@ -631,10 +631,10 @@ mod tests {
 
     #[test]
     fn rejects_oversized_without_parsing() {
-        let bytes = vec![b' '; AGENT_MEMORY_MAX_BYTES + 1];
+        let bytes = vec![b' '; FROZEN_MEMORY_EXPORT_MAX_BYTES + 1];
         assert_eq!(
-            parse_agent_memory_export(&bytes),
-            Err(AgentMemoryImportError::Oversized)
+            parse_frozen_memory_export(&bytes),
+            Err(FrozenMemoryExportParseError::Oversized)
         );
     }
 }

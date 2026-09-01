@@ -3,11 +3,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonical::{CanonicalValue, sha256},
     evidence::hex,
-    ids::{AtomId, CoreMembershipId, JobId, ProcedureId},
+    ids::{AtomId, CoreMembershipId, JobId, ProcedureId, RevisionProposalId},
     revision::RevisionId,
+    semantic::{ProposalOperation, RevisionProposal},
 };
 
 pub const OBJECT_DELETION_LEDGER_SCHEMA_VERSION: u16 = 1;
+const OBJECT_REAUTHORIZATION_INTENT_SCHEMA_VERSION: u16 = 1;
 const MAX_DELETED_REVISIONS: usize = 256;
 const MAX_SUPPRESSION_REFS: usize = 512;
 
@@ -179,6 +181,88 @@ impl ObjectDeletionLedgerEvent {
             && self.deletion_generation == next.deletion_generation
             && self.purge_job_id == next.purge_job_id
             && self.recorded_at_us <= next.recorded_at_us
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectReauthorizationRef {
+    pub target: ObjectDeletionTarget,
+    pub deletion_generation: u64,
+    pub purge_job_audit_ref: String,
+}
+
+impl ObjectReauthorizationRef {
+    pub fn from_deletion(deletion: &ObjectDeletionLedgerEvent) -> Option<Self> {
+        if !deletion.validate() || deletion.phase != ObjectDeletionPhase::Purged {
+            return None;
+        }
+        Some(Self {
+            target: deletion.target,
+            deletion_generation: deletion.deletion_generation,
+            purge_job_audit_ref: deletion.purge_job_audit_ref.clone()?,
+        })
+    }
+
+    pub fn matches(&self, deletion: &ObjectDeletionLedgerEvent) -> bool {
+        Self::from_deletion(deletion).as_ref() == Some(self)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectReauthorizationIntent {
+    pub schema_version: u16,
+    pub deletion: ObjectReauthorizationRef,
+    pub reviewed_proposal_id: RevisionProposalId,
+    pub reviewed_proposal_revision_id: RevisionId,
+    pub reviewed_fingerprint: String,
+}
+
+impl ObjectReauthorizationIntent {
+    pub fn new(deletion: &ObjectDeletionLedgerEvent, reviewed: &RevisionProposal) -> Option<Self> {
+        let value = Self {
+            schema_version: OBJECT_REAUTHORIZATION_INTENT_SCHEMA_VERSION,
+            deletion: ObjectReauthorizationRef::from_deletion(deletion)?,
+            reviewed_proposal_id: reviewed.proposal_id,
+            reviewed_proposal_revision_id: reviewed.proposal_revision_id,
+            reviewed_fingerprint: hex(&reviewed.fingerprint),
+        };
+        value.validate(deletion, reviewed).then_some(value)
+    }
+
+    pub fn validate(
+        &self,
+        deletion: &ObjectDeletionLedgerEvent,
+        reviewed: &RevisionProposal,
+    ) -> bool {
+        deletion.validate()
+            && deletion.phase == ObjectDeletionPhase::Purged
+            && self.deletion.matches(deletion)
+            && self.schema_version == OBJECT_REAUTHORIZATION_INTENT_SCHEMA_VERSION
+            && self.reviewed_proposal_id == reviewed.proposal_id
+            && self.reviewed_proposal_revision_id == reviewed.proposal_revision_id
+            && digest_text(&self.reviewed_fingerprint)
+            && self.reviewed_fingerprint == hex(&reviewed.fingerprint)
+            && reviewed.validate().is_ok()
+            && reviewed.operation == ProposalOperation::Create
+            && reviewed.target_id.is_none()
+            && reviewed.base_revision_id.is_none()
+            && reviewed.status.is_open()
+    }
+
+    pub fn canonical_toml(
+        &self,
+        deletion: &ObjectDeletionLedgerEvent,
+        reviewed: &RevisionProposal,
+    ) -> Option<String> {
+        self.validate(deletion, reviewed)
+            .then(|| toml::to_string(self).ok())
+            .flatten()
+    }
+
+    pub fn from_toml(value: &str) -> Option<Self> {
+        toml::from_str(value).ok()
     }
 }
 

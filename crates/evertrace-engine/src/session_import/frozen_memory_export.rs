@@ -1,10 +1,10 @@
-//! Frozen AgentMemory v0.9.29 export mapping into L0 evidence and pending proposals.
+//! Frozen third-party memory export v0.9.29 mapping into L0 evidence and pending proposals.
 
 use evertrace_capture::{CaptureOutcome, CaptureRecordInput, CaptureRuntime, RuntimeSnapshot};
-use evertrace_codex::session_import::{
-    AgentMemoryExport, AgentMemoryGraphEdge, AgentMemoryGraphNode,
-    AgentMemoryImportError as ParseError, AgentMemoryMemory, AgentMemoryObservation,
-    parse_agent_memory_export,
+use evertrace_codex::frozen_memory_export::{
+    FrozenMemoryExport, FrozenMemoryExportGraphEdge, FrozenMemoryExportGraphNode,
+    FrozenMemoryExportMemory, FrozenMemoryExportObservation, FrozenMemoryExportParseError,
+    parse_frozen_memory_export,
 };
 use evertrace_domain::{
     evidence::{
@@ -20,60 +20,63 @@ use evertrace_domain::{
         ProposalPayload, ProposalTargetKind, ValidityInterval,
     },
 };
-use evertrace_store::{JournalCommand, JournalPayload, SemanticCurrentView};
+use evertrace_store::{
+    JournalCommand, JournalPayload, ObjectDeletionCandidateAdmissionView, SemanticCurrentView,
+};
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
     EvidenceIngestor, WriterHandle,
     semantic::{
-        ProposalCommandContext, ProposalResolution, RevisionProposalService, SubmitProposalRequest,
+        DeletionAwareProposalResolution, ProposalCommandContext, ProposalResolution,
+        RevisionProposalService, SubmitProposalRequest,
     },
 };
 
-const SOURCE_INSTANCE: &str = "agentmemory-export-v0.9.29";
-const ADAPTER_REVISION: &str = "agentmemory-export-v0.9.29";
+const SOURCE_INSTANCE: &str = "evertrace-frozen-memory-export-v1";
+const ADAPTER_REVISION: &str = "evertrace-frozen-memory-export-v1";
 const INGEST_BATCH: usize = 256;
 const PROPOSAL_BATCH: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentMemoryProvenance {
+pub struct FrozenMemoryExportProvenance {
     pub graph_ref: String,
     pub source_observation_refs: Vec<SourceObservationId>,
     pub dangling: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentMemoryImportOutcome {
+pub struct FrozenMemoryExportImportOutcome {
     pub observations: usize,
     pub memory_evidence: usize,
     pub proposals: usize,
-    pub graph_provenance: Vec<AgentMemoryProvenance>,
+    pub graph_provenance: Vec<FrozenMemoryExportProvenance>,
     pub diagnostics: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum AgentMemoryImportError {
-    #[error("AgentMemory export is unavailable or unsupported")]
+pub enum FrozenMemoryExportImportError {
+    #[error("frozen memory export is unavailable or unsupported")]
     Unsupported,
-    #[error("AgentMemory migration persistence failed")]
+    #[error("frozen memory export persistence failed")]
     Persistence,
 }
 
 #[derive(Clone)]
-pub struct AgentMemoryMigrationService {
+pub struct FrozenMemoryExportMigrationService {
     writer: WriterHandle,
     runtime: RuntimeSnapshot,
 }
 
-impl AgentMemoryMigrationService {
+impl FrozenMemoryExportMigrationService {
     pub fn new(
         writer: WriterHandle,
         runtime: RuntimeSnapshot,
-    ) -> Result<Self, AgentMemoryImportError> {
+    ) -> Result<Self, FrozenMemoryExportImportError> {
         runtime
             .validate()
-            .map_err(|_| AgentMemoryImportError::Persistence)?;
+            .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
         Ok(Self { writer, runtime })
     }
 
@@ -81,16 +84,16 @@ impl AgentMemoryMigrationService {
         &self,
         bytes: &[u8],
         occurred_at_us: i64,
-    ) -> Result<AgentMemoryImportOutcome, AgentMemoryImportError> {
+    ) -> Result<FrozenMemoryExportImportOutcome, FrozenMemoryExportImportError> {
         if occurred_at_us < 0 {
-            return Err(AgentMemoryImportError::Unsupported);
+            return Err(FrozenMemoryExportImportError::Unsupported);
         }
-        let export = parse_agent_memory_export(bytes).map_err(map_parse)?;
+        let export = parse_frozen_memory_export(bytes).map_err(map_parse)?;
         let diagnostics = export.dangling_refs.clone();
-        let fingerprint =
-            payload_fingerprint(1, bytes, None).map_err(|_| AgentMemoryImportError::Unsupported)?;
+        let fingerprint = payload_fingerprint(1, bytes, None)
+            .map_err(|_| FrozenMemoryExportImportError::Unsupported)?;
         let revision = SourceRevision::parse(hex(&fingerprint))
-            .map_err(|_| AgentMemoryImportError::Unsupported)?;
+            .map_err(|_| FrozenMemoryExportImportError::Unsupported)?;
         let mut existing = existing_observations(&self.writer).await?;
         let previous = current_revision(&self.writer, &revision).await?;
         let mut observation_map = std::collections::BTreeMap::new();
@@ -102,7 +105,7 @@ impl AgentMemoryMigrationService {
             self.runtime.effective_config_hash,
             ADAPTER_REVISION,
         )
-        .map_err(|_| AgentMemoryImportError::Persistence)?;
+        .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
         let mut records = export
             .observations
             .iter()
@@ -123,12 +126,12 @@ impl AgentMemoryMigrationService {
             ingestor
                 .drain_observations_once(&replay_ids)
                 .await
-                .map_err(|_| AgentMemoryImportError::Persistence)?;
+                .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
             existing.extend(existing_observations(&self.writer).await?);
             let ids = {
                 let mut runtime = CaptureRuntime::open(self.runtime.clone())
-                    .map_err(|_| AgentMemoryImportError::Persistence)?;
-                let mut capture = AgentMemoryCapture {
+                    .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
+                let mut capture = FrozenMemoryExportCapture {
                     runtime: &mut runtime,
                     existing: &existing,
                     revision: &revision,
@@ -136,8 +139,8 @@ impl AgentMemoryMigrationService {
                 };
                 let mut ids = Vec::new();
                 for (ordinal, record) in batch {
-                    let ordinal =
-                        u64::try_from(ordinal).map_err(|_| AgentMemoryImportError::Unsupported)?;
+                    let ordinal = u64::try_from(ordinal)
+                        .map_err(|_| FrozenMemoryExportImportError::Unsupported)?;
                     let (id, captured) = record.capture(&mut capture, ordinal)?;
                     record.remember(id, &mut observation_map, &mut memory_map, &mut graph_map);
                     if captured {
@@ -150,14 +153,14 @@ impl AgentMemoryMigrationService {
                 ingestor
                     .drain_observations_once(&ids)
                     .await
-                    .map_err(|_| AgentMemoryImportError::Persistence)?;
+                    .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
             }
         }
         let proposals = self
             .submit_memories(&export, &observation_map, &memory_map, occurred_at_us)
             .await?;
         let graph_provenance = graph_provenance(&export, &observation_map, &graph_map);
-        Ok(AgentMemoryImportOutcome {
+        Ok(FrozenMemoryExportImportOutcome {
             observations: export.observations.len(),
             memory_evidence: export.memories.len(),
             proposals,
@@ -168,18 +171,20 @@ impl AgentMemoryMigrationService {
 
     async fn submit_memories(
         &self,
-        export: &AgentMemoryExport,
+        export: &FrozenMemoryExport,
         observations: &std::collections::BTreeMap<String, SourceObservationId>,
         memories: &std::collections::BTreeMap<String, SourceObservationId>,
         occurred_at_us: i64,
-    ) -> Result<usize, AgentMemoryImportError> {
+    ) -> Result<usize, FrozenMemoryExportImportError> {
         let snapshot = self
             .writer
             .project()
             .await
-            .map_err(|_| AgentMemoryImportError::Persistence)?;
+            .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
         let view = SemanticCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| AgentMemoryImportError::Persistence)?;
+            .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
+        let deletion_admission = ObjectDeletionCandidateAdmissionView::from_snapshot(&snapshot)
+            .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
         let mut created = 0;
         let mut seen = std::collections::BTreeSet::new();
         let mut pending_events = Vec::new();
@@ -193,7 +198,7 @@ impl AgentMemoryMigrationService {
                 continue;
             }
             let Some(memory_evidence) = memories.get(&memory.id).copied() else {
-                return Err(AgentMemoryImportError::Persistence);
+                return Err(FrozenMemoryExportImportError::Persistence);
             };
             let mut source_refs = memory
                 .source_observation_ids
@@ -222,7 +227,7 @@ impl AgentMemoryMigrationService {
                         epistemic_status: EpistemicStatus::Unverified,
                         value: AtomValue {
                             text,
-                            subject: "agentmemory_import".into(),
+                            subject: "frozen_memory_export_import".into(),
                             predicate: "legacy_memory_claim".into(),
                             object: None,
                             qualifiers: Vec::new(),
@@ -248,8 +253,9 @@ impl AgentMemoryMigrationService {
                 eligibility: ProposalEligibility::ManualRequired,
                 created_by: ProposalCreatedBy::Agent,
             };
-            let resolution = RevisionProposalService.submit(
+            let resolution = RevisionProposalService.submit_with_deletion_admission(
                 &view,
+                &deletion_admission,
                 ProposalCommandContext {
                     command_id: CommandId::new_v7(),
                     occurred_at_us,
@@ -258,9 +264,13 @@ impl AgentMemoryMigrationService {
                 },
                 request,
             );
-            match resolution.map_err(|_| AgentMemoryImportError::Persistence)? {
-                ProposalResolution::NoDelta => {}
-                ProposalResolution::Revision { command, .. } => {
+            match resolution.map_err(|_| FrozenMemoryExportImportError::Persistence)? {
+                DeletionAwareProposalResolution::FixedSuppression
+                | DeletionAwareProposalResolution::Proposal(ProposalResolution::NoDelta) => {}
+                DeletionAwareProposalResolution::Proposal(ProposalResolution::Revision {
+                    command,
+                    ..
+                }) => {
                     pending_events.extend_from_slice(command.events());
                     created += 1;
                     if pending_events.len() >= PROPOSAL_BATCH {
@@ -279,33 +289,33 @@ impl AgentMemoryMigrationService {
         &self,
         events: &mut Vec<evertrace_store::JournalEventDraft>,
         occurred_at_us: i64,
-    ) -> Result<(), AgentMemoryImportError> {
+    ) -> Result<(), FrozenMemoryExportImportError> {
         if events.is_empty() {
             return Ok(());
         }
         let command = JournalCommand::new(CommandId::new_v7(), std::mem::take(events))
-            .map_err(|_| AgentMemoryImportError::Persistence)?;
+            .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
         self.writer
             .commit(command, occurred_at_us)
             .await
-            .map_err(|_| AgentMemoryImportError::Persistence)?;
+            .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
         Ok(())
     }
 }
 
 #[derive(Clone, Copy)]
 enum MigrationRecord<'a> {
-    Observation(&'a AgentMemoryObservation),
-    Memory(&'a AgentMemoryMemory),
-    Node(&'a AgentMemoryGraphNode),
-    Edge(&'a AgentMemoryGraphEdge),
+    Observation(&'a FrozenMemoryExportObservation),
+    Memory(&'a FrozenMemoryExportMemory),
+    Node(&'a FrozenMemoryExportGraphNode),
+    Edge(&'a FrozenMemoryExportGraphEdge),
 }
 
 impl MigrationRecord<'_> {
     fn observation_id(
         self,
         revision: &SourceRevision,
-    ) -> Result<SourceObservationId, AgentMemoryImportError> {
+    ) -> Result<SourceObservationId, FrozenMemoryExportImportError> {
         let identity = match self {
             Self::Observation(value) => format!("observation:{}", value.id),
             Self::Memory(value) => format!("memory:{}", value.id),
@@ -314,19 +324,19 @@ impl MigrationRecord<'_> {
         };
         source_observation_id(
             &SourceInstanceId::parse(SOURCE_INSTANCE)
-                .map_err(|_| AgentMemoryImportError::Unsupported)?,
+                .map_err(|_| FrozenMemoryExportImportError::Unsupported)?,
             revision,
             &SourceRecordIdentity::parse(identity)
-                .map_err(|_| AgentMemoryImportError::Unsupported)?,
+                .map_err(|_| FrozenMemoryExportImportError::Unsupported)?,
         )
-        .map_err(|_| AgentMemoryImportError::Unsupported)
+        .map_err(|_| FrozenMemoryExportImportError::Unsupported)
     }
 
     fn capture(
         self,
-        capture: &mut AgentMemoryCapture<'_>,
+        capture: &mut FrozenMemoryExportCapture<'_>,
         ordinal: u64,
-    ) -> Result<(SourceObservationId, bool), AgentMemoryImportError> {
+    ) -> Result<(SourceObservationId, bool), FrozenMemoryExportImportError> {
         match self {
             Self::Observation(value) => capture.capture(
                 ordinal,
@@ -341,19 +351,19 @@ impl MigrationRecord<'_> {
                 value
                     .session_ids
                     .first()
-                    .map_or("agentmemory-export", String::as_str),
+                    .map_or("evertrace-frozen-memory-export-v1", String::as_str),
             ),
             Self::Node(value) => capture.capture(
                 ordinal,
                 format!("graph-node:{}", value.id),
                 value,
-                "agentmemory-export",
+                "evertrace-frozen-memory-export-v1",
             ),
             Self::Edge(value) => capture.capture(
                 ordinal,
                 format!("graph-edge:{}", value.id),
                 value,
-                "agentmemory-export",
+                "evertrace-frozen-memory-export-v1",
             ),
         }
     }
@@ -382,28 +392,29 @@ impl MigrationRecord<'_> {
     }
 }
 
-struct AgentMemoryCapture<'a> {
+struct FrozenMemoryExportCapture<'a> {
     runtime: &'a mut CaptureRuntime,
     existing: &'a std::collections::BTreeSet<String>,
     revision: &'a SourceRevision,
     previous: Option<&'a SourceRevision>,
 }
 
-impl AgentMemoryCapture<'_> {
+impl FrozenMemoryExportCapture<'_> {
     fn capture<T: Serialize>(
         &mut self,
         ordinal: u64,
         record_identity: String,
         record: &T,
         session: &str,
-    ) -> Result<(SourceObservationId, bool), AgentMemoryImportError> {
-        let raw = serde_json::to_vec(record).map_err(|_| AgentMemoryImportError::Unsupported)?;
+    ) -> Result<(SourceObservationId, bool), FrozenMemoryExportImportError> {
+        let raw =
+            serde_json::to_vec(record).map_err(|_| FrozenMemoryExportImportError::Unsupported)?;
         let source_instance = SourceInstanceId::parse(SOURCE_INSTANCE)
-            .map_err(|_| AgentMemoryImportError::Unsupported)?;
+            .map_err(|_| FrozenMemoryExportImportError::Unsupported)?;
         let identity = SourceRecordIdentity::parse(record_identity.clone())
-            .map_err(|_| AgentMemoryImportError::Unsupported)?;
+            .map_err(|_| FrozenMemoryExportImportError::Unsupported)?;
         let id = source_observation_id(&source_instance, self.revision, &identity)
-            .map_err(|_| AgentMemoryImportError::Unsupported)?;
+            .map_err(|_| FrozenMemoryExportImportError::Unsupported)?;
         if self.existing.contains(&id.to_string()) {
             return Ok((id, false));
         }
@@ -411,15 +422,17 @@ impl AgentMemoryCapture<'_> {
         let outcome = self
             .runtime
             .capture(CaptureRecordInput {
-                spool_record_id: Some(format!("agentmemory-{record_identity}")),
+                spool_record_id: Some(format!(
+                    "evertrace-frozen-memory-export-v1:{record_identity}"
+                )),
                 source_observation_id_hint: None,
                 source_instance_id: SOURCE_INSTANCE.into(),
                 source_revision: self.revision.as_str().into(),
                 source_record_identity: Some(record_identity),
                 identity_strength: Some(IdentityStrength::StableSourceSequence),
                 source_kind: EvidenceSourceKind::Other,
-                identity_domain: "agentmemory-export-v0.9.29".into(),
-                source_ref: "agentmemory:export".into(),
+                identity_domain: "evertrace-frozen-memory-export-v1".into(),
+                source_ref: "evertrace:frozen-memory-export".into(),
                 session_ref: session.into(),
                 turn_ref: None,
                 tool_ref: None,
@@ -467,15 +480,15 @@ impl AgentMemoryCapture<'_> {
                 surface_eligible: false,
                 adapter_revision: 1,
                 adapter_manifest_ref: ADAPTER_REVISION.into(),
-                eligible_event_manifest_ref: "agentmemory-export-records-v1".into(),
+                eligible_event_manifest_ref: "evertrace-frozen-memory-export-records-v1".into(),
                 parser_revision: 1,
                 canonicalization_revision: 1,
                 event_time_us: None,
                 raw_payload: raw,
             })
-            .map_err(|_| AgentMemoryImportError::Persistence)?;
+            .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
         if !matches!(outcome, CaptureOutcome::Durable { .. }) {
-            return Err(AgentMemoryImportError::Persistence);
+            return Err(FrozenMemoryExportImportError::Persistence);
         }
         Ok((id, true))
     }
@@ -483,11 +496,11 @@ impl AgentMemoryCapture<'_> {
 
 async fn existing_observations(
     writer: &WriterHandle,
-) -> Result<std::collections::BTreeSet<String>, AgentMemoryImportError> {
+) -> Result<std::collections::BTreeSet<String>, FrozenMemoryExportImportError> {
     let snapshot = writer
         .project()
         .await
-        .map_err(|_| AgentMemoryImportError::Persistence)?;
+        .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
     Ok(snapshot
         .data_rows()
         .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
@@ -498,11 +511,11 @@ async fn existing_observations(
 async fn current_revision(
     writer: &WriterHandle,
     revision: &SourceRevision,
-) -> Result<Option<SourceRevision>, AgentMemoryImportError> {
+) -> Result<Option<SourceRevision>, FrozenMemoryExportImportError> {
     let snapshot = writer
         .project()
         .await
-        .map_err(|_| AgentMemoryImportError::Persistence)?;
+        .map_err(|_| FrozenMemoryExportImportError::Persistence)?;
     let mut current = None;
     for row in snapshot.data_rows() {
         let Some(json) = row.payload_json.as_deref() else {
@@ -519,10 +532,10 @@ async fn current_revision(
 }
 
 fn graph_provenance(
-    export: &AgentMemoryExport,
+    export: &FrozenMemoryExport,
     observations: &std::collections::BTreeMap<String, SourceObservationId>,
     graph: &std::collections::BTreeMap<String, SourceObservationId>,
-) -> Vec<AgentMemoryProvenance> {
+) -> Vec<FrozenMemoryExportProvenance> {
     let node_ids = export
         .graph_nodes
         .iter()
@@ -531,7 +544,7 @@ fn graph_provenance(
     let nodes = export
         .graph_nodes
         .iter()
-        .map(|node: &AgentMemoryGraphNode| {
+        .map(|node: &FrozenMemoryExportGraphNode| {
             (
                 format!("node:{}", node.id),
                 &node.source_observation_ids,
@@ -541,7 +554,7 @@ fn graph_provenance(
     let edges = export
         .graph_edges
         .iter()
-        .map(|edge: &AgentMemoryGraphEdge| {
+        .map(|edge: &FrozenMemoryExportGraphEdge| {
             (
                 format!("edge:{}", edge.id),
                 &edge.source_observation_ids,
@@ -560,7 +573,7 @@ fn graph_provenance(
                 sources.push(*record);
                 sources.sort();
                 sources.dedup();
-                AgentMemoryProvenance {
+                FrozenMemoryExportProvenance {
                     graph_ref: key,
                     source_observation_refs: sources,
                     dangling: missing_node || refs.iter().any(|id| !observations.contains_key(id)),
@@ -570,6 +583,6 @@ fn graph_provenance(
         .collect()
 }
 
-fn map_parse(_: ParseError) -> AgentMemoryImportError {
-    AgentMemoryImportError::Unsupported
+fn map_parse(_: FrozenMemoryExportParseError) -> FrozenMemoryExportImportError {
+    FrozenMemoryExportImportError::Unsupported
 }

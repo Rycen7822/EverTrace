@@ -15,7 +15,10 @@ use evertrace_domain::{
         evidence_span_hash, host_occurrence_id_for_nonexact, payload_fingerprint,
         source_observation_id, source_receipt_id,
     },
-    ids::{CommandId, CoreMembershipId, RepositoryId, RequestId, RevisionProposalId},
+    ids::{
+        AtomId, CommandId, CoreMembershipId, ProcedureId, RepositoryId, RequestId,
+        RevisionProposalId,
+    },
     procedure::{
         ProcedureActions, ProcedureDone, ProcedureDraft, ProcedureKind, ProcedureScope,
         ProcedureWhen,
@@ -31,16 +34,20 @@ use evertrace_domain::{
     },
 };
 use evertrace_engine::{
-    HumanActionOutcome, HumanGovernanceService, HumanProposalDecision, open_writer,
+    HumanActionOutcome, HumanGovernanceService, HumanProposalDecision, HumanSurface,
+    McpActionService, McpBindingAuthority, McpServiceAction, McpServiceRequest, McpServiceStatus,
+    open_writer,
     semantic::{
-        ProposalCommandContext, ProposalResolution, RevisionProposalService, SubmitProposalRequest,
+        DeletionAwareProposalResolution, ProposalCommandContext, ProposalResolution,
+        RevisionProposalService, SubmitProposalRequest,
     },
     spawn_writer,
 };
 use evertrace_store::{
     DefaultRetrievalSuppressionGeneration, JournalCommand, JournalEventDraft, JournalPayload,
-    NormalizationWatermark, ObjectDeletionCurrentView, ProjectionSnapshot, SemanticCurrentView,
-    SourceIngestWatermark, default_retrieval_suppression_ref_hash, object_deletion_preview,
+    NormalizationWatermark, ObjectDeletionCandidateAdmissionView, ObjectDeletionCurrentView,
+    ProjectionSnapshot, SemanticCurrentView, SourceIngestWatermark,
+    default_retrieval_suppression_ref_hash, object_deletion_preview,
 };
 use tempfile::TempDir;
 
@@ -784,6 +791,19 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
         core_membership_id: membership_id,
     };
     let core_snapshot = handle.project().await.unwrap();
+    let core_membership = core_snapshot
+        .data_rows()
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        .find_map(|payload| match payload {
+            JournalPayload::CoreMembershipRecorded(value)
+                if value.core_membership_id == membership_id =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        })
+        .unwrap();
     let core_preview = object_deletion_preview(&core_snapshot, core_target).unwrap();
     assert_eq!(
         core_preview.guards.source_derivation_guard_hash,
@@ -1117,9 +1137,197 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
             .unwrap()
         )
     );
+    let purged_frontier = purged.frontier;
+    let mut old_id_resurrection = target_atom.clone();
+    old_id_resurrection.revision_id = evertrace_domain::revision::RevisionId::new_v7();
+    old_id_resurrection.parent_revision_id = Some(target_atom.revision_id);
+    old_id_resurrection.created_at_us = 10;
+    assert!(
+        handle
+            .commit(
+                JournalCommand::new(
+                    CommandId::new_v7(),
+                    vec![JournalEventDraft::runtime(
+                        10,
+                        CONFIG,
+                        "s32-test-v1",
+                        JournalPayload::AtomRecorded(Box::new(old_id_resurrection)),
+                    )],
+                )
+                .unwrap(),
+                10,
+            )
+            .await
+            .is_err()
+    );
+    let mut direct_fixed = target_atom.clone();
+    direct_fixed.atom_id = AtomId::new_v7();
+    direct_fixed.revision_id = evertrace_domain::revision::RevisionId::new_v7();
+    direct_fixed.parent_revision_id = None;
+    direct_fixed.accepted_proposal_id = None;
+    direct_fixed.accepted_proposal_revision_id = None;
+    direct_fixed.created_at_us = 10;
+    assert!(
+        handle
+            .commit(
+                JournalCommand::new(
+                    CommandId::new_v7(),
+                    vec![JournalEventDraft::runtime(
+                        10,
+                        CONFIG,
+                        "s32-test-v1",
+                        JournalPayload::AtomRecorded(Box::new(direct_fixed)),
+                    )],
+                )
+                .unwrap(),
+                10,
+            )
+            .await
+            .is_err()
+    );
+    let current_procedure = purged
+        .data_rows()
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        .find_map(|payload| match payload {
+            JournalPayload::ProcedureRevisionRecorded(value)
+                if value.procedure_id == procedure_id =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let mut direct_procedure = current_procedure;
+    direct_procedure.procedure_id = ProcedureId::new_v7();
+    direct_procedure.revision_id = evertrace_domain::revision::RevisionId::new_v7();
+    direct_procedure.parent_revision_id = None;
+    direct_procedure.revision_generation = 1;
+    let mut direct_membership = core_membership;
+    direct_membership.core_membership_id = CoreMembershipId::new_v7();
+    direct_membership.membership_revision_id = evertrace_domain::revision::RevisionId::new_v7();
+    direct_membership.supersedes_membership_revision_id = None;
+    for payload in [
+        JournalPayload::ProcedureRevisionRecorded(Box::new(direct_procedure)),
+        JournalPayload::CoreMembershipRecorded(Box::new(direct_membership)),
+    ] {
+        assert!(
+            handle
+                .commit(
+                    JournalCommand::new(
+                        CommandId::new_v7(),
+                        vec![JournalEventDraft::runtime(
+                            10,
+                            CONFIG,
+                            "s32-test-v1",
+                            payload,
+                        )],
+                    )
+                    .unwrap(),
+                    10,
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(handle.project().await.unwrap().frontier, purged_frontier);
+    let read_service = McpActionService::open(
+        McpBindingAuthority::from_device_key_dir(&runtime.device_key_dir).unwrap(),
+        &store,
+        handle.clone(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let exact_source = read_service
+        .handle(
+            "s32-exact-get",
+            McpServiceRequest {
+                request_id: RequestId::new_v7(),
+                action: McpServiceAction::Get,
+                workspace: repository_id.to_string(),
+                input: exclusive_observation.source_observation_id.to_string(),
+                refs: Vec::new(),
+                client_cwd: repository_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_source.status, McpServiceStatus::Ok);
+    assert!(
+        exact_source
+            .warnings
+            .iter()
+            .any(|warning| warning == "source_retained_object_forgotten")
+    );
+    let shared_source = read_service
+        .handle(
+            "s32-exact-get",
+            McpServiceRequest {
+                request_id: RequestId::new_v7(),
+                action: McpServiceAction::Get,
+                workspace: repository_id.to_string(),
+                input: host_shared_observation.source_observation_id.to_string(),
+                refs: Vec::new(),
+                client_cwd: repository_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared_source.status, McpServiceStatus::Ok);
+    assert!(
+        !shared_source
+            .warnings
+            .iter()
+            .any(|warning| warning == "source_retained_object_forgotten")
+    );
+    drop(read_service);
 
-    let (_, _, rewritten_surface) = source("rewritten", repository_id);
-    let (rewritten_receipt, _, _) = source("rewritten", repository_id);
+    let second_atom_target = ObjectDeletionTarget::Atom {
+        atom_id: downstream_atom.atom_id,
+    };
+    let second_forget_service = HumanGovernanceService::with_acceptance(
+        handle.clone(),
+        CONFIG,
+        runtime.clone(),
+        GlobalPromotionConfig {
+            atom: PromotionLevel::Manual,
+            procedure: PromotionLevel::Manual,
+            core_membership: PromotionLevel::Manual,
+        },
+    );
+    let second_snapshot = handle.project().await.unwrap();
+    let second_preview = object_deletion_preview(&second_snapshot, second_atom_target).unwrap();
+    assert!(matches!(
+        second_forget_service
+            .forget_object(
+                RequestId::new_v7(),
+                second_snapshot.frontier,
+                second_atom_target,
+                second_preview.exact_revision_ids,
+                second_preview.deletion_generation,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::Applied { .. }
+    ));
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let continued_writer = open_writer(&store).await.unwrap();
+    let (handle, task) = spawn_writer(continued_writer, 8).unwrap();
+    let two_tombstones =
+        ObjectDeletionCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    assert_eq!(
+        two_tombstones.events[&atom_target].phase,
+        ObjectDeletionPhase::Purged
+    );
+    assert_eq!(
+        two_tombstones.events[&second_atom_target].phase,
+        ObjectDeletionPhase::Purged
+    );
+
+    let (rewritten_receipt, rewritten_observation, rewritten_surface) =
+        source("rewritten", repository_id);
     assert_ne!(exclusive_surface.span_hash, rewritten_surface.span_hash);
     assert_eq!(
         default_retrieval_suppression_ref_hash(
@@ -1136,6 +1344,191 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
         .unwrap()
     );
 
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![
+                    JournalPayload::SourceReceiptRecorded(Box::new(rewritten_receipt.clone())),
+                    JournalPayload::SourceObservationRecorded(Box::new(
+                        rewritten_observation.clone(),
+                    )),
+                    JournalPayload::EvidenceSurfaceRecorded(Box::new(rewritten_surface.clone())),
+                    JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                        source_instance_id: rewritten_receipt.source_instance_id.clone(),
+                        source_revision: rewritten_receipt.source_revision.clone(),
+                        source_sequence: 1,
+                        confirmed_prefix_digest: None,
+                    }),
+                    JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
+                        target_kind: evertrace_store::DirtyTargetKind::EvidenceSurface,
+                        target_id: rewritten_observation.source_observation_id.to_string(),
+                        algorithm_revision: "s32-test-v1".into(),
+                        source_watermark: 1,
+                    }),
+                    JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
+                        target_kind: evertrace_store::DirtyTargetKind::PhysicalNormalization,
+                        target_id: rewritten_observation.source_observation_id.to_string(),
+                        algorithm_revision: "s32-test-v1".into(),
+                        source_watermark: 1,
+                    }),
+                ]
+                .into_iter()
+                .map(|payload| JournalEventDraft::runtime(10, CONFIG, "s32-test-v1", payload))
+                .collect(),
+            )
+            .unwrap(),
+            10,
+        )
+        .await
+        .unwrap();
+
+    let candidate_snapshot = handle.project().await.unwrap();
+    let candidate_view = SemanticCurrentView::from_snapshot(&candidate_snapshot).unwrap();
+    let candidate_admission =
+        ObjectDeletionCandidateAdmissionView::from_snapshot(&candidate_snapshot).unwrap();
+    let ProposalPayload::Atom(target_payload) = &target_proposal.payload else {
+        panic!("atom proposal expected")
+    };
+    let AtomProposalPayload::Create {
+        draft: target_draft,
+    } = target_payload.as_ref()
+    else {
+        panic!("atom create expected")
+    };
+    assert!(matches!(
+        proposals
+            .submit_with_deletion_admission(
+                &candidate_view,
+                &candidate_admission,
+                context(10),
+                SubmitProposalRequest {
+                    target_kind: ProposalTargetKind::Atom,
+                    target_id: None,
+                    base_revision_id: None,
+                    operation: ProposalOperation::Create,
+                    payload: ProposalPayload::Atom(Box::new(AtomProposalPayload::Create {
+                        draft: target_draft.clone(),
+                    })),
+                    evidence_refs: target_proposal.evidence_refs.clone(),
+                    source_cohort_refs: target_proposal.source_cohort_refs.clone(),
+                    eligibility: ProposalEligibility::AutoEligibleFull,
+                    created_by: ProposalCreatedBy::Agent,
+                },
+            )
+            .unwrap(),
+        DeletionAwareProposalResolution::FixedSuppression
+    ));
+    let mut rewritten_draft = target_draft.clone();
+    rewritten_draft.value.text.push_str(" restated");
+    rewritten_draft.source_observation_refs = vec![rewritten_observation.source_observation_id];
+    rewritten_draft.evidence_refs = vec![rewritten_receipt.source_receipt_id.to_string()];
+    let rewritten_resolution = proposals
+        .submit_with_deletion_admission(
+            &candidate_view,
+            &candidate_admission,
+            context(10),
+            SubmitProposalRequest {
+                target_kind: ProposalTargetKind::Atom,
+                target_id: None,
+                base_revision_id: None,
+                operation: ProposalOperation::Create,
+                payload: ProposalPayload::Atom(Box::new(AtomProposalPayload::Create {
+                    draft: rewritten_draft.clone(),
+                })),
+                evidence_refs: vec![rewritten_receipt.source_receipt_id.to_string()],
+                source_cohort_refs: vec![rewritten_receipt.source_receipt_id.to_string()],
+                eligibility: ProposalEligibility::AutoEligibleFull,
+                created_by: ProposalCreatedBy::Agent,
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            rewritten_resolution,
+            DeletionAwareProposalResolution::FixedSuppression
+        ),
+        "rewritten resolution: {rewritten_resolution:?}"
+    );
+    let mut partial_source_refs = vec![
+        rewritten_receipt.source_receipt_id.to_string(),
+        evertrace_domain::ids::SourceReceiptId::from_digest([99; 32]).to_string(),
+    ];
+    partial_source_refs.sort();
+    let partial_source = proposals
+        .submit_with_deletion_admission(
+            &candidate_view,
+            &candidate_admission,
+            context(10),
+            SubmitProposalRequest {
+                target_kind: ProposalTargetKind::Atom,
+                target_id: None,
+                base_revision_id: None,
+                operation: ProposalOperation::Create,
+                payload: ProposalPayload::Atom(Box::new(AtomProposalPayload::Create {
+                    draft: rewritten_draft,
+                })),
+                evidence_refs: partial_source_refs.clone(),
+                source_cohort_refs: partial_source_refs,
+                eligibility: ProposalEligibility::AutoEligibleFull,
+                created_by: ProposalCreatedBy::Agent,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        partial_source,
+        DeletionAwareProposalResolution::Proposal(ProposalResolution::Revision {
+            value,
+            ..
+        }) if value.eligibility == ProposalEligibility::ManualRequired
+            && value.review_reason.as_deref()
+                == Some("forgotten_object_historical_conflict")
+    ));
+
+    let mut reauthorization_draft = target_draft.clone();
+    reauthorization_draft
+        .value
+        .text
+        .push_str(" with independent review");
+    reauthorization_draft.source_observation_refs =
+        vec![host_shared_observation.source_observation_id];
+    reauthorization_draft.evidence_refs = vec![host_shared_receipt.source_receipt_id.to_string()];
+    let DeletionAwareProposalResolution::Proposal(ProposalResolution::Revision {
+        value: reauthorization_proposal,
+        command: reauthorization_submit,
+    }) = proposals
+        .submit_with_deletion_admission(
+            &candidate_view,
+            &candidate_admission,
+            context(10),
+            SubmitProposalRequest {
+                target_kind: ProposalTargetKind::Atom,
+                target_id: None,
+                base_revision_id: None,
+                operation: ProposalOperation::Create,
+                payload: ProposalPayload::Atom(Box::new(AtomProposalPayload::Create {
+                    draft: reauthorization_draft,
+                })),
+                evidence_refs: vec![host_shared_receipt.source_receipt_id.to_string()],
+                source_cohort_refs: vec![host_shared_receipt.source_receipt_id.to_string()],
+                eligibility: ProposalEligibility::AutoEligibleFull,
+                created_by: ProposalCreatedBy::Agent,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("independent source must create a manual conflict proposal")
+    };
+    assert_eq!(
+        reauthorization_proposal.eligibility,
+        ProposalEligibility::ManualRequired
+    );
+    assert_eq!(
+        reauthorization_proposal.review_reason.as_deref(),
+        Some("forgotten_object_historical_conflict")
+    );
+    handle.commit(reauthorization_submit, 10).await.unwrap();
+
     let restarted_service = HumanGovernanceService::with_acceptance(
         handle.clone(),
         CONFIG,
@@ -1146,6 +1539,125 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
             core_membership: PromotionLevel::Manual,
         },
     );
+    let reauthorization_frontier = handle.project().await.unwrap().frontier;
+    let detail = restarted_service
+        .detail(
+            HumanSurface::Inbox,
+            &reauthorization_proposal.proposal_id.to_string(),
+            reauthorization_frontier,
+            Some(&reauthorization_proposal.proposal_revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let displayed_reauthorization = detail.items[0]
+        .proposal_review
+        .as_ref()
+        .and_then(|review| {
+            (!review.plain_accept_eligible)
+                .then(|| review.reauthorization.clone())
+                .flatten()
+        })
+        .expect("historical conflict must display the representative tombstone");
+    assert_eq!(
+        displayed_reauthorization,
+        evertrace_domain::purge::ObjectReauthorizationRef::from_deletion(
+            &two_tombstones.events[&atom_target],
+        )
+        .unwrap()
+    );
+    assert!(matches!(
+        restarted_service
+            .decide_proposal(
+                RequestId::new_v7(),
+                reauthorization_frontier.saturating_sub(1),
+                reauthorization_proposal.proposal_id,
+                reauthorization_proposal.proposal_revision_id,
+                &evertrace_domain::evidence::hex(&reauthorization_proposal.fingerprint),
+                HumanProposalDecision::Reauthorize,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::Conflict { .. }
+    ));
+    assert!(matches!(
+        restarted_service
+            .decide_proposal(
+                RequestId::new_v7(),
+                reauthorization_frontier,
+                reauthorization_proposal.proposal_id,
+                reauthorization_proposal.proposal_revision_id,
+                &evertrace_domain::evidence::hex(&reauthorization_proposal.fingerprint),
+                HumanProposalDecision::Accept,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::Unavailable {
+            reason: "forgotten_object_requires_explicit_reauthorization"
+        }
+    ));
+    assert_eq!(
+        handle.project().await.unwrap().frontier,
+        reauthorization_frontier
+    );
+    let reauthorization_request = RequestId::new_v7();
+    let reauthorization_outcome = restarted_service
+        .decide_proposal(
+            reauthorization_request,
+            reauthorization_frontier,
+            reauthorization_proposal.proposal_id,
+            reauthorization_proposal.proposal_revision_id,
+            &evertrace_domain::evidence::hex(&reauthorization_proposal.fingerprint),
+            HumanProposalDecision::Reauthorize,
+        )
+        .await
+        .unwrap();
+    let reauthorized_proposal_revision = match reauthorization_outcome {
+        HumanActionOutcome::Applied {
+            current_revision_ref,
+            ..
+        } => current_revision_ref,
+        other => panic!("reauthorization must apply, got {other:?}"),
+    };
+    let after_reauthorization = handle.project().await.unwrap();
+    let reauthorized_atom = SemanticCurrentView::from_snapshot(&after_reauthorization)
+        .unwrap()
+        .atoms
+        .into_values()
+        .find(|atom| atom.accepted_proposal_id == Some(reauthorization_proposal.proposal_id))
+        .unwrap();
+    assert_ne!(reauthorized_atom.atom_id, target_atom.atom_id);
+    assert_eq!(
+        ObjectDeletionCurrentView::from_snapshot(&after_reauthorization)
+            .unwrap()
+            .events[&atom_target]
+            .phase,
+        ObjectDeletionPhase::Purged
+    );
+    assert_eq!(
+        ObjectDeletionCurrentView::from_snapshot(&after_reauthorization)
+            .unwrap()
+            .events[&second_atom_target]
+            .phase,
+        ObjectDeletionPhase::Purged
+    );
+    assert!(matches!(
+        restarted_service
+            .decide_proposal(
+                reauthorization_request,
+                reauthorization_frontier,
+                reauthorization_proposal.proposal_id,
+                reauthorization_proposal.proposal_revision_id,
+                &evertrace_domain::evidence::hex(&reauthorization_proposal.fingerprint),
+                HumanProposalDecision::Reauthorize,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::NoDelta {
+            current_revision_ref
+        } if current_revision_ref == reauthorized_proposal_revision
+    ));
+    assert_eq!(handle.project().await.unwrap(), after_reauthorization);
     let procedure_target = ObjectDeletionTarget::Procedure { procedure_id };
     let stale_snapshot = handle.project().await.unwrap();
     let stale_preview = object_deletion_preview(&stale_snapshot, procedure_target).unwrap();
@@ -1274,6 +1786,22 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
         } => assert_eq!(audit_event_ref, core_audit),
         other => panic!("reopened core retry must replay, got {other:?}"),
     }
+    assert!(matches!(
+        reopened_service
+            .decide_proposal(
+                reauthorization_request,
+                reauthorization_frontier,
+                reauthorization_proposal.proposal_id,
+                reauthorization_proposal.proposal_revision_id,
+                &evertrace_domain::evidence::hex(&reauthorization_proposal.fingerprint),
+                HumanProposalDecision::Reauthorize,
+            )
+            .await
+            .unwrap(),
+        HumanActionOutcome::NoDelta {
+            current_revision_ref
+        } if current_revision_ref == reauthorized_proposal_revision
+    ));
     assert_eq!(reopened_handle.project().await.unwrap(), expected);
     reopened_handle.shutdown().await.unwrap();
     reopened_task.await.unwrap().unwrap();
