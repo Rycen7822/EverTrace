@@ -42,15 +42,16 @@ use evertrace_domain::{
         VerifierStatus, tui_acceptance_event_payload,
     },
     work::{
-        AssignmentStatus, AttemptAdoptionStatus, AttemptOutcomeState, AttemptVerification,
-        ContractField, MultiCasMetricPolicy, PhaseContract, PhaseKind, PrimaryWorkBinding,
-        SeedPolicy, StrategyContract, Task, TaskIdentityConfidence, TaskLifecycle,
-        TaskScopeMembership, VariableDeclaration, WorkBindingRevision, Workstream,
+        AssignmentStatus, Attempt, AttemptAdoptionStatus, AttemptOutcomeState, AttemptVerification,
+        ContractField, ExperimentRun, MultiCasMetricPolicy, PhaseContract, PhaseKind,
+        PrimaryWorkBinding, SeedPolicy, StrategyContract, Task, TaskIdentityConfidence,
+        TaskLifecycle, TaskScopeMembership, VariableDeclaration, WorkBindingRevision, Workstream,
         WorkstreamStatus,
     },
 };
 use evertrace_engine::{
-    HumanActionOutcome, HumanGovernanceService, HumanNegativeDecision, PhysicalNormalizer,
+    HumanActionOutcome, HumanGovernanceService, HumanNegativeDecision, NormalizationSnapshot,
+    PhysicalNormalizer,
     autoresearch::{RunCreateInput, create_experiment_run},
     procedure::{
         ProcedureAcceptanceContext, ProcedureAcceptanceResolution, ProcedureCandidate,
@@ -2578,8 +2579,94 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
     );
 }
 
-#[tokio::test]
-async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() {
+struct RealUsageStage {
+    fixture: ActiveProcedureFixture,
+    stream: Workstream,
+    strategy: StrategyContract,
+    cas_id: CasId,
+    result: ResultEvidence,
+    run: ExperimentRun,
+    post_normalized: NormalizationSnapshot,
+    post_binding: WorkBindingRevision,
+    post_attempt: Attempt,
+    post_result_ref: String,
+    routed: RoutedProcedure,
+    search: SearchContext,
+    constraints: ConstraintState,
+    usage: ProcedureUsageRevision,
+    exposure_revision_id: RevisionId,
+}
+
+struct StableProcedureStage {
+    fixture: ActiveProcedureFixture,
+    strategy: StrategyContract,
+    cas_id: CasId,
+    search: SearchContext,
+    constraints: ConstraintState,
+}
+
+struct LocalizedHarmStage {
+    fixture: ActiveProcedureFixture,
+    cas_id: CasId,
+    search: SearchContext,
+    constraints: ConstraintState,
+    harm_action: ProcedureUsageRevision,
+    harm_run: ExperimentRun,
+    failed_attempt: Attempt,
+    replay_violation: ResultEvidence,
+}
+
+struct HarmReviewedStage {
+    fixture: ActiveProcedureFixture,
+    harm_action: ProcedureUsageRevision,
+    second_localized_id: ProcedureNegativeEvidenceId,
+}
+
+fn harm_result(
+    harm_run: &ExperimentRun,
+    cas_id: CasId,
+    revision_id: RevisionId,
+    verifier_receipt: Option<VerifierReceipt>,
+    failure: Option<ResultFailure>,
+) -> ResultEvidence {
+    let completeness = if failure.is_none()
+        && verifier_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.status == VerifierStatus::Passed)
+    {
+        EvidenceCompleteness::Complete
+    } else {
+        EvidenceCompleteness::Incomplete
+    };
+    ResultEvidence {
+        result_evidence_id: evertrace_domain::ids::ResultEvidenceId::new_v7(),
+        revision_id,
+        parent_revision_id: None,
+        experiment_run_id: harm_run.run_id,
+        experiment_run_revision_id: harm_run.revision_id,
+        result_scope: ResultScope::Partial,
+        raw_artifact_refs: Vec::new(),
+        raw_cas_refs: vec![cas_id],
+        parsed_metric: Some(MetricValue {
+            decimal: "0".into(),
+            unit: "boolean".into(),
+            uncertainty_decimal: None,
+        }),
+        parser_receipt: ParserReceipt {
+            parser_version: "evertrace.result_metric.v1".into(),
+            input_artifact_refs: Vec::new(),
+            input_cas_refs: vec![cas_id],
+            status: ParserStatus::Parsed,
+            failure_code: None,
+        },
+        verifier_receipt,
+        completeness,
+        failure,
+        created_at_us: 23,
+    }
+}
+
+async fn prepare_real_router_usage_stage() -> RealUsageStage {
     let ActiveProcedureFixture {
         _temp,
         store_path,
@@ -2591,7 +2678,6 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         procedure,
         config,
     } = active_procedure_fixture("real", false).await;
-    let service = RevisionProposalService;
     let task = task(repository_id, worktree_id, 5);
     let stream = workstream(task.task_id, repository_id, worktree_id, 5);
     writer
@@ -3009,6 +3095,66 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         )
         .await
         .unwrap();
+    RealUsageStage {
+        fixture: ActiveProcedureFixture {
+            _temp,
+            store_path,
+            writer,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            evidence_receipt,
+            procedure,
+            config,
+        },
+        stream,
+        strategy,
+        cas_id,
+        result,
+        run,
+        post_normalized,
+        post_binding,
+        post_attempt,
+        post_result_ref,
+        routed: routed.items[0].clone(),
+        search,
+        constraints,
+        usage,
+        exposure_revision_id,
+    }
+}
+
+async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProcedureStage {
+    let RealUsageStage {
+        fixture,
+        stream,
+        strategy,
+        cas_id,
+        result,
+        run,
+        post_normalized,
+        post_binding,
+        post_attempt,
+        post_result_ref,
+        routed,
+        search,
+        constraints,
+        usage,
+        exposure_revision_id,
+    } = stage;
+    let ActiveProcedureFixture {
+        _temp,
+        store_path,
+        mut writer,
+        repository_id,
+        worktree_id,
+        snapshot_id,
+        evidence_receipt,
+        procedure,
+        config,
+    } = fixture;
+    let post_operation_id = post_normalized.operations[0].operation_id;
+    let post_binding_id = post_binding.work_binding_revision_id;
     let snapshot = writer.project().await.unwrap();
     assert!(snapshot.data_rows().any(|row| {
         row.object_kind.as_deref() == Some("procedure_usage_revision")
@@ -3019,7 +3165,7 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         begin_procedure_usage(
             &replay_view,
             proposal_context(8),
-            &routed.items[0],
+            &routed,
             stream.workstream_id,
             exposure_revision_id,
         )
@@ -3368,6 +3514,45 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
     );
     writer.commit(&fourth_success_command, 16).await.unwrap();
 
+    StableProcedureStage {
+        fixture: ActiveProcedureFixture {
+            _temp,
+            store_path,
+            writer,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            evidence_receipt,
+            procedure,
+            config,
+        },
+        strategy,
+        cas_id,
+        search,
+        constraints,
+    }
+}
+
+async fn record_localized_harm_stage(stage: StableProcedureStage) -> LocalizedHarmStage {
+    let StableProcedureStage {
+        fixture,
+        strategy,
+        cas_id,
+        search,
+        constraints,
+    } = stage;
+    let ActiveProcedureFixture {
+        _temp,
+        store_path,
+        mut writer,
+        repository_id,
+        worktree_id,
+        snapshot_id,
+        evidence_receipt,
+        procedure,
+        config,
+    } = fixture;
+
     let harm_task = self::task(repository_id, worktree_id, 17);
     let harm_stream = workstream(harm_task.task_id, repository_id, worktree_id, 17);
     let harm_initial_attempt = new_attempt(
@@ -3549,47 +3734,10 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         },
     )
     .unwrap();
-    let result_for = |revision_id: RevisionId,
-                      verifier_receipt: Option<VerifierReceipt>,
-                      failure: Option<ResultFailure>| {
-        let completeness = if failure.is_none()
-            && verifier_receipt
-                .as_ref()
-                .is_some_and(|receipt| receipt.status == VerifierStatus::Passed)
-        {
-            EvidenceCompleteness::Complete
-        } else {
-            EvidenceCompleteness::Incomplete
-        };
-        ResultEvidence {
-            result_evidence_id: evertrace_domain::ids::ResultEvidenceId::new_v7(),
-            revision_id,
-            parent_revision_id: None,
-            experiment_run_id: harm_run.run_id,
-            experiment_run_revision_id: harm_run.revision_id,
-            result_scope: ResultScope::Partial,
-            raw_artifact_refs: Vec::new(),
-            raw_cas_refs: vec![cas_id],
-            parsed_metric: Some(MetricValue {
-                decimal: "0".into(),
-                unit: "boolean".into(),
-                uncertainty_decimal: None,
-            }),
-            parser_receipt: ParserReceipt {
-                parser_version: "evertrace.result_metric.v1".into(),
-                input_artifact_refs: Vec::new(),
-                input_cas_refs: vec![cas_id],
-                status: ParserStatus::Parsed,
-                failure_code: None,
-            },
-            verifier_receipt,
-            completeness,
-            failure,
-            created_at_us: 23,
-        }
-    };
-    let neutral_result = result_for(RevisionId::new_v7(), None, None);
-    let replay_pass = result_for(
+    let neutral_result = harm_result(&harm_run, cas_id, RevisionId::new_v7(), None, None);
+    let replay_pass = harm_result(
+        &harm_run,
+        cas_id,
         RevisionId::new_v7(),
         Some(VerifierReceipt {
             verifier_version: "evertrace.result_reparse.v1".into(),
@@ -3598,7 +3746,9 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         }),
         None,
     );
-    let replay_violation = result_for(
+    let replay_violation = harm_result(
+        &harm_run,
+        cas_id,
         RevisionId::new_v7(),
         Some(VerifierReceipt {
             verifier_version: "evertrace.result_reparse.v1".into(),
@@ -3790,7 +3940,9 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         dismissed.is_err(),
         "pre-negative replay cannot close review"
     );
-    let mut post_negative_mismatch = result_for(
+    let mut post_negative_mismatch = harm_result(
+        &harm_run,
+        cas_id,
         RevisionId::new_v7(),
         Some(VerifierReceipt {
             verifier_version: "evertrace.result_reparse.v1".into(),
@@ -3810,7 +3962,9 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         post_negative_mismatch,
     )
     .await;
-    let post_negative_replay = result_for(
+    let post_negative_replay = harm_result(
+        &harm_run,
+        cas_id,
         RevisionId::new_v7(),
         Some(VerifierReceipt {
             verifier_version: "evertrace.result_reparse.v1".into(),
@@ -3889,7 +4043,51 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         writer.full_projection().await.unwrap(),
         "later usage successors cannot corrupt the earlier review"
     );
-    let second_neutral = result_for(RevisionId::new_v7(), None, None);
+    LocalizedHarmStage {
+        fixture: ActiveProcedureFixture {
+            _temp,
+            store_path,
+            writer,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            evidence_receipt,
+            procedure,
+            config,
+        },
+        cas_id,
+        search,
+        constraints,
+        harm_action,
+        harm_run,
+        failed_attempt,
+        replay_violation,
+    }
+}
+
+async fn confirm_harm_stage(stage: LocalizedHarmStage) -> HarmReviewedStage {
+    let LocalizedHarmStage {
+        fixture,
+        cas_id,
+        search,
+        constraints,
+        harm_action,
+        harm_run,
+        failed_attempt,
+        replay_violation,
+    } = stage;
+    let ActiveProcedureFixture {
+        _temp,
+        store_path,
+        mut writer,
+        repository_id,
+        worktree_id,
+        snapshot_id,
+        evidence_receipt,
+        procedure,
+        config,
+    } = fixture;
+    let second_neutral = harm_result(&harm_run, cas_id, RevisionId::new_v7(), None, None);
     let second_neutral_ref = second_neutral.revision_id.to_string();
     let mut later_failed_attempt = failed_attempt.clone();
     later_failed_attempt.revision_id = RevisionId::new_v7();
@@ -3993,6 +4191,42 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
         true,
     );
     assert!(suspended_routes.items.is_empty());
+
+    HarmReviewedStage {
+        fixture: ActiveProcedureFixture {
+            _temp,
+            store_path,
+            writer,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            evidence_receipt,
+            procedure,
+            config,
+        },
+        harm_action,
+        second_localized_id,
+    }
+}
+
+async fn replace_after_confirmed_harm_stage(stage: HarmReviewedStage) {
+    let HarmReviewedStage {
+        fixture,
+        harm_action,
+        second_localized_id,
+    } = stage;
+    let ActiveProcedureFixture {
+        _temp,
+        store_path,
+        mut writer,
+        repository_id,
+        worktree_id,
+        snapshot_id,
+        evidence_receipt,
+        procedure,
+        config,
+    } = fixture;
+    let service = RevisionProposalService;
 
     let semantic_view =
         SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
@@ -4234,4 +4468,13 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
     drop(writer);
     let reopened = JournalWriter::open(&store_path).await.unwrap();
     assert_eq!(final_projection, reopened.project().await.unwrap());
+}
+
+#[tokio::test]
+async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() {
+    let stage = prepare_real_router_usage_stage().await;
+    let stage = complete_real_router_usage_stage(stage).await;
+    let stage = record_localized_harm_stage(stage).await;
+    let stage = confirm_harm_stage(stage).await;
+    replace_after_confirmed_harm_stage(stage).await;
 }
