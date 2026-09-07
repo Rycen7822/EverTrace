@@ -48,6 +48,8 @@ pub fn command(k: KeyEvent) -> UiCommand {
         KeyCode::Char('A') => UiCommand::PrepareMarkNewAttempt,
         KeyCode::Char('F') => UiCommand::PrepareForgetObject,
         KeyCode::Char('P') => UiCommand::PrepareRepositoryPurge,
+        KeyCode::Char('B') => UiCommand::PrepareCreateBackup,
+        KeyCode::Char('V') => UiCommand::PrepareVerifyBackup,
         KeyCode::Char('p') => {
             UiCommand::PrepareRecovery(evertrace_domain::repository::RecoveryApplicationKind::Patch)
         }

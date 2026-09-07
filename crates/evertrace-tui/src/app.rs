@@ -590,6 +590,27 @@ impl App {
                         Some(local_unavailable("repository_purge_unavailable"));
                 }
             }
+            UiCommand::PrepareCreateBackup => {
+                if self.state.write_queued {
+                    self.state.last_action = Some(local_transport_error());
+                    return command;
+                }
+                self.state.proposal_confirmation = create_backup_action(&self.state);
+                if self.state.proposal_confirmation.is_none() {
+                    self.state.last_action = Some(local_unavailable("backup_create_unavailable"));
+                }
+            }
+            UiCommand::PrepareVerifyBackup => {
+                if self.state.write_queued {
+                    self.state.last_action = Some(local_transport_error());
+                    return command;
+                }
+                self.state.proposal_confirmation = verify_backup_action(&self.state);
+                if self.state.proposal_confirmation.is_none() {
+                    self.state.last_action =
+                        Some(local_unavailable("select_completed_backup_first"));
+                }
+            }
             UiCommand::OpenRelated => {
                 self.state.related_context = related_context(&self.state);
                 if self.state.related_context.is_none() {
@@ -708,7 +729,7 @@ impl App {
         } else if self.state.route == crate::Route::Explorer {
             "1 Inbox  2 Explorer  3 System  Enter detail  F forget  r refresh  p/f/i/M recovery  q quit".into()
         } else if self.state.route == crate::Route::System {
-            "1 Inbox  2 Explorer  3 System  g maintenance boundaries  r refresh  q quit".into()
+            "1 Inbox  2 Explorer  3 System  B create backup  V verify selected backup  g other maintenance boundaries  r refresh  q quit".into()
         } else {
             "1 Inbox  2 Explorer  3 System  r refresh  q quit".into()
         };
@@ -1740,6 +1761,53 @@ fn repository_purge_confirmation(
     })
 }
 
+fn create_backup_action(
+    state: &AppState,
+) -> Option<(
+    u64,
+    evertrace_protocol::dto::HumanActionRequest,
+    Option<evertrace_protocol::dto::HumanProposalReview>,
+)> {
+    let evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { frontier, .. } =
+        state.human.as_ref()?
+    else {
+        return None;
+    };
+    (state.route == crate::Route::System).then_some((
+        *frontier,
+        evertrace_protocol::dto::HumanActionRequest::CreateBackup,
+        None,
+    ))
+}
+
+fn verify_backup_action(
+    state: &AppState,
+) -> Option<(
+    u64,
+    evertrace_protocol::dto::HumanActionRequest,
+    Option<evertrace_protocol::dto::HumanProposalReview>,
+)> {
+    use evertrace_protocol::dto::{
+        HumanActionRequest, HumanGovernanceResponse, HumanJobState, HumanSystemDetail,
+    };
+    let HumanGovernanceResponse::Snapshot { frontier, .. } = state.human.as_ref()? else {
+        return None;
+    };
+    let HumanSystemDetail::Job { detail } = selected_item(state)?.system_detail.as_ref()? else {
+        return None;
+    };
+    (state.route == crate::Route::System
+        && detail.job_kind == "quiesced_backup_create_v1"
+        && detail.state == HumanJobState::Succeeded)
+        .then_some((
+            *frontier,
+            HumanActionRequest::VerifyBackup {
+                backup_job_id: detail.job_id,
+            },
+            None,
+        ))
+}
+
 fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &'static str {
     use evertrace_protocol::dto::{HumanActionRequest, NegativeReviewDecision};
     match action {
@@ -1777,6 +1845,8 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         HumanActionRequest::MarkNewAttempt { .. } => "mark new attempt",
         HumanActionRequest::ForgetObject { .. } => "forget object",
         HumanActionRequest::PurgeRepository { .. } => "purge repository",
+        HumanActionRequest::CreateBackup => "create quiesced backup",
+        HumanActionRequest::VerifyBackup { .. } => "verify backup",
         HumanActionRequest::Unavailable { .. } => "unavailable action",
     }
 }
@@ -1886,7 +1956,8 @@ mod tests {
         },
     };
     use evertrace_protocol::dto::{
-        HealthMode, HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail,
+        HealthMode, HumanBackupSummary, HumanBackupTableState, HumanBackupValidationResult,
+        HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail,
         HumanForgetPreview, HumanGovernanceResponse, HumanItemCategory, HumanItemKind,
         HumanJobBudget, HumanJobDetail, HumanJobState, HumanNegativeReviewMetadata,
         HumanObjectFamily, HumanProposalMetadata, HumanProposalReview, HumanRecoveryDetail,
@@ -2002,6 +2073,124 @@ mod tests {
                 expected_deletion_generation: 2,
             }, None)) if *actual == repository_id && repository_confirmation == &repository_id.to_string()
         ));
+    }
+
+    #[test]
+    fn system_backup_actions_use_the_existing_confirmation_path() {
+        let backup_job_id = JobId::new_v7();
+        let mut item = snapshot_item("runtime_event", "backup".into());
+        item.stable_key = format!("runtime:job:{backup_job_id}");
+        item.row_class = HumanRowClass::Runtime;
+        item.family = HumanObjectFamily::Runtime;
+        item.category = HumanItemCategory::Runtime;
+        item.object_ref = None;
+        item.system_detail = Some(HumanSystemDetail::Job {
+            detail: Box::new(HumanJobDetail {
+                job_id: backup_job_id,
+                target_revision: format!("backup:{backup_job_id}"),
+                target_watermark: 9,
+                target_generation: 1,
+                job_kind: "quiesced_backup_create_v1".into(),
+                algorithm_revision: "quiesced_backup_v1".into(),
+                model_id: None,
+                priority: 1,
+                state: HumanJobState::Succeeded,
+                attempt: 1,
+                backoff_until_us: None,
+                lease_until_us: None,
+                config_hash: [7; 32],
+                budget: HumanJobBudget {
+                    max_items: 1,
+                    max_bytes: None,
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    max_calls: None,
+                    max_wall_time_ms: 10,
+                },
+                terminal_reason: Some(evertrace_protocol::dto::HumanJobTerminalReason::Completed),
+                terminal_result_ref: Some(format!("backup:{backup_job_id}")),
+                backup_summary: Some(HumanBackupSummary {
+                    frontier: 9,
+                    journal: HumanBackupTableState {
+                        version: 4,
+                        frontier: 9,
+                    },
+                    objects: HumanBackupTableState {
+                        version: 5,
+                        frontier: 9,
+                    },
+                    relations: HumanBackupTableState {
+                        version: 6,
+                        frontier: 6,
+                    },
+                    search: HumanBackupTableState {
+                        version: 7,
+                        frontier: 7,
+                    },
+                    committed_source_watermark_count: 2,
+                    spool_source_watermark_count: 1,
+                    live_cas_count: 3,
+                    spool_cas_count: 1,
+                    spool_file_count: 1,
+                    spool_generation_count: 1,
+                    normal_spool_frame_count: 1,
+                    isolated_spool_frame_count: 0,
+                    emergency_gap_count: 0,
+                    quarantine_count: 0,
+                    runtime_outbox_watermark: 8,
+                    index_generation: 1,
+                    compiler_watermark: 9,
+                    effective_config_hash: [8; 32],
+                    runtime_generation: 3,
+                    hook_current_generation: Some(2),
+                    hook_retained_generations: vec![1, 2],
+                    hook_pin_count: 1,
+                    session_pinned_hook_artifact_count: 1,
+                    object_deletion_generation: 4,
+                    repository_purge_generation: 5,
+                    file_count: 12,
+                    total_bytes: 4096,
+                    required_space_bytes: 8192,
+                    available_space_bytes_at_preflight: 16384,
+                    validation_result: HumanBackupValidationResult::VerifiedBeforePublish,
+                }),
+            }),
+        });
+        let mut app = App::new();
+        app.dispatch(UiCommand::Navigate(crate::Route::System));
+        app.state.human = Some(HumanGovernanceResponse::Snapshot {
+            frontier: 9,
+            status: HumanSnapshotStatus::Ready,
+            degraded_reasons: Vec::new(),
+            items: vec![item],
+            next_cursor: None,
+        });
+
+        app.dispatch(UiCommand::PrepareCreateBackup);
+        assert!(matches!(
+            app.state.proposal_confirmation.take(),
+            Some((
+                9,
+                evertrace_protocol::dto::HumanActionRequest::CreateBackup,
+                None
+            ))
+        ));
+        app.dispatch(UiCommand::PrepareVerifyBackup);
+        assert!(matches!(
+            app.state.proposal_confirmation.take(),
+            Some((
+                9,
+                evertrace_protocol::dto::HumanActionRequest::VerifyBackup { backup_job_id: id },
+                None
+            )) if id == backup_job_id
+        ));
+        let rendered = render_app(&app, 160, 100);
+        assert!(rendered.contains("backup verification/frontier: VerifiedBeforePublish / 9"));
+        for table in ["v4@9", "v5@9", "v6@6", "v7@7"] {
+            assert!(rendered.contains(table));
+        }
+        assert!(rendered.contains("backup hook current/retained: 2/2"));
+        assert!(rendered.contains("backup hook pins/pinned artifacts: 1/1"));
     }
 
     #[test]
@@ -2205,6 +2394,7 @@ mod tests {
                 },
                 terminal_reason: None,
                 terminal_result_ref: None,
+                backup_summary: None,
             }),
         });
         app.state.detail = Some(job_detail.clone());

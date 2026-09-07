@@ -10,6 +10,22 @@ use std::time::Instant;
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RawDir, Stat, fstat, open, openat, statat};
 
+/// Opens one regular file without following a final symlink. Callers that own a
+/// stronger path identity compare the returned file metadata with that identity.
+pub fn open_regular_nofollow(path: &Path) -> Result<std::fs::File, ConfinedReadError> {
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(map_open_error)?;
+    let opened = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
+        return Err(ConfinedReadError::UnsupportedType);
+    }
+    Ok(std::fs::File::from(fd))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfinedReadLimits {
     pub single_file_remaining: u64,
@@ -288,6 +304,31 @@ impl ConfinedRoot {
         self.validate_directory_chain(&components, &identities, deadline)?;
         self.revalidate()?;
         Ok(entries)
+    }
+
+    /// Open a regular file without following any component below this root.
+    pub fn open_regular_file(&self, relative: &Path) -> Result<std::fs::File, ConfinedReadError> {
+        let components = strict_components(relative)?;
+        let (leaf, parents) = components
+            .split_last()
+            .ok_or(ConfinedReadError::InvalidPath)?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let (parent, identities) = self.open_directory_chain(parents, deadline)?;
+        let fd = openat(
+            &parent,
+            *leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_open_error)?;
+        if FileType::from_raw_mode(fstat(&fd).map_err(|_| ConfinedReadError::Io)?.st_mode)
+            != FileType::RegularFile
+        {
+            return Err(ConfinedReadError::UnsupportedType);
+        }
+        self.validate_directory_chain(parents, &identities, deadline)?;
+        self.revalidate_stable()?;
+        Ok(fd.into())
     }
 
     pub fn read_range(

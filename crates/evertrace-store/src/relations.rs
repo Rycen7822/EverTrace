@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lancedb::Table;
+use lancedb::{Table, query::QueryBase};
 
 use crate::StoreError;
 
@@ -287,6 +287,40 @@ pub async fn read_relation_rows(table: &Table) -> Result<Vec<RelationProjectionR
     let batches = crate::collect_batches(&table.query())
         .await
         .map_err(|_| StoreError::LanceDb)?;
+    relation_rows_from_batches(batches, true)
+}
+
+pub(crate) async fn read_relation_checkpoint(table: &Table) -> Result<u64, StoreError> {
+    table
+        .checkout_latest()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
+    if schema.as_ref() != relations_schema().as_ref() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let batches = crate::collect_batches(
+        &table
+            .query()
+            .only_if(format!("row_id = '{RELATIONS_CHECKPOINT_ID}'"))
+            .limit(2),
+    )
+    .await
+    .map_err(|_| StoreError::LanceDb)?;
+    let rows = relation_rows_from_batches(batches, false)?;
+    let [checkpoint] = rows.as_slice() else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    if checkpoint.row_id != RELATIONS_CHECKPOINT_ID {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(checkpoint.source_event_seq)
+}
+
+fn relation_rows_from_batches(
+    batches: Vec<RecordBatch>,
+    require_checkpoint: bool,
+) -> Result<Vec<RelationProjectionRow>, StoreError> {
     let mut rows = Vec::new();
     for batch in batches {
         let ids = batch
@@ -333,11 +367,12 @@ pub async fn read_relation_rows(table: &Table) -> Result<Vec<RelationProjectionR
         }
     }
     rows.sort();
-    if rows
-        .iter()
-        .filter(|row| row.row_id == RELATIONS_CHECKPOINT_ID)
-        .count()
-        != 1
+    if (require_checkpoint
+        && rows
+            .iter()
+            .filter(|row| row.row_id == RELATIONS_CHECKPOINT_ID)
+            .count()
+            != 1)
         || rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id)
     {
         return Err(StoreError::StoreCorrupt);

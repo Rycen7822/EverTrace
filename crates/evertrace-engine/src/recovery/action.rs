@@ -164,6 +164,15 @@ impl ActionCustody {
             }
         }
     }
+
+    fn resume(&self) -> bool {
+        if self.active.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.cancelled.store(false, Ordering::Release);
+        self.shutting_down.store(false, Ordering::Release);
+        true
+    }
 }
 
 struct ActiveAction(Arc<ActionCustody>);
@@ -401,6 +410,14 @@ impl RecoveryActionService {
 
     pub async fn shutdown_and_drain(&self) {
         self.custody.shutdown_and_drain().await;
+    }
+
+    pub async fn quiesce_and_drain(&self) {
+        self.custody.shutdown_and_drain().await;
+    }
+
+    pub fn resume_after_quiesce(&self) -> bool {
+        self.custody.resume()
     }
 
     pub async fn reconcile_pending_on_startup(&self) -> Result<(), RecoveryError> {
@@ -2724,6 +2741,9 @@ mod tests {
             draining.await.unwrap();
             assert_eq!(custody.active.load(Ordering::Acquire), 0);
             assert!(!custody.register());
+            assert!(custody.resume());
+            assert!(custody.register());
+            custody.finish();
         }
     }
 }

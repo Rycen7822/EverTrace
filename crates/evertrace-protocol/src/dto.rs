@@ -30,7 +30,6 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_SIZE: usize = 1_048_576;
-
 pub fn proposal_payload_pretty_document(
     payload: &ProposalPayload,
 ) -> Result<String, serde_json::Error> {
@@ -180,6 +179,10 @@ pub enum HumanActionRequest {
         repository_confirmation: String,
         expected_repository_revision: u32,
         expected_deletion_generation: u64,
+    },
+    CreateBackup,
+    VerifyBackup {
+        backup_job_id: JobId,
     },
     Unavailable {
         action: HumanUnavailableAction,
@@ -482,6 +485,56 @@ pub struct HumanJobBudget {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct HumanBackupTableState {
+    pub version: u64,
+    pub frontier: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanBackupValidationResult {
+    VerifiedBeforePublish,
+    VerifyJobPassed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanBackupSummary {
+    pub frontier: u64,
+    pub journal: HumanBackupTableState,
+    pub objects: HumanBackupTableState,
+    pub relations: HumanBackupTableState,
+    pub search: HumanBackupTableState,
+    pub committed_source_watermark_count: u32,
+    pub spool_source_watermark_count: u32,
+    pub live_cas_count: u32,
+    pub spool_cas_count: u32,
+    pub spool_file_count: u32,
+    pub spool_generation_count: u32,
+    pub normal_spool_frame_count: u32,
+    pub isolated_spool_frame_count: u32,
+    pub emergency_gap_count: u32,
+    pub quarantine_count: u32,
+    pub runtime_outbox_watermark: u64,
+    pub index_generation: u64,
+    pub compiler_watermark: u64,
+    pub effective_config_hash: [u8; 32],
+    pub runtime_generation: u64,
+    pub hook_current_generation: Option<u64>,
+    pub hook_retained_generations: Vec<u64>,
+    pub hook_pin_count: u32,
+    pub session_pinned_hook_artifact_count: u32,
+    pub object_deletion_generation: u64,
+    pub repository_purge_generation: u64,
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub required_space_bytes: u64,
+    pub available_space_bytes_at_preflight: u64,
+    pub validation_result: HumanBackupValidationResult,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanJobDetail {
     pub job_id: JobId,
     pub target_revision: String,
@@ -499,6 +552,8 @@ pub struct HumanJobDetail {
     pub budget: HumanJobBudget,
     pub terminal_reason: Option<HumanJobTerminalReason>,
     pub terminal_result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_summary: Option<HumanBackupSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -723,6 +778,7 @@ impl HumanActionRequest {
                     && *expected_repository_revision > 0
                     && *expected_deletion_generation > 0
             }
+            Self::CreateBackup | Self::VerifyBackup { .. } => true,
             Self::Unavailable { .. } => true,
         }
     }
@@ -1127,6 +1183,7 @@ impl HumanSystemDetail {
                     budget,
                     terminal_reason,
                     terminal_result_ref,
+                    backup_summary,
                     ..
                 } = detail.as_ref();
                 let terminal = terminal_reason.is_some();
@@ -1152,6 +1209,19 @@ impl HumanSystemDetail {
                         == terminal_reason
                             .is_some_and(|reason| reason != HumanJobTerminalReason::Completed)
                     && (terminal_result_ref.is_none() || terminal)
+                    && backup_summary.as_ref().is_none_or(|summary| {
+                        *state == HumanJobState::Succeeded
+                            && *terminal_reason == Some(HumanJobTerminalReason::Completed)
+                            && match summary.validation_result {
+                                HumanBackupValidationResult::VerifiedBeforePublish => {
+                                    job_kind == "quiesced_backup_create_v1"
+                                }
+                                HumanBackupValidationResult::VerifyJobPassed => {
+                                    job_kind == "quiesced_backup_verify_v1"
+                                }
+                            }
+                            && summary.validate()
+                    })
                     && budget.validate()
             }
             Self::Config { config_version, .. } => {
@@ -1169,6 +1239,47 @@ impl HumanJobBudget {
             && self.max_input_tokens != Some(0)
             && self.max_output_tokens != Some(0)
             && self.max_calls != Some(0)
+    }
+}
+
+impl HumanBackupSummary {
+    fn validate(&self) -> bool {
+        self.frontier > 0
+            && self.journal.version > 0
+            && self.journal.frontier == self.frontier
+            && self.objects.version > 0
+            && self.objects.frontier == self.frontier
+            && self.relations.version > 0
+            && self.relations.frontier <= self.frontier
+            && self.search.version > 0
+            && self.search.frontier <= self.frontier
+            && self.index_generation > 0
+            && self.compiler_watermark == self.objects.frontier
+            && self.effective_config_hash != [0; 32]
+            && self.runtime_generation > 0
+            && match self.hook_current_generation {
+                Some(generation) => {
+                    generation > 0
+                        && self.hook_retained_generations.contains(&generation)
+                        && !self.hook_retained_generations.is_empty()
+                        && self.hook_retained_generations.len() <= 4096
+                        && self
+                            .hook_retained_generations
+                            .windows(2)
+                            .all(|pair| pair[0] < pair[1])
+                        && usize::try_from(self.session_pinned_hook_artifact_count)
+                            .is_ok_and(|count| count <= self.hook_retained_generations.len())
+                        && self.session_pinned_hook_artifact_count <= self.hook_pin_count
+                }
+                None => {
+                    self.hook_retained_generations.is_empty()
+                        && self.hook_pin_count == 0
+                        && self.session_pinned_hook_artifact_count == 0
+                }
+            }
+            && self.file_count > 0
+            && self.total_bytes > 0
+            && self.required_space_bytes <= self.available_space_bytes_at_preflight
     }
 }
 

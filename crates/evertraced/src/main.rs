@@ -1,11 +1,19 @@
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 
-use std::{env, fs, path::PathBuf, sync::Arc};
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use evertrace_engine::{
     BackgroundScheduler, EngineService, HealthDispatchError,
-    HumanActionOutcome as EngineHumanActionOutcome,
+    HumanActionOutcome as EngineHumanActionOutcome, HumanBackupSummary as EngineHumanBackupSummary,
+    HumanBackupValidationResult as EngineHumanBackupValidationResult,
     HumanCompetingDetail as EngineHumanCompetingDetail,
     HumanExecutionIntegrityDetail as EngineHumanExecutionIntegrityDetail,
     HumanForgetPreview as EngineHumanForgetPreview, HumanGovernanceError, HumanGovernanceService,
@@ -37,6 +45,7 @@ use evertrace_protocol::{
     command::{Command as ProtocolCommand, RecallCueCommand, SessionImportAdminAction},
     dto::{
         ClientKind, HealthMode, HumanActionRequest, HumanActionResult, HumanActionStatus,
+        HumanBackupSummary, HumanBackupTableState, HumanBackupValidationResult,
         HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail,
         HumanForgetPreview, HumanGovernanceRequest, HumanGovernanceResponse, HumanItemCategory,
         HumanItemKind, HumanJobBudget, HumanJobDetail, HumanJobState, HumanJobTerminalReason,
@@ -54,7 +63,7 @@ use evertrace_protocol::{
         RecoveryTerminalResponse, RecoveryUnsupportedReason, Response, SessionImportAdminResponse,
     },
 };
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, mpsc, watch};
 
 #[tokio::main]
 async fn main() {
@@ -67,7 +76,7 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = StartupArgs::parse()?;
     let config_path = config_path(args.config)?;
-    let source = fs::read_to_string(config_path)?;
+    let source = fs::read_to_string(&config_path)?;
     let mode = if args.maintenance {
         RuntimeMode::Maintenance
     } else {
@@ -109,6 +118,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     human_governance.reconcile_reserved_once().await?;
     let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
     let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
+    let (backup_request_tx, mut backup_request_rx) = mpsc::channel(1);
     let scheduler = BackgroundScheduler::new(
         writer_handle.clone(),
         session_catalog,
@@ -117,7 +127,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_snapshot.clone(),
         SynthesisPlanner::new(engine.effective_config().config().llm.clone()),
         engine.effective_config().config().dreaming.clone(),
-    );
+    )
+    .with_backup_requests(backup_request_tx);
     let mut background_scheduler_task =
         tokio::spawn(scheduler.run(session_import_wakeup_rx, session_import_shutdown_rx));
     let mcp_service = McpActionService::open(
@@ -138,7 +149,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &data_dir,
     );
     let recovery_action_service = RecoveryActionService::new(
-        runtime_snapshot,
+        runtime_snapshot.clone(),
         writer_handle.clone(),
         recovery_service.mutation_fence(),
     );
@@ -158,6 +169,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let maintenance_active = Arc::new(AtomicBool::new(false));
+    let dispatch_gate = Arc::new(RwLock::new(()));
     let handler_engine = Arc::clone(&engine);
     let handler_recovery_action_service = recovery_action_service.clone();
     let handler_mcp_bindings = mcp_bindings;
@@ -166,6 +179,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let handler_session_import_admin = session_import_admin;
     let handler_human_governance = human_governance;
     let handler_session_import_wakeup = session_import_wakeup_tx.clone();
+    let handler_maintenance_active = Arc::clone(&maintenance_active);
+    let handler_dispatch_gate = Arc::clone(&dispatch_gate);
     let mut task = tokio::spawn(server.run_dispatch_with_context(
         shutdown_rx,
         move |context, request_id, command| {
@@ -179,7 +194,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let session_import_admin = handler_session_import_admin.clone();
             let human_governance = handler_human_governance.clone();
             let session_import_wakeup = handler_session_import_wakeup.clone();
+            let maintenance_active = Arc::clone(&handler_maintenance_active);
+            let dispatch_gate = Arc::clone(&handler_dispatch_gate);
             async move {
+                if maintenance_active.load(Ordering::Acquire) {
+                    if !matches!(&command, ProtocolCommand::Health) {
+                        return Err(ErrorCode::MaintenanceMode);
+                    }
+                    let snapshot = handler_engine.health().map_err(|_| ErrorCode::MaintenanceMode)?;
+                    return Ok(Response::Health(HealthResponse {
+                        protocol_version: PROTOCOL_VERSION,
+                        mode: HealthMode::Maintenance,
+                        config_version: snapshot.config_version,
+                        effective_config_hash: hex(&snapshot.effective_config_hash),
+                        algorithm_revision: snapshot.algorithm_revision,
+                    }));
+                }
+                let _dispatch = dispatch_gate.read_owned().await;
+                if maintenance_active.load(Ordering::Acquire) {
+                    return Err(ErrorCode::MaintenanceMode);
+                }
                 match command {
                     ProtocolCommand::Health => {
                         let snapshot = handler_engine.health().map_err(|error| match error {
@@ -592,6 +626,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             )
                                             .await
                                     }
+                                    HumanActionRequest::CreateBackup => {
+                                        human_governance
+                                            .create_backup(request_id, expected_frontier)
+                                            .await
+                                    }
+                                    HumanActionRequest::VerifyBackup { backup_job_id } => {
+                                        human_governance
+                                            .verify_backup(
+                                                request_id,
+                                                expected_frontier,
+                                                backup_job_id,
+                                            )
+                                            .await
+                                    }
                                     HumanActionRequest::Unavailable { action } => {
                                         Ok(EngineHumanActionOutcome::Unavailable {
                                             reason: match action {
@@ -637,72 +685,119 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     ));
-    tokio::select! {
-        result = &mut task => {
-            let server_result = result;
-            let _ = session_import_shutdown_tx.send(true);
-            background_scheduler_task.await??;
-            recovery_action_service.shutdown_and_drain().await;
-            recall_worker.abort();
-            let _ = (&mut recall_worker).await;
-            if let Some(handle) = writer_handle.take() {
-                handle.shutdown().await?;
+    loop {
+        tokio::select! {
+            result = &mut task => {
+                let server_result = result;
+                let _ = session_import_shutdown_tx.send(true);
+                background_scheduler_task.await??;
+                recovery_action_service.shutdown_and_drain().await;
+                recall_worker.abort();
+                let _ = (&mut recall_worker).await;
+                if let Some(handle) = writer_handle.take() {
+                    handle.shutdown().await?;
+                }
+                writer_task.await??;
+                server_result??;
+                return Err("server stopped unexpectedly".into());
             }
-            writer_task.await??;
-            server_result??;
-            Err("server stopped unexpectedly".into())
-        }
-        result = &mut writer_task => {
-            let _ = shutdown_tx.send(true);
-            let _ = session_import_shutdown_tx.send(true);
-            background_scheduler_task.await??;
-            recovery_action_service.shutdown_and_drain().await;
-            recall_worker.abort();
-            let _ = (&mut recall_worker).await;
-            task.await??;
-            result??;
-            Err("writer stopped unexpectedly".into())
-        }
-        result = &mut recall_worker => {
-            let _ = shutdown_tx.send(true);
-            let _ = session_import_shutdown_tx.send(true);
-            background_scheduler_task.await??;
-            recovery_action_service.shutdown_and_drain().await;
-            task.await??;
-            if let Some(handle) = writer_handle.take() {
-                handle.shutdown().await?;
+            result = &mut writer_task => {
+                let _ = shutdown_tx.send(true);
+                let _ = session_import_shutdown_tx.send(true);
+                background_scheduler_task.await??;
+                recovery_action_service.shutdown_and_drain().await;
+                recall_worker.abort();
+                let _ = (&mut recall_worker).await;
+                task.await??;
+                result??;
+                return Err("writer stopped unexpectedly".into());
             }
-            writer_task.await??;
-            result?;
-            Err("recall worker stopped unexpectedly".into())
-        }
-        result = &mut background_scheduler_task => {
-            let _ = shutdown_tx.send(true);
-            recovery_action_service.shutdown_and_drain().await;
-            task.await??;
-            recall_worker.abort();
-            let _ = (&mut recall_worker).await;
-            if let Some(handle) = writer_handle.take() {
-                handle.shutdown().await?;
+            result = &mut recall_worker => {
+                let _ = shutdown_tx.send(true);
+                let _ = session_import_shutdown_tx.send(true);
+                background_scheduler_task.await??;
+                recovery_action_service.shutdown_and_drain().await;
+                task.await??;
+                if let Some(handle) = writer_handle.take() {
+                    handle.shutdown().await?;
+                }
+                writer_task.await??;
+                result?;
+                return Err("recall worker stopped unexpectedly".into());
             }
-            writer_task.await??;
-            result??;
-            Err("background scheduler stopped unexpectedly".into())
-        }
-        signal = wait_for_signal() => {
-            signal?;
-            let _ = shutdown_tx.send(true);
-            let _ = session_import_shutdown_tx.send(true);
-            recovery_action_service.shutdown_and_drain().await;
-            task.await??;
-            background_scheduler_task.await??;
-            recall_worker.abort();
-            let _ = (&mut recall_worker).await;
-            if let Some(handle) = writer_handle.take() {
-                handle.shutdown().await?;
+            result = &mut background_scheduler_task => {
+                let _ = shutdown_tx.send(true);
+                recovery_action_service.shutdown_and_drain().await;
+                task.await??;
+                recall_worker.abort();
+                let _ = (&mut recall_worker).await;
+                if let Some(handle) = writer_handle.take() {
+                    handle.shutdown().await?;
+                }
+                writer_task.await??;
+                result??;
+                return Err("background scheduler stopped unexpectedly".into());
             }
-            writer_task.await??;
-            Ok(())
+            Some(request) = backup_request_rx.recv() => {
+                maintenance_active.store(true, Ordering::Release);
+                let dispatch = Arc::clone(&dispatch_gate).write_owned().await;
+                recovery_action_service.quiesce_and_drain().await;
+                recall_worker.abort();
+                let _ = (&mut recall_worker).await;
+                let result = writer_handle
+                    .as_ref()
+                    .ok_or("writer unavailable during backup")?
+                    .create_backup(
+                        request.backup_job_id(),
+                        config_path.clone(),
+                        runtime_snapshot.clone(),
+                    )
+                    .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        request.complete_fatal();
+                        let _ = shutdown_tx.send(true);
+                        let _ = session_import_shutdown_tx.send(true);
+                        recovery_action_service.shutdown_and_drain().await;
+                        task.await??;
+                        background_scheduler_task.await??;
+                        let _ = (&mut writer_task).await;
+                        return Err("writer failed to reopen after backup".into());
+                    }
+                };
+                recall_worker = spawn_recall_worker(
+                    writer_handle
+                        .as_ref()
+                        .ok_or("writer unavailable after backup")?
+                        .clone(),
+                    runtime_snapshot.clone(),
+                    data_dir.clone(),
+                );
+                if !recovery_action_service.resume_after_quiesce() {
+                    maintenance_active.store(false, Ordering::Release);
+                    drop(dispatch);
+                    return Err("recovery action service failed to resume".into());
+                }
+                maintenance_active.store(false, Ordering::Release);
+                drop(dispatch);
+                request.complete(result);
+            }
+            signal = wait_for_signal() => {
+                signal?;
+                let _ = shutdown_tx.send(true);
+                let _ = session_import_shutdown_tx.send(true);
+                recovery_action_service.shutdown_and_drain().await;
+                task.await??;
+                background_scheduler_task.await??;
+                recall_worker.abort();
+                let _ = (&mut recall_worker).await;
+                if let Some(handle) = writer_handle.take() {
+                    handle.shutdown().await?;
+                }
+                writer_task.await??;
+                return Ok(());
+            }
         }
     }
 }
@@ -1216,6 +1311,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                             budget,
                             terminal_reason,
                             terminal_result_ref,
+                            backup_summary,
                         } = *detail;
                         HumanSystemDetail::Job {
                             detail: Box::new(HumanJobDetail {
@@ -1272,6 +1368,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                                     }
                                 }),
                                 terminal_result_ref,
+                                backup_summary: backup_summary.map(map_human_backup_summary),
                             }),
                         }
                     }
@@ -1300,6 +1397,53 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             })
             .collect(),
         next_cursor: page.next_cursor,
+    }
+}
+
+fn map_human_backup_summary(value: EngineHumanBackupSummary) -> HumanBackupSummary {
+    let table = |state: evertrace_engine::HumanBackupTableState| HumanBackupTableState {
+        version: state.version,
+        frontier: state.frontier,
+    };
+    HumanBackupSummary {
+        frontier: value.frontier,
+        journal: table(value.journal),
+        objects: table(value.objects),
+        relations: table(value.relations),
+        search: table(value.search),
+        committed_source_watermark_count: value.committed_source_watermark_count,
+        spool_source_watermark_count: value.spool_source_watermark_count,
+        live_cas_count: value.live_cas_count,
+        spool_cas_count: value.spool_cas_count,
+        spool_file_count: value.spool_file_count,
+        spool_generation_count: value.spool_generation_count,
+        normal_spool_frame_count: value.normal_spool_frame_count,
+        isolated_spool_frame_count: value.isolated_spool_frame_count,
+        emergency_gap_count: value.emergency_gap_count,
+        quarantine_count: value.quarantine_count,
+        runtime_outbox_watermark: value.runtime_outbox_watermark,
+        index_generation: value.index_generation,
+        compiler_watermark: value.compiler_watermark,
+        effective_config_hash: value.effective_config_hash,
+        runtime_generation: value.runtime_generation,
+        hook_current_generation: value.hook_current_generation,
+        hook_retained_generations: value.hook_retained_generations,
+        hook_pin_count: value.hook_pin_count,
+        session_pinned_hook_artifact_count: value.session_pinned_hook_artifact_count,
+        object_deletion_generation: value.object_deletion_generation,
+        repository_purge_generation: value.repository_purge_generation,
+        file_count: value.file_count,
+        total_bytes: value.total_bytes,
+        required_space_bytes: value.required_space_bytes,
+        available_space_bytes_at_preflight: value.available_space_bytes_at_preflight,
+        validation_result: match value.validation_result {
+            EngineHumanBackupValidationResult::VerifiedBeforePublish => {
+                HumanBackupValidationResult::VerifiedBeforePublish
+            }
+            EngineHumanBackupValidationResult::VerifyJobPassed => {
+                HumanBackupValidationResult::VerifyJobPassed
+            }
+        },
     }
 }
 

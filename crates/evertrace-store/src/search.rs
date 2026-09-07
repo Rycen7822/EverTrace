@@ -24,6 +24,7 @@ use crate::{
 
 pub const SEARCH_TABLE: &str = "evertrace_search";
 pub const SEARCH_CHECKPOINT_ID: &str = "checkpoint:evertrace_search";
+pub const SEARCH_PROJECTION_GENERATION: u64 = 1;
 
 #[derive(Clone)]
 pub struct SearchIndex {
@@ -429,13 +430,13 @@ impl SearchProjectionRow {
             retrieval_completeness: "complete".into(),
             suppression_ref_hash: None,
             source_event_seq: frontier,
-            projection_generation: 1,
+            projection_generation: SEARCH_PROJECTION_GENERATION,
         }
     }
 
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.row_id.is_empty()
-            || self.projection_generation != 1
+            || self.projection_generation != SEARCH_PROJECTION_GENERATION
             || self.instruction_authority != "none"
             || self.event_time_us < 0
             || self.recorded_at_us < 0
@@ -749,6 +750,31 @@ pub async fn read_search_rows(table: &Table) -> Result<Vec<SearchProjectionRow>,
     rows_from_batches(batches, true)
 }
 
+pub(crate) async fn read_search_checkpoint(table: &Table) -> Result<u64, StoreError> {
+    table
+        .checkout_latest()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
+    if schema.as_ref() != search_schema().as_ref() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let rows = query_rows(
+        table,
+        Some(format!("row_id = '{SEARCH_CHECKPOINT_ID}'")),
+        2,
+        None,
+    )
+    .await?;
+    let [checkpoint] = rows.as_slice() else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    if checkpoint.row_id != SEARCH_CHECKPOINT_ID {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(checkpoint.source_event_seq)
+}
+
 fn rows_from_batches(
     batches: Vec<RecordBatch>,
     require_checkpoint: bool,
@@ -910,7 +936,7 @@ pub fn build_evidence_surface(
         capture_completeness: observation.capture_completeness,
         canonicalization_version: observation.canonicalization_revision,
         span_hash: hex(&span_hash),
-        projection_generation: 1,
+        projection_generation: SEARCH_PROJECTION_GENERATION,
         protected_text: text,
     };
     surface.validate()?;
@@ -961,7 +987,7 @@ mod tests {
             retrieval_completeness: "complete".into(),
             suppression_ref_hash: None,
             source_event_seq: 1,
-            projection_generation: 1,
+            projection_generation: SEARCH_PROJECTION_GENERATION,
         }
     }
 

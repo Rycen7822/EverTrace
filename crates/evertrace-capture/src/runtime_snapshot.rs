@@ -95,6 +95,14 @@ impl fmt::Debug for RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
+    pub fn sanitized_for_backup(&self) -> Result<Self, RuntimeSnapshotError> {
+        self.validate()?;
+        let mut snapshot = self.clone();
+        snapshot.recall_cues.clear();
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     pub fn for_data_dir(
         data_dir: &Path,
         generation: u64,
@@ -230,7 +238,11 @@ impl RuntimeSnapshot {
             return Err(RuntimeSnapshotError::InvalidPermissions);
         }
         let bytes = fs::read(path).map_err(map_io)?;
-        let snapshot = decode_snapshot(&bytes)?;
+        Self::from_bytes(&bytes)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RuntimeSnapshotError> {
+        let snapshot = decode_snapshot(bytes)?;
         snapshot.validate()?;
         Ok(snapshot)
     }

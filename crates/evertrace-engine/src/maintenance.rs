@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::Path,
     str::FromStr,
     sync::{
         Arc,
@@ -21,12 +22,13 @@ use evertrace_domain::{
     },
 };
 use evertrace_store::{
-    DirtyTargetKind, DurableJob, EventScope, JobBudget, JobLease, JobStatus, JobTerminalAudit,
-    JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
-    RuntimeSchedulerView, SourceKind,
+    BackupError, BackupSummary, DirtyTargetKind, DurableJob, EventScope, JobBudget, JobLease,
+    JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalCommand,
+    JournalEventDraft, JournalPayload, QUIESCED_BACKUP_CREATE_JOB_KIND,
+    QUIESCED_BACKUP_VERIFY_JOB_KIND, RuntimeSchedulerView, SourceKind,
 };
 use thiserror::Error;
-use tokio::sync::{OwnedRwLockReadGuard, RwLock, watch};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 
 use crate::{
     SessionImportBudget, SessionImportWorker, WriterActorError, WriterHandle,
@@ -40,6 +42,22 @@ const PER_LANE_LIMIT: usize = 8;
 const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v1";
+
+pub(crate) fn verify_hook_backup_assets(
+    directory: &Path,
+    summary: &BackupSummary,
+) -> Result<(), BackupError> {
+    let semantic = evertrace_codex::install::StableLauncher::verify_backup_snapshot(directory)
+        .map_err(|_| BackupError::Corrupt)?;
+    if semantic.current_generation != summary.hook_current_generation
+        || semantic.retained_generations != summary.hook_retained_generations
+        || semantic.pin_count != summary.hook_pin_count
+        || semantic.pinned_generation_count != summary.session_pinned_hook_artifact_count
+    {
+        return Err(BackupError::Corrupt);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum BackgroundLane {
@@ -60,6 +78,25 @@ pub struct ScheduledJob {
 pub struct BackgroundProgress {
     pub completed: usize,
     pub retryable: bool,
+}
+
+pub struct QuiescedBackupRequest {
+    backup_job_id: JobId,
+    reply: oneshot::Sender<Result<BackupSummary, BackupError>>,
+}
+
+impl QuiescedBackupRequest {
+    pub const fn backup_job_id(&self) -> JobId {
+        self.backup_job_id
+    }
+
+    pub fn complete(self, result: Result<BackupSummary, BackupError>) {
+        let _ = self.reply.send(result);
+    }
+
+    pub fn complete_fatal(self) {
+        let _ = self.reply.send(Err(BackupError::Io));
+    }
 }
 
 struct ClaimedJob {
@@ -87,6 +124,7 @@ pub struct BackgroundScheduler {
     dreaming: DreamingConfig,
     capture_cursor: Arc<AtomicUsize>,
     repository_purge_plans: Arc<std::sync::Mutex<BTreeMap<JobId, Vec<String>>>>,
+    backup_requests: Option<mpsc::Sender<QuiescedBackupRequest>>,
 }
 
 impl BackgroundScheduler {
@@ -109,7 +147,13 @@ impl BackgroundScheduler {
             dreaming,
             capture_cursor: Arc::new(AtomicUsize::new(0)),
             repository_purge_plans: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            backup_requests: None,
         }
+    }
+
+    pub fn with_backup_requests(mut self, requests: mpsc::Sender<QuiescedBackupRequest>) -> Self {
+        self.backup_requests = Some(requests);
+        self
     }
 
     pub async fn run_once(&self) -> Result<BackgroundProgress, BackgroundSchedulerError> {
@@ -681,20 +725,29 @@ impl BackgroundScheduler {
             .find(|selected| selected.lane == BackgroundLane::Maintenance)
         {
             if let Some(claimed) = self.claim_job(&selected_job.job).await? {
-                if claimed.job.kind != evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND {
+                if claimed.job.kind == QUIESCED_BACKUP_CREATE_JOB_KIND {
+                    let progress = self.run_backup_create(claimed).await?;
+                    completed += progress.completed;
+                    retryable |= progress.retryable;
+                } else if claimed.job.kind == QUIESCED_BACKUP_VERIFY_JOB_KIND {
+                    let progress = self.run_backup_verify(claimed).await?;
+                    completed += progress.completed;
+                    retryable |= progress.retryable;
+                } else if claimed.job.kind == evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND {
+                    let progress = crate::jobs::reconcile_repository_scope_purge_batch(
+                        &self.writer,
+                        &self.runtime,
+                        claimed.snapshot,
+                        &claimed.job,
+                        &self.repository_purge_plans,
+                    )
+                    .await
+                    .map_err(map_writer)?;
+                    completed += usize::from(progress.committed);
+                    retryable |= progress.retryable;
+                } else {
                     return Err(BackgroundSchedulerError::Store);
                 }
-                let progress = crate::jobs::reconcile_repository_scope_purge_batch(
-                    &self.writer,
-                    &self.runtime,
-                    claimed.snapshot,
-                    &claimed.job,
-                    &self.repository_purge_plans,
-                )
-                .await
-                .map_err(map_writer)?;
-                completed += usize::from(progress.committed);
-                retryable |= progress.retryable;
             } else {
                 retryable = true;
             }
@@ -810,6 +863,136 @@ impl BackgroundScheduler {
             completed,
             retryable,
         })
+    }
+
+    async fn run_backup_create(
+        &self,
+        claimed: ClaimedJob,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let requests = self
+            .backup_requests
+            .as_ref()
+            .ok_or(BackgroundSchedulerError::Store)?;
+        let (reply, response) = oneshot::channel();
+        requests
+            .send(QuiescedBackupRequest {
+                backup_job_id: claimed.job.job_id,
+                reply,
+            })
+            .await
+            .map_err(|_| BackgroundSchedulerError::Writer)?;
+        let result = response
+            .await
+            .map_err(|_| BackgroundSchedulerError::Writer)?;
+        self.finish_backup_job(claimed.job, result).await
+    }
+
+    async fn run_backup_verify(
+        &self,
+        claimed: ClaimedJob,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let backup_job_id = JobId::from_str(&claimed.job.target_revision)
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let data_dir = self
+            .runtime
+            .data_dir()
+            .map_err(|_| BackgroundSchedulerError::Store)?
+            .to_owned();
+        let backup_directory = data_dir
+            .join("backups")
+            .join(format!("backup-{backup_job_id}"));
+        let prepared = tokio::task::spawn_blocking(move || {
+            evertrace_store::backup::prepare_backup_verification(&data_dir, backup_job_id)
+        })
+        .await
+        .map_err(|_| BackgroundSchedulerError::Store)?;
+        let result = match prepared {
+            Ok(verification) => {
+                match evertrace_store::backup::complete_backup_verification(verification).await {
+                    Ok(summary) => {
+                        verify_hook_backup_assets(&backup_directory, &summary).map(|()| summary)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.finish_backup_job(claimed.job, result).await
+    }
+
+    async fn finish_backup_job(
+        &self,
+        leased: DurableJob,
+        result: Result<BackupSummary, BackupError>,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let snapshot = self.writer.project().await.map_err(map_writer)?;
+        let current = RuntimeSchedulerView::from_snapshot(&snapshot)
+            .map_err(|_| BackgroundSchedulerError::Store)?
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == leased.job_id)
+            .ok_or(BackgroundSchedulerError::Store)?;
+        if current.state != JobStatus::Leased
+            || current.target_generation != leased.target_generation
+            || current.attempt != leased.attempt
+            || current.kind != leased.kind
+        {
+            return Err(BackgroundSchedulerError::Store);
+        }
+        let mut terminal = current;
+        terminal.lease_until_us = None;
+        terminal.backoff_until_us = None;
+        terminal.terminal = Some(Box::new(match result {
+            Ok(summary) => {
+                terminal.state = JobStatus::Succeeded;
+                JobTerminalAudit {
+                    outcome: JobTerminalOutcome::Succeeded,
+                    reason: JobTerminalReason::Completed,
+                    result_ref: Some(summary.backup_job_id.to_string()),
+                }
+            }
+            Err(error) => {
+                terminal.state = JobStatus::Failed;
+                JobTerminalAudit {
+                    outcome: JobTerminalOutcome::Failed,
+                    reason: match error {
+                        BackupError::Corrupt | BackupError::IdentityChanged => {
+                            JobTerminalReason::IntegrityFailure
+                        }
+                        BackupError::ResourceExhausted => JobTerminalReason::BudgetExhausted,
+                        BackupError::InvalidInput => JobTerminalReason::Unsupported,
+                        BackupError::Io => JobTerminalReason::SourceUnavailable,
+                    },
+                    result_ref: None,
+                }
+            }
+        }));
+        let occurred_at_us = now_us()?;
+        let command = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                occurred_at_us,
+                terminal.config_hash,
+                terminal.algorithm_revision.clone(),
+                JournalPayload::JobState(terminal),
+            )],
+        )
+        .map_err(|_| BackgroundSchedulerError::Store)?;
+        match self
+            .writer
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .await
+        {
+            Ok(outcome) => Ok(BackgroundProgress {
+                completed: usize::from(!outcome.replayed),
+                retryable: false,
+            }),
+            Err(WriterActorError::StaleFrontier) => Ok(BackgroundProgress {
+                completed: 0,
+                retryable: true,
+            }),
+            Err(error) => Err(map_writer(error)),
+        }
     }
 
     pub async fn run(
@@ -1450,6 +1633,8 @@ fn executable_job(job: &DurableJob) -> bool {
             | "capture_reconciliation"
             | "session_import_v1"
             | "semantic_synthesis_v1"
+            | QUIESCED_BACKUP_CREATE_JOB_KIND
+            | QUIESCED_BACKUP_VERIFY_JOB_KIND
             | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
     )
 }

@@ -582,10 +582,14 @@ fn runtime_snapshot_is_private_atomic_and_rejects_invalid_records() {
 #[test]
 fn generation_registry_pins_old_sessions_and_retains_previous_compatible() {
     let temp = TempDir::new().unwrap();
-    let launcher = StableLauncher::open(temp.path().join("install")).unwrap();
+    let data = temp.path().join("data");
+    let launcher = StableLauncher::open(&data).unwrap();
     let generation = |number| {
-        let executable = temp.path().join(format!("hook-{number}"));
-        let runtime_snapshot = temp.path().join(format!("snapshot-{number}"));
+        let directory = data.join(format!("hooks/generations/{number}"));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = directory.join("evertrace-hook");
+        let runtime_snapshot = directory.join("hook-runtime-v1.json");
         fs::write(&executable, b"binary").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(&runtime_snapshot, b"snapshot").unwrap();
@@ -599,32 +603,59 @@ fn generation_registry_pins_old_sessions_and_retains_previous_compatible() {
         }
     };
     launcher.publish_generation(generation(1)).unwrap();
-    assert_eq!(
-        launcher
-            .resolve_for_session("session-old")
-            .unwrap()
-            .generation,
-        1
-    );
     launcher.publish_generation(generation(2)).unwrap();
     assert_eq!(
         launcher
             .resolve_for_session("session-old")
             .unwrap()
             .generation,
-        1
+        2
+    );
+    launcher.publish_generation(generation(3)).unwrap();
+    assert_eq!(
+        launcher
+            .resolve_for_session("session-old")
+            .unwrap()
+            .generation,
+        2
     );
     assert_eq!(
         launcher
             .resolve_for_session("session-new")
             .unwrap()
             .generation,
-        2
+        3
     );
-    assert_eq!(launcher.retained_generations().unwrap(), vec![1, 2]);
+    // The historical catalog entry remains, but its unreferenced assets need not.
+    fs::remove_dir_all(data.join("hooks/generations/1")).unwrap();
+    assert_eq!(
+        launcher
+            .resolve_for_session("session-next")
+            .unwrap()
+            .generation,
+        3
+    );
+    assert_eq!(launcher.retained_generations().unwrap(), vec![2, 3]);
     launcher
-        .install_launcher_binary(&temp.path().join("hook-2"))
+        .install_launcher_binary(&data.join("hooks/generations/2/evertrace-hook"))
         .unwrap();
+    let frozen = StableLauncher::freeze_backup_snapshot(&data).unwrap();
+    assert_eq!(frozen.current_generation, Some(3));
+    assert_eq!(frozen.retained_generations, [2, 3]);
+    assert_eq!(frozen.pin_count, 3);
+    assert_eq!(frozen.pinned_generation_count, 2);
+    assert!(
+        !frozen
+            .files
+            .iter()
+            .any(|file| file.relative_path.starts_with("hooks/generations/1"))
+    );
+    let original = data.join("hooks/generations/2");
+    let moved = temp.path().join("outside-generation");
+    fs::rename(&original, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &original).unwrap();
+    assert!(StableLauncher::freeze_backup_snapshot(&data).is_err());
+    assert!(launcher.resolve_for_session("session-old").is_err());
     assert_eq!(
         fs::metadata(launcher.launcher_path())
             .unwrap()
@@ -638,10 +669,14 @@ fn generation_registry_pins_old_sessions_and_retains_previous_compatible() {
 #[test]
 fn corrupt_generation_registry_is_not_overwritten_on_publish() {
     let temp = TempDir::new().unwrap();
-    let launcher = StableLauncher::open(temp.path().join("install")).unwrap();
+    let data = temp.path().join("data");
+    let launcher = StableLauncher::open(&data).unwrap();
     let generation = |number| {
-        let executable = temp.path().join(format!("hook-{number}"));
-        let runtime_snapshot = temp.path().join(format!("snapshot-{number}"));
+        let directory = data.join(format!("hooks/generations/{number}"));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = directory.join("evertrace-hook");
+        let runtime_snapshot = directory.join("hook-runtime-v1.json");
         fs::write(&executable, b"binary").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(&runtime_snapshot, b"snapshot").unwrap();
@@ -655,7 +690,7 @@ fn corrupt_generation_registry_is_not_overwritten_on_publish() {
         }
     };
     launcher.publish_generation(generation(1)).unwrap();
-    let registry = temp.path().join("install/generations.json");
+    let registry = data.join("hooks/registry-v1.json");
     let corrupt = b"{not-valid-json";
     fs::write(&registry, corrupt).unwrap();
     assert!(launcher.publish_generation(generation(2)).is_err());

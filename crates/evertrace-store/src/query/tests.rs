@@ -5,6 +5,7 @@ mod tests {
     use evertrace_domain::ids::CommandId;
 
     use super::*;
+    use super::super::projection::{checkpoint_relation, checkpoint_search};
     use crate::{
         JournalCommand, JournalEventDraft, JournalPayload, MigrationApplied, ProjectionWorker,
     };

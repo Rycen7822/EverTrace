@@ -1,22 +1,28 @@
 //! S33 Repository physical purge authority, bounded CAS deletion, and restart proof.
 
-use std::{collections::BTreeSet, path::Path, process::Command, sync::Arc};
+use std::{
+    collections::BTreeSet, io::Cursor, os::unix::fs::PermissionsExt, path::Path, process::Command,
+    sync::Arc, time::Duration,
+};
 
 use evertrace_capture::{
     CaptureOutcome, CaptureRecordInput, CaptureRuntime, CasError, CasStore, DeviceKeyStore,
-    RUNTIME_SNAPSHOT_VERSION, RecallCueGateMode, RecoveryGateMode, RuntimeSnapshot, SpoolLimits,
+    DurableSpool, RUNTIME_SNAPSHOT_VERSION, RecallCueGateMode, RecoveryGateMode, RuntimeSnapshot,
+    SpoolLimits, copy_exact_sha256_hex,
 };
+use evertrace_codex::install::{HookGeneration, StableLauncher};
 use evertrace_domain::{
-    config::{DreamingConfig, LlmConfig},
+    config::{DreamingConfig, EffectiveConfig, GlobalPromotionConfig, LlmConfig},
     evidence::{
         CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
         HostCorrelationEvidence, IdentityStrength, ObservationRole, SourceObservation,
         SourceReceipt, SourceRevision, SourceRevisionMode, SourceRole,
     },
     ids::{
-        CasId, CommandId, JobId, RepositoryId, RequestId, TaskId, WorkArtifactId, WorkstreamId,
-        WorktreeId,
+        CasId, CommandId, ExecutionLaneId, JobId, PresentationAttemptId, RepositoryId, RequestId,
+        TaskId, WorkArtifactId, WorkstreamId, WorktreeId,
     },
+    recall::RecallCueSnapshot,
     repository::{
         FilesystemIdentity, GitObjectFormat, GitRegistrationState, PathObservation,
         RepositoryInstance, WorktreeInstance, WorktreeKind, WorktreeLifecycle,
@@ -44,24 +50,35 @@ use evertrace_engine::semantic::{
 use evertrace_engine::session_import::SessionCatalogService;
 use evertrace_engine::{
     BackgroundScheduler, EvidenceIngestor, HumanActionOutcome, HumanGovernanceService,
-    HumanSurface, SessionImportWorker, SynthesisPlanner, spawn_writer,
+    HumanSurface, HumanSystemDetail, SessionImportWorker, SynthesisPlanner, spawn_writer,
     work::{WorkCommandContext, activate_episode, new_episode},
 };
 use evertrace_store::{
-    DurableJob, JobBudget, JobLease, JobStatus, JobTerminalReason, JournalCommand,
-    JournalEventDraft, JournalPayload, JournalWriter, RuntimeSchedulerView, ScopePurgeCurrentView,
-    SemanticCurrentView, SessionBodyState, SessionImportCurrentView, StoreError,
+    BackupManifest, DurableJob, JobBudget, JobLease, JobStatus, JobTerminalReason, JournalCommand,
+    JournalEventDraft, JournalPayload, JournalWriter, QUIESCED_BACKUP_CREATE_JOB_KIND,
+    RuntimeSchedulerView, ScopePurgeCurrentView, SemanticCurrentView, SessionBodyState,
+    SessionImportCurrentView, StoreError,
     repository::RepositoryCurrentView,
     session_import::{
         BodyStateReason, MetadataState, SessionImportEvent, SessionImportEventKind,
         SessionMetadata, WorkspaceResolutionKind,
     },
+    verify_backup,
 };
 use tempfile::TempDir;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 const CONFIG: [u8; 32] = [0x73; 32];
 const ALGORITHM: &str = "s33-test-v1";
+
+fn file_sha256(bytes: &[u8]) -> String {
+    copy_exact_sha256_hex(
+        &mut Cursor::new(bytes),
+        &mut std::io::sink(),
+        u64::try_from(bytes.len()).unwrap(),
+    )
+    .unwrap()
+}
 
 fn runtime_snapshot(root: &Path) -> RuntimeSnapshot {
     let limits = SpoolLimits {
@@ -1971,6 +1988,741 @@ async fn repository_purge_closes_immediately_batches_cas_and_resumes_after_reope
         row.object_kind.as_deref() == Some("repository")
             && row.object_id.as_deref() == Some(replacement_id.to_string().as_str())
     }));
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn quiesced_backup_create_verify_preserves_post_boundary_hook_and_reopens_writer() {
+    let root = TempDir::new().unwrap();
+    let data_dir = root.path().join("data");
+    let writer = JournalWriter::open(&data_dir).await.unwrap();
+    let (handle, actor) = spawn_writer(writer, 32).unwrap();
+
+    let effective = EffectiveConfig::default();
+    let config_path = root.path().join("config.toml");
+    std::fs::write(&config_path, effective.to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut runtime = runtime_snapshot(&data_dir);
+    runtime.effective_config_hash = effective.hash();
+    runtime.recall_cue_gate = RecallCueGateMode::Active;
+    runtime.recall_cue_adapter_manifest_id = Some("adapter:s33-backup".into());
+    runtime.recall_cues = vec![
+        RecallCueSnapshot {
+            session_id: "session:private-live-cue".into(),
+            execution_lane_id: ExecutionLaneId::new_v7(),
+            host_lane_key: "lane:private-live-cue".into(),
+            adapter_manifest_id: "adapter:s33-backup".into(),
+            runtime_generation: runtime.generation,
+            recall_need_hash: [0x4c; 32],
+            presentation_attempt_id: PresentationAttemptId::new_v7(),
+            expires_at_us: i64::MAX,
+            checksum: [0; 32],
+        }
+        .seal()
+        .unwrap(),
+    ];
+    DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    runtime
+        .publish(&RuntimeSnapshot::snapshot_path(&data_dir))
+        .unwrap();
+    let absent_hook = StableLauncher::freeze_backup_snapshot(&data_dir).unwrap();
+    assert_eq!(absent_hook.current_generation, None);
+    assert!(absent_hook.files.is_empty());
+    std::fs::write(data_dir.join("hook-v1"), b"partial-install").unwrap();
+    std::fs::set_permissions(
+        data_dir.join("hook-v1"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(StableLauncher::freeze_backup_snapshot(&data_dir).is_err());
+    std::fs::remove_file(data_dir.join("hook-v1")).unwrap();
+    let launcher = StableLauncher::open(&data_dir).unwrap();
+    for generation in 1..=2_u64 {
+        let directory = data_dir.join(format!("hooks/generations/{generation}"));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = directory.join("evertrace-hook");
+        std::fs::write(&executable, format!("hook-generation-{generation}")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let generation_runtime = directory.join("hook-runtime-v1.json");
+        let mut snapshot = runtime.clone();
+        snapshot.generation += generation;
+        for cue in &mut snapshot.recall_cues {
+            cue.runtime_generation = snapshot.generation;
+            *cue = cue.clone().seal().unwrap();
+        }
+        snapshot.publish(&generation_runtime).unwrap();
+        launcher
+            .publish_generation(HookGeneration {
+                generation,
+                protocol_version: 1,
+                executable,
+                runtime_snapshot: generation_runtime,
+                compatible: true,
+            })
+            .unwrap();
+        if generation == 1 {
+            assert_eq!(
+                launcher
+                    .resolve_for_session("session-backup-old")
+                    .unwrap()
+                    .generation,
+                1
+            );
+        }
+    }
+    launcher
+        .install_launcher_binary(&data_dir.join("hooks/generations/2/evertrace-hook"))
+        .unwrap();
+
+    let repository_id = RepositoryId::new_v7();
+    let mut payload = vec![0_u8; 1024 * 1024];
+    let mut value = 0x9e37_79b9_u32;
+    for byte in &mut payload {
+        value ^= value << 13;
+        value ^= value >> 17;
+        value ^= value << 5;
+        *byte = value as u8;
+    }
+    let pre_boundary = CaptureRuntime::open(runtime.clone())
+        .unwrap()
+        .capture(capture_input("backup-pre", repository_id, &payload))
+        .unwrap();
+    let CaptureOutcome::Durable {
+        cas_digest: pre_digest,
+        ..
+    } = pre_boundary
+    else {
+        panic!("pre-boundary capture must be durable");
+    };
+    let mut second_pre_input = capture_input("backup-pre-second", repository_id, b"second");
+    second_pre_input.source_instance_id = "hook-backup-pre".into();
+    second_pre_input.source_revision = "revision-1".into();
+    second_pre_input.source_sequence = 2;
+    let CaptureOutcome::Durable {
+        cas_digest: second_pre_digest,
+        ..
+    } = CaptureRuntime::open(runtime.clone())
+        .unwrap()
+        .capture(second_pre_input)
+        .unwrap()
+    else {
+        panic!("second pre-boundary capture must be durable");
+    };
+    drop(payload);
+
+    let governance = HumanGovernanceService::with_acceptance(
+        handle.clone(),
+        effective.hash(),
+        runtime.clone(),
+        GlobalPromotionConfig::default(),
+    );
+    let frontier = handle.project().await.unwrap().frontier;
+    let request_id = RequestId::new_v7();
+    let backup_job_id = JobId::from_uuid(request_id.as_uuid()).unwrap();
+    assert!(matches!(
+        governance
+            .create_backup(request_id, frontier)
+            .await
+            .unwrap(),
+        HumanActionOutcome::Applied { .. }
+    ));
+
+    let report = Arc::new(RwLock::new(None::<evertrace_codex::HostProbeReport>));
+    let (backup_tx, mut backup_rx) = mpsc::channel(1);
+    let scheduler = BackgroundScheduler::new(
+        handle.clone(),
+        SessionCatalogService::new(handle.clone(), effective.hash()),
+        SessionImportWorker::new(handle.clone(), runtime.clone(), Arc::clone(&report)).unwrap(),
+        report,
+        runtime.clone(),
+        SynthesisPlanner::new(LlmConfig {
+            enabled: false,
+            ..LlmConfig::default()
+        }),
+        DreamingConfig::default(),
+    )
+    .with_backup_requests(backup_tx);
+    let scheduler_task = tokio::spawn(async move { scheduler.run_once().await });
+    let request = backup_rx.recv().await.unwrap();
+    assert_eq!(request.backup_job_id(), backup_job_id);
+    handle
+        .commit(
+            repository_command(
+                repository(
+                    RepositoryId::new_v7(),
+                    "/repository/backup-frontier-lag",
+                    12,
+                ),
+                12,
+            ),
+            12,
+        )
+        .await
+        .unwrap();
+    let backup_handle = handle.clone();
+    let backup_runtime = runtime.clone();
+    let backup_config = config_path.clone();
+    let backup_task = tokio::spawn(async move {
+        let result = backup_handle
+            .create_backup(backup_job_id, backup_config, backup_runtime)
+            .await
+            .expect("writer actor must remain available");
+        let observed = result.clone();
+        request.complete(result);
+        observed
+    });
+    let staging = data_dir
+        .join("backups")
+        .join(format!(".staging-{backup_job_id}"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !staging.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("streaming backup must expose its private staging interval");
+    assert_eq!(
+        launcher
+            .resolve_for_session("session-backup-after-boundary")
+            .unwrap()
+            .generation,
+        2
+    );
+    let post_boundary = CaptureRuntime::open(runtime.clone())
+        .unwrap()
+        .capture(capture_input(
+            "backup-post",
+            repository_id,
+            b"post-boundary",
+        ))
+        .unwrap();
+    let CaptureOutcome::Durable {
+        cas_digest: post_digest,
+        ..
+    } = post_boundary
+    else {
+        panic!("post-boundary capture must be durable");
+    };
+    backup_task.await.unwrap().unwrap();
+    let progress = scheduler_task.await.unwrap().unwrap();
+    assert_eq!(progress.completed, 1);
+
+    let backup_dir = data_dir
+        .join("backups")
+        .join(format!("backup-{backup_job_id}"));
+    assert!(!staging.exists());
+    let manifest: BackupManifest =
+        serde_json::from_slice(&std::fs::read(backup_dir.join("manifest.json")).unwrap()).unwrap();
+    assert!(manifest.committed_source_watermarks.is_empty());
+    assert_eq!(manifest.spool_source_watermarks.len(), 1);
+    assert_eq!(
+        manifest.spool_source_watermarks[0]
+            .source_instance_id
+            .as_str(),
+        "hook-backup-pre"
+    );
+    assert_eq!(manifest.spool_source_watermarks[0].source_sequence, 2);
+    assert!(manifest.spool_cas_refs.contains(&pre_digest));
+    assert!(manifest.spool_cas_refs.contains(&second_pre_digest));
+    assert_eq!(manifest.table_states.journal.checkpoint, manifest.frontier);
+    assert_eq!(manifest.table_states.objects.checkpoint, manifest.frontier);
+    assert!(manifest.table_states.relations.checkpoint < manifest.frontier);
+    assert!(manifest.table_states.search.checkpoint < manifest.frontier);
+    assert_eq!(
+        manifest.index_generation,
+        evertrace_store::SEARCH_PROJECTION_GENERATION
+    );
+    assert_eq!(manifest.compiler_watermark, manifest.frontier);
+    assert_eq!(manifest.hook_current_generation, Some(2));
+    assert_eq!(manifest.hook_retained_generations, [1, 2]);
+    assert_eq!(manifest.hook_pin_count, 1);
+    assert_eq!(manifest.session_pinned_hook_artifact_count, 1);
+    for required in [
+        "hook-v1",
+        "hooks/registry-v1.json",
+        "hooks/pins/session-backup-old.pin",
+        "hooks/generations/1/evertrace-hook",
+        "hooks/generations/1/hook-runtime-v1.json",
+        "hooks/generations/2/evertrace-hook",
+        "hooks/generations/2/hook-runtime-v1.json",
+    ] {
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|file| file.relative_path == required)
+        );
+    }
+    assert!(!manifest.files.iter().any(|file| {
+        file.relative_path == "hooks/pins/session-backup-after-boundary.pin"
+            || file.relative_path == "hooks/registry.lock"
+    }));
+    let backed_up_runtime =
+        RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&backup_dir)).unwrap();
+    assert!(backed_up_runtime.recall_cues.is_empty());
+    for generation in 1..=2 {
+        let relative = format!("hooks/generations/{generation}/hook-runtime-v1.json");
+        let live = RuntimeSnapshot::load(&data_dir.join(&relative)).unwrap();
+        let saved = RuntimeSnapshot::load(&backup_dir.join(&relative)).unwrap();
+        assert_eq!(saved, live.sanitized_for_backup().unwrap());
+        assert_eq!(saved.generation, runtime.generation + generation);
+        assert_eq!(live.recall_cues.len(), 1);
+    }
+    assert_eq!(
+        RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&data_dir))
+            .unwrap()
+            .recall_cues
+            .len(),
+        1
+    );
+    assert!(manifest.files.iter().any(|file| {
+        file.relative_path == format!("cas/blobs/{}/{}", &pre_digest[..2], &pre_digest[2..])
+    }));
+    assert!(manifest.files.iter().any(|file| {
+        file.relative_path
+            == format!(
+                "cas/blobs/{}/{}",
+                &second_pre_digest[..2],
+                &second_pre_digest[2..]
+            )
+    }));
+    assert!(!manifest.files.iter().any(|file| {
+        file.relative_path == format!("cas/blobs/{}/{}", &post_digest[..2], &post_digest[2..])
+            || file.relative_path.starts_with("keys/")
+            || file.relative_path.starts_with("backups/")
+            || file.relative_path.contains(".staging-")
+    }));
+    let offline_launcher = root.path().join("offline-hook-v1");
+    let offline_hooks = root.path().join("offline-hooks");
+    std::fs::rename(data_dir.join("hook-v1"), &offline_launcher).unwrap();
+    std::fs::rename(data_dir.join("hooks"), &offline_hooks).unwrap();
+    assert_eq!(
+        verify_backup(&data_dir, backup_job_id)
+            .await
+            .unwrap()
+            .backup_job_id,
+        backup_job_id
+    );
+    let verify_frontier = handle.project().await.unwrap().frontier;
+    let verify_request_id = RequestId::new_v7();
+    let verify_job_id = JobId::from_uuid(verify_request_id.as_uuid()).unwrap();
+    assert!(matches!(
+        governance
+            .verify_backup(verify_request_id, verify_frontier, backup_job_id)
+            .await
+            .unwrap(),
+        HumanActionOutcome::Applied { .. }
+    ));
+    let report = Arc::new(RwLock::new(None::<evertrace_codex::HostProbeReport>));
+    let verify_scheduler = BackgroundScheduler::new(
+        handle.clone(),
+        SessionCatalogService::new(handle.clone(), effective.hash()),
+        SessionImportWorker::new(handle.clone(), runtime.clone(), Arc::clone(&report)).unwrap(),
+        report,
+        runtime.clone(),
+        SynthesisPlanner::new(LlmConfig {
+            enabled: false,
+            ..LlmConfig::default()
+        }),
+        DreamingConfig::default(),
+    );
+    assert_eq!(verify_scheduler.run_once().await.unwrap().completed, 1);
+    let detail_frontier = handle.project().await.unwrap().frontier;
+    let detail = governance
+        .detail(
+            HumanSurface::System,
+            &format!("runtime:job:{backup_job_id}"),
+            detail_frontier,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(HumanSystemDetail::Job { detail }) = detail.items[0].system_detail.as_ref() else {
+        panic!("backup job detail must remain typed");
+    };
+    let summary = detail
+        .backup_summary
+        .as_ref()
+        .expect("completed backup detail must read the small manifest summary");
+    assert_eq!(summary.frontier, manifest.frontier);
+    assert_eq!(
+        summary.journal.frontier,
+        manifest.table_states.journal.checkpoint
+    );
+    assert_eq!(
+        summary.objects.frontier,
+        manifest.table_states.objects.checkpoint
+    );
+    assert_eq!(
+        summary.relations.frontier,
+        manifest.table_states.relations.checkpoint
+    );
+    assert_eq!(
+        summary.search.frontier,
+        manifest.table_states.search.checkpoint
+    );
+    assert_eq!(
+        summary.index_generation,
+        evertrace_store::SEARCH_PROJECTION_GENERATION
+    );
+    assert_eq!(summary.compiler_watermark, summary.frontier);
+    assert_eq!(summary.spool_source_watermark_count, 1);
+    assert_eq!(summary.hook_current_generation, Some(2));
+    assert_eq!(summary.hook_retained_generations, [1, 2]);
+    assert_eq!(summary.hook_pin_count, 1);
+    assert_eq!(summary.session_pinned_hook_artifact_count, 1);
+    assert_eq!(
+        handle
+            .create_backup(backup_job_id, config_path.clone(), runtime.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .backup_job_id,
+        backup_job_id
+    );
+    assert_eq!(
+        std::fs::read_dir(data_dir.join("backups"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| { entry.file_name().to_string_lossy().starts_with("backup-") })
+            .count(),
+        1
+    );
+    std::fs::rename(&offline_launcher, data_dir.join("hook-v1")).unwrap();
+    std::fs::rename(&offline_hooks, data_dir.join("hooks")).unwrap();
+
+    let generation_runtime = data_dir.join("hooks/generations/1/hook-runtime-v1.json");
+    let original_runtime = std::fs::read(&generation_runtime).unwrap();
+    std::fs::write(&generation_runtime, b"malformed-runtime").unwrap();
+    let malformed_job = JobId::new_v7();
+    assert!(
+        handle
+            .create_backup(malformed_job, config_path.clone(), runtime.clone())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        !data_dir
+            .join("backups")
+            .join(format!("backup-{malformed_job}"))
+            .exists()
+    );
+    std::fs::write(&generation_runtime, original_runtime).unwrap();
+
+    let missing_reference_job_id = JobId::new_v7();
+    let old_pin = data_dir.join("hooks/pins/session-backup-old.pin");
+    std::fs::write(&old_pin, b"3").unwrap();
+    assert!(
+        handle
+            .create_backup(
+                missing_reference_job_id,
+                config_path.clone(),
+                runtime.clone(),
+            )
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        !data_dir
+            .join("backups")
+            .join(format!("backup-{missing_reference_job_id}"))
+            .exists()
+    );
+    std::fs::write(old_pin, b"1").unwrap();
+
+    let spool =
+        DurableSpool::open_read_only(runtime.spool_dir.clone(), runtime.spool_limits().unwrap())
+            .unwrap();
+    let records = spool
+        .read_durable_records(
+            usize::try_from(runtime.max_main_files).unwrap(),
+            runtime.main_high_watermark_bytes,
+        )
+        .unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.cas_refs == [post_digest.clone()])
+    );
+    let drained = EvidenceIngestor::new(
+        runtime.clone(),
+        handle.clone(),
+        effective.hash(),
+        "s33-backup-ingest-v1",
+    )
+    .unwrap()
+    .drain_once()
+    .await
+    .unwrap();
+    assert!(drained.committed_frames >= 3);
+    assert!(handle.project().await.is_ok());
+
+    let manifest_path = backup_dir.join("manifest.json");
+    let canonical_manifest_bytes = std::fs::read(&manifest_path).unwrap();
+    let canonical_manifest: BackupManifest =
+        serde_json::from_slice(&canonical_manifest_bytes).unwrap();
+    let runtime_relative = "hooks/generations/1/hook-runtime-v1.json";
+    let saved_runtime_path = backup_dir.join(runtime_relative);
+    let clean_runtime = std::fs::read(&saved_runtime_path).unwrap();
+    let cue_runtime = std::fs::read(data_dir.join(runtime_relative)).unwrap();
+    for tampered_runtime in [cue_runtime, b"malformed-runtime".to_vec()] {
+        std::fs::write(&saved_runtime_path, &tampered_runtime).unwrap();
+        let mut tampered = canonical_manifest.clone();
+        let entry = tampered
+            .files
+            .iter_mut()
+            .find(|file| file.relative_path == runtime_relative)
+            .unwrap();
+        entry.size = u64::try_from(tampered_runtime.len()).unwrap();
+        entry.sha256 = Some(file_sha256(&tampered_runtime));
+        std::fs::write(&manifest_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(verify_backup(&data_dir, backup_job_id).await.is_err());
+    }
+    std::fs::write(&saved_runtime_path, clean_runtime).unwrap();
+    std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
+    let hook_registry_relative = "hooks/registry-v1.json";
+    let hook_registry_path = backup_dir.join(hook_registry_relative);
+    let canonical_hook_registry = std::fs::read(&hook_registry_path).unwrap();
+    let mut tampered_hook_registry: serde_json::Value =
+        serde_json::from_slice(&canonical_hook_registry).unwrap();
+    tampered_hook_registry["current_generation"] = serde_json::Value::from(1_u64);
+    let tampered_hook_registry = serde_json::to_vec(&tampered_hook_registry).unwrap();
+    std::fs::write(&hook_registry_path, &tampered_hook_registry).unwrap();
+    let mut tampered_hook_manifest = canonical_manifest.clone();
+    let hook_registry_entry = tampered_hook_manifest
+        .files
+        .iter_mut()
+        .find(|file| file.relative_path == hook_registry_relative)
+        .unwrap();
+    hook_registry_entry.size = u64::try_from(tampered_hook_registry.len()).unwrap();
+    hook_registry_entry.sha256 = Some(file_sha256(&tampered_hook_registry));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&tampered_hook_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        handle
+            .create_backup(backup_job_id, config_path.clone(), runtime.clone())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    std::fs::write(&hook_registry_path, &canonical_hook_registry).unwrap();
+    std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
+
+    let copied_generation = backup_dir.join("hooks/generations/1/evertrace-hook");
+    let copied_generation_bytes = std::fs::read(&copied_generation).unwrap();
+    std::fs::remove_file(&copied_generation).unwrap();
+    assert!(
+        handle
+            .create_backup(backup_job_id, config_path.clone(), runtime.clone())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    std::fs::write(&copied_generation, &copied_generation_bytes).unwrap();
+    std::fs::set_permissions(&copied_generation, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let cas_relative = canonical_manifest
+        .files
+        .iter()
+        .find(|file| {
+            file.relative_path == format!("cas/blobs/{}/{}", &pre_digest[..2], &pre_digest[2..])
+        })
+        .unwrap()
+        .relative_path
+        .clone();
+    let cas_path = backup_dir.join(&cas_relative);
+    let canonical_cas = std::fs::read(&cas_path).unwrap();
+    let mut tampered_cas = canonical_cas.clone();
+    *tampered_cas.last_mut().unwrap() ^= 0x5a;
+    std::fs::write(&cas_path, &tampered_cas).unwrap();
+    let mut tampered_manifest = canonical_manifest.clone();
+    tampered_manifest
+        .files
+        .iter_mut()
+        .find(|file| file.relative_path == cas_relative)
+        .unwrap()
+        .sha256 = Some(file_sha256(&tampered_cas));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&tampered_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_backup(&data_dir, backup_job_id).await.is_err());
+    std::fs::write(&cas_path, &canonical_cas).unwrap();
+    std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
+
+    let spool_relative = canonical_manifest
+        .spool_files
+        .iter()
+        .find(|file| {
+            file.kind == evertrace_store::backup::BackupSpoolFileKind::Normal
+                || file.kind == evertrace_store::backup::BackupSpoolFileKind::Isolated
+        })
+        .unwrap()
+        .relative_path
+        .clone();
+    let spool_path = backup_dir.join(&spool_relative);
+    let canonical_spool = std::fs::read(&spool_path).unwrap();
+    let mut tampered_spool = canonical_spool.clone();
+    tampered_spool[0] ^= 0x7f;
+    std::fs::write(&spool_path, &tampered_spool).unwrap();
+    let mut tampered_manifest = canonical_manifest.clone();
+    tampered_manifest
+        .files
+        .iter_mut()
+        .find(|file| file.relative_path == spool_relative)
+        .unwrap()
+        .sha256 = Some(file_sha256(&tampered_spool));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&tampered_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_backup(&data_dir, backup_job_id).await.is_err());
+    std::fs::write(&spool_path, &canonical_spool).unwrap();
+    std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
+
+    let mut forged_table_manifest = canonical_manifest.clone();
+    forged_table_manifest.table_states.journal.version += 1;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&forged_table_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_backup(&data_dir, backup_job_id).await.is_err());
+    std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
+
+    let mut ahead_checkpoint_manifest = canonical_manifest.clone();
+    ahead_checkpoint_manifest.table_states.relations.checkpoint =
+        ahead_checkpoint_manifest.frontier + 1;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&ahead_checkpoint_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_backup(&data_dir, backup_job_id).await.is_err());
+    std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
+
+    let exports_dir = backup_dir.join("exports");
+    std::fs::create_dir(&exports_dir).unwrap();
+    std::fs::set_permissions(&exports_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let excluded_file = exports_dir.join("extra");
+    std::fs::write(&excluded_file, b"excluded").unwrap();
+    std::fs::set_permissions(&excluded_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut excluded_manifest = canonical_manifest.clone();
+    excluded_manifest
+        .files
+        .push(evertrace_store::backup::BackupFileManifest {
+            relative_path: "exports".into(),
+            kind: evertrace_store::backup::BackupFileKind::Directory,
+            size: 0,
+            sha256: None,
+        });
+    excluded_manifest
+        .files
+        .push(evertrace_store::backup::BackupFileManifest {
+            relative_path: "exports/extra".into(),
+            kind: evertrace_store::backup::BackupFileKind::Regular,
+            size: 8,
+            sha256: Some(file_sha256(b"excluded")),
+        });
+    excluded_manifest
+        .files
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&excluded_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_backup(&data_dir, backup_job_id).await.is_err());
+    std::fs::remove_file(excluded_file).unwrap();
+    std::fs::remove_dir(exports_dir).unwrap();
+    std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
+
+    let missing_job_id = JobId::new_v7();
+    let crash_staging = data_dir
+        .join("backups")
+        .join(format!(".staging-{missing_job_id}"));
+    std::fs::create_dir(&crash_staging).unwrap();
+    std::fs::set_permissions(&crash_staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let crash_residue = crash_staging.join("partial");
+    std::fs::write(&crash_residue, b"interrupted-before-publish").unwrap();
+    std::fs::set_permissions(&crash_residue, std::fs::Permissions::from_mode(0o600)).unwrap();
+    handle
+        .create_backup(missing_job_id, config_path.clone(), runtime.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!crash_staging.exists());
+    let missing_dir = data_dir
+        .join("backups")
+        .join(format!("backup-{missing_job_id}"));
+    std::fs::remove_file(missing_dir.join("config/config.toml")).unwrap();
+    assert!(verify_backup(&data_dir, missing_job_id).await.is_err());
+
+    let symlink_job_id = JobId::new_v7();
+    handle
+        .create_backup(symlink_job_id, config_path.clone(), runtime.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let symlink_dir = data_dir
+        .join("backups")
+        .join(format!("backup-{symlink_job_id}"));
+    let symlink_manifest_path = symlink_dir.join("manifest.json");
+    let canonical_manifest = std::fs::read(&symlink_manifest_path).unwrap();
+    let mut malicious_manifest: BackupManifest =
+        serde_json::from_slice(&canonical_manifest).unwrap();
+    malicious_manifest.files[0].relative_path = "../escape".into();
+    std::fs::write(
+        &symlink_manifest_path,
+        serde_json::to_vec(&malicious_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_backup(&data_dir, symlink_job_id).await.is_err());
+    let mut duplicate_manifest: BackupManifest =
+        serde_json::from_slice(&canonical_manifest).unwrap();
+    duplicate_manifest.files[1].relative_path = duplicate_manifest.files[0].relative_path.clone();
+    std::fs::write(
+        &symlink_manifest_path,
+        serde_json::to_vec(&duplicate_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_backup(&data_dir, symlink_job_id).await.is_err());
+    std::fs::write(&symlink_manifest_path, canonical_manifest).unwrap();
+    let symlink_config = symlink_dir.join("config/config.toml");
+    std::fs::remove_file(&symlink_config).unwrap();
+    std::os::unix::fs::symlink(&config_path, &symlink_config).unwrap();
+    assert!(verify_backup(&data_dir, symlink_job_id).await.is_err());
+
+    std::fs::write(backup_dir.join("config/config.toml"), b"tampered").unwrap();
+    assert!(verify_backup(&data_dir, backup_job_id).await.is_err());
+    let projected = handle.project().await.unwrap();
+    let jobs = RuntimeSchedulerView::from_snapshot(&projected).unwrap();
+    let terminal = jobs
+        .jobs
+        .iter()
+        .find(|job| job.job_id == backup_job_id)
+        .unwrap();
+    assert_eq!(terminal.kind, QUIESCED_BACKUP_CREATE_JOB_KIND);
+    assert_eq!(terminal.state, JobStatus::Succeeded);
+    assert_eq!(
+        jobs.jobs
+            .iter()
+            .find(|job| job.job_id == verify_job_id)
+            .unwrap()
+            .state,
+        JobStatus::Succeeded
+    );
     handle.shutdown().await.unwrap();
     actor.await.unwrap().unwrap();
 }

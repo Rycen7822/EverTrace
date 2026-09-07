@@ -18,11 +18,12 @@ pub use admission::{
 };
 pub use cas::{
     CasDeleteOutcome, CasDigest, CasError, CasStore, MaintenanceFence, MaintenanceGuard,
+    copy_exact_sha256_hex,
 };
 pub use confined_read::{
     ConfinedDirectoryEntry, ConfinedEntryType, ConfinedFile, ConfinedFileIdentity,
     ConfinedFileMetadata, ConfinedFileRange, ConfinedLimitKind, ConfinedReadError,
-    ConfinedReadLimits, ConfinedRoot,
+    ConfinedReadLimits, ConfinedRoot, open_regular_nofollow,
 };
 pub use frame::{
     CAPTURE_RECORD_BODY_VERSION, CaptureRecordBody, DecodedFrame, FrameScan,
@@ -41,5 +42,7 @@ pub use runtime_snapshot::{
 };
 pub use spool::{
     CaptureGapMarker, DurableSpool, GapEvidence, GapReason, PendingGapMarker, PendingQuarantine,
-    RecoveryReport, SealedFrame, SealedSegment, SpoolError, SpoolLimits,
+    RecoveryReport, SealedFrame, SealedSegment, SpoolBackupBoundary, SpoolBackupDirectory,
+    SpoolBackupFile, SpoolBackupFileKind, SpoolBackupSemantic, SpoolBackupSourceWatermark,
+    SpoolError, SpoolLimits, verify_backup_spool_file,
 };

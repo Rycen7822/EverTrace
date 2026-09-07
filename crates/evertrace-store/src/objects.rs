@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lancedb::Table;
+use lancedb::{Table, query::QueryBase};
 
 use crate::{
     collect_batches,
@@ -223,6 +223,38 @@ pub async fn read_object_rows(table: &Table) -> Result<Vec<ObjectRow>, StoreErro
     }
     rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
     Ok(rows)
+}
+
+pub(crate) async fn read_object_checkpoint(table: &Table) -> Result<u64, StoreError> {
+    table
+        .checkout_latest()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let actual = table.schema().await.map_err(|_| StoreError::LanceDb)?;
+    if actual.as_ref() != objects_schema().as_ref() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let batches = collect_batches(
+        &table
+            .query()
+            .only_if(format!("row_id = '{OBJECTS_CHECKPOINT_ID}'"))
+            .limit(2),
+    )
+    .await
+    .map_err(|_| StoreError::LanceDb)?;
+    let mut rows = Vec::new();
+    for batch in &batches {
+        rows.extend(rows_from_batch(batch)?);
+    }
+    let [checkpoint] = rows.as_slice() else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    if checkpoint.row_id != OBJECTS_CHECKPOINT_ID
+        || checkpoint.row_kind != ObjectRowKind::Checkpoint
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(checkpoint.source_event_seq)
 }
 
 pub(crate) fn objects_batch(rows: &[ObjectRow]) -> Result<RecordBatch, StoreError> {

@@ -17,7 +17,7 @@ use crate::{
         validate_journal_table,
     },
     migrations::{L0002, MigrationOutcome},
-    objects::{OBJECTS_TABLE, read_object_rows, validate_objects_table},
+    objects::{OBJECTS_TABLE, read_object_checkpoint, read_object_rows, validate_objects_table},
     projections::{
         JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
         ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
@@ -39,6 +39,7 @@ pub struct SiblingWriterLock {
     data_dir: PathBuf,
     lock_path: PathBuf,
     file: File,
+    data_identity: (u64, u64),
 }
 
 impl SiblingWriterLock {
@@ -79,10 +80,12 @@ impl SiblingWriterLock {
         })?;
         validate_lock_identity(&lock_path, &file)?;
         ensure_data_root(data_dir, parent)?;
+        let data_metadata = fs::symlink_metadata(data_dir).map_err(|_| StoreError::Io)?;
         Ok(Self {
             data_dir: data_dir.to_owned(),
             lock_path,
             file,
+            data_identity: (data_metadata.dev(), data_metadata.ino()),
         })
     }
 
@@ -98,6 +101,23 @@ impl SiblingWriterLock {
         let metadata = self.file.metadata().map_err(|_| StoreError::Io)?;
         Ok((metadata.dev(), metadata.ino()))
     }
+
+    fn validate_held(&self) -> Result<(), StoreError> {
+        validate_lock_identity(&self.lock_path, &self.file)?;
+        let metadata = fs::symlink_metadata(&self.data_dir).map_err(|_| StoreError::Io)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || (metadata.dev(), metadata.ino()) != self.data_identity
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct ClosedJournalWriter {
+    lock: SiblingWriterLock,
 }
 
 pub struct JournalWriter {
@@ -131,7 +151,12 @@ impl JournalWriter {
 
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
         let lock = SiblingWriterLock::acquire(data_dir)?;
-        let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
+        Self::open_with_lock(lock).await
+    }
+
+    async fn open_with_lock(lock: SiblingWriterLock) -> Result<Self, StoreError> {
+        lock.validate_held()?;
+        let connection = lancedb::connect(lock.data_dir().to_str().ok_or(StoreError::InvalidPath)?)
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
@@ -178,6 +203,73 @@ impl JournalWriter {
             admission_state,
             migration_outcome,
         })
+    }
+
+    pub async fn backup_table_states(&self) -> Result<crate::BackupTableStates, StoreError> {
+        let journal_checkpoint = read_journal_frontier(&self.journal).await?;
+        let object_checkpoint = read_object_checkpoint(&self.objects).await?;
+        let relation_checkpoint =
+            crate::relations::read_relation_checkpoint(&self.relations).await?;
+        let search_checkpoint = crate::search::read_search_checkpoint(&self.search).await?;
+        Ok(crate::BackupTableStates {
+            journal: crate::BackupTableState {
+                version: self
+                    .journal
+                    .version()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?,
+                checkpoint: journal_checkpoint,
+            },
+            objects: crate::BackupTableState {
+                version: self
+                    .objects
+                    .version()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?,
+                checkpoint: object_checkpoint,
+            },
+            relations: crate::BackupTableState {
+                version: self
+                    .relations
+                    .version()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?,
+                checkpoint: relation_checkpoint,
+            },
+            search: crate::BackupTableState {
+                version: self
+                    .search
+                    .version()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?,
+                checkpoint: search_checkpoint,
+            },
+        })
+    }
+
+    pub fn close_for_backup(self) -> ClosedJournalWriter {
+        let Self {
+            _lock: lock,
+            connection,
+            journal,
+            objects,
+            relations,
+            search,
+            next_seq,
+            admission_state,
+            migration_outcome,
+        } = self;
+        drop((
+            connection,
+            journal,
+            objects,
+            relations,
+            search,
+            next_seq,
+            admission_state,
+            migration_outcome,
+        ));
+        ClosedJournalWriter { lock }
     }
 
     pub const fn migration_outcome(&self) -> MigrationOutcome {
@@ -326,6 +418,86 @@ impl JournalWriter {
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)
+    }
+}
+
+impl ClosedJournalWriter {
+    pub fn stage_backup(
+        self,
+        config_path: PathBuf,
+        runtime: evertrace_capture::RuntimeSnapshot,
+        backup_job_id: evertrace_domain::ids::JobId,
+        snapshot: ProjectionSnapshot,
+        table_states: crate::BackupTableStates,
+        boundary: crate::backup::BackupFrozenBoundary,
+    ) -> (
+        Self,
+        Result<crate::backup::BackupStaging, crate::BackupError>,
+    ) {
+        if self.lock.validate_held().is_err() {
+            return (self, Err(crate::BackupError::IdentityChanged));
+        }
+        let data_dir = match runtime.data_dir() {
+            Ok(data_dir) => data_dir.to_owned(),
+            Err(_) => return (self, Err(crate::BackupError::InvalidInput)),
+        };
+        let result = crate::backup::prepare_backup(
+            &data_dir,
+            &config_path,
+            &runtime,
+            backup_job_id,
+            &snapshot,
+            table_states,
+            boundary,
+        )
+        .and_then(crate::backup::stage_backup);
+        if self.lock.validate_held().is_err() {
+            if let Ok(staging) = &result {
+                let _ = crate::backup::discard_backup(staging);
+            }
+            return (self, Err(crate::BackupError::IdentityChanged));
+        }
+        (self, result)
+    }
+
+    pub async fn verify_staged_backup(
+        &self,
+        staging: &crate::backup::BackupStaging,
+    ) -> Result<crate::BackupSummary, crate::BackupError> {
+        if self.lock.validate_held().is_err() {
+            return Err(crate::BackupError::IdentityChanged);
+        }
+        let result = crate::backup::verify_staged_backup(staging).await;
+        if self.lock.validate_held().is_err() {
+            return Err(crate::BackupError::IdentityChanged);
+        }
+        result
+    }
+
+    pub fn publish_staged_backup(
+        self,
+        staging: crate::backup::BackupStaging,
+        summary: crate::BackupSummary,
+    ) -> (Self, Result<crate::BackupSummary, crate::BackupError>) {
+        if self.lock.validate_held().is_err() {
+            return (self, Err(crate::BackupError::IdentityChanged));
+        }
+        let result = crate::backup::publish_backup(staging, summary);
+        if self.lock.validate_held().is_err() {
+            return (self, Err(crate::BackupError::IdentityChanged));
+        }
+        (self, result)
+    }
+
+    pub fn discard_staged_backup(
+        &self,
+        staging: &crate::backup::BackupStaging,
+    ) -> Result<(), crate::BackupError> {
+        crate::backup::discard_backup(staging)
+    }
+
+    pub async fn reopen(self) -> Result<JournalWriter, StoreError> {
+        JournalWriter::open_with_lock(self.lock).await
     }
 }
 

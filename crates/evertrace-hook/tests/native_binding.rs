@@ -79,19 +79,27 @@ fn stable_launcher_performs_native_pretooluse_uds_issue_and_exact_rewrite() {
     let snapshot_path = runtime.join("hook-runtime-v1.json");
     snapshot.publish(&snapshot_path).unwrap();
 
-    let install = root.join("install");
-    let launcher = StableLauncher::open(&install).unwrap();
-    let pinned_executable = root.join("evertrace-hook-generation-1");
+    let launcher = StableLauncher::open(&data).unwrap();
+    let generation_directory = data.join("hooks/generations/1");
+    fs::create_dir(&generation_directory).unwrap();
+    fs::set_permissions(&generation_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let pinned_executable = generation_directory.join("evertrace-hook");
     fs::copy(env!("CARGO_BIN_EXE_evertrace-hook"), &pinned_executable).unwrap();
     fs::set_permissions(&pinned_executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let generation_runtime = generation_directory.join("hook-runtime-v1.json");
+    fs::copy(&snapshot_path, &generation_runtime).unwrap();
+    fs::set_permissions(&generation_runtime, fs::Permissions::from_mode(0o600)).unwrap();
     launcher
         .publish_generation(HookGeneration {
             generation: 1,
             protocol_version: 1,
-            executable: pinned_executable,
-            runtime_snapshot: snapshot_path,
+            executable: pinned_executable.clone(),
+            runtime_snapshot: generation_runtime,
             compatible: true,
         })
+        .unwrap();
+    launcher
+        .install_launcher_binary(&pinned_executable)
         .unwrap();
 
     let server = thread::spawn(move || {
@@ -143,7 +151,7 @@ fn stable_launcher_performs_native_pretooluse_uds_issue_and_exact_rewrite() {
         "{{\"agent_id\":\"agent-native\",\"cwd\":\"/workspace/project\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5\",\"permission_mode\":\"default\",\"session_id\":\"session-native\",\"tool_input\":{{\"action\":\"search\",\"workspace\":\"@active\",\"input\":\"needle\",\"refs\":[\"atom:a\"]}},\"tool_name\":\"{CODEX_EVERTRACE_TOOL_NAME}\",\"tool_use_id\":\"tool-native\",\"transcript_path\":null,\"turn_id\":\"turn-native\"}}"
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_evertrace-hook"))
-        .args(["--launcher-root", install.to_str().unwrap()])
+        .args(["--launcher-root", data.to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -170,7 +178,7 @@ fn stable_launcher_performs_native_pretooluse_uds_issue_and_exact_rewrite() {
         native.replacen("{", "{\"unknown\":true,", 1),
     ] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_evertrace-hook"))
-            .args(["--launcher-root", install.to_str().unwrap()])
+            .args(["--launcher-root", data.to_str().unwrap()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

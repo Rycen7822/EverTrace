@@ -52,9 +52,11 @@ use evertrace_domain::{
     },
 };
 use evertrace_store::{
-    JobStatus, JobTerminalReason, JournalCommand, JournalPayload, ObjectDeletionCandidateAdmission,
+    BackupSummary as StoreBackupSummary, DurableJob, JobBudget, JobStatus, JobTerminalReason,
+    JournalCommand, JournalPayload, ObjectDeletionCandidateAdmission,
     ObjectDeletionCandidateAdmissionView, ObjectDeletionCurrentView, ObjectFamily, ObjectRow,
-    ObjectRowClass, ObjectRowKind, ProjectionSnapshot, RecoveryEvidenceCurrentView,
+    ObjectRowClass, ObjectRowKind, ProjectionSnapshot, QUIESCED_BACKUP_ALGORITHM_REVISION,
+    QUIESCED_BACKUP_CREATE_JOB_KIND, QUIESCED_BACKUP_VERIFY_JOB_KIND, RecoveryEvidenceCurrentView,
     RuntimeSchedulerView, SemanticCurrentView, SourceIngestWatermark,
 };
 use thiserror::Error;
@@ -331,6 +333,53 @@ pub struct HumanJobBudget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanBackupTableState {
+    pub version: u64,
+    pub frontier: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HumanBackupValidationResult {
+    VerifiedBeforePublish,
+    VerifyJobPassed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanBackupSummary {
+    pub frontier: u64,
+    pub journal: HumanBackupTableState,
+    pub objects: HumanBackupTableState,
+    pub relations: HumanBackupTableState,
+    pub search: HumanBackupTableState,
+    pub committed_source_watermark_count: u32,
+    pub spool_source_watermark_count: u32,
+    pub live_cas_count: u32,
+    pub spool_cas_count: u32,
+    pub spool_file_count: u32,
+    pub spool_generation_count: u32,
+    pub normal_spool_frame_count: u32,
+    pub isolated_spool_frame_count: u32,
+    pub emergency_gap_count: u32,
+    pub quarantine_count: u32,
+    pub runtime_outbox_watermark: u64,
+    pub index_generation: u64,
+    pub compiler_watermark: u64,
+    pub effective_config_hash: [u8; 32],
+    pub runtime_generation: u64,
+    pub hook_current_generation: Option<u64>,
+    pub hook_retained_generations: Vec<u64>,
+    pub hook_pin_count: u32,
+    pub session_pinned_hook_artifact_count: u32,
+    pub object_deletion_generation: u64,
+    pub repository_purge_generation: u64,
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub required_space_bytes: u64,
+    pub available_space_bytes_at_preflight: u64,
+    pub validation_result: HumanBackupValidationResult,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanJobDetail {
     pub job_id: JobId,
     pub target_revision: String,
@@ -348,6 +397,7 @@ pub struct HumanJobDetail {
     pub budget: HumanJobBudget,
     pub terminal_reason: Option<HumanJobTerminalReason>,
     pub terminal_result_ref: Option<String>,
+    pub backup_summary: Option<HumanBackupSummary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -857,7 +907,7 @@ impl HumanGovernanceService {
             .map_err(|_| HumanGovernanceError::Store)?;
         let usage_view = ProcedureUsageCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
-        let items = matching
+        let mut items = matching
             .into_iter()
             .map(|row| {
                 summary(
@@ -871,6 +921,54 @@ impl HumanGovernanceService {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some((index, backup_job_id, validation_result)) =
+            items.iter().enumerate().find_map(|(index, item)| {
+                let HumanSystemDetail::Job { detail } = item.system_detail.as_ref()? else {
+                    return None;
+                };
+                if detail.state != HumanJobState::Succeeded
+                    || detail.terminal_reason != Some(HumanJobTerminalReason::Completed)
+                {
+                    return None;
+                }
+                match detail.job_kind.as_str() {
+                    QUIESCED_BACKUP_CREATE_JOB_KIND => Some((
+                        index,
+                        detail.job_id,
+                        HumanBackupValidationResult::VerifiedBeforePublish,
+                    )),
+                    QUIESCED_BACKUP_VERIFY_JOB_KIND => Some((
+                        index,
+                        JobId::from_str(&detail.target_revision).ok()?,
+                        HumanBackupValidationResult::VerifyJobPassed,
+                    )),
+                    _ => None,
+                }
+            })
+        {
+            let runtime = self
+                .runtime_snapshot
+                .as_ref()
+                .ok_or(HumanGovernanceError::Store)?;
+            let data_dir = runtime
+                .data_dir()
+                .map_err(|_| HumanGovernanceError::Store)?
+                .to_owned();
+            let summary = tokio::task::spawn_blocking(move || {
+                evertrace_store::backup::read_backup_summary(&data_dir, backup_job_id)
+            })
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+            .map_err(|_| HumanGovernanceError::Store)?;
+            let HumanSystemDetail::Job { detail } = items[index]
+                .system_detail
+                .as_mut()
+                .ok_or(HumanGovernanceError::Store)?
+            else {
+                return Err(HumanGovernanceError::Store);
+            };
+            detail.backup_summary = Some(human_backup_summary(summary, validation_result));
+        }
         let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
             frontier: snapshot.frontier,
@@ -2773,6 +2871,154 @@ impl HumanGovernanceService {
         })
     }
 
+    pub async fn create_backup(
+        &self,
+        request_id: RequestId,
+        expected_frontier: u64,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let job_id = JobId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        self.queue_backup_job(
+            request_id,
+            expected_frontier,
+            job_id,
+            QUIESCED_BACKUP_CREATE_JOB_KIND,
+            job_id.to_string(),
+        )
+        .await
+    }
+
+    pub async fn verify_backup(
+        &self,
+        request_id: RequestId,
+        expected_frontier: u64,
+        backup_job_id: JobId,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let job_id = JobId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        self.queue_backup_job(
+            request_id,
+            expected_frontier,
+            job_id,
+            QUIESCED_BACKUP_VERIFY_JOB_KIND,
+            backup_job_id.to_string(),
+        )
+        .await
+    }
+
+    async fn queue_backup_job(
+        &self,
+        request_id: RequestId,
+        expected_frontier: u64,
+        job_id: JobId,
+        kind: &str,
+        target_revision: String,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        if let Some(committed) = self
+            .writer
+            .committed_command(command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            let matches = committed
+                .payloads
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, payload)| match payload {
+                    JournalPayload::JobState(job)
+                        if job.job_id == job_id
+                            && job.kind == kind
+                            && job.target_revision == target_revision
+                            && job.target_watermark == expected_frontier =>
+                    {
+                        Some(ordinal)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [ordinal] = matches.as_slice() else {
+                return Err(HumanGovernanceError::Store);
+            };
+            return Ok(HumanActionOutcome::Applied {
+                current_revision_ref: job_id.to_string(),
+                audit_event_ref: committed
+                    .event_ids
+                    .get(*ordinal)
+                    .cloned()
+                    .ok_or(HumanGovernanceError::Store)?,
+            });
+        }
+        let snapshot = self
+            .writer
+            .project()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        if snapshot.frontier != expected_frontier {
+            return Ok(HumanActionOutcome::Conflict {
+                current_revision_ref: None,
+            });
+        }
+        let occurred_at_us = now_us()?;
+        let job = DurableJob {
+            job_id,
+            idempotency_key: format!("{kind}:{job_id}"),
+            target_revision,
+            target_watermark: snapshot.frontier,
+            target_generation: 1,
+            kind: kind.into(),
+            algorithm_revision: QUIESCED_BACKUP_ALGORITHM_REVISION.into(),
+            model_id: None,
+            priority: 100,
+            state: JobStatus::Queued,
+            attempt: 1,
+            backoff_until_us: None,
+            config_hash: self.effective_config_hash,
+            budget: JobBudget {
+                max_items: 100_000,
+                max_bytes: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_calls: None,
+                max_wall_time_ms: 86_400_000,
+            },
+            terminal: None,
+            lease_until_us: None,
+        };
+        let command = JournalCommand::new(
+            command_id,
+            vec![evertrace_store::JournalEventDraft::runtime(
+                occurred_at_us,
+                self.effective_config_hash,
+                QUIESCED_BACKUP_ALGORITHM_REVISION,
+                JournalPayload::JobState(job),
+            )],
+        )
+        .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let outcome = match self
+            .writer
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(crate::WriterActorError::StaleFrontier) => {
+                return Ok(HumanActionOutcome::Conflict {
+                    current_revision_ref: None,
+                });
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        };
+        Ok(HumanActionOutcome::Applied {
+            current_revision_ref: job_id.to_string(),
+            audit_event_ref: outcome
+                .event_ids
+                .first()
+                .cloned()
+                .ok_or(HumanGovernanceError::Store)?,
+        })
+    }
+
     pub async fn review_negative(
         &self,
         request_id: RequestId,
@@ -4135,6 +4381,7 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                         terminal_result_ref: value
                             .terminal
                             .and_then(|terminal| terminal.result_ref),
+                        backup_summary: None,
                     }),
                 }),
             ))
@@ -4183,6 +4430,49 @@ fn map_job_state(value: JobStatus) -> HumanJobState {
         JobStatus::Leased => HumanJobState::Leased,
         JobStatus::Succeeded => HumanJobState::Succeeded,
         JobStatus::Failed => HumanJobState::Failed,
+    }
+}
+
+fn human_backup_summary(
+    summary: StoreBackupSummary,
+    validation_result: HumanBackupValidationResult,
+) -> HumanBackupSummary {
+    let table = |state: evertrace_store::BackupTableState| HumanBackupTableState {
+        version: state.version,
+        frontier: state.checkpoint,
+    };
+    HumanBackupSummary {
+        frontier: summary.frontier,
+        journal: table(summary.table_states.journal),
+        objects: table(summary.table_states.objects),
+        relations: table(summary.table_states.relations),
+        search: table(summary.table_states.search),
+        committed_source_watermark_count: summary.committed_source_watermark_count,
+        spool_source_watermark_count: summary.spool_source_watermark_count,
+        live_cas_count: summary.live_cas_count,
+        spool_cas_count: summary.spool_cas_count,
+        spool_file_count: summary.spool_file_count,
+        spool_generation_count: summary.spool_generation_count,
+        normal_spool_frame_count: summary.normal_spool_frame_count,
+        isolated_spool_frame_count: summary.isolated_spool_frame_count,
+        emergency_gap_count: summary.emergency_gap_count,
+        quarantine_count: summary.quarantine_count,
+        runtime_outbox_watermark: summary.runtime_outbox_watermark,
+        index_generation: summary.index_generation,
+        compiler_watermark: summary.compiler_watermark,
+        effective_config_hash: summary.effective_config_hash,
+        runtime_generation: summary.runtime_generation,
+        hook_current_generation: summary.hook_current_generation,
+        hook_retained_generations: summary.hook_retained_generations,
+        hook_pin_count: summary.hook_pin_count,
+        session_pinned_hook_artifact_count: summary.session_pinned_hook_artifact_count,
+        object_deletion_generation: summary.object_deletion_generation,
+        repository_purge_generation: summary.repository_purge_generation,
+        file_count: summary.file_count,
+        total_bytes: summary.total_bytes,
+        required_space_bytes: summary.required_space_bytes,
+        available_space_bytes_at_preflight: summary.available_space_bytes_at_preflight,
+        validation_result,
     }
 }
 

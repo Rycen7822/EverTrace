@@ -31,20 +31,21 @@ pub use jobs::{
 };
 pub use maintenance::{
     BackgroundLane, BackgroundProgress, BackgroundScheduler, BackgroundSchedulerError,
-    ScheduledJob, select_jobs,
+    QuiescedBackupRequest, ScheduledJob, select_jobs,
 };
 pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
 pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};
 pub use recovery::*;
 pub use service::{
     EngineError, EngineService, HealthDispatchError, HealthSnapshot, HumanActionOutcome,
-    HumanCompetingDetail, HumanDegradedReason, HumanExecutionIntegrityDetail, HumanForgetPreview,
-    HumanGovernanceError, HumanGovernanceService, HumanItemCategory, HumanJobBudget,
-    HumanJobDetail, HumanJobState, HumanJobTerminalReason, HumanNegativeDecision,
-    HumanObjectFamily, HumanPage, HumanProposalDecision, HumanProposalReview, HumanRecoveryDetail,
-    HumanRelatedRequest, HumanRelationKind, HumanRepositoryPurgePreview, HumanRowClass,
-    HumanSnapshotStatus, HumanSummary, HumanSupportDetail, HumanSurface, HumanSystemDetail,
-    McpActionService, McpBindingAuthority, McpBindingError, McpBindingGrant, McpBindingIssue,
-    McpItemPartition, McpResolvedScope, McpScopeMechanism, McpServiceAction, McpServiceError,
-    McpServiceItem, McpServiceRequest, McpServiceResult, McpServiceStatus, RuntimeMode,
+    HumanBackupSummary, HumanBackupTableState, HumanBackupValidationResult, HumanCompetingDetail,
+    HumanDegradedReason, HumanExecutionIntegrityDetail, HumanForgetPreview, HumanGovernanceError,
+    HumanGovernanceService, HumanItemCategory, HumanJobBudget, HumanJobDetail, HumanJobState,
+    HumanJobTerminalReason, HumanNegativeDecision, HumanObjectFamily, HumanPage,
+    HumanProposalDecision, HumanProposalReview, HumanRecoveryDetail, HumanRelatedRequest,
+    HumanRelationKind, HumanRepositoryPurgePreview, HumanRowClass, HumanSnapshotStatus,
+    HumanSummary, HumanSupportDetail, HumanSurface, HumanSystemDetail, McpActionService,
+    McpBindingAuthority, McpBindingError, McpBindingGrant, McpBindingIssue, McpItemPartition,
+    McpResolvedScope, McpScopeMechanism, McpServiceAction, McpServiceError, McpServiceItem,
+    McpServiceRequest, McpServiceResult, McpServiceStatus, RuntimeMode,
 };

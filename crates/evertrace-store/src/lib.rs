@@ -3,6 +3,7 @@
 
 //! Authoritative journal storage and pinned LanceDB compatibility primitives.
 
+pub mod backup;
 pub mod command;
 pub mod connection;
 pub mod journal;
@@ -18,6 +19,11 @@ pub mod search;
 pub mod session_import;
 pub mod writer;
 
+pub use backup::{
+    BackupError, BackupManifest, BackupSummary, BackupTableState, BackupTableStates,
+    QUIESCED_BACKUP_ALGORITHM_REVISION, QUIESCED_BACKUP_CREATE_JOB_KIND,
+    QUIESCED_BACKUP_VERIFY_JOB_KIND, verify_backup,
+};
 pub use command::*;
 pub use connection::{CompatibilityStore, StoreProfileError, collect_batches};
 pub use journal::{JOURNAL_TABLE, JournalRow, journal_schema};
@@ -55,8 +61,8 @@ pub use relations::{
 };
 pub use schema::{PROBE_SCHEMA_VERSION, ProbeRow, probe_batch, probe_schema, schema_fingerprint};
 pub use search::{
-    SEARCH_CHECKPOINT_ID, SEARCH_TABLE, SearchHardFilter, SearchIndex, SearchProjectionRow,
-    SearchSnapshot, read_search_rows, search_schema,
+    SEARCH_CHECKPOINT_ID, SEARCH_PROJECTION_GENERATION, SEARCH_TABLE, SearchHardFilter,
+    SearchIndex, SearchProjectionRow, SearchSnapshot, read_search_rows, search_schema,
 };
 pub use session_import::*;
-pub use writer::{CommittedCommand, JournalWriter, SiblingWriterLock};
+pub use writer::{ClosedJournalWriter, CommittedCommand, JournalWriter, SiblingWriterLock};

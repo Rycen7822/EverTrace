@@ -311,9 +311,20 @@ impl ProjectionSnapshot {
         &self,
         candidates: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>, StoreError> {
+        self.collect_live_cas_refs(Some(candidates))
+    }
+
+    pub fn live_cas_refs(&self) -> Result<BTreeSet<String>, StoreError> {
+        self.collect_live_cas_refs(None)
+    }
+
+    fn collect_live_cas_refs(
+        &self,
+        candidates: Option<&BTreeSet<String>>,
+    ) -> Result<BTreeSet<String>, StoreError> {
         let mut refs = BTreeSet::new();
         let mut retain = |value: String| {
-            if candidates.contains(&value) {
+            if candidates.is_none_or(|candidates| candidates.contains(&value)) {
                 refs.insert(value);
             }
         };

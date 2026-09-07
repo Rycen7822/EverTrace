@@ -39,6 +39,36 @@ impl CasDigest {
     }
 }
 
+/// Streams one exact-length file while computing its ordinary SHA-256 checksum.
+/// This is deliberately independent from the protected-payload CAS digest type.
+pub fn copy_exact_sha256_hex(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    expected_length: u64,
+) -> Result<String, CasError> {
+    let mut remaining = expected_length;
+    let mut checksum = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| CasError::StoreCorrupt)?;
+        let read = reader.read(&mut buffer[..limit]).map_err(map_io)?;
+        if read == 0 {
+            return Err(CasError::StoreCorrupt);
+        }
+        writer.write_all(&buffer[..read]).map_err(map_io)?;
+        checksum.update(&buffer[..read]);
+        remaining = remaining
+            .checked_sub(u64::try_from(read).map_err(|_| CasError::StoreCorrupt)?)
+            .ok_or(CasError::StoreCorrupt)?;
+    }
+    let mut extra = [0_u8; 1];
+    if reader.read(&mut extra).map_err(map_io)? != 0 {
+        return Err(CasError::StoreCorrupt);
+    }
+    Ok(hex(&checksum.finalize()))
+}
+
 impl fmt::Debug for CasDigest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -217,11 +247,30 @@ impl Drop for MaintenanceGuard {
     }
 }
 
+impl MaintenanceGuard {
+    pub fn require_exclusive_for(&self, data_dir: &Path) -> Result<(), CasError> {
+        if !self.exclusive {
+            return Err(CasError::ExclusiveMaintenanceRequired);
+        }
+        if directory_identity(data_dir)? != directory_file_identity(&self.data_dir)? {
+            return Err(CasError::IdentityChanged);
+        }
+        Ok(())
+    }
+}
+
 impl CasStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, CasError> {
         let store = Self { root: root.into() };
         ensure_directory(&store.root)?;
         ensure_directory(&store.root.join("blobs"))?;
+        Ok(store)
+    }
+
+    pub fn open_existing(root: impl Into<PathBuf>) -> Result<Self, CasError> {
+        let store = Self { root: root.into() };
+        validate_directory(&store.root)?;
+        validate_directory(&store.root.join("blobs"))?;
         Ok(store)
     }
 
@@ -317,6 +366,91 @@ impl CasStore {
             return Err(CasError::StoreCorrupt);
         }
         Ok(protected)
+    }
+
+    /// Verifies one encoded CAS envelope and its protected-payload digest with
+    /// fixed memory, without returning or retaining the protected bytes.
+    pub fn verify_envelope(&self, digest: &CasDigest) -> Result<u64, CasError> {
+        self.validate_root()?;
+        let path = self.blob_path(digest);
+        let before = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CasError::NotFound
+            } else {
+                map_io(error)
+            }
+        })?;
+        if before.file_type().is_symlink() || !before.is_file() {
+            return Err(CasError::InvalidType);
+        }
+        if before.uid() != current_uid()? {
+            return Err(CasError::WrongOwner);
+        }
+        if before.permissions().mode() & 0o777 != 0o600 {
+            return Err(CasError::InvalidPermissions);
+        }
+        let mut file =
+            crate::open_regular_nofollow(&path).map_err(|_| CasError::IdentityChanged)?;
+        let opened = file.metadata().map_err(map_io)?;
+        if opened.dev() != before.dev()
+            || opened.ino() != before.ino()
+            || opened.len() != before.len()
+        {
+            return Err(CasError::IdentityChanged);
+        }
+        let mut header = [0_u8; HEADER_LENGTH];
+        file.read_exact(&mut header)
+            .map_err(|_| CasError::StoreCorrupt)?;
+        let decoded = decode_header(&header, digest)?;
+        if before.len()
+            != (HEADER_LENGTH as u64)
+                .checked_add(decoded.compressed_length)
+                .ok_or(CasError::StoreCorrupt)?
+        {
+            return Err(CasError::StoreCorrupt);
+        }
+        let limited = file.take(decoded.compressed_length);
+        let mut decoder =
+            zstd::stream::read::Decoder::new(limited).map_err(|_| CasError::StoreCorrupt)?;
+        let mut checksum = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = decoder
+                .read(&mut buffer)
+                .map_err(|_| CasError::StoreCorrupt)?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(u64::try_from(read).map_err(|_| CasError::StoreCorrupt)?)
+                .ok_or(CasError::StoreCorrupt)?;
+            if total > decoded.uncompressed_length {
+                return Err(CasError::StoreCorrupt);
+            }
+            checksum.update(&buffer[..read]);
+        }
+        let buffered = decoder.finish();
+        if !buffered.buffer().is_empty() || buffered.get_ref().limit() != 0 {
+            return Err(CasError::StoreCorrupt);
+        }
+        let file = buffered.into_inner().into_inner();
+        let after = fs::symlink_metadata(&path).map_err(map_io)?;
+        let opened_after = file.metadata().map_err(map_io)?;
+        let actual: [u8; 32] = checksum.finalize().into();
+        if after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
+            || opened_after.dev() != before.dev()
+            || opened_after.ino() != before.ino()
+            || opened_after.len() != before.len()
+        {
+            return Err(CasError::IdentityChanged);
+        }
+        if total != decoded.uncompressed_length || actual != *digest.as_bytes() {
+            return Err(CasError::StoreCorrupt);
+        }
+        Ok(total)
     }
 
     pub fn encoded_blob_length(&self, digest: &CasDigest) -> Result<u64, CasError> {

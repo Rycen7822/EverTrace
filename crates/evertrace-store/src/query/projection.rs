@@ -810,13 +810,13 @@ async fn commit_search_rows(
         .map_err(|_| StoreError::Projection)?;
     Ok(())
 }
-fn checkpoint_relation(rows: &[RelationProjectionRow]) -> Result<u64, StoreError> {
+pub(super) fn checkpoint_relation(rows: &[RelationProjectionRow]) -> Result<u64, StoreError> {
     rows.iter()
         .find(|row| row.row_id == crate::relations::RELATIONS_CHECKPOINT_ID)
         .map(|row| row.source_event_seq)
         .ok_or(StoreError::StoreCorrupt)
 }
-fn checkpoint_search(rows: &[SearchProjectionRow]) -> Result<u64, StoreError> {
+pub(super) fn checkpoint_search(rows: &[SearchProjectionRow]) -> Result<u64, StoreError> {
     rows.iter()
         .find(|row| row.row_id == crate::search::SEARCH_CHECKPOINT_ID)
         .map(|row| row.source_event_seq)

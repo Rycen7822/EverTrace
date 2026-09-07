@@ -1,12 +1,13 @@
 use evertrace_store::{
-    CommitOutcome, CommittedCommand, DurableJob, JobStatus, JournalCommand, JournalWriter,
-    ObjectDeletionCurrentView, ProjectionSnapshot, ProjectionWorker, RecallCurrentContext,
-    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
-    RuntimeSchedulerView, ScopePurgeCurrentView, StoreError,
+    BackupError, BackupSummary, CommitOutcome, CommittedCommand, DurableJob, JobStatus,
+    JournalCommand, JournalWriter, ObjectDeletionCurrentView, ProjectionSnapshot, ProjectionWorker,
+    RecallCurrentContext, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
+    ReconciliationFrontier, RuntimeSchedulerView, ScopePurgeCurrentView, StoreError,
 };
 use std::{
     collections::BTreeSet,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -47,6 +48,12 @@ enum WriterRequest {
         limit: usize,
         reply: oneshot::Sender<Result<ReconciliationArtifactFrontier, WriterActorError>>,
     },
+    CreateBackup {
+        backup_job_id: evertrace_domain::ids::JobId,
+        config_path: PathBuf,
+        runtime: Box<evertrace_capture::RuntimeSnapshot>,
+        reply: oneshot::Sender<Result<Result<BackupSummary, BackupError>, WriterActorError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -55,7 +62,7 @@ enum WriterRequest {
 #[derive(Clone)]
 pub struct WriterHandle {
     sender: mpsc::Sender<WriterRequest>,
-    projection_worker: ProjectionWorker,
+    projection_worker: Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
     recall_frontier: watch::Sender<u64>,
     background_frontier: watch::Sender<u64>,
 }
@@ -174,6 +181,38 @@ impl WriterHandle {
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)
     }
+
+    pub async fn create_backup(
+        &self,
+        backup_job_id: evertrace_domain::ids::JobId,
+        config_path: PathBuf,
+        runtime: evertrace_capture::RuntimeSnapshot,
+    ) -> Result<Result<BackupSummary, BackupError>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CreateBackup {
+                backup_job_id,
+                config_path,
+                runtime: Box::new(runtime),
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    async fn project_at_frontier(
+        &self,
+        frontier: u64,
+    ) -> Result<ProjectionSnapshot, WriterActorError> {
+        let worker = self.projection_worker.read().await;
+        worker
+            .as_ref()
+            .ok_or(WriterActorError::Stopped)?
+            .project_at_frontier(frontier)
+            .await
+            .map_err(map_store_error)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -204,13 +243,14 @@ pub fn spawn_writer(
         return Err(WriterActorError::InvalidInput);
     }
     let frontier = writer.frontier();
-    let projection_worker = writer.projection_worker();
+    let projection_worker = Arc::new(tokio::sync::RwLock::new(Some(writer.projection_worker())));
     let (sender, receiver) = mpsc::channel(capacity);
     let (recall_frontier, _) = watch::channel(frontier);
     let (background_frontier, _) = watch::channel(frontier);
     let task = tokio::spawn(Box::pin(run_writer(
         writer,
         receiver,
+        Arc::clone(&projection_worker),
         recall_frontier.clone(),
         background_frontier.clone(),
     )));
@@ -226,12 +266,18 @@ pub fn spawn_writer(
 }
 
 async fn run_writer(
-    mut writer: JournalWriter,
+    writer: JournalWriter,
     mut receiver: mpsc::Receiver<WriterRequest>,
+    projection_worker: Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
     recall_frontier: watch::Sender<u64>,
     background_frontier: watch::Sender<u64>,
 ) -> Result<(), WriterActorError> {
-    if let Some(frontier) = Box::pin(reconcile_object_deletions(&mut writer)).await? {
+    let mut writer = Some(writer);
+    if let Some(frontier) = Box::pin(reconcile_object_deletions(
+        writer.as_mut().ok_or(WriterActorError::Stopped)?,
+    ))
+    .await?
+    {
         recall_frontier.send_replace(frontier);
         background_frontier.send_replace(frontier);
     }
@@ -244,6 +290,8 @@ async fn run_writer(
                 reply,
             } => {
                 let result = writer
+                    .as_mut()
+                    .ok_or(WriterActorError::Stopped)?
                     .commit(&command, ingested_at_us)
                     .await
                     .map_err(map_store_error);
@@ -275,8 +323,10 @@ async fn run_writer(
                     return Err(error);
                 }
                 if reconcile
-                    && let Some(frontier) =
-                        Box::pin(reconcile_object_deletions(&mut writer)).await?
+                    && let Some(frontier) = Box::pin(reconcile_object_deletions(
+                        writer.as_mut().ok_or(WriterActorError::Stopped)?,
+                    ))
+                    .await?
                 {
                     recall_frontier.send_replace(frontier);
                     background_frontier.send_replace(frontier);
@@ -289,6 +339,8 @@ async fn run_writer(
                 reply,
             } => {
                 let result = writer
+                    .as_mut()
+                    .ok_or(WriterActorError::Stopped)?
                     .commit_if_frontier(&command, ingested_at_us, expected_frontier)
                     .await
                     .map_err(map_store_error);
@@ -320,15 +372,22 @@ async fn run_writer(
                     return Err(error);
                 }
                 if reconcile
-                    && let Some(frontier) =
-                        Box::pin(reconcile_object_deletions(&mut writer)).await?
+                    && let Some(frontier) = Box::pin(reconcile_object_deletions(
+                        writer.as_mut().ok_or(WriterActorError::Stopped)?,
+                    ))
+                    .await?
                 {
                     recall_frontier.send_replace(frontier);
                     background_frontier.send_replace(frontier);
                 }
             }
             WriterRequest::Project { reply } => {
-                let result = writer.project().await.map_err(map_store_error);
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .project()
+                    .await
+                    .map_err(map_store_error);
                 let fatal = result.is_err();
                 let _ = reply.send(result);
                 if fatal {
@@ -337,6 +396,8 @@ async fn run_writer(
             }
             WriterRequest::CommittedCommand { command_id, reply } => {
                 let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
                     .committed_command(command_id)
                     .await
                     .map_err(map_store_error);
@@ -348,12 +409,16 @@ async fn run_writer(
             }
             WriterRequest::RecallCurrentContexts { limit, reply } => {
                 let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
                     .recall_current_contexts(limit)
                     .map_err(map_store_error);
                 let _ = reply.send(result);
             }
             WriterRequest::ReconciliationFrontier { limit, reply } => {
                 let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
                     .reconciliation_frontier(limit)
                     .await
                     .map_err(map_store_error);
@@ -374,6 +439,8 @@ async fn run_writer(
                 reply,
             } => {
                 let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
                     .reconciliation_artifact_context(&descriptors, limit)
                     .await
                     .map_err(map_store_error);
@@ -383,6 +450,26 @@ async fn run_writer(
                         WriterActorError::Store | WriterActorError::StoreCorrupt
                     )
                 });
+                let _ = reply.send(result);
+                if let Some(error) = fatal {
+                    return Err(error);
+                }
+            }
+            WriterRequest::CreateBackup {
+                backup_job_id,
+                config_path,
+                runtime,
+                reply,
+            } => {
+                let result = create_quiesced_backup(
+                    &mut writer,
+                    &projection_worker,
+                    backup_job_id,
+                    config_path,
+                    *runtime,
+                )
+                .await;
+                let fatal = result.as_ref().err().copied();
                 let _ = reply.send(result);
                 if let Some(error) = fatal {
                     return Err(error);
@@ -398,6 +485,170 @@ async fn run_writer(
         let _ = reply.send(());
     }
     Ok(())
+}
+
+async fn create_quiesced_backup(
+    writer: &mut Option<JournalWriter>,
+    projection_worker: &Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
+    backup_job_id: evertrace_domain::ids::JobId,
+    config_path: PathBuf,
+    runtime: evertrace_capture::RuntimeSnapshot,
+) -> Result<Result<BackupSummary, BackupError>, WriterActorError> {
+    let data_dir = runtime
+        .data_dir()
+        .map_err(|_| WriterActorError::InvalidInput)?
+        .to_owned();
+    let published = data_dir
+        .join("backups")
+        .join(format!("backup-{backup_job_id}"));
+    match std::fs::symlink_metadata(&published) {
+        Ok(_) => {
+            let backup_directory = published.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                evertrace_store::backup::prepare_backup_verification(&data_dir, backup_job_id)
+            })
+            .await
+            .map_err(|_| WriterActorError::Store)?;
+            return Ok(match prepared {
+                Ok(verification) => {
+                    match evertrace_store::backup::complete_backup_verification(verification).await
+                    {
+                        Ok(summary) => crate::maintenance::verify_hook_backup_assets(
+                            &backup_directory,
+                            &summary,
+                        )
+                        .map(|()| summary),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(Err(BackupError::Io)),
+    }
+
+    let current = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+    let snapshot = current
+        .projection_worker()
+        .catch_up()
+        .await
+        .map_err(map_store_error)?;
+    let table_states = current
+        .backup_table_states()
+        .await
+        .map_err(map_store_error)?;
+    let fence = evertrace_capture::MaintenanceFence::open(&data_dir)
+        .map_err(|_| WriterActorError::Store)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let guard = loop {
+        match fence.exclusive() {
+            Ok(guard) => break guard,
+            Err(evertrace_capture::CasError::LockBusy) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(evertrace_capture::CasError::LockBusy) => return Ok(Err(BackupError::Io)),
+            Err(_) => return Ok(Err(BackupError::IdentityChanged)),
+        }
+    };
+    let (mut spool, _) = evertrace_capture::DurableSpool::open(
+        runtime.spool_dir.clone(),
+        runtime
+            .spool_limits()
+            .map_err(|_| WriterActorError::InvalidInput)?,
+    )
+    .map_err(|_| WriterActorError::Store)?;
+    let boundary = spool
+        .freeze_backup_boundary(&guard, runtime.generation)
+        .map_err(|_| WriterActorError::Store)?;
+    drop(guard);
+    drop(spool);
+    let hook_snapshot =
+        match evertrace_codex::install::StableLauncher::freeze_backup_snapshot(&data_dir) {
+            Ok(snapshot) => snapshot,
+            Err(evertrace_codex::install::InstallError::ResourceExhausted) => {
+                return Ok(Err(BackupError::ResourceExhausted));
+            }
+            Err(evertrace_codex::install::InstallError::LockBusy) => {
+                return Ok(Err(BackupError::Io));
+            }
+            Err(_) => return Ok(Err(BackupError::Corrupt)),
+        };
+    let hook = evertrace_store::backup::BackupHookBoundary {
+        current_generation: hook_snapshot.current_generation,
+        retained_generations: hook_snapshot.retained_generations,
+        pin_count: hook_snapshot.pin_count,
+        pinned_generation_count: hook_snapshot.pinned_generation_count,
+        files: hook_snapshot
+            .files
+            .into_iter()
+            .map(|file| evertrace_store::backup::BackupFrozenFile {
+                directories: file.directories,
+                source: file.source,
+                relative_path: file.relative_path,
+                device: file.device,
+                inode: file.inode,
+                length: file.length,
+                modified_seconds: file.modified_seconds,
+                modified_nanoseconds: file.modified_nanoseconds,
+                changed_seconds: file.changed_seconds,
+                changed_nanoseconds: file.changed_nanoseconds,
+            })
+            .collect(),
+    };
+    let boundary = evertrace_store::backup::BackupFrozenBoundary {
+        spool: boundary,
+        hook,
+    };
+
+    let mut projection = projection_worker.write().await;
+    *projection = None;
+    let closed = writer
+        .take()
+        .ok_or(WriterActorError::Stopped)?
+        .close_for_backup();
+    let (closed, staged) = tokio::task::spawn_blocking(move || {
+        closed.stage_backup(
+            config_path,
+            runtime,
+            backup_job_id,
+            snapshot,
+            table_states,
+            boundary,
+        )
+    })
+    .await
+    .map_err(|_| WriterActorError::Store)?;
+    let (closed, result) = match staged {
+        Ok(staging) => match closed.verify_staged_backup(&staging).await {
+            Ok(summary) => {
+                match crate::maintenance::verify_hook_backup_assets(staging.directory(), &summary) {
+                    Ok(()) => tokio::task::spawn_blocking(move || {
+                        closed.publish_staged_backup(staging, summary)
+                    })
+                    .await
+                    .map_err(|_| WriterActorError::Store)?,
+                    Err(error) => tokio::task::spawn_blocking(move || {
+                        let cleanup = closed.discard_staged_backup(&staging);
+                        (closed, cleanup.err().map_or(Err(error), Err))
+                    })
+                    .await
+                    .map_err(|_| WriterActorError::Store)?,
+                }
+            }
+            Err(error) => tokio::task::spawn_blocking(move || {
+                let cleanup = closed.discard_staged_backup(&staging);
+                (closed, cleanup.err().map_or(Err(error), Err))
+            })
+            .await
+            .map_err(|_| WriterActorError::Store)?,
+        },
+        Err(error) => (closed, Err(error)),
+    };
+    let reopened = closed.reopen().await.map_err(map_store_error)?;
+    *projection = Some(reopened.projection_worker());
+    *writer = Some(reopened);
+    Ok(result)
 }
 
 async fn reconcile_object_deletions(
@@ -490,10 +741,8 @@ pub(crate) async fn reconcile_repository_scope_purge_batch(
     };
     if needs_plan {
         let confirmation = writer
-            .projection_worker
             .project_at_frontier(progress.confirmation_frontier)
-            .await
-            .map_err(map_store_error)?;
+            .await?;
         let preview = evertrace_store::repository_scope_purge_preview(
             &confirmation,
             progress.target.repository_id(),

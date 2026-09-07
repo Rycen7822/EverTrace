@@ -1,16 +1,18 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
+use evertrace_domain::evidence::{SourceInstanceId, SourceRevision};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::MaintenanceGuard;
 use crate::frame::{
     DecodedFrame, SpoolFrameError, SpoolRecord, decode_validated_record_body, encode_frame,
     scan_frames,
@@ -75,6 +77,67 @@ pub struct GapEvidence {
 pub struct RecoveryReport {
     pub repaired_tail_bytes: u64,
     pub gaps: Vec<GapEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SpoolBackupFileKind {
+    Normal,
+    Isolated,
+    EmergencyGap,
+    Quarantine,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SpoolBackupFile {
+    pub relative_path: PathBuf,
+    pub kind: SpoolBackupFileKind,
+    pub device: u64,
+    pub inode: u64,
+    pub length: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+    pub frame_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SpoolBackupDirectory {
+    pub relative_path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SpoolBackupSourceWatermark {
+    pub source_instance_id: SourceInstanceId,
+    pub source_revision: SourceRevision,
+    pub source_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpoolBackupBoundary {
+    pub files: Vec<SpoolBackupFile>,
+    pub directories: Vec<SpoolBackupDirectory>,
+    pub cas_refs: BTreeSet<String>,
+    pub source_watermarks: Vec<SpoolBackupSourceWatermark>,
+    pub spool_generations: Vec<u64>,
+    pub normal_frame_count: u32,
+    pub isolated_frame_count: u32,
+    pub emergency_gap_count: u32,
+    pub quarantine_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpoolBackupSemantic {
+    pub frame_count: u32,
+    pub cas_refs: BTreeSet<String>,
+    pub source_watermarks: Vec<SpoolBackupSourceWatermark>,
+    pub spool_generations: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +293,137 @@ impl DurableSpool {
 
     pub const fn last_durable_watermark(&self) -> u64 {
         self.last_watermark
+    }
+
+    /// Seals the exact pre-backup Hook prefix while the caller owns the data-root
+    /// exclusive fence. New Hook frames can use a new active file after the guard drops.
+    pub fn freeze_backup_boundary(
+        &mut self,
+        guard: &MaintenanceGuard,
+        generation: u64,
+    ) -> Result<SpoolBackupBoundary, SpoolError> {
+        let data_dir = self.root.parent().ok_or(SpoolError::InvalidConfiguration)?;
+        guard
+            .require_exclusive_for(data_dir)
+            .map_err(|_| SpoolError::IdentityChanged)?;
+        self.seal_active(generation)?;
+
+        let configured_limit = usize::try_from(self.limits.max_main_files)
+            .map_err(|_| SpoolError::InvalidConfiguration)?;
+        let normal = self.sealed_segments(configured_limit)?;
+        let isolated = self.isolated_segments(configured_limit)?;
+        if normal
+            .len()
+            .checked_add(isolated.len())
+            .is_none_or(|count| count > configured_limit)
+        {
+            return Err(SpoolError::ResourceExhausted);
+        }
+        let gap_handles =
+            self.pending_gap_marker_handles(usize::from(self.limits.emergency_slots))?;
+        let quarantine = self.backup_quarantine(configured_limit)?;
+
+        let mut files = Vec::new();
+        let mut cas_refs = BTreeSet::new();
+        let mut source_watermarks: BTreeMap<(SourceInstanceId, SourceRevision), u64> =
+            BTreeMap::new();
+        let mut spool_generations = BTreeSet::new();
+        let mut normal_frame_count = 0_u32;
+        let mut isolated_frame_count = 0_u32;
+        for (segments, kind, count) in [
+            (
+                &normal,
+                SpoolBackupFileKind::Normal,
+                &mut normal_frame_count,
+            ),
+            (
+                &isolated,
+                SpoolBackupFileKind::Isolated,
+                &mut isolated_frame_count,
+            ),
+        ] {
+            for segment in segments {
+                *count = count
+                    .checked_add(
+                        u32::try_from(segment.frames.len())
+                            .map_err(|_| SpoolError::ResourceExhausted)?,
+                    )
+                    .ok_or(SpoolError::ResourceExhausted)?;
+                for frame in &segment.frames {
+                    let (body, _) = decode_validated_record_body(&frame.record)?;
+                    cas_refs.insert(body.cas_ref.clone());
+                    source_watermarks
+                        .entry((body.source_instance_id, body.source_revision))
+                        .and_modify(|sequence| *sequence = (*sequence).max(body.source_sequence))
+                        .or_insert(body.source_sequence);
+                    spool_generations.insert(frame.record.spool_generation);
+                }
+                files.push(backup_file(
+                    &self.root,
+                    segment.path(),
+                    &segment.file,
+                    kind,
+                    u32::try_from(segment.frames.len())
+                        .map_err(|_| SpoolError::ResourceExhausted)?,
+                )?);
+            }
+        }
+        for handle in &gap_handles {
+            files.push(backup_file(
+                &self.root,
+                handle.path(),
+                &handle.file,
+                SpoolBackupFileKind::EmergencyGap,
+                0,
+            )?);
+        }
+        for handle in &quarantine {
+            files.push(backup_file(
+                &self.root,
+                handle.path(),
+                &handle.file,
+                SpoolBackupFileKind::Quarantine,
+                0,
+            )?);
+        }
+        files.sort();
+        if files
+            .windows(2)
+            .any(|pair| pair[0].relative_path == pair[1].relative_path)
+        {
+            return Err(SpoolError::Corrupt);
+        }
+        let mut directories = [
+            self.main_dir.as_path(),
+            self.emergency_dir.as_path(),
+            self.quarantine_dir.as_path(),
+        ]
+        .into_iter()
+        .map(|path| backup_directory(&self.root, path))
+        .collect::<Result<Vec<_>, _>>()?;
+        directories.sort();
+        Ok(SpoolBackupBoundary {
+            files,
+            directories,
+            cas_refs,
+            source_watermarks: source_watermarks
+                .into_iter()
+                .map(|((source_instance_id, source_revision), source_sequence)| {
+                    SpoolBackupSourceWatermark {
+                        source_instance_id,
+                        source_revision,
+                        source_sequence,
+                    }
+                })
+                .collect(),
+            spool_generations: spool_generations.into_iter().collect(),
+            normal_frame_count,
+            isolated_frame_count,
+            emergency_gap_count: u32::try_from(gap_handles.len())
+                .map_err(|_| SpoolError::ResourceExhausted)?,
+            quarantine_count: u32::try_from(quarantine.len())
+                .map_err(|_| SpoolError::ResourceExhausted)?,
+        })
     }
 
     pub fn append(&mut self, record: &SpoolRecord) -> Result<DurableWrite, SpoolError> {
@@ -813,6 +1007,46 @@ impl DurableSpool {
         self.pending_quarantine_from(limit, 0)
     }
 
+    fn backup_quarantine(&self, limit: usize) -> Result<Vec<PendingQuarantine>, SpoolError> {
+        if limit == 0 {
+            return Err(SpoolError::InvalidConfiguration);
+        }
+        self.validate_directories()?;
+        let directory_lock = File::open(&self.quarantine_dir).map_err(map_io)?;
+        FileExt::lock_shared(&directory_lock).map_err(map_io)?;
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&self.quarantine_dir).map_err(map_io)? {
+            if paths.len() == limit {
+                return Err(SpoolError::ResourceExhausted);
+            }
+            paths.push(entry.map_err(map_io)?.path());
+        }
+        paths.sort();
+        let mut handles = Vec::with_capacity(paths.len());
+        for path in paths {
+            if path.extension().is_none_or(|value| value != "spool") {
+                return Err(SpoolError::Corrupt);
+            }
+            let mut file = File::open(&path).map_err(map_io)?;
+            validate_owned_file(&path, &file)?;
+            let metadata = file.metadata().map_err(map_io)?;
+            if metadata.len() == 0 || metadata.len() > self.limits.high_watermark_bytes {
+                return Err(SpoolError::ResourceExhausted);
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(map_io)?;
+            handles.push(PendingQuarantine {
+                path,
+                file,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+                fingerprint: hex_digest(&bytes),
+            });
+        }
+        Ok(handles)
+    }
+
     pub fn pending_quarantine_from(
         &self,
         limit: usize,
@@ -959,6 +1193,79 @@ impl DurableSpool {
         gaps.sort_by(|left, right| left.quarantined_file.cmp(&right.quarantined_file));
         Ok(gaps)
     }
+}
+
+pub fn verify_backup_spool_file(
+    path: &Path,
+    kind: SpoolBackupFileKind,
+    max_bytes: u64,
+) -> Result<SpoolBackupSemantic, SpoolError> {
+    let metadata = fs::symlink_metadata(path).map_err(map_io)?;
+    if metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(SpoolError::ResourceExhausted);
+    }
+    let bytes = read_owned_file_exact(path, &metadata, max_bytes)?;
+    let mut cas_refs = BTreeSet::new();
+    let mut source_watermarks: BTreeMap<(SourceInstanceId, SourceRevision), u64> = BTreeMap::new();
+    let mut spool_generations = BTreeSet::new();
+    let frame_count = match kind {
+        SpoolBackupFileKind::Normal | SpoolBackupFileKind::Isolated => {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or(SpoolError::Corrupt)?;
+            if path.extension().is_none_or(|value| value != "sealed")
+                || (kind == SpoolBackupFileKind::Isolated) != name.starts_with(ISOLATED_PREFIX)
+            {
+                return Err(SpoolError::Corrupt);
+            }
+            let scan = scan_frames(&bytes)?;
+            if scan.incomplete_tail
+                || scan.complete_length != metadata.len()
+                || scan.frames.is_empty()
+            {
+                return Err(SpoolError::Corrupt);
+            }
+            for frame in &scan.frames {
+                let (body, _) = decode_validated_record_body(&frame.record)?;
+                cas_refs.insert(body.cas_ref.clone());
+                source_watermarks
+                    .entry((body.source_instance_id, body.source_revision))
+                    .and_modify(|sequence| *sequence = (*sequence).max(body.source_sequence))
+                    .or_insert(body.source_sequence);
+                spool_generations.insert(frame.record.spool_generation);
+            }
+            u32::try_from(scan.frames.len()).map_err(|_| SpoolError::ResourceExhausted)?
+        }
+        SpoolBackupFileKind::EmergencyGap => {
+            if path.extension().is_none_or(|value| value != "marker") {
+                return Err(SpoolError::Corrupt);
+            }
+            decode_marker(&bytes)?;
+            0
+        }
+        SpoolBackupFileKind::Quarantine => {
+            if path.extension().is_none_or(|value| value != "spool") {
+                return Err(SpoolError::Corrupt);
+            }
+            0
+        }
+    };
+    Ok(SpoolBackupSemantic {
+        frame_count,
+        cas_refs,
+        source_watermarks: source_watermarks
+            .into_iter()
+            .map(|((source_instance_id, source_revision), source_sequence)| {
+                SpoolBackupSourceWatermark {
+                    source_instance_id,
+                    source_revision,
+                    source_sequence,
+                }
+            })
+            .collect(),
+        spool_generations: spool_generations.into_iter().collect(),
+    })
 }
 
 #[derive(Default)]
@@ -1135,6 +1442,65 @@ fn read_owned_file_exact(
     }
     validate_ack_identity(path, &file, expected.dev(), expected.ino(), expected_length)?;
     Ok(bytes)
+}
+
+fn backup_relative_path(root: &Path, path: &Path) -> Result<PathBuf, SpoolError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| SpoolError::InvalidConfiguration)?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            !matches!(component, std::path::Component::Normal(value) if !value.is_empty())
+        })
+    {
+        return Err(SpoolError::InvalidConfiguration);
+    }
+    Ok(relative.to_owned())
+}
+
+fn backup_file(
+    root: &Path,
+    path: &Path,
+    file: &File,
+    kind: SpoolBackupFileKind,
+    frame_count: u32,
+) -> Result<SpoolBackupFile, SpoolError> {
+    let opened = file.metadata().map_err(map_io)?;
+    validate_ack_identity(path, file, opened.dev(), opened.ino(), opened.len())?;
+    let current = fs::symlink_metadata(path).map_err(map_io)?;
+    if current.mtime() != opened.mtime()
+        || current.mtime_nsec() != opened.mtime_nsec()
+        || current.ctime() != opened.ctime()
+        || current.ctime_nsec() != opened.ctime_nsec()
+    {
+        return Err(SpoolError::IdentityChanged);
+    }
+    Ok(SpoolBackupFile {
+        relative_path: backup_relative_path(root, path)?,
+        kind,
+        device: opened.dev(),
+        inode: opened.ino(),
+        length: opened.len(),
+        modified_seconds: opened.mtime(),
+        modified_nanoseconds: opened.mtime_nsec(),
+        changed_seconds: opened.ctime(),
+        changed_nanoseconds: opened.ctime_nsec(),
+        frame_count,
+    })
+}
+
+fn backup_directory(root: &Path, path: &Path) -> Result<SpoolBackupDirectory, SpoolError> {
+    let metadata = fs::symlink_metadata(path).map_err(map_io)?;
+    validate_directory(path)?;
+    Ok(SpoolBackupDirectory {
+        relative_path: backup_relative_path(root, path)?,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 fn validate_marker(marker: &CaptureGapMarker) -> Result<(), SpoolError> {

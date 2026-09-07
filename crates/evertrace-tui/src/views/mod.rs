@@ -489,42 +489,119 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
     if let Some(detail) = &item.system_detail {
         use evertrace_protocol::dto::HumanSystemDetail;
         match detail {
-            HumanSystemDetail::Job { detail } => lines.extend([
-                format!("job: {}", detail.job_id),
-                format!(
-                    "target: {} @ {}/{}",
-                    detail.target_revision, detail.target_watermark, detail.target_generation
-                ),
-                format!(
-                    "kind/algorithm/model: {} / {} / {:?}",
-                    detail.job_kind, detail.algorithm_revision, detail.model_id
-                ),
-                format!(
-                    "priority/state/attempt: {} / {:?} / {}",
-                    detail.priority, detail.state, detail.attempt
-                ),
-                format!(
-                    "backoff/lease: {:?} / {:?}",
-                    detail.backoff_until_us, detail.lease_until_us
-                ),
-                format!(
-                    "config hash: {}",
-                    evertrace_domain::evidence::hex(&detail.config_hash)
-                ),
-                format!(
-                    "budget: items {} bytes {:?} input {:?} output {:?} calls {:?} wall {}ms",
-                    detail.budget.max_items,
-                    detail.budget.max_bytes,
-                    detail.budget.max_input_tokens,
-                    detail.budget.max_output_tokens,
-                    detail.budget.max_calls,
-                    detail.budget.max_wall_time_ms
-                ),
-                format!(
-                    "terminal: {:?} / {:?}",
-                    detail.terminal_reason, detail.terminal_result_ref
-                ),
-            ]),
+            HumanSystemDetail::Job { detail } => {
+                lines.extend([
+                    format!("job: {}", detail.job_id),
+                    format!(
+                        "target: {} @ {}/{}",
+                        detail.target_revision, detail.target_watermark, detail.target_generation
+                    ),
+                    format!(
+                        "kind/algorithm/model: {} / {} / {:?}",
+                        detail.job_kind, detail.algorithm_revision, detail.model_id
+                    ),
+                    format!(
+                        "priority/state/attempt: {} / {:?} / {}",
+                        detail.priority, detail.state, detail.attempt
+                    ),
+                    format!(
+                        "backoff/lease: {:?} / {:?}",
+                        detail.backoff_until_us, detail.lease_until_us
+                    ),
+                    format!(
+                        "config hash: {}",
+                        evertrace_domain::evidence::hex(&detail.config_hash)
+                    ),
+                    format!(
+                        "budget: items {} bytes {:?} input {:?} output {:?} calls {:?} wall {}ms",
+                        detail.budget.max_items,
+                        detail.budget.max_bytes,
+                        detail.budget.max_input_tokens,
+                        detail.budget.max_output_tokens,
+                        detail.budget.max_calls,
+                        detail.budget.max_wall_time_ms
+                    ),
+                    format!(
+                        "terminal: {:?} / {:?}",
+                        detail.terminal_reason, detail.terminal_result_ref
+                    ),
+                ]);
+                if let Some(backup) = &detail.backup_summary {
+                    lines.extend([
+                        format!(
+                            "backup verification/frontier: {:?} / {}",
+                            backup.validation_result, backup.frontier
+                        ),
+                        format!(
+                            "backup journal/objects: v{}@{} / v{}@{}",
+                            backup.journal.version,
+                            backup.journal.frontier,
+                            backup.objects.version,
+                            backup.objects.frontier
+                        ),
+                        format!(
+                            "backup relations/search: v{}@{} / v{}@{}",
+                            backup.relations.version,
+                            backup.relations.frontier,
+                            backup.search.version,
+                            backup.search.frontier
+                        ),
+                        format!(
+                            "backup source/spool/cas: {}/{} watermarks; {} files/{} generations; {}/{} CAS",
+                            backup.committed_source_watermark_count,
+                            backup.spool_source_watermark_count,
+                            backup.spool_file_count,
+                            backup.spool_generation_count,
+                            backup.live_cas_count,
+                            backup.spool_cas_count
+                        ),
+                        format!(
+                            "backup spool normal/isolated/gap/quarantine: {}/{}/{}/{}",
+                            backup.normal_spool_frame_count,
+                            backup.isolated_spool_frame_count,
+                            backup.emergency_gap_count,
+                            backup.quarantine_count
+                        ),
+                        format!(
+                            "backup runtime/outbox/index generation/compiler watermark: {} / {} / {} / {}",
+                            backup.runtime_generation,
+                            backup.runtime_outbox_watermark,
+                            backup.index_generation,
+                            backup.compiler_watermark
+                        ),
+                        format!(
+                            "backup hook current/retained: {}/{}",
+                            backup
+                                .hook_current_generation
+                                .map_or_else(|| "absent".to_owned(), |generation| generation.to_string()),
+                            backup.hook_retained_generations.len()
+                        ),
+                        format!(
+                            "backup hook pins/pinned artifacts: {}/{}",
+                            backup.hook_pin_count,
+                            backup.session_pinned_hook_artifact_count
+                        ),
+                        format!(
+                            "backup config hash: {}",
+                            evertrace_domain::evidence::hex(&backup.effective_config_hash)
+                        ),
+                        format!(
+                            "backup deletion generations object/repository: {}/{}",
+                            backup.object_deletion_generation,
+                            backup.repository_purge_generation
+                        ),
+                        format!(
+                            "backup files/bytes: {}/{}",
+                            backup.file_count, backup.total_bytes
+                        ),
+                        format!(
+                            "backup space required/available: {}/{}",
+                            backup.required_space_bytes,
+                            backup.available_space_bytes_at_preflight
+                        ),
+                    ]);
+                }
+            }
             HumanSystemDetail::Config {
                 config_version,
                 effective_config_hash,
