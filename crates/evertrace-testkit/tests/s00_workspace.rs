@@ -5,6 +5,29 @@ use std::process::Command;
 use serde_json::Value;
 
 #[test]
+fn online_cli_modules_do_not_import_offline_services() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../evertrace-cli/src");
+    for module in [
+        "commands/admin.rs",
+        "commands/config.rs",
+        "commands/doctor.rs",
+        "commands/mcp.rs",
+        "commands/tui.rs",
+        "daemon_client.rs",
+    ] {
+        let source = std::fs::read_to_string(root.join(module)).unwrap();
+        assert!(
+            !source.contains("evertrace_engine"),
+            "online module {module} imports Engine"
+        );
+        assert!(
+            !source.contains("evertrace_store"),
+            "online module {module} imports Store"
+        );
+    }
+}
+
+#[test]
 fn workspace_members_and_product_dependency_dag_are_exact() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new(env!("CARGO"))
@@ -74,6 +97,7 @@ fn workspace_members_and_product_dependency_dag_are_exact() {
             BTreeSet::from([
                 "evertrace-codex",
                 "evertrace-domain",
+                "evertrace-engine",
                 "evertrace-protocol",
                 "evertrace-store",
                 "evertrace-tui",

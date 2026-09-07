@@ -39,6 +39,7 @@ pub struct SiblingWriterLock {
     data_dir: PathBuf,
     lock_path: PathBuf,
     file: File,
+    parent_file: File,
     data_identity: (u64, u64),
 }
 
@@ -47,6 +48,7 @@ impl SiblingWriterLock {
         validate_lexical_data_dir(data_dir)?;
         let parent = data_dir.parent().ok_or(StoreError::InvalidPath)?;
         validate_parent(parent)?;
+        let parent_file = File::open(parent).map_err(|_| StoreError::Io)?;
         let lock_path = sibling_lock_path(data_dir)?;
         let existed = match fs::symlink_metadata(&lock_path) {
             Ok(metadata) => {
@@ -85,6 +87,7 @@ impl SiblingWriterLock {
             data_dir: data_dir.to_owned(),
             lock_path,
             file,
+            parent_file,
             data_identity: (data_metadata.dev(), data_metadata.ino()),
         })
     }
@@ -102,8 +105,20 @@ impl SiblingWriterLock {
         Ok((metadata.dev(), metadata.ino()))
     }
 
-    fn validate_held(&self) -> Result<(), StoreError> {
+    fn validate_parent_and_lock(&self) -> Result<(), StoreError> {
         validate_lock_identity(&self.lock_path, &self.file)?;
+        let parent = self.data_dir.parent().ok_or(StoreError::InvalidPath)?;
+        validate_parent(parent)?;
+        let located = fs::symlink_metadata(parent).map_err(|_| StoreError::Io)?;
+        let held = self.parent_file.metadata().map_err(|_| StoreError::Io)?;
+        if (located.dev(), located.ino()) != (held.dev(), held.ino()) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_held(&self) -> Result<(), StoreError> {
+        self.validate_parent_and_lock()?;
         let metadata = fs::symlink_metadata(&self.data_dir).map_err(|_| StoreError::Io)?;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
@@ -113,11 +128,25 @@ impl SiblingWriterLock {
         }
         Ok(())
     }
+
+    pub(crate) fn rebind_restored_root(&mut self, expected: (u64, u64)) -> Result<(), StoreError> {
+        self.validate_parent_and_lock()?;
+        let metadata = fs::symlink_metadata(&self.data_dir).map_err(|_| StoreError::Io)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (metadata.dev(), metadata.ino()) != expected
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.data_identity = expected;
+        self.parent_file.sync_all().map_err(|_| StoreError::Io)?;
+        self.validate_held()
+    }
 }
 
 #[derive(Debug)]
 pub struct ClosedJournalWriter {
-    lock: SiblingWriterLock,
+    pub(crate) lock: SiblingWriterLock,
 }
 
 pub struct JournalWriter {
@@ -154,9 +183,17 @@ impl JournalWriter {
         Self::open_with_lock(lock).await
     }
 
-    async fn open_with_lock(lock: SiblingWriterLock) -> Result<Self, StoreError> {
+    pub(crate) async fn open_with_lock(lock: SiblingWriterLock) -> Result<Self, StoreError> {
+        let data_dir = lock.data_dir().to_owned();
+        Self::open_at_with_lock(lock, &data_dir).await
+    }
+
+    async fn open_at_with_lock(
+        lock: SiblingWriterLock,
+        data_dir: &Path,
+    ) -> Result<Self, StoreError> {
         lock.validate_held()?;
-        let connection = lancedb::connect(lock.data_dir().to_str().ok_or(StoreError::InvalidPath)?)
+        let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
@@ -284,6 +321,44 @@ impl JournalWriter {
         self._lock.inode_identity()
     }
 
+    pub(crate) fn validate_restore_lock(&self) -> Result<(), StoreError> {
+        self._lock.validate_held()
+    }
+
+    pub(crate) async fn rebuild_restore_projections(&self) -> Result<(), StoreError> {
+        self.validate_restore_lock()?;
+        let objects = self.projection_worker().rebuild_for_restore().await?;
+        crate::query::L0002ProjectionWorker::new(
+            self.journal.clone(),
+            self.relations.clone(),
+            self.search.clone(),
+        )
+        .rebuild_for_restore(&objects)
+        .await?;
+        self.validate_restore_lock()
+    }
+
+    pub(crate) async fn import_restore_ledger(
+        &mut self,
+        current: &crate::restore::CurrentLedger,
+        occurred_at_us: i64,
+        config_hash: [u8; 32],
+    ) -> Result<(), StoreError> {
+        for command in current.commands(self, occurred_at_us, config_hash)? {
+            let command = command?;
+            let prepared = prepare_command(&command)?;
+            let rows = rows_for_append(&prepared, self.next_seq, occurred_at_us)?;
+            let admission = self
+                .admission_state
+                .apply_row_batch(&rows.iter().collect::<Vec<_>>())?;
+            self.validate_restore_lock()?;
+            reserve_range(&mut self.next_seq, prepared.event_count)?;
+            append_rows(&self.journal, &rows).await?;
+            self.admission_state = admission;
+        }
+        Ok(())
+    }
+
     pub async fn commit(
         &mut self,
         command: &JournalCommand,
@@ -330,7 +405,12 @@ impl JournalWriter {
         ingested_at_us: i64,
         expected_frontier: Option<u64>,
     ) -> Result<CommitOutcome, StoreError> {
-        if ingested_at_us < 0 {
+        if ingested_at_us < 0
+            || command
+                .events()
+                .iter()
+                .any(|event| event.algorithm_revision == crate::restore::LEDGER_REVISION)
+        {
             return Err(StoreError::InvalidInput);
         }
         let prepared = prepare_command(command)?;
@@ -498,6 +578,17 @@ impl ClosedJournalWriter {
 
     pub async fn reopen(self) -> Result<JournalWriter, StoreError> {
         JournalWriter::open_with_lock(self.lock).await
+    }
+
+    pub(crate) async fn open_restore_candidate(
+        self,
+        candidate: &Path,
+    ) -> Result<JournalWriter, StoreError> {
+        self.lock.validate_held()?;
+        if candidate.parent() != self.lock.data_dir.parent() {
+            return Err(StoreError::InvalidPath);
+        }
+        JournalWriter::open_at_with_lock(self.lock, candidate).await
     }
 }
 

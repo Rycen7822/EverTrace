@@ -925,7 +925,7 @@ pub fn read_backup_summary(
     summary_from_manifest(&manifest, total_bytes)
 }
 
-fn prepare_verification_directory(
+pub(crate) fn prepare_verification_directory(
     directory: &Path,
     expected_job_id: Option<JobId>,
 ) -> Result<BackupVerification, BackupError> {
@@ -955,13 +955,105 @@ pub fn prepare_backup_verification(
     )
 }
 
+pub(crate) fn check_restore_copy_budget(
+    verification: &BackupVerification,
+    destination: &Path,
+) -> Result<(), BackupError> {
+    let parent = destination.parent().ok_or(BackupError::InvalidInput)?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|_| BackupError::Io)?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != current_uid()?
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(BackupError::Corrupt);
+    }
+    let needed = verification
+        .summary
+        .total_bytes
+        .checked_add(COPY_SPACE_RESERVE)
+        .ok_or(BackupError::ResourceExhausted)?;
+    if fs2::available_space(parent).map_err(|_| BackupError::Io)? < needed {
+        return Err(BackupError::ResourceExhausted);
+    }
+    Ok(())
+}
+
+pub(crate) fn copy_restore_candidate(
+    verification: &BackupVerification,
+    destination: &Path,
+    destination_root: &evertrace_capture::ConfinedRoot,
+) -> Result<(), BackupError> {
+    destination_root
+        .revalidate_stable()
+        .map_err(|_| BackupError::IdentityChanged)?;
+    let source_root = evertrace_capture::ConfinedRoot::open_owned_private(&verification.directory)
+        .map_err(|_| BackupError::IdentityChanged)?;
+    for entry in &verification.manifest.files {
+        let relative = strict_relative(&entry.relative_path)?;
+        let output_path = destination.join(&relative);
+        if entry.kind == BackupFileKind::Directory {
+            ensure_staging_parents(destination, &output_path)?;
+            continue;
+        }
+        ensure_staging_parents(
+            destination,
+            output_path.parent().ok_or(BackupError::InvalidInput)?,
+        )?;
+        let mut input = source_root
+            .open_regular_file(&relative)
+            .map_err(|_| BackupError::IdentityChanged)?;
+        let before = identity(&input.metadata().map_err(|_| BackupError::Io)?);
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&output_path)
+            .map_err(|_| BackupError::Io)?;
+        let digest = copy_exact_sha256_hex(&mut input, &mut output, entry.size)
+            .map_err(|_| BackupError::Corrupt)?;
+        if entry.sha256.as_deref() != Some(digest.as_str())
+            || identity(&input.metadata().map_err(|_| BackupError::Io)?) != before
+            || identity(
+                &source_root
+                    .open_regular_file(&relative)
+                    .map_err(|_| BackupError::IdentityChanged)?
+                    .metadata()
+                    .map_err(|_| BackupError::Io)?,
+            ) != before
+        {
+            return Err(BackupError::IdentityChanged);
+        }
+        output.sync_all().map_err(|_| BackupError::Io)?;
+    }
+    let manifest = serde_json::to_vec(&verification.manifest).map_err(|_| BackupError::Corrupt)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination.join(MANIFEST_NAME))
+        .map_err(|_| BackupError::Io)?;
+    output.write_all(&manifest).map_err(|_| BackupError::Io)?;
+    output.sync_all().map_err(|_| BackupError::Io)?;
+    source_root
+        .revalidate_stable()
+        .map_err(|_| BackupError::IdentityChanged)?;
+    File::open(destination)
+        .and_then(|root| root.sync_all())
+        .map_err(|_| BackupError::Io)?;
+    destination_root
+        .revalidate_stable()
+        .map_err(|_| BackupError::IdentityChanged)?;
+    Ok(())
+}
+
 pub async fn complete_backup_verification(
     verification: BackupVerification,
 ) -> Result<BackupSummary, BackupError> {
     complete_backup_verification_ref(&verification).await
 }
 
-async fn complete_backup_verification_ref(
+pub(crate) async fn complete_backup_verification_ref(
     verification: &BackupVerification,
 ) -> Result<BackupSummary, BackupError> {
     verify_backup_tables(&verification.directory, &verification.manifest).await?;
@@ -1073,11 +1165,9 @@ fn verify_backup_cas_and_spool(
     Ok(())
 }
 
-async fn verify_backup_tables(
-    directory: &Path,
-    manifest: &BackupManifest,
-) -> Result<(), BackupError> {
-    let store_dir = directory.join("store");
+pub(crate) async fn read_verified_store_tables(
+    store_dir: &Path,
+) -> Result<(BackupTableStates, ProjectionSnapshot), BackupError> {
     let connection = lancedb::connect(store_dir.to_str().ok_or(BackupError::Corrupt)?)
         .execute()
         .await
@@ -1159,6 +1249,24 @@ async fn verify_backup_tables(
             checkpoint: search_checkpoint,
         },
     };
+    Ok((
+        actual,
+        ProjectionSnapshot {
+            frontier: journal_checkpoint,
+            rows: object_rows,
+        },
+    ))
+}
+
+async fn verify_backup_tables(
+    directory: &Path,
+    manifest: &BackupManifest,
+) -> Result<(), BackupError> {
+    let (actual, snapshot) = read_verified_store_tables(&directory.join("store")).await?;
+    let journal_checkpoint = actual.journal.checkpoint;
+    let object_checkpoint = actual.objects.checkpoint;
+    let relation_checkpoint = actual.relations.checkpoint;
+    let search_checkpoint = actual.search.checkpoint;
     if actual != manifest.table_states
         || journal_checkpoint != manifest.frontier
         || object_checkpoint != manifest.frontier
@@ -1169,10 +1277,6 @@ async fn verify_backup_tables(
     {
         return Err(BackupError::Corrupt);
     }
-    let snapshot = ProjectionSnapshot {
-        frontier: journal_checkpoint,
-        rows: object_rows,
-    };
     let (committed_source_watermarks, runtime_outbox_watermark) = backup_watermarks(&snapshot)?;
     let object_deletions =
         ObjectDeletionCurrentView::from_snapshot(&snapshot).map_err(map_store)?;

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 evertrace-codex = { path = "../evertrace-codex" }
 evertrace-domain = { path = "../evertrace-domain" }
+evertrace-engine = { path = "../evertrace-engine" }
 evertrace-protocol = { path = "../evertrace-protocol" }
 evertrace-store = { path = "../evertrace-store" }
 evertrace-tui = { path = "../evertrace-tui" }

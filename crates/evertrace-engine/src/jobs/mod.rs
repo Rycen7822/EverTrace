@@ -1,7 +1,7 @@
 mod deterministic;
 mod executor;
 mod import;
-mod synthesis;
+pub(crate) mod synthesis;
 
 pub use deterministic::{
     JobResultDisposition, RecoveryAction, SupportClosureAction, classify_job_result,

@@ -103,6 +103,20 @@ pub struct L0002ProjectionWorker {
 }
 
 impl L0002ProjectionWorker {
+    pub(crate) async fn rebuild_for_restore(
+        &self,
+        objects: &ProjectionSnapshot,
+    ) -> Result<(), StoreError> {
+        let expected = derive_l0002_projections(objects)?;
+        commit_relation_rows(&self.relations, &expected.relations, false).await?;
+        commit_search_rows(&self.search, &expected.search, false).await?;
+        if read_relation_rows(&self.relations).await? != expected.relations
+            || read_search_rows(&self.search).await? != expected.search
+        {
+            return Err(StoreError::Projection);
+        }
+        Ok(())
+    }
     pub(crate) fn new(journal: Table, relations: Table, search: Table) -> Self {
         Self {
             journal,

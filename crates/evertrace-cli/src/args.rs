@@ -11,6 +11,9 @@ pub enum Command {
     ConfigCheck,
     ConfigShowEffective,
     Doctor,
+    Restore {
+        backup: PathBuf,
+    },
     Mcp,
     Tui,
     AdminSession {
@@ -37,7 +40,11 @@ impl Args {
         } else {
             first
         };
-        let command = if command == "doctor" {
+        let command = if command == "restore" {
+            Command::Restore {
+                backup: PathBuf::from(values.next().ok_or("restore requires a backup path")?),
+            }
+        } else if command == "doctor" {
             Command::Doctor
         } else if command == "mcp" {
             Command::Mcp
@@ -85,5 +92,5 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|doctor|mcp|tui|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|doctor|mcp|tui|admin session queue|revoke SESSION_ID"
 }

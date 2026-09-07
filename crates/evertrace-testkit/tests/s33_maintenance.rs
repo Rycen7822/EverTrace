@@ -71,6 +71,502 @@ use tokio::sync::{RwLock, mpsc};
 const CONFIG: [u8; 32] = [0x73; 32];
 const ALGORITHM: &str = "s33-test-v1";
 
+#[tokio::test]
+async fn offline_restore_imports_current_pending_scope_without_reviving_candidate_rows() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    let mut config_file = EffectiveConfig::default().config().clone();
+    config_file.runtime.data_dir = data.to_str().unwrap().to_owned();
+    let effective = EffectiveConfig::new(config_file).unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, effective.to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let writer = JournalWriter::open(&data).await.unwrap();
+    let (handle, actor) = spawn_writer(writer, 8).unwrap();
+    let mut runtime = runtime_snapshot(&data);
+    runtime.effective_config_hash = effective.hash();
+    let old_key = DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let old_tag =
+        evertrace_capture::protect::mcp_call_auth_tag(b"restore-keyed-authority", &old_key)
+            .unwrap();
+    let old_cache_identity =
+        evertrace_capture::protect::recovery_path_token(b"restore-keyed-cache", &old_key).unwrap();
+    runtime
+        .publish(&RuntimeSnapshot::snapshot_path(&data))
+        .unwrap();
+    let _ = DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+    CasStore::open(runtime.cas_dir.clone()).unwrap();
+    let repository_id = RepositoryId::new_v7();
+    handle
+        .commit(
+            repository_command(repository(repository_id, "/restore-target", 1), 1),
+            1,
+        )
+        .await
+        .unwrap();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    let CaptureOutcome::Durable { cas_digest, .. } = capture
+        .capture(capture_input(
+            "restore-deleted",
+            repository_id,
+            b"restore deleted evidence",
+        ))
+        .unwrap()
+    else {
+        panic!("durable capture required")
+    };
+    EvidenceIngestor::new(runtime.clone(), handle.clone(), effective.hash(), ALGORITHM)
+        .unwrap()
+        .drain_once()
+        .await
+        .unwrap();
+    drop(capture);
+    let stale_job_id = JobId::new_v7();
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    1,
+                    effective.hash(),
+                    "objects-projection-v1",
+                    JournalPayload::JobState(DurableJob {
+                        job_id: stale_job_id,
+                        kind: "objects_projection".into(),
+                        idempotency_key: "objects_projection:obsolete-restore-target".into(),
+                        target_revision: "obsolete-restore-target".into(),
+                        target_watermark: 1,
+                        target_generation: 1,
+                        algorithm_revision: "objects-projection-v1".into(),
+                        model_id: None,
+                        config_hash: effective.hash(),
+                        budget: JobBudget {
+                            max_items: 1,
+                            max_bytes: None,
+                            max_input_tokens: None,
+                            max_output_tokens: None,
+                            max_calls: None,
+                            max_wall_time_ms: 250,
+                        },
+                        state: JobStatus::Queued,
+                        priority: 1,
+                        attempt: 1,
+                        lease_until_us: None,
+                        backoff_until_us: None,
+                        terminal: None,
+                    }),
+                )],
+            )
+            .unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    let backup_id = JobId::new_v7();
+    handle
+        .create_backup(backup_id, config.clone(), runtime.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let before = handle.project().await.unwrap();
+    let preview =
+        evertrace_store::repository_scope_purge_preview(&before, repository_id, 1).unwrap();
+    let command = evertrace_engine::purge::pending_repository_purge_command(
+        RequestId::new_v7(),
+        &preview,
+        preview.deletion_generation,
+        2,
+        before.frontier,
+        CONFIG,
+    )
+    .unwrap();
+    handle.commit(command, 2).await.unwrap();
+    let current = ScopePurgeCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+    let backup = root.path().join("external-backup");
+    std::fs::rename(
+        data.join("backups").join(format!("backup-{backup_id}")),
+        &backup,
+    )
+    .unwrap();
+    let manifest_before = std::fs::read(backup.join("manifest.json")).unwrap();
+    let entries_before = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<BTreeSet<_>>();
+    // Invalid command time fails after the verified copy, not before candidate creation.
+    assert!(matches!(
+        evertrace_store::restore::prepare(&data, &backup, -1, CONFIG).await,
+        Err(evertrace_store::restore::RestoreError::Store(
+            StoreError::InvalidInput
+        ))
+    ));
+    assert_eq!(
+        std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>(),
+        entries_before
+    );
+    assert_eq!(
+        std::fs::read(backup.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+    let prepared = evertrace_store::restore::prepare(&data, &backup, 3, CONFIG)
+        .await
+        .unwrap();
+    let evertrace_store::restore::RestorePreparation::Candidate(candidate) = prepared else {
+        panic!("validated current ledger must prepare a candidate");
+    };
+    assert!(matches!(
+        JournalWriter::open(&data).await,
+        Err(StoreError::WriterAlreadyRunning)
+    ));
+    let full = candidate.full_projection().await.unwrap();
+    let restored = ScopePurgeCurrentView::from_snapshot(&full).unwrap();
+    let previous = current.events.get(&repository_id).unwrap();
+    let terminal = restored.events.get(&repository_id).unwrap();
+    assert_eq!(
+        terminal.stage,
+        evertrace_domain::purge::ScopePurgeStage::Purged
+    );
+    assert_eq!(terminal.target, previous.target);
+    assert_eq!(terminal.deletion_generation, previous.deletion_generation);
+    assert_eq!(
+        terminal.confirmation_frontier,
+        previous.confirmation_frontier
+    );
+    assert_eq!(terminal.purge_job_id, previous.purge_job_id);
+    let digest = CasStore::parse_digest(&cas_digest).unwrap();
+    assert!(
+        !CasStore::open(candidate.path().join("cas"))
+            .unwrap()
+            .blob_path(&digest)
+            .exists()
+    );
+    assert!(
+        CasStore::open(data.join("cas"))
+            .unwrap()
+            .blob_path(&digest)
+            .exists()
+    );
+    assert!(
+        !full
+            .data_rows()
+            .any(|row| row.object_id.as_deref() == Some(repository_id.to_string().as_str()))
+    );
+    assert_eq!(
+        std::fs::read(backup.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+    drop(candidate);
+    let mut live = JournalWriter::open(&data).await.unwrap();
+    let reserved = JournalCommand::new(
+        CommandId::new_v7(),
+        vec![JournalEventDraft::runtime(
+            4,
+            CONFIG,
+            "offline_restore_ledger_v1",
+            JournalPayload::RepositoryInstanceRecorded(Box::new(repository(
+                RepositoryId::new_v7(),
+                "/forged",
+                4,
+            ))),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        live.commit(&reserved, 4).await,
+        Err(StoreError::InvalidInput)
+    );
+    let (handle, actor) = spawn_writer(live, 8).unwrap();
+    let background = scheduler(handle.clone(), runtime);
+    background.run_once().await.unwrap();
+    background.run_once().await.unwrap();
+    let interrupted =
+        ScopePurgeCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    let progress = interrupted.events.get(&repository_id).unwrap();
+    assert_eq!(
+        progress.stage,
+        evertrace_domain::purge::ScopePurgeStage::PhysicalDeleting
+    );
+    assert_eq!(progress.next_ordinal, 1);
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+    let prepared =
+        evertrace_store::restore::prepare(&data, &backup, progress.recorded_at_us + 1, CONFIG)
+            .await
+            .unwrap();
+    let evertrace_store::restore::RestorePreparation::Candidate(candidate) = prepared else {
+        panic!("intermediate deletion must prepare a candidate");
+    };
+    assert!(
+        !CasStore::open(candidate.path().join("cas"))
+            .unwrap()
+            .blob_path(&digest)
+            .exists()
+    );
+    let restored =
+        ScopePurgeCurrentView::from_snapshot(&candidate.full_projection().await.unwrap()).unwrap();
+    assert_eq!(
+        restored.events.get(&repository_id).unwrap().stage,
+        evertrace_domain::purge::ScopePurgeStage::Purged
+    );
+    // The second post-swap validation fails after configuration publication.
+    // Both names must return to their original identity/content under one lock.
+    let old_config = std::fs::read(&config).unwrap();
+    let external_config_root =
+        TempDir::new_in("/dev/shm").unwrap_or_else(|_| TempDir::new().unwrap());
+    if std::os::unix::fs::MetadataExt::dev(&external_config_root.path().metadata().unwrap())
+        == std::os::unix::fs::MetadataExt::dev(&root.path().metadata().unwrap())
+    {
+        eprintln!(
+            "cross-filesystem configuration proof unavailable: temporary directories share a device"
+        );
+    }
+    let external_config = external_config_root.path().join("config.toml");
+    std::fs::write(&external_config, &old_config).unwrap();
+    std::fs::set_permissions(&external_config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let replacement_config = [old_config.as_slice(), b"\n# restored configuration\n"].concat();
+    let validations = std::cell::Cell::new(0);
+    let failure = candidate
+        .activate(&external_config, &replacement_config, |root| {
+            assert_child_fence_busy(root, "writer");
+            assert_child_fence_busy(root, "shared");
+            validations.set(validations.get() + 1);
+            if validations.get() == 2 {
+                assert_eq!(std::fs::read(&external_config).unwrap(), replacement_config);
+                Err(evertrace_store::restore::RestoreError::Io)
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+    assert!(failure.is_err());
+    assert_eq!(validations.get(), 2);
+    assert_eq!(std::fs::read(&config).unwrap(), old_config);
+    assert_eq!(std::fs::read(&external_config).unwrap(), old_config);
+    let live = JournalWriter::open(&data).await.unwrap();
+    assert_eq!(
+        ScopePurgeCurrentView::from_snapshot(&live.full_projection().await.unwrap())
+            .unwrap()
+            .events
+            .get(&repository_id)
+            .unwrap()
+            .stage,
+        evertrace_domain::purge::ScopePurgeStage::PhysicalDeleting
+    );
+    drop(live);
+    let config_failure_parent = root.path().join("config-publish-failure");
+    std::fs::create_dir(&config_failure_parent).unwrap();
+    std::fs::set_permissions(
+        &config_failure_parent,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let unwritable_config = config_failure_parent.join("config.toml");
+    std::fs::write(&unwritable_config, &old_config).unwrap();
+    std::fs::set_permissions(&unwritable_config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let evertrace_store::restore::RestorePreparation::Candidate(candidate) =
+        evertrace_store::restore::prepare(&data, &backup, progress.recorded_at_us + 1, CONFIG)
+            .await
+            .unwrap()
+    else {
+        panic!("candidate required")
+    };
+    let failure = candidate
+        .activate(&unwritable_config, &old_config, |_| {
+            std::fs::set_permissions(
+                &config_failure_parent,
+                std::fs::Permissions::from_mode(0o500),
+            )
+            .unwrap();
+            Ok(())
+        })
+        .await;
+    std::fs::set_permissions(
+        &config_failure_parent,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let Err(evertrace_store::restore::RestoreError::ResidualConfiguration {
+        temporary, saved, ..
+    }) = failure
+    else {
+        panic!("unwritable configuration staging must report its retained locators");
+    };
+    assert_eq!(temporary.parent(), Some(config_failure_parent.as_path()));
+    assert_eq!(saved.parent(), Some(config_failure_parent.as_path()));
+    assert!(temporary.exists() && saved.exists());
+    assert_eq!(std::fs::read(&unwritable_config).unwrap(), old_config);
+    let live = JournalWriter::open(&data).await.unwrap();
+    assert_eq!(
+        ScopePurgeCurrentView::from_snapshot(&live.full_projection().await.unwrap())
+            .unwrap()
+            .events
+            .get(&repository_id)
+            .unwrap()
+            .stage,
+        evertrace_domain::purge::ScopePurgeStage::PhysicalDeleting
+    );
+    drop(live);
+    let binaries = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let output = Command::new(binaries.join("evertrace"))
+        .current_dir(root.path())
+        .arg("--config")
+        .arg(&external_config)
+        .arg("restore")
+        .arg("external-backup")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("restored="));
+    let live = JournalWriter::open(&data).await.unwrap();
+    let snapshot = live.full_projection().await.unwrap();
+    let jobs = RuntimeSchedulerView::from_snapshot(&snapshot).unwrap();
+    let stale = jobs
+        .jobs
+        .iter()
+        .find(|job| job.job_id == stale_job_id)
+        .unwrap();
+    assert_eq!(stale.state, JobStatus::Failed);
+    assert_eq!(
+        stale.attempt, 1,
+        "stale restored work must never acquire an execution lease"
+    );
+    assert_eq!(
+        stale.terminal.as_ref().unwrap().reason,
+        JobTerminalReason::StaleGeneration
+    );
+    assert_eq!(
+        ScopePurgeCurrentView::from_snapshot(&snapshot)
+            .unwrap()
+            .events
+            .get(&repository_id)
+            .unwrap()
+            .stage,
+        evertrace_domain::purge::ScopePurgeStage::Purged
+    );
+    assert!(
+        !CasStore::open(data.join("cas"))
+            .unwrap()
+            .blob_path(&digest)
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read(backup.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+    assert!(
+        RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&data))
+            .unwrap()
+            .recall_cues
+            .is_empty()
+    );
+    StableLauncher::validate_restored_package(&data, &data).unwrap();
+    let restored_key = DeviceKeyStore::new(data.join("keys")).load().unwrap();
+    assert_ne!(
+        old_cache_identity,
+        evertrace_capture::protect::recovery_path_token(b"restore-keyed-cache", &restored_key)
+            .unwrap()
+    );
+    assert!(
+        !evertrace_capture::protect::verify_mcp_call_auth_tag(
+            b"restore-keyed-authority",
+            &restored_key,
+            &old_tag
+        )
+        .unwrap()
+    );
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&data)).unwrap();
+    let (handle, actor) = spawn_writer(live, 8).unwrap();
+    let scheduler = scheduler(handle.clone(), runtime);
+    let new_repository = RepositoryId::new_v7();
+    handle
+        .commit(
+            repository_command(repository(new_repository, "/restore-new-work", 1), 4),
+            4,
+        )
+        .await
+        .unwrap();
+    let watermark = handle.project().await.unwrap().frontier;
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    4,
+                    effective.hash(),
+                    ALGORITHM,
+                    JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
+                        target_kind: evertrace_store::DirtyTargetKind::ObjectsProjection,
+                        target_id: new_repository.to_string(),
+                        algorithm_revision: ALGORITHM.into(),
+                        source_watermark: watermark,
+                    }),
+                )],
+            )
+            .unwrap(),
+            4,
+        )
+        .await
+        .unwrap();
+    scheduler.run_once().await.unwrap();
+    let jobs = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    assert!(jobs.jobs.iter().any(|job| job.kind == "objects_projection"
+        && job.job_id != stale_job_id
+        && job.state == JobStatus::Succeeded));
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+    // A second root has no current deletion authority: the same valid backup
+    // must remain historical, not become an empty-ledger activation.
+    let historical_data = root.path().join("without-current-ledger");
+    let mut historical_config = effective.config().clone();
+    historical_config.runtime.data_dir = historical_data.to_str().unwrap().to_owned();
+    let historical_config = EffectiveConfig::new(historical_config)
+        .unwrap()
+        .to_toml()
+        .unwrap();
+    let historical_config_path = root.path().join("historical.toml");
+    std::fs::write(&historical_config_path, &historical_config).unwrap();
+    std::fs::set_permissions(
+        &historical_config_path,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let output = Command::new(binaries.join("evertrace"))
+        .arg("--config")
+        .arg(&historical_config_path)
+        .arg("restore")
+        .arg(&backup)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("historical_only="));
+    assert!(!historical_data.join("journal.lance").exists());
+    assert_eq!(
+        std::fs::read_to_string(&historical_config_path).unwrap(),
+        historical_config
+    );
+}
+
 fn file_sha256(bytes: &[u8]) -> String {
     copy_exact_sha256_hex(
         &mut Cursor::new(bytes),
@@ -2732,6 +3228,13 @@ fn maintenance_fence_child() {
     let Some(root) = std::env::var_os("EVERTRACE_S33_FENCE_CHILD_ROOT") else {
         return;
     };
+    if std::env::var("EVERTRACE_S33_FENCE_CHILD_MODE").unwrap() == "writer" {
+        assert!(matches!(
+            evertrace_store::SiblingWriterLock::acquire(Path::new(&root)),
+            Err(StoreError::WriterAlreadyRunning)
+        ));
+        return;
+    }
     let fence = evertrace_capture::MaintenanceFence::open(Path::new(&root)).unwrap();
     let result = match std::env::var("EVERTRACE_S33_FENCE_CHILD_MODE")
         .unwrap()

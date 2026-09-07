@@ -589,6 +589,27 @@ pub(crate) struct ObjectDeletionState {
 }
 
 impl ObjectDeletionState {
+    pub(crate) fn import_restore(
+        &mut self,
+        event: ObjectDeletionLedgerEvent,
+        seq: u64,
+    ) -> Result<(), StoreError> {
+        if !event.validate()
+            || self.events.values().any(|(other, _)| {
+                other.deletion_generation == event.deletion_generation
+                    && other.target != event.target
+            })
+            || self
+                .current(event.target)
+                .is_some_and(|current| current != &event && !current.validate_successor(&event))
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.generation = self.generation.max(event.deletion_generation);
+        self.events.insert(event.target, (event, seq));
+        Ok(())
+    }
+
     pub(crate) fn current(
         &self,
         target: ObjectDeletionTarget,
@@ -715,6 +736,43 @@ pub(crate) struct ScopePurgeState {
 }
 
 impl ScopePurgeState {
+    pub(crate) fn import_restore(
+        &mut self,
+        event: ScopePurgeProgress,
+        seq: u64,
+    ) -> Result<(), StoreError> {
+        let rank = |stage| match stage {
+            ScopePurgeStage::Pending => 0,
+            ScopePurgeStage::ProjectionClosed => 1,
+            ScopePurgeStage::PhysicalDeleting => 2,
+            ScopePurgeStage::Purged => 3,
+        };
+        if !event.validate()
+            || self.events.values().any(|(other, _)| {
+                other.deletion_generation == event.deletion_generation
+                    && other.target != event.target
+            })
+            || self
+                .current(event.target.repository_id())
+                .is_some_and(|current| {
+                    current.target != event.target
+                        || current.confirmation_frontier != event.confirmation_frontier
+                        || current.deletion_generation != event.deletion_generation
+                        || current.purge_job_id != event.purge_job_id
+                        || current.recorded_at_us > event.recorded_at_us
+                        || current.next_ordinal > event.next_ordinal
+                        || rank(current.stage) > rank(event.stage)
+                        || current.stage == ScopePurgeStage::Purged && current != &event
+                })
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.generation = self.generation.max(event.deletion_generation);
+        self.events
+            .insert(event.target.repository_id(), (event, seq));
+        Ok(())
+    }
+
     pub(crate) fn current(&self, repository_id: RepositoryId) -> Option<&ScopePurgeProgress> {
         self.events.get(&repository_id).map(|(event, _)| event)
     }

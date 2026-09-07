@@ -325,10 +325,7 @@ impl SynthesisPlanner {
         job: &DurableJob,
         effective_config_hash: [u8; 32],
     ) -> bool {
-        job.kind == "semantic_synthesis_v1"
-            && job.algorithm_revision == "semantic_synthesis_v1"
-            && job.model_id.as_deref() == Some(self.llm.model.as_str())
-            && job.config_hash == effective_config_hash
+        synthesis_identity_is_current(&self.llm, job, effective_config_hash)
     }
 
     pub(crate) fn job_is_current(
@@ -344,32 +341,7 @@ impl SynthesisPlanner {
         &self,
         max_wall_time: std::time::Duration,
     ) -> Result<JobBudget, crate::semantic::SemanticServiceError> {
-        if max_wall_time.is_zero() {
-            return Err(crate::semantic::SemanticServiceError::InvalidInput);
-        }
-        let max_wall_time_ms = self
-            .llm
-            .timeout
-            .seconds()
-            .saturating_mul(1_000)
-            .min(u64::try_from(max_wall_time.as_millis()).unwrap_or(u64::MAX))
-            .min(
-                self.llm
-                    .daily_wall_time_budget
-                    .seconds()
-                    .saturating_mul(1_000),
-            );
-        if max_wall_time_ms == 0 {
-            return Err(crate::semantic::SemanticServiceError::InvalidInput);
-        }
-        Ok(JobBudget {
-            max_items: 64,
-            max_bytes: Some(256 * 1024),
-            max_input_tokens: Some(self.llm.daily_input_token_budget.max(1)),
-            max_output_tokens: Some(self.llm.daily_output_token_budget.max(1)),
-            max_calls: Some(1),
-            max_wall_time_ms,
-        })
+        synthesis_budget(&self.llm, max_wall_time)
     }
 
     pub(crate) fn remaining_daily_wall_time(
@@ -794,6 +766,44 @@ fn synthesis_trigger(episode: &WorkEpisode) -> Option<SemanticDigestTrigger> {
         && (episode.pending_delta_stats.selected_token_count >= 1024
             || episode.pending_delta_stats.meaningful_burst_count >= 4))
         .then_some(SemanticDigestTrigger::BudgetBackstop)
+}
+
+pub(crate) fn synthesis_identity_is_current(
+    llm: &LlmConfig,
+    job: &DurableJob,
+    effective_config_hash: [u8; 32],
+) -> bool {
+    job.kind == "semantic_synthesis_v1"
+        && job.algorithm_revision == "semantic_synthesis_v1"
+        && job.model_id.as_deref() == Some(llm.model.as_str())
+        && job.config_hash == effective_config_hash
+}
+
+pub(crate) fn synthesis_budget(
+    llm: &LlmConfig,
+    max_wall_time: std::time::Duration,
+) -> Result<JobBudget, crate::semantic::SemanticServiceError> {
+    let max_wall_time_ms = llm
+        .timeout
+        .seconds()
+        .saturating_mul(1_000)
+        .min(u64::try_from(max_wall_time.as_millis()).unwrap_or(u64::MAX))
+        .min(llm.daily_wall_time_budget.seconds().saturating_mul(1_000));
+    if max_wall_time_ms == 0 {
+        return Err(crate::semantic::SemanticServiceError::InvalidInput);
+    }
+    Ok(JobBudget {
+        max_items: 64,
+        max_bytes: Some(256 * 1024),
+        max_input_tokens: Some(llm.daily_input_token_budget.max(1)),
+        max_output_tokens: Some(llm.daily_output_token_budget.max(1)),
+        max_calls: Some(1),
+        max_wall_time_ms,
+    })
+}
+
+pub(crate) fn synthesis_target_is_current(snapshot: &ProjectionSnapshot, job: &DurableJob) -> bool {
+    scheduled_input(snapshot, job).is_ok()
 }
 
 fn scheduled_input(

@@ -1826,6 +1826,7 @@ version = "0.0.0"
 dependencies = [
  "evertrace-codex",
  "evertrace-domain",
+ "evertrace-engine",
  "evertrace-protocol",
  "evertrace-store",
  "evertrace-tui",

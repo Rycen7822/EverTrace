@@ -14,6 +14,7 @@ pub mod purge;
 pub mod query;
 pub mod relations;
 pub mod repository;
+pub mod restore;
 pub mod schema;
 pub mod search;
 pub mod session_import;

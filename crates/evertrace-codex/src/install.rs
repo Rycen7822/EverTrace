@@ -99,7 +99,179 @@ pub struct StableLauncher {
     root: PathBuf,
 }
 
+pub struct RestoredHookPackage {
+    pub current_generation: u64,
+    /// Local runtime files whose contents remain owned by Capture, not this parser.
+    pub pinned_runtime_files: Vec<PathBuf>,
+    pub current_runtime_file: PathBuf,
+}
+
 impl StableLauncher {
+    pub fn prepare_restored_package(
+        candidate: &Path,
+        active_root: &Path,
+        current_executable: &Path,
+    ) -> Result<RestoredHookPackage, InstallError> {
+        let backup = Self::verify_backup_snapshot(candidate)?;
+        let launcher = Self::open(candidate)?;
+        let mut registry = if backup.current_generation.is_some() {
+            serde_json::from_slice::<GenerationRegistry>(&read_private_file_bounded(
+                &launcher.registry_path(),
+                0o600,
+                MAX_REGISTRY_BYTES,
+            )?)
+            .map_err(|_| InstallError::InvalidRegistry)?
+        } else {
+            GenerationRegistry {
+                registry_version: REGISTRY_VERSION,
+                current_generation: 1,
+                generations: Vec::new(),
+            }
+        };
+        let pins = read_pins(&candidate.join(HOOKS_DIRECTORY).join(PINS_DIRECTORY), false)?;
+        let pinned = pins
+            .iter()
+            .map(|pin| pin.generation)
+            .collect::<BTreeSet<_>>();
+        let generation = registry
+            .generations
+            .last()
+            .map_or(Some(1), |item| item.generation.checked_add(1))
+            .ok_or(InstallError::ResourceExhausted)?;
+        let mut pinned_runtime_files = Vec::new();
+        for item in &mut registry.generations {
+            item.executable = active_root.join(generation_relative(
+                item.generation,
+                GENERATION_EXECUTABLE_NAME,
+            ));
+            item.runtime_snapshot = active_root.join(generation_relative(
+                item.generation,
+                GENERATION_RUNTIME_NAME,
+            ));
+            item.compatible = pinned.contains(&item.generation);
+            if item.compatible {
+                let executable = candidate.join(generation_relative(
+                    item.generation,
+                    GENERATION_EXECUTABLE_NAME,
+                ));
+                validate_private_file(&executable, 0o600)?;
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                    .map_err(map_io)?;
+                pinned_runtime_files.push(candidate.join(generation_relative(
+                    item.generation,
+                    GENERATION_RUNTIME_NAME,
+                )));
+            }
+        }
+        let source_parent = current_executable
+            .parent()
+            .ok_or(InstallError::InvalidType)?;
+        for directory in source_parent.ancestors() {
+            let metadata = fs::symlink_metadata(directory).map_err(map_io)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(InstallError::InvalidType);
+            }
+        }
+        let parent_identity = fs::symlink_metadata(source_parent).map_err(map_io)?;
+        let owner = fs::metadata("/proc/self").map_err(map_io)?.uid();
+        if parent_identity.mode() & 0o022 != 0 || ![0, owner].contains(&parent_identity.uid()) {
+            return Err(InstallError::InvalidType);
+        }
+        let metadata = fs::symlink_metadata(current_executable).map_err(map_io)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o111 == 0
+            || ![0, owner].contains(&metadata.uid())
+            || metadata.len() > 256 * 1024 * 1024
+        {
+            return Err(InstallError::InvalidType);
+        }
+        if fs2::available_space(candidate).map_err(map_io)?
+            < metadata.len().saturating_mul(2).saturating_add(1024 * 1024)
+        {
+            return Err(InstallError::ResourceExhausted);
+        }
+        let mut source = File::open(current_executable).map_err(map_io)?;
+        if hook_file_identity(&source.metadata().map_err(map_io)?) != hook_file_identity(&metadata)
+        {
+            return Err(InstallError::InvalidType);
+        }
+        let mut bytes = Vec::new();
+        (&mut source)
+            .take(256 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(map_io)?;
+        if u64::try_from(bytes.len()).map_err(|_| InstallError::ResourceExhausted)?
+            != metadata.len()
+            || hook_file_identity(&source.metadata().map_err(map_io)?)
+                != hook_file_identity(&metadata)
+        {
+            return Err(InstallError::InvalidType);
+        }
+        let after = fs::symlink_metadata(current_executable).map_err(map_io)?;
+        let parent_after = fs::symlink_metadata(source_parent).map_err(map_io)?;
+        if hook_file_identity(&metadata) != hook_file_identity(&after)
+            || (parent_identity.dev(), parent_identity.ino())
+                != (parent_after.dev(), parent_after.ino())
+        {
+            return Err(InstallError::InvalidType);
+        }
+        let directory = candidate
+            .join(HOOKS_DIRECTORY)
+            .join(GENERATIONS_DIRECTORY)
+            .join(generation.to_string());
+        ensure_private_directory(&directory)?;
+        atomic_write(&directory.join(GENERATION_EXECUTABLE_NAME), &bytes, 0o700)?;
+        atomic_write(&launcher.launcher_path(), &bytes, 0o700)?;
+        registry.current_generation = generation;
+        registry.generations.push(HookGeneration {
+            generation,
+            protocol_version: 1,
+            executable: active_root
+                .join(generation_relative(generation, GENERATION_EXECUTABLE_NAME)),
+            runtime_snapshot: active_root
+                .join(generation_relative(generation, GENERATION_RUNTIME_NAME)),
+            compatible: true,
+        });
+        validate_registry(active_root, &registry)?;
+        atomic_json(&launcher.registry_path(), &registry, 0o600)?;
+        Ok(RestoredHookPackage {
+            current_generation: generation,
+            pinned_runtime_files,
+            current_runtime_file: directory.join(GENERATION_RUNTIME_NAME),
+        })
+    }
+
+    pub fn validate_restored_package(
+        candidate: &Path,
+        active_root: &Path,
+    ) -> Result<(), InstallError> {
+        validate_private_directory(candidate)?;
+        validate_private_file(&candidate.join("hook-v1"), 0o700)?;
+        let registry: GenerationRegistry = serde_json::from_slice(&read_private_file_bounded(
+            &candidate.join(HOOKS_DIRECTORY).join(REGISTRY_NAME),
+            0o600,
+            MAX_REGISTRY_BYTES,
+        )?)
+        .map_err(|_| InstallError::InvalidRegistry)?;
+        validate_registry(active_root, &registry)?;
+        let pins = read_pins(&candidate.join(HOOKS_DIRECTORY).join(PINS_DIRECTORY), false)?;
+        for generation in retained_generations(&registry, &pins)? {
+            let mut local = registry
+                .generations
+                .iter()
+                .find(|item| item.generation == generation)
+                .cloned()
+                .ok_or(InstallError::InvalidRegistry)?;
+            local.executable =
+                candidate.join(generation_relative(generation, GENERATION_EXECUTABLE_NAME));
+            local.runtime_snapshot =
+                candidate.join(generation_relative(generation, GENERATION_RUNTIME_NAME));
+            validate_generation(candidate, &local)?;
+        }
+        Ok(())
+    }
     pub fn open(data_root: impl Into<PathBuf>) -> Result<Self, InstallError> {
         let root = data_root.into();
         ensure_private_directory(&root)?;

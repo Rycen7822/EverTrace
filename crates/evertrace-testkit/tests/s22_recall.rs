@@ -53,7 +53,6 @@ use tempfile::TempDir;
 const CONFIG: [u8; 32] = [0x22; 32];
 const MANIFEST: &str = "adapter-manifest-s22";
 const SESSION: &str = "session-s22-real";
-const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn command(at: i64, payloads: Vec<JournalPayload>) -> JournalCommand {
     JournalCommand::new(
@@ -75,7 +74,7 @@ fn work_context(at: i64) -> WorkCommandContext {
     }
 }
 
-fn evidence() -> (SourceReceipt, SourceObservation) {
+fn evidence(cas_ref: String) -> (SourceReceipt, SourceObservation) {
     let instance = SourceInstanceId::parse("source-s22").unwrap();
     let revision = SourceRevision::parse("revision-1").unwrap();
     let record = SourceRecordIdentity::parse("record-s22").unwrap();
@@ -138,7 +137,7 @@ fn evidence() -> (SourceReceipt, SourceObservation) {
         unsupported_record_classification: None,
         capture_completeness: CaptureCompleteness::Complete,
         archive_mode: SourceArchiveMode::Exact,
-        cas_ref: DIGEST.into(),
+        cas_ref,
         protected_length: 1,
         original_length: 1,
         protected_secret_digest: None,
@@ -387,9 +386,17 @@ async fn start_real_recall(root: TempDir) -> RunningRecall {
     runtime
         .publish(&RuntimeSnapshot::snapshot_path(&data_dir))
         .unwrap();
+    let key = DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let cas_ref = evertrace_capture::CasStore::open(runtime.cas_dir.clone())
+        .unwrap()
+        .put(&evertrace_capture::protect::protect(b"x", &key).unwrap())
+        .unwrap()
+        .as_hex();
     let worker = spawn_recall_worker(handle.clone(), runtime, data_dir.clone());
 
-    let (source_receipt, observation) = evidence();
+    let (source_receipt, observation) = evidence(cas_ref);
     let target = observation.source_observation_id.to_string();
     commit_quick(
         &handle,
@@ -608,6 +615,240 @@ fn need() -> RecallNeed {
     }
     .seal()
     .unwrap()
+}
+
+#[tokio::test]
+async fn offline_restore_resets_claim_authority_without_erasing_presentation_evidence() {
+    use evertrace_domain::recall::{PresentationAttemptState, RecallPresentationAttempt};
+    use evertrace_store::{DurableJob, JobBudget, JobLease, JobStatus, RuntimeSchedulerView};
+    use std::os::unix::fs::PermissionsExt;
+    let running = start_real_recall(TempDir::new().unwrap()).await;
+    let (context, _) = wait_for_need_and_cue(&running).await;
+    running.worker.abort();
+    let _ = running.worker.await;
+    let template = context.needs.first().unwrap();
+    let at = template.created_at_us + 1;
+    let mut expected = std::collections::BTreeMap::new();
+    let mut unfinished = None;
+    for state in [
+        PresentationAttemptState::ClaimedForBoundary,
+        PresentationAttemptState::Emitted,
+        PresentationAttemptState::PresentationUnknown,
+    ] {
+        let mut need = template.clone();
+        need.recall_need_id = RecallNeedId::new_v7();
+        need.revision_id = RevisionId::new_v7();
+        need.parent_revision_id = None;
+        need.delivery_state = RecallDeliveryState::Detected;
+        need.active_presentation_attempt_id = None;
+        let need = need.seal().unwrap();
+        running
+            .handle
+            .commit(
+                command(
+                    at,
+                    vec![JournalPayload::RecallLedgerRecorded(Box::new(
+                        RecallLedgerEvent::NeedRecorded {
+                            need: Box::new(need.clone()),
+                        },
+                    ))],
+                ),
+                at,
+            )
+            .await
+            .unwrap();
+        let mut attempt = RecallPresentationAttempt {
+            presentation_attempt_id: PresentationAttemptId::new_v7(),
+            recall_need_id: need.recall_need_id,
+            recall_need_hash: need.recall_need_hash,
+            boundary_event_ref: need.boundary_event_ref.clone(),
+            state: PresentationAttemptState::ClaimedForBoundary,
+            occurred_at_us: at + 1,
+        };
+        running
+            .handle
+            .commit(
+                command(
+                    at + 1,
+                    vec![JournalPayload::RecallLedgerRecorded(Box::new(
+                        RecallLedgerEvent::PresentationAttempt {
+                            attempt: attempt.clone(),
+                        },
+                    ))],
+                ),
+                at + 1,
+            )
+            .await
+            .unwrap();
+        if state != PresentationAttemptState::ClaimedForBoundary {
+            attempt.state = state;
+            attempt.occurred_at_us = at + 2;
+            running
+                .handle
+                .commit(
+                    command(
+                        at + 2,
+                        vec![JournalPayload::RecallLedgerRecorded(Box::new(
+                            RecallLedgerEvent::PresentationAttempt {
+                                attempt: attempt.clone(),
+                            },
+                        ))],
+                    ),
+                    at + 2,
+                )
+                .await
+                .unwrap();
+        } else {
+            unfinished = Some(attempt.clone());
+        }
+        expected.insert(
+            need.recall_need_id,
+            (
+                attempt.presentation_attempt_id,
+                if state == PresentationAttemptState::Emitted {
+                    RecallDeliveryState::Emitted
+                } else {
+                    RecallDeliveryState::PresentationUnknown
+                },
+            ),
+        );
+    }
+    let job = DurableJob {
+        job_id: evertrace_domain::ids::JobId::new_v7(),
+        idempotency_key: "restore-job".into(),
+        target_revision: "target".into(),
+        target_watermark: 1,
+        target_generation: 1,
+        kind: "objects_projection".into(),
+        algorithm_revision: "s22-test-v1".into(),
+        model_id: None,
+        priority: 0,
+        state: JobStatus::Queued,
+        attempt: 1,
+        backoff_until_us: None,
+        config_hash: CONFIG,
+        budget: JobBudget {
+            max_items: 1,
+            max_bytes: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            max_calls: None,
+            max_wall_time_ms: 1000,
+        },
+        terminal: None,
+        lease_until_us: None,
+    };
+    running
+        .handle
+        .commit(
+            command(at + 3, vec![JournalPayload::JobState(job.clone())]),
+            at + 3,
+        )
+        .await
+        .unwrap();
+    running
+        .handle
+        .commit(
+            command(
+                at + 3,
+                vec![JournalPayload::JobLease(JobLease {
+                    job_id: job.job_id,
+                    target_generation: 1,
+                    attempt: 2,
+                    lease_until_us: at + 100,
+                })],
+            ),
+            at + 3,
+        )
+        .await
+        .unwrap();
+    let effective = evertrace_domain::config::EffectiveConfig::default();
+    let config = running._root.path().join("config.toml");
+    std::fs::write(&config, effective.to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut snapshot =
+        RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&running.data_dir)).unwrap();
+    snapshot.effective_config_hash = effective.hash();
+    snapshot
+        .publish(&RuntimeSnapshot::snapshot_path(&running.data_dir))
+        .unwrap();
+    evertrace_capture::DurableSpool::open(
+        snapshot.spool_dir.clone(),
+        snapshot.spool_limits().unwrap(),
+    )
+    .unwrap();
+    let backup_id = evertrace_domain::ids::JobId::new_v7();
+    running
+        .handle
+        .create_backup(backup_id, config, snapshot)
+        .await
+        .unwrap()
+        .unwrap();
+    running.handle.shutdown().await.unwrap();
+    running.writer_task.await.unwrap().unwrap();
+    let backup = running
+        .data_dir
+        .join("backups")
+        .join(format!("backup-{backup_id}"));
+    let prepared =
+        evertrace_store::restore::prepare(&running.data_dir, &backup, at + 4, effective.hash())
+            .await
+            .unwrap();
+    let evertrace_store::restore::RestorePreparation::Candidate(candidate) = prepared else {
+        panic!("current authority required")
+    };
+    let full = candidate.full_projection().await.unwrap();
+    let jobs = RuntimeSchedulerView::from_snapshot(&full).unwrap();
+    let reset = jobs
+        .jobs
+        .iter()
+        .find(|item| item.job_id == job.job_id)
+        .unwrap();
+    assert_eq!(reset.state, JobStatus::Queued);
+    assert_eq!(reset.lease_until_us, None);
+    assert_eq!(reset.attempt, 2);
+    let mut seen = 0;
+    for row in full.data_rows() {
+        if let Some(need) = evertrace_store::projections::recall_need(row).unwrap()
+            && let Some((attempt, state)) = expected.get(&need.recall_need_id)
+        {
+            assert_eq!(need.active_presentation_attempt_id, Some(*attempt));
+            assert_eq!(need.delivery_state, *state);
+            assert_eq!(need.obligation_state, RecallObligationState::Active);
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 3);
+    let candidate_path = candidate.path().to_owned();
+    assert!(
+        RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&candidate_path))
+            .unwrap()
+            .recall_cues
+            .is_empty()
+    );
+    drop(candidate);
+    let mut reopened = evertrace_store::JournalWriter::open(&candidate_path)
+        .await
+        .unwrap();
+    assert_eq!(reopened.project().await.unwrap().rows, full.rows);
+    assert_eq!(reopened.full_projection().await.unwrap().rows, full.rows);
+    let mut stale = unfinished.unwrap();
+    stale.state = PresentationAttemptState::Emitted;
+    stale.occurred_at_us = at + 5;
+    assert_eq!(
+        reopened
+            .commit(
+                &command(
+                    at + 5,
+                    vec![JournalPayload::RecallLedgerRecorded(Box::new(
+                        RecallLedgerEvent::PresentationAttempt { attempt: stale }
+                    ))]
+                ),
+                at + 5
+            )
+            .await,
+        Err(evertrace_store::StoreError::InvalidInput)
+    );
 }
 
 #[test]

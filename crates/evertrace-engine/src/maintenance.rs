@@ -43,6 +43,446 @@ const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v1";
 
+pub enum OfflineRestoreOutcome {
+    Historical { directory: std::path::PathBuf },
+    Activated(evertrace_store::restore::RestoreActivated),
+}
+
+/// Offline only: no actor, provider, socket or background scheduler is started.
+pub async fn restore_offline(
+    data_dir: &Path,
+    config_path: &Path,
+    backup: &Path,
+    current_hook: &Path,
+    config_hash: [u8; 32],
+) -> Result<OfflineRestoreOutcome, evertrace_store::restore::RestoreError> {
+    use evertrace_store::restore::{RestoreError, RestorePreparation};
+    let at = now_us().map_err(|_| RestoreError::Io)?;
+    let preparation = evertrace_store::restore::prepare(data_dir, backup, at, config_hash).await?;
+    let RestorePreparation::Candidate(mut candidate) = preparation else {
+        let RestorePreparation::Historical { directory } = preparation else {
+            unreachable!()
+        };
+        return Ok(OfflineRestoreOutcome::Historical { directory });
+    };
+    let prepared = async {
+        let invalid = || RestoreError::Store(evertrace_store::StoreError::InvalidInput);
+        let bytes = std::fs::read(candidate.path().join("config/config.toml"))
+            .map_err(|_| RestoreError::Io)?;
+        let config = evertrace_domain::config::EffectiveConfig::parse_toml(
+            std::str::from_utf8(&bytes).map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+        let mut restored = config.config().clone();
+        restored.runtime.data_dir = data_dir.to_str().ok_or_else(invalid)?.to_owned();
+        let config =
+            evertrace_domain::config::EffectiveConfig::new(restored).map_err(|_| invalid())?;
+        let config_bytes = config.to_toml().map_err(|_| invalid())?.into_bytes();
+        let package = evertrace_codex::install::StableLauncher::prepare_restored_package(
+            candidate.path(),
+            data_dir,
+            current_hook,
+        )
+        .map_err(|_| invalid())?;
+        let mut runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(candidate.path()))
+            .map_err(|_| invalid())?;
+        let current_generation = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
+            .map_err(|_| invalid())?
+            .generation;
+        let mut max_generation = runtime.generation.max(current_generation);
+        for path in &package.pinned_runtime_files {
+            let mut pinned = RuntimeSnapshot::load(path).map_err(|_| invalid())?;
+            max_generation = max_generation.max(pinned.generation);
+            relocate_restore_runtime(&mut pinned, data_dir, config.hash());
+            pinned.publish(path).map_err(|_| invalid())?;
+        }
+        runtime.generation = max_generation.checked_add(1).ok_or_else(invalid)?;
+        relocate_restore_runtime(&mut runtime, data_dir, config.hash());
+        runtime
+            .publish(&RuntimeSnapshot::snapshot_path(candidate.path()))
+            .map_err(|_| invalid())?;
+        runtime
+            .publish(&package.current_runtime_file)
+            .map_err(|_| invalid())?;
+        evertrace_capture::DeviceKeyStore::new(candidate.path().join("keys"))
+            .load_or_create()
+            .map_err(|_| invalid())?;
+        probe_restore_package(candidate.path(), &runtime)?;
+        validate_restore_jobs(&mut candidate, &config, at).await?;
+        evertrace_codex::install::StableLauncher::validate_restored_package(
+            candidate.path(),
+            data_dir,
+        )
+        .map_err(|_| invalid())?;
+        Ok::<_, RestoreError>(config_bytes)
+    }
+    .await;
+    let config_bytes = match prepared {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(candidate.discard(error)),
+    };
+    let activated = candidate
+        .activate(config_path, &config_bytes, |root| {
+            evertrace_codex::install::StableLauncher::validate_restored_package(root, root)
+                .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))
+        })
+        .await?;
+    Ok(OfflineRestoreOutcome::Activated(activated))
+}
+
+fn relocate_restore_runtime(runtime: &mut RuntimeSnapshot, root: &Path, config_hash: [u8; 32]) {
+    runtime.device_key_dir = root.join("keys");
+    runtime.cas_dir = root.join("cas");
+    runtime.spool_dir = root.join("spool");
+    runtime.recovery_socket_path = root.join("runtime/evertraced-v1.sock");
+    runtime.effective_config_hash = config_hash;
+    runtime.recall_cues.clear();
+    // A private package probe cannot certify a live Host capability.
+    runtime.recall_cue_gate = evertrace_capture::RecallCueGateMode::Disabled;
+    runtime.recall_cue_adapter_manifest_id = None;
+    runtime.recovery_gate = evertrace_capture::RecoveryGateMode::Disabled;
+    runtime.recovery_adapter_manifest_id = None;
+}
+
+fn probe_restore_package(
+    candidate: &Path,
+    runtime: &RuntimeSnapshot,
+) -> Result<(), evertrace_store::restore::RestoreError> {
+    use evertrace_capture::{CasStore, ConfinedRoot, DurableSpool};
+    use evertrace_store::restore::RestoreError;
+    use std::{
+        io::Write,
+        os::unix::fs::{DirBuilderExt, MetadataExt},
+        process::Stdio,
+    };
+    let invalid = || RestoreError::Store(evertrace_store::StoreError::StoreCorrupt);
+    let root = candidate.join(format!("restore-probe-{}", JobId::new_v7()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .map_err(|_| RestoreError::Io)?;
+    let custody = ConfinedRoot::open_owned_private(&root).map_err(|_| invalid())?;
+    let fence = evertrace_capture::MaintenanceFence::open(&root).map_err(|_| invalid())?;
+    let fence_identity =
+        std::fs::symlink_metadata(fence.lock_path()).map_err(|_| RestoreError::Io)?;
+    let result = (|| {
+        let mut probe = runtime.clone();
+        relocate_restore_runtime(&mut probe, &root, runtime.effective_config_hash);
+        let snapshot_path = RuntimeSnapshot::snapshot_path(&root);
+        probe.publish(&snapshot_path).map_err(|_| invalid())?;
+        evertrace_capture::DeviceKeyStore::new(probe.device_key_dir.clone())
+            .load_or_create()
+            .map_err(|_| invalid())?;
+        let input = serde_json::json!({
+            "input_version": evertrace_codex::hook_input::CAPTURE_HOOK_INPUT_VERSION,
+            "spool_record_id": "restore-package-probe", "source_observation_id_hint": null,
+            "source_instance_id": "restore-package-probe", "source_revision": "probe-v1",
+            "source_record_identity": "restore-package-probe", "identity_strength": "stable_native",
+            "source_kind": "codex_hook", "identity_domain": "codex-hook-v1",
+            "adapter_manifest_ref": "restore-package-probe", "eligible_event_manifest_ref": "restore-package-probe",
+            "source_revision_mode": "append", "previous_source_revision": null,
+            "source_ref": "restore-package-probe", "session_id": "restore-package-probe",
+            "turn_id": null, "tool_use_id": null, "event_kind": "post_tool_use",
+            "correlation": {
+                "occurrence_schema_version": 1, "host_instance_id": null, "host_trace_lineage_id": null,
+                "host_lane_key": null, "canonical_event_family": null, "native_request_id": null,
+                "physical_execution_ordinal": null, "pairing_role": "result", "field_provenance": [],
+                "adapter_manifest_ref": "restore-package-probe", "adapter_revision": 1,
+                "strong_gate_receipt_ref": null, "admission": "unavailable", "partial_correlation_ref": null,
+                "possible_duplicate_group_id": null
+            },
+            "scope_effect_claims": [], "lifecycle": null, "source_sequence": 1,
+            "source_sequence_origin": null, "task_id": null, "repository_instance_id": null,
+            "worktree_instance_id": null, "event_time_us": 1, "payload": "restore-package-probe"
+        });
+        // Decode through the adapter before execution; the runtime probe uses the
+        // same public input contract as the installed Hook, not a special mode.
+        let bytes = serde_json::to_vec(&input).map_err(|_| invalid())?;
+        evertrace_codex::hook_input::CaptureHookInput::from_json(&bytes).map_err(|_| invalid())?;
+        let mut child = std::process::Command::new(candidate.join("hook-v1"))
+            .arg("--runtime-snapshot")
+            .arg(&snapshot_path)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| RestoreError::Io)?;
+        let execution = (|| {
+            child
+                .stdin
+                .take()
+                .ok_or_else(invalid)?
+                .write_all(&bytes)
+                .map_err(|_| RestoreError::Io)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().map_err(|_| RestoreError::Io)? {
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(invalid())
+                    };
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(invalid());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })();
+        if execution.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        execution?;
+        let (spool, _) = DurableSpool::open(
+            probe.spool_dir.clone(),
+            probe.spool_limits().map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+        let frames = spool.read_active().map_err(|_| invalid())?;
+        let [frame] = frames.as_slice() else {
+            return Err(invalid());
+        };
+        if frame.record.spool_record_id != "restore-package-probe"
+            || frame.record.spool_generation != probe.generation
+            || frame.record.cas_refs.len() != 1
+        {
+            return Err(invalid());
+        }
+        evertrace_capture::decode_validated_record_body(&frame.record).map_err(|_| invalid())?;
+        let cas = CasStore::open(probe.cas_dir).map_err(|_| invalid())?;
+        let digest = CasStore::parse_digest(&frame.record.cas_refs[0]).map_err(|_| invalid())?;
+        if cas.read(&digest).map_err(|_| invalid())? != b"restore-package-probe" {
+            return Err(invalid());
+        }
+        Ok(())
+    })();
+    custody.revalidate_stable().map_err(|_| invalid())?;
+    std::fs::remove_dir_all(&root).map_err(|_| RestoreError::Io)?;
+    // This private root's fence lives inside the candidate, never at the live
+    // sibling locator. It is not a restored capability or durable work item.
+    let located = std::fs::symlink_metadata(fence.lock_path()).map_err(|_| RestoreError::Io)?;
+    if (located.dev(), located.ino()) != (fence_identity.dev(), fence_identity.ino()) {
+        return Err(invalid());
+    }
+    std::fs::remove_file(fence.lock_path()).map_err(|_| RestoreError::Io)?;
+    result
+}
+
+async fn validate_restore_jobs(
+    candidate: &mut evertrace_store::restore::RestoreCandidate,
+    config: &evertrace_domain::config::EffectiveConfig,
+    at: i64,
+) -> Result<(), evertrace_store::restore::RestoreError> {
+    let snapshot = candidate.full_projection().await?;
+    let view = RuntimeSchedulerView::from_snapshot(&snapshot)?;
+    for mut job in view
+        .jobs
+        .iter()
+        .filter(|job| job.state == JobStatus::Queued)
+        .cloned()
+    {
+        if restore_job_is_current(&snapshot, &view, &job, config)? {
+            continue;
+        }
+        let replacement =
+            if job.kind == "session_import_v1" && import_target_is_current(&snapshot, &job)? {
+                Some(replacement_import_job(&job, config.hash()))
+            } else if job.kind == "support_closure"
+                && job_target_is_current(&snapshot, &view, &job, config.hash())?
+            {
+                let mut replacement = job.clone();
+                replacement.job_id = JobId::new_v7();
+                replacement.config_hash = config.hash();
+                replacement.attempt = 1;
+                replacement.backoff_until_us = None;
+                Some(replacement)
+            } else {
+                None
+            };
+        job.state = JobStatus::Failed;
+        job.lease_until_us = None;
+        job.backoff_until_us = None;
+        job.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: JobTerminalOutcome::Failed,
+            reason: JobTerminalReason::StaleGeneration,
+            result_ref: Some(job.target_revision.clone()),
+        }));
+        let mut events = vec![JournalEventDraft {
+            occurred_at_us: at,
+            source_kind: SourceKind::System,
+            scope: EventScope::default(),
+            causation_id: None,
+            correlation_id: None,
+            effective_config_hash: job.config_hash,
+            algorithm_revision: job.algorithm_revision.clone(),
+            payload: JournalPayload::JobState(job),
+        }];
+        if let Some(replacement) = replacement {
+            events.push(JournalEventDraft::runtime(
+                at,
+                replacement.config_hash,
+                replacement.algorithm_revision.clone(),
+                JournalPayload::JobState(replacement),
+            ));
+        }
+        let command = JournalCommand::new(CommandId::new_v7(), events)?;
+        candidate.commit(&command, at).await?;
+    }
+    Ok(())
+}
+
+fn restore_job_is_current(
+    snapshot: &evertrace_store::ProjectionSnapshot,
+    view: &RuntimeSchedulerView,
+    job: &DurableJob,
+    config: &evertrace_domain::config::EffectiveConfig,
+) -> Result<bool, evertrace_store::StoreError> {
+    // Objects projection is a pure authoritative rebuild, independent of config.
+    if job.kind != "objects_projection" && job.config_hash != config.hash() {
+        return Ok(false);
+    }
+    if job.kind == QUIESCED_BACKUP_VERIFY_JOB_KIND {
+        return Ok(false);
+    }
+    if job.kind == "semantic_synthesis_v1" {
+        let llm = &config.config().llm;
+        if !crate::jobs::synthesis::synthesis_identity_is_current(llm, job, config.hash())
+            || !crate::jobs::synthesis::synthesis_budget(
+                llm,
+                Duration::from_secs(config.config().dreaming.max_wall_time.seconds()),
+            )
+            .is_ok_and(|budget| budget == job.budget)
+        {
+            return Ok(false);
+        }
+    }
+    job_target_is_current(snapshot, view, job, config.hash())
+}
+
+/// Pure authoritative target checks, shared by offline preparation and the
+/// ordinary pre-lease boundary. Host manifests are additionally checked online.
+fn job_target_is_current(
+    snapshot: &evertrace_store::ProjectionSnapshot,
+    view: &RuntimeSchedulerView,
+    job: &DurableJob,
+    config_hash: [u8; 32],
+) -> Result<bool, evertrace_store::StoreError> {
+    if job.target_watermark > snapshot.frontier {
+        return Ok(false);
+    }
+    Ok(match job.kind.as_str() {
+        "objects_projection" => view.dirty.iter().any(|dirty| {
+            dirty.target_kind == DirtyTargetKind::ObjectsProjection
+                && dirty.stable_key() == job.idempotency_key
+                && dirty.target_id == job.target_revision
+                && dirty.source_watermark == job.target_watermark
+                && job.target_generation == dirty.source_watermark.max(1)
+                && dirty.algorithm_revision == job.algorithm_revision
+        }),
+        "physical_normalization" | "capture_reconciliation" => {
+            if !capture_job_is_current(job, config_hash) {
+                return Ok(false);
+            }
+            let id = SourceObservationId::from_str(&job.target_revision)
+                .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+            let frontier = snapshot.reconciliation_frontier_for_observations(&[id])?;
+            // A retained, exact dirty target may already have its authoritative
+            // watermark satisfied. That is safe no-work, not a stale target.
+            if frontier.items.is_empty() {
+                return Ok(view.dirty.iter().any(|dirty| {
+                    dirty.target_id == job.target_revision
+                        && dirty.target_kind.as_str() == job.kind
+                        && job.idempotency_key == format!("{}:{}", job.kind, dirty.target_id)
+                        && snapshot
+                            .row(&format!("runtime:dirty:{}", dirty.stable_key()))
+                            .is_some_and(|row| {
+                                row.source_event_seq == job.target_watermark
+                                    && job.target_generation == row.source_event_seq.max(1)
+                            })
+                }));
+            }
+            frontier.items.iter().any(|item| {
+                item.target_id == job.target_revision
+                    && item.source_event_seq == job.target_watermark
+                    && job.target_generation == item.source_event_seq.max(1)
+                    && ((job.kind == "physical_normalization"
+                        && item.target_kind == DirtyTargetKind::PhysicalNormalization)
+                        || (job.kind == "capture_reconciliation"
+                            && item.target_kind == DirtyTargetKind::CaptureReconciliation))
+            })
+        }
+        "semantic_synthesis_v1" => {
+            crate::jobs::synthesis::synthesis_target_is_current(snapshot, job)
+        }
+        "support_closure" => support_context(snapshot, job).is_ok_and(|(contract, current)| {
+            current.support_contract_ref == contract.support_contract_revision_id
+                && current.dependency_generation == job.target_generation
+        }),
+        "session_import_v1" => {
+            import_job_is_current(job, config_hash) && import_target_is_current(snapshot, job)?
+        }
+        QUIESCED_BACKUP_CREATE_JOB_KIND => {
+            job.target_revision == job.job_id.to_string()
+                && job.algorithm_revision == evertrace_store::QUIESCED_BACKUP_ALGORITHM_REVISION
+        }
+        QUIESCED_BACKUP_VERIFY_JOB_KIND => {
+            JobId::from_str(&job.target_revision).is_ok()
+                && job.algorithm_revision == evertrace_store::QUIESCED_BACKUP_ALGORITHM_REVISION
+        }
+        evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND => {
+            evertrace_store::ScopePurgeCurrentView::from_snapshot(snapshot)?
+                .events
+                .values()
+                .any(|progress| {
+                    progress.purge_job_id == job.job_id
+                        && progress.deletion_generation == job.target_generation
+                        && progress.confirmation_frontier == job.target_watermark
+                        && progress.stage != evertrace_domain::purge::ScopePurgeStage::Purged
+                })
+        }
+        _ => return Err(evertrace_store::StoreError::InvalidInput),
+    })
+}
+
+fn import_target_is_current(
+    snapshot: &evertrace_store::ProjectionSnapshot,
+    job: &DurableJob,
+) -> Result<bool, evertrace_store::StoreError> {
+    let sessions =
+        evertrace_store::session_import::SessionImportCurrentView::from_snapshot(snapshot)?;
+    Ok(sessions.sessions.values().any(|session| {
+        job.idempotency_key == format!("session_import:{}", session.session_id)
+            && job.target_revision == session.metadata.source_revision.as_str()
+            && job.target_generation <= session.revision
+            && job.target_watermark <= session.source_event_seq
+            && session.access_decision
+                == Some(evertrace_store::session_import::SessionAccessDecision::Approved)
+            && matches!(
+                session.body_state,
+                evertrace_store::session_import::SessionBodyState::Queued
+                    | evertrace_store::session_import::SessionBodyState::Importing
+                    | evertrace_store::session_import::SessionBodyState::Partial
+            )
+    }))
+}
+
+fn replacement_import_job(job: &DurableJob, config_hash: [u8; 32]) -> DurableJob {
+    let mut replacement = job.clone();
+    replacement.job_id = JobId::new_v7();
+    replacement.config_hash = config_hash;
+    replacement.algorithm_revision = "session_import_v1".into();
+    replacement.model_id = None;
+    replacement.budget = session_import_job_budget();
+    replacement.state = JobStatus::Queued;
+    replacement.attempt = 1;
+    replacement.lease_until_us = None;
+    replacement.backoff_until_us = None;
+    replacement.terminal = None;
+    replacement
+}
+
 pub(crate) fn verify_hook_backup_assets(
     directory: &Path,
     summary: &BackupSummary,
@@ -260,20 +700,8 @@ impl BackgroundScheduler {
                     })
                     && replacement_keys
                         .insert((job.idempotency_key.clone(), job.target_generation));
-                let mut replacement = needs_replacement.then(|| {
-                    let mut replacement = job.clone();
-                    replacement.job_id = JobId::new_v7();
-                    replacement.config_hash = self.runtime.effective_config_hash;
-                    replacement.algorithm_revision = "session_import_v1".into();
-                    replacement.model_id = None;
-                    replacement.budget = session_import_job_budget();
-                    replacement.state = JobStatus::Queued;
-                    replacement.attempt = 1;
-                    replacement.lease_until_us = None;
-                    replacement.backoff_until_us = None;
-                    replacement.terminal = None;
-                    replacement
-                });
+                let mut replacement = needs_replacement
+                    .then(|| replacement_import_job(&job, self.runtime.effective_config_hash));
                 job.state = JobStatus::Failed;
                 job.lease_until_us = None;
                 job.terminal = Some(Box::new(JobTerminalAudit {
@@ -1345,6 +1773,44 @@ impl BackgroundScheduler {
         if current.state != JobStatus::Queued
             || current.target_generation != selected.target_generation
         {
+            return Ok(None);
+        }
+        if !job_target_is_current(
+            &snapshot,
+            &view,
+            current,
+            self.runtime.effective_config_hash,
+        )
+        .map_err(|_| BackgroundSchedulerError::Store)?
+        {
+            let occurred_at_us = now_us()?;
+            let mut stale = current.clone();
+            stale.state = JobStatus::Failed;
+            stale.lease_until_us = None;
+            stale.backoff_until_us = None;
+            stale.terminal = Some(Box::new(JobTerminalAudit {
+                outcome: JobTerminalOutcome::Failed,
+                reason: JobTerminalReason::StaleGeneration,
+                result_ref: Some(stale.target_revision.clone()),
+            }));
+            let command = JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    occurred_at_us,
+                    stale.config_hash,
+                    stale.algorithm_revision.clone(),
+                    JournalPayload::JobState(stale),
+                )],
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+            match self
+                .writer
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .await
+            {
+                Ok(_) | Err(WriterActorError::StaleFrontier) => {}
+                Err(error) => return Err(map_writer(error)),
+            }
             return Ok(None);
         }
         if let Some(report) = report.as_ref() {

@@ -5626,7 +5626,34 @@ impl JournalAdmissionState {
         Ok(())
     }
 
-    fn apply_row_batch(&self, rows: &[&JournalRow]) -> Result<Self, StoreError> {
+    pub(crate) fn apply_row_batch(&self, rows: &[&JournalRow]) -> Result<Self, StoreError> {
+        if crate::restore::ledger_command(rows)? {
+            let mut next = self.clone();
+            for row in rows {
+                match row.payload()? {
+                    JournalPayload::ObjectDeletionLedgerRecorded(value) => {
+                        next.deletions.import_restore(*value, row.seq)?;
+                    }
+                    JournalPayload::ScopePurgeProgressRecorded(value) => {
+                        let repository_id = value.target.repository_id();
+                        if let Some((repository, _)) = next.repositories.get(&repository_id) {
+                            let closure = derive_repository_scope_purge_preview(
+                                next.repository_scope_preview_inputs(),
+                                repository_id,
+                                repository.repository_revision,
+                                true,
+                            )?
+                            .closure;
+                            next.repository_closures.insert(repository_id, closure);
+                        }
+                        next.scope_purges.import_restore(*value, row.seq)?;
+                    }
+                    _ => return Err(StoreError::StoreCorrupt),
+                }
+                next.frontier = next.frontier.max(row.seq);
+            }
+            return Ok(next);
+        }
         let parsed = rows
             .iter()
             .map(|row| {
@@ -7395,6 +7422,30 @@ fn apply_event(
 ) -> Result<(), StoreError> {
     let payload = row.payload()?;
     payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    // The complete batch was checked by admission before event reduction.
+    if row.algorithm_revision == crate::restore::LEDGER_REVISION {
+        match payload {
+            JournalPayload::ObjectDeletionLedgerRecorded(value) => {
+                state.deletions.import_restore(*value, row.seq)?;
+            }
+            JournalPayload::ScopePurgeProgressRecorded(value) => {
+                let repository_id = value.target.repository_id();
+                if let Some((repository, _)) = state.repositories.get(&repository_id) {
+                    let closure = derive_repository_scope_purge_preview(
+                        state.repository_scope_preview_inputs(),
+                        repository_id,
+                        repository.repository_revision,
+                        true,
+                    )?
+                    .closure;
+                    state.repository_closures.insert(repository_id, closure);
+                }
+                state.scope_purges.import_restore(*value, row.seq)?;
+            }
+            _ => return Err(StoreError::StoreCorrupt),
+        }
+        return Ok(());
+    }
     match payload {
         JournalPayload::MigrationApplied(value) => {
             state.migrations.insert(
@@ -11331,7 +11382,9 @@ impl ProjectionWorker {
             let JournalPayload::ScopePurgeProgressRecorded(progress) = payload else {
                 return Err(StoreError::StoreCorrupt);
             };
-            Ok(reconcile || progress.stage == ScopePurgeStage::Pending)
+            Ok(reconcile
+                || progress.stage == ScopePurgeStage::Pending
+                || row.algorithm_revision == crate::restore::LEDGER_REVISION)
         })?;
         let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
@@ -11386,6 +11439,16 @@ impl ProjectionWorker {
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
         reduce_journal(&read_all_journal_rows(&self.journal).await?)
+    }
+
+    pub(crate) async fn rebuild_for_restore(&self) -> Result<ProjectionSnapshot, StoreError> {
+        let expected = self.full_snapshot().await?;
+        self.commit_rows(&expected.rows, true, true, true, true, true)
+            .await?;
+        if validate_objects_table(&self.objects).await? != expected.rows {
+            return Err(StoreError::Projection);
+        }
+        Ok(expected)
     }
 
     pub async fn project_at_frontier(
