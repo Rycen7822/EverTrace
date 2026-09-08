@@ -4912,11 +4912,14 @@ impl RepositoryClosureKeys {
     }
 }
 
-fn cas_ref_string(value: CasId) -> String {
+pub(crate) fn cas_ref_string(value: CasId) -> String {
     hex(&value.as_digest())
 }
 
-fn extend_recovery_bundle_cas_refs(references: &mut BTreeSet<String>, bundle: &RecoveryBundle) {
+pub(crate) fn extend_recovery_bundle_cas_refs(
+    references: &mut BTreeSet<String>,
+    bundle: &RecoveryBundle,
+) {
     for content in bundle
         .tracked_diff_blob_refs
         .iter()

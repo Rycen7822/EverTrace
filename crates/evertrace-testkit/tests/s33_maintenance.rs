@@ -567,6 +567,250 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
     );
 }
 
+#[tokio::test]
+async fn retention_gc_marks_real_spool_backup_receipts_and_waits_without_a_lease() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    let writer = JournalWriter::open(&data).await.unwrap();
+    let (handle, actor) = spawn_writer(writer, 8).unwrap();
+    let mut runtime = runtime_snapshot(&data);
+    runtime.effective_config_hash = EffectiveConfig::default().hash();
+    runtime
+        .publish(&RuntimeSnapshot::snapshot_path(&data))
+        .unwrap();
+    DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+    CasStore::open(runtime.cas_dir.clone()).unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, EffectiveConfig::default().to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let repository_id = RepositoryId::new_v7();
+    handle
+        .commit(
+            repository_command(repository(repository_id, "/gc-test", 1), 1),
+            1,
+        )
+        .await
+        .unwrap();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    let CaptureOutcome::Durable { cas_digest, .. } = capture
+        .capture(capture_input("gc-spool", repository_id, b"backup-only pin"))
+        .unwrap()
+    else {
+        panic!("durable capture");
+    };
+    capture.seal_active().unwrap();
+    drop(capture);
+    assert_eq!(
+        handle
+            .mark_gc(runtime.clone(), 0)
+            .await
+            .unwrap()
+            .candidate_count(),
+        0
+    );
+    let backup_id = JobId::new_v7();
+    handle
+        .create_backup(backup_id, config, runtime.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    // Isolate the backup pin: simulate loss of the live spool in this disposable
+    // fixture, without adding a journal receipt for these backed-up bytes.
+    let spool =
+        DurableSpool::open_read_only(runtime.spool_dir.clone(), runtime.spool_limits().unwrap())
+            .unwrap();
+    for segment in spool.sealed_segments(16).unwrap() {
+        let frames = segment.frames().len();
+        spool.acknowledge_segment(segment, frames).unwrap();
+    }
+    assert_eq!(
+        handle
+            .mark_gc(runtime.clone(), 0)
+            .await
+            .unwrap()
+            .candidate_count(),
+        0
+    );
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    capture
+        .capture(capture_input(
+            "gc-receipt",
+            repository_id,
+            b"journal receipt pin",
+        ))
+        .unwrap();
+    capture.seal_active().unwrap();
+    drop(capture);
+    EvidenceIngestor::new(
+        runtime.clone(),
+        handle.clone(),
+        runtime.effective_config_hash,
+        ALGORITHM,
+    )
+    .unwrap()
+    .drain_once()
+    .await
+    .unwrap();
+    assert_eq!(
+        handle
+            .mark_gc(runtime.clone(), 0)
+            .await
+            .unwrap()
+            .candidate_count(),
+        0
+    );
+    let key = DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let cas = CasStore::open(runtime.cas_dir.clone()).unwrap();
+    let orphan = cas
+        .put(&evertrace_capture::protect::protect(b"gc orphan", &key).unwrap())
+        .unwrap();
+    let before_reference = handle.mark_gc(runtime.clone(), 0).await.unwrap();
+    assert_eq!(before_reference.candidate_count(), 1);
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    let CaptureOutcome::Durable {
+        cas_digest: newly_pinned,
+        ..
+    } = capture
+        .capture(capture_input("gc-after-mark", repository_id, b"gc orphan"))
+        .unwrap()
+    else {
+        panic!("durable capture");
+    };
+    assert_eq!(newly_pinned, orphan.as_hex());
+    capture.seal_active().unwrap();
+    drop(capture);
+    EvidenceIngestor::new(
+        runtime.clone(),
+        handle.clone(),
+        runtime.effective_config_hash,
+        ALGORITHM,
+    )
+    .unwrap()
+    .drain_once()
+    .await
+    .unwrap();
+    assert_eq!(
+        handle
+            .mark_gc(runtime.clone(), 0)
+            .await
+            .unwrap()
+            .candidate_count(),
+        0
+    );
+    let unknown = runtime.spool_dir.join("quarantine/unknown-evidence");
+    std::fs::write(&unknown, b"unknown").unwrap();
+    assert!(handle.mark_gc(runtime.clone(), 0).await.is_err());
+    std::fs::remove_file(&unknown).unwrap();
+    // A fully pinned EOF now completes without grace. Keep a real unreferenced
+    // candidate here so the scheduler/restart assertion exercises the wait.
+    cas.put(&evertrace_capture::protect::protect(b"gc waiting candidate", &key).unwrap())
+        .unwrap();
+    let governance = HumanGovernanceService::new(handle.clone(), runtime.effective_config_hash);
+    let request = RequestId::new_v7();
+    let job_id = JobId::from_uuid(request.as_uuid()).unwrap();
+    let frontier = handle.project().await.unwrap().frontier;
+    assert!(matches!(
+        governance.collect_garbage(request, frontier).await.unwrap(),
+        HumanActionOutcome::Applied { .. }
+    ));
+    let background = scheduler(handle.clone(), runtime.clone());
+    background.run_once().await.unwrap();
+    drop(background);
+    scheduler(handle.clone(), runtime.clone())
+        .run_once()
+        .await
+        .unwrap();
+    let jobs = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    let job = jobs.jobs.iter().find(|job| job.job_id == job_id).unwrap();
+    assert_eq!(
+        (job.state, job.attempt, job.lease_until_us),
+        (JobStatus::Queued, 1, None)
+    );
+    assert!(
+        cas.read(&orphan).is_ok()
+            && cas
+                .read(&CasStore::parse_digest(&cas_digest).unwrap())
+                .is_ok()
+    );
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn retention_gc_continues_past_a_full_pinned_shard_page() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    let writer = JournalWriter::open(&data).await.unwrap();
+    let runtime = runtime_snapshot(&data);
+    let key = DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let cas = CasStore::open(runtime.cas_dir.clone()).unwrap();
+    DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+    let mut payloads = std::collections::BTreeMap::new();
+    for number in 0_u64.. {
+        let bytes = format!("retention page payload {number}").into_bytes();
+        let protected = evertrace_capture::protect::protect(&bytes, &key).unwrap();
+        let digest = evertrace_capture::CasDigest::for_protected_bytes(protected.protected_bytes());
+        if digest.as_bytes()[0] == 0 {
+            cas.put(&protected).unwrap();
+            payloads.insert(digest.as_hex(), bytes);
+            if payloads.len() == 257 {
+                break;
+            }
+        }
+    }
+    let guard = evertrace_capture::MaintenanceFence::open(&data)
+        .unwrap()
+        .exclusive()
+        .unwrap();
+    let first = cas
+        .gc_candidates(
+            &guard,
+            &mut evertrace_capture::cas::CasGcCursor::new(0),
+            256,
+            64 << 20,
+        )
+        .unwrap();
+    assert_eq!(first.len(), 256);
+    drop(guard);
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    for (index, candidate) in first.iter().enumerate() {
+        assert!(matches!(
+            capture
+                .capture(capture_input(
+                    &format!("pinned-page-{index}"),
+                    RepositoryId::new_v7(),
+                    &payloads[&candidate.digest.as_hex()],
+                ))
+                .unwrap(),
+            CaptureOutcome::Durable { .. }
+        ));
+    }
+    capture.seal_active().unwrap();
+    drop(capture);
+    let first = writer
+        .mark_gc_page(&runtime, evertrace_capture::cas::CasGcCursor::new(0))
+        .await
+        .unwrap();
+    assert_eq!(first.round.candidate_count(), 0);
+    assert!(!first.cursor.finished());
+    let second = writer.mark_gc_page(&runtime, first.cursor).await.unwrap();
+    assert_eq!(second.round.candidate_count(), 1);
+    assert!(second.cursor.finished());
+    assert!(
+        writer
+            .sweep_gc(&runtime, JobId::new_v7(), &second.round)
+            .await
+            .is_err()
+    );
+}
+
 fn file_sha256(bytes: &[u8]) -> String {
     copy_exact_sha256_hex(
         &mut Cursor::new(bytes),
@@ -2427,6 +2671,18 @@ async fn repository_purge_closes_immediately_batches_cas_and_resumes_after_reope
     assert_eq!(cas.read(&historical_digest), Err(CasError::NotFound));
     assert_eq!(cas.read(&current_digest), Err(CasError::NotFound));
     let writer = JournalWriter::open(&store).await.unwrap();
+    // GC's authoritative scan includes historical revisions even though normal
+    // product projections correctly suppress the explicitly purged object.
+    assert_eq!(
+        writer
+            .historical_cas_refs_intersect(&BTreeSet::from([
+                historical_digest.as_hex(),
+                current_digest.as_hex()
+            ]))
+            .await
+            .unwrap(),
+        BTreeSet::from([historical_digest.as_hex(), current_digest.as_hex()])
+    );
     let (handle, actor) = spawn_writer(writer, 8).unwrap();
     let service = HumanGovernanceService::new(handle.clone(), CONFIG);
     let terminal_frontier = handle.project().await.unwrap().frontier;

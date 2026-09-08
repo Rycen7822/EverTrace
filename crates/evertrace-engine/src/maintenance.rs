@@ -373,6 +373,12 @@ fn job_target_is_current(
         return Ok(false);
     }
     Ok(match job.kind.as_str() {
+        evertrace_store::optimize::GC_ALGORITHM_REVISION => {
+            job.target_revision == job.job_id.to_string()
+                && job.algorithm_revision == evertrace_store::optimize::GC_ALGORITHM_REVISION
+                && job.target_generation == 1
+                && job.idempotency_key == format!("{}:{}", job.kind, job.job_id)
+        }
         "objects_projection" => view.dirty.iter().any(|dirty| {
             dirty.target_kind == DirtyTargetKind::ObjectsProjection
                 && dirty.stable_key() == job.idempotency_key
@@ -565,6 +571,8 @@ pub struct BackgroundScheduler {
     capture_cursor: Arc<AtomicUsize>,
     repository_purge_plans: Arc<std::sync::Mutex<BTreeMap<JobId, Vec<String>>>>,
     backup_requests: Option<mpsc::Sender<QuiescedBackupRequest>>,
+    gc_rounds: Arc<tokio::sync::Mutex<BTreeMap<JobId, evertrace_store::optimize::GcRound>>>,
+    gc_cursor: Arc<tokio::sync::Mutex<Option<evertrace_capture::cas::CasGcCursor>>>,
 }
 
 impl BackgroundScheduler {
@@ -588,6 +596,8 @@ impl BackgroundScheduler {
             capture_cursor: Arc::new(AtomicUsize::new(0)),
             repository_purge_plans: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             backup_requests: None,
+            gc_rounds: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            gc_cursor: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -602,6 +612,7 @@ impl BackgroundScheduler {
             .unwrap_or(CaptureAdmissionState::Unavailable);
         let optional_allowed = capture_state == CaptureAdmissionState::Normal;
         let mut completed = 0;
+        completed += self.run_gc_round().await?;
         let mut retryable = false;
         if optional_allowed {
             let report = Arc::clone(&self.report).read_owned().await;
@@ -1291,6 +1302,117 @@ impl BackgroundScheduler {
             completed,
             retryable,
         })
+    }
+
+    async fn run_gc_round(&self) -> Result<usize, BackgroundSchedulerError> {
+        let snapshot = self.writer.project().await.map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let Some(job) = view.jobs.iter().find(|job| {
+            job.kind == evertrace_store::optimize::GC_ALGORITHM_REVISION
+                && job.state == JobStatus::Queued
+        }) else {
+            return Ok(0);
+        };
+        let mut rounds = self.gc_rounds.lock().await;
+        rounds.retain(|id, _| {
+            view.jobs
+                .iter()
+                .any(|job| job.job_id == *id && job.state == JobStatus::Queued)
+        });
+        let data_dir = self
+            .runtime
+            .data_dir()
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let interrupted = data_dir
+            .join("maintenance")
+            .join(format!("gc-{}.json", job.job_id))
+            .try_exists()
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let mut failed = interrupted;
+        if !failed && !rounds.contains_key(&job.job_id) {
+            // Enumeration progresses across ticks and jobs, but never survives
+            // restart. Empty pinned pages neither finish the job nor start grace.
+            let mut progress = self.gc_cursor.lock().await;
+            let cursor = progress
+                .take()
+                .filter(|cursor| !cursor.finished())
+                .unwrap_or_else(|| evertrace_capture::cas::CasGcCursor::new(0));
+            match self.writer.mark_gc_page(self.runtime.clone(), cursor).await {
+                Ok(page) => {
+                    let finished = page.cursor.finished();
+                    let empty = page.round.candidate_count() == 0;
+                    *progress = Some(page.cursor);
+                    if empty && !finished {
+                        return Ok(0);
+                    }
+                    rounds.insert(job.job_id, page.round);
+                    if !empty {
+                        return Ok(0);
+                    }
+                }
+                Err(_) => failed = true,
+            }
+        }
+        if !failed
+            && rounds.get(&job.job_id).is_some_and(|round| {
+                round.candidate_count() != 0 && std::time::Instant::now() < round.ready_at()
+            })
+        {
+            return Ok(0);
+        }
+        let Some(claimed) = self.claim_job(job).await? else {
+            return Ok(0);
+        };
+        if !failed {
+            let round = rounds
+                .remove(&job.job_id)
+                .ok_or(BackgroundSchedulerError::Store)?;
+            failed = self
+                .writer
+                .sweep_gc(self.runtime.clone(), job.job_id, round)
+                .await
+                .is_err();
+        }
+        let mut terminal = claimed.job;
+        terminal.state = if failed {
+            JobStatus::Failed
+        } else {
+            JobStatus::Succeeded
+        };
+        terminal.lease_until_us = None;
+        terminal.backoff_until_us = None;
+        terminal.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: if failed {
+                JobTerminalOutcome::Failed
+            } else {
+                JobTerminalOutcome::Succeeded
+            },
+            reason: if failed {
+                JobTerminalReason::IntegrityFailure
+            } else {
+                JobTerminalReason::Completed
+            },
+            result_ref: Some(job.job_id.to_string()),
+        }));
+        let at = now_us()?;
+        self.writer
+            .commit(
+                JournalCommand::new(
+                    CommandId::new_v7(),
+                    vec![JournalEventDraft::runtime(
+                        at,
+                        terminal.config_hash,
+                        terminal.algorithm_revision.clone(),
+                        JournalPayload::JobState(terminal),
+                    )],
+                )
+                .map_err(|_| BackgroundSchedulerError::Store)?,
+                at,
+            )
+            .await
+            .map_err(map_writer)?;
+        Ok(1)
     }
 
     async fn run_backup_create(

@@ -27,6 +27,46 @@ use crate::{
     search::SEARCH_TABLE,
 };
 
+pub(crate) struct GcAuthority {
+    references: std::collections::BTreeSet<String>,
+    backup_root: Option<evertrace_capture::confined_read::ConfinedRoot>,
+    backup_names: Vec<String>,
+    backups: Vec<crate::backup::BackupVerification>,
+}
+
+impl GcAuthority {
+    pub(crate) fn revalidate(&self, data_dir: &Path) -> Result<(), StoreError> {
+        // A shared deadline and total metadata budget, not one budget per backup.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let mut remaining = 100_000;
+        let path = data_dir.join("backups");
+        if let Some(root) = &self.backup_root {
+            root.revalidate_stable()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let names = root
+                .list_directory(None, 64, deadline)
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>();
+            if names != self.backup_names {
+                return Err(StoreError::StoreCorrupt);
+            }
+            for backup in &self.backups {
+                backup
+                    .revalidate_gc_inputs(deadline, &mut remaining)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+            }
+            root.revalidate_stable()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+        } else if !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedCommand {
     pub command_id: evertrace_domain::ids::CommandId,
@@ -478,6 +518,190 @@ impl JournalWriter {
 
     pub async fn journal_rows(&self) -> Result<Vec<crate::JournalRow>, StoreError> {
         read_all_journal_rows(&self.journal).await
+    }
+
+    pub async fn mark_gc(
+        &self,
+        runtime: &evertrace_capture::RuntimeSnapshot,
+        shard: u8,
+    ) -> Result<crate::optimize::GcRound, StoreError> {
+        Ok(self
+            .mark_gc_page(runtime, evertrace_capture::cas::CasGcCursor::new(shard))
+            .await?
+            .round)
+    }
+
+    pub async fn mark_gc_page(
+        &self,
+        runtime: &evertrace_capture::RuntimeSnapshot,
+        mut cursor: evertrace_capture::cas::CasGcCursor,
+    ) -> Result<crate::optimize::GcScanPage, StoreError> {
+        if runtime.data_dir().map_err(|_| StoreError::InvalidInput)? != self._lock.data_dir() {
+            return Err(StoreError::InvalidInput);
+        }
+        self._lock.validate_held()?;
+        let guard = evertrace_capture::MaintenanceFence::open(self._lock.data_dir())
+            .and_then(|fence| fence.exclusive())
+            .map_err(|_| StoreError::Io)?;
+        let cas = evertrace_capture::CasStore::open_existing(runtime.cas_dir.clone())
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let candidates = cas
+            .gc_candidates(
+                &guard,
+                &mut cursor,
+                crate::optimize::GC_MAX_FILES,
+                crate::optimize::GC_MAX_BYTES,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        drop(guard);
+        cas.verify_gc_candidates(&candidates)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let ids = candidates
+            .iter()
+            .map(|candidate| candidate.digest.as_hex())
+            .collect();
+        let authority = self.gc_authority(runtime, &ids).await?;
+        self._lock.validate_held()?;
+        let guard = evertrace_capture::MaintenanceFence::open(self._lock.data_dir())
+            .and_then(|fence| fence.exclusive())
+            .map_err(|_| StoreError::Io)?;
+        authority.revalidate(self._lock.data_dir())?;
+        evertrace_capture::CasStore::validate_gc_candidates(&guard, &candidates)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let mut references = authority.references;
+        references.extend(self.gc_spool_references(runtime, &ids)?);
+        Ok(crate::optimize::GcScanPage {
+            cursor,
+            round: crate::optimize::GcRound::mark(
+                candidates,
+                &references,
+                self.frontier(),
+                std::time::Instant::now(),
+            ),
+        })
+    }
+
+    pub async fn historical_cas_refs_intersect(
+        &self,
+        candidates: &std::collections::BTreeSet<String>,
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        crate::optimize::historical_cas_refs(&self.journal, self.frontier(), candidates).await
+    }
+
+    pub async fn sweep_gc(
+        &self,
+        runtime: &evertrace_capture::RuntimeSnapshot,
+        job_id: evertrace_domain::ids::JobId,
+        round: &crate::optimize::GcRound,
+    ) -> Result<crate::optimize::GcReport, StoreError> {
+        if runtime.data_dir().map_err(|_| StoreError::InvalidInput)? != self._lock.data_dir() {
+            return Err(StoreError::InvalidInput);
+        }
+        self._lock.validate_held()?;
+        let ids = round.candidates();
+        let authority = self.gc_authority(runtime, &ids).await?;
+        self._lock.validate_held()?;
+        let guard = evertrace_capture::MaintenanceFence::open(self._lock.data_dir())
+            .and_then(|fence| fence.exclusive())
+            .map_err(|_| StoreError::Io)?;
+        authority.revalidate(self._lock.data_dir())?;
+        let mut references = authority.references;
+        references.extend(self.gc_spool_references(runtime, &ids)?);
+        let candidates = round.sweep_candidates(&guard, &references, std::time::Instant::now())?;
+        let report = crate::optimize::delete_and_report(
+            self._lock.data_dir(),
+            &guard,
+            job_id,
+            round,
+            &candidates,
+            self.frontier(),
+        )?;
+        drop(guard);
+        self._lock.validate_held()?;
+        crate::optimize::conservative_prune(
+            self._lock.data_dir(),
+            [&self.journal, &self.objects, &self.relations, &self.search],
+            report,
+        )
+        .await
+    }
+
+    pub(crate) async fn gc_authority(
+        &self,
+        runtime: &evertrace_capture::RuntimeSnapshot,
+        candidates: &std::collections::BTreeSet<String>,
+    ) -> Result<GcAuthority, StoreError> {
+        if runtime.data_dir().map_err(|_| StoreError::InvalidInput)? != self._lock.data_dir() {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut refs = self.historical_cas_refs_intersect(candidates).await?;
+        refs.extend(self.project().await?.live_cas_refs_intersect(candidates)?);
+        let mut authority = GcAuthority {
+            references: refs,
+            backup_root: None,
+            backup_names: Vec::new(),
+            backups: Vec::new(),
+        };
+        let backups = self._lock.data_dir().join("backups");
+        let backups_present = match std::fs::symlink_metadata(&backups) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(StoreError::Io),
+        };
+        if backups_present {
+            let root = evertrace_capture::confined_read::ConfinedRoot::open_owned_private(&backups)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let entries = root
+                .list_directory(
+                    None,
+                    64,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            for entry in entries {
+                let id = entry
+                    .name
+                    .strip_prefix("backup-")
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .parse()
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let verification =
+                    crate::backup::prepare_backup_verification(self._lock.data_dir(), id)
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                crate::backup::complete_backup_verification_ref(&verification)
+                    .await
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                authority
+                    .references
+                    .extend(verification.cas_refs_intersect(candidates));
+                authority.backup_names.push(entry.name);
+                authority.backups.push(verification);
+            }
+            root.revalidate_stable()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            authority.backup_root = Some(root);
+        }
+        Ok(authority)
+    }
+
+    fn gc_spool_references(
+        &self,
+        runtime: &evertrace_capture::RuntimeSnapshot,
+        candidates: &std::collections::BTreeSet<String>,
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        let limits = runtime
+            .spool_limits()
+            .map_err(|_| StoreError::InvalidInput)?;
+        let spool =
+            evertrace_capture::DurableSpool::open_read_only(runtime.spool_dir.clone(), limits)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+        spool
+            .gc_cas_refs_intersect(
+                candidates,
+                limits.max_main_files as usize,
+                limits.high_watermark_bytes,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)
     }
 
     pub async fn object_rows(&self) -> Result<Vec<crate::ObjectRow>, StoreError> {

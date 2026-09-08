@@ -615,6 +615,25 @@ impl DurableSpool {
         Ok(retained)
     }
 
+    /// GC cannot interpret quarantined bytes as an empty reference set. Any
+    /// entry, including an unrecognized filename, makes this round inconclusive.
+    pub fn gc_cas_refs_intersect(
+        &self,
+        candidates: &BTreeSet<String>,
+        max_segments: usize,
+        max_bytes: u64,
+    ) -> Result<BTreeSet<String>, SpoolError> {
+        self.validate_directories()?;
+        if fs::read_dir(&self.quarantine_dir)
+            .map_err(map_io)?
+            .next()
+            .is_some()
+        {
+            return Err(SpoolError::Corrupt);
+        }
+        self.durable_cas_refs_intersect(candidates, max_segments, max_bytes)
+    }
+
     fn visit_durable_records(
         &self,
         max_segments: usize,

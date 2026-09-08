@@ -600,6 +600,20 @@ impl App {
                     self.state.last_action = Some(local_unavailable("backup_create_unavailable"));
                 }
             }
+            UiCommand::PrepareCollectGarbage => {
+                if self.state.write_queued {
+                    self.state.last_action = Some(local_transport_error());
+                    return command;
+                }
+                self.state.proposal_confirmation =
+                    create_backup_action(&self.state).map(|(frontier, _, review)| {
+                        (
+                            frontier,
+                            evertrace_protocol::dto::HumanActionRequest::CollectGarbage,
+                            review,
+                        )
+                    });
+            }
             UiCommand::PrepareVerifyBackup => {
                 if self.state.write_queued {
                     self.state.last_action = Some(local_transport_error());
@@ -1846,6 +1860,9 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         HumanActionRequest::ForgetObject { .. } => "forget object",
         HumanActionRequest::PurgeRepository { .. } => "purge repository",
         HumanActionRequest::CreateBackup => "create quiesced backup",
+        HumanActionRequest::CollectGarbage => {
+            "collect orphan CAS (24 h grace) and prune versions older than 30 d"
+        }
         HumanActionRequest::VerifyBackup { .. } => "verify backup",
         HumanActionRequest::Unavailable { .. } => "unavailable action",
     }
@@ -2109,6 +2126,7 @@ mod tests {
                 },
                 terminal_reason: Some(evertrace_protocol::dto::HumanJobTerminalReason::Completed),
                 terminal_result_ref: Some(format!("backup:{backup_job_id}")),
+                gc_summary: None,
                 backup_summary: Some(HumanBackupSummary {
                     frontier: 9,
                     journal: HumanBackupTableState {
@@ -2172,6 +2190,15 @@ mod tests {
             Some((
                 9,
                 evertrace_protocol::dto::HumanActionRequest::CreateBackup,
+                None
+            ))
+        ));
+        app.dispatch(UiCommand::PrepareCollectGarbage);
+        assert!(matches!(
+            app.state.proposal_confirmation.take(),
+            Some((
+                9,
+                evertrace_protocol::dto::HumanActionRequest::CollectGarbage,
                 None
             ))
         ));
@@ -2395,6 +2422,7 @@ mod tests {
                 terminal_reason: None,
                 terminal_result_ref: None,
                 backup_summary: None,
+                gc_summary: None,
             }),
         });
         app.state.detail = Some(job_detail.clone());

@@ -143,6 +143,21 @@ pub async fn read_journal_after(table: &Table, seq: u64) -> Result<Vec<JournalRo
     .await
 }
 
+pub(crate) async fn read_journal_page(
+    table: &Table,
+    after: u64,
+    frontier: u64,
+) -> Result<Vec<JournalRow>, StoreError> {
+    read_query(
+        table
+            .query()
+            .only_if(format!("seq > {after} AND seq <= {frontier}"))
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("seq".into())]))
+            .limit(256),
+    )
+    .await
+}
+
 pub(crate) async fn read_journal_frontier(table: &Table) -> Result<u64, StoreError> {
     let query = table
         .query()

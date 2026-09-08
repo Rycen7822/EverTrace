@@ -526,6 +526,36 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
                         detail.terminal_reason, detail.terminal_result_ref
                     ),
                 ]);
+                if let Some(gc) = &detail.gc_summary {
+                    lines.extend([
+                        format!(
+                            "GC bounded batch examined/marked: {}/{}",
+                            gc.examined_files, gc.marked_candidates
+                        ),
+                        format!(
+                            "GC deleted objects/bytes: {}/{}",
+                            gc.deleted_count, gc.deleted_bytes
+                        ),
+                        format!("GC unknown/interrupted: {}", gc.unknown_count),
+                        format!(
+                            "GC mark/sweep watermark: {}/{}",
+                            gc.mark_watermark, gc.sweep_watermark
+                        ),
+                        format!("GC checksum: {}", gc.checksum),
+                    ]);
+                    for result in &gc.conservative_prune {
+                        lines.push(match (result.old_versions, result.bytes_removed) {
+                            (Some(versions), Some(bytes)) => format!(
+                                "Prune {} confirmed: versions {versions}, bytes {bytes}",
+                                result.table
+                            ),
+                            _ => format!("Prune {}: unknown/interrupted", result.table),
+                        });
+                    }
+                    if gc.conservative_prune.is_empty() {
+                        lines.push("Prune: not started/confirmed".into());
+                    }
+                }
                 if let Some(backup) = &detail.backup_summary {
                     lines.extend([
                         format!(

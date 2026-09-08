@@ -9,6 +9,7 @@ pub mod connection;
 pub mod journal;
 pub mod migrations;
 pub mod objects;
+pub mod optimize;
 pub mod projections;
 pub mod purge;
 pub mod query;

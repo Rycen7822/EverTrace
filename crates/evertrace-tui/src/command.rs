@@ -23,6 +23,7 @@ pub enum UiCommand {
     PrepareForgetObject,
     PrepareRepositoryPurge,
     PrepareCreateBackup,
+    PrepareCollectGarbage,
     PrepareVerifyBackup,
     ConfirmProposal,
     PrepareRecovery(RecoveryApplicationKind),

@@ -631,6 +631,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             .create_backup(request_id, expected_frontier)
                                             .await
                                     }
+                                    HumanActionRequest::CollectGarbage => {
+                                        human_governance.collect_garbage(request_id, expected_frontier).await
+                                    }
                                     HumanActionRequest::VerifyBackup { backup_job_id } => {
                                         human_governance
                                             .verify_backup(
@@ -1312,6 +1315,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                             terminal_reason,
                             terminal_result_ref,
                             backup_summary,
+                            gc_report,
                         } = *detail;
                         HumanSystemDetail::Job {
                             detail: Box::new(HumanJobDetail {
@@ -1369,6 +1373,19 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                                 }),
                                 terminal_result_ref,
                                 backup_summary: backup_summary.map(map_human_backup_summary),
+                                gc_summary: gc_report.map(|report| evertrace_protocol::dto::HumanGcSummary {
+                                    examined_files: report.examined_files as u32,
+                                    marked_candidates: report.marked_candidates as u32,
+                                    deleted_count: report.deleted_count() as u32,
+                                    deleted_bytes: report.deleted_bytes(),
+                                    unknown_count: report.unknown_count() as u32,
+                                    mark_watermark: report.mark_watermark,
+                                    sweep_watermark: report.sweep_watermark,
+                                    checksum: report.checksum,
+                                    conservative_prune: report.conservative_prune.into_iter().map(|result| evertrace_protocol::dto::HumanConservativePruneResult {
+                                        table: result.table, bytes_removed: result.bytes_removed, old_versions: result.old_versions,
+                                    }).collect(),
+                                }),
                             }),
                         }
                     }

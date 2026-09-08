@@ -3,7 +3,10 @@ use std::{
     fmt,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -113,6 +116,37 @@ pub struct CasStore {
 pub enum CasDeleteOutcome {
     Deleted,
     Missing,
+}
+
+#[derive(Clone, Debug)]
+pub struct CasGcCandidate {
+    pub digest: CasDigest,
+    pub bytes: u64,
+    uncompressed_bytes: u64,
+    identity: (u64, u64, i64, i64),
+    parent_identity: (u64, u64),
+    cas_identity: (u64, u64),
+}
+
+/// Process-local enumeration only: never serialized, and discarded on restart.
+pub struct CasGcCursor {
+    first_shard: u8,
+    offset: u16,
+    directory: Option<(File, fs::ReadDir)>,
+}
+
+impl CasGcCursor {
+    pub fn new(first_shard: u8) -> Self {
+        Self {
+            first_shard,
+            offset: 0,
+            directory: None,
+        }
+    }
+
+    pub fn finished(&self) -> bool {
+        self.offset == 256
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +294,152 @@ impl MaintenanceGuard {
 }
 
 impl CasStore {
+    /// Enumerate one bounded canonical shard while holding the producer fence.
+    /// Unknown files and over-limit shards are inconclusive, never deletable.
+    pub fn gc_candidates(
+        &self,
+        guard: &MaintenanceGuard,
+        cursor: &mut CasGcCursor,
+        max_files: usize,
+        max_bytes: u64,
+    ) -> Result<Vec<CasGcCandidate>, CasError> {
+        let data_dir = self.root.parent().ok_or(CasError::InvalidPath)?;
+        guard.require_exclusive_for(data_dir)?;
+        if directory_identity(&self.root)? != directory_file_identity(&guard.cas_dir)? {
+            return Err(CasError::IdentityChanged);
+        }
+        let mut total = 0_u64;
+        let mut uncompressed_total = 0_u64;
+        let mut candidates = Vec::new();
+        let mut examined = 0;
+        while !cursor.finished() && examined < max_files {
+            let prefix = format!(
+                "{:02x}",
+                cursor.first_shard.wrapping_add(cursor.offset as u8)
+            );
+            if cursor.directory.is_none() {
+                let Some(parent) = open_optional_directory_at(&guard.blobs_dir, &prefix)? else {
+                    cursor.offset += 1;
+                    continue;
+                };
+                let entries = fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+                    .map_err(map_io)?;
+                cursor.directory = Some((parent, entries));
+            }
+            let (parent, entries) = cursor.directory.as_mut().ok_or(CasError::StoreCorrupt)?;
+            let current = open_optional_directory_at(&guard.blobs_dir, &prefix)?
+                .ok_or(CasError::IdentityChanged)?;
+            if directory_file_identity(parent)? != directory_file_identity(&current)? {
+                return Err(CasError::IdentityChanged);
+            }
+            let Some(entry) = entries.next() else {
+                cursor.directory = None;
+                cursor.offset += 1;
+                continue;
+            };
+            let entry = entry.map_err(map_io)?;
+            examined += 1;
+            if !entry.file_type().map_err(map_io)?.is_file() {
+                return Err(CasError::InvalidType);
+            }
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(CasError::InvalidPath)?;
+            let digest = CasDigest::from_str(&format!("{prefix}{name}"))?;
+            let mut file = File::from(
+                openat(
+                    &*parent,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| CasError::Io)?,
+            );
+            let before = file.metadata().map_err(map_io)?;
+            validate_lock_metadata(&before)?;
+            let mut header = [0_u8; HEADER_LENGTH];
+            file.read_exact(&mut header)
+                .map_err(|_| CasError::StoreCorrupt)?;
+            let decoded = decode_header(&header, &digest)?;
+            if decoded.uncompressed_length > max_bytes || before.len() > max_bytes {
+                continue;
+            }
+            let bytes = before.len();
+            let Some(next_total) = total.checked_add(bytes).filter(|total| *total <= max_bytes)
+            else {
+                // This file remains retained; consuming it cannot block later
+                // small files. A later full enumeration may select it.
+                continue;
+            };
+            let Some(next_uncompressed) = uncompressed_total
+                .checked_add(decoded.uncompressed_length)
+                .filter(|total| *total <= max_bytes)
+            else {
+                continue;
+            };
+            total = next_total;
+            uncompressed_total = next_uncompressed;
+            if metadata_identity(&before) != file_identity(&file)? || before.len() != bytes {
+                return Err(CasError::IdentityChanged);
+            }
+            candidates.push(CasGcCandidate {
+                digest,
+                bytes,
+                uncompressed_bytes: decoded.uncompressed_length,
+                identity: metadata_identity(&before),
+                parent_identity: directory_file_identity(parent)?,
+                cas_identity: directory_file_identity(&guard.cas_dir)?,
+            });
+        }
+        Self::validate_gc_candidates(guard, &candidates)?;
+        Ok(candidates)
+    }
+
+    /// Expensive envelope hashing/decompression belongs outside the exclusive
+    /// fence. The Writer rechecks original candidate identities after this pass.
+    pub fn verify_gc_candidates(&self, candidates: &[CasGcCandidate]) -> Result<(), CasError> {
+        for candidate in candidates {
+            if self.verify_envelope(&candidate.digest)? != candidate.uncompressed_bytes {
+                return Err(CasError::StoreCorrupt);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_gc_candidates(
+        guard: &MaintenanceGuard,
+        candidates: &[CasGcCandidate],
+    ) -> Result<(), CasError> {
+        if !guard.exclusive {
+            return Err(CasError::ExclusiveMaintenanceRequired);
+        }
+        for candidate in candidates {
+            let name = candidate.digest.as_hex();
+            let parent = open_directory_at(&guard.blobs_dir, &name[..2])?;
+            if directory_file_identity(&parent)? != candidate.parent_identity
+                || directory_file_identity(&guard.cas_dir)? != candidate.cas_identity
+            {
+                return Err(CasError::IdentityChanged);
+            }
+            let file = File::from(
+                openat(
+                    &parent,
+                    &name[2..],
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| CasError::Io)?,
+            );
+            let metadata = file.metadata().map_err(map_io)?;
+            validate_lock_metadata(&metadata)?;
+            if metadata_identity(&metadata) != candidate.identity
+                || metadata.len() != candidate.bytes
+            {
+                return Err(CasError::IdentityChanged);
+            }
+        }
+        Ok(())
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, CasError> {
         let store = Self { root: root.into() };
         ensure_directory(&store.root)?;

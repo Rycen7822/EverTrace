@@ -17,6 +17,17 @@ use tokio::{
 };
 
 enum WriterRequest {
+    MarkGc {
+        runtime: Box<evertrace_capture::RuntimeSnapshot>,
+        cursor: evertrace_capture::cas::CasGcCursor,
+        reply: oneshot::Sender<Result<evertrace_store::optimize::GcScanPage, WriterActorError>>,
+    },
+    SweepGc {
+        runtime: Box<evertrace_capture::RuntimeSnapshot>,
+        job_id: evertrace_domain::ids::JobId,
+        round: evertrace_store::optimize::GcRound,
+        reply: oneshot::Sender<Result<evertrace_store::optimize::GcReport, WriterActorError>>,
+    },
     Commit {
         command: JournalCommand,
         ingested_at_us: i64,
@@ -68,6 +79,52 @@ pub struct WriterHandle {
 }
 
 impl WriterHandle {
+    pub async fn mark_gc(
+        &self,
+        runtime: evertrace_capture::RuntimeSnapshot,
+        shard: u8,
+    ) -> Result<evertrace_store::optimize::GcRound, WriterActorError> {
+        Ok(self
+            .mark_gc_page(runtime, evertrace_capture::cas::CasGcCursor::new(shard))
+            .await?
+            .round)
+    }
+
+    pub async fn mark_gc_page(
+        &self,
+        runtime: evertrace_capture::RuntimeSnapshot,
+        cursor: evertrace_capture::cas::CasGcCursor,
+    ) -> Result<evertrace_store::optimize::GcScanPage, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::MarkGc {
+                runtime: Box::new(runtime),
+                cursor,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn sweep_gc(
+        &self,
+        runtime: evertrace_capture::RuntimeSnapshot,
+        job_id: evertrace_domain::ids::JobId,
+        round: evertrace_store::optimize::GcRound,
+    ) -> Result<evertrace_store::optimize::GcReport, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SweepGc {
+                runtime: Box::new(runtime),
+                job_id,
+                round,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
     pub fn subscribe_recall_frontier(&self) -> watch::Receiver<u64> {
         self.recall_frontier.subscribe()
     }
@@ -478,6 +535,33 @@ async fn run_writer(
             WriterRequest::Shutdown { reply } => {
                 receiver.close();
                 shutdown_replies.push(reply);
+            }
+            WriterRequest::MarkGc {
+                runtime,
+                cursor,
+                reply,
+            } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .mark_gc_page(&runtime, cursor)
+                    .await
+                    .map_err(map_store_error);
+                let _ = reply.send(result);
+            }
+            WriterRequest::SweepGc {
+                runtime,
+                job_id,
+                round,
+                reply,
+            } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .sweep_gc(&runtime, job_id, &round)
+                    .await
+                    .map_err(map_store_error);
+                let _ = reply.send(result);
             }
         }
     }

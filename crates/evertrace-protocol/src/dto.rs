@@ -181,6 +181,7 @@ pub enum HumanActionRequest {
         expected_deletion_generation: u64,
     },
     CreateBackup,
+    CollectGarbage,
     VerifyBackup {
         backup_job_id: JobId,
     },
@@ -554,6 +555,30 @@ pub struct HumanJobDetail {
     pub terminal_result_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_summary: Option<HumanBackupSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_summary: Option<HumanGcSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanGcSummary {
+    pub examined_files: u32,
+    pub marked_candidates: u32,
+    pub deleted_count: u32,
+    pub deleted_bytes: u64,
+    pub unknown_count: u32,
+    pub mark_watermark: u64,
+    pub sweep_watermark: u64,
+    pub checksum: String,
+    pub conservative_prune: Vec<HumanConservativePruneResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanConservativePruneResult {
+    pub table: String,
+    pub bytes_removed: Option<u64>,
+    pub old_versions: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -778,7 +803,7 @@ impl HumanActionRequest {
                     && *expected_repository_revision > 0
                     && *expected_deletion_generation > 0
             }
-            Self::CreateBackup | Self::VerifyBackup { .. } => true,
+            Self::CreateBackup | Self::VerifyBackup { .. } | Self::CollectGarbage => true,
             Self::Unavailable { .. } => true,
         }
     }
@@ -1184,6 +1209,7 @@ impl HumanSystemDetail {
                     terminal_reason,
                     terminal_result_ref,
                     backup_summary,
+                    gc_summary,
                     ..
                 } = detail.as_ref();
                 let terminal = terminal_reason.is_some();
@@ -1223,6 +1249,32 @@ impl HumanSystemDetail {
                             && summary.validate()
                     })
                     && budget.validate()
+                    && gc_summary.as_ref().is_none_or(|summary| {
+                        job_kind == "two_pass_gc_v1"
+                            && valid_hex(&summary.checksum)
+                            && summary.mark_watermark <= summary.sweep_watermark
+                            && summary.marked_candidates <= summary.examined_files
+                            && summary.examined_files <= budget.max_items
+                            && summary.deleted_count <= summary.marked_candidates
+                            && summary.unknown_count <= summary.marked_candidates
+                            && summary
+                                .deleted_count
+                                .checked_add(summary.unknown_count)
+                                .is_some_and(|count| count <= summary.marked_candidates)
+                            && summary.conservative_prune.len() <= 4
+                            && summary.conservative_prune.iter().all(|result| {
+                                valid_short(&result.table)
+                                    && result.bytes_removed.is_some()
+                                        == result.old_versions.is_some()
+                            })
+                            && (*state != HumanJobState::Succeeded
+                                || (summary.unknown_count == 0
+                                    && summary.conservative_prune.len() == 4
+                                    && summary
+                                        .conservative_prune
+                                        .iter()
+                                        .all(|result| result.bytes_removed.is_some())))
+                    })
             }
             Self::Config { config_version, .. } => {
                 item.stable_key == "runtime:config:current" && *config_version > 0

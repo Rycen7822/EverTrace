@@ -398,6 +398,7 @@ pub struct HumanJobDetail {
     pub terminal_reason: Option<HumanJobTerminalReason>,
     pub terminal_result_ref: Option<String>,
     pub backup_summary: Option<HumanBackupSummary>,
+    pub gc_report: Option<evertrace_store::optimize::GcReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -968,6 +969,25 @@ impl HumanGovernanceService {
                 return Err(HumanGovernanceError::Store);
             };
             detail.backup_summary = Some(human_backup_summary(summary, validation_result));
+        }
+        for item in &mut items {
+            if let Some(HumanSystemDetail::Job { detail }) = item.system_detail.as_mut()
+                && detail.job_kind == evertrace_store::optimize::GC_ALGORITHM_REVISION
+                && let Some(runtime) = &self.runtime_snapshot
+            {
+                let data_dir = runtime
+                    .data_dir()
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                let path = data_dir
+                    .join("maintenance")
+                    .join(format!("gc-{}.json", detail.job_id));
+                if path.try_exists().map_err(|_| HumanGovernanceError::Store)? {
+                    detail.gc_report = Some(
+                        evertrace_store::optimize::read_gc_report(data_dir, detail.job_id)
+                            .map_err(|_| HumanGovernanceError::Store)?,
+                    );
+                }
+            }
         }
         let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
@@ -2878,11 +2898,28 @@ impl HumanGovernanceService {
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
         let job_id = JobId::from_uuid(request_id.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        self.queue_backup_job(
+        self.queue_maintenance_job(
             request_id,
             expected_frontier,
             job_id,
             QUIESCED_BACKUP_CREATE_JOB_KIND,
+            job_id.to_string(),
+        )
+        .await
+    }
+
+    pub async fn collect_garbage(
+        &self,
+        request_id: RequestId,
+        expected_frontier: u64,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let job_id = JobId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        self.queue_maintenance_job(
+            request_id,
+            expected_frontier,
+            job_id,
+            evertrace_store::optimize::GC_ALGORITHM_REVISION,
             job_id.to_string(),
         )
         .await
@@ -2896,7 +2933,7 @@ impl HumanGovernanceService {
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
         let job_id = JobId::from_uuid(request_id.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        self.queue_backup_job(
+        self.queue_maintenance_job(
             request_id,
             expected_frontier,
             job_id,
@@ -2906,7 +2943,7 @@ impl HumanGovernanceService {
         .await
     }
 
-    async fn queue_backup_job(
+    async fn queue_maintenance_job(
         &self,
         request_id: RequestId,
         expected_frontier: u64,
@@ -2914,6 +2951,12 @@ impl HumanGovernanceService {
         kind: &str,
         target_revision: String,
     ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        let gc = kind == evertrace_store::optimize::GC_ALGORITHM_REVISION;
+        let algorithm = if gc {
+            evertrace_store::optimize::GC_ALGORITHM_REVISION
+        } else {
+            QUIESCED_BACKUP_ALGORITHM_REVISION
+        };
         let command_id = CommandId::from_uuid(request_id.as_uuid())
             .map_err(|_| HumanGovernanceError::InvalidInput)?;
         if let Some(committed) = self
@@ -2968,7 +3011,7 @@ impl HumanGovernanceService {
             target_watermark: snapshot.frontier,
             target_generation: 1,
             kind: kind.into(),
-            algorithm_revision: QUIESCED_BACKUP_ALGORITHM_REVISION.into(),
+            algorithm_revision: algorithm.into(),
             model_id: None,
             priority: 100,
             state: JobStatus::Queued,
@@ -2976,12 +3019,16 @@ impl HumanGovernanceService {
             backoff_until_us: None,
             config_hash: self.effective_config_hash,
             budget: JobBudget {
-                max_items: 100_000,
-                max_bytes: None,
+                max_items: if gc {
+                    evertrace_store::optimize::GC_MAX_FILES as u32
+                } else {
+                    100_000
+                },
+                max_bytes: gc.then_some(evertrace_store::optimize::GC_MAX_BYTES),
                 max_input_tokens: None,
                 max_output_tokens: None,
                 max_calls: None,
-                max_wall_time_ms: 86_400_000,
+                max_wall_time_ms: if gc { 60_000 } else { 86_400_000 },
             },
             terminal: None,
             lease_until_us: None,
@@ -2991,7 +3038,7 @@ impl HumanGovernanceService {
             vec![evertrace_store::JournalEventDraft::runtime(
                 occurred_at_us,
                 self.effective_config_hash,
-                QUIESCED_BACKUP_ALGORITHM_REVISION,
+                algorithm,
                 JournalPayload::JobState(job),
             )],
         )
@@ -4382,6 +4429,7 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                             .terminal
                             .and_then(|terminal| terminal.result_ref),
                         backup_summary: None,
+                        gc_report: None,
                     }),
                 }),
             ))

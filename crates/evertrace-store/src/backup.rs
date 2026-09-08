@@ -235,6 +235,45 @@ pub struct BackupVerification {
     manifest: BackupManifest,
     summary: BackupSummary,
     root_identity: FileIdentity,
+    input_identities: Vec<(PathBuf, bool, FileIdentity)>,
+}
+
+impl BackupVerification {
+    pub(crate) fn revalidate_gc_inputs(
+        &self,
+        deadline: std::time::Instant,
+        remaining: &mut usize,
+    ) -> Result<(), BackupError> {
+        if private_directory_identity(&self.directory)? != self.root_identity {
+            return Err(BackupError::IdentityChanged);
+        }
+        for (relative, directory, expected) in &self.input_identities {
+            if *remaining == 0 || std::time::Instant::now() >= deadline {
+                return Err(BackupError::ResourceExhausted);
+            }
+            *remaining -= 1;
+            let path = self.directory.join(relative);
+            let actual = if *directory {
+                private_directory_identity(&path)?
+            } else {
+                private_file_identity(&path)?
+            };
+            if actual != *expected {
+                return Err(BackupError::IdentityChanged);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cas_refs_intersect(&self, candidates: &BTreeSet<String>) -> BTreeSet<String> {
+        self.manifest
+            .live_cas_refs
+            .iter()
+            .chain(&self.manifest.spool_cas_refs)
+            .filter(|value| candidates.contains(*value))
+            .cloned()
+            .collect()
+    }
 }
 
 impl BackupStaging {
@@ -381,6 +420,37 @@ pub(crate) fn prepare_backup(
         BackupFileKind::Regular,
         &mut sources,
     )?;
+    let maintenance = data_dir.join("maintenance");
+    if maintenance.try_exists().map_err(|_| BackupError::Io)? {
+        let root = evertrace_capture::ConfinedRoot::open_owned_private(&maintenance)
+            .map_err(|_| BackupError::Corrupt)?;
+        let entries = root
+            .list_directory(
+                None,
+                1024,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .map_err(|_| BackupError::ResourceExhausted)?;
+        for entry in entries {
+            if entry.name.starts_with('.') {
+                continue;
+            }
+            let id = entry
+                .name
+                .strip_prefix("gc-")
+                .and_then(|name| name.strip_suffix(".json"))
+                .ok_or(BackupError::Corrupt)?
+                .parse()
+                .map_err(|_| BackupError::Corrupt)?;
+            crate::optimize::read_gc_report(data_dir, id).map_err(map_store)?;
+            push_source(
+                &maintenance.join(&entry.name),
+                &PathBuf::from("maintenance").join(&entry.name),
+                BackupFileKind::Regular,
+                &mut sources,
+            )?;
+        }
+    }
     for file in &hook.files {
         if file
             .source
@@ -780,7 +850,7 @@ pub(crate) async fn verify_staged_backup(
 fn verify_backup_files(
     directory: &Path,
     expected_job_id: Option<JobId>,
-) -> Result<(BackupManifest, BackupSummary, FileIdentity), BackupError> {
+) -> Result<BackupVerification, BackupError> {
     let root_before = private_directory_identity(directory)?;
     let manifest_path = directory.join(MANIFEST_NAME);
     let manifest_before = private_file_identity(&manifest_path)?;
@@ -811,6 +881,7 @@ fn verify_backup_files(
     }
 
     let mut total_bytes = 0_u64;
+    let mut input_identities = vec![(PathBuf::from(MANIFEST_NAME), false, manifest_before)];
     for item in &manifest.files {
         let relative = strict_relative(&item.relative_path)?;
         let path = directory.join(&relative);
@@ -819,7 +890,7 @@ fn verify_backup_files(
                 if item.size != 0 || item.sha256.is_some() {
                     return Err(BackupError::Corrupt);
                 }
-                private_directory_identity(&path)?;
+                input_identities.push((relative, true, private_directory_identity(&path)?));
             }
             BackupFileKind::Regular => {
                 let identity = private_file_identity(&path)?;
@@ -837,6 +908,7 @@ fn verify_backup_files(
                 total_bytes = total_bytes
                     .checked_add(item.size)
                     .ok_or(BackupError::ResourceExhausted)?;
+                input_identities.push((relative, false, identity));
             }
         }
     }
@@ -847,7 +919,13 @@ fn verify_backup_files(
         return Err(BackupError::IdentityChanged);
     }
     let summary = summary_from_manifest(&manifest, total_bytes)?;
-    Ok((manifest, summary, root_before))
+    Ok(BackupVerification {
+        directory: directory.to_owned(),
+        manifest,
+        summary,
+        root_identity: root_before,
+        input_identities,
+    })
 }
 
 fn summary_from_manifest(
@@ -929,17 +1007,12 @@ pub(crate) fn prepare_verification_directory(
     directory: &Path,
     expected_job_id: Option<JobId>,
 ) -> Result<BackupVerification, BackupError> {
-    let (manifest, summary, root_identity) = verify_backup_files(directory, expected_job_id)?;
-    verify_backup_cas_and_spool(directory, &manifest)?;
-    if private_directory_identity(directory)? != root_identity {
+    let verification = verify_backup_files(directory, expected_job_id)?;
+    verify_backup_cas_and_spool(directory, &verification.manifest)?;
+    if private_directory_identity(directory)? != verification.root_identity {
         return Err(BackupError::IdentityChanged);
     }
-    Ok(BackupVerification {
-        directory: directory.to_owned(),
-        manifest,
-        summary,
-        root_identity,
-    })
+    Ok(verification)
 }
 
 pub fn prepare_backup_verification(
@@ -1057,6 +1130,18 @@ pub(crate) async fn complete_backup_verification_ref(
     verification: &BackupVerification,
 ) -> Result<BackupSummary, BackupError> {
     verify_backup_tables(&verification.directory, &verification.manifest).await?;
+    for entry in &verification.manifest.files {
+        if valid_gc_report_path(&entry.relative_path) {
+            let id = entry
+                .relative_path
+                .strip_prefix("maintenance/gc-")
+                .and_then(|value| value.strip_suffix(".json"))
+                .ok_or(BackupError::Corrupt)?
+                .parse()
+                .map_err(|_| BackupError::Corrupt)?;
+            crate::optimize::read_gc_report(&verification.directory, id).map_err(map_store)?;
+        }
+    }
     if private_directory_identity(&verification.directory)? != verification.root_identity {
         return Err(BackupError::IdentityChanged);
     }
@@ -1685,6 +1770,7 @@ fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
                 && !item.relative_path.starts_with("cas/blobs/")
                 && !declared_spool_paths.contains(&item.relative_path)
                 && !item.relative_path.starts_with("hooks/")
+                && !valid_gc_report_path(&item.relative_path)
         }
         BackupFileKind::Directory => {
             let prefix = format!("{}/", item.relative_path);
@@ -1709,6 +1795,12 @@ fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
         return Err(BackupError::Corrupt);
     }
     Ok(())
+}
+
+fn valid_gc_report_path(path: &str) -> bool {
+    path.strip_prefix("maintenance/gc-")
+        .and_then(|value| value.strip_suffix(".json"))
+        .is_some_and(|value| value.parse::<JobId>().is_ok())
 }
 
 fn collect_tree(
