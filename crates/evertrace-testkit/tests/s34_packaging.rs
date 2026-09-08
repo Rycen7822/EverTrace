@@ -376,6 +376,11 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     .unwrap();
     paths.unit = root.path().join("config/systemd/user/evertraced.service");
     install_offline(&paths, false).unwrap();
+    let host_with_token = format!(
+        "{}\n[model_providers.private_test]\napi_key = \"fictional-package-token-never-copy\"\n",
+        fs::read_to_string(&paths.host_config).unwrap()
+    );
+    fs::write(&paths.host_config, &host_with_token).unwrap();
     let connection =
         evertrace_store::connection::CompatibilityStore::connect_local(&paths.data_root)
             .await
@@ -432,6 +437,42 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         fs::copy(paths.cli.parent().unwrap().join(name), package.join(name)).unwrap();
         fs::set_permissions(package.join(name), fs::Permissions::from_mode(0o700)).unwrap();
     }
+    let materials_root = TempDir::new().unwrap();
+    let preflight = evertrace_codex::install::preflight_package_check(
+        &paths.data_root,
+        &paths.config,
+        &paths.host_config,
+        &paths.unit,
+        &package,
+    )
+    .unwrap();
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
+    let materials =
+        evertrace_codex::install::prepare_package_check(preflight, materials_root.path(), |path| {
+            runtime
+                .publish(path)
+                .map_err(|_| evertrace_codex::install::InstallError::Io)
+        })
+        .unwrap();
+    let staged = fs::read_to_string(&materials.host_configuration).unwrap();
+    assert!(staged.starts_with("# BEGIN EverTrace managed wiring v1\n"));
+    assert!(staged.ends_with("# END EverTrace managed wiring v1\n"));
+    assert!(!staged.contains("fictional-package-token-never-copy"));
+    assert!(!staged.contains("model_providers"));
+    assert!(staged.contains("mcp_servers.evertrace") && staged.contains("PreToolUse"));
+    materials.validate().unwrap();
+    fs::write(
+        &materials.host_configuration,
+        format!("{staged}# changed\n"),
+    )
+    .unwrap();
+    assert!(materials.validate().is_err());
+    assert_eq!(
+        fs::read_to_string(&paths.host_config).unwrap(),
+        host_with_token
+    );
+    drop(materials);
+    drop(materials_root);
     let probe_roots = std::sync::Mutex::new(Vec::new());
     let health = |socket: std::path::PathBuf| {
         assert!(socket.as_os_str().len() < 108);

@@ -295,6 +295,23 @@ fn wiring(data_root: &Path, cli: &Path, config: &Path) -> Result<Vec<u8>, Instal
     .into_bytes())
 }
 
+fn owned_wiring(bytes: &[u8]) -> Result<&[u8], InstallError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?;
+    let start = text.find(OWNED_BEGIN).ok_or(InstallError::InvalidType)?;
+    let end = text[start..]
+        .find(OWNED_END)
+        .map(|end| start + end + OWNED_END.len())
+        .ok_or(InstallError::InvalidType)?;
+    if text[..start].contains(OWNED_END)
+        || text[start + OWNED_BEGIN.len()..end].contains(OWNED_BEGIN)
+        || text[end..].contains(OWNED_BEGIN)
+        || text[end..].contains(OWNED_END)
+    {
+        return Err(InstallError::InvalidType);
+    }
+    Ok(&bytes[start..end])
+}
+
 fn merge_wiring(original: &[u8], owned: &[u8], uninstall: bool) -> Result<Vec<u8>, InstallError> {
     let text = std::str::from_utf8(original).map_err(|_| InstallError::InvalidType)?;
     let parsed: toml::Value = toml::from_str(text).map_err(|_| InstallError::InvalidType)?;
@@ -960,12 +977,24 @@ impl UnpublishedPackage {
         self.service
             .revalidate(self.service.original.as_ref().map(|(identity, _)| identity))?;
         for (path, expected) in [
-            (&self.host_configuration, &self.host.desired),
-            (&self.service_unit, &self.service.desired),
+            (
+                &self.host_configuration,
+                owned_wiring(
+                    self.host
+                        .desired
+                        .as_deref()
+                        .ok_or(InstallError::InvalidType)?,
+                )?,
+            ),
+            (
+                &self.service_unit,
+                self.service
+                    .desired
+                    .as_deref()
+                    .ok_or(InstallError::InvalidType)?,
+            ),
         ] {
-            if read_private_file_bounded(path, 0o600, MAX_CONFIG_BYTES)?
-                != *expected.as_ref().ok_or(InstallError::InvalidType)?
-            {
+            if read_private_file_bounded(path, 0o600, MAX_CONFIG_BYTES)? != expected {
                 return Err(InstallError::InvalidType);
             }
         }
@@ -1157,11 +1186,13 @@ pub fn prepare_package_check(
     prepare_runtime(&result.runtime)?;
     atomic_write(
         &result.host_configuration,
-        result
-            .host
-            .desired
-            .as_ref()
-            .ok_or(InstallError::InvalidType)?,
+        owned_wiring(
+            result
+                .host
+                .desired
+                .as_ref()
+                .ok_or(InstallError::InvalidType)?,
+        )?,
         0o600,
     )?;
     atomic_write(
