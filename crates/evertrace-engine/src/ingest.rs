@@ -19,7 +19,7 @@ use evertrace_store::{
 };
 use thiserror::Error;
 
-use crate::{WriterActorError, WriterHandle, capture::verify_capture_frame};
+use crate::{WriterActorError, WriterHandle, capture::verify_capture_frame_bounded};
 
 const MAX_SEGMENTS_PER_DRAIN: usize = 16;
 const MAX_SELECTED_OBSERVATIONS: usize = 256;
@@ -42,6 +42,98 @@ pub struct EvidenceIngestor {
 }
 
 impl EvidenceIngestor {
+    /// Ordinary daemon consumer. Each unit releases segment claims before
+    /// yielding the dispatch read guard, allowing backup and shutdown to drain.
+    pub async fn run(
+        self,
+        dispatch: std::sync::Arc<tokio::sync::RwLock<()>>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), IngestError> {
+        let startup_guard = dispatch.read().await;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        DurableSpool::open_read_only(
+            self.snapshot.spool_dir.clone(),
+            self.snapshot
+                .spool_limits()
+                .map_err(|_| IngestError::Snapshot)?,
+        )
+        .map_err(map_spool)?
+        .validate_active_without_repair()
+        .map_err(|_| IngestError::Recovering)?;
+        let (_, recovery) = DurableSpool::open(
+            self.snapshot.spool_dir.clone(),
+            self.snapshot
+                .spool_limits()
+                .map_err(|_| IngestError::Snapshot)?,
+        )
+        .map_err(map_spool)?;
+        if recovery.repaired_tail_bytes != 0 || !recovery.gaps.is_empty() {
+            return Err(IngestError::Recovering);
+        }
+        CasStore::open(self.snapshot.cas_dir.clone()).map_err(|_| IngestError::Cas)?;
+        drop(startup_guard);
+        let mut cursor = None;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let guard = tokio::select! {
+                result = shutdown.changed() => { if result.is_err() || *shutdown.borrow() { return Ok(()); } else { continue; } },
+                guard = dispatch.read() => guard,
+            };
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let result = self.drain_page(&mut cursor).await;
+            drop(guard);
+            match result {
+                Ok(_) | Err(IngestError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                result = shutdown.changed() => { if result.is_err() || *shutdown.borrow() { return Ok(()); } },
+            }
+        }
+    }
+
+    async fn drain_page(
+        &self,
+        cursor: &mut Option<evertrace_capture::spool::SpoolReadCursor>,
+    ) -> Result<DrainProgress, IngestError> {
+        let mut spool = DurableSpool::open_read_only(
+            self.snapshot.spool_dir.clone(),
+            self.snapshot
+                .spool_limits()
+                .map_err(|_| IngestError::Snapshot)?,
+        )
+        .map_err(map_spool)?;
+        if !spool.pending_gap_markers().map_err(map_spool)?.is_empty()
+            || std::fs::read_dir(self.snapshot.spool_dir.join("quarantine"))
+                .map_err(|_| IngestError::Spool)?
+                .next()
+                .transpose()
+                .map_err(|_| IngestError::Spool)?
+                .is_some()
+        {
+            return Err(IngestError::Recovering);
+        }
+        if cursor.is_none() {
+            spool
+                .seal_active(self.snapshot.generation)
+                .map_err(map_spool)?;
+        }
+        let segments = spool.sealed_page(cursor.as_ref()).map_err(map_spool)?;
+        if segments.is_empty() {
+            return Ok(DrainProgress::default());
+        }
+        let next = segments[0].continuation().map_err(map_spool)?;
+        let result = self.drain_segments(&spool, segments, None, true).await?;
+        *cursor = next;
+        Ok(result)
+    }
     pub fn new(
         snapshot: RuntimeSnapshot,
         writer: WriterHandle,
@@ -91,7 +183,6 @@ impl EvidenceIngestor {
         &self,
         selected: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<DrainProgress, IngestError> {
-        let cas = CasStore::open(self.snapshot.cas_dir.clone()).map_err(|_| IngestError::Cas)?;
         let (mut spool, recovery) = DurableSpool::open(
             self.snapshot.spool_dir.clone(),
             self.snapshot
@@ -114,10 +205,30 @@ impl EvidenceIngestor {
         let segments = spool
             .sealed_segments(segment_limit)
             .map_err(|_| IngestError::Spool)?;
+        self.drain_segments(&spool, segments, selected, false).await
+    }
+
+    async fn drain_segments(
+        &self,
+        spool: &DurableSpool,
+        segments: Vec<SealedSegment>,
+        selected: Option<&BTreeSet<String>>,
+        bounded: bool,
+    ) -> Result<DrainProgress, IngestError> {
+        if segments.is_empty() {
+            return Ok(DrainProgress::default());
+        }
+        let cas =
+            CasStore::open_existing(self.snapshot.cas_dir.clone()).map_err(|_| IngestError::Cas)?;
         let mut progress = DrainProgress::default();
         let mut prefix_projection = None;
         let mut prefix_states = BTreeMap::new();
         let mut terminal_segments = Vec::new();
+        let mut remaining = if bounded {
+            (64 * 1024 * 1024, 64 * 1024 * 1024)
+        } else {
+            (u64::MAX, u64::MAX)
+        };
         for segment in segments {
             let purge_snapshot = self.writer.project().await.map_err(map_writer_error)?;
             let purge_view = ScopePurgeCurrentView::from_snapshot(&purge_snapshot)
@@ -142,7 +253,7 @@ impl EvidenceIngestor {
                     let fence = MaintenanceFence::open(data_dir).map_err(|_| IngestError::Cas)?;
                     shared_maintenance = Some(fence.shared().map_err(|_| IngestError::Cas)?);
                 }
-                let verified = verify_capture_frame(frame, &cas)?;
+                let verified = verify_capture_frame_bounded(frame, &cas, &mut remaining)?;
                 let surface_count = usize::from(verified.surface.is_some());
                 let recorded_at_us = verified.body.recorded_at_us;
                 let digest = if verified
@@ -246,20 +357,20 @@ impl EvidenceIngestor {
             let consumed = committed
                 .checked_add(terminal.len())
                 .ok_or(IngestError::InvalidRecord)?;
-            if selected.is_none() || consumed == segment.frames().len() {
+            if segment.complete() && (selected.is_none() || consumed == segment.frames().len()) {
                 if !terminal.is_empty() {
                     terminal_segments.push((segment, consumed, terminal));
                 } else {
                     spool
                         .acknowledge_segment(segment, consumed)
-                        .map_err(|_| IngestError::Acknowledgement)?;
+                        .map_err(map_spool_ack)?;
                     progress.sealed_segments += 1;
                 }
             }
         }
         let terminal_count = terminal_segments.len();
         if terminal_count != 0 {
-            self.discard_purged_segments(&spool, terminal_segments)
+            self.discard_purged_segments(spool, terminal_segments)
                 .await?;
             progress.sealed_segments = progress
                 .sealed_segments
@@ -325,7 +436,7 @@ impl EvidenceIngestor {
         for (segment, consumed, _) in terminal_segments {
             spool
                 .acknowledge_segment(segment, consumed)
-                .map_err(|_| IngestError::Acknowledgement)?;
+                .map_err(map_spool_ack)?;
         }
         Ok(())
     }
@@ -639,8 +750,26 @@ fn map_writer_error(error: WriterActorError) -> IngestError {
     }
 }
 
+fn map_spool(error: evertrace_capture::SpoolError) -> IngestError {
+    if error == evertrace_capture::SpoolError::Busy {
+        IngestError::Busy
+    } else {
+        IngestError::Spool
+    }
+}
+
+fn map_spool_ack(error: evertrace_capture::SpoolError) -> IngestError {
+    if error == evertrace_capture::SpoolError::Busy {
+        IngestError::Busy
+    } else {
+        IngestError::Acknowledgement
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum IngestError {
+    #[error("capture spool is busy")]
+    Busy,
     #[error("capture runtime snapshot is invalid")]
     Snapshot,
     #[error("capture spool is unavailable")]

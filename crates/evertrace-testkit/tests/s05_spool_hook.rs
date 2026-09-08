@@ -145,6 +145,13 @@ fn versioned_frame_round_trip_preserves_record_identity_and_commit_boundary() {
     let second = record("record-b", b"same protected payload");
     let first_bytes = encode_frame(&first).unwrap();
     let second_bytes = encode_frame(&second).unwrap();
+    for length in 1..54 {
+        let partial = scan_frames(&first_bytes[..length]).unwrap();
+        assert!(partial.incomplete_tail && partial.frames.is_empty());
+    }
+    let mut bad_magic = first_bytes[..30].to_vec();
+    bad_magic[0] ^= 1;
+    assert!(scan_frames(&bad_magic).is_err());
     assert_ne!(first_bytes, second_bytes);
 
     let mut stream = first_bytes.clone();
@@ -162,6 +169,79 @@ fn versioned_frame_round_trip_preserves_record_identity_and_commit_boundary() {
     let mut corrupt = first_bytes;
     corrupt[24] ^= 1;
     assert!(scan_frames(&corrupt).is_err());
+}
+
+#[test]
+fn spool_pages_advance_release_claims_and_defer_busy_without_collecting_isolated() {
+    let temp = TempDir::new().unwrap();
+    let (mut spool, _) = DurableSpool::open(
+        temp.path().join("spool"),
+        SpoolLimits {
+            high_watermark_bytes: 8 * 1024 * 1024,
+            ..limits()
+        },
+    )
+    .unwrap();
+    let directory_lock = fs::File::open(spool.root().join("main")).unwrap();
+    directory_lock.lock().unwrap();
+    assert!(matches!(spool.seal_active(1), Err(SpoolError::Busy)));
+    assert!(matches!(spool.sealed_page(None), Err(SpoolError::Busy)));
+    drop(directory_lock);
+    for index in 0..257 {
+        spool
+            .append(&record(&format!("page-{index}"), b"body"))
+            .unwrap();
+    }
+    spool.seal_active(1).unwrap();
+    let reserved = spool
+        .append_isolated_sealed(&record("reserved", b"body"), "reserved")
+        .unwrap();
+    let reserved_path = reserved.path().to_owned();
+    drop(reserved);
+    let page = spool.sealed_page(None).unwrap().remove(0);
+    assert_eq!(page.frames().len(), 256);
+    let cursor = page.continuation().unwrap().unwrap();
+    assert!(!page.complete());
+    drop(page);
+    let page = spool.sealed_page(Some(&cursor)).unwrap().remove(0);
+    assert_eq!(page.frames().len(), 1);
+    assert_eq!(page.frames()[0].record.spool_record_id, "page-256");
+    assert!(page.complete());
+    spool.acknowledge_segment(page, 1).unwrap();
+    assert!(spool.sealed_page(None).unwrap().is_empty());
+    assert!(reserved_path.exists());
+    spool.append(&record("bad-active", b"body")).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(spool.active_path())
+        .unwrap()
+        .write_all(b"ETS")
+        .unwrap();
+    let broken = fs::read(spool.active_path()).unwrap();
+    let _admission = CaptureRuntime::open_for_admission(snapshot(
+        temp.path(),
+        SpoolLimits {
+            high_watermark_bytes: 8 * 1024 * 1024,
+            ..limits()
+        },
+    ))
+    .unwrap();
+    assert_eq!(fs::read(spool.active_path()).unwrap(), broken);
+    assert!(spool.append(&record("must-not-append", b"body")).is_err());
+    assert_eq!(fs::read(spool.active_path()).unwrap(), broken);
+    fs::rename(spool.active_path(), temp.path().join("preserved-active")).unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(spool.active_path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(spool.validate_active_without_repair().is_err());
+    assert_eq!(
+        fs::read(temp.path().join("preserved-active")).unwrap(),
+        broken
+    );
 }
 
 #[test]

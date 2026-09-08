@@ -154,6 +154,42 @@ impl CaptureRuntime {
         self.state
     }
 
+    /// Ordinary Hook admission never repairs existing spool state. Recovery is
+    /// a daemon startup/explicit recovery responsibility, not a delivery cost.
+    pub fn open_for_admission(snapshot: RuntimeSnapshot) -> Result<Self, CaptureError> {
+        snapshot.validate()?;
+        let spool = match std::fs::symlink_metadata(&snapshot.spool_dir) {
+            Ok(_) => {
+                DurableSpool::open_read_only(snapshot.spool_dir.clone(), snapshot.spool_limits()?)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::open(snapshot);
+            }
+            Err(_) => return Err(CaptureError::Spool),
+        };
+        let quarantine = std::fs::read_dir(snapshot.spool_dir.join("quarantine"))
+            .map_err(|_| CaptureError::Spool)?
+            .next()
+            .transpose()
+            .map_err(|_| CaptureError::Spool)?
+            .is_some();
+        let state = if !quarantine
+            && spool.pending_gap_markers()?.is_empty()
+            && spool.below_low_watermark()?
+        {
+            CaptureAdmissionState::Normal
+        } else {
+            CaptureAdmissionState::Recovering
+        };
+        Ok(Self {
+            cas: CasStore::open(snapshot.cas_dir.clone())?,
+            maintenance_fence: crate::MaintenanceFence::open(snapshot.data_dir()?)?,
+            snapshot,
+            spool,
+            state,
+        })
+    }
+
     pub fn complete_recovery(&mut self) -> Result<(), CaptureError> {
         if !self.spool.below_low_watermark()? {
             return Err(CaptureError::RecoveryIncomplete);

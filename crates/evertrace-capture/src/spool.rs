@@ -161,6 +161,16 @@ pub struct SealedSegment {
     inode: u64,
     length: u64,
     frames: Vec<SealedFrame>,
+    end_offset: u64,
+    identity: (u64, u64, u64, i64, i64, i64, i64),
+}
+
+/// Volatile committed prefix; never survives restart or authorizes another inode.
+#[derive(Clone, Debug)]
+pub struct SpoolReadCursor {
+    path: PathBuf,
+    identity: (u64, u64, u64, i64, i64, i64, i64),
+    offset: u64,
 }
 
 #[derive(Debug)]
@@ -216,6 +226,20 @@ impl PendingQuarantine {
 }
 
 impl SealedSegment {
+    pub fn continuation(&self) -> Result<Option<SpoolReadCursor>, SpoolError> {
+        if self.end_offset == self.length {
+            return Ok(None);
+        }
+        Ok(Some(SpoolReadCursor {
+            path: self.path.clone(),
+            identity: self.identity,
+            offset: self.end_offset,
+        }))
+    }
+
+    pub fn complete(&self) -> bool {
+        self.end_offset == self.length
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -448,6 +472,9 @@ impl DurableSpool {
             .open(&path)
             .map_err(map_write_error)?;
         validate_owned_file(&path, &file)?;
+        if active_exists {
+            validate_active_file(&path, &mut file, self.limits.high_watermark_bytes)?;
+        }
         file.write_all(&frame).map_err(map_write_error)?;
         file.sync_data().map_err(map_write_error)?;
         if !active_exists {
@@ -535,6 +562,8 @@ impl DurableSpool {
             device: metadata.dev(),
             inode: metadata.ino(),
             length: metadata.len(),
+            end_offset: metadata.len(),
+            identity: segment_identity(&metadata),
             frames: vec![SealedFrame {
                 record: record.clone(),
                 byte_start: 0,
@@ -695,13 +724,14 @@ impl DurableSpool {
 
     pub fn seal_active(&mut self, generation: u64) -> Result<Option<PathBuf>, SpoolError> {
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
-        FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
+        FileExt::try_lock_exclusive(&directory_lock).map_err(map_busy)?;
         let active = self.active_path();
         let metadata = match fs::symlink_metadata(&active) {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(map_io(error)),
         };
+        validate_owned_file_metadata(&metadata)?;
         if metadata.len() == 0 {
             return Ok(None);
         }
@@ -715,17 +745,25 @@ impl DurableSpool {
     }
 
     pub fn sealed_segments(&self, limit: usize) -> Result<Vec<SealedSegment>, SpoolError> {
-        self.claimed_segments(limit, false)
+        self.claimed_segments(limit, false, None)
     }
 
     pub fn isolated_segments(&self, limit: usize) -> Result<Vec<SealedSegment>, SpoolError> {
-        self.claimed_segments(limit, true)
+        self.claimed_segments(limit, true, None)
+    }
+
+    pub fn sealed_page(
+        &self,
+        cursor: Option<&SpoolReadCursor>,
+    ) -> Result<Vec<SealedSegment>, SpoolError> {
+        self.claimed_segments(1, false, Some(cursor))
     }
 
     fn claimed_segments(
         &self,
         limit: usize,
         isolated: bool,
+        page: Option<Option<&SpoolReadCursor>>,
     ) -> Result<Vec<SealedSegment>, SpoolError> {
         let configured_limit = usize::try_from(self.limits.max_main_files)
             .map_err(|_| SpoolError::InvalidConfiguration)?;
@@ -734,7 +772,7 @@ impl DurableSpool {
         }
         self.validate_directories()?;
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
-        FileExt::lock_shared(&directory_lock).map_err(map_io)?;
+        FileExt::try_lock_shared(&directory_lock).map_err(map_busy)?;
         let mut paths = Vec::new();
         for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
             let entry = entry.map_err(map_io)?;
@@ -755,11 +793,20 @@ impl DurableSpool {
                 return Err(SpoolError::Corrupt);
             }
             paths.push(path);
+            if paths.len() > configured_limit {
+                return Err(SpoolError::ResourceExhausted);
+            }
         }
         paths.sort();
-        let mut segments = Vec::with_capacity(paths.len());
+        if let Some(Some(cursor)) = page {
+            if !paths.contains(&cursor.path) {
+                return Err(SpoolError::IdentityChanged);
+            }
+            paths.retain(|path| *path == cursor.path);
+        }
+        let mut claimed = Vec::new();
         for path in paths {
-            if segments.len() == limit {
+            if claimed.len() == limit {
                 break;
             }
             let before = fs::symlink_metadata(&path).map_err(map_io)?;
@@ -767,7 +814,7 @@ impl DurableSpool {
             if before.len() == 0 || before.len() > self.limits.high_watermark_bytes {
                 return Err(SpoolError::Corrupt);
             }
-            let mut file = File::open(&path).map_err(map_io)?;
+            let file = File::open(&path).map_err(map_io)?;
             validate_owned_file(&path, &file)?;
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => {}
@@ -775,21 +822,55 @@ impl DurableSpool {
                 Err(error) => return Err(map_io(error)),
             }
             let opened = file.metadata().map_err(map_io)?;
-            let capacity =
-                usize::try_from(opened.len()).map_err(|_| SpoolError::ResourceExhausted)?;
-            let mut bytes = Vec::with_capacity(capacity);
-            file.read_to_end(&mut bytes).map_err(map_io)?;
-            let scan = scan_frames(&bytes)?;
-            if scan.incomplete_tail
-                || scan.complete_length != opened.len()
-                || scan.frames.is_empty()
+            if let Some(Some(cursor)) = page
+                && segment_identity(&opened) != cursor.identity
             {
+                return Err(SpoolError::IdentityChanged);
+            }
+            claimed.push((path, file, opened));
+        }
+        drop(directory_lock);
+        let mut segments = Vec::new();
+        for (path, mut file, opened) in claimed {
+            let start = page.flatten().map_or(0, |cursor| cursor.offset);
+            file.seek(SeekFrom::Start(start)).map_err(map_io)?;
+            let available = opened.len().checked_sub(start).ok_or(SpoolError::Corrupt)?;
+            let read_length = if page.is_some() {
+                available.min(8 * 1024 * 1024)
+            } else {
+                available
+            };
+            let capacity =
+                usize::try_from(read_length).map_err(|_| SpoolError::ResourceExhausted)?;
+            let mut bytes = Vec::with_capacity(capacity);
+            std::io::Read::by_ref(&mut file)
+                .take(read_length)
+                .read_to_end(&mut bytes)
+                .map_err(map_io)?;
+            let scan = scan_frames(&bytes)?;
+            if (read_length == available && scan.incomplete_tail) || scan.frames.is_empty() {
                 return Err(SpoolError::Corrupt);
             }
-            let mut offset = 0_u64;
+            let mut offset = start;
+            let mut remaining_cas = 60 * 1024 * 1024_u64;
             let frames = scan
                 .frames
                 .into_iter()
+                .take(if page.is_some() { 256 } else { usize::MAX })
+                .take_while(|frame| {
+                    if page.is_none() {
+                        return true;
+                    }
+                    let Ok((body, _)) = decode_validated_record_body(&frame.record) else {
+                        return true;
+                    };
+                    let needed = body.protected_length.saturating_add(4096);
+                    if needed > remaining_cas {
+                        return false;
+                    }
+                    remaining_cas -= needed;
+                    true
+                })
                 .map(|frame| {
                     let start = offset;
                     offset = offset
@@ -802,8 +883,14 @@ impl DurableSpool {
                     })
                 })
                 .collect::<Result<Vec<_>, SpoolError>>()?;
-            if offset != opened.len() {
-                return Err(SpoolError::Corrupt);
+            if frames.is_empty() {
+                return Err(SpoolError::ResourceExhausted);
+            }
+            if segment_identity(&file.metadata().map_err(map_io)?) != segment_identity(&opened)
+                || segment_identity(&fs::symlink_metadata(&path).map_err(map_io)?)
+                    != segment_identity(&opened)
+            {
+                return Err(SpoolError::IdentityChanged);
             }
             segments.push(SealedSegment {
                 path,
@@ -812,6 +899,8 @@ impl DurableSpool {
                 inode: opened.ino(),
                 length: opened.len(),
                 frames,
+                end_offset: offset,
+                identity: segment_identity(&opened),
             });
         }
         Ok(segments)
@@ -822,11 +911,12 @@ impl DurableSpool {
         segment: SealedSegment,
         committed_frames: usize,
     ) -> Result<(), SpoolError> {
-        if committed_frames != segment.frames.len() || committed_frames == 0 {
+        if !segment.complete() || committed_frames != segment.frames.len() || committed_frames == 0
+        {
             return Err(SpoolError::InvalidAcknowledgement);
         }
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
-        FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
+        FileExt::try_lock_exclusive(&directory_lock).map_err(map_busy)?;
         let path_metadata = fs::symlink_metadata(&segment.path).map_err(map_io)?;
         validate_owned_file_metadata(&path_metadata)?;
         let opened = segment.file.metadata().map_err(map_io)?;
@@ -835,6 +925,8 @@ impl DurableSpool {
             || opened.dev() != segment.device
             || opened.ino() != segment.inode
             || opened.len() != segment.length
+            || segment_identity(&path_metadata) != segment.identity
+            || segment_identity(&opened) != segment.identity
         {
             return Err(SpoolError::IdentityChanged);
         }
@@ -909,6 +1001,23 @@ impl DurableSpool {
         }
         report.gaps = self.quarantine_evidence()?;
         Ok(report)
+    }
+
+    pub fn validate_active_without_repair(&self) -> Result<(), SpoolError> {
+        self.validate_directories()?;
+        let directory = File::open(&self.main_dir).map_err(map_io)?;
+        FileExt::lock_shared(&directory).map_err(map_io)?;
+        let path = self.active_path();
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(map_io(error)),
+            Ok(metadata) => {
+                validate_owned_file_metadata(&metadata)?;
+                let mut file = File::open(&path).map_err(map_io)?;
+                validate_owned_file(&path, &file)?;
+                validate_active_file(&path, &mut file, self.limits.high_watermark_bytes)
+            }
+        }
     }
 
     pub fn write_gap_marker(&self, marker: &CaptureGapMarker) -> Result<PathBuf, SpoolError> {
@@ -1295,6 +1404,8 @@ struct Usage {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SpoolError {
+    #[error("spool is busy")]
+    Busy,
     #[error("spool configuration is invalid")]
     InvalidConfiguration,
     #[error("spool frame failed validation")]
@@ -1707,6 +1818,61 @@ fn map_write_error(error: io::Error) -> SpoolError {
 
 fn map_io(_: io::Error) -> SpoolError {
     SpoolError::Io
+}
+
+fn validate_active_file(path: &Path, file: &mut File, max_bytes: u64) -> Result<(), SpoolError> {
+    let before = file.metadata().map_err(map_io)?;
+    if before.len() > max_bytes {
+        return Err(SpoolError::ResourceExhausted);
+    }
+    file.seek(SeekFrom::Start(0)).map_err(map_io)?;
+    let mut remaining = before.len();
+    let mut pending = Vec::new();
+    let mut buffer = [0; 64 * 1024];
+    while remaining != 0 {
+        let length = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| SpoolError::ResourceExhausted)?;
+        file.read_exact(&mut buffer[..length]).map_err(map_io)?;
+        pending.extend_from_slice(&buffer[..length]);
+        let scan = scan_frames(&pending)?;
+        pending.drain(
+            ..usize::try_from(scan.complete_length).map_err(|_| SpoolError::ResourceExhausted)?,
+        );
+        if pending.len() > 8 * 1024 * 1024 {
+            return Err(SpoolError::ResourceExhausted);
+        }
+        remaining -= length as u64;
+    }
+    if !pending.is_empty() {
+        return Err(SpoolError::Corrupt);
+    }
+    if segment_identity(&file.metadata().map_err(map_io)?) != segment_identity(&before)
+        || segment_identity(&fs::symlink_metadata(path).map_err(map_io)?)
+            != segment_identity(&before)
+    {
+        return Err(SpoolError::IdentityChanged);
+    }
+    Ok(())
+}
+
+fn map_busy(error: io::Error) -> SpoolError {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        SpoolError::Busy
+    } else {
+        map_io(error)
+    }
+}
+
+fn segment_identity(value: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+    (
+        value.dev(),
+        value.ino(),
+        value.len(),
+        value.mtime(),
+        value.mtime_nsec(),
+        value.ctime(),
+        value.ctime_nsec(),
+    )
 }
 
 #[cfg(test)]

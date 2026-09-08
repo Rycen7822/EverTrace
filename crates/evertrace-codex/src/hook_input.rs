@@ -98,6 +98,18 @@ impl std::fmt::Debug for CaptureHookInput {
     }
 }
 
+pub fn native_generation_report(
+    generation: u64,
+) -> Result<crate::probe::HostProbeReport, HookInputError> {
+    if generation == 0 {
+        return Err(HookInputError::Invalid);
+    }
+    let mut context = crate::probe::ProbeContext::unobserved_codex();
+    context.adapter_revision = format!("native-hook-v1-generation-{generation}");
+    crate::probe::HostProbeReport::evaluate(&context, &crate::probe::ProbeEvidence::empty())
+        .map_err(|_| HookInputError::Invalid)
+}
+
 impl CaptureHookInput {
     /// One native delivery is one local weak source, never a host sequence or
     /// retry identity. The launcher invokes this once after selecting its pin.
@@ -111,13 +123,7 @@ impl CaptureHookInput {
         input
             .validate_host_fields()
             .map_err(|_| HookInputError::Invalid)?;
-        let mut context = crate::probe::ProbeContext::unobserved_codex();
-        context.adapter_revision = format!("native-hook-v1-generation-{generation}");
-        let report = crate::probe::HostProbeReport::evaluate(
-            &context,
-            &crate::probe::ProbeEvidence::empty(),
-        )
-        .map_err(|_| HookInputError::Invalid)?;
+        let report = native_generation_report(generation)?;
         let manifest = report.manifest().adapter_manifest_id.clone();
         let source = SourceInstanceId::new_v7().as_str().to_owned();
         let event_kind = match input.hook_event_name {

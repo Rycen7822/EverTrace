@@ -77,7 +77,7 @@ use std::{
     time::Duration,
 };
 
-use evertrace_capture::{CaptureAdmissionState, CaptureRuntime, RuntimeSnapshot};
+use evertrace_capture::{CaptureAdmissionState, RuntimeSnapshot};
 use evertrace_codex::HostProbeReport;
 use evertrace_domain::{
     config::DreamingConfig,
@@ -164,17 +164,31 @@ pub struct PackageUpgradeCheck {
     pub migrated: bool,
     pub generation: Option<u64>,
     pub materials_validated: bool,
+    pub candidate_native_verified: bool,
+    pub candidate_daemon_verified: bool,
+}
+
+pub async fn verify_package_native(
+    native: &Path,
+    cas: &Path,
+) -> Result<(), evertrace_store::restore::RestoreError> {
+    evertrace_store::restore::verify_package_native(native, cas).await
 }
 
 /// Pre-publication only. The returned materials result never certifies a Host
 /// or package-ready state; the verified backup survives candidate disposal.
-pub async fn check_package_upgrade(
+pub async fn check_package_upgrade<F, Fut>(
     data_dir: &Path,
     config_path: &Path,
     host_config: &Path,
     unit: &Path,
     package: &Path,
-) -> Result<PackageUpgradeCheck, evertrace_store::restore::RestoreError> {
+    health: F,
+) -> Result<PackageUpgradeCheck, evertrace_store::restore::RestoreError>
+where
+    F: Fn(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     use evertrace_store::restore::{NativeUpgradePreparation, RestoreError};
     let preflight = evertrace_codex::install::preflight_package_check(
         data_dir,
@@ -196,7 +210,9 @@ pub async fn check_package_upgrade(
     };
     let backup = prepared.backup().to_owned();
     let migrated = prepared.migrated();
-    let validation = (|| {
+    let mut candidate_native_verified = false;
+    let mut candidate_daemon_verified = false;
+    let validation = async {
         let mut runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
             .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
         runtime.recovery_gate = evertrace_capture::RecoveryGateMode::Disabled;
@@ -217,25 +233,292 @@ pub async fn check_package_upgrade(
         let candidate_runtime = RuntimeSnapshot::load(&materials.runtime)
             .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
         probe_package_capture(prepared.path(), &materials.executable, &candidate_runtime)?;
+        run_package_native(
+            &package.join("evertraced"),
+            prepared.path(),
+            &backup.join("cas"),
+        )
+        .await?;
+        candidate_native_verified = true;
+        probe_package_daemon(package, &health).await?;
+        candidate_daemon_verified = true;
         materials
             .validate()
             .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
         Ok::<_, RestoreError>(materials.generation)
-    })();
+    }
+    .await;
     // Both failed and successful checks dispose only this owned candidate while
     // the same sibling lock is still held. Unknown residuals are explicit errors.
+    if matches!(&validation, Err(RestoreError::ResidualCandidate { directory, .. }) if directory.starts_with(prepared.path()))
+    {
+        return validation.map(|_| unreachable!());
+    }
     prepared.discard()?;
+    if matches!(&validation, Err(RestoreError::ResidualCandidate { .. })) {
+        return validation.map(|_| unreachable!());
+    }
     Ok(PackageUpgradeCheck {
         backup,
         migrated,
         generation: validation.as_ref().ok().copied(),
         materials_validated: validation.is_ok(),
+        candidate_native_verified,
+        candidate_daemon_verified,
     })
 }
 
 pub enum OfflineRestoreOutcome {
     Historical { directory: std::path::PathBuf },
     Activated(evertrace_store::restore::RestoreActivated),
+}
+
+struct PackageProbeChild(Option<std::process::Child>);
+
+impl Drop for PackageProbeChild {
+    fn drop(&mut self) {
+        if crate::recovery::finish_owned_child(&mut self.0, true).is_err() {
+            tracing::warn!("package probe child cleanup failed");
+        }
+    }
+}
+
+async fn run_package_native(
+    executable: &Path,
+    native: &Path,
+    cas: &Path,
+) -> Result<(), evertrace_store::restore::RestoreError> {
+    use evertrace_store::restore::RestoreError;
+    use std::{
+        io::Read,
+        os::{
+            fd::OwnedFd,
+            unix::{net::UnixStream, process::CommandExt},
+        },
+        process::Stdio,
+    };
+    let (mut reader, output) = UnixStream::pair().map_err(|_| RestoreError::Io)?;
+    reader.set_nonblocking(true).map_err(|_| RestoreError::Io)?;
+    let descriptor: OwnedFd = output.into();
+    let mut child = PackageProbeChild(Some(
+        std::process::Command::new(executable)
+            .args(["--verify-package-native"])
+            .arg(native)
+            .arg("--cas")
+            .arg(cas)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(descriptor))
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|_| RestoreError::Io)?,
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut output = Vec::new();
+    let result =
+        async {
+            loop {
+                let mut buffer = [0; 1024];
+                match reader.read(&mut buffer) {
+                    Ok(count) => output.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return Err(RestoreError::Io),
+                }
+                if output.len() > 4096 || std::time::Instant::now() >= deadline {
+                    return Err(RestoreError::Io);
+                }
+                if let Some(status) = crate::recovery::finish_owned_child(&mut child.0, false)
+                    .map_err(|_| RestoreError::ResidualCandidate {
+                        directory: native.to_owned(),
+                        cause: Box::new(RestoreError::Io),
+                    })?
+                {
+                    // Drain only the bounded bytes already available after group cleanup.
+                    loop {
+                        match reader.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(count) if output.len() + count <= 4096 => {
+                                output.extend_from_slice(&buffer[..count])
+                            }
+                            _ => return Err(RestoreError::Io),
+                        }
+                    }
+                    return if status.success() && output == b"candidate native verified\n" {
+                        Ok(())
+                    } else {
+                        Err(RestoreError::Io)
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        .await;
+    crate::recovery::finish_owned_child(&mut child.0, true).map_err(|_| {
+        RestoreError::ResidualCandidate {
+            directory: native.to_owned(),
+            cause: Box::new(RestoreError::Io),
+        }
+    })?;
+    result
+}
+
+async fn probe_package_daemon<F, Fut>(
+    package: &Path,
+    health: &F,
+) -> Result<(), evertrace_store::restore::RestoreError>
+where
+    F: Fn(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use evertrace_store::restore::RestoreError;
+    use std::{
+        io::Write,
+        os::unix::{
+            fs::{DirBuilderExt, OpenOptionsExt},
+            process::CommandExt,
+        },
+        process::Stdio,
+    };
+    let invalid = || RestoreError::Store(evertrace_store::StoreError::StoreCorrupt);
+    // Do not inherit TMPDIR or the potentially long historical native locator.
+    if !std::fs::symlink_metadata("/tmp")
+        .map_err(|_| invalid())?
+        .is_dir()
+    {
+        return Err(invalid());
+    }
+    let temporary =
+        evertrace_capture::ConfinedRoot::open(Path::new("/tmp")).map_err(|_| invalid())?;
+    let wrapper = Path::new("/tmp").join(format!("et-pkg-{}", JobId::new_v7()));
+    let root = wrapper.join("data");
+    let uncertain = || RestoreError::ResidualCandidate {
+        directory: wrapper.clone(),
+        cause: Box::new(RestoreError::Io),
+    };
+    use std::os::unix::ffi::OsStrExt;
+    if root
+        .join("runtime/evertraced-v1.sock")
+        .as_os_str()
+        .as_bytes()
+        .len()
+        >= 108
+    {
+        return Err(invalid());
+    }
+    temporary.revalidate_stable().map_err(|_| invalid())?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&wrapper)
+        .map_err(|_| RestoreError::Io)?;
+    let custody =
+        evertrace_capture::ConfinedRoot::open_owned_private(&wrapper).map_err(|_| uncertain())?;
+    let result = async {
+    temporary.revalidate_stable().map_err(|_| uncertain())?;
+    std::fs::DirBuilder::new().mode(0o700).create(&root).map_err(|_| RestoreError::Io)?;
+    let mut config = evertrace_domain::config::EffectiveConfig::default()
+        .config()
+        .clone();
+    config.runtime.data_dir = root.to_str().ok_or_else(invalid)?.to_owned();
+    config.llm.enabled = false;
+    let config = evertrace_domain::config::EffectiveConfig::new(config).map_err(|_| invalid())?;
+    let config_path = root.join("probe.toml");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config_path)
+        .map_err(|_| RestoreError::Io)?;
+    file.write_all(config.to_toml().map_err(|_| invalid())?.as_bytes())
+        .map_err(|_| RestoreError::Io)?;
+    file.sync_all().map_err(|_| RestoreError::Io)?;
+    drop(file);
+    let mut daemon = PackageProbeChild(Some(
+        std::process::Command::new(package.join("evertraced"))
+            .arg("--config")
+            .arg(&config_path)
+            .env_clear()
+            .env("HOME", &root)
+            .env("XDG_CONFIG_HOME", &root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|_| RestoreError::Io)?,
+    ));
+    let result = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if crate::recovery::finish_owned_child(&mut daemon.0, false).map_err(|_| uncertain())?.is_some() { return Err(invalid()); }
+            let ready = tokio::time::timeout_at(deadline, health(root.join("runtime/evertraced-v1.sock"))).await.map_err(|_| invalid())?;
+            if ready { break; }
+            if tokio::time::Instant::now() >= deadline { return Err(invalid()); }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let runtime_path = RuntimeSnapshot::snapshot_path(&root);
+        let runtime = RuntimeSnapshot::load(&runtime_path).map_err(|_| invalid())?;
+        if runtime.effective_config_hash != config.hash() { return Err(invalid()); }
+        let launcher = evertrace_codex::install::prepare_probe_generation(&root, &package.join("evertrace-hook"), |path| runtime.publish(path).map_err(|_| evertrace_codex::install::InstallError::Io)).map_err(|_| invalid())?;
+        let native = serde_json::json!({
+            "cwd": root, "hook_event_name":"PreToolUse", "model":"package-probe", "permission_mode":"default",
+            "session_id":"package-daemon-probe", "tool_input":{"command":"printf package-daemon-probe"},
+            "tool_name":"Bash", "tool_use_id":"one", "transcript_path":null, "turn_id":"one"
+        });
+        let mut hook = PackageProbeChild(Some(std::process::Command::new(launcher)
+            .arg("--launcher-root").arg(&root).env_clear().stdin(Stdio::piped())
+            .stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn().map_err(|_| RestoreError::Io)?));
+        let hook_result = async {
+        hook.0.as_mut().ok_or_else(invalid)?.stdin.take().ok_or_else(invalid)?.write_all(&serde_json::to_vec(&native).map_err(|_| invalid())?).map_err(|_| RestoreError::Io)?;
+        loop {
+            if let Some(status) = crate::recovery::finish_owned_child(&mut hook.0, false).map_err(|_| uncertain())? {
+                if !status.success() { return Err(invalid()); }
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline { return Err(invalid()); }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        }.await;
+        crate::recovery::finish_owned_child(&mut hook.0, true).map_err(|_| uncertain())?;
+        hook_result?;
+        loop {
+            let connection = evertrace_store::connection::CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root)).await.map_err(|_| invalid())?;
+            let journal = connection.connection().open_table(evertrace_store::JOURNAL_TABLE).execute().await.map_err(|_| invalid())?;
+            let payloads = evertrace_store::journal::read_all_journal_rows(&journal).await?.iter().map(|row| row.payload()).collect::<Result<Vec<_>, _>>()?;
+            let receipt = payloads.iter().find_map(|payload| match payload {
+                JournalPayload::SourceReceiptRecorded(receipt) if receipt.source_session_ref == "package-daemon-probe" => Some(receipt), _ => None,
+            });
+            let normalized = payloads.iter().any(|payload| matches!(payload, JournalPayload::HostOccurrenceNormalized(_)));
+            if let Some(receipt) = receipt && normalized
+                && payloads.iter().any(|payload| matches!(payload, JournalPayload::SourceIngestWatermark(value) if value.source_instance_id == receipt.source_instance_id)) {
+                if payloads.iter().any(|payload| matches!(payload, JournalPayload::ExecutionLaneRecorded(_) | JournalPayload::CaptureReceiptRecorded(_))) { return Err(invalid()); }
+                let cas = evertrace_capture::CasStore::open_existing(runtime.cas_dir.clone()).map_err(|_| invalid())?;
+                let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref).map_err(|_| invalid())?;
+                let (payload, _) = cas.read_bounded(&digest, 64 * 1024, 64 * 1024).map_err(|_| invalid())?;
+                if !payload.windows(b"package-daemon-probe".len()).any(|value| value == b"package-daemon-probe") { return Err(invalid()); }
+                return Ok(());
+            }
+            drop(journal); drop(connection);
+            if tokio::time::Instant::now() >= deadline { return Err(invalid()); }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }.await;
+    crate::recovery::finish_owned_child(&mut daemon.0, true).map_err(|_| {
+        RestoreError::ResidualCandidate {
+            directory: wrapper.clone(),
+            cause: Box::new(RestoreError::Io),
+        }
+    })?;
+    result
+    }.await;
+    // Uncertain process custody must never authorize removing its files.
+    if matches!(&result, Err(RestoreError::ResidualCandidate { .. })) {
+        return result;
+    }
+    temporary.revalidate_stable().map_err(|_| uncertain())?;
+    custody.revalidate_stable().map_err(|_| uncertain())?;
+    std::fs::remove_dir_all(&wrapper).map_err(|_| uncertain())?;
+    result
 }
 
 /// Offline only: no actor, provider, socket or background scheduler is started.
@@ -802,8 +1085,33 @@ impl BackgroundScheduler {
     }
 
     pub async fn run_once(&self) -> Result<BackgroundProgress, BackgroundSchedulerError> {
-        let capture_state = CaptureRuntime::open(self.runtime.clone())
-            .map(|runtime| runtime.state())
+        let capture_state = self
+            .runtime
+            .spool_limits()
+            .ok()
+            .and_then(|limits| {
+                let spool = evertrace_capture::DurableSpool::open_read_only(
+                    self.runtime.spool_dir.clone(),
+                    limits,
+                )
+                .ok()?;
+                let quarantine = std::fs::read_dir(self.runtime.spool_dir.join("quarantine"))
+                    .ok()?
+                    .next()
+                    .transpose()
+                    .ok()?
+                    .is_some();
+                Some(
+                    if spool.below_low_watermark().ok()?
+                        && spool.pending_gap_markers().ok()?.is_empty()
+                        && !quarantine
+                    {
+                        CaptureAdmissionState::Normal
+                    } else {
+                        CaptureAdmissionState::Recovering
+                    },
+                )
+            })
             .unwrap_or(CaptureAdmissionState::Unavailable);
         let optional_allowed = capture_state == CaptureAdmissionState::Normal;
         let mut completed = 0;
@@ -1175,11 +1483,7 @@ impl BackgroundScheduler {
                     && job.target_generation == item.source_event_seq.max(1)
                     && capture_job_is_current(job, self.runtime.effective_config_hash)
             });
-            if covered
-                || !report
-                    .as_ref()
-                    .is_some_and(|report| capture_item_manifest_matches(&item, report))
-            {
+            if covered || resolve_capture_report(&item, report.as_ref(), &self.runtime).is_none() {
                 continue;
             }
             capture_jobs.push(DurableJob {
@@ -1951,9 +2255,7 @@ impl BackgroundScheduler {
                 )
                 .await;
         }
-        let Some(report) = report_guard
-            .as_ref()
-            .filter(|report| capture_item_manifest_matches(item, report))
+        let Some(report) = resolve_capture_report(item, report_guard.as_ref(), &self.runtime)
         else {
             return Err(BackgroundSchedulerError::Store);
         };
@@ -2145,13 +2447,11 @@ impl BackgroundScheduler {
                 return Ok(None);
             }
             if !frontier.items.is_empty()
-                && !report.as_ref().is_some_and(|report| {
-                    frontier.items.iter().any(|item| {
-                        item.target_kind == expected_kind
-                            && item.target_id == current.target_revision
-                            && item.source_event_seq == current.target_watermark
-                            && capture_item_manifest_matches(item, report)
-                    })
+                && !frontier.items.iter().any(|item| {
+                    item.target_kind == expected_kind
+                        && item.target_id == current.target_revision
+                        && item.source_event_seq == current.target_watermark
+                        && resolve_capture_report(item, report.as_ref(), &self.runtime).is_some()
                 })
             {
                 return Ok(None);
@@ -2350,6 +2650,25 @@ fn capture_item_manifest_matches(
         }
     }
     count != 0
+}
+
+fn resolve_capture_report(
+    item: &evertrace_store::ReconciliationWorkItem,
+    current: Option<&HostProbeReport>,
+    runtime: &RuntimeSnapshot,
+) -> Option<HostProbeReport> {
+    if let Some(report) = current.filter(|report| capture_item_manifest_matches(item, report)) {
+        return Some(report.clone());
+    }
+    // An unobserved native delivery has no lane/lifecycle authority. It can
+    // normalize weak physical facts, never manufacture capture completeness.
+    if item.target_kind != DirtyTargetKind::PhysicalNormalization {
+        return None;
+    }
+    evertrace_codex::install::StableLauncher::retained_native_reports(runtime.data_dir().ok()?)
+        .ok()?
+        .into_iter()
+        .find(|report| capture_item_manifest_matches(item, report))
 }
 
 pub fn select_jobs(

@@ -29,12 +29,19 @@ pub async fn upgrade(
             &std::path::absolute(host.join("config.toml"))?,
             &std::path::absolute(configuration.join("systemd/user/evertraced.service"))?,
             &package,
+            |socket| async move {
+                crate::daemon_client::health(&socket)
+                    .await
+                    .is_ok_and(|health| health.validate())
+            },
         )
         .await?;
         println!(
-            "scope=package_prepublication check=not-ready native_prepared=true migrated={} materials_validated={} generation={:?} backup={} candidate_removed=true",
+            "scope=package_prepublication check=not-ready native_prepared=true migrated={} materials_validated={} candidate_native_verified={} candidate_daemon_verified={} host_verified=false generation={:?} backup={} candidate_removed=true",
             checked.migrated,
             checked.materials_validated,
+            checked.candidate_native_verified,
+            checked.candidate_daemon_verified,
             checked.generation,
             checked.backup.display()
         );

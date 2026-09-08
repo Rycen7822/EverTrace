@@ -990,6 +990,37 @@ pub struct PackageCheckPreflight {
     service: InstallFile,
 }
 
+/// Wiring for the caller-owned disposable package probe only.
+pub fn prepare_probe_generation(
+    root: &Path,
+    executable: &Path,
+    runtime: impl FnOnce(&Path) -> Result<(), InstallError>,
+) -> Result<PathBuf, InstallError> {
+    let required = package_metadata(executable)?
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(16 * 1024 * 1024))
+        .ok_or(InstallError::ResourceExhausted)?;
+    if fs2::available_space(root).map_err(map_io)? < required {
+        return Err(InstallError::ResourceExhausted);
+    }
+    let launcher = StableLauncher::open(root)?;
+    launcher.install_launcher_binary(executable)?;
+    let directory = root.join(generation_relative(1, GENERATION_EXECUTABLE_NAME));
+    ensure_private_directory(directory.parent().ok_or(InstallError::InvalidType)?)?;
+    atomic_write(&directory, &package_bytes(executable)?, 0o700)?;
+    let snapshot = root.join(generation_relative(1, GENERATION_RUNTIME_NAME));
+    runtime(&snapshot)?;
+    launcher.publish_generation(HookGeneration {
+        generation: 1,
+        protocol_version: 1,
+        executable: directory,
+        runtime_snapshot: snapshot,
+        compatible: true,
+    })?;
+    Ok(launcher.launcher_path())
+}
+
 /// Reject invalid inputs before the caller creates its backup/native candidate.
 pub fn preflight_package_check(
     data: &Path,
@@ -1458,6 +1489,27 @@ impl StableLauncher {
             }
             Ok(retained)
         })
+    }
+
+    pub fn retained_native_reports(
+        data: &Path,
+    ) -> Result<Vec<crate::probe::HostProbeReport>, InstallError> {
+        let launcher = Self {
+            root: data.to_owned(),
+        };
+        match fs::symlink_metadata(launcher.registry_path()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(map_io(error)),
+            Ok(_) => {}
+        }
+        launcher
+            .retained_generations()?
+            .into_iter()
+            .map(|generation| {
+                crate::hook_input::native_generation_report(generation)
+                    .map_err(|_| InstallError::InvalidRegistry)
+            })
+            .collect()
     }
 
     /// Fixed current-install closure, not the retained backup closure. The

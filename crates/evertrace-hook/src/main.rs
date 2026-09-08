@@ -98,7 +98,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
     let socket = snapshot.recovery_socket_path.clone();
     let configured_timeout =
         Duration::from_millis(u64::from(snapshot.recovery_preflight_timeout_ms));
-    let mut runtime = CaptureRuntime::open(snapshot.clone()).map_err(|_| ())?;
+    let mut runtime = CaptureRuntime::open_for_admission(snapshot.clone()).map_err(|_| ())?;
     let record = CaptureRecordInput {
         spool_record_id: input.spool_record_id,
         source_observation_id_hint: input.source_observation_id_hint,
@@ -185,7 +185,8 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
             )
             .is_err()
         });
-        if barrier_failed && let Ok(runtime) = CaptureRuntime::open(snapshot.clone()) {
+        if barrier_failed && let Ok(runtime) = CaptureRuntime::open_for_admission(snapshot.clone())
+        {
             let _ = runtime.record_recovery_unavailable(&recovery_gap_record);
         }
     }

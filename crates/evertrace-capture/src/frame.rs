@@ -368,7 +368,7 @@ pub fn scan_frames(bytes: &[u8]) -> Result<FrameScan, SpoolFrameError> {
     while offset < bytes.len() {
         let remaining = &bytes[offset..];
         if remaining.len() < PREFIX_LENGTH {
-            if !MAGIC.starts_with(remaining) {
+            if !MAGIC.starts_with(&remaining[..remaining.len().min(MAGIC.len())]) {
                 return Err(SpoolFrameError::Corrupt);
             }
             return Ok(FrameScan {

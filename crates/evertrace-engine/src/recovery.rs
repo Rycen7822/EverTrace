@@ -300,57 +300,64 @@ struct CanaryRun {
 
 impl CanaryRun {
     fn finish_child(&mut self, force: bool) -> Result<Option<std::process::ExitStatus>, ()> {
-        use rustix::{
-            io::Errno,
-            process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
-        };
-        let Some(child) = self.child.as_mut() else {
-            return Ok(None);
-        };
-        let pid = Pid::from_child(child);
-        let observed = loop {
-            match waitid(
-                WaitId::Pid(pid),
-                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-            ) {
-                Err(Errno::INTR) => continue,
-                Err(Errno::CHILD) => {
-                    // Custody was lost: never signal a potentially reused PGID.
-                    self.child = None;
-                    return Err(());
-                }
-                Err(_) => return Err(()),
-                Ok(value) => break value,
-            }
-        };
-        if observed.is_none() && !force {
-            return Ok(None);
-        }
-        // NOWAIT leaves the leader unreaped until the whole owned group has
-        // been signalled, including descendants surviving a natural exit.
-        let signalled = loop {
-            match kill_process_group(pid, Signal::KILL) {
-                Err(Errno::INTR) => continue,
-                Ok(()) | Err(Errno::SRCH) => break true,
-                Err(_) => break false,
-            }
-        };
-        // Also terminate our direct child if it changed its own process group.
-        // Its unreaped identity remains owned even when the old group is gone.
-        let directly_stopped = loop {
-            match child.kill() {
-                Ok(()) => break true,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => break error.raw_os_error() == Some(Errno::SRCH.raw_os_error()),
-            }
-        };
-        let status = child.wait().map_err(|_| ());
-        self.child = None;
-        if !signalled || !directly_stopped {
-            return Err(());
-        }
-        status.map(Some)
+        finish_owned_child(&mut self.child, force)
     }
+}
+
+pub(crate) fn finish_owned_child(
+    owned: &mut Option<std::process::Child>,
+    force: bool,
+) -> Result<Option<std::process::ExitStatus>, ()> {
+    use rustix::{
+        io::Errno,
+        process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
+    };
+    let Some(child) = owned.as_mut() else {
+        return Ok(None);
+    };
+    let pid = Pid::from_child(child);
+    let observed = loop {
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Err(Errno::INTR) => continue,
+            Err(Errno::CHILD) => {
+                // Custody was lost: never signal a potentially reused PGID.
+                *owned = None;
+                return Err(());
+            }
+            Err(_) => return Err(()),
+            Ok(value) => break value,
+        }
+    };
+    if observed.is_none() && !force {
+        return Ok(None);
+    }
+    // NOWAIT leaves the leader unreaped until the whole owned group has
+    // been signalled, including descendants surviving a natural exit.
+    let signalled = loop {
+        match kill_process_group(pid, Signal::KILL) {
+            Err(Errno::INTR) => continue,
+            Ok(()) | Err(Errno::SRCH) => break true,
+            Err(_) => break false,
+        }
+    };
+    // Also terminate our direct child if it changed its own process group.
+    // Its unreaped identity remains owned even when the old group is gone.
+    let directly_stopped = loop {
+        match child.kill() {
+            Ok(()) => break true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break error.raw_os_error() == Some(Errno::SRCH.raw_os_error()),
+        }
+    };
+    let status = child.wait().map_err(|_| ());
+    *owned = None;
+    if !signalled || !directly_stopped {
+        return Err(());
+    }
+    status.map(Some)
 }
 
 impl Drop for CanaryRun {

@@ -97,6 +97,22 @@ fn map_host_canary(
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let raw = env::args_os().skip(1).collect::<Vec<_>>();
+    if raw
+        .first()
+        .is_some_and(|value| value == "--verify-package-native")
+    {
+        if raw.len() != 4 || raw[2] != "--cas" {
+            return Err("usage: evertraced --verify-package-native PATH --cas PATH".into());
+        }
+        evertrace_engine::maintenance::verify_package_native(
+            std::path::Path::new(&raw[1]),
+            std::path::Path::new(&raw[3]),
+        )
+        .await?;
+        println!("candidate native verified");
+        return Ok(());
+    }
     let args = StartupArgs::parse()?;
     let config_path = config_path(args.config)?;
     let source = fs::read_to_string(&config_path)?;
@@ -202,6 +218,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let maintenance_active = Arc::new(AtomicBool::new(false));
     let dispatch_gate = Arc::new(RwLock::new(()));
+    let ingestor = evertrace_engine::EvidenceIngestor::new(
+        runtime_snapshot.clone(),
+        writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+        runtime_snapshot.effective_config_hash,
+        "ordinary-hook-ingest-v1",
+    )?;
+    let mut ingest_task = tokio::spawn(ingestor.run(
+        Arc::clone(&dispatch_gate),
+        session_import_shutdown_tx.subscribe(),
+    ));
     let handler_engine = Arc::clone(&engine);
     let handler_recovery_action_service = recovery_action_service.clone();
     let handler_mcp_bindings = mcp_bindings;
@@ -730,9 +756,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     loop {
         tokio::select! {
+            result = &mut ingest_task => {
+                let _ = shutdown_tx.send(true);
+                let _ = session_import_shutdown_tx.send(true);
+                background_scheduler_task.await??;
+                recovery_action_service.shutdown_and_drain().await;
+                task.await??;
+                recall_worker.abort();
+                let _ = (&mut recall_worker).await;
+                if let Some(handle) = writer_handle.take() { handle.shutdown().await?; }
+                writer_task.await??;
+                result??;
+                return Err("ordinary ingest stopped unexpectedly".into());
+            }
             result = &mut task => {
                 let server_result = result;
                 let _ = session_import_shutdown_tx.send(true);
+                let ingest_result = ingest_task.await;
                 background_scheduler_task.await??;
                 recovery_action_service.shutdown_and_drain().await;
                 recall_worker.abort();
@@ -741,23 +781,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     handle.shutdown().await?;
                 }
                 writer_task.await??;
+                ingest_result??;
                 server_result??;
                 return Err("server stopped unexpectedly".into());
             }
             result = &mut writer_task => {
                 let _ = shutdown_tx.send(true);
                 let _ = session_import_shutdown_tx.send(true);
+                let ingest_result = ingest_task.await;
                 background_scheduler_task.await??;
                 recovery_action_service.shutdown_and_drain().await;
                 recall_worker.abort();
                 let _ = (&mut recall_worker).await;
                 task.await??;
+                ingest_result??;
                 result??;
                 return Err("writer stopped unexpectedly".into());
             }
             result = &mut recall_worker => {
                 let _ = shutdown_tx.send(true);
                 let _ = session_import_shutdown_tx.send(true);
+                let ingest_result = ingest_task.await;
                 background_scheduler_task.await??;
                 recovery_action_service.shutdown_and_drain().await;
                 task.await??;
@@ -765,11 +809,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     handle.shutdown().await?;
                 }
                 writer_task.await??;
+                ingest_result??;
                 result?;
                 return Err("recall worker stopped unexpectedly".into());
             }
             result = &mut background_scheduler_task => {
                 let _ = shutdown_tx.send(true);
+                let _ = session_import_shutdown_tx.send(true);
+                let ingest_result = ingest_task.await;
                 recovery_action_service.shutdown_and_drain().await;
                 task.await??;
                 recall_worker.abort();
@@ -778,6 +825,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     handle.shutdown().await?;
                 }
                 writer_task.await??;
+                ingest_result??;
                 result??;
                 return Err("background scheduler stopped unexpectedly".into());
             }
@@ -802,10 +850,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         request.complete_fatal();
                         let _ = shutdown_tx.send(true);
                         let _ = session_import_shutdown_tx.send(true);
+                        drop(dispatch);
+                        let ingest_result = ingest_task.await;
                         recovery_action_service.shutdown_and_drain().await;
                         task.await??;
                         background_scheduler_task.await??;
                         let _ = (&mut writer_task).await;
+                        ingest_result??;
                         return Err("writer failed to reopen after backup".into());
                     }
                 };
@@ -830,6 +881,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 signal?;
                 let _ = shutdown_tx.send(true);
                 let _ = session_import_shutdown_tx.send(true);
+                let ingest_result = ingest_task.await;
                 recovery_action_service.shutdown_and_drain().await;
                 task.await??;
                 background_scheduler_task.await??;
@@ -839,6 +891,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     handle.shutdown().await?;
                 }
                 writer_task.await??;
+                ingest_result??;
                 return Ok(());
             }
         }

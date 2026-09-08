@@ -660,6 +660,75 @@ async fn rebuild_upgrade_native(native: &Path) -> Result<(), RestoreError> {
     Ok(())
 }
 
+/// Read-only candidate validation: no writer, migration, catch-up or repair.
+pub async fn verify_package_native(native: &Path, cas: &Path) -> Result<(), RestoreError> {
+    let custody = evertrace_capture::ConfinedRoot::open_owned_private(native)
+        .map_err(|_| StoreError::InvalidPath)?;
+    let before = crate::backup::native_upgrade_manifest(native)?;
+    let (_, persisted) = crate::backup::read_verified_store_tables(native).await?;
+    if crate::JournalWriter::existing_profile(native).await? != Some("L0002") {
+        return Err(StoreError::StoreCorrupt.into());
+    }
+    let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let journal = connection
+        .open_table(crate::JOURNAL_TABLE)
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let objects = connection
+        .open_table(crate::OBJECTS_TABLE)
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let expected = crate::ProjectionWorker::new(journal.clone(), objects)
+        .full_snapshot()
+        .await?;
+    if expected != persisted {
+        return Err(StoreError::Projection.into());
+    }
+    let relations = connection
+        .open_table(crate::RELATIONS_TABLE)
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let search = connection
+        .open_table(crate::SEARCH_TABLE)
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let actual = crate::query::L0002ProjectionWorker::new(journal, relations, search)
+        .current()
+        .await?;
+    let derived = crate::query::derive_l0002_projections(&expected)?;
+    if actual.frontier != derived.frontier
+        || actual.relation_hash()? != derived.relation_hash()?
+        || actual.search_hash()? != derived.search_hash()?
+    {
+        return Err(StoreError::Projection.into());
+    }
+    let references = expected.live_cas_refs()?;
+    if !references.is_empty() {
+        let cas = evertrace_capture::CasStore::open_existing(cas.to_owned())
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        for reference in references {
+            let digest = evertrace_capture::CasStore::parse_digest(&reference)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            cas.verify_envelope(&digest)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+        }
+    }
+    custody
+        .revalidate_stable()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    if before != crate::backup::native_upgrade_manifest(native)? {
+        return Err(StoreError::StoreCorrupt.into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
     #[error(

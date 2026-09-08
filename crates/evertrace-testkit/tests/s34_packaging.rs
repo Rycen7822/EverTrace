@@ -58,11 +58,322 @@ fn service(paths: &ManagedInstallPaths, body: &str) {
     fs::set_permissions(&paths.systemctl, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+async fn package_health(socket: std::path::PathBuf) -> bool {
+    evertrace_protocol::request_health(
+        &socket,
+        env!("CARGO_PKG_VERSION"),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .is_ok_and(|health| health.validate())
+}
+
+#[tokio::test]
+async fn candidate_native_binary_validates_without_starting_or_repairing() {
+    let (root, paths, _) = fixture();
+    drop(JournalWriter::open(&paths.data_root).await.unwrap());
+    let native = evertrace_store::connection::native_root(&paths.data_root);
+    let run = |path: &std::path::Path| {
+        Command::new(&paths.daemon)
+            .arg("--verify-package-native")
+            .arg(path)
+            .arg("--cas")
+            .arg(root.path().join("absent-cas"))
+            .env_clear()
+            .output()
+            .unwrap()
+    };
+    let valid = run(&native);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert_eq!(valid.stdout, b"candidate native verified\n");
+    assert!(!paths.data_root.join("runtime").exists());
+    let broken = root.path().join("broken-native");
+    fs::create_dir(&broken).unwrap();
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(broken.join("unrelated"), b"preserve").unwrap();
+    assert!(!run(&broken).status.success());
+    assert_eq!(fs::read_dir(&broken).unwrap().count(), 1);
+    assert_eq!(fs::read(broken.join("unrelated")).unwrap(), b"preserve");
+}
+
+#[tokio::test]
+async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_cas() {
+    use std::time::Duration;
+    let (_root, paths, _) = fixture();
+    install_offline(&paths, false).unwrap();
+    let native = serde_json::json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"ordinary-backlog","tool_input":{"command":"true"},"tool_name":"Bash","tool_use_id":"one","transcript_path":null,"turn_id":"one"});
+    invoke(&paths, &serde_json::to_vec(&native).unwrap());
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
+    let spool =
+        DurableSpool::open_read_only(runtime.spool_dir.clone(), runtime.spool_limits().unwrap())
+            .unwrap();
+    let original = spool.read_active().unwrap().remove(0).record;
+    drop(spool);
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        Daemon(
+            Command::new(&paths.daemon)
+                .arg("--config")
+                .arg(&paths.config)
+                .env_clear()
+                .env("HOME", paths.data_root.parent().unwrap())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    for replay in [false, true] {
+        if replay {
+            let mut spool = DurableSpool::open_read_only(
+                runtime.spool_dir.clone(),
+                runtime.spool_limits().unwrap(),
+            )
+            .unwrap();
+            spool.append(&original).unwrap();
+        }
+        let mut daemon = spawn();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if package_health(paths.data_root.join("runtime/evertraced-v1.sock")).await {
+                let connection = evertrace_store::connection::CompatibilityStore::connect_local(
+                    &evertrace_store::connection::native_root(&paths.data_root),
+                )
+                .await
+                .unwrap();
+                let journal = connection
+                    .connection()
+                    .open_table(evertrace_store::JOURNAL_TABLE)
+                    .execute()
+                    .await
+                    .unwrap();
+                let payloads = evertrace_store::journal::read_all_journal_rows(&journal)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.payload().unwrap())
+                    .collect::<Vec<_>>();
+                let receipts = payloads
+                    .iter()
+                    .filter(|payload| matches!(payload, JournalPayload::SourceReceiptRecorded(_)))
+                    .count();
+                assert!(receipts <= 1);
+                let spool = DurableSpool::open_read_only(
+                    runtime.spool_dir.clone(),
+                    runtime.spool_limits().unwrap(),
+                )
+                .unwrap();
+                if receipts == 1
+                    && spool.read_active().unwrap().is_empty()
+                    && !fs::read_dir(runtime.spool_dir.join("main"))
+                        .unwrap()
+                        .any(|entry| {
+                            entry
+                                .unwrap()
+                                .path()
+                                .extension()
+                                .is_some_and(|value| value == "sealed")
+                        })
+                    && payloads.iter().any(|payload| {
+                        matches!(payload, JournalPayload::HostOccurrenceNormalized(_))
+                    })
+                {
+                    assert!(payloads.iter().any(|payload| matches!(
+                        payload,
+                        JournalPayload::SourceIngestWatermark(_)
+                    )));
+                    assert!(!payloads.iter().any(|payload| matches!(
+                        payload,
+                        JournalPayload::ExecutionLaneRecorded(_)
+                            | JournalPayload::CaptureReceiptRecorded(_)
+                    )));
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !replay {
+            use evertrace_protocol::{
+                command::Command as Rpc,
+                dto::{
+                    ClientKind, HumanActionRequest, HumanActionStatus, HumanGovernanceRequest,
+                    HumanGovernanceResponse, HumanReadRequest, HumanSurface,
+                },
+                response::Response,
+            };
+            let mut client = evertrace_protocol::LocalClient::connect(
+                &paths.data_root.join("runtime/evertraced-v1.sock"),
+                "s34-test",
+                ClientKind::Cli,
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+            let mut requested = false;
+            for _ in 0..4 {
+                let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
+                    frontier, ..
+                }) = client
+                    .request(
+                        evertrace_domain::ids::RequestId::new_v7(),
+                        Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                            request: HumanReadRequest::List {
+                                surface: HumanSurface::System,
+                                expected_frontier: None,
+                                after: None,
+                                limit: 16,
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("system snapshot");
+                };
+                let response = client
+                    .request(
+                        evertrace_domain::ids::RequestId::new_v7(),
+                        Rpc::HumanGovernance(HumanGovernanceRequest::Act {
+                            expected_frontier: frontier,
+                            action: HumanActionRequest::CreateBackup,
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                if matches!(response, Response::HumanGovernance(HumanGovernanceResponse::Action { result }) if result.status == HumanActionStatus::Applied)
+                {
+                    requested = true;
+                    break;
+                }
+            }
+            assert!(requested);
+            drop(client);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let complete = fs::read_dir(paths.data_root.join("backups"))
+                    .ok()
+                    .is_some_and(|entries| {
+                        entries.filter_map(Result::ok).any(|entry| {
+                            entry.file_name().to_string_lossy().starts_with("backup-")
+                                && entry.path().join("manifest.json").is_file()
+                        })
+                    });
+                if complete
+                    && package_health(paths.data_root.join("runtime/evertraced-v1.sock")).await
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline
+                        && daemon.0.try_wait().unwrap().is_none()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        assert!(
+            Command::new("/usr/bin/kill")
+                .args(["-TERM", &daemon.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = daemon.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    invoke(&paths, &serde_json::to_vec(&native).unwrap());
+    let spool =
+        DurableSpool::open_read_only(runtime.spool_dir.clone(), runtime.spool_limits().unwrap())
+            .unwrap();
+    let frame = spool.read_active().unwrap().remove(0);
+    let cas = evertrace_capture::CasStore::open_existing(runtime.cas_dir.clone()).unwrap();
+    let blob = cas
+        .blob_path(&evertrace_capture::CasStore::parse_digest(&frame.record.cas_refs[0]).unwrap());
+    let valid_cas = fs::read(&blob).unwrap();
+    fs::write(&blob, b"corrupt").unwrap();
+    drop(spool);
+    let mut daemon = spawn();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = daemon.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let spool =
+        DurableSpool::open_read_only(runtime.spool_dir.clone(), runtime.spool_limits().unwrap())
+            .unwrap();
+    let segments = spool.sealed_segments(1).unwrap();
+    assert_eq!(
+        segments[0].frames()[0].record.spool_record_id,
+        frame.record.spool_record_id
+    );
+    drop(segments);
+    fs::write(&blob, valid_cas).unwrap();
+    let broken = evertrace_capture::encode_frame(&original).unwrap()[..30].to_vec();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(spool.active_path())
+        .unwrap();
+    file.write_all(&broken).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    for _ in 0..2 {
+        let mut daemon = spawn();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = daemon.0.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(fs::read(spool.active_path()).unwrap(), broken);
+    }
+}
+
 #[tokio::test]
 async fn package_check_prepares_native_and_materials_without_publication() {
     use evertrace_engine::maintenance::{check_package_upgrade, upgrade_offline};
     use std::os::unix::fs::MetadataExt;
     let (root, mut paths, _) = fixture();
+    let original_data = paths.data_root.clone();
+    paths.data_root = root
+        .path()
+        .join("a-long-data-directory-for-real-package-socket-validation");
+    fs::write(
+        &paths.config,
+        fs::read_to_string(&paths.config).unwrap().replace(
+            original_data.to_str().unwrap(),
+            paths.data_root.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
     paths.unit = root.path().join("config/systemd/user/evertraced.service");
     install_offline(&paths, false).unwrap();
     let connection =
@@ -101,6 +412,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
                 &paths.host_config,
                 &paths.unit,
                 invalid,
+                package_health,
             )
             .await
             .is_err()
@@ -120,16 +432,47 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         fs::copy(paths.cli.parent().unwrap().join(name), package.join(name)).unwrap();
         fs::set_permissions(package.join(name), fs::Permissions::from_mode(0o700)).unwrap();
     }
+    let probe_roots = std::sync::Mutex::new(Vec::new());
+    let health = |socket: std::path::PathBuf| {
+        assert!(socket.as_os_str().len() < 108);
+        let wrapper = socket
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        assert!(wrapper.starts_with("/tmp"));
+        assert!(!wrapper.starts_with(&paths.data_root));
+        probe_roots.lock().unwrap().push(wrapper);
+        package_health(socket)
+    };
     let checked = check_package_upgrade(
         &paths.data_root,
         &paths.config,
         &paths.host_config,
         &paths.unit,
         &package,
+        &health,
     )
     .await
     .unwrap();
-    assert!(checked.materials_validated && checked.migrated);
+    assert!(
+        checked.materials_validated && checked.migrated,
+        "native={} daemon={}",
+        checked.candidate_native_verified,
+        checked.candidate_daemon_verified
+    );
+    assert!(checked.candidate_native_verified && checked.candidate_daemon_verified);
+    assert!(!probe_roots.lock().unwrap().is_empty());
+    assert!(
+        probe_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|path| !path.exists())
+    );
     assert_eq!(checked.generation, Some(2));
     assert!(!paths.data_root.join("store").exists());
     assert!(matches!(
@@ -181,6 +524,12 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         "{output}"
     );
     assert!(output.contains("materials_validated=true"), "{output}");
+    assert!(
+        output.contains(
+            "candidate_native_verified=true candidate_daemon_verified=true host_verified=false"
+        ),
+        "{output}"
+    );
     assert!(output.contains("migrated=false"));
     assert_eq!(
         fs::read_dir(paths.data_root.join("backups"))
@@ -196,11 +545,35 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         &paths.host_config,
         &paths.unit,
         &package,
+        package_health,
     )
     .await
     .unwrap();
     assert!(!rejected.materials_validated);
     assert!(rejected.backup.is_dir());
+    fs::copy(&paths.hook, package.join("evertrace-hook")).unwrap();
+    // Native verification still uses the real candidate implementation; only
+    // its ordinary daemon startup fails. This cannot certify daemon readiness.
+    fs::write(package.join("evertraced"), format!("#!/bin/sh\nif [ \"$1\" = --verify-package-native ]; then exec '{}' \"$@\"; fi\nexit 1\n", paths.daemon.display())).unwrap();
+    let failed_daemon = check_package_upgrade(
+        &paths.data_root,
+        &paths.config,
+        &paths.host_config,
+        &paths.unit,
+        &package,
+        &health,
+    )
+    .await
+    .unwrap();
+    assert!(failed_daemon.candidate_native_verified);
+    assert!(
+        probe_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|path| !path.exists())
+    );
+    assert!(!failed_daemon.candidate_daemon_verified && !failed_daemon.materials_validated);
     assert!(!fs::read_dir(&paths.data_root).unwrap().any(|entry| {
         entry
             .unwrap()

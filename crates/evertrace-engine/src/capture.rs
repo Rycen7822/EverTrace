@@ -52,6 +52,14 @@ pub(crate) fn verify_capture_frame(
     frame: &SealedFrame,
     cas: &CasStore,
 ) -> Result<VerifiedCapture, IngestError> {
+    verify_capture_frame_bounded(frame, cas, &mut (u64::MAX, u64::MAX))
+}
+
+pub(crate) fn verify_capture_frame_bounded(
+    frame: &SealedFrame,
+    cas: &CasStore,
+    remaining: &mut (u64, u64),
+) -> Result<VerifiedCapture, IngestError> {
     let (body, observation_id) =
         decode_validated_record_body(&frame.record).map_err(|error| match error {
             evertrace_capture::SpoolFrameError::LegacyUnsupported => IngestError::LegacyRecord,
@@ -59,7 +67,17 @@ pub(crate) fn verify_capture_frame(
             _ => IngestError::InvalidRecord,
         })?;
     let cas_digest = CasDigest::from_str(&body.cas_ref).map_err(|_| IngestError::Cas)?;
-    let protected = cas.read(&cas_digest).map_err(|_| IngestError::Cas)?;
+    let (protected, compressed) = cas
+        .read_bounded(&cas_digest, remaining.0, remaining.1)
+        .map_err(|_| IngestError::Cas)?;
+    remaining.0 = remaining
+        .0
+        .checked_sub(compressed)
+        .ok_or(IngestError::Cas)?;
+    remaining.1 = remaining
+        .1
+        .checked_sub(protected.len() as u64)
+        .ok_or(IngestError::Cas)?;
     if u64::try_from(protected.len()).map_err(|_| IngestError::InvalidRecord)?
         != body.protected_length
         || CasDigest::for_protected_bytes(&protected) != cas_digest
@@ -301,14 +319,18 @@ async fn reconcile_selected(
     {
         return Err(ReconcileError::InvalidInput);
     }
-    let (spool, _) = DurableSpool::open(
-        input.runtime_snapshot.spool_dir.clone(),
-        input
-            .runtime_snapshot
-            .spool_limits()
-            .map_err(|_| ReconcileError::InvalidInput)?,
-    )
-    .map_err(|_| ReconcileError::Spool)?;
+    let limits = input
+        .runtime_snapshot
+        .spool_limits()
+        .map_err(|_| ReconcileError::InvalidInput)?;
+    let spool = if targeted {
+        DurableSpool::open_read_only(input.runtime_snapshot.spool_dir.clone(), limits)
+            .map_err(|_| ReconcileError::Spool)?
+    } else {
+        DurableSpool::open(input.runtime_snapshot.spool_dir.clone(), limits)
+            .map_err(|_| ReconcileError::Spool)?
+            .0
+    };
     let marker_handles = if targeted {
         Vec::new()
     } else {
