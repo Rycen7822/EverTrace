@@ -1955,6 +1955,7 @@ version = "0.0.0"
 dependencies = [
  "evertrace-engine",
  "evertrace-protocol",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -53,6 +53,253 @@ fn fixture() -> (TempDir, ManagedInstallPaths, EffectiveConfig) {
     (root, paths, config)
 }
 
+#[tokio::test]
+async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
+    use evertrace_domain::{
+        ids::{CommandId, RepositoryId},
+        repository::{FilesystemIdentity, GitObjectFormat, PathObservation, RepositoryInstance},
+        semantic::{
+            ApplicabilityExpr, AtomDraft, AtomKind, AtomProvenance, AtomScope, AtomValue,
+            ConstraintExpr, ConstraintField, EpistemicStatus, ValidityInterval,
+        },
+    };
+    use evertrace_engine::semantic::{AtomAuthorityBasis, AtomMaterialization, materialize_atom};
+    use evertrace_store::{JournalCommand, JournalEventDraft};
+    use serde_json::{Value, json};
+    use std::time::{Duration, Instant};
+    let (_root, paths, config) = fixture();
+    let repository_id = RepositoryId::new_v7();
+    install_offline(&paths, false).unwrap();
+    invoke(&paths, &serde_json::to_vec(&json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"budget-session","tool_input":{"command":"echo budgetneedle"},"tool_name":"Bash","tool_use_id":"budget-tool","transcript_path":null,"turn_id":"budget-turn"})).unwrap());
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
+    let (mut spool, _) =
+        DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+    spool.seal_active(runtime.generation).unwrap();
+    drop(spool);
+    let (handle, actor) = spawn_writer(
+        evertrace_engine::open_writer(&paths.data_root)
+            .await
+            .unwrap(),
+        8,
+    )
+    .unwrap();
+    EvidenceIngestor::new(runtime, handle.clone(), config.hash(), "s34-budget-v1")
+        .unwrap()
+        .drain_once()
+        .await
+        .unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let observation = snapshot
+        .data_rows()
+        .find_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceObservationRecorded(value) => {
+                    Some(value.source_observation_id)
+                }
+                _ => None,
+            }
+        })
+        .unwrap();
+    drop(handle);
+    actor.await.unwrap().unwrap();
+    let path = paths.data_root.to_string_lossy().into_owned();
+    let repository = RepositoryInstance {
+        repository_id,
+        repository_revision: 1,
+        predecessor_revision: None,
+        current_path: path.clone(),
+        path_history: vec![PathObservation {
+            path,
+            first_observed_at_us: 1,
+            last_observed_at_us: 1,
+            evidence_refs: vec!["local-test".into()],
+        }],
+        git_common_dir_path: Some(format!("{}/.git", paths.data_root.display())),
+        common_dir_filesystem: Some(FilesystemIdentity {
+            device: 1,
+            inode: 1,
+        }),
+        object_format: Some(GitObjectFormat::Sha1),
+        remote_fingerprints: Vec::new(),
+        derived_from: None,
+        identity_evidence_refs: vec!["local-test".into()],
+        recorded_at_us: 1,
+    };
+    let atom = materialize_atom(
+        AtomMaterialization {
+            draft: AtomDraft {
+                kind: AtomKind::Claim,
+                epistemic_status: EpistemicStatus::Unverified,
+                value: AtomValue {
+                    text: "budgetneedle bounded evidence ".repeat(120),
+                    subject: "budgetneedle".into(),
+                    predicate: "records".into(),
+                    object: None,
+                    qualifiers: Vec::new(),
+                    critical_revision_refs: Vec::new(),
+                },
+                scope: AtomScope::Repository {
+                    repository_instance_id: repository_id,
+                },
+                applicability_expr: ApplicabilityExpr::Constraint(ConstraintExpr::Exists {
+                    field: ConstraintField::Phase,
+                }),
+                future_cue_lifecycle_exprs: None,
+                validity_interval: ValidityInterval {
+                    valid_from_us: 1,
+                    valid_until_us: None,
+                },
+                provenance: vec![AtomProvenance::AgentClaimed],
+                source_observation_refs: vec![observation],
+                evidence_refs: vec![observation.to_string()],
+                supersedes_revision_refs: Vec::new(),
+                supports_revision_refs: Vec::new(),
+                contradicts_revision_refs: Vec::new(),
+            },
+            authority_basis: AtomAuthorityBasis::AgentInferred,
+            accepted_proposal_id: None,
+            accepted_proposal_revision_id: None,
+            created_at_us: 1,
+        },
+        None,
+    )
+    .unwrap();
+    let reference = atom.atom_id.to_string();
+    repository.validate().unwrap();
+    atom.validate().unwrap();
+    let mut writer = evertrace_engine::open_writer(&paths.data_root)
+        .await
+        .unwrap();
+    for payload in [
+        JournalPayload::RepositoryInstanceRecorded(Box::new(repository)),
+        JournalPayload::AtomRecorded(Box::new(atom)),
+    ] {
+        let command = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                1,
+                config.hash(),
+                "s34-budget-v1",
+                payload,
+            )],
+        )
+        .unwrap();
+        writer.commit(&command, 1).await.unwrap_or_else(|error| {
+            panic!("{}: {error:?}", command.events()[0].payload.event_type())
+        });
+    }
+    writer.project().await.unwrap();
+    drop(writer);
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut lengths = Vec::new();
+    // Separate startups, not reload. Reverse the low budgets to expose action mixups.
+    for (search, get) in [(0, 1_200), (600, 1), (600, 1_200), (1_200, 2_400)] {
+        let mut source = config.config().clone();
+        source.llm.enabled = false;
+        source.search.search_token_budget = search;
+        source.search.get_token_budget = get;
+        fs::write(
+            &paths.config,
+            EffectiveConfig::new(source).unwrap().to_toml().unwrap(),
+        )
+        .unwrap();
+        let mut daemon = Daemon(
+            Command::new(&paths.daemon)
+                .arg("--config")
+                .arg(&paths.config)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !package_health(paths.data_root.join("runtime/evertraced-v1.sock")).await {
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let mut requests = vec![
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"budget-test","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        ];
+        for (id, action, input) in [
+            (1, "search", "budgetneedle"),
+            (2, "get", reference.as_str()),
+        ] {
+            requests.push(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"evertrace","arguments":{"action":action,"workspace":repository_id.to_string(),"input":input,"refs":[]}}}));
+        }
+        let mut cli = Command::new(&paths.cli)
+            .arg("--config")
+            .arg(&paths.config)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = cli.stdin.take().unwrap();
+        for request in requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        let output = cli.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let messages: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut pair = Vec::new();
+        for (index, target, hard) in [(1, search, 4_800), (2, get, 9_600)] {
+            let result = &messages[index]["result"]["structuredContent"];
+            assert!(
+                matches!(
+                    result["status"].as_str(),
+                    Some("ok" | "partial" | "degraded_index")
+                ),
+                "{result}"
+            );
+            let bytes = serde_json::to_vec(result).unwrap().len();
+            assert!(bytes <= hard);
+            let items = result["items"]["evidence"].as_array().unwrap();
+            if target <= 1 {
+                assert!(items.is_empty() && result["truncated"] == true);
+                assert!(
+                    result["next_refs"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(reference))
+                );
+            } else {
+                assert!(!items.is_empty(), "{result}");
+                for item in items {
+                    assert_eq!(item["instruction_authority"], "none");
+                    assert!(item["content_trust"].is_string());
+                    assert!(item["object_ref"].is_string());
+                }
+            }
+            pair.push(bytes);
+        }
+        lengths.push(pair);
+        drop(daemon);
+    }
+    assert!(lengths[0][0] < lengths[2][0]);
+    assert!(lengths[1][1] < lengths[2][1]);
+    assert!(lengths[2][0] <= lengths[3][0] && lengths[2][1] <= lengths[3][1]);
+}
+
 fn service(paths: &ManagedInstallPaths, body: &str) {
     fs::write(&paths.systemctl, format!("#!/bin/sh\nif [ \"$2\" = is-enabled ]; then echo disabled; exit 1; fi\nif [ \"$2\" = is-active ]; then echo inactive; exit 3; fi\n{body}\n")).unwrap();
     fs::set_permissions(&paths.systemctl, fs::Permissions::from_mode(0o700)).unwrap();

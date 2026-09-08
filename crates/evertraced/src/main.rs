@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 
+mod mcp_output;
+
 use std::{
     env, fs,
     path::PathBuf,
@@ -415,6 +417,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if context.client_kind != ClientKind::Mcp {
                             return Err(ErrorCode::Untrusted);
                         }
+                        let config_snapshot = handler_engine.effective_config().clone();
+                        let output_action = call.input.action;
                         let action = match call.input.action {
                             evertrace_protocol::mcp::McpAction::Search => McpServiceAction::Search,
                             evertrace_protocol::mcp::McpAction::Get => McpServiceAction::Get,
@@ -437,7 +441,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await
                             .map_err(|_| ErrorCode::Internal)?;
-                        Ok(Response::McpResult(Box::new(map_mcp_result(result))))
+                        let target_bytes = match output_action {
+                            evertrace_protocol::mcp::McpAction::Search => {
+                                config_snapshot.config().search.search_token_budget as usize * 4
+                            }
+                            evertrace_protocol::mcp::McpAction::Get => {
+                                config_snapshot.config().search.get_token_budget as usize * 4
+                            }
+                            _ => 2_400,
+                        };
+                        let mut result = map_mcp_result(result);
+                        mcp_output::bound_result(&mut result, output_action, target_bytes);
+                        Ok(Response::McpResult(Box::new(result)))
                     }
                     ProtocolCommand::SessionImportAdmin(command) => {
                         if context.client_kind != ClientKind::Cli {

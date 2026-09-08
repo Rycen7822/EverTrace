@@ -101,7 +101,7 @@ async fn stdio_tool_call_uses_one_persistent_mcp_uds_connection() {
                             .lock()
                             .unwrap()
                             .push(context.connection_id);
-                        Ok(Response::McpResult(Box::new(McpResultEnvelope {
+                        let envelope = McpResultEnvelope {
                             schema_version: 1,
                             request_id,
                             status: McpStatus::Ok,
@@ -117,7 +117,9 @@ async fn stdio_tool_call_uses_one_persistent_mcp_uds_connection() {
                                     scope: None,
                                     applicability: None,
                                     authority: None,
-                                    text: Some(call.input.input),
+                                    // The daemon owns output formatting; transport must not
+                                    // independently re-trim an already accepted response.
+                                    text: Some(call.input.input.repeat(500)),
                                     content_trust: ContentTrust::UntrustedSourceContent,
                                     capture_completeness: None,
                                     instruction_authority: InstructionAuthority::None,
@@ -128,7 +130,11 @@ async fn stdio_tool_call_uses_one_persistent_mcp_uds_connection() {
                             truncated: false,
                             next_refs: Vec::new(),
                             audit_ref: None,
-                        })))
+                        };
+                        assert!(
+                            (2_401..=4_800).contains(&serde_json::to_vec(&envelope).unwrap().len())
+                        );
+                        Ok(Response::McpResult(Box::new(envelope)))
                     }
                     _ => Err(ErrorCode::InvalidInput),
                 }
@@ -178,11 +184,11 @@ async fn stdio_tool_call_uses_one_persistent_mcp_uds_connection() {
     assert_eq!(messages.len(), 3);
     assert_eq!(
         messages[1]["result"]["structuredContent"]["items"]["evidence"][0]["text"],
-        "needle"
+        "needle".repeat(500)
     );
     assert_eq!(
         messages[2]["result"]["structuredContent"]["items"]["evidence"][0]["text"],
-        "second"
+        "second".repeat(500)
     );
     {
         let observed = connection_ids.lock().unwrap();
