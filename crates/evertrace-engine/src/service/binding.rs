@@ -66,6 +66,15 @@ pub struct McpBindingAuthority {
 struct McpBindingState {
     claims: BTreeMap<String, McpClaim>,
     client_cwds: BTreeMap<String, McpPinnedCwd>,
+    canary: Option<CanaryBindingObservation>,
+}
+
+struct CanaryBindingObservation {
+    nonce: String,
+    workspace: String,
+    deadline: Instant,
+    session: Option<String>,
+    conflicted: bool,
 }
 
 struct McpClaim {
@@ -81,6 +90,46 @@ struct McpPinnedCwd {
 }
 
 impl McpBindingAuthority {
+    pub(crate) fn begin_canary(&self, nonce: &str, workspace: &str, deadline: Instant) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state
+            .canary
+            .as_ref()
+            .is_some_and(|value| value.deadline > Instant::now())
+        {
+            return false;
+        }
+        state.canary = Some(CanaryBindingObservation {
+            nonce: nonce.into(),
+            workspace: workspace.into(),
+            deadline,
+            session: None,
+            conflicted: false,
+        });
+        true
+    }
+
+    pub(crate) fn canary_session(&self, nonce: &str) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        let value = state.canary.as_ref()?;
+        (value.nonce == nonce && !value.conflicted && Instant::now() < value.deadline)
+            .then(|| value.session.clone())
+            .flatten()
+    }
+
+    pub(crate) fn end_canary(&self, nonce: &str) {
+        if let Ok(mut state) = self.state.lock()
+            && state
+                .canary
+                .as_ref()
+                .is_some_and(|value| value.nonce == nonce)
+        {
+            state.canary = None;
+        }
+    }
+
     pub fn from_device_key_dir(path: &std::path::Path) -> Result<Self, McpBindingError> {
         DeviceKeyStore::new(path)
             .load()
@@ -222,6 +271,23 @@ impl McpBindingAuthority {
                 {
                     return Err(McpBindingError::ScopeUnresolved);
                 }
+                if let Some(observation) = state.canary.as_mut()
+                    && now < observation.deadline
+                    && original.action == "search"
+                    && original.input == observation.nonce
+                    && original.workspace == observation.workspace
+                    && original.refs.is_empty()
+                {
+                    if observation
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| *session != claim.anchor.session_id)
+                    {
+                        observation.conflicted = true;
+                    } else {
+                        observation.session = Some(claim.anchor.session_id.clone());
+                    }
+                }
                 Ok(McpResolvedScope {
                     workspace: claim.workspace,
                     anchor: Some(claim.anchor),
@@ -320,6 +386,53 @@ mod tests {
                 .mechanism,
             McpScopeMechanism::CwdOnly
         );
+    }
+
+    #[test]
+    fn canary_observes_only_current_nonce_atomic_consume_and_rejects_cross_session() {
+        let call = |workspace: &str, input: &str| {
+            let mut value = call(workspace, input);
+            value.refs.clear();
+            value
+        };
+        let authority = new_authority();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(authority.begin_canary("nonce-current", "path_hint:/tmp/canary", deadline));
+        assert!(!authority.begin_canary("another", "path_hint:/tmp/canary", deadline));
+        let old = call("path_hint:/tmp/canary", "nonce-old");
+        let grant = authority.issue(issue_for(&old)).unwrap();
+        authority
+            .resolve(&call(&grant.bound_workspace, "nonce-old"))
+            .unwrap();
+        assert!(authority.canary_session("nonce-current").is_none());
+        let current = call("path_hint:/tmp/canary", "nonce-current");
+        let grant = authority.issue(issue_for(&current)).unwrap();
+        assert!(authority.canary_session("nonce-current").is_none());
+        let resolved = authority
+            .resolve(&call(&grant.bound_workspace, "nonce-current"))
+            .unwrap();
+        assert_eq!(
+            authority.canary_session("nonce-current"),
+            Some(resolved.anchor.unwrap().session_id)
+        );
+        assert!(
+            authority
+                .resolve(&call(&grant.bound_workspace, "nonce-current"))
+                .is_err()
+        );
+        let mut other = issue_for(&current);
+        other.session_id = "another-session".into();
+        let grant = authority.issue(other).unwrap();
+        authority
+            .resolve(&call(&grant.bound_workspace, "nonce-current"))
+            .unwrap();
+        assert!(authority.canary_session("nonce-current").is_none());
+        authority.end_canary("nonce-current");
+        assert!(authority.begin_canary("expired", "path_hint:/tmp/canary", Instant::now()));
+        assert!(authority.canary_session("expired").is_none());
+        assert!(authority.begin_canary("next", "path_hint:/tmp/canary", deadline));
+        let restarted = McpBindingAuthority::new(authority.device_key.clone());
+        assert!(restarted.canary_session("next").is_none());
     }
 
     #[test]

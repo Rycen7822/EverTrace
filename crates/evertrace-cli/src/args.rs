@@ -10,7 +10,9 @@ pub struct Args {
 pub enum Command {
     ConfigCheck,
     ConfigShowEffective,
-    Doctor,
+    Doctor {
+        refresh_host: Option<PathBuf>,
+    },
     Upgrade,
     Install {
         host_executable: PathBuf,
@@ -62,7 +64,15 @@ impl Args {
         } else if command == "uninstall" {
             Command::Uninstall
         } else if command == "doctor" {
-            Command::Doctor
+            Command::Doctor {
+                refresh_host: match values.next() {
+                    None => None,
+                    Some(flag) if flag == "--refresh-host" => {
+                        Some(PathBuf::from(values.next().ok_or(usage())?))
+                    }
+                    _ => return Err(usage()),
+                },
+            }
         } else if command == "mcp" {
             Command::Mcp
         } else if command == "tui" {
@@ -109,5 +119,5 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade|install CODEX_EXECUTABLE|uninstall|doctor|mcp|tui|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade|install CODEX_EXECUTABLE|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
 }

@@ -20,6 +20,7 @@ pub struct CommandEnvelope {
 #[serde(rename_all = "snake_case")]
 pub enum Command {
     Health,
+    RunHostCanary(RunHostCanaryCommand),
     RecoveryBarrier(RecoveryBarrierLocator),
     RequestRecovery(RequestRecoveryCommand),
     IssueMcpBinding(McpBindingIssueCommand),
@@ -27,6 +28,13 @@ pub enum Command {
     RecallCue(RecallCueCommand),
     SessionImportAdmin(SessionImportAdminCommand),
     HumanGovernance(HumanGovernanceRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunHostCanaryCommand {
+    pub host_executable: String,
+    pub host_config: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

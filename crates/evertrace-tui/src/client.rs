@@ -483,6 +483,7 @@ mod tests {
             config_version: 1,
             effective_config_hash: "0".repeat(64),
             algorithm_revision: 1,
+            host_canary: None,
         }
     }
 

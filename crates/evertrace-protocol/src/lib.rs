@@ -140,6 +140,7 @@ impl LocalServer {
                 Command::RecoveryBarrier(_) => Err(ErrorCode::InvalidInput),
                 Command::RequestRecovery(_) => Err(ErrorCode::InvalidInput),
                 Command::IssueMcpBinding(_)
+                | Command::RunHostCanary(_)
                 | Command::McpCall(_)
                 | Command::RecallCue(_)
                 | Command::SessionImportAdmin(_)
@@ -678,6 +679,7 @@ pub async fn request_health(
             Response::Health(health) if health.validate() => Ok(health),
             Response::Health(_) => Err(ProtocolError::InvalidHealth),
             Response::RecoveryTerminal(_)
+            | Response::HostCanary(_)
             | Response::RecoveryAction(_)
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)
@@ -751,6 +753,7 @@ pub async fn request_recovery(
             Response::RecoveryAction(response) if response.validate() => Ok(response),
             Response::RecoveryAction(_) => Err(ProtocolError::InvalidRecoveryAction),
             Response::Health(_)
+            | Response::HostCanary(_)
             | Response::RecoveryTerminal(_)
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)

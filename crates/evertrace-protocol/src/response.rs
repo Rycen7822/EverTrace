@@ -19,6 +19,7 @@ pub struct ResponseEnvelope {
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     Health(HealthResponse),
+    HostCanary(crate::dto::HostCanaryDiagnostic),
     RecoveryTerminal(RecoveryTerminalResponse),
     RecoveryAction(RecoveryActionResponse),
     McpBindingIssued(McpBindingIssuedResponse),
@@ -104,11 +105,17 @@ pub struct HealthResponse {
     pub config_version: u32,
     pub effective_config_hash: String,
     pub algorithm_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_canary: Option<crate::dto::HostCanaryDiagnostic>,
 }
 
 impl HealthResponse {
     pub fn validate(&self) -> bool {
         self.protocol_version == PROTOCOL_VERSION
+            && self
+                .host_canary
+                .as_ref()
+                .is_none_or(crate::dto::HostCanaryDiagnostic::validate)
             && self.config_version == 1
             && self.mode == HealthMode::Normal
             && self.algorithm_revision != 0

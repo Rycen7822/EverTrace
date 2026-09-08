@@ -11,6 +11,7 @@ evertrace-codex = { path = "../evertrace-codex" }
 evertrace-domain = { path = "../evertrace-domain" }
 evertrace-store = { path = "../evertrace-store" }
 reqwest.workspace = true
+rustix = { workspace = true, features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

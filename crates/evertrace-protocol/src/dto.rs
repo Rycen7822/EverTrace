@@ -1508,3 +1508,43 @@ fn valid_hex(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
+/// Current process-local observation, never a capability grant or durable audit.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCanaryDiagnostic {
+    pub status: HostCanaryStatus,
+    pub native_delivery_observed: bool,
+    pub mcp_claim_consumed: bool,
+    pub capture_receipt_observed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCanaryStatus {
+    NotRun,
+    Running,
+    Unavailable,
+    BudgetExceeded,
+    EvidenceMissing,
+    TimedOut,
+    IdentityChanged,
+    Interrupted,
+    Observed,
+}
+
+impl HostCanaryDiagnostic {
+    pub fn validate(&self) -> bool {
+        (!self.capture_receipt_observed || self.native_delivery_observed)
+            && match self.status {
+                HostCanaryStatus::Observed => {
+                    self.native_delivery_observed && self.mcp_claim_consumed
+                }
+                HostCanaryStatus::EvidenceMissing => true,
+                _ => {
+                    !self.native_delivery_observed
+                        && !self.mcp_claim_consumed
+                        && !self.capture_receipt_observed
+                }
+            }
+    }
+}

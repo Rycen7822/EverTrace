@@ -488,6 +488,18 @@ impl CasStore {
     }
 
     pub fn read(&self, digest: &CasDigest) -> Result<Vec<u8>, CasError> {
+        self.read_bounded(digest, u64::MAX, u64::MAX)
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// Caller budgets cover encoded envelope and decoded output bytes, not the
+    /// decoder's total RSS/window. Returns actual encoded bytes for batching.
+    pub fn read_bounded(
+        &self,
+        digest: &CasDigest,
+        max_encoded: u64,
+        max_decoded: u64,
+    ) -> Result<(Vec<u8>, u64), CasError> {
         self.validate_root()?;
         let path = self.blob_path(digest);
         let before = fs::symlink_metadata(&path).map_err(|error| {
@@ -515,6 +527,12 @@ impl CasStore {
         file.read_exact(&mut header)
             .map_err(|_| CasError::StoreCorrupt)?;
         let decoded = decode_header(&header, digest)?;
+        if before.len() > max_encoded
+            || decoded.compressed_length > max_encoded
+            || decoded.uncompressed_length > max_decoded
+        {
+            return Err(CasError::ReadBudgetExceeded);
+        }
         if before.len()
             != (HEADER_LENGTH as u64)
                 .checked_add(decoded.compressed_length)
@@ -545,7 +563,7 @@ impl CasStore {
         {
             return Err(CasError::StoreCorrupt);
         }
-        Ok(protected)
+        Ok((protected, before.len()))
     }
 
     /// Verifies one encoded CAS envelope and its protected-payload digest with
@@ -836,6 +854,8 @@ struct DecodedHeader {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CasError {
+    #[error("CAS read byte budget was exceeded")]
+    ReadBudgetExceeded,
     #[error("CAS path is invalid")]
     InvalidPath,
     #[error("CAS digest is invalid")]

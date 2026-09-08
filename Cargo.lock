@@ -1871,6 +1871,7 @@ dependencies = [
  "evertrace-domain",
  "evertrace-store",
  "reqwest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "thiserror",

@@ -32,6 +32,33 @@ use tokio::{
 const ID: &str = "01890f47-6a4a-7cc1-98b9-01890f476a4a";
 const WAIT: Duration = Duration::from_secs(1);
 
+#[test]
+fn host_canary_request_and_current_diagnostic_are_closed() {
+    use evertrace_protocol::{
+        command::RunHostCanaryCommand,
+        dto::{HostCanaryDiagnostic, HostCanaryStatus},
+    };
+    let request = serde_json::json!({
+        "host_executable": "/package/codex",
+        "host_config": "/private/config.toml"
+    });
+    assert!(serde_json::from_value::<RunHostCanaryCommand>(request.clone()).is_ok());
+    let mut injected = request;
+    injected["prompt"] = serde_json::json!("claim success");
+    assert!(serde_json::from_value::<RunHostCanaryCommand>(injected).is_err());
+    let mut diagnostic = HostCanaryDiagnostic {
+        status: HostCanaryStatus::Observed,
+        native_delivery_observed: true,
+        mcp_claim_consumed: false,
+        capture_receipt_observed: false,
+    };
+    assert!(!diagnostic.validate());
+    diagnostic.mcp_claim_consumed = true;
+    assert!(diagnostic.validate()); // CaptureComplete is not granted by this diagnostic.
+    diagnostic.status = HostCanaryStatus::TimedOut;
+    assert!(!diagnostic.validate());
+}
+
 fn request_id() -> RequestId {
     RequestId::from_str(ID).expect("fixed UUIDv7")
 }
@@ -59,6 +86,7 @@ fn health(mode: HealthMode) -> HealthResponse {
         config_version: 1,
         effective_config_hash: "0".repeat(64),
         algorithm_revision: 1,
+        host_canary: None,
     }
 }
 
@@ -110,6 +138,7 @@ async fn start_server_with(
             config_version: snapshot.config_version,
             effective_config_hash: hex(&snapshot.effective_config_hash),
             algorithm_revision: snapshot.algorithm_revision,
+            host_canary: None,
         })
     }));
     (temp, socket, tx, task)

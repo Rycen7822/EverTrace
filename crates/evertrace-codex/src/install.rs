@@ -263,25 +263,20 @@ fn shell_path(path: &Path) -> Result<String, InstallError> {
     Ok(format!("'{}'", text.replace('\'', "'\\''")))
 }
 
-fn wiring(paths: &ManagedInstallPaths) -> Result<Vec<u8>, InstallError> {
+fn wiring(data_root: &Path, cli: &Path, config: &Path) -> Result<Vec<u8>, InstallError> {
     let command = format!(
         "{} --launcher-root {}",
-        shell_path(&paths.data_root.join("hook-v1"))?,
-        shell_path(&paths.data_root)?
+        shell_path(&data_root.join("hook-v1"))?,
+        shell_path(data_root)?
     );
     let mut mcp: toml::Value = toml::from_str(include_str!(
         "../../../packaging/codex/mcp.v1.template.toml"
     ))
     .map_err(|_| InstallError::InvalidType)?;
     mcp["mcp_servers"]["evertrace"]["command"] =
-        toml::Value::String(paths.cli.to_str().ok_or(InstallError::InvalidType)?.into());
-    mcp["mcp_servers"]["evertrace"]["args"][1] = toml::Value::String(
-        paths
-            .config
-            .to_str()
-            .ok_or(InstallError::InvalidType)?
-            .into(),
-    );
+        toml::Value::String(cli.to_str().ok_or(InstallError::InvalidType)?.into());
+    mcp["mcp_servers"]["evertrace"]["args"][1] =
+        toml::Value::String(config.to_str().ok_or(InstallError::InvalidType)?.into());
     let mut hooks: serde_json::Value = serde_json::from_str(include_str!(
         "../../../packaging/codex/hooks.v1.template.json"
     ))
@@ -344,6 +339,35 @@ fn merge_wiring(original: &[u8], owned: &[u8], uninstall: bool) -> Result<Vec<u8
     }
     toml::from_str::<toml::Value>(&result).map_err(|_| InstallError::InvalidType)?;
     Ok(result.into_bytes())
+}
+
+/// Read-only canary preflight uses exactly the installer-owned fragment, not a
+/// second interpretation of host wiring or an existence-based activation claim.
+pub fn validate_installed_wiring(
+    data_root: &Path,
+    config: &Path,
+    host_config: &Path,
+) -> Result<PathBuf, InstallError> {
+    let file = InstallFile::read(host_config)?;
+    let (_, bytes) = file.original.as_ref().ok_or(InstallError::InvalidType)?;
+    let text = std::str::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?;
+    if !text.contains(OWNED_BEGIN) {
+        return Err(InstallError::InvalidType);
+    }
+    let parsed: toml::Value = toml::from_str(text).map_err(|_| InstallError::InvalidType)?;
+    let cli = parsed
+        .get("mcp_servers")
+        .and_then(|value| value.get("evertrace"))
+        .and_then(|value| value.get("command"))
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or(InstallError::InvalidType)?;
+    package_metadata(&cli)?;
+    if merge_wiring(bytes, &wiring(data_root, &cli, config)?, false)? != *bytes {
+        return Err(InstallError::InvalidType);
+    }
+    file.revalidate(file.original.as_ref().map(|(identity, _)| identity))?;
+    Ok(cli)
 }
 
 fn ensure_install_parent(path: &Path) -> Result<(), InstallError> {
@@ -557,7 +581,11 @@ pub fn managed_install(
             .original
             .as_ref()
             .map_or(&[][..], |(_, bytes)| bytes.as_slice());
-        let merged = merge_wiring(original_host, &wiring(paths)?, uninstall)?;
+        let merged = merge_wiring(
+            original_host,
+            &wiring(&paths.data_root, &paths.cli, &paths.config)?,
+            uninstall,
+        )?;
         host.desired = if host.original.is_none() && uninstall {
             None
         } else {
@@ -908,6 +936,11 @@ pub struct HookBackupSnapshot {
     pub files: Vec<FrozenHookFile>,
 }
 
+pub struct CurrentHookSnapshot {
+    pub generation: u64,
+    pub files: [FrozenHookFile; 4],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookBackupSemantic {
     pub current_generation: Option<u64>,
@@ -1209,6 +1242,77 @@ impl StableLauncher {
                 validate_generation(&self.root, value)?;
             }
             Ok(retained)
+        })
+    }
+
+    /// Fixed current-install closure, not the retained backup closure. The
+    /// deadline is cooperative between bounded reads; blocking filesystem calls
+    /// themselves cannot be interrupted by this synchronous API.
+    pub fn freeze_current_snapshot(
+        data_root: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<CurrentHookSnapshot, InstallError> {
+        let check_deadline = || {
+            if std::time::Instant::now() >= deadline {
+                Err(InstallError::ResourceExhausted)
+            } else {
+                Ok(())
+            }
+        };
+        check_deadline()?;
+        validate_private_directory(data_root)?;
+        let hooks = data_root.join(HOOKS_DIRECTORY);
+        validate_private_directory(&hooks)?;
+        let lock_path = hooks.join(REGISTRY_LOCK_NAME);
+        let before = private_file_identity(&lock_path, 0o600)?;
+        let lock = File::open(&lock_path).map_err(map_io)?;
+        if hook_file_identity(&lock.metadata().map_err(map_io)?) != before {
+            return Err(InstallError::InvalidRegistry);
+        }
+        fs2::FileExt::try_lock_shared(&lock).map_err(|_| InstallError::LockBusy)?;
+        let launcher = Self {
+            root: data_root.to_owned(),
+        };
+        check_deadline()?;
+        // The sole closed registry is bounded to 1 MiB. Historical entries get
+        // shape/layout validation, never historical asset or pin traversal.
+        let registry = launcher.read_registry()?;
+        check_deadline()?;
+        let current = registry
+            .generations
+            .iter()
+            .find(|entry| entry.generation == registry.current_generation && entry.compatible)
+            .ok_or(InstallError::GenerationUnavailable)?;
+        validate_generation(data_root, current)?;
+        let files = [
+            freeze_file(&data_root.join("hook-v1"), Path::new("hook-v1"), 0o700)?,
+            freeze_file(
+                &launcher.registry_path(),
+                &PathBuf::from(HOOKS_DIRECTORY).join(REGISTRY_NAME),
+                0o600,
+            )?,
+            freeze_file(
+                &current.executable,
+                &generation_relative(current.generation, GENERATION_EXECUTABLE_NAME),
+                0o700,
+            )?,
+            freeze_file(
+                &current.runtime_snapshot,
+                &generation_relative(current.generation, GENERATION_RUNTIME_NAME),
+                0o600,
+            )?,
+        ];
+        for file in &files {
+            check_deadline()?;
+            revalidate_frozen_file(file)?;
+        }
+        if private_file_identity(&lock_path, 0o600)? != before {
+            return Err(InstallError::InvalidRegistry);
+        }
+        check_deadline()?;
+        Ok(CurrentHookSnapshot {
+            generation: current.generation,
+            files,
         })
     }
 

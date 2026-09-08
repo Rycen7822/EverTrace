@@ -73,6 +73,29 @@ async fn main() {
     }
 }
 
+fn map_host_canary(
+    value: evertrace_engine::HostCanaryDiagnostic,
+) -> evertrace_protocol::dto::HostCanaryDiagnostic {
+    use evertrace_engine::HostCanaryStatus as Source;
+    use evertrace_protocol::dto::HostCanaryStatus as Target;
+    evertrace_protocol::dto::HostCanaryDiagnostic {
+        status: match value.status {
+            Source::NotRun => Target::NotRun,
+            Source::Running => Target::Running,
+            Source::Unavailable => Target::Unavailable,
+            Source::BudgetExceeded => Target::BudgetExceeded,
+            Source::EvidenceMissing => Target::EvidenceMissing,
+            Source::TimedOut => Target::TimedOut,
+            Source::IdentityChanged => Target::IdentityChanged,
+            Source::Interrupted => Target::Interrupted,
+            Source::Observed => Target::Observed,
+        },
+        native_delivery_observed: value.native_delivery_observed,
+        mcp_claim_consumed: value.mcp_claim_consumed,
+        capture_receipt_observed: value.capture_receipt_observed,
+    }
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = StartupArgs::parse()?;
     let config_path = config_path(args.config)?;
@@ -87,6 +110,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = resolve_data_dir(engine.data_dir(), home.as_deref(), |name| env::var_os(name))?;
     let runtime_snapshot = publish_recovery_runtime(&data_dir, engine.effective_config(), None)?;
     let writer = open_writer(&data_dir).await?;
+    evertrace_engine::initialize_runtime_spool(&runtime_snapshot)?;
     let (writer_handle, mut writer_task) = spawn_writer(writer, 64)?;
     let mut recall_worker = spawn_recall_worker(
         writer_handle.clone(),
@@ -94,6 +118,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_dir.clone(),
     );
     let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
+    let host_canary = evertrace_engine::HostCanaryService::new(
+        writer_handle.clone(),
+        data_dir.clone(),
+        std::path::absolute(&config_path)?,
+        runtime_snapshot.effective_config_hash,
+        mcp_bindings.clone(),
+    );
     let current_session_catalog_report = Arc::new(RwLock::new(None));
     let session_import_admin = SessionImportAdminService::new(
         writer_handle.clone(),
@@ -188,6 +219,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let recovery_service = recovery_service.clone();
             let recovery_action_service = handler_recovery_action_service.clone();
             let mcp_bindings = handler_mcp_bindings.clone();
+            let host_canary = host_canary.clone();
             let mcp_service = handler_mcp_service.clone();
             let recall_cue_service = recall_cue_service.clone();
             let session_catalog_report = Arc::clone(&handler_session_catalog_report);
@@ -208,6 +240,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         config_version: snapshot.config_version,
                         effective_config_hash: hex(&snapshot.effective_config_hash),
                         algorithm_revision: snapshot.algorithm_revision,
+                        host_canary: host_canary.current().map(map_host_canary),
                     }));
                 }
                 let _dispatch = dispatch_gate.read_owned().await;
@@ -215,6 +248,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err(ErrorCode::MaintenanceMode);
                 }
                 match command {
+                    ProtocolCommand::RunHostCanary(request) => {
+                        if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
+                        Ok(Response::HostCanary(map_host_canary(host_canary.run(evertrace_engine::HostCanaryRequest {
+                            host_executable: request.host_executable, host_config: request.host_config,
+                        }).await)))
+                    }
                     ProtocolCommand::Health => {
                         let snapshot = handler_engine.health().map_err(|error| match error {
                             HealthDispatchError::MaintenanceMode => ErrorCode::MaintenanceMode,
@@ -225,6 +264,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             config_version: snapshot.config_version,
                             effective_config_hash: hex(&snapshot.effective_config_hash),
                             algorithm_revision: snapshot.algorithm_revision,
+                            host_canary: host_canary.current().map(map_host_canary),
                         }))
                     }
                     ProtocolCommand::RecoveryBarrier(locator) => {

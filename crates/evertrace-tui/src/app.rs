@@ -2177,6 +2177,28 @@ mod tests {
         });
         let mut app = App::new();
         app.dispatch(UiCommand::Navigate(crate::Route::System));
+        app.handle(AppEvent::Health(HealthResponse {
+            protocol_version: PROTOCOL_VERSION,
+            mode: HealthMode::Normal,
+            config_version: 1,
+            effective_config_hash: "0".repeat(64),
+            algorithm_revision: 1,
+            host_canary: Some(evertrace_protocol::dto::HostCanaryDiagnostic {
+                status: evertrace_protocol::dto::HostCanaryStatus::EvidenceMissing,
+                native_delivery_observed: true,
+                mcp_claim_consumed: false,
+                capture_receipt_observed: false,
+            }),
+        }));
+        let current = render_app(&app, 100, 50);
+        for label in [
+            "Host canary: EvidenceMissing",
+            "Native delivery: true",
+            "MCP consumed: false",
+            "CaptureReceipt: false",
+        ] {
+            assert!(current.contains(label), "missing {label}");
+        }
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
             frontier: 9,
             status: HumanSnapshotStatus::Ready,
@@ -2579,6 +2601,7 @@ mod tests {
             config_version: 1,
             effective_config_hash: "0".repeat(64),
             algorithm_revision: 1,
+            host_canary: None,
         }));
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,

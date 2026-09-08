@@ -14,10 +14,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     match args.command {
         Command::ConfigCheck => config::check(args.config),
         Command::ConfigShowEffective => config::show_effective(args.config),
-        Command::Doctor => doctor::run(args.config).await,
+        Command::Doctor { refresh_host } => doctor::run(args.config, refresh_host).await,
         Command::Upgrade => restore::upgrade(args.config).await,
-        Command::Install { host_executable } => install::run(args.config, Some(host_executable)),
-        Command::Uninstall => install::run(args.config, None),
+        Command::Install { host_executable } => {
+            install::run(args.config, Some(host_executable)).await
+        }
+        Command::Uninstall => install::run(args.config, None).await,
         Command::Restore { backup } => restore::run(args.config, backup).await,
         Command::Mcp => mcp::run(args.config).await,
         Command::Tui => tui::run(args.config).await,

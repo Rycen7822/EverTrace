@@ -1,6 +1,6 @@
 use std::{env, error::Error, path::PathBuf};
 
-pub fn run(
+pub async fn run(
     config: Option<PathBuf>,
     host_executable: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
@@ -69,5 +69,23 @@ pub fn run(
         println!("config_backup={}", backup.display());
     }
     println!("data_preserved={}", paths.data_root.display());
+    if !uninstall {
+        let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+        match crate::daemon_client::health(&socket).await {
+            Ok(_) => match crate::daemon_client::run_host_canary(
+                &socket,
+                &paths.host_executable,
+                &paths.host_config,
+            )
+            .await
+            {
+                Ok(result) => {
+                    println!("host_canary={result:?}; independent capability gates unchanged")
+                }
+                Err(error) => println!("host_canary=unavailable: {error}; installation preserved"),
+            },
+            Err(_) => println!("host_canary=not_run: daemon unavailable; installation preserved"),
+        }
+    }
     Ok(())
 }

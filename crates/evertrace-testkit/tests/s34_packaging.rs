@@ -74,7 +74,7 @@ fn invoke(paths: &ManagedInstallPaths, bytes: &[u8]) {
 
 #[tokio::test]
 async fn installed_native_capture_is_weak_durable_and_replay_safe() {
-    let (_root, paths, config) = fixture();
+    let (root, paths, config) = fixture();
     fs::create_dir(&paths.data_root).unwrap();
     fs::set_permissions(&paths.data_root, fs::Permissions::from_mode(0o700)).unwrap();
     for _ in 0..3 {
@@ -82,6 +82,28 @@ async fn installed_native_capture_is_weak_durable_and_replay_safe() {
     }
     let result = install_offline(&paths, false).unwrap();
     assert!(!result.service_available);
+    // Current installation inspection must not traverse unrelated session pins.
+    let unrelated_pin = paths.data_root.join("hooks/pins/unrelated-old-session.pin");
+    fs::write(&unrelated_pin, b"999999").unwrap();
+    fs::set_permissions(&unrelated_pin, fs::Permissions::from_mode(0o600)).unwrap();
+    let current = evertrace_codex::install::StableLauncher::freeze_current_snapshot(
+        &paths.data_root,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(current.generation, 1);
+    assert_eq!(current.files.len(), 4);
+    assert!(
+        evertrace_codex::install::StableLauncher::freeze_current_snapshot(
+            &paths.data_root,
+            std::time::Instant::now(),
+        )
+        .is_err()
+    );
+    assert!(
+        evertrace_codex::install::StableLauncher::freeze_backup_snapshot(&paths.data_root).is_err()
+    );
+    fs::remove_file(&unrelated_pin).unwrap();
     let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
     assert_eq!(runtime.generation, 3);
     let installed_runtime = RuntimeSnapshot::load(
@@ -165,6 +187,40 @@ async fn installed_native_capture_is_weak_durable_and_replay_safe() {
         }
     }
     assert_eq!(sources.len(), 3);
+    let cas = evertrace_capture::CasStore::open_existing(paths.data_root.join("cas")).unwrap();
+    let digest = snapshot
+        .data_rows()
+        .find_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceReceiptRecorded(receipt) => {
+                    Some(evertrace_capture::CasStore::parse_digest(&receipt.cas_ref).unwrap())
+                }
+                _ => None,
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        cas.read_bounded(&digest, 0, 8 << 20),
+        Err(evertrace_capture::CasError::ReadBudgetExceeded)
+    );
+    assert_eq!(
+        cas.read_bounded(&digest, 8 << 20, 0),
+        Err(evertrace_capture::CasError::ReadBudgetExceeded)
+    );
+    let blob = cas.blob_path(&digest);
+    let original_blob = fs::read(&blob).unwrap();
+    let mut bad_header = original_blob.clone();
+    bad_header[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
+    fs::write(&blob, bad_header).unwrap();
+    assert_eq!(
+        cas.read_bounded(&digest, 8 << 20, 8 << 20),
+        Err(evertrace_capture::CasError::ReadBudgetExceeded)
+    );
+    fs::write(&blob, original_blob).unwrap();
+    assert_eq!(
+        cas.read_bounded(&digest, 8 << 20, 8 << 20).unwrap().0,
+        cas.read(&digest).unwrap()
+    );
     for (path, bytes) in replay {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -177,6 +233,127 @@ async fn installed_native_capture_is_weak_durable_and_replay_safe() {
     }
     assert_eq!(ingest.drain_once().await.unwrap().replayed_frames, 3);
     assert_eq!(handle.project().await.unwrap().frontier, snapshot.frontier);
+    // A scripted Host is only an orchestration/negative test. Old genuine
+    // native receipts above cannot qualify this fresh nonce/workspace.
+    use evertrace_engine::{
+        HostCanaryRequest, HostCanaryService, HostCanaryStatus, McpBindingAuthority,
+    };
+    let bindings = McpBindingAuthority::from_device_key_dir(&paths.data_root.join("keys")).unwrap();
+    let canary = HostCanaryService::new(
+        handle.clone(),
+        paths.data_root.clone(),
+        paths.config.clone(),
+        config.hash(),
+        bindings.clone(),
+    );
+    let request = || HostCanaryRequest {
+        host_executable: paths.host_executable.to_string_lossy().into_owned(),
+        host_config: paths.host_config.to_string_lossy().into_owned(),
+    };
+    fs::write(&paths.host_executable, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.1.0'; exit 0; fi\nif [ \"$1\" = features ]; then echo 'hooks experimental true'; exit 0; fi\nsleep 60\n").unwrap();
+    let running = canary.clone();
+    let input = request();
+    let probe = tokio::spawn(async move { running.run(input).await });
+    for _ in 0..100 {
+        if canary.current().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        canary.run(request()).await.status,
+        HostCanaryStatus::Running
+    );
+    let result = probe.await.unwrap();
+    assert_eq!(result.status, HostCanaryStatus::TimedOut);
+    assert!(
+        !result.native_delivery_observed
+            && !result.mcp_claim_consumed
+            && !result.capture_receipt_observed
+    );
+    assert_eq!(canary.current().unwrap().status, HostCanaryStatus::TimedOut);
+    let restarted = HostCanaryService::new(
+        handle.clone(),
+        paths.data_root.clone(),
+        paths.config.clone(),
+        config.hash(),
+        bindings,
+    );
+    assert!(restarted.current().is_none());
+    let running = canary.clone();
+    let input = request();
+    let probe = tokio::spawn(async move { running.run(input).await });
+    for _ in 0..100 {
+        if canary
+            .current()
+            .is_some_and(|value| value.status == HostCanaryStatus::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    probe.abort();
+    assert!(probe.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        canary.current().unwrap().status,
+        HostCanaryStatus::Interrupted
+    );
+    // Natural leader exit must not orphan a still-running member of its group.
+    let child_ids = root.path().join("canary-child-ids");
+    fs::write(&paths.host_executable, format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.1.0'; exit 0; fi\nif [ \"$1\" = features ]; then echo 'hooks experimental true'; exit 0; fi\nsleep 60 &\nprintf '%s %s' \"$$\" \"$!\" > '{}'\nexit 0\n",
+        child_ids.display(),
+    )).unwrap();
+    let running = canary.clone();
+    let input = request();
+    let probe = tokio::spawn(async move { running.run(input).await });
+    let mut stopped = false;
+    for _ in 0..100 {
+        if let Ok(ids) = fs::read_to_string(&child_ids) {
+            let ids = ids
+                .split_whitespace()
+                .map(|value| value.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            if ids.len() == 2 {
+                let leader_reaped = !std::path::PathBuf::from(format!("/proc/{}", ids[0])).exists();
+                let descendant_stopped = fs::read_to_string(format!("/proc/{}/stat", ids[1]))
+                    .map_or(true, |stat| {
+                        stat.rsplit_once(')')
+                            .is_some_and(|(_, fields)| fields.trim_start().starts_with('Z'))
+                    });
+                if leader_reaped && descendant_stopped {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        stopped,
+        "natural-exit group was not terminated before leader reap"
+    );
+    assert!(!probe.is_finished()); // Exit zero is not positive canary evidence.
+    probe.abort();
+    assert!(probe.await.unwrap_err().is_cancelled());
+    let mut changed = fs::read(&paths.host_config).unwrap();
+    changed.extend_from_slice(b"\n# changed after probe\n");
+    fs::write(&paths.host_config, changed).unwrap();
+    assert_eq!(
+        canary.current().unwrap().status,
+        HostCanaryStatus::IdentityChanged
+    );
+    assert!(
+        fs::read_dir(paths.data_root.join("runtime"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("canary-"))
+    );
+    drop(canary);
+    drop(restarted);
     drop(ingest);
     drop(handle);
     actor.await.unwrap().unwrap();
@@ -237,6 +414,112 @@ fn owned_merge_idempotence_uninstall_and_unknown_owner() {
     assert_eq!(
         fs::read_to_string(&paths.unit).unwrap(),
         "# another installation\n"
+    );
+}
+
+#[tokio::test]
+async fn doctor_reads_current_state_and_only_cli_refresh_runs_the_selected_host() {
+    use evertrace_protocol::{
+        LocalClient,
+        command::{Command as Rpc, RunHostCanaryCommand},
+        dto::ClientKind,
+    };
+    use std::time::{Duration, Instant};
+    let (_root, paths, _) = fixture();
+    install_offline(&paths, false).unwrap();
+    let marker = paths.data_root.join("host-probe-called");
+    fs::write(
+        &paths.host_executable,
+        format!(
+            "#!/bin/sh\ntouch '{}'\necho unsupported\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut daemon = Daemon(
+        Command::new(&paths.daemon)
+            .arg("--config")
+            .arg(&paths.config)
+            .env("CODEX_HOME", paths.host_config.parent().unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if evertrace_protocol::request_health(&socket, "s34-test", Duration::from_millis(100))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let doctor = |refresh: bool| {
+        let mut command = Command::new(&paths.cli);
+        command
+            .arg("--config")
+            .arg(&paths.config)
+            .arg("doctor")
+            .env("CODEX_HOME", paths.host_config.parent().unwrap());
+        if refresh {
+            command.arg("--refresh-host").arg(&paths.host_executable);
+        }
+        command.output().unwrap()
+    };
+    let read = doctor(false);
+    assert!(read.status.success());
+    assert!(
+        String::from_utf8(read.stdout)
+            .unwrap()
+            .contains("host_canary=not_run")
+    );
+    assert!(!marker.exists());
+    let mut hook = LocalClient::connect(
+        &socket,
+        "s34-test",
+        ClientKind::Hook,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert!(
+        hook.request(
+            evertrace_domain::ids::RequestId::new_v7(),
+            Rpc::RunHostCanary(RunHostCanaryCommand {
+                host_executable: paths.host_executable.to_string_lossy().into_owned(),
+                host_config: paths.host_config.to_string_lossy().into_owned(),
+            })
+        )
+        .await
+        .is_err()
+    );
+    assert!(!marker.exists());
+    let refresh = doctor(true);
+    assert!(refresh.status.success());
+    assert!(
+        String::from_utf8(refresh.stdout)
+            .unwrap()
+            .contains("Unavailable")
+    );
+    assert!(marker.exists());
+    let current = doctor(false);
+    assert!(current.status.success());
+    assert!(
+        String::from_utf8(current.stdout)
+            .unwrap()
+            .contains("Unavailable")
     );
 }
 
