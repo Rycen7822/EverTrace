@@ -84,6 +84,53 @@ pub struct ProbeContext {
     pub evidence_source: EvidenceSourceKind,
 }
 
+pub struct InstallHostProbe {
+    pub observed_version: String,
+    pub hooks_enabled: bool,
+}
+
+/// Read-only executable probe. This permits wiring the documented shape, not
+/// trusting the hook or granting any canary-backed capability.
+pub fn probe_install_host(
+    executable: &std::path::Path,
+    host_home: &std::path::Path,
+) -> Result<InstallHostProbe, crate::install::InstallError> {
+    use crate::install::{InstallError, bounded_install_command};
+    let (status, version) = bounded_install_command(executable, &["--version"], Some(host_home))?;
+    let version = version.trim();
+    if status != 0
+        || !version.starts_with("codex-cli ")
+        || version.len() > 128
+        || version.chars().any(char::is_control)
+    {
+        return Err(InstallError::InvalidType);
+    }
+    let (status, features) =
+        bounded_install_command(executable, &["features", "list"], Some(host_home))?;
+    if status != 0 {
+        return Err(InstallError::InvalidType);
+    }
+    let mut hooks = features.lines().filter_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if !matches!(fields.first(), Some(&"hooks" | &"codex_hooks")) {
+            return None;
+        }
+        match fields.last() {
+            Some(&"true") => Some(true),
+            Some(&"false") => Some(false),
+            _ => None,
+        }
+    });
+    let hooks_enabled = hooks.next().ok_or(InstallError::InvalidType)?;
+    if hooks.next().is_some() {
+        return Err(InstallError::InvalidType);
+    }
+    Ok(InstallHostProbe {
+        observed_version: version.to_owned(),
+        hooks_enabled,
+    })
+}
+
 impl ProbeContext {
     pub fn unobserved_codex() -> Self {
         Self {

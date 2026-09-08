@@ -33,6 +33,828 @@ pub const fn shadow_canary_diagnostic(durable_frame_observed: bool) -> Option<Ho
     }
 }
 
+/// Explicit local paths supplied by the offline CLI, never discovered from PATH.
+pub struct ManagedInstallPaths {
+    pub data_root: PathBuf,
+    pub host_config: PathBuf,
+    pub unit: PathBuf,
+    pub config: PathBuf,
+    pub cli: PathBuf,
+    pub hook: PathBuf,
+    pub daemon: PathBuf,
+    pub systemctl: PathBuf,
+    pub host_executable: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct ManagedInstallResult {
+    pub service_available: bool,
+    pub backups: Vec<PathBuf>,
+    pub manual_command: String,
+    pub host_hooks_enabled: Option<bool>,
+}
+
+#[derive(Debug, Error)]
+#[error("managed installation failed during {stage}: {cause}; preserved paths: {preserved:?}")]
+pub struct ManagedInstallError {
+    pub stage: &'static str,
+    pub cause: InstallError,
+    pub preserved: Vec<PathBuf>,
+}
+
+const OWNED_BEGIN: &str = "# BEGIN EverTrace managed wiring v1\n";
+const OWNED_END: &str = "# END EverTrace managed wiring v1\n";
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+fn install_nonce() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+struct InstallFile {
+    path: PathBuf,
+    parent: File,
+    original: Option<(HookFileIdentity, Vec<u8>)>,
+    published: Option<HookFileIdentity>,
+    desired: Option<Vec<u8>>,
+    backup: Option<PathBuf>,
+    backup_identity: Option<HookFileIdentity>,
+    temporary: Option<PathBuf>,
+    changed: bool,
+}
+
+impl InstallFile {
+    fn read(path: &Path) -> Result<Self, InstallError> {
+        let parent_path = path.parent().ok_or(InstallError::InvalidType)?;
+        for ancestor in parent_path.ancestors() {
+            let metadata = fs::symlink_metadata(ancestor).map_err(map_io)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(InstallError::InvalidType);
+            }
+        }
+        let parent = File::open(parent_path).map_err(map_io)?;
+        let metadata = parent.metadata().map_err(map_io)?;
+        if metadata.uid() != current_uid()? || metadata.mode() & 0o022 != 0 {
+            return Err(InstallError::InvalidPermissions);
+        }
+        let original = match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != current_uid()?
+                    || metadata.mode() & 0o022 != 0
+                    || metadata.len() > MAX_CONFIG_BYTES
+                {
+                    return Err(InstallError::InvalidType);
+                }
+                let bytes = fs::read(path).map_err(map_io)?;
+                let identity = hook_file_identity(&metadata);
+                if hook_file_identity(&fs::symlink_metadata(path).map_err(map_io)?) != identity
+                    || bytes.len() as u64 != metadata.len()
+                {
+                    return Err(InstallError::InvalidType);
+                }
+                Some((identity, bytes))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(map_io(error)),
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            parent,
+            original,
+            published: None,
+            desired: None,
+            backup: None,
+            backup_identity: None,
+            temporary: None,
+            changed: false,
+        })
+    }
+
+    fn revalidate(&self, expected: Option<&HookFileIdentity>) -> Result<(), InstallError> {
+        let current_parent =
+            fs::symlink_metadata(self.path.parent().ok_or(InstallError::InvalidType)?)
+                .map_err(map_io)?;
+        let held = self.parent.metadata().map_err(map_io)?;
+        if !current_parent.is_dir()
+            || current_parent.file_type().is_symlink()
+            || (held.dev(), held.ino()) != (current_parent.dev(), current_parent.ino())
+        {
+            return Err(InstallError::InvalidType);
+        }
+        match (fs::symlink_metadata(&self.path), expected) {
+            (Ok(metadata), Some(expected))
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && hook_file_identity(&metadata) == *expected =>
+            {
+                Ok(())
+            }
+            (Err(error), None) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            _ => Err(InstallError::InvalidType),
+        }
+    }
+
+    fn publish(&mut self) -> Result<(), InstallError> {
+        self.revalidate(self.original.as_ref().map(|(id, _)| id))?;
+        if self.original.as_ref().map(|(_, bytes)| bytes) == self.desired.as_ref() {
+            return Ok(());
+        }
+        if let Some((_, bytes)) = &self.original {
+            let backup = self
+                .path
+                .with_file_name(format!(".evertrace-backup-{}", install_nonce()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backup)
+                .map_err(map_io)?;
+            self.backup = Some(backup);
+            file.write_all(bytes).map_err(map_io)?;
+            file.sync_all().map_err(map_io)?;
+            self.backup_identity = Some(hook_file_identity(&file.metadata().map_err(map_io)?));
+            self.parent.sync_all().map_err(map_io)?;
+        }
+        self.revalidate(self.original.as_ref().map(|(id, _)| id))?;
+        if let Some(bytes) = self.desired.clone() {
+            // Keep the staging handle: a rename-success/post-sync failure must
+            // still retain the exact published identity for conditional rollback.
+            let temporary = self
+                .path
+                .with_file_name(format!(".evertrace-install-{}", install_nonce()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(map_io)?;
+            self.temporary = Some(temporary.clone());
+            let result = (|| {
+                file.write_all(&bytes).map_err(map_io)?;
+                file.sync_all().map_err(map_io)?;
+                self.revalidate(self.original.as_ref().map(|(id, _)| id))?;
+                fs::rename(&temporary, &self.path).map_err(map_io)?;
+                self.changed = true;
+                self.temporary = None;
+                self.published = Some(hook_file_identity(&file.metadata().map_err(map_io)?));
+                self.parent.sync_all().map_err(map_io)
+            })();
+            if self.temporary.is_some()
+                && file
+                    .metadata()
+                    .ok()
+                    .zip(fs::symlink_metadata(&temporary).ok())
+                    .is_some_and(|(held, actual)| {
+                        actual.is_file()
+                            && !actual.file_type().is_symlink()
+                            && hook_file_identity(&held) == hook_file_identity(&actual)
+                    })
+                && fs::remove_file(&temporary).is_ok()
+            {
+                self.temporary = None;
+            }
+            result
+        } else {
+            fs::remove_file(&self.path).map_err(map_io)?;
+            self.changed = true;
+            self.parent.sync_all().map_err(map_io)
+        }
+    }
+
+    fn rollback(&self) -> Result<(), InstallError> {
+        if self.original.as_ref().map(|(_, bytes)| bytes) == self.desired.as_ref() {
+            return self.revalidate(self.original.as_ref().map(|(id, _)| id));
+        }
+        if !self.changed {
+            return self.revalidate(self.original.as_ref().map(|(id, _)| id));
+        }
+        self.revalidate(self.published.as_ref())?;
+        if let Some((_, original)) = &self.original {
+            let backup = self.backup.as_ref().ok_or(InstallError::Io)?;
+            if Some(private_file_identity(backup, 0o600)?) != self.backup_identity {
+                return Err(InstallError::InvalidType);
+            }
+            if fs::read(backup).map_err(map_io)? != *original {
+                return Err(InstallError::InvalidType);
+            }
+            fs::rename(backup, &self.path).map_err(map_io)?;
+        } else if self.published.is_some() {
+            fs::remove_file(&self.path).map_err(map_io)?;
+        }
+        self.parent.sync_all().map_err(map_io)
+    }
+}
+
+fn shell_path(path: &Path) -> Result<String, InstallError> {
+    let text = path.to_str().ok_or(InstallError::InvalidType)?;
+    if !path.is_absolute() || text.chars().any(char::is_control) {
+        return Err(InstallError::InvalidType);
+    }
+    Ok(format!("'{}'", text.replace('\'', "'\\''")))
+}
+
+fn wiring(paths: &ManagedInstallPaths) -> Result<Vec<u8>, InstallError> {
+    let command = format!(
+        "{} --launcher-root {}",
+        shell_path(&paths.data_root.join("hook-v1"))?,
+        shell_path(&paths.data_root)?
+    );
+    let mut mcp: toml::Value = toml::from_str(include_str!(
+        "../../../packaging/codex/mcp.v1.template.toml"
+    ))
+    .map_err(|_| InstallError::InvalidType)?;
+    mcp["mcp_servers"]["evertrace"]["command"] =
+        toml::Value::String(paths.cli.to_str().ok_or(InstallError::InvalidType)?.into());
+    mcp["mcp_servers"]["evertrace"]["args"][1] = toml::Value::String(
+        paths
+            .config
+            .to_str()
+            .ok_or(InstallError::InvalidType)?
+            .into(),
+    );
+    let mut hooks: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../packaging/codex/hooks.v1.template.json"
+    ))
+    .map_err(|_| InstallError::InvalidType)?;
+    for event in ["PreToolUse", "PostToolUse"] {
+        hooks["hooks"][event][0]["hooks"][0]["command"] = command.clone().into();
+    }
+    mcp.as_table_mut().ok_or(InstallError::InvalidType)?.insert(
+        "hooks".into(),
+        toml::Value::try_from(&hooks["hooks"]).map_err(|_| InstallError::InvalidType)?,
+    );
+    Ok(format!(
+        "{OWNED_BEGIN}{}{OWNED_END}",
+        toml::to_string(&mcp).map_err(|_| InstallError::InvalidType)?
+    )
+    .into_bytes())
+}
+
+fn merge_wiring(original: &[u8], owned: &[u8], uninstall: bool) -> Result<Vec<u8>, InstallError> {
+    let text = std::str::from_utf8(original).map_err(|_| InstallError::InvalidType)?;
+    let parsed: toml::Value = toml::from_str(text).map_err(|_| InstallError::InvalidType)?;
+    let owned = std::str::from_utf8(owned).map_err(|_| InstallError::InvalidType)?;
+    let result = if let Some(start) = text.find(OWNED_BEGIN) {
+        let end = text[start..]
+            .find(OWNED_END)
+            .map(|end| start + end + OWNED_END.len())
+            .ok_or(InstallError::InvalidType)?;
+        if &text[start..end] != owned || text[end..].contains(OWNED_BEGIN) {
+            return Err(InstallError::InvalidType);
+        }
+        if uninstall {
+            format!("{}{}", &text[..start], &text[end..])
+        } else {
+            text.to_owned()
+        }
+    } else {
+        if text.contains(OWNED_END)
+            || parsed
+                .get("mcp_servers")
+                .and_then(|servers| servers.get("evertrace"))
+                .is_some()
+        {
+            return Err(InstallError::InvalidType);
+        }
+        if uninstall {
+            text.to_owned()
+        } else {
+            format!(
+                "{text}{}{owned}",
+                if text.is_empty() || text.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                }
+            )
+        }
+    };
+    if result.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(InstallError::ResourceExhausted);
+    }
+    toml::from_str::<toml::Value>(&result).map_err(|_| InstallError::InvalidType)?;
+    Ok(result.into_bytes())
+}
+
+fn ensure_install_parent(path: &Path) -> Result<(), InstallError> {
+    let mut missing = Vec::new();
+    for parent in path.ancestors() {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
+            Ok(_) => return Err(InstallError::InvalidType),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(parent),
+            Err(error) => return Err(map_io(error)),
+        }
+    }
+    for directory in missing.into_iter().rev() {
+        DirBuilder::new()
+            .mode(0o700)
+            .create(directory)
+            .map_err(map_io)?;
+    }
+    Ok(())
+}
+
+fn package_metadata(path: &Path) -> Result<fs::Metadata, InstallError> {
+    for parent in path.parent().ok_or(InstallError::InvalidType)?.ancestors() {
+        let metadata = fs::symlink_metadata(parent).map_err(map_io)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(InstallError::InvalidType);
+        }
+    }
+    let metadata = fs::symlink_metadata(path).map_err(map_io)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || ![0, current_uid()?].contains(&metadata.uid())
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return Err(InstallError::InvalidType);
+    }
+    let parent = fs::metadata(path.parent().ok_or(InstallError::InvalidType)?).map_err(map_io)?;
+    if ![0, current_uid()?].contains(&parent.uid()) || parent.mode() & 0o022 != 0 {
+        return Err(InstallError::InvalidPermissions);
+    }
+    Ok(metadata)
+}
+
+fn package_bytes(path: &Path) -> Result<Vec<u8>, InstallError> {
+    let metadata = package_metadata(path)?;
+    if metadata.len() > 256 * 1024 * 1024 {
+        return Err(InstallError::ResourceExhausted);
+    }
+    let mut file = File::open(path).map_err(map_io)?;
+    let identity = hook_file_identity(&metadata);
+    if hook_file_identity(&file.metadata().map_err(map_io)?) != identity {
+        return Err(InstallError::InvalidType);
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(256 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(map_io)?;
+    if bytes.len() as u64 != metadata.len()
+        || hook_file_identity(&file.metadata().map_err(map_io)?) != identity
+        || hook_file_identity(&fs::symlink_metadata(path).map_err(map_io)?) != identity
+    {
+        return Err(InstallError::InvalidType);
+    }
+    Ok(bytes)
+}
+
+fn unit_bytes(paths: &ManagedInstallPaths) -> Result<Vec<u8>, InstallError> {
+    let quote = |path: &Path| -> Result<String, InstallError> {
+        let value = path.to_str().ok_or(InstallError::InvalidType)?;
+        if !path.is_absolute() || value.chars().any(char::is_control) {
+            return Err(InstallError::InvalidType);
+        }
+        Ok(format!(
+            "\"{}\"",
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+                .replace('$', "$$")
+        ))
+    };
+    Ok(
+        include_str!("../../../packaging/systemd/evertraced.service.in")
+            .replace("@DAEMON@", &quote(&paths.daemon)?)
+            .replace("@CONFIG@", &quote(&paths.config)?)
+            .into_bytes(),
+    )
+}
+
+/// Fixed systemctl operations, bounded output and wall time. Nonblocking socket
+/// output avoids waiting on a descendant that inherited a pipe after timeout.
+pub(crate) fn bounded_install_command(
+    executable: &Path,
+    arguments: &[&str],
+    host_home: Option<&Path>,
+) -> Result<(i32, String), InstallError> {
+    use std::{
+        os::fd::OwnedFd,
+        os::unix::net::UnixStream,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let (mut reader, output) = UnixStream::pair().map_err(map_io)?;
+    reader.set_nonblocking(true).map_err(map_io)?;
+    let descriptor: OwnedFd = output.into();
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(descriptor))
+        .stderr(Stdio::null());
+    if let Some(home) = host_home {
+        command.env("CODEX_HOME", home);
+    }
+    let mut child = command.spawn().map_err(map_io)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut bytes = Vec::new();
+    loop {
+        let mut buffer = [0; 1024];
+        match reader.read(&mut buffer) {
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(InstallError::Io);
+            }
+        }
+        if bytes.len() > 16 * 1024 || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(InstallError::ResourceExhausted);
+        }
+        if let Some(status) = child.try_wait().map_err(map_io)? {
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        bytes.extend_from_slice(&buffer[..count]);
+                        if bytes.len() > 16 * 1024 {
+                            return Err(InstallError::ResourceExhausted);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => return Err(InstallError::Io),
+                }
+            }
+            return Ok((
+                status.code().unwrap_or(-1),
+                String::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?,
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn user_service(executable: &Path, arguments: &[&str]) -> Result<(i32, String), InstallError> {
+    let mut args = vec!["--user"];
+    args.extend_from_slice(arguments);
+    bounded_install_command(executable, &args, None)
+}
+
+fn require_service(executable: &Path, arguments: &[&str]) -> Result<(), InstallError> {
+    match user_service(executable, arguments)?.0 {
+        0 => Ok(()),
+        code => Err(InstallError::ServiceExit(code)),
+    }
+}
+
+pub fn managed_install(
+    paths: &ManagedInstallPaths,
+    config_bytes: &[u8],
+    uninstall: bool,
+    prepare_runtime: impl FnOnce(u64, &Path) -> Result<(), InstallError>,
+) -> Result<ManagedInstallResult, ManagedInstallError> {
+    let mut edits: Vec<InstallFile> = Vec::new();
+    let mut new_assets: Vec<PathBuf> = Vec::new();
+    let mut new_files = Vec::new();
+    let mut new_directory = None;
+    let mut service_started = false;
+    let mut service_attempted = false;
+    let mut previous_service = None;
+    let mut stage = "host probe";
+    let result = (|| {
+        if paths.unit.file_name().and_then(|name| name.to_str()) != Some("evertraced.service") {
+            return Err(InstallError::InvalidType);
+        }
+        let host_hooks_enabled = if uninstall {
+            None
+        } else {
+            package_metadata(&paths.host_executable)?;
+            Some(
+                crate::probe::probe_install_host(
+                    &paths.host_executable,
+                    paths
+                        .host_config
+                        .parent()
+                        .ok_or(InstallError::InvalidType)?,
+                )?
+                .hooks_enabled,
+            )
+        };
+        for path in [&paths.host_config, &paths.unit, &paths.config] {
+            ensure_install_parent(path.parent().ok_or(InstallError::InvalidType)?)?;
+        }
+        stage = "host wiring";
+        let mut host = InstallFile::read(&paths.host_config)?;
+        let original_host = host
+            .original
+            .as_ref()
+            .map_or(&[][..], |(_, bytes)| bytes.as_slice());
+        let merged = merge_wiring(original_host, &wiring(paths)?, uninstall)?;
+        host.desired = if host.original.is_none() && uninstall {
+            None
+        } else {
+            Some(merged)
+        };
+        stage = "unit ownership";
+        let mut unit = InstallFile::read(&paths.unit)?;
+        let expected_unit = unit_bytes(paths)?;
+        if unit
+            .original
+            .as_ref()
+            .is_some_and(|(_, original)| *original != expected_unit)
+        {
+            return Err(InstallError::InvalidType);
+        }
+        let unit_exists = unit.original.is_some();
+        unit.desired = (!uninstall).then_some(expected_unit);
+        let mut config = InstallFile::read(&paths.config)?;
+        if let Some((_, bytes)) = &config.original
+            && bytes != config_bytes
+        {
+            return Err(InstallError::InvalidType);
+        }
+        config.desired = config
+            .original
+            .as_ref()
+            .map(|(_, bytes)| bytes.clone())
+            .or_else(|| (!uninstall).then(|| config_bytes.to_vec()));
+        edits.extend([config, host, unit]);
+        stage = "service probe";
+        let service_available = match fs::symlink_metadata(&paths.systemctl) {
+            Ok(_) => {
+                package_metadata(&paths.systemctl)?;
+                let (success, fragment) = user_service(
+                    &paths.systemctl,
+                    &[
+                        "show",
+                        "evertraced.service",
+                        "--property=FragmentPath",
+                        "--value",
+                    ],
+                )?;
+                if success == 0
+                    && !fragment.trim().is_empty()
+                    && (!unit_exists
+                        || fragment.trim()
+                            != paths.unit.to_str().ok_or(InstallError::InvalidType)?)
+                {
+                    return Err(InstallError::InvalidType);
+                }
+                if success == 0 && unit_exists {
+                    let enabled =
+                        user_service(&paths.systemctl, &["is-enabled", "evertraced.service"])?;
+                    let active =
+                        user_service(&paths.systemctl, &["is-active", "evertraced.service"])?;
+                    if !matches!(enabled.1.trim(), "enabled" | "disabled")
+                        || !matches!(active.1.trim(), "active" | "inactive" | "failed")
+                    {
+                        return Err(InstallError::InvalidType);
+                    }
+                    previous_service =
+                        Some((enabled.1.trim() == "enabled", active.1.trim() == "active"));
+                }
+                success == 0
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(map_io(error)),
+        };
+        if !uninstall {
+            stage = "package assets";
+            package_metadata(&paths.cli)?;
+            package_metadata(&paths.daemon)?;
+            let bytes = package_bytes(&paths.hook)?;
+            ensure_install_parent(&paths.data_root)?;
+            let launcher = StableLauncher::open(&paths.data_root)?;
+            if launcher.registry_path().try_exists().map_err(map_io)? {
+                let registry = launcher.with_lock(|| launcher.read_registry())?;
+                let current = registry
+                    .generations
+                    .iter()
+                    .find(|item| item.generation == registry.current_generation)
+                    .ok_or(InstallError::InvalidRegistry)?;
+                if package_bytes(&current.executable)? != bytes
+                    || package_bytes(&launcher.launcher_path())? != bytes
+                {
+                    return Err(InstallError::GenerationUnavailable);
+                }
+            } else {
+                if launcher.launcher_path().try_exists().map_err(map_io)? {
+                    return Err(InstallError::InvalidType);
+                }
+                let directory = paths
+                    .data_root
+                    .join(generation_relative(1, GENERATION_EXECUTABLE_NAME))
+                    .parent()
+                    .ok_or(InstallError::InvalidType)?
+                    .to_owned();
+                DirBuilder::new()
+                    .mode(0o700)
+                    .create(&directory)
+                    .map_err(map_io)?;
+                new_directory = Some((directory.clone(), File::open(&directory).map_err(map_io)?));
+                new_assets.push(directory.clone());
+                stage = "runtime preparation";
+                let runtime = directory.join(GENERATION_RUNTIME_NAME);
+                prepare_runtime(1, &runtime)?;
+                new_files.push((runtime.clone(), private_file_identity(&runtime, 0o600)?));
+                atomic_write(&directory.join(GENERATION_EXECUTABLE_NAME), &bytes, 0o700)?;
+                new_files.push((
+                    directory.join(GENERATION_EXECUTABLE_NAME),
+                    private_file_identity(&directory.join(GENERATION_EXECUTABLE_NAME), 0o700)?,
+                ));
+                atomic_write(&launcher.launcher_path(), &bytes, 0o700)?;
+                new_files.push((
+                    launcher.launcher_path(),
+                    private_file_identity(&launcher.launcher_path(), 0o700)?,
+                ));
+                new_assets.push(launcher.launcher_path());
+                launcher.publish_generation(HookGeneration {
+                    generation: 1,
+                    protocol_version: 1,
+                    executable: directory.join(GENERATION_EXECUTABLE_NAME),
+                    runtime_snapshot: runtime,
+                    compatible: true,
+                })?;
+                new_assets.push(launcher.registry_path());
+                new_files.push((
+                    launcher.registry_path(),
+                    private_file_identity(&launcher.registry_path(), 0o600)?,
+                ));
+            }
+        }
+        if service_available && uninstall && unit_exists {
+            stage = "service removal";
+            for edit in &edits {
+                edit.revalidate(edit.original.as_ref().map(|(id, _)| id))?;
+            }
+            service_attempted = true;
+            require_service(
+                &paths.systemctl,
+                &["disable", "--now", "evertraced.service"],
+            )?;
+        }
+        stage = "configuration publication";
+        for edit in &mut edits {
+            edit.publish()?;
+        }
+        stage = "service publication";
+        if service_available && (uninstall && unit_exists || !uninstall && !unit_exists) {
+            for edit in &edits {
+                let expected =
+                    if edit.original.as_ref().map(|(_, bytes)| bytes) == edit.desired.as_ref() {
+                        edit.original.as_ref().map(|(id, _)| id)
+                    } else {
+                        edit.published.as_ref()
+                    };
+                edit.revalidate(expected)?;
+            }
+            service_attempted = true;
+            require_service(&paths.systemctl, &["daemon-reload"])?;
+            if !uninstall {
+                service_started = true;
+                require_service(&paths.systemctl, &["enable", "--now", "evertraced.service"])?;
+            }
+        }
+        Ok(ManagedInstallResult {
+            service_available,
+            backups: edits
+                .iter()
+                .filter_map(|edit| edit.backup.clone())
+                .collect(),
+            manual_command: format!(
+                "{} --config {}",
+                shell_path(&paths.daemon)?,
+                shell_path(&paths.config)?
+            ),
+            host_hooks_enabled,
+        })
+    })();
+    result.map_err(|cause| {
+        let mut preserved = Vec::new();
+        let unit_owned = edits.get(2).is_some_and(|edit| {
+            edit.revalidate(if edit.changed {
+                edit.published.as_ref()
+            } else {
+                edit.original.as_ref().map(|(id, _)| id)
+            })
+            .is_ok()
+        });
+        let mut rollback_complete = !service_started
+            || unit_owned
+                && require_service(
+                    &paths.systemctl,
+                    &["disable", "--now", "evertraced.service"],
+                )
+                .is_ok();
+        if !rollback_complete {
+            preserved.push(paths.unit.clone());
+        }
+        for edit in edits.iter().rev() {
+            if edit.rollback().is_err() {
+                rollback_complete = false;
+                preserved.push(edit.path.clone());
+            }
+            preserved.extend(edit.temporary.clone());
+            if let Some(backup) = &edit.backup
+                && backup.exists()
+            {
+                preserved.push(backup.clone());
+            }
+        }
+        if service_attempted && unit_owned && rollback_complete {
+            if require_service(&paths.systemctl, &["daemon-reload"]).is_err() {
+                preserved.push(paths.unit.clone());
+            }
+            if let Some((enabled, active)) = previous_service {
+                for action in [
+                    if enabled { "enable" } else { "disable" },
+                    if active { "start" } else { "stop" },
+                ] {
+                    if require_service(&paths.systemctl, &[action, "evertraced.service"]).is_err() {
+                        preserved.push(paths.unit.clone());
+                    }
+                }
+            }
+        } else if service_attempted {
+            preserved.push(paths.unit.clone());
+        }
+        if let Some((directory, custody)) = new_directory {
+            let cleanup = (|| {
+                if !rollback_complete {
+                    return Err(InstallError::InvalidType);
+                }
+                let launcher = StableLauncher::open(&paths.data_root)?;
+                launcher.with_lock(|| {
+                    if !read_pins(
+                        &paths.data_root.join(HOOKS_DIRECTORY).join(PINS_DIRECTORY),
+                        false,
+                    )?
+                    .is_empty()
+                    {
+                        return Err(InstallError::InvalidType);
+                    }
+                    let current = fs::symlink_metadata(&directory).map_err(map_io)?;
+                    let held = custody.metadata().map_err(map_io)?;
+                    if !current.is_dir()
+                        || current.file_type().is_symlink()
+                        || (held.dev(), held.ino()) != (current.dev(), current.ino())
+                    {
+                        return Err(InstallError::InvalidType);
+                    }
+                    for path in [launcher.launcher_path(), launcher.registry_path()] {
+                        if path.try_exists().map_err(map_io)?
+                            && !new_files.iter().any(|(owned, _)| *owned == path)
+                        {
+                            return Err(InstallError::InvalidType);
+                        }
+                    }
+                    for entry in fs::read_dir(&directory).map_err(map_io)?.take(3) {
+                        let path = entry.map_err(map_io)?.path();
+                        if !new_files.iter().any(|(owned, _)| *owned == path) {
+                            return Err(InstallError::InvalidType);
+                        }
+                    }
+                    for (path, identity) in &new_files {
+                        let actual = fs::symlink_metadata(path).map_err(map_io)?;
+                        if !actual.is_file()
+                            || actual.file_type().is_symlink()
+                            || hook_file_identity(&actual) != *identity
+                        {
+                            return Err(InstallError::InvalidType);
+                        }
+                    }
+                    for (path, _) in new_files.iter().rev() {
+                        fs::remove_file(path).map_err(map_io)?;
+                        File::open(path.parent().ok_or(InstallError::InvalidType)?)
+                            .and_then(|parent| parent.sync_all())
+                            .map_err(map_io)?;
+                    }
+                    fs::remove_dir(&directory).map_err(map_io)?;
+                    File::open(directory.parent().ok_or(InstallError::InvalidType)?)
+                        .and_then(|parent| parent.sync_all())
+                        .map_err(map_io)
+                })
+            })();
+            if cleanup.is_err() {
+                preserved.extend(new_assets);
+            }
+        }
+        ManagedInstallError {
+            stage,
+            cause,
+            preserved,
+        }
+    })
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookGeneration {
@@ -584,6 +1406,8 @@ impl StableLauncher {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum InstallError {
+    #[error("systemctl exited with status {0}")]
+    ServiceExit(i32),
     #[error("hook generation registry is invalid")]
     InvalidRegistry,
     #[error("hook generation is unavailable")]

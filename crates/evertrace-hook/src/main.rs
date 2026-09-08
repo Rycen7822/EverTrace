@@ -17,7 +17,7 @@ use evertrace_capture::{
 use evertrace_codex::{
     binding::{
         BINDING_PROTOCOL_REVISION, CanonicalBindingCall, NativeHookSpecificOutput,
-        NativePermissionDecision, NativePreToolUse, NativePreToolUseEvent, NativePreToolUseOutput,
+        NativePermissionDecision, NativePreToolUseOutput, NativeToolUse, NativeToolUseEvent,
         PublicWorkspace, validated_bound_workspace,
     },
     hook_input::{CaptureHookInput, HookEventKind, MAX_CAPTURE_HOOK_INPUT},
@@ -288,7 +288,7 @@ fn recovery_preflight(
 }
 
 fn binding_rewrite(snapshot_path: &Path, bytes: &[u8]) -> Result<(), ()> {
-    let mut native = NativePreToolUse::<McpToolInput>::from_json(bytes).map_err(|_| ())?;
+    let mut native = NativeToolUse::<McpToolInput>::from_json(bytes).map_err(|_| ())?;
     native.validate_host_fields().map_err(|_| ())?;
     if !native.targets_evertrace() || !native.tool_input.validate() {
         return Ok(());
@@ -320,7 +320,7 @@ fn binding_rewrite(snapshot_path: &Path, bytes: &[u8]) -> Result<(), ()> {
         validated_bound_workspace(&original_call, &issued.bound_workspace).map_err(|_| ())?;
     let output = NativePreToolUseOutput {
         hook_specific_output: NativeHookSpecificOutput {
-            hook_event_name: NativePreToolUseEvent::PreToolUse,
+            hook_event_name: NativeToolUseEvent::PreToolUse,
             permission_decision: NativePermissionDecision::Allow,
             updated_input: native.tool_input,
         },
@@ -332,14 +332,27 @@ fn binding_rewrite(snapshot_path: &Path, bytes: &[u8]) -> Result<(), ()> {
 
 fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
     let capture_input = CaptureHookInput::from_json(bytes).ok();
-    let native_input = NativePreToolUse::<McpToolInput>::from_json(bytes).ok();
+    let native_input = NativeToolUse::from_json(bytes).ok();
     let (session_id, binding_mode) = match (&capture_input, &native_input) {
         (Some(input), None) => (input.session_id.as_str(), false),
-        (None, Some(input)) => (input.session_id.as_str(), true),
+        (None, Some(input)) => (
+            input.session_id.as_str(),
+            input.hook_event_name == NativeToolUseEvent::PreToolUse && input.targets_evertrace(),
+        ),
         _ => return Err(()),
     };
     let launcher = StableLauncher::open(root).map_err(|_| ())?;
     let generation = launcher.resolve_for_session(session_id).map_err(|_| ())?;
+    let normalized;
+    let bytes = if !binding_mode && let Some(native) = native_input {
+        normalized = CaptureHookInput::from_native(native, generation.generation)
+            .map_err(|_| ())?
+            .to_json()
+            .map_err(|_| ())?;
+        normalized.as_slice()
+    } else {
+        bytes
+    };
     let snapshot = RuntimeSnapshot::load(&generation.runtime_snapshot).map_err(|_| ())?;
     let child_timeout = capture_input.as_ref().map_or(CHILD_TIMEOUT, |input| {
         launcher_child_timeout(

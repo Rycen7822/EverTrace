@@ -7,7 +7,7 @@ use std::{
 use evertrace_capture::{ConfinedReadError, ConfinedReadLimits, ConfinedRoot};
 use evertrace_codex::{
     adapter_manifest::{AdapterKind, SessionCatalogRootKind},
-    binding::NativePreToolUse,
+    binding::NativeToolUse,
     capability::CanaryStatus,
     policy::{RepositoryTrustResult, RepositoryTrustState, parse_repository_trust},
     probe::{
@@ -49,7 +49,7 @@ fn observe_native_session_catalog_root_at(
     native_input: &[u8],
     deadline: Instant,
 ) -> Result<(SessionCatalogRootEvidence, PathBuf), SessionCatalogObservationError> {
-    let input = NativePreToolUse::<Value>::from_json(native_input)
+    let input = NativeToolUse::<Value>::from_json(native_input)
         .map_err(|_| SessionCatalogObservationError::InvalidNativeInput)?;
     input
         .validate_host_fields()

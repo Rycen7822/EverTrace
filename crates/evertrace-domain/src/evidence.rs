@@ -34,6 +34,12 @@ macro_rules! source_identity {
 }
 
 source_identity!(SourceInstanceId);
+
+impl SourceInstanceId {
+    pub fn new_v7() -> Self {
+        Self(uuid::Uuid::now_v7().to_string())
+    }
+}
 source_identity!(SourceRevision);
 source_identity!(SourceRecordIdentity);
 

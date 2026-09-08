@@ -1,1 +1,4 @@
-# intentionally empty
+[mcp_servers.evertrace]
+command = "@CLI@"
+args = ["--config", "@CONFIG@", "mcp"]
+enabled_tools = ["evertrace"]

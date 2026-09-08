@@ -12,6 +12,10 @@ pub enum Command {
     ConfigShowEffective,
     Doctor,
     Upgrade,
+    Install {
+        host_executable: PathBuf,
+    },
+    Uninstall,
     Restore {
         backup: PathBuf,
     },
@@ -47,6 +51,16 @@ impl Args {
             }
         } else if command == "upgrade" {
             Command::Upgrade
+        } else if command == "install" {
+            Command::Install {
+                host_executable: PathBuf::from(
+                    values
+                        .next()
+                        .ok_or("install requires an absolute Codex executable path")?,
+                ),
+            }
+        } else if command == "uninstall" {
+            Command::Uninstall
         } else if command == "doctor" {
             Command::Doctor
         } else if command == "mcp" {
@@ -95,5 +109,5 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade|doctor|mcp|tui|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade|install CODEX_EXECUTABLE|uninstall|doctor|mcp|tui|admin session queue|revoke SESSION_ID"
 }

@@ -99,6 +99,91 @@ impl std::fmt::Debug for CaptureHookInput {
 }
 
 impl CaptureHookInput {
+    /// One native delivery is one local weak source, never a host sequence or
+    /// retry identity. The launcher invokes this once after selecting its pin.
+    pub fn from_native(
+        input: crate::binding::NativeToolUse<serde_json::Value>,
+        generation: u64,
+    ) -> Result<Self, HookInputError> {
+        use evertrace_domain::evidence::{
+            CorrelationField, CorrelationFieldClaim, ObservationRole, SourceInstanceId,
+        };
+        input
+            .validate_host_fields()
+            .map_err(|_| HookInputError::Invalid)?;
+        let mut context = crate::probe::ProbeContext::unobserved_codex();
+        context.adapter_revision = format!("native-hook-v1-generation-{generation}");
+        let report = crate::probe::HostProbeReport::evaluate(
+            &context,
+            &crate::probe::ProbeEvidence::empty(),
+        )
+        .map_err(|_| HookInputError::Invalid)?;
+        let manifest = report.manifest().adapter_manifest_id.clone();
+        let source = SourceInstanceId::new_v7().as_str().to_owned();
+        let event_kind = match input.hook_event_name {
+            crate::binding::NativeToolUseEvent::PreToolUse => HookEventKind::PreToolUse,
+            crate::binding::NativeToolUseEvent::PostToolUse => HookEventKind::PostToolUse,
+        };
+        let payload = serde_json::to_string(&input).map_err(|_| HookInputError::Invalid)?;
+        let value = Self {
+            input_version: CAPTURE_HOOK_INPUT_VERSION,
+            spool_record_id: None,
+            source_observation_id_hint: None,
+            source_instance_id: source.clone(),
+            source_revision: "initial".into(),
+            source_record_identity: None,
+            identity_strength: Some(IdentityStrength::SynthesizedBestEffort),
+            source_kind: EvidenceSourceKind::CodexHook,
+            identity_domain: "native-hook-delivery-v1".into(),
+            adapter_manifest_ref: manifest.clone(),
+            eligible_event_manifest_ref: crate::source_catalog::CODEX_ELIGIBLE_EVENT_MANIFEST
+                .into(),
+            source_revision_mode: SourceRevisionMode::Append,
+            previous_source_revision: None,
+            source_ref: source.clone(),
+            session_id: input.session_id,
+            turn_id: Some(input.turn_id),
+            tool_use_id: Some(input.tool_use_id.clone()),
+            event_kind,
+            correlation: HostCorrelationEvidence {
+                occurrence_schema_version: 1,
+                host_instance_id: None,
+                host_trace_lineage_id: None,
+                host_lane_key: None,
+                canonical_event_family: None,
+                native_request_id: Some(input.tool_use_id),
+                physical_execution_ordinal: None,
+                pairing_role: if event_kind == HookEventKind::PreToolUse {
+                    ObservationRole::Intent
+                } else {
+                    ObservationRole::Result
+                },
+                field_provenance: vec![CorrelationFieldClaim {
+                    field: CorrelationField::NativeRequestId,
+                    source_ref: source.clone(),
+                    evidence_ref: source,
+                }],
+                adapter_manifest_ref: manifest,
+                adapter_revision: 1,
+                strong_gate_receipt_ref: None,
+                admission: CorrelationAdmission::Unavailable,
+                partial_correlation_ref: None,
+                possible_duplicate_group_id: None,
+            },
+            scope_effect_claims: Vec::new(),
+            lifecycle: None,
+            source_sequence: 0,
+            source_sequence_origin: Some(0),
+            task_id: None,
+            repository_instance_id: None,
+            worktree_instance_id: None,
+            event_time_us: None,
+            payload,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self, HookInputError> {
         if bytes.len() > MAX_CAPTURE_HOOK_INPUT {
             return Err(HookInputError::Oversize);

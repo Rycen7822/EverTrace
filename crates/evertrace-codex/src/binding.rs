@@ -173,13 +173,15 @@ pub enum NativePermissionMode {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativePreToolUse<T> {
+pub struct NativeToolUse<T> {
     pub cwd: String,
-    pub hook_event_name: NativePreToolUseEvent,
+    pub hook_event_name: NativeToolUseEvent,
     pub model: String,
     pub permission_mode: NativePermissionMode,
     pub session_id: String,
     pub tool_input: T,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_response: Option<serde_json::Value>,
     pub tool_name: String,
     pub tool_use_id: String,
     pub transcript_path: Option<String>,
@@ -189,20 +191,30 @@ pub struct NativePreToolUse<T> {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum NativePreToolUseEvent {
+pub enum NativeToolUseEvent {
     PreToolUse,
+    PostToolUse,
 }
 
-impl<T> NativePreToolUse<T>
+impl<T> NativeToolUse<T>
 where
     T: for<'de> Deserialize<'de>,
 {
     pub fn from_json(input: &[u8]) -> Result<Self, BindingError> {
-        serde_json::from_slice(input).map_err(|_| BindingError::InvalidCall)
+        let raw: serde_json::Value =
+            serde_json::from_slice(input).map_err(|_| BindingError::InvalidCall)?;
+        let response = raw.get("tool_response").cloned();
+        let mut value: Self = serde_json::from_value(raw).map_err(|_| BindingError::InvalidCall)?;
+        if matches!(value.hook_event_name, NativeToolUseEvent::PostToolUse) != response.is_some() {
+            return Err(BindingError::InvalidCall);
+        }
+        value.tool_response = response;
+        Ok(value)
     }
 
     pub fn targets_evertrace(&self) -> bool {
-        self.tool_name == CODEX_EVERTRACE_TOOL_NAME
+        self.hook_event_name == NativeToolUseEvent::PreToolUse
+            && self.tool_name == CODEX_EVERTRACE_TOOL_NAME
     }
 
     pub fn validate_host_fields(&self) -> Result<(), BindingError> {
@@ -252,7 +264,7 @@ pub struct NativePreToolUseOutput<T> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeHookSpecificOutput<T> {
-    pub hook_event_name: NativePreToolUseEvent,
+    pub hook_event_name: NativeToolUseEvent,
     pub permission_decision: NativePermissionDecision,
     pub updated_input: T,
 }
@@ -265,6 +277,9 @@ pub enum NativePermissionDecision {
 
 impl<T: Serialize> NativePreToolUseOutput<T> {
     pub fn to_json(&self) -> Result<Vec<u8>, BindingError> {
+        if self.hook_specific_output.hook_event_name != NativeToolUseEvent::PreToolUse {
+            return Err(BindingError::InvalidCall);
+        }
         serde_json::to_vec(self).map_err(|_| BindingError::InvalidCall)
     }
 }
@@ -369,24 +384,21 @@ mod tests {
             "turn_id": "turn-a"
         });
         let native =
-            NativePreToolUse::<TestToolInput>::from_json(&serde_json::to_vec(&raw).unwrap())
-                .unwrap();
+            NativeToolUse::<TestToolInput>::from_json(&serde_json::to_vec(&raw).unwrap()).unwrap();
         native.validate_host_fields().unwrap();
         assert!(native.targets_evertrace());
         assert_eq!(native.tool_input.action, "search");
 
         let mut null_transcript = raw.clone();
         null_transcript["transcript_path"] = serde_json::Value::Null;
-        NativePreToolUse::<TestToolInput>::from_json(
-            &serde_json::to_vec(&null_transcript).unwrap(),
-        )
-        .unwrap()
-        .validate_host_fields()
-        .unwrap();
+        NativeToolUse::<TestToolInput>::from_json(&serde_json::to_vec(&null_transcript).unwrap())
+            .unwrap()
+            .validate_host_fields()
+            .unwrap();
 
         let output = NativePreToolUseOutput {
             hook_specific_output: NativeHookSpecificOutput {
-                hook_event_name: NativePreToolUseEvent::PreToolUse,
+                hook_event_name: NativeToolUseEvent::PreToolUse,
                 permission_decision: NativePermissionDecision::Allow,
                 updated_input: native.tool_input,
             },
@@ -405,13 +417,13 @@ mod tests {
         let mut unknown = raw.clone();
         unknown["extra"] = serde_json::json!(true);
         assert!(
-            NativePreToolUse::<TestToolInput>::from_json(&serde_json::to_vec(&unknown).unwrap())
+            NativeToolUse::<TestToolInput>::from_json(&serde_json::to_vec(&unknown).unwrap())
                 .is_err()
         );
         let mut other = raw;
         other["tool_name"] = serde_json::json!("mcp__other__evertrace");
         assert!(
-            !NativePreToolUse::<TestToolInput>::from_json(&serde_json::to_vec(&other).unwrap())
+            !NativeToolUse::<TestToolInput>::from_json(&serde_json::to_vec(&other).unwrap())
                 .unwrap()
                 .targets_evertrace()
         );

@@ -1,9 +1,10 @@
+# EverTrace managed user unit v1
 [Unit]
 Description=EverTrace local daemon
 
 [Service]
 Type=simple
-ExecStart=@BINDIR@/evertraced
+ExecStart=@DAEMON@ --config @CONFIG@
 UMask=0077
 Restart=on-failure
 RestartSec=2s

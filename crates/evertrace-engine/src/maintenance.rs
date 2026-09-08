@@ -1,5 +1,71 @@
 //! Single bounded owner for durable background work.
 
+/// Offline installation keeps runtime interpretation in Engine/Capture. The
+/// adapter never manufactures snapshot JSON or alters a pinned runtime.
+pub fn install_offline(
+    paths: &evertrace_codex::install::ManagedInstallPaths,
+    uninstall: bool,
+) -> Result<
+    evertrace_codex::install::ManagedInstallResult,
+    evertrace_codex::install::ManagedInstallError,
+> {
+    use evertrace_codex::install::{InstallError, ManagedInstallError};
+    let invalid = || ManagedInstallError {
+        stage: "configuration",
+        cause: InstallError::InvalidType,
+        preserved: Vec::new(),
+    };
+    let (config, bytes) = match std::fs::symlink_metadata(&paths.config) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= 1024 * 1024 =>
+        {
+            let bytes = std::fs::read(&paths.config).map_err(|_| invalid())?;
+            let config = evertrace_domain::config::EffectiveConfig::parse_toml(
+                std::str::from_utf8(&bytes).map_err(|_| invalid())?,
+            )
+            .map_err(|_| invalid())?;
+            (config, bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let config = evertrace_domain::config::EffectiveConfig::default();
+            let bytes = config.to_toml().map_err(|_| invalid())?.into_bytes();
+            (config, bytes)
+        }
+        _ => return Err(invalid()),
+    };
+    evertrace_codex::install::managed_install(
+        paths,
+        &bytes,
+        uninstall,
+        |_generation, destination| {
+            let snapshot_path = RuntimeSnapshot::snapshot_path(&paths.data_root);
+            let mut runtime = match std::fs::symlink_metadata(&snapshot_path) {
+                Ok(_) => {
+                    RuntimeSnapshot::load(&snapshot_path).map_err(|_| InstallError::InvalidType)?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let _lock = evertrace_store::SiblingWriterLock::acquire(&paths.data_root)
+                        .map_err(|_| InstallError::LockBusy)?;
+                    if snapshot_path.try_exists().map_err(|_| InstallError::Io)? {
+                        return Err(InstallError::InvalidType);
+                    }
+                    crate::publish_recovery_runtime(&paths.data_root, &config, None)
+                        .map_err(|_| InstallError::InvalidType)?
+                }
+                Err(_) => return Err(InstallError::Io),
+            };
+            runtime.recovery_gate = evertrace_capture::RecoveryGateMode::Disabled;
+            runtime.recovery_adapter_manifest_id = None;
+            runtime.recall_cue_gate = evertrace_capture::RecallCueGateMode::Disabled;
+            runtime.recall_cue_adapter_manifest_id = None;
+            runtime.recall_cues.clear();
+            runtime.publish(destination).map_err(|_| InstallError::Io)
+        },
+    )
+}
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,

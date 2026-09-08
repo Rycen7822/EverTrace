@@ -899,12 +899,36 @@ fn fixtures_and_packaging_are_content_free_minimal_inputs() {
         }
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    assert_eq!(
-        fs::read_to_string(root.join("packaging/codex/hooks.v1.template.json")).unwrap(),
-        "{}\n"
-    );
+    let hooks: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("packaging/codex/hooks.v1.template.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hooks.as_object().unwrap().len(), 1);
+    assert_eq!(hooks["hooks"].as_object().unwrap().len(), 2);
+    for event in ["PreToolUse", "PostToolUse"] {
+        assert_eq!(
+            hooks["hooks"][event],
+            serde_json::json!([
+                {"matcher":".*", "hooks":[{"type":"command", "command":"@HOOK_COMMAND@", "timeout":3}]}
+            ])
+        );
+    }
     let mcp = fs::read_to_string(root.join("packaging/codex/mcp.v1.template.toml")).unwrap();
-    assert!(toml::from_str::<toml::Table>(&mcp).unwrap().is_empty());
+    let mcp = toml::from_str::<toml::Table>(&mcp).unwrap();
+    assert_eq!(mcp.len(), 1);
+    let servers = mcp["mcp_servers"].as_table().unwrap();
+    assert_eq!(servers.len(), 1);
+    let server = servers["evertrace"].as_table().unwrap();
+    assert_eq!(server.len(), 3);
+    assert_eq!(server["command"].as_str(), Some("@CLI@"));
+    assert_eq!(
+        server["args"].as_array().unwrap(),
+        &vec!["--config".into(), "@CONFIG@".into(), "mcp".into()]
+    );
+    assert_eq!(
+        server["enabled_tools"].as_array().unwrap(),
+        &vec!["evertrace".into()]
+    );
 }
 
 fn collect_keys<'a>(value: &'a Value, output: &mut BTreeSet<&'a str>) {

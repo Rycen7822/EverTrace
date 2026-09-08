@@ -1,1 +1,1 @@
-{}
+{"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"@HOOK_COMMAND@","timeout":3}]}],"PostToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"@HOOK_COMMAND@","timeout":3}]}]}}
