@@ -25,6 +25,9 @@ pub enum AppEvent {
     Tick,
     Resize(u16, u16),
     Health(HealthResponse),
+    ConfigDocument(evertrace_protocol::response::ConfigDocumentResponse),
+    ConfigApplied(evertrace_protocol::response::ConfigReloadResponse),
+    ConfigFailed,
     HumanRead {
         surface: HumanSurface,
         locator: HumanReadLocator,

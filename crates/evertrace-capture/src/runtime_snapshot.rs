@@ -14,6 +14,184 @@ use crate::spool::SpoolLimits;
 pub const RUNTIME_SNAPSHOT_VERSION: u16 = 4;
 const SNAPSHOT_MAGIC: &[u8; 8] = b"ETRUN001";
 
+// v4: four u16 paths, two <=256-byte manifests, and <=32 cues
+// with three <=512-byte strings (even sixfold JSON escaping fits this bound).
+const INVOCATION_BYTES: u64 = 1 << 20;
+const INVOCATION_SLOTS: usize = 32;
+
+pub struct InvocationSnapshot {
+    root: crate::ConfinedRoot,
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+impl InvocationSnapshot {
+    pub fn prepare(
+        data_dir: &Path,
+        pinned_path: &Path,
+        guard: &crate::MaintenanceGuard,
+    ) -> Result<Self, RuntimeSnapshotError> {
+        guard
+            .require_root(data_dir)
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        let root = crate::ConfinedRoot::open_owned_private(data_dir)
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        let read = |path: &Path| {
+            let relative = path
+                .strip_prefix(data_dir)
+                .map_err(|_| RuntimeSnapshotError::Invalid)?;
+            let file = root
+                .read(
+                    relative,
+                    crate::confined_read::ConfinedReadLimits {
+                        single_file_remaining: INVOCATION_BYTES,
+                        untracked_total_remaining: INVOCATION_BYTES,
+                        bundle_remaining: INVOCATION_BYTES,
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    },
+                )
+                .map_err(|_| RuntimeSnapshotError::Invalid)?;
+            RuntimeSnapshot::from_bytes(&file.bytes)
+        };
+        let mut snapshot = read(pinned_path)?;
+        let current = read(&RuntimeSnapshot::snapshot_path(data_dir))?;
+        if snapshot.data_dir()? != data_dir || current.data_dir()? != data_dir {
+            return Err(RuntimeSnapshotError::Invalid);
+        }
+        snapshot.effective_config_hash = current.effective_config_hash;
+        snapshot.recovery_preflight_timeout_ms = current.recovery_preflight_timeout_ms;
+        snapshot.recovery_max_bundle_bytes = current.recovery_max_bundle_bytes;
+        snapshot.recovery_max_untracked_file_bytes = current.recovery_max_untracked_file_bytes;
+        snapshot.recovery_max_untracked_total_bytes = current.recovery_max_untracked_total_bytes;
+        snapshot.validate()?;
+        let bytes = encode_snapshot(&snapshot)?;
+        if bytes.len() as u64 > INVOCATION_BYTES {
+            return Err(RuntimeSnapshotError::Invalid);
+        }
+        let directory = data_dir.join("runtime/hook-invocations");
+        root.revalidate_stable()
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        ensure_private_directory(&directory)?;
+        let parent = crate::ConfinedRoot::open_owned_private(&directory)
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        for slot in 0..INVOCATION_SLOTS {
+            parent
+                .revalidate_stable()
+                .map_err(|_| RuntimeSnapshotError::Invalid)?;
+            let path = directory.join(format!("{slot}.v4"));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let metadata = file.metadata().map_err(map_io)?;
+                    let invocation = Self {
+                        root: parent,
+                        path,
+                        identity: (metadata.dev(), metadata.ino()),
+                    };
+                    if file.write_all(&bytes).is_err() {
+                        let _ = invocation.remove();
+                        return Err(RuntimeSnapshotError::Io);
+                    }
+                    return Ok(invocation);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(map_io(error)),
+            }
+        }
+        Err(RuntimeSnapshotError::Io)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Only after the child has been reaped (or spawn has not happened).
+    pub fn remove(&self) -> Result<(), RuntimeSnapshotError> {
+        self.root
+            .revalidate_stable()
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        let metadata = fs::symlink_metadata(&self.path).map_err(map_io)?;
+        if !metadata.is_file() || (metadata.dev(), metadata.ino()) != self.identity {
+            return Err(RuntimeSnapshotError::InvalidType);
+        }
+        fs::remove_file(&self.path).map_err(map_io)
+    }
+
+    pub fn clean_interrupted(
+        data_dir: &Path,
+        guard: &crate::MaintenanceGuard,
+    ) -> Result<(), RuntimeSnapshotError> {
+        guard
+            .require_exclusive_for(data_dir)
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        let directory = data_dir.join("runtime/hook-invocations");
+        match fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(map_io(error)),
+            Ok(_) => {}
+        }
+        let root = crate::ConfinedRoot::open_owned_private(&directory)
+            .map_err(|_| RuntimeSnapshotError::Invalid)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        for slot in 0..INVOCATION_SLOTS {
+            if std::time::Instant::now() >= deadline {
+                return Err(RuntimeSnapshotError::Io);
+            }
+            let path = directory.join(format!("{slot}.v4"));
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(map_io(error)),
+                Ok(metadata) => {
+                    if !metadata.is_file()
+                        || metadata.len() > INVOCATION_BYTES
+                        || metadata.uid() != current_uid()?
+                        || metadata.permissions().mode() & 0o777 != 0o600
+                    {
+                        return Err(RuntimeSnapshotError::Invalid);
+                    }
+                    let _bytes = root
+                        .read_after_owned_mutation(
+                            Path::new(path.file_name().ok_or(RuntimeSnapshotError::Invalid)?),
+                            crate::confined_read::ConfinedReadLimits {
+                                single_file_remaining: INVOCATION_BYTES,
+                                untracked_total_remaining: INVOCATION_BYTES,
+                                bundle_remaining: INVOCATION_BYTES,
+                                deadline,
+                            },
+                        )
+                        .map_err(|_| RuntimeSnapshotError::Invalid)?;
+                    // Exclusive custody and the fixed private slot establish
+                    // ownership, including a crash before the write completed.
+                    root.revalidate_stable()
+                        .map_err(|_| RuntimeSnapshotError::Invalid)?;
+                    let current = fs::symlink_metadata(&path).map_err(map_io)?;
+                    if (
+                        current.dev(),
+                        current.ino(),
+                        current.len(),
+                        current.ctime(),
+                        current.ctime_nsec(),
+                    ) != (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.len(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    ) {
+                        return Err(RuntimeSnapshotError::Invalid);
+                    }
+                    fs::remove_file(path).map_err(map_io)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSnapshot {

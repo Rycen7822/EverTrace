@@ -40,6 +40,8 @@ use evertrace_protocol::{
 };
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(2);
+// Covers the validated 120s Recovery ceiling plus bounded child setup/cleanup.
+const LAUNCHER_CHILD_TIMEOUT: Duration = Duration::from_secs(122);
 const RECOVERY_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
 const RECALL_CUE_CONTEXT: &[u8] = b"{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"EverTrace recall is due. Call evertrace with action=search and input=@due before continuing.\"}}";
 
@@ -86,6 +88,7 @@ fn read_input() -> Result<Vec<u8>, ()> {
 
 fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> Result<(), ()> {
     let snapshot = RuntimeSnapshot::load(snapshot_path).map_err(|_| ())?;
+    let mut runtime = CaptureRuntime::open_for_admission(snapshot.clone()).map_err(|_| ())?;
     let cue_session_id = input.session_id.clone();
     let cue_adapter_manifest_ref = input.adapter_manifest_ref.clone();
     let cue_host_lane_key = input
@@ -98,7 +101,6 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
     let socket = snapshot.recovery_socket_path.clone();
     let configured_timeout =
         Duration::from_millis(u64::from(snapshot.recovery_preflight_timeout_ms));
-    let mut runtime = CaptureRuntime::open_for_admission(snapshot.clone()).map_err(|_| ())?;
     let record = CaptureRecordInput {
         spool_record_id: input.spool_record_id,
         source_observation_id_hint: input.source_observation_id_hint,
@@ -331,6 +333,25 @@ fn binding_rewrite(snapshot_path: &Path, bytes: &[u8]) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
+struct InvocationChild {
+    child: Option<std::process::Child>,
+    snapshot: evertrace_capture::InvocationSnapshot,
+}
+
+impl Drop for InvocationChild {
+    fn drop(&mut self) {
+        let reaped = if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            child.wait().is_ok()
+        } else {
+            true
+        };
+        if reaped {
+            let _ = self.snapshot.remove();
+        }
+    }
+}
+
 fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
     let capture_input = CaptureHookInput::from_json(bytes).ok();
     let native_input = NativeToolUse::from_json(bytes).ok();
@@ -344,6 +365,30 @@ fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
     };
     let launcher = StableLauncher::open(root).map_err(|_| ())?;
     let generation = launcher.resolve_for_session(session_id).map_err(|_| ())?;
+    evertrace_capture::CasStore::open(root.join("cas")).map_err(|_| ())?;
+    let fence = evertrace_capture::MaintenanceFence::open(root).map_err(|_| ())?;
+    if let Ok(exclusive) = fence.exclusive() {
+        evertrace_capture::InvocationSnapshot::clean_interrupted(root, &exclusive)
+            .map_err(|_| ())?;
+    }
+    let guard = loop {
+        match fence.shared() {
+            Ok(guard) => break guard,
+            Err(evertrace_capture::CasError::LockBusy)
+                if started.elapsed() < Duration::from_secs(1) =>
+            {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(_) => return Err(()),
+        }
+    };
+    let invocation =
+        evertrace_capture::InvocationSnapshot::prepare(root, &generation.runtime_snapshot, &guard)
+            .map_err(|_| ())?;
+    let mut running = InvocationChild {
+        child: None,
+        snapshot: invocation,
+    };
     let normalized;
     let bytes = if !binding_mode && let Some(native) = native_input {
         normalized = CaptureHookInput::from_native(native, generation.generation)
@@ -354,24 +399,21 @@ fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
     } else {
         bytes
     };
-    let snapshot = RuntimeSnapshot::load(&generation.runtime_snapshot).map_err(|_| ())?;
-    let child_timeout = capture_input.as_ref().map_or(CHILD_TIMEOUT, |input| {
-        launcher_child_timeout(
-            recovery_candidate_matches(&snapshot, input),
-            snapshot.recovery_preflight_timeout_ms,
-        )
-    });
+    let child_timeout = LAUNCHER_CHILD_TIMEOUT;
     let deadline = started.checked_add(child_timeout).ok_or(())?;
     if Instant::now() >= deadline {
         return Err(());
     }
-    let mut child = Command::new(generation.executable)
+    // The launcher has not started its stdin writer thread yet. Only this
+    // spawn inherits the duplicate of the parent's shared flock description.
+    let inherited = guard.inherit_shared_for_spawn().map_err(|_| ())?;
+    let child = Command::new(generation.executable)
         .arg(if binding_mode {
             "--binding-runtime-snapshot"
         } else {
             "--runtime-snapshot"
         })
-        .arg(generation.runtime_snapshot)
+        .arg(running.snapshot.path())
         .stdin(Stdio::piped())
         .stdout(if binding_mode {
             Stdio::inherit()
@@ -381,11 +423,15 @@ fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| ())?;
+    drop(inherited);
+    running.child = Some(child);
+    let child = running.child.as_mut().ok_or(())?;
     let mut child_stdin = child.stdin.take().ok_or(())?;
     let input = bytes.to_vec();
     let writer = thread::spawn(move || child_stdin.write_all(&input));
     loop {
         if child.try_wait().map_err(|_| ())?.is_some() {
+            running.child = None;
             return writer.join().map_err(|_| ())?.map_err(|_| ());
         }
         if Instant::now() >= deadline {
@@ -413,14 +459,6 @@ fn recovery_candidate_matches(snapshot: &RuntimeSnapshot, input: &CaptureHookInp
     };
     classify_codex_pretool_candidate(&input.payload, &cwd).detection_status
         == DestructiveDetectionStatus::Matched
-}
-
-fn launcher_child_timeout(recovery_candidate: bool, configured_timeout_ms: u32) -> Duration {
-    if recovery_candidate {
-        Duration::from_millis(u64::from(configured_timeout_ms))
-    } else {
-        CHILD_TIMEOUT
-    }
 }
 
 fn recovery_barrier_budget(
@@ -500,11 +538,7 @@ mod budget_proof {
 
     #[test]
     fn launcher_and_barrier_budgets_are_bounded_without_sleeping() {
-        assert_eq!(launcher_child_timeout(false, 10_000), CHILD_TIMEOUT);
-        assert_eq!(
-            launcher_child_timeout(true, 10_000),
-            Duration::from_secs(10)
-        );
+        assert_eq!(LAUNCHER_CHILD_TIMEOUT, Duration::from_secs(122));
         assert_eq!(
             recovery_barrier_budget(
                 Duration::from_secs(10),

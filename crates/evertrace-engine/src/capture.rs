@@ -48,6 +48,48 @@ pub(crate) struct VerifiedCapture {
     pub surface: Option<EvidenceSurface>,
 }
 
+fn protected_presentation(
+    bytes: &[u8],
+    config: &evertrace_domain::config::CaptureConfig,
+) -> evertrace_domain::evidence::ProtectedPresentation {
+    use evertrace_domain::evidence::{ProtectedPresentation, ProtectedPresentationUnavailable};
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return ProtectedPresentation::Unavailable {
+            reason: ProtectedPresentationUnavailable::NonText,
+        };
+    };
+    if text
+        .chars()
+        .any(|value| value.is_control() && !matches!(value, '\n' | '\r' | '\t'))
+    {
+        return ProtectedPresentation::Unavailable {
+            reason: ProtectedPresentationUnavailable::NonText,
+        };
+    }
+    if bytes.len() as u64 <= u64::from(config.inline_payload_bytes) {
+        return ProtectedPresentation::Inline {
+            text: text.to_owned(),
+        };
+    }
+    let mut end = bytes.len().min(config.preview_bytes as usize);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    // Do not turn a complete redaction marker into apparently ordinary text.
+    for (start, _) in text.match_indices("[REDACTED]") {
+        if start >= end {
+            break;
+        }
+        if start + "[REDACTED]".len() > end {
+            end = start;
+            break;
+        }
+    }
+    ProtectedPresentation::Preview {
+        text: text[..end].to_owned(),
+    }
+}
+
 pub(crate) fn verify_capture_frame(
     frame: &SealedFrame,
     cas: &CasStore,
@@ -59,6 +101,15 @@ pub(crate) fn verify_capture_frame_bounded(
     frame: &SealedFrame,
     cas: &CasStore,
     remaining: &mut (u64, u64),
+) -> Result<VerifiedCapture, IngestError> {
+    verify_capture_frame_presented(frame, cas, remaining, None)
+}
+
+pub(crate) fn verify_capture_frame_presented(
+    frame: &SealedFrame,
+    cas: &CasStore,
+    remaining: &mut (u64, u64),
+    presentation: Option<&evertrace_domain::config::CaptureConfig>,
 ) -> Result<VerifiedCapture, IngestError> {
     let (body, observation_id) =
         decode_validated_record_body(&frame.record).map_err(|error| match error {
@@ -104,6 +155,8 @@ pub(crate) fn verify_capture_frame_bounded(
     )
     .map_err(|_| IngestError::InvalidRecord)?;
     let receipt = SourceReceipt {
+        protected_presentation: presentation
+            .map(|config| protected_presentation(&protected, config)),
         source_receipt_id: receipt_id,
         source_observation_id: observation_id,
         source_instance_id: body.source_instance_id.clone(),
@@ -2420,6 +2473,47 @@ fn map_reconcile_writer(error: WriterActorError) -> ReconcileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_presentation_is_bounded_utf8_and_never_partial_redaction() {
+        use evertrace_domain::evidence::{ProtectedPresentation, ProtectedPresentationUnavailable};
+        let config = evertrace_domain::config::CaptureConfig {
+            inline_payload_bytes: 1024,
+            preview_bytes: 256,
+        };
+        assert_eq!(
+            protected_presentation(b"small", &config),
+            ProtectedPresentation::Inline {
+                text: "small".into()
+            }
+        );
+        let text = format!("{}界{}", "a".repeat(255), "z".repeat(1024));
+        assert_eq!(
+            protected_presentation(text.as_bytes(), &config),
+            ProtectedPresentation::Preview {
+                text: "a".repeat(255)
+            }
+        );
+        let text = format!("{}[REDACTED]{}", "a".repeat(252), "z".repeat(1024));
+        assert_eq!(
+            protected_presentation(text.as_bytes(), &config),
+            ProtectedPresentation::Preview {
+                text: "a".repeat(252)
+            }
+        );
+        assert_eq!(
+            protected_presentation(&[0xff, 0], &config),
+            ProtectedPresentation::Unavailable {
+                reason: ProtectedPresentationUnavailable::NonText
+            }
+        );
+        assert_eq!(
+            protected_presentation(&vec![b'x'; 1024], &config),
+            ProtectedPresentation::Inline {
+                text: "x".repeat(1024)
+            }
+        );
+    }
 
     fn lifecycle(spawn_event_ref: &str) -> evertrace_domain::work::LaneLifecycleEvidence {
         evertrace_domain::work::LaneLifecycleEvidence {

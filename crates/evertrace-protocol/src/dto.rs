@@ -599,7 +599,44 @@ pub enum HumanSystemDetail {
     Config {
         config_version: u32,
         effective_config_hash: [u8; 32],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reload: Option<ConfigReloadAudit>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigReloadAudit {
+    pub previous_config_hash: [u8; 32],
+    pub outcome: ConfigReloadOutcome,
+    pub source: ConfigReloadSource,
+    pub actor: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReloadOutcome {
+    Prepared,
+    Applied,
+    Rejected,
+    RestartRequired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReloadSource {
+    Startup,
+    Watcher,
+    Cli,
+    Tui,
+}
+
+impl ConfigReloadAudit {
+    fn validate(&self) -> bool {
+        !self.actor.is_empty()
+            && self.actor.len() <= 128
+            && !self.actor.chars().any(char::is_control)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1285,8 +1322,21 @@ impl HumanSystemDetail {
                                         .all(|result| result.bytes_removed.is_some())))
                     })
             }
-            Self::Config { config_version, .. } => {
-                item.stable_key == "runtime:config:current" && *config_version > 0
+            Self::Config {
+                config_version,
+                reload,
+                ..
+            } => {
+                *config_version > 0
+                    && match item.stable_key.as_str() {
+                        "runtime:config:current" => reload.as_ref().is_none_or(|detail| {
+                            detail.outcome == ConfigReloadOutcome::Applied && detail.validate()
+                        }),
+                        "runtime:config:attempt" => {
+                            reload.as_ref().is_some_and(ConfigReloadAudit::validate)
+                        }
+                        _ => false,
+                    }
             }
         }
     }

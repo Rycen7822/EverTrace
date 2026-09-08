@@ -422,6 +422,13 @@ impl HostCanaryService {
         }
     }
 
+    /// Keep the shared probe/result identity while fixing this operation's config.
+    pub fn for_config(&self, config: &evertrace_domain::config::EffectiveConfig) -> Self {
+        let mut operation = self.clone();
+        operation.config_hash = config.hash();
+        operation
+    }
+
     /// Only the explicit disposable candidate daemon startup uses this mode.
     pub fn with_candidate(
         mut self,
@@ -1028,6 +1035,18 @@ pub fn publish_recovery_runtime(
     config: &evertrace_domain::config::EffectiveConfig,
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<evertrace_capture::RuntimeSnapshot, RecoveryError> {
+    let snapshot = prepare_recovery_runtime(data_dir, config, report)?;
+    snapshot
+        .publish(&evertrace_capture::RuntimeSnapshot::snapshot_path(data_dir))
+        .map_err(|_| RecoveryError::InvalidInput)?;
+    Ok(snapshot)
+}
+
+pub(crate) fn prepare_recovery_runtime(
+    data_dir: &std::path::Path,
+    config: &evertrace_domain::config::EffectiveConfig,
+    report: Option<&evertrace_codex::HostProbeReport>,
+) -> Result<evertrace_capture::RuntimeSnapshot, RecoveryError> {
     evertrace_capture::DeviceKeyStore::new(data_dir.join("keys"))
         .load_or_create()
         .map_err(|_| RecoveryError::Protection)?;
@@ -1076,9 +1095,6 @@ pub fn publish_recovery_runtime(
         },
     )
     .map_err(|_| RecoveryError::InvalidInput)?;
-    snapshot
-        .publish(&path)
-        .map_err(|_| RecoveryError::InvalidInput)?;
     Ok(snapshot)
 }
 

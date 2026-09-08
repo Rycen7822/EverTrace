@@ -26,7 +26,7 @@ mod cue;
 mod detector;
 mod validation;
 pub use cue::{RecallCueError, RecallCueOutcome, RecallCueService};
-pub use detector::{RecallDetectionAnchor, spawn_recall_worker};
+pub use detector::{RecallDetectionAnchor, spawn_recall_worker, spawn_recall_worker_with_config};
 pub(crate) use validation::{
     RecallNeedValidity, revalidate_need, terminal_need_event, validate_need_against_current,
 };

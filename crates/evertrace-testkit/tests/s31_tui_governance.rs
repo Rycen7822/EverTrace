@@ -205,6 +205,7 @@ fn source(
         &payload_fingerprint(1, b"reviewed evidence", None).unwrap(),
     );
     let receipt = SourceReceipt {
+        protected_presentation: None,
         source_receipt_id: receipt_id,
         source_observation_id: observation_id,
         source_instance_id: instance.clone(),
@@ -1044,6 +1045,7 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
             JournalPayload::ConfigAudit(ConfigAudit {
                 config_version: 1,
                 effective_config_hash: CONFIG,
+                reload: None,
             }),
         ),
         JournalEventDraft::runtime(
@@ -1152,6 +1154,7 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
         Some(HumanSystemDetail::Config {
             config_version: 1,
             effective_config_hash: CONFIG,
+            reload: None,
         })
     ));
     let job_detail = service

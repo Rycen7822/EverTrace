@@ -109,6 +109,12 @@ pub struct SessionCatalogService {
 }
 
 impl SessionCatalogService {
+    pub fn for_config(&self, config: &evertrace_domain::config::EffectiveConfig) -> Self {
+        let mut operation = self.clone();
+        operation.effective_config_hash = config.hash();
+        operation
+    }
+
     pub fn new(writer: WriterHandle, effective_config_hash: [u8; 32]) -> Self {
         Self {
             writer,
@@ -312,6 +318,12 @@ impl SessionCatalogService {
 }
 
 impl SessionImportAdminService {
+    pub fn for_config(&self, config: &evertrace_domain::config::EffectiveConfig) -> Self {
+        let mut operation = self.clone();
+        operation.effective_config_hash = config.hash();
+        operation
+    }
+
     pub const fn new(
         writer: WriterHandle,
         report: Arc<RwLock<Option<HostProbeReport>>>,

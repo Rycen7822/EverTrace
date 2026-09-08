@@ -1937,6 +1937,7 @@ struct ReducerState {
     jobs: BTreeMap<JobId, (DurableJob, u64)>,
     watermarks: BTreeMap<String, (WatermarkAdvanced, u64)>,
     config: Option<(JournalPayload, u64)>,
+    config_attempt: Option<(JournalPayload, u64)>,
     stale_audits: BTreeMap<String, (JournalPayload, u64)>,
     source_revisions: BTreeMap<String, (SourceRevisionRecorded, u64)>,
     source_receipts: BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
@@ -7507,7 +7508,12 @@ fn apply_event(
             state.watermarks.insert(key, (value, row.seq));
         }
         JournalPayload::ConfigAudit(value) => {
-            state.config = Some((JournalPayload::ConfigAudit(value), row.seq));
+            if value.is_applied() {
+                state.config = Some((JournalPayload::ConfigAudit(value.clone()), row.seq));
+            }
+            if value.reload.is_some() {
+                state.config_attempt = Some((JournalPayload::ConfigAudit(value), row.seq));
+            }
         }
         JournalPayload::StaleGenerationAudit(value) => {
             state.stale_audits.insert(
@@ -9405,10 +9411,20 @@ impl ReducerState {
                     .is_some()
             }
             JournalPayload::ConfigAudit(value) => {
-                require_row(row, ObjectRowClass::Runtime, "runtime:config:current")?;
-                self.config
-                    .replace((JournalPayload::ConfigAudit(value), row.source_event_seq))
-                    .is_some()
+                if row.row_id == "runtime:config:attempt" && value.reload.is_some() {
+                    require_row(row, ObjectRowClass::Runtime, "runtime:config:attempt")?;
+                    self.config_attempt
+                        .replace((JournalPayload::ConfigAudit(value), row.source_event_seq))
+                        .is_some()
+                } else {
+                    require_row(row, ObjectRowClass::Runtime, "runtime:config:current")?;
+                    if !value.is_applied() {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    self.config
+                        .replace((JournalPayload::ConfigAudit(value), row.source_event_seq))
+                        .is_some()
+                }
             }
             JournalPayload::StaleGenerationAudit(value) => {
                 let event_id = row
@@ -10018,6 +10034,14 @@ impl ReducerState {
         if let Some((payload, seq)) = self.config {
             rows.push(runtime_row(
                 "runtime:config:current".into(),
+                ObjectRowClass::Runtime,
+                &payload,
+                seq,
+            )?);
+        }
+        if let Some((payload, seq)) = self.config_attempt {
+            rows.push(runtime_row(
+                "runtime:config:attempt".into(),
                 ObjectRowClass::Runtime,
                 &payload,
                 seq,
@@ -13015,6 +13039,7 @@ mod tests {
             JournalPayload::ConfigAudit(crate::ConfigAudit {
                 config_version: 1,
                 effective_config_hash: [0; 32],
+                reload: None,
             })
             .canonical_json()
             .unwrap(),

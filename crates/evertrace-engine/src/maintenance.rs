@@ -1073,6 +1073,8 @@ pub struct BackgroundScheduler {
     backup_requests: Option<mpsc::Sender<QuiescedBackupRequest>>,
     gc_rounds: Arc<tokio::sync::Mutex<BTreeMap<JobId, evertrace_store::optimize::GcRound>>>,
     gc_cursor: Arc<tokio::sync::Mutex<Option<evertrace_capture::cas::CasGcCursor>>>,
+    config: Option<Arc<crate::ConfigReloadService>>,
+    import_settings: evertrace_domain::config::SessionImportConfig,
 }
 
 impl BackgroundScheduler {
@@ -1098,6 +1100,8 @@ impl BackgroundScheduler {
             backup_requests: None,
             gc_rounds: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             gc_cursor: Arc::new(tokio::sync::Mutex::new(None)),
+            config: None,
+            import_settings: evertrace_domain::config::SessionImportConfig::default(),
         }
     }
 
@@ -1106,7 +1110,35 @@ impl BackgroundScheduler {
         self
     }
 
+    pub fn with_config(mut self, config: Arc<crate::ConfigReloadService>) -> Self {
+        self.import = self.import.with_config(Arc::clone(&config));
+        self.config = Some(config);
+        self
+    }
+
     pub async fn run_once(&self) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let mut operation = self.clone();
+        if let Some(config) = &self.config {
+            let config = config
+                .admit_job()
+                .await
+                .map_err(|_| BackgroundSchedulerError::Writer)?;
+            operation.runtime =
+                crate::config_reload::operation_runtime(&self.runtime, &config.effective)
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
+            operation.synthesis = config.synthesis.clone();
+            operation.dreaming = config.effective.config().dreaming.clone();
+            operation.catalog = self.catalog.for_config(&config.effective);
+            operation.import_settings = config.effective.config().session_import.clone();
+            operation.import = self
+                .import
+                .for_config(Arc::clone(&config.effective))
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+        }
+        operation.run_once_inner().await
+    }
+
+    async fn run_once_inner(&self) -> Result<BackgroundProgress, BackgroundSchedulerError> {
         let capture_state = self
             .runtime
             .spool_limits()
@@ -1139,7 +1171,7 @@ impl BackgroundScheduler {
         let mut completed = 0;
         completed += self.run_gc_round().await?;
         let mut retryable = false;
-        if optional_allowed {
+        if optional_allowed && self.import_settings.historical_metadata_backfill {
             let report = Arc::clone(&self.report).read_owned().await;
             if let Some(report) = report.as_ref() {
                 match self.catalog.refresh(report).await {
@@ -1555,12 +1587,15 @@ impl BackgroundScheduler {
                 Err(error) => return Err(map_writer(error)),
             }
         }
+        let mut idle = SynthesisIdle::default();
+        idle.refresh(&snapshot)?;
+        let selection_time = now_us()?;
         let synthesis_candidates = if self.dreaming.max_llm_tasks_per_run == 0 {
             Vec::new()
         } else {
             self.synthesis
-                .durable_jobs(
-                    &snapshot,
+                .durable_jobs_for_episodes(
+                    idle.ready_episodes(&self.dreaming, selection_time),
                     self.runtime.effective_config_hash,
                     &covered,
                     PER_LANE_LIMIT,
@@ -1599,7 +1634,13 @@ impl BackgroundScheduler {
                 Err(error) => return Err(map_writer(error)),
             }
         }
-        let selected = select_jobs(&view, capture_state)?;
+        let selected = idle.select(
+            &snapshot,
+            &view,
+            capture_state,
+            &self.dreaming,
+            selection_time,
+        )?;
         let paused_optional_pending = view.jobs.iter().any(|job| {
             matches!(job.state, JobStatus::Queued | JobStatus::Leased)
                 && matches!(
@@ -1771,7 +1812,10 @@ impl BackgroundScheduler {
                     retryable = true;
                     break;
                 };
-                let Some(claimed) = self.claim_job(&selected_job.job).await? else {
+                let Some(claimed) = self
+                    .claim_job_with_idle(&selected_job.job, Some(&mut idle))
+                    .await?
+                else {
                     retryable = true;
                     continue;
                 };
@@ -2119,7 +2163,30 @@ impl BackgroundScheduler {
                 Duration::from_micros(u64::try_from(deadline.saturating_sub(now)).unwrap_or(0))
             })
             .min();
-        let mut delay = Duration::from_secs(self.dreaming.integrity_sweep_interval.seconds());
+        let dreaming = if let Some(config) = &self.config {
+            config
+                .admit()
+                .await
+                .map_err(|_| BackgroundSchedulerError::Writer)?
+                .config()
+                .dreaming
+                .clone()
+        } else {
+            self.dreaming.clone()
+        };
+        let mut delay = Duration::from_secs(dreaming.integrity_sweep_interval.seconds());
+        let mut idle = SynthesisIdle::default();
+        idle.refresh(&snapshot)?;
+        if let Some(idle_delay) = idle
+            .episodes
+            .values()
+            .filter(|episode| crate::jobs::synthesis::synthesis_trigger(episode).is_some())
+            .filter_map(|episode| idle.delay(episode, &dreaming, now))
+            .filter(|delay| !delay.is_zero())
+            .min()
+        {
+            delay = delay.min(idle_delay);
+        }
         if retryable {
             delay = delay.min(RETRY_DELAY);
         }
@@ -2400,6 +2467,26 @@ impl BackgroundScheduler {
         &self,
         selected: &DurableJob,
     ) -> Result<Option<ClaimedJob>, BackgroundSchedulerError> {
+        self.claim_job_with_idle(selected, None).await
+    }
+
+    async fn claim_job_with_idle(
+        &self,
+        selected: &DurableJob,
+        idle: Option<&mut SynthesisIdle>,
+    ) -> Result<Option<ClaimedJob>, BackgroundSchedulerError> {
+        if let Some(config) = &self.config {
+            let claimed = config
+                .admit_job()
+                .await
+                .map_err(|_| BackgroundSchedulerError::Writer)?;
+            if claimed.effective.hash() != self.runtime.effective_config_hash {
+                // Reselect under the next tick's snapshot, rather than combine
+                // a new claim with the old tick's prepared planner. Once this
+                // check succeeds, this operation owns that planner until done.
+                return Ok(None);
+            }
+        }
         let report = if is_capture_job(selected) {
             Some(Arc::clone(&self.report).read_owned().await)
         } else {
@@ -2453,6 +2540,14 @@ impl BackgroundScheduler {
                 Err(error) => return Err(map_writer(error)),
             }
             return Ok(None);
+        }
+        if current.kind == "semantic_synthesis_v1" {
+            let mut fresh = SynthesisIdle::default();
+            let idle = idle.unwrap_or(&mut fresh);
+            idle.refresh(&snapshot)?;
+            if !idle.job_ready(current, &self.dreaming, now_us()?) {
+                return Ok(None);
+            }
         }
         if let Some(report) = report.as_ref() {
             let observation_id = SourceObservationId::from_str(&current.target_revision)
@@ -2813,6 +2908,319 @@ fn support_context(
     Ok((contract.clone(), current.clone()))
 }
 
+// One scheduling round only. Fresh claims still scan projection metadata, but
+// lease/audit writes do not decode the same receipts again. No bodies retained.
+#[derive(Default)]
+struct SynthesisIdle {
+    receipts: BTreeMap<String, (u64, Option<String>, Option<String>)>,
+    attribution_rows: BTreeMap<String, u64>,
+    episode_rows: BTreeMap<String, u64>,
+    scoped: BTreeMap<
+        (
+            Option<evertrace_domain::ids::RepositoryId>,
+            Option<evertrace_domain::ids::WorktreeId>,
+        ),
+        i64,
+    >,
+    repositories: BTreeMap<evertrace_domain::ids::RepositoryId, i64>,
+    worktrees: BTreeMap<evertrace_domain::ids::WorktreeId, i64>,
+    local: BTreeMap<evertrace_domain::ids::WorkEpisodeId, i64>,
+    observations: BTreeMap<
+        evertrace_domain::ids::SourceObservationId,
+        std::collections::BTreeSet<evertrace_domain::ids::WorkEpisodeId>,
+    >,
+    episodes: BTreeMap<evertrace_domain::ids::WorkEpisodeId, evertrace_domain::work::WorkEpisode>,
+    #[cfg(test)]
+    decoded_receipts: usize,
+}
+
+impl SynthesisIdle {
+    fn refresh(
+        &mut self,
+        snapshot: &evertrace_store::ProjectionSnapshot,
+    ) -> Result<(), BackgroundSchedulerError> {
+        let attribution_rows = snapshot
+            .data_rows()
+            .filter(|row| {
+                matches!(
+                    row.object_kind.as_deref(),
+                    Some("operation" | "work_binding")
+                )
+            })
+            .map(|row| (row.row_id.clone(), row.source_event_seq))
+            .collect::<BTreeMap<_, _>>();
+        let episode_rows = snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("work_episode"))
+            .map(|row| (row.row_id.clone(), row.source_event_seq))
+            .collect::<BTreeMap<_, _>>();
+        let mut episode_attribution_changed = false;
+        if episode_rows != self.episode_rows {
+            let episodes = crate::jobs::synthesis::current_synthesis_episodes(snapshot)
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            episode_attribution_changed = episodes.len() != self.episodes.len()
+                || episodes.iter().any(|(id, episode)| {
+                    self.episodes.get(id).is_none_or(|old| {
+                        (old.task_id, old.workstream_id) != (episode.task_id, episode.workstream_id)
+                    })
+                });
+            self.episodes = episodes;
+            self.episode_rows = episode_rows;
+        }
+        let receipt_rows = snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+            .map(|row| {
+                (
+                    row.row_id.clone(),
+                    (
+                        row.source_event_seq,
+                        row.repository_id.clone(),
+                        row.worktree_id.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut rebuild = self
+            .receipts
+            .iter()
+            .any(|(id, seq)| receipt_rows.get(id) != Some(seq));
+        if episode_attribution_changed || attribution_rows != self.attribution_rows {
+            let mut observations = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+            let bindings = evertrace_store::WorkBindingCurrentView::from_snapshot(snapshot)
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let mut operations = BTreeMap::new();
+            for row in snapshot
+                .data_rows()
+                .filter(|row| row.object_kind.as_deref() == Some("operation"))
+            {
+                let JournalPayload::OperationDerived(operation) = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(BackgroundSchedulerError::Store)?,
+                )
+                .map_err(|_| BackgroundSchedulerError::Store)?
+                else {
+                    return Err(BackgroundSchedulerError::Store);
+                };
+                operation
+                    .validate()
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
+                let existing = operations
+                    .entry(operation.operation_id)
+                    .or_insert_with(|| operation.clone());
+                if existing.operation_revision < operation.operation_revision {
+                    *existing = operation;
+                }
+            }
+            for (id, binding) in bindings.bindings {
+                if binding.assignment_status != evertrace_domain::work::AssignmentStatus::Resolved {
+                    continue;
+                }
+                let Some(episode) = binding
+                    .primary_binding
+                    .episode_id
+                    .and_then(|id| self.episodes.get(&id))
+                else {
+                    continue;
+                };
+                if binding.primary_binding.task_id != Some(episode.task_id)
+                    || binding.primary_binding.workstream_id != Some(episode.workstream_id)
+                {
+                    continue;
+                }
+                let Some(operation) = operations.get(&id) else {
+                    continue;
+                };
+                for observation in operation
+                    .input_source_observation_refs
+                    .iter()
+                    .chain(&operation.result_source_observation_refs)
+                {
+                    observations
+                        .entry(*observation)
+                        .or_default()
+                        .insert(episode.episode_id);
+                }
+            }
+            rebuild |= observations != self.observations;
+            self.observations = observations;
+            self.attribution_rows = attribution_rows;
+        }
+        if rebuild {
+            self.receipts.clear();
+            self.scoped.clear();
+            self.repositories.clear();
+            self.worktrees.clear();
+            self.local.clear();
+        }
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+        {
+            let stamp = (
+                row.source_event_seq,
+                row.repository_id.clone(),
+                row.worktree_id.clone(),
+            );
+            if self.receipts.get(&row.row_id) == Some(&stamp) {
+                continue;
+            }
+            let JournalPayload::SourceReceiptRecorded(receipt) = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(BackgroundSchedulerError::Store)?,
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?
+            else {
+                return Err(BackgroundSchedulerError::Store);
+            };
+            receipt
+                .validate()
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            #[cfg(test)]
+            {
+                self.decoded_receipts += 1;
+            }
+            self.record(
+                (receipt.repository_instance_id, receipt.worktree_instance_id),
+                receipt.source_observation_id,
+                receipt.recorded_at_us,
+            );
+            self.receipts.insert(row.row_id.clone(), stamp);
+        }
+        Ok(())
+    }
+
+    fn record(
+        &mut self,
+        scope: (
+            Option<evertrace_domain::ids::RepositoryId>,
+            Option<evertrace_domain::ids::WorktreeId>,
+        ),
+        observation: evertrace_domain::ids::SourceObservationId,
+        recorded_at_us: i64,
+    ) {
+        if scope != (None, None) {
+            self.scoped
+                .entry(scope)
+                .and_modify(|time| *time = (*time).max(recorded_at_us))
+                .or_insert(recorded_at_us);
+        }
+        if let Some(repository) = scope.0 {
+            self.repositories
+                .entry(repository)
+                .and_modify(|time| *time = (*time).max(recorded_at_us))
+                .or_insert(recorded_at_us);
+        }
+        if let Some(worktree) = scope.1 {
+            self.worktrees
+                .entry(worktree)
+                .and_modify(|time| *time = (*time).max(recorded_at_us))
+                .or_insert(recorded_at_us);
+        }
+        if let Some(episodes) = self.observations.get(&observation) {
+            for episode in episodes {
+                self.local
+                    .entry(*episode)
+                    .and_modify(|time| *time = (*time).max(recorded_at_us))
+                    .or_insert(recorded_at_us);
+            }
+        }
+    }
+
+    fn delay(
+        &self,
+        episode: &evertrace_domain::work::WorkEpisode,
+        config: &evertrace_domain::config::DreamingConfig,
+        now: i64,
+    ) -> Option<Duration> {
+        if !config.idle_enabled {
+            return None;
+        }
+        let scope_time = match (episode.repository_instance_id, episode.worktree_instance_id) {
+            (Some(repo), Some(tree)) => [
+                (Some(repo), None),
+                (Some(repo), Some(tree)),
+                (None, Some(tree)),
+            ]
+            .iter()
+            .filter_map(|key| self.scoped.get(key).copied())
+            .max(),
+            (Some(repo), None) => self.repositories.get(&repo).copied(),
+            (None, Some(tree)) => self.worktrees.get(&tree).copied(),
+            (None, None) => None,
+        };
+        let last = scope_time
+            .into_iter()
+            .chain(self.local.get(&episode.episode_id).copied())
+            .max()?;
+        let idle_us = i64::try_from(config.idle_after.seconds().saturating_mul(1_000_000)).ok()?;
+        Some(Duration::from_micros(
+            last.saturating_add(idle_us).saturating_sub(now).max(0) as u64,
+        ))
+    }
+
+    fn job_ready(
+        &self,
+        job: &DurableJob,
+        config: &evertrace_domain::config::DreamingConfig,
+        now: i64,
+    ) -> bool {
+        self.episodes
+            .values()
+            .find(|episode| episode.revision_id.to_string() == job.target_revision)
+            .and_then(|episode| self.delay(episode, config, now))
+            .is_some_and(|delay| delay.is_zero())
+    }
+
+    fn ready_episodes<'a>(
+        &'a self,
+        config: &'a evertrace_domain::config::DreamingConfig,
+        now: i64,
+    ) -> impl Iterator<Item = evertrace_domain::work::WorkEpisode> + 'a {
+        self.episodes
+            .values()
+            .filter(move |episode| {
+                self.delay(episode, config, now)
+                    .is_some_and(|delay| delay.is_zero())
+            })
+            .cloned()
+    }
+
+    fn select(
+        &self,
+        snapshot: &evertrace_store::ProjectionSnapshot,
+        view: &RuntimeSchedulerView,
+        capture: CaptureAdmissionState,
+        config: &evertrace_domain::config::DreamingConfig,
+        now: i64,
+    ) -> Result<Vec<ScheduledJob>, BackgroundSchedulerError> {
+        let mut selectable = view.clone();
+        selectable.jobs.clear();
+        for job in &view.jobs {
+            let target_present = self.episodes.values().any(|episode| {
+                episode.revision_id.to_string() == job.target_revision
+                    && episode.revision_generation == job.target_generation
+                    && episode.source_watermark == job.target_watermark
+            });
+            // Missing/superseded metadata is only a hint: use the original
+            // verifier before admitting terminal cleanup, never infer readiness
+            // from a missing clock. Current busy targets consume no lane slot.
+            if job.kind != "semantic_synthesis_v1"
+                || self.job_ready(job, config, now)
+                || (config.idle_enabled
+                    && !target_present
+                    && !job_target_is_current(snapshot, view, job, job.config_hash)
+                        .map_err(|_| BackgroundSchedulerError::Store)?)
+            {
+                selectable.jobs.push(job.clone());
+            }
+        }
+        select_jobs(&selectable, capture)
+    }
+}
+
 fn now_us() -> Result<i64, BackgroundSchedulerError> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2824,5 +3232,337 @@ fn map_writer(error: WriterActorError) -> BackgroundSchedulerError {
     match error {
         WriterActorError::Stopped => BackgroundSchedulerError::Writer,
         _ => BackgroundSchedulerError::Store,
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use evertrace_domain::{ids::*, revision::RevisionId, work::*};
+
+    fn episode() -> WorkEpisode {
+        let stream = Workstream {
+            workstream_id: WorkstreamId::new_v7(),
+            revision_id: RevisionId::new_v7(),
+            predecessor_revision_id: None,
+            task_id: TaskId::new_v7(),
+            repository_instance_id: None,
+            worktree_instance_ids: vec![],
+            active_worktree_instance_id: None,
+            worktree_lineage_refs: vec![],
+            parent_workstream_id: None,
+            dependency_workstream_ids: vec![],
+            status: WorkstreamStatus::Active,
+            root_goal: "quiet target".into(),
+            workstream_goal: "quiet target".into(),
+            target_family: "test".into(),
+            hypothesis_or_failure_family: "test".into(),
+            acceptance_boundary: "bounded selection".into(),
+            phase_contract: PhaseContract {
+                local_goal: "test".into(),
+                phase_kind: PhaseKind::Analyze,
+                phase_label: "test".into(),
+                primary_targets: vec!["test".into()],
+                entry_conditions: vec!["test".into()],
+                acceptance_boundary: "test".into(),
+                expected_state_transition: "test".into(),
+            },
+            active_episode_id: None,
+            execution_lane_ids: vec![],
+            source_watermark: 0,
+        };
+        let mut episode = crate::work::new_episode(&stream, None, 9).unwrap();
+        episode.pending_delta_stats.selected_token_count = 1024;
+        episode
+    }
+
+    fn row(kind: &str, id: String, payload: JournalPayload) -> evertrace_store::ObjectRow {
+        let mut row = evertrace_store::ObjectRow::checkpoint(9, 1);
+        row.row_id = id;
+        row.row_kind = evertrace_store::ObjectRowKind::Data;
+        row.object_kind = Some(kind.into());
+        row.payload_json = Some(payload.canonical_json().unwrap());
+        row
+    }
+
+    #[test]
+    fn scoped_idle_filters_before_both_limits_and_rechecks_activity() {
+        let mut idle = SynthesisIdle::default();
+        let config = evertrace_domain::config::DreamingConfig {
+            idle_after: evertrace_domain::config::DurationValue::from_seconds(1).unwrap(),
+            ..Default::default()
+        };
+        let now = 10_000_000;
+        let observation = SourceObservationId::from_digest([1; 32]);
+        let active_repo = RepositoryId::new_v7();
+        for _ in 0..9 {
+            let mut episode = episode();
+            episode.repository_instance_id = Some(active_repo);
+            idle.episodes.insert(episode.episode_id, episode);
+        }
+        let mut quiet = episode();
+        quiet.source_watermark = 100;
+        quiet.repository_instance_id = Some(RepositoryId::new_v7());
+        idle.episodes.insert(quiet.episode_id, quiet.clone());
+        idle.record((Some(active_repo), None), observation, now);
+        idle.record((quiet.repository_instance_id, None), observation, 1);
+        let planner = crate::SynthesisPlanner::new(evertrace_domain::config::LlmConfig::default());
+        let planned = planner
+            .durable_jobs_for_episodes(
+                idle.ready_episodes(&config, now),
+                [1; 32],
+                &Default::default(),
+                8,
+                Duration::from_secs(600),
+            )
+            .unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].target_revision, quiet.revision_id.to_string());
+        let mut all = planner
+            .durable_jobs_for_episodes(
+                idle.episodes.values().cloned(),
+                [1; 32],
+                &Default::default(),
+                32,
+                Duration::from_secs(600),
+            )
+            .unwrap();
+        for job in &mut all {
+            job.priority = if job.target_revision == quiet.revision_id.to_string() {
+                100
+            } else {
+                0
+            };
+        }
+        let view = RuntimeSchedulerView {
+            frontier: 9,
+            jobs: all,
+            dirty: vec![],
+            outbox: vec![],
+        };
+        assert_eq!(
+            idle.select(
+                &evertrace_store::ProjectionSnapshot {
+                    frontier: 100,
+                    rows: vec![]
+                },
+                &view,
+                CaptureAdmissionState::Normal,
+                &config,
+                now
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let mut stale_view = view.clone();
+        let mut stale = planned[0].clone();
+        stale.job_id = JobId::new_v7();
+        stale.target_revision = RevisionId::new_v7().to_string();
+        stale.idempotency_key = format!("semantic_synthesis:{}:0:100", stale.target_revision);
+        stale_view.jobs.push(stale.clone());
+        let selected = idle
+            .select(
+                &evertrace_store::ProjectionSnapshot {
+                    frontier: 100,
+                    rows: vec![],
+                },
+                &stale_view,
+                CaptureAdmissionState::Normal,
+                &config,
+                now,
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.job.job_id == stale.job_id)
+        );
+        // Activity observed at fresh claim makes the formerly selected target busy.
+        idle.record((quiet.repository_instance_id, None), observation, now);
+        assert!(!idle.job_ready(&planned[0], &config, now));
+        let tree_a = WorktreeId::new_v7();
+        let tree_b = WorktreeId::new_v7();
+        quiet.worktree_instance_id = Some(tree_a);
+        idle.scoped.remove(&(quiet.repository_instance_id, None));
+        idle.record((quiet.repository_instance_id, Some(tree_a)), observation, 1);
+        idle.record(
+            (quiet.repository_instance_id, Some(tree_b)),
+            observation,
+            now,
+        );
+        assert!(idle.delay(&quiet, &config, now).unwrap().is_zero());
+        quiet.worktree_instance_id = None;
+        assert!(!idle.delay(&quiet, &config, now).unwrap().is_zero());
+        quiet.worktree_instance_id = Some(tree_a);
+        idle.record((quiet.repository_instance_id, None), observation, now);
+        assert!(!idle.delay(&quiet, &config, now).unwrap().is_zero());
+        quiet.repository_instance_id = None;
+        quiet.worktree_instance_id = None;
+        assert!(idle.delay(&quiet, &config, now).is_none());
+    }
+
+    #[test]
+    fn local_binding_and_receipt_metadata_survive_unrelated_frontiers() {
+        use evertrace_domain::evidence::*;
+        let source = SourceInstanceId::parse("idle-test").unwrap();
+        let revision = SourceRevision::parse("one").unwrap();
+        let identity = SourceRecordIdentity::parse("one").unwrap();
+        let receipt = SourceReceipt {
+            source_receipt_id: source_receipt_id(&source, &revision, &identity).unwrap(),
+            source_observation_id: source_observation_id(&source, &revision, &identity).unwrap(),
+            source_instance_id: source,
+            source_revision: revision,
+            source_record_identity: identity,
+            source_kind: EvidenceSourceKind::CodexHook,
+            identity_domain: "idle-test".into(),
+            source_ref: "source:idle".into(),
+            source_session_ref: "session:idle".into(),
+            identity_strength: IdentityStrength::SynthesizedBestEffort,
+            source_sequence: 0,
+            source_sequence_origin: Some(0),
+            task_id: None,
+            repository_instance_id: None,
+            worktree_instance_id: None,
+            source_byte_range: None,
+            spool_byte_range: EvidenceByteRange { start: 0, end: 1 },
+            source_revision_mode: SourceRevisionMode::Append,
+            previous_source_revision: None,
+            close_watermark: None,
+            observation_role: ObservationRole::Intent,
+            unsupported_record_classification: None,
+            capture_completeness: CaptureCompleteness::Partial,
+            archive_mode: SourceArchiveMode::Exact,
+            cas_ref: "ab".repeat(32),
+            protected_length: 1,
+            original_length: 1,
+            protected_presentation: None,
+            protected_secret_digest: None,
+            redaction_spans: vec![],
+            adapter_revision: 1,
+            adapter_manifest_ref: "manifest:idle".into(),
+            eligible_event_manifest_ref: "events:idle".into(),
+            parser_revision: 1,
+            canonicalization_revision: 1,
+            detector_revision: 1,
+            redaction_revision: 1,
+            protection_key_generation: 1,
+            event_time_us: 0,
+            recorded_at_us: 1,
+            lifecycle: None,
+        };
+        receipt.validate().unwrap();
+        let episode = episode();
+        let observation = receipt.source_observation_id;
+        let operation_id = OperationId::new_v7();
+        let operation = Operation {
+            operation_id,
+            host_occurrence_id: HostOccurrenceId::from_digest([2; 32]),
+            execution_lane_id: None,
+            operation_kind: OperationKind::Observe,
+            input_source_observation_refs: vec![observation],
+            result_source_observation_refs: vec![],
+            pairing_state: PairingState::UnmatchedIntent,
+            scope_effect_ids: vec![],
+            artifact_refs: vec![],
+            operation_resolver_version: 1,
+            operation_revision: 1,
+            previous_operation_revision: None,
+        };
+        let binding = WorkBindingRevision {
+            work_binding_revision_id: WorkBindingRevisionId::new_v7(),
+            operation_id,
+            revision_generation: 1,
+            predecessor_revision_id: None,
+            primary_binding: PrimaryWorkBinding {
+                task_id: Some(episode.task_id),
+                workstream_id: Some(episode.workstream_id),
+                episode_id: Some(episode.episode_id),
+                ..Default::default()
+            },
+            secondary_bindings: vec![],
+            scope_effect_refs: vec![],
+            assignment_status: AssignmentStatus::Resolved,
+            evidence_refs: vec![observation.to_string()],
+            resolver_version: 1,
+        };
+        let mut snapshot = evertrace_store::ProjectionSnapshot {
+            frontier: 9,
+            rows: vec![
+                row(
+                    "work_episode",
+                    episode.revision_id.to_string(),
+                    JournalPayload::WorkEpisodeRecorded(Box::new(episode.clone())),
+                ),
+                row(
+                    "operation",
+                    operation_id.to_string(),
+                    JournalPayload::OperationDerived(Box::new(operation)),
+                ),
+                row(
+                    "work_binding",
+                    format!(
+                        "object:work:work_binding:{}",
+                        binding.work_binding_revision_id
+                    ),
+                    JournalPayload::WorkBindingRecorded(Box::new(binding)),
+                ),
+            ],
+        };
+        let mut idle = SynthesisIdle::default();
+        snapshot.rows.push(row(
+            "source_receipt",
+            "receipt".into(),
+            JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+        ));
+        idle.refresh(&snapshot).unwrap();
+        let config = evertrace_domain::config::DreamingConfig::default();
+        assert!(
+            idle.delay(&episode, &config, 2_000_000_000)
+                .unwrap()
+                .is_zero()
+        );
+        // An unrelated observation has no global unknown-scope bucket.
+        idle.record(
+            (None, None),
+            SourceObservationId::from_digest([3; 32]),
+            i64::MAX,
+        );
+        assert!(
+            idle.delay(&episode, &config, 2_000_000_000)
+                .unwrap()
+                .is_zero()
+        );
+        // Deliberately unreadable cached payload proves subsequent claims only
+        // inspect unchanged metadata. A new source event must be decoded.
+        snapshot.rows.last_mut().unwrap().payload_json = Some("invalid".into());
+        for frontier in 10..13 {
+            snapshot.frontier = frontier;
+            idle.refresh(&snapshot).unwrap();
+        }
+        assert_eq!(idle.decoded_receipts, 1);
+        let mut future = receipt.clone();
+        future.event_time_us = i64::MAX;
+        snapshot.rows.last_mut().unwrap().payload_json = Some(
+            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(future)))
+                .unwrap(),
+        );
+        snapshot.rows.last_mut().unwrap().source_event_seq = 13;
+        assert!(idle.refresh(&snapshot).is_err());
+        let mut fresh = receipt;
+        fresh.recorded_at_us = 2_000_000_000;
+        snapshot.rows.last_mut().unwrap().payload_json = Some(
+            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(fresh))).unwrap(),
+        );
+        snapshot.rows.last_mut().unwrap().source_event_seq = 14;
+        idle.refresh(&snapshot).unwrap();
+        assert_eq!(idle.decoded_receipts, 2);
+        assert!(
+            !idle
+                .delay(&episode, &config, 2_000_000_000)
+                .unwrap()
+                .is_zero()
+        );
     }
 }

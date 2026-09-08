@@ -20,6 +20,9 @@ pub struct CommandEnvelope {
 #[serde(rename_all = "snake_case")]
 pub enum Command {
     Health,
+    ConfigReload,
+    ConfigRead,
+    ConfigWrite(ConfigWriteCommand),
     RunHostCanary(RunHostCanaryCommand),
     RecoveryBarrier(RecoveryBarrierLocator),
     RequestRecovery(RequestRecoveryCommand),
@@ -28,6 +31,13 @@ pub enum Command {
     RecallCue(RecallCueCommand),
     SessionImportAdmin(SessionImportAdminCommand),
     HumanGovernance(HumanGovernanceRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigWriteCommand {
+    pub source: String,
+    pub expected_file_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

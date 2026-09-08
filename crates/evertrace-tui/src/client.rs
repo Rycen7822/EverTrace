@@ -22,6 +22,8 @@ pub(crate) enum ClientCommand {
     Refresh(HumanSurface),
     Human(HumanGovernanceRequest),
     Recovery(RequestRecoveryCommand),
+    ConfigRead,
+    ConfigWrite(evertrace_protocol::command::ConfigWriteCommand),
     Shutdown,
 }
 
@@ -31,6 +33,8 @@ enum PendingKind {
     HumanRead(HumanSurface, HumanReadLocator),
     HumanAction,
     Recovery,
+    ConfigRead,
+    ConfigWrite,
 }
 
 async fn send_recovery(
@@ -308,9 +312,15 @@ pub(crate) async fn run(
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
             let response_deadline = pending
                 .values()
-                .map(|(started, _)| *started)
+                .map(|(started, kind)| {
+                    *started
+                        + if matches!(kind, PendingKind::ConfigWrite) {
+                            Duration::from_secs(10)
+                        } else {
+                            RESPONSE_DEADLINE
+                        }
+                })
                 .min()
-                .map(|started| started + RESPONSE_DEADLINE)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
             tokio::select! {
                 command = commands.recv() => {
@@ -344,6 +354,19 @@ pub(crate) async fn run(
                                 break;
                             }
                         }
+                        Some(config @ (ClientCommand::ConfigRead | ClientCommand::ConfigWrite(_))) => {
+                            if pending.len() >= MAX_PENDING || pending.values().any(|(_, kind)| matches!(kind, PendingKind::ConfigRead | PendingKind::ConfigWrite)) {
+                                let _ = events.send(AppEvent::ConfigFailed).await;
+                                continue;
+                            }
+                            let (command, kind) = match config {
+                                ClientCommand::ConfigWrite(write) => (Command::ConfigWrite(write), PendingKind::ConfigWrite),
+                                _ => (Command::ConfigRead, PendingKind::ConfigRead),
+                            };
+                            let request_id = RequestId::new_v7();
+                            if outgoing.send(CommandEnvelope { request_id, command }).await.is_err() { break; }
+                            pending.insert(request_id, (Instant::now(), kind));
+                        }
                         Some(ClientCommand::Shutdown) | None => {
                             shutdown_requested = true;
                             break;
@@ -359,6 +382,18 @@ pub(crate) async fn run(
                                 pending_visible = !pending.is_empty();
                             }
                             let accepted = match (kind, envelope.response) {
+                                (PendingKind::ConfigRead, Response::ConfigDocument(document)) if document.source.len() <= 128 * 1024 && document.file_hash.len() == 64 && document.file_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+                                    let _ = events.send(AppEvent::ConfigDocument(document)).await;
+                                    true
+                                }
+                                (PendingKind::ConfigWrite, Response::ConfigReload(result)) => {
+                                    let event = match result.outcome {
+                                        evertrace_protocol::dto::ConfigReloadOutcome::Applied | evertrace_protocol::dto::ConfigReloadOutcome::RestartRequired => AppEvent::ConfigApplied(result),
+                                        _ => AppEvent::ConfigFailed,
+                                    };
+                                    let _ = events.send(event).await;
+                                    true
+                                }
                                 (PendingKind::Health, Response::Health(health)) if health.validate() => {
                                     healthy = true;
                                     backoff = 0;
@@ -391,7 +426,11 @@ pub(crate) async fn run(
                                 break;
                             }
                         }
-                        Some(Ok(LocalIncoming::Error(_))) => break,
+                        Some(Ok(LocalIncoming::Error(error))) => {
+                            if error.request_id.and_then(|id| pending.remove(&id)).is_some_and(|(_, kind)| matches!(kind, PendingKind::ConfigRead | PendingKind::ConfigWrite)) {
+                                let _ = events.send(AppEvent::ConfigFailed).await;
+                            } else { break; }
+                        }
                         Some(Ok(LocalIncoming::Notification(notification))) => {
                             let _ = events.send(AppEvent::Notification(notification)).await;
                         }
@@ -445,6 +484,9 @@ async fn wait_or_shutdown(
                 Some(ClientCommand::Human(HumanGovernanceRequest::Read { .. })) => continue,
                 Some(ClientCommand::Recovery(_)) => {
                     let _ = events.send(AppEvent::Disconnected).await;
+                }
+                Some(ClientCommand::ConfigRead | ClientCommand::ConfigWrite(_)) => {
+                    let _ = events.send(AppEvent::ConfigFailed).await;
                 }
                 Some(ClientCommand::Shutdown) | None => return true,
             },

@@ -14,6 +14,7 @@ pub fn command(k: KeyEvent) -> UiCommand {
         KeyCode::Char('o') => UiCommand::OpenRelated,
         KeyCode::Char('g') => UiCommand::OpenFutureOperationShell,
         KeyCode::Char('E') => UiCommand::OpenProposalEditor,
+        KeyCode::Char('C') => UiCommand::OpenConfigEditor,
         KeyCode::Char('R') => {
             UiCommand::PrepareProposal(evertrace_protocol::dto::ProposalHumanDecision::Reauthorize)
         }

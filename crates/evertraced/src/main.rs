@@ -33,8 +33,8 @@ use evertrace_engine::{
     McpServiceResult, McpServiceStatus, RecallCueOutcome, RecallCueService, RecoveryActionOutcome,
     RecoveryActionService, RecoveryBarrierLocator as EngineRecoveryLocator, RecoveryBarrierService,
     RecoveryError, RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason,
-    RuntimeMode, SessionImportWorker, SynthesisPlanner, open_writer, publish_recovery_runtime,
-    recall::spawn_recall_worker,
+    RuntimeMode, SessionImportWorker, open_writer,
+    recall::spawn_recall_worker_with_config,
     repository::observe_session_catalog_report,
     session_import::{
         SessionCatalogService, SessionImportAdminAction as EngineSessionImportAdminAction,
@@ -66,6 +66,18 @@ use evertrace_protocol::{
     },
 };
 use tokio::sync::{RwLock, mpsc, watch};
+use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+fn lifecycle_filter<S>(engine: Arc<EngineService>) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    // Dynamic interest is essential: a disabled callsite must become enabled
+    // after a reload. Never enable arbitrary dependency/body logging.
+    tracing_subscriber::filter::dynamic_filter_fn(move |metadata, _| {
+        metadata.target() == "evertrace_lifecycle" && *metadata.level() <= engine.log_level()
+    })
+}
 
 #[tokio::main]
 async fn main() {
@@ -110,6 +122,27 @@ fn map_host_canary(
     }
 }
 
+fn map_config_reload(result: evertrace_engine::ConfigReloadResult) -> Response {
+    Response::ConfigReload(evertrace_protocol::response::ConfigReloadResponse {
+        active_hash: result.active_hash,
+        pending_hash: result.pending_hash,
+        outcome: match result.outcome {
+            evertrace_engine::ConfigReloadOutcome::Prepared => {
+                evertrace_protocol::dto::ConfigReloadOutcome::Prepared
+            }
+            evertrace_engine::ConfigReloadOutcome::Applied => {
+                evertrace_protocol::dto::ConfigReloadOutcome::Applied
+            }
+            evertrace_engine::ConfigReloadOutcome::Rejected => {
+                evertrace_protocol::dto::ConfigReloadOutcome::Rejected
+            }
+            evertrace_engine::ConfigReloadOutcome::RestartRequired => {
+                evertrace_protocol::dto::ConfigReloadOutcome::RestartRequired
+            }
+        },
+    })
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let raw = env::args_os().skip(1).collect::<Vec<_>>();
     if raw
@@ -136,11 +169,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         RuntimeMode::Normal
     };
     let engine = Arc::new(EngineService::from_toml(&source, mode)?);
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(lifecycle_filter(Arc::clone(&engine))),
+    );
+    tracing::subscriber::set_global_default(subscriber)?;
+    tracing::info!(target: "evertrace_lifecycle", "daemon starting");
     if args.candidate.is_some() && engine.effective_config().config().llm.enabled {
         return Err("candidate daemon requires llm.enabled=false".into());
     }
     let home = env::var_os("HOME").map(PathBuf::from);
-    let data_dir = resolve_data_dir(engine.data_dir(), home.as_deref(), |name| env::var_os(name))?;
+    let data_dir = resolve_data_dir(&engine.data_dir(), home.as_deref(), |name| {
+        env::var_os(name)
+    })?;
     if args.candidate.is_some() {
         let candidate_config = std::path::absolute(&config_path)?;
         // At most the explicit config may pre-exist; reject any native/other
@@ -151,14 +193,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let runtime_snapshot = publish_recovery_runtime(&data_dir, engine.effective_config(), None)?;
     let writer = open_writer(&data_dir).await?;
-    evertrace_engine::initialize_runtime_spool(&runtime_snapshot)?;
     let (writer_handle, mut writer_task) = spawn_writer(writer, 64)?;
-    let mut recall_worker = spawn_recall_worker(
+    let config_reload = Arc::new(evertrace_engine::ConfigReloadService::new(
+        Arc::clone(&engine),
+        writer_handle.clone(),
+        data_dir.clone(),
+        std::path::absolute(&config_path)?,
+    )?);
+    let runtime_snapshot = config_reload.initialize_runtime().await?;
+    evertrace_engine::initialize_runtime_spool(&runtime_snapshot)?;
+    let mut recall_worker = spawn_recall_worker_with_config(
         writer_handle.clone(),
         runtime_snapshot.clone(),
         data_dir.clone(),
+        Some(Arc::clone(&config_reload)),
     );
     let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
     let mut host_canary = evertrace_engine::HostCanaryService::new(
@@ -210,10 +259,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         session_import_worker,
         Arc::clone(&current_session_catalog_report),
         runtime_snapshot.clone(),
-        SynthesisPlanner::new(engine.effective_config().config().llm.clone()),
+        engine.synthesis_planner(),
         engine.effective_config().config().dreaming.clone(),
     )
-    .with_backup_requests(backup_request_tx);
+    .with_backup_requests(backup_request_tx)
+    .with_config(Arc::clone(&config_reload));
     let mut background_scheduler_task =
         tokio::spawn(scheduler.run(session_import_wakeup_rx, session_import_shutdown_rx));
     let mcp_service = McpActionService::open(
@@ -261,7 +311,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
         runtime_snapshot.effective_config_hash,
         "ordinary-hook-ingest-v1",
-    )?;
+    )?
+    .with_config(Arc::clone(&config_reload));
     let mut ingest_task = tokio::spawn(ingestor.run(
         Arc::clone(&dispatch_gate),
         session_import_shutdown_tx.subscribe(),
@@ -276,10 +327,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let handler_session_import_wakeup = session_import_wakeup_tx.clone();
     let handler_maintenance_active = Arc::clone(&maintenance_active);
     let handler_dispatch_gate = Arc::clone(&dispatch_gate);
+    let handler_shutdown = shutdown_tx.clone();
+    let handler_config_reload = Arc::clone(&config_reload);
     let mut task = tokio::spawn(server.run_dispatch_with_context(
         shutdown_rx,
         move |context, request_id, command| {
             let handler_engine = Arc::clone(&handler_engine);
+            let config_reload = Arc::clone(&handler_config_reload);
+            let config_shutdown = handler_shutdown.clone();
             let recovery_service = recovery_service.clone();
             let recovery_action_service = handler_recovery_action_service.clone();
             let mcp_bindings = handler_mcp_bindings.clone();
@@ -297,12 +352,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if !matches!(&command, ProtocolCommand::Health) {
                         return Err(ErrorCode::MaintenanceMode);
                     }
+                    let config = config_reload.admit().await.map_err(|_| ErrorCode::MaintenanceMode)?;
                     let snapshot = handler_engine.health().map_err(|_| ErrorCode::MaintenanceMode)?;
                     return Ok(Response::Health(HealthResponse {
                         protocol_version: PROTOCOL_VERSION,
                         mode: HealthMode::Maintenance,
-                        config_version: snapshot.config_version,
-                        effective_config_hash: hex(&snapshot.effective_config_hash),
+                        config_version: config.config().config_version,
+                        effective_config_hash: hex(&config.hash()),
                         algorithm_revision: snapshot.algorithm_revision,
                         host_canary: host_canary.current().map(map_host_canary),
                     }));
@@ -311,6 +367,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if maintenance_active.load(Ordering::Acquire) {
                     return Err(ErrorCode::MaintenanceMode);
                 }
+                let config_snapshot = config_reload.admit().await.map_err(|_| ErrorCode::MaintenanceMode)?;
+                let mcp_service = mcp_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
+                let human_governance = human_governance.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
+                let recovery_service = recovery_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
+                let recovery_action_service = recovery_action_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
+                let recall_cue_service = recall_cue_service.for_config(&config_snapshot);
+                let session_import_admin = session_import_admin.for_config(&config_snapshot);
+                let host_canary = host_canary.for_config(&config_snapshot);
                 match command {
                     ProtocolCommand::RunHostCanary(request) => {
                         if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
@@ -325,8 +389,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(Response::Health(HealthResponse {
                             protocol_version: PROTOCOL_VERSION,
                             mode: HealthMode::Normal,
-                            config_version: snapshot.config_version,
-                            effective_config_hash: hex(&snapshot.effective_config_hash),
+                            config_version: config_snapshot.config().config_version,
+                            effective_config_hash: hex(&config_snapshot.hash()),
                             algorithm_revision: snapshot.algorithm_revision,
                             host_canary: host_canary.current().map(map_host_canary),
                         }))
@@ -413,11 +477,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             expires_at_us: grant.expires_at_us,
                         }))
                     }
+                    ProtocolCommand::ConfigRead => {
+                        if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
+                        let (source, file_hash) = config_reload.read_editable().map_err(|_| ErrorCode::InvalidInput)?;
+                        Ok(Response::ConfigDocument(evertrace_protocol::response::ConfigDocumentResponse { source, file_hash }))
+                    }
+                    ProtocolCommand::ConfigWrite(write) => {
+                        if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
+                        let result = config_reload.write_optimistic(&write.source, &write.expected_file_hash).await.map_err(|error| {
+                            if matches!(error, evertrace_engine::ConfigReloadError::Stopped) { let _ = config_shutdown.send(true); }
+                            ErrorCode::InvalidInput
+                        })?;
+                        let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                        session_import_wakeup.send_replace(next);
+                        tracing::info!(target: "evertrace_lifecycle", outcome = ?result.outcome, "configuration result");
+                        Ok(map_config_reload(result))
+                    }
+                    ProtocolCommand::ConfigReload => {
+                        if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
+                        let source = evertrace_engine::ConfigReloadSource::Cli;
+                        let result = config_reload.reload(source).await.map_err(|error| {
+                            if matches!(error, evertrace_engine::ConfigReloadError::Stopped) { let _ = config_shutdown.send(true); }
+                            ErrorCode::InvalidInput
+                        })?;
+                        if result.outcome == evertrace_engine::ConfigReloadOutcome::Applied {
+                            let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                            session_import_wakeup.send_replace(next);
+                        }
+                        tracing::info!(target: "evertrace_lifecycle", outcome = ?result.outcome, "configuration result");
+                        Ok(map_config_reload(result))
+                    }
                     ProtocolCommand::McpCall(call) => {
                         if context.client_kind != ClientKind::Mcp {
                             return Err(ErrorCode::Untrusted);
                         }
-                        let config_snapshot = handler_engine.effective_config().clone();
                         let output_action = call.input.action;
                         let action = match call.input.action {
                             evertrace_protocol::mcp::McpAction::Search => McpServiceAction::Search,
@@ -805,8 +898,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     ));
+    let mut config_poll = tokio::time::interval(std::time::Duration::from_secs(1));
+    config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_watch_failure = None;
     loop {
         tokio::select! {
+            _ = config_poll.tick() => {
+                match config_reload.watch_once().await {
+                    Ok(Some(result)) => {
+                        last_watch_failure = None;
+                        match result.outcome {
+                            evertrace_engine::ConfigReloadOutcome::Applied => tracing::info!(target: "evertrace_lifecycle", "configuration watch applied"),
+                            evertrace_engine::ConfigReloadOutcome::RestartRequired => tracing::info!(target: "evertrace_lifecycle", "configuration watch restart required"),
+                            _ => tracing::warn!(target: "evertrace_lifecycle", "configuration watch rejected"),
+                        }
+                        let next = (*session_import_wakeup_tx.borrow()).wrapping_add(1);
+                        session_import_wakeup_tx.send_replace(next);
+                    }
+                    Err(evertrace_engine::ConfigReloadError::Stopped) => {
+                        tracing::error!(target: "evertrace_lifecycle", "configuration watch stopped: uncertain commit");
+                        let _ = shutdown_tx.send(true);
+                    }
+                    Err(error) => {
+                        let kind = match error {
+                            evertrace_engine::ConfigReloadError::Busy => "busy",
+                            _ => "invalid",
+                        };
+                        if last_watch_failure != Some(kind) {
+                            tracing::warn!(target: "evertrace_lifecycle", reason = kind, "configuration watch failed");
+                        }
+                        last_watch_failure = Some(kind);
+                    }
+                    Ok(None) => { last_watch_failure = None; },
+                }
+            }
             result = &mut ingest_task => {
                 let _ = shutdown_tx.send(true);
                 let _ = session_import_shutdown_tx.send(true);
@@ -886,15 +1011,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 recovery_action_service.quiesce_and_drain().await;
                 recall_worker.abort();
                 let _ = (&mut recall_worker).await;
-                let result = writer_handle
+                let result = match config_reload.backup_runtime(&runtime_snapshot).await {
+                    Ok(runtime) => writer_handle
                     .as_ref()
                     .ok_or("writer unavailable during backup")?
                     .create_backup(
                         request.backup_job_id(),
                         config_path.clone(),
-                        runtime_snapshot.clone(),
+                        runtime,
                     )
-                    .await;
+                    .await.map_err(|_| ()),
+                    Err(_) => Err(()),
+                };
                 let result = match result {
                     Ok(result) => result,
                     Err(_) => {
@@ -906,18 +1034,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         recovery_action_service.shutdown_and_drain().await;
                         task.await??;
                         background_scheduler_task.await??;
+                        if let Some(handle) = writer_handle.take() { let _ = handle.shutdown().await; }
                         let _ = (&mut writer_task).await;
                         ingest_result??;
                         return Err("writer failed to reopen after backup".into());
                     }
                 };
-                recall_worker = spawn_recall_worker(
+                recall_worker = spawn_recall_worker_with_config(
                     writer_handle
                         .as_ref()
                         .ok_or("writer unavailable after backup")?
                         .clone(),
                     runtime_snapshot.clone(),
                     data_dir.clone(),
+                    Some(Arc::clone(&config_reload)),
                 );
                 if !recovery_action_service.resume_after_quiesce() {
                     maintenance_active.store(false, Ordering::Release);
@@ -943,6 +1073,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 writer_task.await??;
                 ingest_result??;
+                tracing::info!(target: "evertrace_lifecycle", "daemon stopped");
                 return Ok(());
             }
         }
@@ -1540,9 +1671,26 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                     EngineHumanSystemDetail::Config {
                         config_version,
                         effective_config_hash,
+                        reload,
                     } => HumanSystemDetail::Config {
                         config_version,
                         effective_config_hash,
+                        reload: reload.map(|detail| evertrace_protocol::dto::ConfigReloadAudit {
+                            previous_config_hash: detail.previous_config_hash,
+                            actor: detail.actor,
+                            source: match detail.source {
+                                evertrace_engine::ConfigReloadSource::Startup => evertrace_protocol::dto::ConfigReloadSource::Startup,
+                                evertrace_engine::ConfigReloadSource::Watcher => evertrace_protocol::dto::ConfigReloadSource::Watcher,
+                                evertrace_engine::ConfigReloadSource::Cli => evertrace_protocol::dto::ConfigReloadSource::Cli,
+                                evertrace_engine::ConfigReloadSource::Tui => evertrace_protocol::dto::ConfigReloadSource::Tui,
+                            },
+                            outcome: match detail.outcome {
+                                evertrace_engine::ConfigReloadOutcome::Prepared => evertrace_protocol::dto::ConfigReloadOutcome::Prepared,
+                                evertrace_engine::ConfigReloadOutcome::Applied => evertrace_protocol::dto::ConfigReloadOutcome::Applied,
+                                evertrace_engine::ConfigReloadOutcome::Rejected => evertrace_protocol::dto::ConfigReloadOutcome::Rejected,
+                                evertrace_engine::ConfigReloadOutcome::RestartRequired => evertrace_protocol::dto::ConfigReloadOutcome::RestartRequired,
+                            },
+                        }),
                     },
                 }),
                 stable_key: item.stable_key,

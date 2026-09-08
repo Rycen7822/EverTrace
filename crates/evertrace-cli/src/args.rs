@@ -10,6 +10,9 @@ pub struct Args {
 pub enum Command {
     ConfigCheck,
     ConfigShowEffective,
+    ConfigReload {
+        socket: Option<PathBuf>,
+    },
     Doctor {
         refresh_host: Option<PathBuf>,
     },
@@ -133,6 +136,20 @@ impl Args {
         } else if command == "config" {
             match values.next().as_deref().and_then(|value| value.to_str()) {
                 Some("check") => Command::ConfigCheck,
+                Some("reload") => {
+                    let socket = match values.next() {
+                        None => None,
+                        Some(flag) if flag == "--socket" => {
+                            let path = PathBuf::from(values.next().ok_or(usage())?);
+                            if !path.is_absolute() {
+                                return Err(usage());
+                            }
+                            Some(path)
+                        }
+                        _ => return Err(usage()),
+                    };
+                    Command::ConfigReload { socket }
+                }
                 Some("show")
                     if values.next().as_deref() == Some(std::ffi::OsStr::new("--effective")) =>
                 {

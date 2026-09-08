@@ -19,7 +19,7 @@ use evertrace_store::{
 };
 use thiserror::Error;
 
-use crate::{WriterActorError, WriterHandle, capture::verify_capture_frame_bounded};
+use crate::{WriterActorError, WriterHandle, capture::verify_capture_frame_presented};
 
 const MAX_SEGMENTS_PER_DRAIN: usize = 16;
 const MAX_SELECTED_OBSERVATIONS: usize = 256;
@@ -39,9 +39,22 @@ pub struct EvidenceIngestor {
     writer: WriterHandle,
     effective_config_hash: [u8; 32],
     algorithm_revision: String,
+    config: Option<std::sync::Arc<crate::ConfigReloadService>>,
+    operation_config: Option<std::sync::Arc<evertrace_domain::config::EffectiveConfig>>,
 }
 
 impl EvidenceIngestor {
+    pub fn with_operation_config(
+        mut self,
+        config: std::sync::Arc<evertrace_domain::config::EffectiveConfig>,
+    ) -> Self {
+        self.operation_config = Some(config);
+        self
+    }
+    pub fn with_config(mut self, config: std::sync::Arc<crate::ConfigReloadService>) -> Self {
+        self.config = Some(config);
+        self
+    }
     /// Ordinary daemon consumer. Each unit releases segment claims before
     /// yielding the dispatch read guard, allowing backup and shutdown to drain.
     pub async fn run(
@@ -150,6 +163,8 @@ impl EvidenceIngestor {
             writer,
             effective_config_hash,
             algorithm_revision,
+            config: None,
+            operation_config: None,
         })
     }
 
@@ -218,6 +233,13 @@ impl EvidenceIngestor {
         if segments.is_empty() {
             return Ok(DrainProgress::default());
         }
+        let config = match self.config.as_ref() {
+            Some(config) => Some(config.admit().await.map_err(|_| IngestError::Snapshot)?),
+            None => self.operation_config.clone(),
+        };
+        let effective_config_hash = config
+            .as_ref()
+            .map_or(self.effective_config_hash, |config| config.hash());
         let cas =
             CasStore::open_existing(self.snapshot.cas_dir.clone()).map_err(|_| IngestError::Cas)?;
         let mut progress = DrainProgress::default();
@@ -253,7 +275,12 @@ impl EvidenceIngestor {
                     let fence = MaintenanceFence::open(data_dir).map_err(|_| IngestError::Cas)?;
                     shared_maintenance = Some(fence.shared().map_err(|_| IngestError::Cas)?);
                 }
-                let verified = verify_capture_frame_bounded(frame, &cas, &mut remaining)?;
+                let mut verified = verify_capture_frame_presented(
+                    frame,
+                    &cas,
+                    &mut remaining,
+                    config.as_ref().map(|config| &config.config().capture),
+                )?;
                 let surface_count = usize::from(verified.surface.is_some());
                 let recorded_at_us = verified.body.recorded_at_us;
                 let digest = if verified
@@ -340,7 +367,67 @@ impl EvidenceIngestor {
                 } else {
                     None
                 };
-                let command = self.command_for(verified, digest)?;
+                // The journal validates the original whole command before
+                // returning it. Preserve its first presentation across lost ack
+                // and reload; verify every payload against this same frame/CAS.
+                if let Some(committed_command) = self
+                    .writer
+                    .committed_command(verified.body.command_id)
+                    .await
+                    .map_err(map_writer_error)?
+                {
+                    let receipt = committed_command
+                        .payloads
+                        .iter()
+                        .find_map(|payload| match payload {
+                            JournalPayload::SourceReceiptRecorded(receipt) => {
+                                Some(receipt.as_ref())
+                            }
+                            _ => None,
+                        })
+                        .ok_or(IngestError::StoreCorrupt)?;
+                    verified
+                        .receipt
+                        .protected_presentation
+                        .clone_from(&receipt.protected_presentation);
+                    let original_algorithm = committed_command
+                        .payloads
+                        .iter()
+                        .find_map(|payload| match payload {
+                            JournalPayload::DirtyTarget(target) => {
+                                Some(target.algorithm_revision.as_str())
+                            }
+                            _ => None,
+                        })
+                        .ok_or(IngestError::StoreCorrupt)?;
+                    let expected = capture_event_drafts(
+                        &verified,
+                        digest,
+                        effective_config_hash,
+                        original_algorithm,
+                    )?
+                    .into_iter()
+                    .map(|event| event.payload)
+                    .collect::<Vec<_>>();
+                    if committed_command.payloads != expected {
+                        return Err(IngestError::StoreCorrupt);
+                    }
+                    committed += 1;
+                    progress.committed_frames += 1;
+                    progress.replayed_frames += 1;
+                    progress.projected_surfaces += surface_count;
+                    continue;
+                }
+                let command = JournalCommand::new(
+                    verified.body.command_id,
+                    capture_event_drafts(
+                        &verified,
+                        digest,
+                        effective_config_hash,
+                        &self.algorithm_revision,
+                    )?,
+                )
+                .map_err(|_| IngestError::InvalidRecord)?;
                 let outcome = self
                     .writer
                     .commit(command, recorded_at_us)
@@ -439,21 +526,6 @@ impl EvidenceIngestor {
                 .map_err(map_spool_ack)?;
         }
         Ok(())
-    }
-
-    fn command_for(
-        &self,
-        verified: crate::capture::VerifiedCapture,
-        confirmed_prefix_digest: Option<String>,
-    ) -> Result<JournalCommand, IngestError> {
-        let command_id = verified.body.command_id;
-        let events = capture_event_drafts(
-            &verified,
-            confirmed_prefix_digest,
-            self.effective_config_hash,
-            &self.algorithm_revision,
-        )?;
-        JournalCommand::new(command_id, events).map_err(|_| IngestError::InvalidRecord)
     }
 }
 

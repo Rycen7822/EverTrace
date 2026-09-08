@@ -416,6 +416,7 @@ pub enum HumanSystemDetail {
     Config {
         config_version: u32,
         effective_config_hash: [u8; 32],
+        reload: Option<evertrace_store::ConfigReloadAudit>,
     },
 }
 
@@ -645,6 +646,21 @@ pub struct HumanGovernanceService {
 }
 
 impl HumanGovernanceService {
+    pub fn for_config(
+        &self,
+        config: &evertrace_domain::config::EffectiveConfig,
+    ) -> Result<Self, crate::ConfigReloadError> {
+        let mut operation = self.clone();
+        operation.effective_config_hash = config.hash();
+        operation.global_promotion = config.config().global_promotion.clone();
+        operation.runtime_snapshot = self
+            .runtime_snapshot
+            .as_ref()
+            .map(|runtime| crate::config_reload::operation_runtime(runtime, config))
+            .transpose()?;
+        Ok(operation)
+    }
+
     pub fn new(writer: WriterHandle, effective_config_hash: [u8; 32]) -> Self {
         Self {
             writer,
@@ -4446,8 +4462,10 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
             ))
         }
         ("runtime_event", JournalPayload::ConfigAudit(value)) => {
-            if row.row_id != "runtime:config:current"
-                || row.object_id.is_some()
+            if !matches!(
+                row.row_id.as_str(),
+                "runtime:config:current" | "runtime:config:attempt"
+            ) || row.object_id.is_some()
                 || row.current_revision_id.is_some()
             {
                 return Err(HumanGovernanceError::Store);
@@ -4459,6 +4477,7 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 Some(HumanSystemDetail::Config {
                     config_version: value.config_version,
                     effective_config_hash: value.effective_config_hash,
+                    reload: value.reload,
                 }),
             ))
         }

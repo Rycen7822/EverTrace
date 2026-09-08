@@ -1,4 +1,6 @@
 use evertrace_domain::{config::EffectiveConfig, revision::AlgorithmRevision};
+pub use evertrace_store::{ConfigReloadAudit, ConfigReloadOutcome, ConfigReloadSource};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 mod actions;
@@ -38,13 +40,34 @@ pub enum EngineError {
 
 #[derive(Clone, Debug)]
 pub struct EngineService {
-    config: EffectiveConfig,
+    config: Arc<RwLock<Arc<OperationConfig>>>,
     mode: RuntimeMode,
 }
 
+pub(crate) struct OperationConfig {
+    pub effective: Arc<EffectiveConfig>,
+    pub synthesis: crate::SynthesisPlanner,
+}
+
+impl std::fmt::Debug for OperationConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperationConfig")
+            .field("effective", &self.effective)
+            .finish_non_exhaustive()
+    }
+}
+
 impl EngineService {
-    pub const fn new(config: EffectiveConfig, mode: RuntimeMode) -> Self {
-        Self { config, mode }
+    pub fn new(config: EffectiveConfig, mode: RuntimeMode) -> Self {
+        let synthesis = crate::SynthesisPlanner::new(config.config().llm.clone());
+        Self {
+            config: Arc::new(RwLock::new(Arc::new(OperationConfig {
+                effective: Arc::new(config),
+                synthesis,
+            }))),
+            mode,
+        }
     }
 
     pub fn from_toml(input: &str, mode: RuntimeMode) -> Result<Self, EngineError> {
@@ -53,23 +76,74 @@ impl EngineService {
             .map_err(|_| EngineError::InvalidConfiguration)
     }
 
-    pub fn data_dir(&self) -> &str {
-        &self.config.config().runtime.data_dir
+    pub fn data_dir(&self) -> String {
+        self.effective_config().config().runtime.data_dir.clone()
     }
 
-    pub const fn effective_config(&self) -> &EffectiveConfig {
-        &self.config
+    pub fn effective_config(&self) -> Arc<EffectiveConfig> {
+        Arc::clone(&self.operation_config().effective)
+    }
+
+    pub fn synthesis_planner(&self) -> crate::SynthesisPlanner {
+        self.operation_config().synthesis.clone()
+    }
+
+    pub(crate) fn operation_config(&self) -> Arc<OperationConfig> {
+        Arc::clone(
+            &self
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    pub(crate) fn prepare_config(
+        &self,
+        effective: Arc<EffectiveConfig>,
+    ) -> Result<Arc<OperationConfig>, EngineError> {
+        let synthesis = self
+            .operation_config()
+            .synthesis
+            .reconfigured(effective.config().llm.clone())
+            .map_err(|_| EngineError::InvalidConfiguration)?;
+        Ok(Arc::new(OperationConfig {
+            effective,
+            synthesis,
+        }))
+    }
+
+    pub(crate) fn apply_config(&self, config: Arc<OperationConfig>) {
+        *self
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+    }
+
+    pub(crate) fn finish_config_commit(&self) {
+        self.operation_config().synthesis.activate_limit();
     }
 
     pub fn health(&self) -> Result<HealthSnapshot, HealthDispatchError> {
         if self.mode == RuntimeMode::Maintenance {
             return Err(HealthDispatchError::MaintenanceMode);
         }
+        let config = self.effective_config();
         Ok(HealthSnapshot {
             mode: self.mode,
-            config_version: self.config.config().config_version,
-            effective_config_hash: self.config.hash(),
+            config_version: config.config().config_version,
+            effective_config_hash: config.hash(),
             algorithm_revision: AlgorithmRevision::V1.version(),
         })
+    }
+
+    pub fn log_level(&self) -> tracing::Level {
+        use evertrace_domain::config::LogLevel;
+        match self.effective_config().config().runtime.log_level {
+            LogLevel::Trace => tracing::Level::TRACE,
+            LogLevel::Debug => tracing::Level::DEBUG,
+            LogLevel::Info => tracing::Level::INFO,
+            LogLevel::Warn => tracing::Level::WARN,
+            LogLevel::Error => tracing::Level::ERROR,
+        }
     }
 }

@@ -77,6 +77,8 @@ pub struct SessionImportWorker {
     report: Arc<RwLock<Option<HostProbeReport>>>,
     verified_prefix: Arc<Mutex<Option<VerifiedPrefix>>>,
     next_session: Arc<Mutex<Option<String>>>,
+    operation_config: Option<Arc<evertrace_domain::config::EffectiveConfig>>,
+    config: Option<Arc<crate::ConfigReloadService>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +90,22 @@ struct VerifiedPrefix {
 }
 
 impl SessionImportWorker {
+    pub(crate) fn with_config(mut self, config: Arc<crate::ConfigReloadService>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    pub fn for_config(
+        &self,
+        config: Arc<evertrace_domain::config::EffectiveConfig>,
+    ) -> Result<Self, SessionImportError> {
+        let mut operation = self.clone();
+        operation.runtime = crate::config_reload::operation_runtime(&self.runtime, &config)
+            .map_err(|_| SessionImportError::Unavailable)?;
+        operation.operation_config = Some(config);
+        Ok(operation)
+    }
+
     pub fn new(
         writer: WriterHandle,
         runtime: RuntimeSnapshot,
@@ -102,6 +120,8 @@ impl SessionImportWorker {
             report,
             verified_prefix: Arc::new(Mutex::new(None)),
             next_session: Arc::new(Mutex::new(None)),
+            operation_config: None,
+            config: None,
         })
     }
 
@@ -206,13 +226,16 @@ impl SessionImportWorker {
             )
             .await?;
         }
-        let ingestor = EvidenceIngestor::new(
+        let mut ingestor = EvidenceIngestor::new(
             self.runtime.clone(),
             self.writer.clone(),
             self.runtime.effective_config_hash,
             "session_import_v1",
         )
         .map_err(|_| SessionImportError::Persistence)?;
+        if let Some(config) = &self.operation_config {
+            ingestor = ingestor.with_operation_config(Arc::clone(config));
+        }
         let source_instance = SourceInstanceId::parse(format!("codex-session:{session_id}"))
             .map_err(|_| SessionImportError::Unsupported)?;
         let mut cursor = offset;
@@ -445,13 +468,21 @@ impl SessionImportWorker {
         drop(cursor);
         let mut processed = 0;
         let mut retryable = queued.len() > selected.len();
+        let mut remaining_bytes = self.operation_config.as_ref().map_or(usize::MAX, |config| {
+            config.config().session_import.max_body_import_mib_per_run as usize * 1024 * 1024
+        });
         for session_id in selected {
-            if Instant::now() >= budget.deadline {
+            if Instant::now() >= budget.deadline || remaining_bytes == 0 {
                 retryable = true;
                 break;
             }
+            let budget = SessionImportBudget {
+                max_bytes: budget.max_bytes.min(remaining_bytes),
+                ..budget
+            };
             match self.process_checkpoint(&session_id, budget).await {
                 Ok(progress) => {
+                    remaining_bytes = remaining_bytes.saturating_sub(progress.bytes);
                     processed += 1;
                     retryable |= !progress.completed;
                 }
@@ -556,6 +587,17 @@ impl SessionImportWorker {
         snapshot: &evertrace_store::ProjectionSnapshot,
         session_id: &str,
     ) -> Result<(), SessionImportError> {
+        if let Some(config) = &self.config {
+            let current = config
+                .admit()
+                .await
+                .map_err(|_| SessionImportError::Unavailable)?;
+            if current.hash() != self.runtime.effective_config_hash {
+                // A later session in the batch is a new claim, not permission
+                // to keep using the earlier session's configuration.
+                return Err(SessionImportError::Unavailable);
+            }
+        }
         let Some(job) =
             active_import_job(snapshot, session_id).map_err(|_| SessionImportError::Persistence)?
         else {

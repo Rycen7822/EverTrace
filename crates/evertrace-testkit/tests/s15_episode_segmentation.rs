@@ -88,6 +88,7 @@ fn source_evidence(sequence: u64) -> (SourceReceipt, SourceObservation) {
         possible_duplicate_group_id: None,
     };
     let receipt = SourceReceipt {
+        protected_presentation: None,
         source_receipt_id: receipt_id,
         source_observation_id: observation_id,
         source_instance_id: instance.clone(),

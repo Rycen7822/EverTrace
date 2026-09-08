@@ -40,6 +40,12 @@ pub struct RecallCueService {
 }
 
 impl RecallCueService {
+    pub fn for_config(&self, config: &evertrace_domain::config::EffectiveConfig) -> Self {
+        let mut operation = self.clone();
+        operation.effective_config_hash = config.hash();
+        operation
+    }
+
     pub fn new(
         writer: WriterHandle,
         gate: RecallCueGateMode,

@@ -275,17 +275,25 @@ impl MaintenanceFence {
     }
 }
 
-impl Drop for MaintenanceGuard {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.lock_file);
-    }
-}
-
 impl MaintenanceGuard {
+    /// Duplicate this same flock description for the immediately following
+    /// single-threaded child spawn. The caller closes its copy after spawn.
+    /// Last close, not explicit LOCK_UN, releases the shared lease.
+    pub fn inherit_shared_for_spawn(&self) -> Result<std::os::fd::OwnedFd, CasError> {
+        if self.exclusive {
+            return Err(CasError::ExclusiveMaintenanceRequired);
+        }
+        rustix::io::dup(&self.lock_file).map_err(|_| CasError::Io)
+    }
+
     pub fn require_exclusive_for(&self, data_dir: &Path) -> Result<(), CasError> {
         if !self.exclusive {
             return Err(CasError::ExclusiveMaintenanceRequired);
         }
+        self.require_root(data_dir)
+    }
+
+    pub(crate) fn require_root(&self, data_dir: &Path) -> Result<(), CasError> {
         if directory_identity(data_dir)? != directory_file_identity(&self.data_dir)? {
             return Err(CasError::IdentityChanged);
         }

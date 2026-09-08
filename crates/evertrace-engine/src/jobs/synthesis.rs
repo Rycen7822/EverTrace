@@ -124,16 +124,45 @@ pub struct SynthesisPlanner {
     llm: LlmConfig,
     provider: Option<OpenAiCompatibleProvider>,
     prompt_hash: [u8; 32],
+    concurrency: std::sync::Arc<crate::provider::ProviderConcurrency>,
 }
 
 impl SynthesisPlanner {
     pub fn new(llm: LlmConfig) -> Self {
-        let provider = OpenAiCompatibleProvider::new(&llm).ok();
+        let concurrency = crate::provider::ProviderConcurrency::new(llm.max_concurrency);
+        let provider =
+            OpenAiCompatibleProvider::with_concurrency(&llm, std::sync::Arc::clone(&concurrency))
+                .ok();
         Self {
             llm,
             provider,
             prompt_hash: canonical_prompt_hash(),
+            concurrency,
         }
+    }
+
+    pub(crate) fn reconfigured(
+        &self,
+        llm: LlmConfig,
+    ) -> Result<Self, crate::provider::ProviderError> {
+        let provider = match OpenAiCompatibleProvider::with_concurrency(
+            &llm,
+            std::sync::Arc::clone(&self.concurrency),
+        ) {
+            Ok(provider) => Some(provider),
+            Err(crate::provider::ProviderError::Disabled) => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            llm,
+            provider,
+            prompt_hash: self.prompt_hash,
+            concurrency: std::sync::Arc::clone(&self.concurrency),
+        })
+    }
+
+    pub(crate) fn activate_limit(&self) {
+        self.concurrency.set_limit(self.llm.max_concurrency);
     }
 
     pub fn durable_jobs(
@@ -144,12 +173,28 @@ impl SynthesisPlanner {
         limit: usize,
         max_wall_time: std::time::Duration,
     ) -> Result<Vec<DurableJob>, crate::semantic::SemanticServiceError> {
+        self.durable_jobs_for_episodes(
+            current_synthesis_episodes(snapshot)?.into_values(),
+            effective_config_hash,
+            covered,
+            limit,
+            max_wall_time,
+        )
+    }
+
+    pub(crate) fn durable_jobs_for_episodes(
+        &self,
+        episodes: impl Iterator<Item = WorkEpisode>,
+        effective_config_hash: [u8; 32],
+        covered: &std::collections::BTreeSet<(String, u64, [u8; 32])>,
+        limit: usize,
+        max_wall_time: std::time::Duration,
+    ) -> Result<Vec<DurableJob>, crate::semantic::SemanticServiceError> {
         if limit == 0 || limit > 32 {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
         let budget = self.durable_budget(max_wall_time)?;
-        let mut episodes = current_synthesis_episodes(snapshot)?
-            .into_values()
+        let mut episodes = episodes
             .filter(|episode| synthesis_trigger(episode).is_some())
             .filter(|episode| {
                 !covered.contains(&(
@@ -716,7 +761,7 @@ impl SynthesisPlanner {
     }
 }
 
-fn current_synthesis_episodes(
+pub(crate) fn current_synthesis_episodes(
     snapshot: &ProjectionSnapshot,
 ) -> Result<
     std::collections::BTreeMap<evertrace_domain::ids::WorkEpisodeId, WorkEpisode>,
@@ -750,7 +795,7 @@ fn current_synthesis_episodes(
     Ok(current)
 }
 
-fn synthesis_trigger(episode: &WorkEpisode) -> Option<SemanticDigestTrigger> {
+pub(crate) fn synthesis_trigger(episode: &WorkEpisode) -> Option<SemanticDigestTrigger> {
     episode.pending_semantic_delta?;
     if episode.lifecycle_status == EpisodeLifecycle::Closed {
         let valuable = episode.pending_delta_stats.high_value_signal_count != 0

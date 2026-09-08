@@ -561,7 +561,7 @@ mod replacement_proof {
     }
 
     #[cfg(test)]
-    fn run_replacement_capture(restore_original: bool) {
+    fn run_replacement_capture(restore_original: bool, reload_limits: bool) {
         let base = std::env::temp_dir().join(format!(
             "evertrace-s16-{}-{}",
             restore_original,
@@ -589,6 +589,9 @@ mod replacement_proof {
         DeviceKeyStore::new(&key_dir).load_or_create().unwrap();
         let cas_dir = base.join("cas");
         let cas = CasStore::open(&cas_dir).unwrap();
+        if reload_limits {
+            std::fs::write(target.join("large"), b"safe plain text\n".repeat(70_000)).unwrap();
+        }
         let pinned = ConfinedRoot::open(&target).unwrap();
         let repository_id = RepositoryId::new_v7();
         let worktree_id = WorktreeId::new_v7();
@@ -690,6 +693,72 @@ mod replacement_proof {
             recovery_capture_request_id: pending.recovery_capture_request_id,
             pending_revision_id: pending.request_revision_id,
         };
+        if reload_limits {
+            let mut old = runtime.clone();
+            old.recovery_socket_path = base.join("runtime/evertraced-v1.sock");
+            old.recovery_max_bundle_bytes = 16 << 20;
+            old.recovery_max_untracked_file_bytes = 2 << 20;
+            old.recovery_max_untracked_total_bytes = 4 << 20;
+            let original = old.clone();
+            let mut config = evertrace_domain::config::EffectiveConfig::default()
+                .config()
+                .clone();
+            config.recovery.max_bundle_mib = 16;
+            config.recovery.max_untracked_file_mib = 1;
+            config.recovery.max_untracked_total_mib = 4;
+            let config = evertrace_domain::config::EffectiveConfig::new(config).unwrap();
+            let updated = crate::config_reload::operation_runtime(&old, &config).unwrap();
+            let capture = |runtime: &RuntimeSnapshot| {
+                prepare_capture_inner(
+                    PrepareCaptureContext {
+                        runtime,
+                        locator: &locator,
+                        pending: &pending,
+                        adapter_manifest_id: "adapter-s16",
+                        target_path: &target,
+                        pinned_root: &pinned,
+                        protected_target_paths: Vec::new(),
+                        repository_view: &repository_view,
+                        attempt_anchor_ids: Vec::new(),
+                        artifact_refs: Vec::new(),
+                        config_and_run_refs: Vec::new(),
+                        cas: &cas,
+                        deadline: RecoveryDeadline(Instant::now() + Duration::from_secs(10)),
+                    },
+                    |_| {},
+                )
+                .unwrap()
+                .bundle
+                .unwrap()
+            };
+            let before = capture(&old);
+            let after = capture(&updated);
+            let large = |bundle: &evertrace_domain::repository::RecoveryBundle| {
+                bundle.untracked_file_blob_refs.iter().any(|item| {
+                    cas.read(&CasDigest::from_str(&item.payload.cas_ref).unwrap())
+                        .unwrap()
+                        .len()
+                        > 1 << 20
+                })
+            };
+            assert!(
+                large(&before),
+                "old capture omissions: {:?}",
+                before.omissions
+            );
+            assert!(!large(&after));
+            assert!(
+                !after.untracked_file_blob_refs.is_empty(),
+                "small eligible files still capture"
+            );
+            assert_eq!(
+                old, original,
+                "operation refresh never edits the pinned authority"
+            );
+            drop(pinned);
+            std::fs::remove_dir_all(&base).unwrap();
+            return;
+        }
         let prepared = prepare_capture_inner(
             PrepareCaptureContext {
                 runtime: &runtime,
@@ -751,12 +820,17 @@ mod replacement_proof {
 
     #[test]
     fn pinned_capture_replacement_never_publishes_replacement_bytes_as_complete() {
-        run_replacement_capture(false);
+        run_replacement_capture(false, false);
     }
 
     #[test]
     fn pinned_capture_aba_reads_only_the_original_open_file_description() {
-        run_replacement_capture(true);
+        run_replacement_capture(true, false);
+    }
+
+    #[test]
+    fn reloaded_recovery_limit_changes_real_capture_without_mutating_pin() {
+        run_replacement_capture(true, true);
     }
 }
 

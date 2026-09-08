@@ -5,6 +5,8 @@
 
 pub mod autoresearch;
 pub mod capture;
+mod config_reload;
+pub use config_reload::{ConfigReloadError, ConfigReloadResult, ConfigReloadService};
 pub mod ingest;
 pub mod jobs;
 pub mod maintenance;
@@ -37,9 +39,10 @@ pub use normalize::{NormalizationSnapshot, NormalizeError, PhysicalNormalizer};
 pub use recall::{RecallCueError, RecallCueOutcome, RecallCueService};
 pub use recovery::*;
 pub use service::{
-    EngineError, EngineService, HealthDispatchError, HealthSnapshot, HumanActionOutcome,
-    HumanBackupSummary, HumanBackupTableState, HumanBackupValidationResult, HumanCompetingDetail,
-    HumanDegradedReason, HumanExecutionIntegrityDetail, HumanForgetPreview, HumanGovernanceError,
+    ConfigReloadAudit, ConfigReloadOutcome, ConfigReloadSource, EngineError, EngineService,
+    HealthDispatchError, HealthSnapshot, HumanActionOutcome, HumanBackupSummary,
+    HumanBackupTableState, HumanBackupValidationResult, HumanCompetingDetail, HumanDegradedReason,
+    HumanExecutionIntegrityDetail, HumanForgetPreview, HumanGovernanceError,
     HumanGovernanceService, HumanItemCategory, HumanJobBudget, HumanJobDetail, HumanJobState,
     HumanJobTerminalReason, HumanNativeHistoryCleanupAvailability, HumanNegativeDecision,
     HumanObjectFamily, HumanPage, HumanProposalDecision, HumanProposalReview, HumanRecoveryDetail,

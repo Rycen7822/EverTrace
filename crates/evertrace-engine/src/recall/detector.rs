@@ -230,18 +230,35 @@ fn runtime_anomaly(previous: Option<&WorkCheckpoint>, current: &WorkCheckpoint) 
 
 pub fn spawn_recall_worker(
     writer: crate::WriterHandle,
+    runtime: evertrace_capture::RuntimeSnapshot,
+    data_dir: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    spawn_recall_worker_with_config(writer, runtime, data_dir, None)
+}
+
+pub fn spawn_recall_worker_with_config(
+    writer: crate::WriterHandle,
     mut runtime: evertrace_capture::RuntimeSnapshot,
     data_dir: std::path::PathBuf,
+    config: Option<std::sync::Arc<crate::ConfigReloadService>>,
 ) -> tokio::task::JoinHandle<()> {
     let mut frontier = writer.subscribe_recall_frontier();
     tokio::spawn(async move {
         let mut startup = true;
         loop {
-            let first = process_recall_batch(&writer, &mut runtime, &data_dir, startup).await;
+            let first =
+                process_recall_batch(&writer, &mut runtime, &data_dir, startup, config.as_deref())
+                    .await;
             if first.is_err()
-                && process_recall_batch(&writer, &mut runtime, &data_dir, startup)
-                    .await
-                    .is_err()
+                && process_recall_batch(
+                    &writer,
+                    &mut runtime,
+                    &data_dir,
+                    startup,
+                    config.as_deref(),
+                )
+                .await
+                .is_err()
             {
                 eprintln!("evertraced: recall worker batch unavailable");
             }
@@ -258,7 +275,15 @@ async fn process_recall_batch(
     runtime: &mut evertrace_capture::RuntimeSnapshot,
     data_dir: &std::path::Path,
     abandon_claims: bool,
+    config: Option<&crate::ConfigReloadService>,
 ) -> Result<(), crate::WriterActorError> {
+    if let Some(config) = config {
+        runtime.effective_config_hash = config
+            .admit()
+            .await
+            .map_err(|_| crate::WriterActorError::Store)?
+            .hash();
+    }
     let mut stale_retries = 0;
     let mut state_advances = 0;
     loop {
@@ -367,7 +392,7 @@ async fn process_recall_batch(
                 Err(error) => return Err(error),
             }
         }
-        publish_cues(writer, runtime, data_dir, occurred_at_us).await?;
+        publish_cues(writer, runtime, data_dir, occurred_at_us, config).await?;
         return Ok(());
     }
 }
@@ -383,6 +408,7 @@ async fn publish_cues(
     runtime: &mut evertrace_capture::RuntimeSnapshot,
     data_dir: &std::path::Path,
     occurred_at_us: i64,
+    config: Option<&crate::ConfigReloadService>,
 ) -> Result<(), crate::WriterActorError> {
     let contexts = writer.recall_current_contexts(32).await?;
     let mut cues = Vec::new();
@@ -462,11 +488,18 @@ async fn publish_cues(
     if runtime.recall_cues != cues {
         let mut next = runtime.clone();
         next.recall_cues = cues;
-        publish_next_runtime(
-            runtime,
-            next,
-            &evertrace_capture::RuntimeSnapshot::snapshot_path(data_dir),
-        )?;
+        if let Some(config) = config {
+            *runtime = config
+                .publish_recall_cues(&next)
+                .await
+                .map_err(|_| crate::WriterActorError::Store)?;
+        } else {
+            publish_next_runtime(
+                runtime,
+                next,
+                &evertrace_capture::RuntimeSnapshot::snapshot_path(data_dir),
+            )?;
+        }
     }
     Ok(())
 }

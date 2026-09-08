@@ -343,10 +343,30 @@ impl McpActionService {
                 [],
             ));
         };
-        let payload = row
-            .payload_json
-            .clone()
-            .filter(|payload| payload.len() <= 8_192);
+        let payload = if row.object_kind.as_deref() == Some("source_receipt") {
+            let receipt = match row
+                .payload_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<JournalPayload>(value).ok())
+            {
+                Some(JournalPayload::SourceReceiptRecorded(receipt)) => receipt,
+                _ => return Err(McpServiceError::Store),
+            };
+            receipt.validate().map_err(|_| McpServiceError::Store)?;
+            Some(
+                serde_json::to_string(&serde_json::json!({
+                    "cas_ref": receipt.cas_ref,
+                    "original_length": receipt.original_length,
+                    "protected_length": receipt.protected_length,
+                    "protected_presentation": receipt.protected_presentation,
+                }))
+                .map_err(|_| McpServiceError::Store)?,
+            )
+        } else {
+            row.payload_json
+                .clone()
+                .filter(|payload| payload.len() <= 8_192)
+        };
         let payload_omitted = payload.is_none();
         let retained_forgotten_source = retained_forgotten_source(&scope.snapshot, row)?;
         let mut warnings = payload_omitted

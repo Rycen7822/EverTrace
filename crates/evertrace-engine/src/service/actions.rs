@@ -147,9 +147,22 @@ pub struct McpActionService {
     search_index: SearchIndex,
     writer: WriterHandle,
     runtime_snapshot: RuntimeSnapshot,
+    operation_config: Option<std::sync::Arc<evertrace_domain::config::EffectiveConfig>>,
 }
 
 impl McpActionService {
+    pub fn for_config(
+        &self,
+        config: &evertrace_domain::config::EffectiveConfig,
+    ) -> Result<Self, McpServiceError> {
+        let mut operation = self.clone();
+        operation.runtime_snapshot =
+            crate::config_reload::operation_runtime(&self.runtime_snapshot, config)
+                .map_err(|_| McpServiceError::Store)?;
+        operation.operation_config = Some(std::sync::Arc::new(config.clone()));
+        Ok(operation)
+    }
+
     pub async fn open(
         bindings: McpBindingAuthority,
         data_dir: &Path,
@@ -173,6 +186,7 @@ impl McpActionService {
             search_index,
             writer,
             runtime_snapshot,
+            operation_config: None,
         }
     }
 

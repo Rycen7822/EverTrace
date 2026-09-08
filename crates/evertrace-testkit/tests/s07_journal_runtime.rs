@@ -394,6 +394,7 @@ async fn job_lease_recovery_watermark_config_and_stale_audit_rebuild() {
                     JournalPayload::ConfigAudit(ConfigAudit {
                         config_version: 1,
                         effective_config_hash: CONFIG_HASH,
+                        reload: None,
                     }),
                 ],
             ),

@@ -13,6 +13,8 @@ pub enum UiCommand {
     OpenRelated,
     OpenFutureOperationShell,
     OpenProposalEditor,
+    OpenConfigEditor,
+    SubmitConfig,
     OpenSupportDeprecateEditor,
     PrepareProposal(ProposalHumanDecision),
     PrepareNegativeReview(NegativeReviewDecision),

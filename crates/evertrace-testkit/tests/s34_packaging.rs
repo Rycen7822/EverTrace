@@ -54,6 +54,374 @@ fn fixture() -> (TempDir, ManagedInstallPaths, EffectiveConfig) {
 }
 
 #[tokio::test]
+async fn strict_reload_keeps_last_good_and_withdraws_whole_pending_config() {
+    use evertrace_engine::{
+        ConfigReloadOutcome, ConfigReloadService, ConfigReloadSource, EngineService, RuntimeMode,
+    };
+    use std::sync::Arc;
+    let (_root, paths, initial) = fixture();
+    fs::create_dir(&paths.data_root).unwrap();
+    fs::set_permissions(&paths.data_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = initial.to_toml().unwrap();
+    let engine = Arc::new(EngineService::from_toml(&source, RuntimeMode::Normal).unwrap());
+    let writer = JournalWriter::open(&paths.data_root).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 16).unwrap();
+    let reload = ConfigReloadService::new(
+        Arc::clone(&engine),
+        handle.clone(),
+        paths.data_root.clone(),
+        paths.config.clone(),
+    )
+    .unwrap();
+    let startup = reload.initialize_runtime().await.unwrap();
+    let old_operation = reload.admit().await.unwrap();
+    let hot = source.replace("get_token_budget = 1200", "get_token_budget = 17");
+    assert_ne!(hot, source);
+    fs::write(&paths.config, &hot).unwrap();
+    let applied = reload.reload(ConfigReloadSource::Cli).await.unwrap();
+    assert_eq!(applied.outcome, ConfigReloadOutcome::Applied);
+    assert_eq!(old_operation.hash(), initial.hash());
+    assert_ne!(reload.admit().await.unwrap().hash(), old_operation.hash());
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
+    assert_eq!(runtime.generation, startup.generation);
+    assert_eq!(runtime.recovery_gate, startup.recovery_gate);
+    assert_eq!(runtime.effective_config_hash, applied.active_hash);
+    let mixed = hot.replace(
+        paths.data_root.to_str().unwrap(),
+        paths.data_root.join("other").to_str().unwrap(),
+    );
+    fs::write(&paths.config, mixed).unwrap();
+    let pending = reload.reload(ConfigReloadSource::Cli).await.unwrap();
+    assert_eq!(pending.outcome, ConfigReloadOutcome::RestartRequired);
+    assert_eq!(pending.active_hash, applied.active_hash);
+    assert!(pending.pending_hash.is_some());
+    fs::write(&paths.config, "invalid[").unwrap();
+    let rejected = reload.reload(ConfigReloadSource::Cli).await.unwrap();
+    assert_eq!(rejected.outcome, ConfigReloadOutcome::Rejected);
+    assert_eq!(rejected.active_hash, applied.active_hash);
+    assert_eq!(rejected.pending_hash, None);
+    fs::write(&paths.config, &source).unwrap();
+    reload.watch_once().await.unwrap();
+    assert_eq!(reload.admit().await.unwrap().hash(), initial.hash());
+    let (_, file_hash) = reload.read_editable().unwrap();
+    let external = format!("{source}\n# concurrent owner edit\n");
+    fs::write(&paths.config, &external).unwrap();
+    assert!(reload.write_optimistic(&hot, &file_hash).await.is_err());
+    assert_eq!(fs::read_to_string(&paths.config).unwrap(), external);
+    let (_, fresh_hash) = reload.read_editable().unwrap();
+    let edited = format!("{hot}\n# concurrent owner edit\n");
+    assert_eq!(
+        reload
+            .write_optimistic(&edited, &fresh_hash)
+            .await
+            .unwrap()
+            .outcome,
+        ConfigReloadOutcome::Applied
+    );
+    assert_eq!(fs::read_to_string(&paths.config).unwrap(), edited);
+    let fence = evertrace_capture::MaintenanceFence::open(&paths.data_root).unwrap();
+    let operation = fence.shared().unwrap();
+    fs::write(&paths.config, &source).unwrap();
+    assert!(matches!(
+        reload.reload(ConfigReloadSource::Cli).await,
+        Err(evertrace_engine::ConfigReloadError::Busy)
+    ));
+    let snapshot = handle.project().await.unwrap();
+    let current = snapshot
+        .rows
+        .iter()
+        .find(|row| row.row_id == "runtime:config:current")
+        .unwrap();
+    let JournalPayload::ConfigAudit(audit) =
+        serde_json::from_str(current.payload_json.as_ref().unwrap()).unwrap()
+    else {
+        panic!("config audit")
+    };
+    assert_eq!(
+        audit.effective_config_hash,
+        reload.admit().await.unwrap().hash()
+    );
+    assert_ne!(
+        audit.effective_config_hash,
+        initial.hash(),
+        "Prepared never advances current"
+    );
+    drop(operation);
+    reload.reload(ConfigReloadSource::Cli).await.unwrap();
+    let incremental = handle.project().await.unwrap();
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let reopened = JournalWriter::open(&paths.data_root).await.unwrap();
+    let full = reopened.full_projection().await.unwrap();
+    for id in ["runtime:config:current", "runtime:config:attempt"] {
+        assert_eq!(
+            incremental.rows.iter().find(|row| row.row_id == id),
+            full.rows.iter().find(|row| row.row_id == id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_reload_config_transport_and_dynamic_log_callsite() {
+    use evertrace_protocol::{command::Command as Rpc, dto::ClientKind, response::Response};
+    use std::time::{Duration, Instant};
+    let (root, paths, initial) = fixture();
+    let log_path = root.path().join("daemon.log");
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut daemon = Daemon(
+        Command::new(&paths.daemon)
+            .arg("--config")
+            .arg(&paths.config)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = evertrace_protocol::LocalClient::connect(
+        &socket,
+        "reload-test",
+        ClientKind::Cli,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    for level in ["error", "info", "error"] {
+        let Response::ConfigDocument(document) = client
+            .request(evertrace_domain::ids::RequestId::new_v7(), Rpc::ConfigRead)
+            .await
+            .unwrap()
+        else {
+            panic!("config read")
+        };
+        let source = initial
+            .to_toml()
+            .unwrap()
+            .replace("log_level = \"info\"", &format!("log_level = \"{level}\""));
+        let Response::ConfigReload(result) = client
+            .request(
+                evertrace_domain::ids::RequestId::new_v7(),
+                Rpc::ConfigWrite(evertrace_protocol::command::ConfigWriteCommand {
+                    source,
+                    expected_file_hash: document.file_hash,
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("config write")
+        };
+        assert_eq!(
+            result.outcome,
+            evertrace_protocol::dto::ConfigReloadOutcome::Applied
+        );
+    }
+    // The exact same INFO callsite must be enabled after initially disabled,
+    // then disabled again, without rebuilding the subscriber.
+    assert_eq!(
+        fs::read_to_string(&log_path)
+            .unwrap()
+            .matches("configuration result")
+            .count(),
+        1
+    );
+    fs::write(&paths.config, "invalid[").unwrap();
+    let output = Command::new(&paths.cli)
+        .args(["config", "reload", "--socket"])
+        .arg(&socket)
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Rejected"));
+    fs::write(&paths.config, initial.to_toml().unwrap()).unwrap();
+    client
+        .request(
+            evertrace_domain::ids::RequestId::new_v7(),
+            Rpc::ConfigReload,
+        )
+        .await
+        .unwrap();
+    fs::write(&paths.config, "invalid[").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fs::read_to_string(&log_path)
+        .unwrap()
+        .contains("configuration watch rejected")
+    {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(
+        fs::read_to_string(&log_path)
+            .unwrap()
+            .matches("configuration watch rejected")
+            .count(),
+        1
+    );
+    assert!(package_health(socket).await);
+}
+
+#[test]
+#[ignore = "requires a retained pre-reload Hook executable via EVERTRACE_TEST_OLD_HOOK"]
+fn strict_reload_real_old_hook_uses_invocation_snapshot_and_inherited_fence() {
+    use evertrace_codex::{
+        binding::NativeToolUse, hook_input::CaptureHookInput, install::StableLauncher,
+    };
+    use std::{
+        os::unix::net::UnixListener,
+        time::{Duration, Instant},
+    };
+    let old_hook = std::env::var_os("EVERTRACE_TEST_OLD_HOOK").expect("retained old executable");
+    let (_root, paths, _) = fixture();
+    install_offline(&paths, false).unwrap();
+    let launcher = StableLauncher::open(&paths.data_root).unwrap();
+    let generation = launcher.resolve_for_session("reload-old-child").unwrap();
+    fs::copy(old_hook, &generation.executable).unwrap();
+    fs::set_permissions(&generation.executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let native = NativeToolUse::from_json(&serde_json::to_vec(&serde_json::json!({
+        "cwd": paths.data_root, "hook_event_name":"PreToolUse", "model":"test",
+        "permission_mode":"default", "session_id":"reload-old-child", "tool_input":{"command":"rm doomed.txt"},
+        "tool_name":"Bash", "tool_use_id":"reload-tool", "transcript_path":null, "turn_id":"reload-turn"
+    })).unwrap()).unwrap();
+    fs::write(paths.data_root.join("doomed.txt"), "must remain").unwrap();
+    let mut input = CaptureHookInput::from_native(native, generation.generation).unwrap();
+    // Exercise the existing typed recovery boundary, not native weak-delivery
+    // qualification (which deliberately cannot activate recovery).
+    input.payload = serde_json::json!({
+        "program": "rm", "args": ["doomed.txt"], "cwd": paths.data_root
+    })
+    .to_string();
+    input.repository_instance_id = Some(evertrace_domain::ids::RepositoryId::new_v7().to_string());
+    input.worktree_instance_id = Some(evertrace_domain::ids::WorktreeId::new_v7().to_string());
+    let mut pinned = RuntimeSnapshot::load(&generation.runtime_snapshot).unwrap();
+    pinned.recovery_gate = evertrace_capture::RecoveryGateMode::Active;
+    pinned.recovery_adapter_manifest_id = Some(input.adapter_manifest_ref.clone());
+    pinned.recovery_preflight_timeout_ms = 3000;
+    pinned.publish(&generation.runtime_snapshot).unwrap();
+    let pinned_bytes = fs::read(&generation.runtime_snapshot).unwrap();
+    let mut current = pinned.clone();
+    current.recovery_preflight_timeout_ms = 1000;
+    current.effective_config_hash = [42; 32];
+    current
+        .publish(&RuntimeSnapshot::snapshot_path(&paths.data_root))
+        .unwrap();
+    let _listener = UnixListener::bind(&current.recovery_socket_path).unwrap();
+    fs::set_permissions(
+        &current.recovery_socket_path,
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let input = input.to_json().unwrap();
+    let spawn = |executable: &std::path::Path, option: &str, target: &std::path::Path| {
+        let mut child = Command::new(executable)
+            .arg(option)
+            .arg(target)
+            .current_dir(&paths.data_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        child
+    };
+    let started = Instant::now();
+    assert!(
+        spawn(
+            &generation.executable,
+            "--runtime-snapshot",
+            &generation.runtime_snapshot
+        )
+        .wait()
+        .unwrap()
+        .success()
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(2500),
+        "artifact must exhibit the old pinned-only timeout behavior"
+    );
+    let started = Instant::now();
+    assert!(
+        spawn(&paths.hook, "--launcher-root", &paths.data_root)
+            .wait()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "current launcher must pass the new timeout to the real old child"
+    );
+    assert_eq!(
+        fs::read(&generation.runtime_snapshot).unwrap(),
+        pinned_bytes
+    );
+    assert!(paths.data_root.join("doomed.txt").exists());
+    let mut parent = spawn(&paths.hook, "--launcher-root", &paths.data_root);
+    std::thread::sleep(Duration::from_millis(300));
+    parent.kill().unwrap();
+    parent.wait().unwrap();
+    let fence = evertrace_capture::MaintenanceFence::open(&paths.data_root).unwrap();
+    assert!(matches!(
+        fence.exclusive(),
+        Err(evertrace_capture::CasError::LockBusy)
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let guard = loop {
+        if let Ok(guard) = fence.exclusive() {
+            break guard;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _second_interrupted = evertrace_capture::InvocationSnapshot::prepare(
+        &paths.data_root,
+        &generation.runtime_snapshot,
+        &guard,
+    )
+    .unwrap();
+    evertrace_capture::InvocationSnapshot::clean_interrupted(&paths.data_root, &guard).unwrap();
+    let slots = paths.data_root.join("runtime/hook-invocations");
+    for (name, bytes) in [("0.v4", &b""[..]), ("1.v4", &b"partial"[..])] {
+        fs::write(slots.join(name), bytes).unwrap();
+        fs::set_permissions(slots.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    evertrace_capture::InvocationSnapshot::clean_interrupted(&paths.data_root, &guard).unwrap();
+    std::os::unix::fs::symlink(&generation.runtime_snapshot, slots.join("0.v4")).unwrap();
+    assert!(
+        evertrace_capture::InvocationSnapshot::clean_interrupted(&paths.data_root, &guard).is_err()
+    );
+    fs::remove_file(slots.join("0.v4")).unwrap();
+    fs::write(slots.join("0.v4"), b"").unwrap();
+    fs::set_permissions(slots.join("0.v4"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        evertrace_capture::InvocationSnapshot::clean_interrupted(&paths.data_root, &guard).is_err()
+    );
+    assert!(slots.join("0.v4").is_file());
+    fs::set_permissions(slots.join("0.v4"), fs::Permissions::from_mode(0o600)).unwrap();
+    evertrace_capture::InvocationSnapshot::clean_interrupted(&paths.data_root, &guard).unwrap();
+    assert_eq!(
+        fs::read_dir(paths.data_root.join("runtime/hook-invocations"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
     use evertrace_domain::{
         ids::{CommandId, RepositoryId},
@@ -70,7 +438,7 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
     let (_root, paths, config) = fixture();
     let repository_id = RepositoryId::new_v7();
     install_offline(&paths, false).unwrap();
-    invoke(&paths, &serde_json::to_vec(&json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"budget-session","tool_input":{"command":"echo budgetneedle"},"tool_name":"Bash","tool_use_id":"budget-tool","transcript_path":null,"turn_id":"budget-turn"})).unwrap());
+    invoke(&paths, &serde_json::to_vec(&json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"budget-session","tool_input":{"command":"echo budgetneedle ".repeat(2500)},"tool_name":"Bash","tool_use_id":"budget-tool","transcript_path":null,"turn_id":"budget-turn"})).unwrap());
     let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
     let (mut spool, _) =
         DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
@@ -85,10 +453,17 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
     .unwrap();
     EvidenceIngestor::new(runtime, handle.clone(), config.hash(), "s34-budget-v1")
         .unwrap()
+        .with_operation_config(std::sync::Arc::new(config.clone()))
         .drain_once()
         .await
         .unwrap();
     let snapshot = handle.project().await.unwrap();
+    let receipt_row = snapshot
+        .data_rows()
+        .find(|row| row.object_kind.as_deref() == Some("source_receipt"))
+        .unwrap();
+    assert!(receipt_row.payload_json.as_ref().unwrap().len() > 8192);
+    let receipt_ref = receipt_row.object_id.clone().unwrap();
     let observation = snapshot
         .data_rows()
         .find_map(|row| {
@@ -198,12 +573,18 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
         }
     }
     let mut lengths = Vec::new();
-    // Separate startups, not reload. Reverse the low budgets to expose action mixups.
+    // Reverse low budgets to expose action mixups. The default case also
+    // proves the same running daemon consumes a real CLI reload.
     for (search, get) in [(0, 1_200), (600, 1), (600, 1_200), (1_200, 2_400)] {
         let mut source = config.config().clone();
         source.llm.enabled = false;
         source.search.search_token_budget = search;
         source.search.get_token_budget = get;
+        let desired = EffectiveConfig::new(source.clone()).unwrap();
+        if (search, get) == (600, 1_200) {
+            source.search.search_token_budget = 0;
+            source.search.get_token_budget = 1;
+        }
         fs::write(
             &paths.config,
             EffectiveConfig::new(source).unwrap().to_toml().unwrap(),
@@ -226,6 +607,21 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        if (search, get) == (600, 1_200) {
+            fs::write(&paths.config, desired.to_toml().unwrap()).unwrap();
+            let reloaded = Command::new(&paths.cli)
+                .args(["config", "reload", "--socket"])
+                .arg(paths.data_root.join("runtime/evertraced-v1.sock"))
+                .env_clear()
+                .output()
+                .unwrap();
+            assert!(
+                reloaded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reloaded.stderr)
+            );
+            assert!(daemon.0.try_wait().unwrap().is_none());
+        }
         let mut requests = vec![
             json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"budget-test","version":"1"}}}),
             json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -233,6 +629,7 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
         for (id, action, input) in [
             (1, "search", "budgetneedle"),
             (2, "get", reference.as_str()),
+            (3, "get", receipt_ref.as_str()),
         ] {
             requests.push(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"evertrace","arguments":{"action":action,"workspace":repository_id.to_string(),"input":input,"refs":[]}}}));
         }
@@ -293,6 +690,18 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
             pair.push(bytes);
         }
         lengths.push(pair);
+        if get > 1 {
+            let receipt_result = &messages[3]["result"]["structuredContent"];
+            let items = receipt_result["items"]["evidence"].as_array().unwrap();
+            assert_eq!(items.len(), 1, "{receipt_result}");
+            assert_eq!(items[0]["instruction_authority"], "none");
+            let text = items[0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("cas_ref") && text.contains("protected_length"),
+                "{text}"
+            );
+            assert!(!text.contains("source_instance_id"));
+        }
         drop(daemon);
     }
     assert!(lengths[0][0] < lengths[2][0]);
@@ -350,9 +759,20 @@ async fn candidate_native_binary_validates_without_starting_or_repairing() {
 #[tokio::test]
 async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_cas() {
     use std::time::Duration;
-    let (_root, paths, _) = fixture();
+    let (_root, paths, initial) = fixture();
+    let mut settings = initial.config().clone();
+    settings.capture.preview_bytes = 256;
+    settings.capture.inline_payload_bytes = 1024;
+    fs::write(
+        &paths.config,
+        EffectiveConfig::new(settings.clone())
+            .unwrap()
+            .to_toml()
+            .unwrap(),
+    )
+    .unwrap();
     install_offline(&paths, false).unwrap();
-    let native = serde_json::json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"ordinary-backlog","tool_input":{"command":"true"},"tool_name":"Bash","tool_use_id":"one","transcript_path":null,"turn_id":"one"});
+    let native = serde_json::json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"ordinary-backlog","tool_input":{"command":"true ".repeat(500)},"tool_name":"Bash","tool_use_id":"one","transcript_path":null,"turn_id":"one"});
     invoke(&paths, &serde_json::to_vec(&native).unwrap());
     let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
     let spool =
@@ -381,8 +801,19 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
                 .unwrap(),
         )
     };
+    let mut original_receipt = None;
     for replay in [false, true] {
         if replay {
+            settings.capture.preview_bytes = 1024;
+            settings.capture.inline_payload_bytes = 8192;
+            fs::write(
+                &paths.config,
+                EffectiveConfig::new(settings.clone())
+                    .unwrap()
+                    .to_toml()
+                    .unwrap(),
+            )
+            .unwrap();
             let mut spool = DurableSpool::open_read_only(
                 runtime.spool_dir.clone(),
                 runtime.spool_limits().unwrap(),
@@ -436,6 +867,23 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
                         matches!(payload, JournalPayload::HostOccurrenceNormalized(_))
                     })
                 {
+                    let receipt = payloads
+                        .iter()
+                        .find_map(|payload| match payload {
+                            JournalPayload::SourceReceiptRecorded(receipt) => Some(receipt),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert!(matches!(&receipt.protected_presentation,
+                        Some(evertrace_domain::evidence::ProtectedPresentation::Preview { text }) if text.len() <= 256));
+                    if let Some(previous) = &original_receipt {
+                        assert_eq!(
+                            receipt, previous,
+                            "replayed frame retains its first presentation snapshot"
+                        );
+                    } else {
+                        original_receipt = Some(receipt.clone());
+                    }
                     assert!(payloads.iter().any(|payload| matches!(
                         payload,
                         JournalPayload::SourceIngestWatermark(_)
@@ -471,6 +919,25 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
             .await
             .unwrap();
             let mut requested = false;
+            settings.capture.preview_bytes = 512;
+            fs::write(
+                &paths.config,
+                EffectiveConfig::new(settings.clone())
+                    .unwrap()
+                    .to_toml()
+                    .unwrap(),
+            )
+            .unwrap();
+            let response = client
+                .request(
+                    evertrace_domain::ids::RequestId::new_v7(),
+                    Rpc::ConfigReload,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(response, Response::ConfigReload(result) if result.outcome == evertrace_protocol::dto::ConfigReloadOutcome::Applied)
+            );
             for _ in 0..4 {
                 let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
                     frontier, ..
@@ -529,6 +996,34 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
                         && daemon.0.try_wait().unwrap().is_none()
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if replay {
+            invoke(&paths, &serde_json::to_vec(&native).unwrap());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let connection = evertrace_store::connection::CompatibilityStore::connect_local(
+                    &evertrace_store::connection::native_root(&paths.data_root),
+                )
+                .await
+                .unwrap();
+                let journal = connection
+                    .connection()
+                    .open_table(evertrace_store::JOURNAL_TABLE)
+                    .execute()
+                    .await
+                    .unwrap();
+                let rows = evertrace_store::journal::read_all_journal_rows(&journal)
+                    .await
+                    .unwrap();
+                let current_hash = EffectiveConfig::new(settings.clone()).unwrap().hash();
+                if rows.iter().any(|row| matches!(row.payload().unwrap(), JournalPayload::SourceReceiptRecorded(receipt)
+                    if matches!(receipt.protected_presentation, Some(evertrace_domain::evidence::ProtectedPresentation::Inline { .. }))
+                        && row.effective_config_hash == current_hash)) {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
         assert!(

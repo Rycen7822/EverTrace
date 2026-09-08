@@ -311,6 +311,43 @@ pub struct WatermarkAdvanced {
 pub struct ConfigAudit {
     pub config_version: u32,
     pub effective_config_hash: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload: Option<ConfigReloadAudit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigReloadAudit {
+    pub previous_config_hash: [u8; 32],
+    pub outcome: ConfigReloadOutcome,
+    pub source: ConfigReloadSource,
+    pub actor: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReloadOutcome {
+    Prepared,
+    Applied,
+    Rejected,
+    RestartRequired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReloadSource {
+    Startup,
+    Watcher,
+    Cli,
+    Tui,
+}
+
+impl ConfigAudit {
+    pub fn is_applied(&self) -> bool {
+        self.reload
+            .as_ref()
+            .is_none_or(|detail| detail.outcome == ConfigReloadOutcome::Applied)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -734,6 +771,9 @@ impl JournalPayload {
                 if value.config_version == 0 {
                     return Err(StoreError::InvalidInput);
                 }
+                if let Some(detail) = &value.reload {
+                    validate_identifier(&detail.actor)?;
+                }
                 Ok(())
             }
             Self::StaleGenerationAudit(value) => {
@@ -1009,16 +1049,47 @@ impl JournalPayload {
                     ("value", integer(value.value)),
                 ],
             ),
-            Self::ConfigAudit(value) => tagged(
-                "config_audit",
-                vec![
+            Self::ConfigAudit(value) => {
+                let mut fields = vec![
                     ("config_version", integer(value.config_version)),
                     (
                         "effective_config_hash",
                         CanonicalValue::Bytes(value.effective_config_hash.to_vec()),
                     ),
-                ],
-            ),
+                ];
+                // Legacy audits retain exactly their original canonical fields.
+                if let Some(detail) = &value.reload {
+                    fields.push((
+                        "reload",
+                        CanonicalValue::Map(vec![
+                            (
+                                "previous_config_hash".into(),
+                                CanonicalValue::Bytes(detail.previous_config_hash.to_vec()),
+                            ),
+                            (
+                                "outcome".into(),
+                                text(match detail.outcome {
+                                    ConfigReloadOutcome::Prepared => "prepared",
+                                    ConfigReloadOutcome::Applied => "applied",
+                                    ConfigReloadOutcome::Rejected => "rejected",
+                                    ConfigReloadOutcome::RestartRequired => "restart_required",
+                                }),
+                            ),
+                            (
+                                "source".into(),
+                                text(match detail.source {
+                                    ConfigReloadSource::Startup => "startup",
+                                    ConfigReloadSource::Watcher => "watcher",
+                                    ConfigReloadSource::Cli => "cli",
+                                    ConfigReloadSource::Tui => "tui",
+                                }),
+                            ),
+                            ("actor".into(), text(&detail.actor)),
+                        ]),
+                    ));
+                }
+                tagged("config_audit", fields)
+            }
             Self::StaleGenerationAudit(value) => tagged(
                 "stale_generation_audit",
                 vec![
@@ -2526,6 +2597,35 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_config_audit_keeps_its_original_json_and_canonical_shape() {
+        use super::*;
+        let audit = ConfigAudit {
+            config_version: 1,
+            effective_config_hash: [7; 32],
+            reload: None,
+        };
+        let json = serde_json::to_value(&audit).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 2);
+        assert_eq!(serde_json::from_value::<ConfigAudit>(json).unwrap(), audit);
+        let payload = JournalPayload::ConfigAudit(audit);
+        assert_eq!(
+            payload.canonical_value(),
+            CanonicalValue::Map(vec![
+                ("kind".into(), CanonicalValue::String("config_audit".into())),
+                (
+                    "value".into(),
+                    CanonicalValue::Map(vec![
+                        ("config_version".into(), CanonicalValue::Integer(1)),
+                        (
+                            "effective_config_hash".into(),
+                            CanonicalValue::Bytes(vec![7; 32])
+                        ),
+                    ])
+                ),
+            ])
+        );
+    }
     use super::*;
 
     fn direct_range() -> SourceCloseRange {

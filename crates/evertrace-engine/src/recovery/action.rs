@@ -198,6 +198,15 @@ struct PreparedPatch {
 }
 
 impl RecoveryActionService {
+    pub fn for_config(
+        &self,
+        config: &evertrace_domain::config::EffectiveConfig,
+    ) -> Result<Self, crate::ConfigReloadError> {
+        let mut operation = self.clone();
+        operation.snapshot = crate::config_reload::operation_runtime(&self.snapshot, config)?;
+        Ok(operation)
+    }
+
     pub async fn supports_compatible_lineage_transfer(
         &self,
         application_id: RecoveryApplicationId,

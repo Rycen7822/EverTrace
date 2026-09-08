@@ -1795,79 +1795,92 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
 
 #[tokio::test]
 async fn zero_llm_tasks_per_run_never_claims_or_calls_the_provider() {
-    let episode = synthesis_episode_row(9);
-    let planning_snapshot = ProjectionSnapshot {
-        frontier: 9,
-        rows: vec![episode],
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let planner = SynthesisPlanner::new(provider_config(&base_url));
-    let queued = planner
-        .durable_jobs(
-            &planning_snapshot,
-            CONFIG,
-            &Default::default(),
-            1,
-            std::time::Duration::from_secs(600),
-        )
-        .unwrap()
-        .remove(0);
-    let job_id = queued.job_id;
-
-    let temp = TempDir::new().unwrap();
-    DeviceKeyStore::new(temp.path().join("keys"))
-        .load_or_create()
-        .unwrap();
-    let runtime = runtime(temp.path());
-    CaptureRuntime::open(runtime.clone()).unwrap();
-    let writer = open_writer(&temp.path().join("store")).await.unwrap();
-    let (handle, task) = spawn_writer(writer, 16).unwrap();
-    handle
-        .commit(
-            JournalCommand::new(
-                CommandId::new_v7(),
-                vec![JournalEventDraft::runtime(
-                    2,
-                    CONFIG,
-                    "semantic_synthesis_v1",
-                    JournalPayload::JobState(queued),
-                )],
+    for (max_llm_tasks_per_run, idle_enabled) in [(0, true), (2, false), (2, true)] {
+        let episode = synthesis_episode_row(9);
+        let planning_snapshot = ProjectionSnapshot {
+            frontier: 9,
+            rows: vec![episode],
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let planner = SynthesisPlanner::new(provider_config(&base_url));
+        let queued = planner
+            .durable_jobs(
+                &planning_snapshot,
+                CONFIG,
+                &Default::default(),
+                1,
+                std::time::Duration::from_secs(600),
             )
-            .unwrap(),
-            2,
-        )
-        .await
-        .unwrap();
-    let report = Arc::new(RwLock::new(Some(synthetic_report())));
-    let dreaming = DreamingConfig {
-        max_llm_tasks_per_run: 0,
-        ..DreamingConfig::default()
-    };
-    let scheduler = BackgroundScheduler::new(
-        handle.clone(),
-        SessionCatalogService::new(handle.clone(), CONFIG),
-        SessionImportWorker::new(handle.clone(), runtime.clone(), Arc::clone(&report)).unwrap(),
-        report,
-        runtime,
-        planner,
-        dreaming,
-    );
-    scheduler.run_once().await.unwrap();
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .unwrap()
+            .remove(0);
+        let job_id = queued.job_id;
+
+        let temp = TempDir::new().unwrap();
+        DeviceKeyStore::new(temp.path().join("keys"))
+            .load_or_create()
+            .unwrap();
+        let runtime = runtime(temp.path());
+        CaptureRuntime::open(runtime.clone()).unwrap();
+        let writer = open_writer(&temp.path().join("store")).await.unwrap();
+        let (handle, task) = spawn_writer(writer, 16).unwrap();
+        handle
+            .commit(
+                JournalCommand::new(
+                    CommandId::new_v7(),
+                    vec![JournalEventDraft::runtime(
+                        2,
+                        CONFIG,
+                        "semantic_synthesis_v1",
+                        JournalPayload::JobState(queued),
+                    )],
+                )
+                .unwrap(),
+                2,
+            )
             .await
-            .is_err()
-    );
-    let current = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
-        .unwrap()
-        .jobs
-        .into_iter()
-        .find(|job| job.job_id == job_id)
-        .unwrap();
-    assert_eq!((current.state, current.attempt), (JobStatus::Queued, 1));
-    handle.shutdown().await.unwrap();
-    task.await.unwrap().unwrap();
+            .unwrap();
+        let report = Arc::new(RwLock::new(Some(synthetic_report())));
+        let dreaming = DreamingConfig {
+            max_llm_tasks_per_run,
+            idle_enabled,
+            ..DreamingConfig::default()
+        };
+        let scheduler = BackgroundScheduler::new(
+            handle.clone(),
+            SessionCatalogService::new(handle.clone(), CONFIG),
+            SessionImportWorker::new(handle.clone(), runtime.clone(), Arc::clone(&report)).unwrap(),
+            report,
+            runtime,
+            planner,
+            dreaming,
+        );
+        scheduler.run_once().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        let current = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .unwrap();
+        if max_llm_tasks_per_run != 0 && idle_enabled {
+            // The queued target is absent from the authoritative store. Normal
+            // scheduling terminates it without a lease or provider call.
+            assert_eq!((current.state, current.attempt), (JobStatus::Failed, 1));
+            assert_eq!(
+                current.terminal.as_deref().map(|audit| audit.reason),
+                Some(JobTerminalReason::StaleGeneration)
+            );
+        } else {
+            assert_eq!((current.state, current.attempt), (JobStatus::Queued, 1));
+        }
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]

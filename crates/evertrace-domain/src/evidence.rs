@@ -397,6 +397,8 @@ pub struct SourceReceipt {
     pub archive_mode: SourceArchiveMode,
     pub cas_ref: String,
     pub protected_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_presentation: Option<ProtectedPresentation>,
     pub original_length: u64,
     pub protected_secret_digest: Option<String>,
     pub redaction_spans: Vec<EvidenceRedactionSpan>,
@@ -413,8 +415,42 @@ pub struct SourceReceipt {
     pub lifecycle: Option<crate::work::LaneLifecycleEvidence>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProtectedPresentation {
+    Inline {
+        text: String,
+    },
+    Preview {
+        text: String,
+    },
+    Unavailable {
+        reason: ProtectedPresentationUnavailable,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectedPresentationUnavailable {
+    NonText,
+}
+
 impl SourceReceipt {
     pub fn validate(&self) -> Result<(), EvidenceError> {
+        if let Some(presentation) = &self.protected_presentation {
+            let valid = match presentation {
+                ProtectedPresentation::Inline { text } => {
+                    text.len() <= 1_048_576 && text.len() as u64 == self.protected_length
+                }
+                ProtectedPresentation::Preview { text } => {
+                    text.len() <= 65_536 && (text.len() as u64) < self.protected_length
+                }
+                ProtectedPresentation::Unavailable { .. } => true,
+            };
+            if !valid {
+                return Err(EvidenceError::Invalid);
+            }
+        }
         validate_identifier(&self.source_session_ref)?;
         validate_identifier(&self.identity_domain)?;
         validate_identifier(&self.source_ref)?;

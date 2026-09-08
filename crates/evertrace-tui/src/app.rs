@@ -45,11 +45,54 @@ impl App {
             AppEvent::Health(health) => {
                 self.state.shell.health = Some(health);
                 self.state.shell.connection = ConnectionState::Connected;
-                self.state.proposal_edit = None;
+                if !is_config_editor(&self.state) {
+                    self.state.proposal_edit = None;
+                }
                 self.state.repository_purge_confirmation = None;
                 self.state.related_context = None;
                 self.state.future_operation_shell = None;
                 UiCommand::Refresh
+            }
+            AppEvent::ConfigDocument(document) => {
+                if self.state.route == crate::Route::System && document.source.len() <= 128 * 1024 {
+                    self.state.proposal_edit = Some(crate::state::ProposalEditState {
+                        frozen_frontier: 0, // Config writes use only the file hash.
+                        context: crate::state::ProposalEditContext::Configuration {
+                            file_hash: document.file_hash,
+                        },
+                        document: document.source,
+                        cursor: 0,
+                        error: None,
+                    });
+                }
+                UiCommand::None
+            }
+            AppEvent::ConfigApplied(result) => {
+                if !matches!(
+                    result.outcome,
+                    evertrace_protocol::dto::ConfigReloadOutcome::Applied
+                        | evertrace_protocol::dto::ConfigReloadOutcome::RestartRequired
+                ) {
+                    return self.handle(AppEvent::ConfigFailed);
+                }
+                self.state.write_queued = false;
+                self.state.proposal_edit = None;
+                self.state.detail_message = Some(format!(
+                    "configuration {:?}; pending={}",
+                    result.outcome,
+                    result.pending_hash.is_some()
+                ));
+                UiCommand::Refresh
+            }
+            AppEvent::ConfigFailed => {
+                self.state.write_queued = false;
+                if let Some(edit) = self.state.proposal_edit.as_mut() {
+                    edit.error = Some(
+                        "configuration rejected or changed externally; reread before resubmitting"
+                            .into(),
+                    );
+                }
+                UiCommand::None
             }
             AppEvent::HumanRead {
                 surface,
@@ -69,7 +112,9 @@ impl App {
                 {
                     return UiCommand::None;
                 }
-                self.state.proposal_edit = None;
+                if !is_config_editor(&self.state) {
+                    self.state.proposal_edit = None;
+                }
                 self.state.repository_purge_confirmation = None;
                 use evertrace_protocol::dto::HumanGovernanceResponse;
                 match (locator, snapshot) {
@@ -231,7 +276,9 @@ impl App {
             }
             AppEvent::Disconnected => {
                 self.state.shell.connection = ConnectionState::Disconnected;
-                self.state.proposal_edit = None;
+                if !is_config_editor(&self.state) {
+                    self.state.proposal_edit = None;
+                }
                 self.state.write_queued = false;
                 self.state.proposal_confirmation = None;
                 self.state.repository_purge_confirmation = None;
@@ -310,11 +357,20 @@ impl App {
     }
 
     fn handle_proposal_edit_key(&mut self, key: KeyEvent) -> UiCommand {
+        if is_config_editor(&self.state) && self.state.write_queued {
+            return UiCommand::None;
+        }
         if key.code == KeyCode::Esc {
             self.state.proposal_edit = None;
             return UiCommand::None;
         }
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if is_config_editor(&self.state) {
+                if !self.state.write_queued {
+                    return UiCommand::SubmitConfig;
+                }
+                return UiCommand::None;
+            }
             submit_proposal_edit(&mut self.state);
             return UiCommand::None;
         }
@@ -394,6 +450,11 @@ impl App {
                 self.state.future_operation_shell = None;
             }
             UiCommand::Quit => self.state.quit = true,
+            UiCommand::OpenConfigEditor => {
+                if self.state.route != crate::Route::System || self.state.write_queued {
+                    return UiCommand::None;
+                }
+            }
             UiCommand::OpenProposalEditor => {
                 if self.state.write_queued {
                     self.state.last_action = Some(local_transport_error());
@@ -677,6 +738,7 @@ impl App {
             | UiCommand::Detail
             | UiCommand::ConfirmProposal
             | UiCommand::ConfirmRecovery
+            | UiCommand::SubmitConfig
             | UiCommand::None => {}
         }
         command
@@ -743,7 +805,7 @@ impl App {
         } else if self.state.route == crate::Route::Explorer {
             "1 Inbox  2 Explorer  3 System  Enter detail  F forget  r refresh  p/f/i/M recovery  q quit".into()
         } else if self.state.route == crate::Route::System {
-            "1 Inbox  2 Explorer  3 System  B create backup  V verify selected backup  g other maintenance boundaries  r refresh  q quit".into()
+            "1 Inbox  2 Explorer  3 System  C edit config  B create backup  V verify backup  g maintenance boundaries  r refresh  q quit".into()
         } else {
             "1 Inbox  2 Explorer  3 System  r refresh  q quit".into()
         };
@@ -846,6 +908,9 @@ fn proposal_edit_state(state: &AppState) -> Result<crate::state::ProposalEditSta
         return Err("support_replacement_unavailable");
     };
     let original_payload = match &context {
+        crate::state::ProposalEditContext::Configuration { .. } => {
+            return Err("configuration_requires_file_read");
+        }
         crate::state::ProposalEditContext::Proposal(review) => &review.proposal.payload,
         crate::state::ProposalEditContext::SupportReplacement {
             original_payload, ..
@@ -966,6 +1031,15 @@ fn proposal_edit_shape_matches(
     )
 }
 
+fn is_config_editor(state: &AppState) -> bool {
+    state.proposal_edit.as_ref().is_some_and(|edit| {
+        matches!(
+            edit.context,
+            crate::state::ProposalEditContext::Configuration { .. }
+        )
+    })
+}
+
 fn submit_proposal_edit(state: &mut AppState) {
     let result = state
         .proposal_edit
@@ -975,6 +1049,9 @@ fn submit_proposal_edit(state: &mut AppState) {
             let payload = evertrace_protocol::dto::parse_proposal_payload_document(&edit.document)
                 .map_err(|error| format!("parse_error: {error}"))?;
             let original_payload = match &edit.context {
+                crate::state::ProposalEditContext::Configuration { .. } => {
+                    return Err("configuration_uses_file_hash".into());
+                }
                 crate::state::ProposalEditContext::Proposal(review) => &review.proposal.payload,
                 crate::state::ProposalEditContext::SupportReplacement {
                     original_payload, ..
@@ -1012,6 +1089,7 @@ fn submit_proposal_edit(state: &mut AppState) {
         }
     };
     state.proposal_confirmation = Some(match context {
+        crate::state::ProposalEditContext::Configuration { .. } => return,
         crate::state::ProposalEditContext::Proposal(review) => (
             frontier,
             evertrace_protocol::dto::HumanActionRequest::Proposal {
@@ -1059,7 +1137,15 @@ fn submit_proposal_edit(state: &mut AppState) {
 }
 
 fn insert_edit_text(edit: &mut crate::state::ProposalEditState, value: &str) -> bool {
-    if edit.document.len().saturating_add(value.len()) > MAX_PROPOSAL_EDIT_DOCUMENT {
+    let limit = if matches!(
+        edit.context,
+        crate::state::ProposalEditContext::Configuration { .. }
+    ) {
+        128 * 1024
+    } else {
+        MAX_PROPOSAL_EDIT_DOCUMENT
+    };
+    if edit.document.len().saturating_add(value.len()) > limit {
         edit.error = Some("proposal_document_too_large".into());
         return false;
     }
@@ -1153,6 +1239,9 @@ fn proposal_edit_modal_text(
     let first_line = cursor_line.saturating_sub(visible_rows / 2);
     let mut rendered = String::with_capacity(width.saturating_mul(visible_rows + 4));
     rendered.push_str(match &edit.context {
+        crate::state::ProposalEditContext::Configuration { .. } => {
+            "EDIT CONFIGURATION TOML (optimistic file hash)\n"
+        }
         crate::state::ProposalEditContext::Proposal(_) => "EDIT PROPOSAL DOCUMENT\n",
         crate::state::ProposalEditContext::SupportReplacement { .. } => {
             "EDIT SUPPORT REPLACEMENT\n"
@@ -1286,6 +1375,28 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(request) = human_request(&app.state, command) {
                 let _ = ui_commands.try_send(client::ClientCommand::Human(request));
+            }
+            if command == UiCommand::OpenConfigEditor {
+                let _ = ui_commands.try_send(client::ClientCommand::ConfigRead);
+            }
+            if command == UiCommand::SubmitConfig
+                && let Some(edit) = &app.state.proposal_edit
+                && let crate::state::ProposalEditContext::Configuration { file_hash } =
+                    &edit.context
+            {
+                let request = evertrace_protocol::command::ConfigWriteCommand {
+                    source: edit.document.clone(),
+                    expected_file_hash: file_hash.clone(),
+                };
+                if request.source.len() <= 128 * 1024
+                    && ui_commands
+                        .try_send(client::ClientCommand::ConfigWrite(request))
+                        .is_ok()
+                {
+                    app.state.write_queued = true;
+                } else {
+                    app.handle(AppEvent::ConfigFailed);
+                }
             }
             if command == UiCommand::ConfirmRecovery
                 && let Some(request) = app.state.recovery_confirmation.clone()
@@ -1983,6 +2094,52 @@ mod tests {
         PROTOCOL_VERSION, ProposalHumanDecision,
     };
     use evertrace_protocol::response::HealthResponse;
+
+    #[test]
+    fn configuration_editor_preserves_conflicted_document_and_uses_file_identity() {
+        let mut app = App::new();
+        app.state.route = crate::Route::System;
+        assert_eq!(
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::NONE
+            ))),
+            UiCommand::OpenConfigEditor
+        );
+        app.handle(AppEvent::ConfigDocument(
+            evertrace_protocol::response::ConfigDocumentResponse {
+                source: "# preserved comment\nconfig_version = 1\n".into(),
+                file_hash: "a".repeat(64),
+            },
+        ));
+        app.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('#'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL
+            ))),
+            UiCommand::SubmitConfig
+        );
+        let document = app.state.proposal_edit.as_ref().unwrap().document.clone();
+        app.state.write_queued = true;
+        app.handle(AppEvent::ConfigApplied(
+            evertrace_protocol::response::ConfigReloadResponse {
+                active_hash: [0; 32],
+                pending_hash: None,
+                outcome: evertrace_protocol::dto::ConfigReloadOutcome::Rejected,
+            },
+        ));
+        let edit = app.state.proposal_edit.as_ref().unwrap();
+        assert_eq!(edit.document, document);
+        assert!(edit.error.is_some());
+        assert!(
+            matches!(&edit.context, crate::state::ProposalEditContext::Configuration { file_hash } if file_hash == &"a".repeat(64))
+        );
+        assert!(!app.state.write_queued);
+    }
 
     #[test]
     fn repository_purge_requires_exact_id_and_never_offers_strict_erasure() {

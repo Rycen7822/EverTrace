@@ -19,6 +19,8 @@ pub struct ResponseEnvelope {
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     Health(HealthResponse),
+    ConfigReload(ConfigReloadResponse),
+    ConfigDocument(ConfigDocumentResponse),
     HostCanary(crate::dto::HostCanaryDiagnostic),
     RecoveryTerminal(RecoveryTerminalResponse),
     RecoveryAction(RecoveryActionResponse),
@@ -27,6 +29,21 @@ pub enum Response {
     RecallCue(RecallCueResponse),
     SessionImportAdmin(SessionImportAdminResponse),
     HumanGovernance(HumanGovernanceResponse),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigDocumentResponse {
+    pub source: String,
+    pub file_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigReloadResponse {
+    pub active_hash: [u8; 32],
+    pub pending_hash: Option<[u8; 32]>,
+    pub outcome: crate::dto::ConfigReloadOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

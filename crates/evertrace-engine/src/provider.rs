@@ -13,7 +13,7 @@ use evertrace_domain::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::Notify;
 
 pub const PROVIDER_REQUEST_MAX_BYTES: usize = 128 * 1024;
 pub const PROVIDER_RESPONSE_MAX_BYTES: usize = 256 * 1024;
@@ -185,8 +185,95 @@ pub struct OpenAiCompatibleProvider {
     endpoint: String,
     model: String,
     api_key_env: String,
-    semaphore: Arc<Semaphore>,
+    concurrency: Arc<ProviderConcurrency>,
     timeout: Duration,
+}
+
+pub(crate) struct ProviderConcurrency {
+    state: std::sync::Mutex<(usize, usize)>,
+    changed: Notify,
+}
+
+impl ProviderConcurrency {
+    pub(crate) fn new(limit: u8) -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new((0, usize::from(limit))),
+            changed: Notify::new(),
+        })
+    }
+
+    pub(crate) fn set_limit(&self, limit: u8) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = usize::from(limit);
+        self.changed.notify_waiters();
+    }
+
+    async fn acquire(self: &Arc<Self>) -> ProviderPermit {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.0 < state.1 {
+                    state.0 += 1;
+                    return ProviderPermit(Arc::clone(self));
+                }
+            }
+            changed.await;
+        }
+    }
+}
+
+struct ProviderPermit(Arc<ProviderConcurrency>);
+impl Drop for ProviderPermit {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 -= 1;
+        self.0.changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn changed_limit_keeps_existing_requests_in_the_same_count() {
+        let pool = ProviderConcurrency::new(2);
+        let first = pool.acquire().await;
+        let second = pool.acquire().await;
+        pool.set_limit(1);
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pool.acquire())
+                .await
+                .is_err()
+        );
+        drop(second);
+        let one = tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+            .await
+            .unwrap();
+        pool.set_limit(2);
+        let two = tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pool.acquire())
+                .await
+                .is_err()
+        );
+        drop((one, two));
+        assert_eq!(pool.state.lock().unwrap().0, 0);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -211,6 +298,13 @@ pub enum ProviderError {
 
 impl OpenAiCompatibleProvider {
     pub fn new(config: &LlmConfig) -> Result<Self, ProviderError> {
+        Self::with_concurrency(config, ProviderConcurrency::new(config.max_concurrency))
+    }
+
+    pub(crate) fn with_concurrency(
+        config: &LlmConfig,
+        concurrency: Arc<ProviderConcurrency>,
+    ) -> Result<Self, ProviderError> {
         if !config.enabled
             || config.provider != "openai_compatible"
             || config.episode_enrichment == evertrace_domain::config::EpisodeEnrichment::Off
@@ -230,7 +324,7 @@ impl OpenAiCompatibleProvider {
             endpoint,
             model: config.model.clone(),
             api_key_env: config.api_key_env.clone(),
-            semaphore: Arc::new(Semaphore::new(usize::from(config.max_concurrency))),
+            concurrency,
             timeout: Duration::from_secs(config.timeout.seconds()),
         })
     }
@@ -270,11 +364,7 @@ impl OpenAiCompatibleProvider {
         if encoded.len() > PROVIDER_REQUEST_MAX_BYTES {
             return Err(ProviderError::RequestOversize);
         }
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| ProviderError::Transport)?;
+        let _permit = self.concurrency.acquire().await;
         let response = self
             .client
             .post(&self.endpoint)

@@ -27,6 +27,9 @@ pub(crate) enum FutureOperationShell {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProposalEditContext {
+    Configuration {
+        file_hash: String,
+    },
     Proposal(HumanProposalReview),
     SupportReplacement {
         expected_validation_revision_id: evertrace_domain::revision::RevisionId,

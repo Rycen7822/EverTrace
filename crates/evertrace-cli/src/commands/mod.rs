@@ -14,6 +14,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     match args.command {
         Command::ConfigCheck => config::check(args.config),
         Command::ConfigShowEffective => config::show_effective(args.config),
+        Command::ConfigReload { socket } => config::reload(args.config, socket).await,
         Command::Doctor { refresh_host } => doctor::run(args.config, refresh_host).await,
         Command::Upgrade {
             check_package,

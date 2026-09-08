@@ -162,16 +162,20 @@ impl McpActionService {
             ));
         };
         drop(runtime);
-        EvidenceIngestor::new(
+        let mut ingestor = EvidenceIngestor::new(
             self.runtime_snapshot.clone(),
             self.writer.clone(),
             self.runtime_snapshot.effective_config_hash,
             "s20-mcp-v1",
         )
-        .map_err(|_| McpServiceError::Store)?
-        .drain_observations_once(&[observation_id])
-        .await
         .map_err(|_| McpServiceError::Store)?;
+        if let Some(config) = &self.operation_config {
+            ingestor = ingestor.with_operation_config(std::sync::Arc::clone(config));
+        }
+        ingestor
+            .drain_observations_once(&[observation_id])
+            .await
+            .map_err(|_| McpServiceError::Store)?;
         let details = serde_json::to_string(&AddResultDetails {
             authorization_status: "unverified",
             proposal_created: false,

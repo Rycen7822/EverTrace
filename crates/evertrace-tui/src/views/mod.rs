@@ -640,13 +640,23 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
             HumanSystemDetail::Config {
                 config_version,
                 effective_config_hash,
-            } => lines.extend([
-                format!("config version: {config_version}"),
-                format!(
-                    "effective config hash: {}",
-                    evertrace_domain::evidence::hex(effective_config_hash)
-                ),
-            ]),
+                reload,
+            } => {
+                lines.extend([
+                    format!("config version: {config_version}"),
+                    format!(
+                        "effective config hash: {}",
+                        evertrace_domain::evidence::hex(effective_config_hash)
+                    ),
+                ]);
+                if let Some(detail) = reload {
+                    lines.push(format!(
+                        "reload: {:?} ({:?})",
+                        detail.outcome, detail.source
+                    ));
+                    lines.push(format!("actor: {}", detail.actor));
+                }
+            }
         }
     }
     if state.detail.is_some() {
