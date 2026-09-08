@@ -13,7 +13,9 @@ pub enum Command {
     Doctor {
         refresh_host: Option<PathBuf>,
     },
-    Upgrade,
+    Upgrade {
+        check_package: Option<PathBuf>,
+    },
     Install {
         host_executable: PathBuf,
     },
@@ -52,7 +54,16 @@ impl Args {
                 backup: PathBuf::from(values.next().ok_or("restore requires a backup path")?),
             }
         } else if command == "upgrade" {
-            Command::Upgrade
+            let check_package = match values.next() {
+                None => None,
+                Some(flag) if flag == "--check" => {
+                    Some(PathBuf::from(values.next().ok_or(
+                        "upgrade --check requires an explicit package directory",
+                    )?))
+                }
+                Some(_) => return Err(usage()),
+            };
+            Command::Upgrade { check_package }
         } else if command == "install" {
             Command::Install {
                 host_executable: PathBuf::from(
@@ -119,5 +130,5 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade|install CODEX_EXECUTABLE|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY]|install CODEX_EXECUTABLE|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
 }

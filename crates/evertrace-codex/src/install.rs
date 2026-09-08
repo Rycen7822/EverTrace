@@ -436,7 +436,7 @@ fn package_bytes(path: &Path) -> Result<Vec<u8>, InstallError> {
     Ok(bytes)
 }
 
-fn unit_bytes(paths: &ManagedInstallPaths) -> Result<Vec<u8>, InstallError> {
+fn unit_bytes(daemon: &Path, config: &Path) -> Result<Vec<u8>, InstallError> {
     let quote = |path: &Path| -> Result<String, InstallError> {
         let value = path.to_str().ok_or(InstallError::InvalidType)?;
         if !path.is_absolute() || value.chars().any(char::is_control) {
@@ -453,8 +453,8 @@ fn unit_bytes(paths: &ManagedInstallPaths) -> Result<Vec<u8>, InstallError> {
     };
     Ok(
         include_str!("../../../packaging/systemd/evertraced.service.in")
-            .replace("@DAEMON@", &quote(&paths.daemon)?)
-            .replace("@CONFIG@", &quote(&paths.config)?)
+            .replace("@DAEMON@", &quote(daemon)?)
+            .replace("@CONFIG@", &quote(config)?)
             .into_bytes(),
     )
 }
@@ -593,7 +593,7 @@ pub fn managed_install(
         };
         stage = "unit ownership";
         let mut unit = InstallFile::read(&paths.unit)?;
-        let expected_unit = unit_bytes(paths)?;
+        let expected_unit = unit_bytes(&paths.daemon, &paths.config)?;
         if unit
             .original
             .as_ref()
@@ -939,6 +939,221 @@ pub struct HookBackupSnapshot {
 pub struct CurrentHookSnapshot {
     pub generation: u64,
     pub files: [FrozenHookFile; 4],
+}
+
+pub struct UnpublishedPackage {
+    pub generation: u64,
+    pub executable: PathBuf,
+    pub runtime: PathBuf,
+    pub host_configuration: PathBuf,
+    pub service_unit: PathBuf,
+    assets: Vec<(PathBuf, HookFileIdentity)>,
+    snapshot: CurrentHookSnapshot,
+    host: InstallFile,
+    service: InstallFile,
+}
+
+impl UnpublishedPackage {
+    pub fn validate(&self) -> Result<(), InstallError> {
+        self.host
+            .revalidate(self.host.original.as_ref().map(|(identity, _)| identity))?;
+        self.service
+            .revalidate(self.service.original.as_ref().map(|(identity, _)| identity))?;
+        for (path, expected) in [
+            (&self.host_configuration, &self.host.desired),
+            (&self.service_unit, &self.service.desired),
+        ] {
+            if read_private_file_bounded(path, 0o600, MAX_CONFIG_BYTES)?
+                != *expected.as_ref().ok_or(InstallError::InvalidType)?
+            {
+                return Err(InstallError::InvalidType);
+            }
+        }
+        for file in &self.snapshot.files {
+            revalidate_frozen_file(file)?;
+        }
+        for (path, identity) in &self.assets {
+            if hook_file_identity(&fs::symlink_metadata(path).map_err(map_io)?) != *identity {
+                return Err(InstallError::InvalidType);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct PackageCheckPreflight {
+    generation: u64,
+    package: PathBuf,
+    assets: Vec<(PathBuf, HookFileIdentity)>,
+    snapshot: CurrentHookSnapshot,
+    host: InstallFile,
+    service: InstallFile,
+}
+
+/// Reject invalid inputs before the caller creates its backup/native candidate.
+pub fn preflight_package_check(
+    data: &Path,
+    config: &Path,
+    host_config: &Path,
+    unit: &Path,
+    package: &Path,
+) -> Result<PackageCheckPreflight, InstallError> {
+    let old_cli = validate_installed_wiring(data, config, host_config)?;
+    let old_package = old_cli.parent().ok_or(InstallError::InvalidType)?;
+    if !package.is_absolute()
+        || package.starts_with(old_package)
+        || old_package.starts_with(package)
+    {
+        return Err(InstallError::InvalidType);
+    }
+    let snapshot = StableLauncher::freeze_current_snapshot(
+        data,
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+    )?;
+    let launcher = StableLauncher {
+        root: data.to_owned(),
+    };
+    let registry = launcher.read_registry()?;
+    let generation = registry
+        .generations
+        .last()
+        .and_then(|entry| entry.generation.checked_add(1))
+        .ok_or(InstallError::ResourceExhausted)?;
+    if data
+        .join(generation_relative(generation, GENERATION_EXECUTABLE_NAME))
+        .parent()
+        .ok_or(InstallError::InvalidType)?
+        .try_exists()
+        .map_err(map_io)?
+    {
+        return Err(InstallError::InvalidType);
+    }
+    let mut assets = Vec::new();
+    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+        let source = package.join(name);
+        let identity = hook_file_identity(&package_metadata(&source)?);
+        let previous = package_metadata(&old_package.join(name))?;
+        if (identity.device, identity.inode) == (previous.dev(), previous.ino()) {
+            return Err(InstallError::InvalidType);
+        }
+        assets.push((source, identity));
+    }
+    let (status, output) = bounded_install_command(
+        &package.join("evertrace"),
+        &[
+            "--config",
+            config.to_str().ok_or(InstallError::InvalidType)?,
+            "config",
+            "check",
+        ],
+        None,
+    )?;
+    if status != 0 || output.trim() != "configuration is valid" {
+        return Err(InstallError::InvalidType);
+    }
+    let mut host = InstallFile::read(host_config)?;
+    let old_host = &host.original.as_ref().ok_or(InstallError::InvalidType)?.1;
+    let without_old = merge_wiring(old_host, &wiring(data, &old_cli, config)?, true)?;
+    let proposed = merge_wiring(
+        &without_old,
+        &wiring(data, &package.join("evertrace"), config)?,
+        false,
+    )?;
+    let mut service = InstallFile::read(unit)?;
+    let expected_unit = unit_bytes(&old_package.join("evertraced"), config)?;
+    if service
+        .original
+        .as_ref()
+        .is_none_or(|(_, bytes)| *bytes != expected_unit)
+    {
+        return Err(InstallError::InvalidType);
+    }
+    host.desired = Some(proposed);
+    service.desired = Some(unit_bytes(&package.join("evertraced"), config)?);
+    Ok(PackageCheckPreflight {
+        generation,
+        package: package.to_owned(),
+        assets,
+        snapshot,
+        host,
+        service,
+    })
+}
+
+/// Consume the preflight only inside the caller-owned private native candidate.
+/// No registry, launcher, pin, Host file or service operation is published.
+pub fn prepare_package_check(
+    preflight: PackageCheckPreflight,
+    candidate: &Path,
+    prepare_runtime: impl FnOnce(&Path) -> Result<(), InstallError>,
+) -> Result<UnpublishedPackage, InstallError> {
+    let PackageCheckPreflight {
+        generation,
+        package,
+        assets,
+        snapshot,
+        host,
+        service,
+    } = preflight;
+    let directory = candidate.join("package");
+    let needed = package_metadata(&package.join("evertrace-hook"))?
+        .len()
+        .checked_add(16 * 1024 * 1024)
+        .ok_or(InstallError::ResourceExhausted)?;
+    if fs2::available_space(candidate).map_err(map_io)? < needed {
+        return Err(InstallError::ResourceExhausted);
+    }
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(map_io)?;
+    let mut result = UnpublishedPackage {
+        generation,
+        executable: directory.join(GENERATION_EXECUTABLE_NAME),
+        runtime: directory.join(GENERATION_RUNTIME_NAME),
+        host_configuration: directory.join("host-config.toml"),
+        service_unit: directory.join("evertraced.service"),
+        assets,
+        snapshot,
+        host,
+        service,
+    };
+    atomic_write(
+        &result.executable,
+        &package_bytes(&package.join("evertrace-hook"))?,
+        0o700,
+    )?;
+    prepare_runtime(&result.runtime)?;
+    atomic_write(
+        &result.host_configuration,
+        result
+            .host
+            .desired
+            .as_ref()
+            .ok_or(InstallError::InvalidType)?,
+        0o600,
+    )?;
+    atomic_write(
+        &result.service_unit,
+        result
+            .service
+            .desired
+            .as_ref()
+            .ok_or(InstallError::InvalidType)?,
+        0o600,
+    )?;
+    for (path, mode) in [
+        (&result.executable, 0o700),
+        (&result.runtime, 0o600),
+        (&result.host_configuration, 0o600),
+        (&result.service_unit, 0o600),
+    ] {
+        result
+            .assets
+            .push((path.clone(), private_file_identity(path, mode)?));
+    }
+    result.validate()?;
+    Ok(result)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

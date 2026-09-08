@@ -159,6 +159,80 @@ pub async fn upgrade_offline(
     .await
 }
 
+pub struct PackageUpgradeCheck {
+    pub backup: std::path::PathBuf,
+    pub migrated: bool,
+    pub generation: Option<u64>,
+    pub materials_validated: bool,
+}
+
+/// Pre-publication only. The returned materials result never certifies a Host
+/// or package-ready state; the verified backup survives candidate disposal.
+pub async fn check_package_upgrade(
+    data_dir: &Path,
+    config_path: &Path,
+    host_config: &Path,
+    unit: &Path,
+    package: &Path,
+) -> Result<PackageUpgradeCheck, evertrace_store::restore::RestoreError> {
+    use evertrace_store::restore::{NativeUpgradePreparation, RestoreError};
+    let preflight = evertrace_codex::install::preflight_package_check(
+        data_dir,
+        config_path,
+        host_config,
+        unit,
+        package,
+    )
+    .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+    let preparation = evertrace_store::restore::prepare_native_upgrade(
+        data_dir,
+        config_path,
+        || freeze_hook_backup(data_dir),
+        verify_hook_backup_assets,
+    )
+    .await?;
+    let NativeUpgradePreparation::Prepared(prepared) = preparation else {
+        return Err(evertrace_store::StoreError::InvalidInput.into());
+    };
+    let backup = prepared.backup().to_owned();
+    let migrated = prepared.migrated();
+    let validation = (|| {
+        let mut runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
+            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+        runtime.recovery_gate = evertrace_capture::RecoveryGateMode::Disabled;
+        runtime.recovery_adapter_manifest_id = None;
+        runtime.recall_cue_gate = evertrace_capture::RecallCueGateMode::Disabled;
+        runtime.recall_cue_adapter_manifest_id = None;
+        runtime.recall_cues.clear();
+        let materials = evertrace_codex::install::prepare_package_check(
+            preflight,
+            prepared.path(),
+            |destination| {
+                runtime
+                    .publish(destination)
+                    .map_err(|_| evertrace_codex::install::InstallError::Io)
+            },
+        )
+        .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+        let candidate_runtime = RuntimeSnapshot::load(&materials.runtime)
+            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+        probe_package_capture(prepared.path(), &materials.executable, &candidate_runtime)?;
+        materials
+            .validate()
+            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+        Ok::<_, RestoreError>(materials.generation)
+    })();
+    // Both failed and successful checks dispose only this owned candidate while
+    // the same sibling lock is still held. Unknown residuals are explicit errors.
+    prepared.discard()?;
+    Ok(PackageUpgradeCheck {
+        backup,
+        migrated,
+        generation: validation.as_ref().ok().copied(),
+        materials_validated: validation.is_ok(),
+    })
+}
+
 pub enum OfflineRestoreOutcome {
     Historical { directory: std::path::PathBuf },
     Activated(evertrace_store::restore::RestoreActivated),
@@ -223,7 +297,11 @@ pub async fn restore_offline(
         evertrace_capture::DeviceKeyStore::new(candidate.path().join("keys"))
             .load_or_create()
             .map_err(|_| invalid())?;
-        probe_restore_package(candidate.path(), &runtime)?;
+        probe_package_capture(
+            candidate.path(),
+            &candidate.path().join("hook-v1"),
+            &runtime,
+        )?;
         validate_restore_jobs(&mut candidate, &config, at).await?;
         evertrace_codex::install::StableLauncher::validate_restored_package(
             candidate.path(),
@@ -260,8 +338,9 @@ fn relocate_restore_runtime(runtime: &mut RuntimeSnapshot, root: &Path, config_h
     runtime.recovery_adapter_manifest_id = None;
 }
 
-fn probe_restore_package(
+fn probe_package_capture(
     candidate: &Path,
+    executable: &Path,
     runtime: &RuntimeSnapshot,
 ) -> Result<(), evertrace_store::restore::RestoreError> {
     use evertrace_capture::{CasStore, ConfinedRoot, DurableSpool};
@@ -315,7 +394,7 @@ fn probe_restore_package(
         // same public input contract as the installed Hook, not a special mode.
         let bytes = serde_json::to_vec(&input).map_err(|_| invalid())?;
         evertrace_codex::hook_input::CaptureHookInput::from_json(&bytes).map_err(|_| invalid())?;
-        let mut child = std::process::Command::new(candidate.join("hook-v1"))
+        let mut child = std::process::Command::new(executable)
             .arg("--runtime-snapshot")
             .arg(&snapshot_path)
             .env_clear()

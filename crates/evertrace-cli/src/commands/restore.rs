@@ -1,6 +1,9 @@
 use std::{env, error::Error, path::PathBuf};
 
-pub async fn upgrade(config: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+pub async fn upgrade(
+    config: Option<PathBuf>,
+    check_package: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     let config_path = std::path::absolute(crate::resolve_config_path(config)?)?;
     let effective = super::config::load(Some(config_path.clone()))?;
     let home = env::var_os("HOME").map(PathBuf::from);
@@ -9,6 +12,40 @@ pub async fn upgrade(config: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
         home.as_deref(),
         |name| env::var_os(name),
     )?;
+    if let Some(package) = check_package {
+        if !package.is_absolute() {
+            return Err("candidate package directory must be absolute".into());
+        }
+        let home = home.as_ref().ok_or("HOME unavailable")?;
+        let host = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"));
+        let configuration = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let checked = evertrace_engine::maintenance::check_package_upgrade(
+            &data_dir,
+            &config_path,
+            &std::path::absolute(host.join("config.toml"))?,
+            &std::path::absolute(configuration.join("systemd/user/evertraced.service"))?,
+            &package,
+        )
+        .await?;
+        println!(
+            "scope=package_prepublication check=not-ready native_prepared=true migrated={} materials_validated={} generation={:?} backup={} candidate_removed=true",
+            checked.migrated,
+            checked.materials_validated,
+            checked.generation,
+            checked.backup.display()
+        );
+        return Err(if checked.materials_validated {
+            "not-ready: candidate Host proof unavailable"
+        } else {
+            "not-ready: candidate package material validation failed"
+        }
+        .into());
+    }
+    println!("scope=native_store");
     use evertrace_store::restore::NativeUpgradeOutcome;
     match evertrace_engine::maintenance::upgrade_offline(&data_dir, &config_path).await? {
         NativeUpgradeOutcome::Empty => println!("upgrade=noop reason=empty_store"),

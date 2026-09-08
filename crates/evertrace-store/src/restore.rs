@@ -44,6 +44,70 @@ async fn upgrade_native_inner(
     verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
     checkpoint: impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
 ) -> Result<NativeUpgradeOutcome, RestoreError> {
+    match prepare_upgrade_inner(
+        data_dir,
+        config_path,
+        freeze_hook,
+        verify_hook,
+        false,
+        &checkpoint,
+    )
+    .await?
+    {
+        NativeUpgradePreparation::Unchanged(outcome) => Ok(outcome),
+        NativeUpgradePreparation::Prepared(prepared) => prepared.publish(checkpoint).await,
+    }
+}
+
+pub enum NativeUpgradePreparation {
+    Unchanged(NativeUpgradeOutcome),
+    Prepared(Box<PreparedNativeUpgrade>),
+}
+
+pub struct PreparedNativeUpgrade {
+    lock: crate::SiblingWriterLock,
+    parent: evertrace_capture::ConfinedRoot,
+    source_root: evertrace_capture::ConfinedRoot,
+    source_tables: Vec<(PathBuf, evertrace_capture::ConfinedRoot)>,
+    data_dir: PathBuf,
+    source: PathBuf,
+    canonical: PathBuf,
+    canonical_exists: bool,
+    candidate: PathBuf,
+    custody: evertrace_capture::ConfinedRoot,
+    backup: PathBuf,
+    verification: crate::backup::BackupVerification,
+    prepared_manifest: Vec<crate::backup::BackupFileManifest>,
+    table_names: &'static [&'static str],
+    migrated: bool,
+}
+
+/// Package checks require the actual backup/replay boundary even at L0002.
+pub async fn prepare_native_upgrade(
+    data_dir: &Path,
+    config_path: &Path,
+    freeze_hook: impl FnOnce() -> Result<crate::backup::BackupHookBoundary, crate::BackupError>,
+    verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
+) -> Result<NativeUpgradePreparation, RestoreError> {
+    prepare_upgrade_inner(
+        data_dir,
+        config_path,
+        freeze_hook,
+        verify_hook,
+        true,
+        &|_| Ok(()),
+    )
+    .await
+}
+
+async fn prepare_upgrade_inner(
+    data_dir: &Path,
+    config_path: &Path,
+    freeze_hook: impl FnOnce() -> Result<crate::backup::BackupHookBoundary, crate::BackupError>,
+    verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
+    check_package: bool,
+    checkpoint: &impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
+) -> Result<NativeUpgradePreparation, RestoreError> {
     let lock = crate::SiblingWriterLock::acquire(data_dir)?;
     let parent = evertrace_capture::ConfinedRoot::open_owned_private(data_dir)
         .map_err(|_| RestoreError::Io)?;
@@ -74,9 +138,11 @@ async fn upgrade_native_inner(
         {
             return Err(StoreError::StoreCorrupt.into());
         }
-        return Ok(NativeUpgradeOutcome::Empty);
+        return Ok(NativeUpgradePreparation::Unchanged(
+            NativeUpgradeOutcome::Empty,
+        ));
     }
-    let table_names: &[&str] = if profile == Some("L0001") {
+    let table_names: &'static [&'static str] = if profile == Some("L0001") {
         &[crate::JOURNAL_TABLE, crate::OBJECTS_TABLE]
     } else {
         &[
@@ -96,7 +162,7 @@ async fn upgrade_native_inner(
         })
         .collect::<Result<Vec<_>, _>>()?;
     crate::backup::read_verified_store_tables(source).await?;
-    if canonical_exists && profile == Some("L0002") {
+    if !check_package && canonical_exists && profile == Some("L0002") {
         let mut retained_native = Vec::new();
         for table in table_names {
             let path = data_dir.join(format!("{table}.lance"));
@@ -106,7 +172,9 @@ async fn upgrade_native_inner(
                 Err(_) => return Err(RestoreError::Io),
             }
         }
-        return Ok(NativeUpgradeOutcome::Noop { retained_native });
+        return Ok(NativeUpgradePreparation::Unchanged(
+            NativeUpgradeOutcome::Noop { retained_native },
+        ));
     }
     if canonical_exists {
         validate_upgrade_container_entries(source, table_names)?;
@@ -214,190 +282,257 @@ async fn upgrade_native_inner(
             };
         }
     };
-    let directory_identity = |path: &Path| -> Result<(u64, u64), RestoreError> {
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| RestoreError::Io)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(StoreError::StoreCorrupt.into());
-        }
-        Ok((metadata.dev(), metadata.ino()))
-    };
-    let candidate_identity =
-        directory_identity(&candidate).map_err(|cause| RestoreError::ResidualCandidate {
-            directory: candidate.clone(),
+    Ok(NativeUpgradePreparation::Prepared(Box::new(
+        PreparedNativeUpgrade {
+            lock,
+            parent,
+            source_root,
+            source_tables,
+            data_dir: data_dir.to_owned(),
+            source: source.to_owned(),
+            canonical,
+            canonical_exists,
+            candidate,
+            custody,
+            backup,
+            verification,
+            prepared_manifest,
+            table_names,
+            migrated: profile == Some("L0001"),
+        },
+    )))
+}
+
+impl PreparedNativeUpgrade {
+    pub fn path(&self) -> &Path {
+        &self.candidate
+    }
+    pub fn backup(&self) -> &Path {
+        &self.backup
+    }
+    pub fn migrated(&self) -> bool {
+        self.migrated
+    }
+
+    pub fn discard(self) -> Result<(), RestoreError> {
+        let cleanup = self
+            .lock
+            .validate_held()
+            .map_err(RestoreError::from)
+            .and_then(|()| remove_owned_candidate_tree(&self.candidate, &self.custody));
+        cleanup.map_err(|cause| RestoreError::ResidualCandidate {
+            directory: self.candidate,
             cause: Box::new(cause),
-        })?;
-    let previous_identity =
-        directory_identity(source).map_err(|cause| RestoreError::ResidualCandidate {
-            directory: candidate.clone(),
-            cause: Box::new(cause),
-        })?;
-    // No semantic write resumes until publication, directory sync and validation
-    // have all succeeded. Flat source tables are never moved or overwritten.
-    let publish = if canonical_exists {
-        parent.exchange_directories(&custody, &source_root)
-    } else {
-        parent.publish_directory_noreplace(&custody, "store")
-    };
-    if publish.is_err() {
-        let source_unchanged = directory_identity(&candidate).ok() == Some(candidate_identity);
-        let target_unchanged = if canonical_exists {
-            directory_identity(&canonical).ok() == Some(previous_identity)
-        } else {
-            directory_identity(&canonical).ok() != Some(candidate_identity)
+        })
+    }
+
+    async fn publish(
+        self,
+        checkpoint: impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
+    ) -> Result<NativeUpgradeOutcome, RestoreError> {
+        let Self {
+            lock,
+            parent,
+            source_root,
+            source_tables,
+            data_dir,
+            source,
+            canonical,
+            canonical_exists,
+            candidate,
+            custody,
+            backup,
+            verification,
+            prepared_manifest,
+            table_names,
+            migrated,
+        } = self;
+        let source = source.as_path();
+        let directory_identity = |path: &Path| -> Result<(u64, u64), RestoreError> {
+            let metadata = std::fs::symlink_metadata(path).map_err(|_| RestoreError::Io)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(StoreError::StoreCorrupt.into());
+            }
+            Ok((metadata.dev(), metadata.ino()))
         };
-        if source_unchanged
-            && target_unchanged
-            && parent.revalidate_stable().is_ok()
-            && lock.validate_held().is_ok()
-        {
-            remove_owned_candidate_tree(&candidate, &custody).map_err(|cause| {
+        let candidate_identity =
+            directory_identity(&candidate).map_err(|cause| RestoreError::ResidualCandidate {
+                directory: candidate.clone(),
+                cause: Box::new(cause),
+            })?;
+        let previous_identity =
+            directory_identity(source).map_err(|cause| RestoreError::ResidualCandidate {
+                directory: candidate.clone(),
+                cause: Box::new(cause),
+            })?;
+        // No semantic write resumes until publication, directory sync and validation
+        // have all succeeded. Flat source tables are never moved or overwritten.
+        let publish = if canonical_exists {
+            parent.exchange_directories(&custody, &source_root)
+        } else {
+            parent.publish_directory_noreplace(&custody, "store")
+        };
+        if publish.is_err() {
+            let source_unchanged = directory_identity(&candidate).ok() == Some(candidate_identity);
+            let target_unchanged = if canonical_exists {
+                directory_identity(&canonical).ok() == Some(previous_identity)
+            } else {
+                directory_identity(&canonical).ok() != Some(candidate_identity)
+            };
+            if source_unchanged
+                && target_unchanged
+                && parent.revalidate_stable().is_ok()
+                && lock.validate_held().is_ok()
+            {
+                remove_owned_candidate_tree(&candidate, &custody).map_err(|cause| {
+                    RestoreError::ResidualCandidate {
+                        directory: candidate.clone(),
+                        cause: Box::new(cause),
+                    }
+                })?;
+                return Err(RestoreError::Io);
+            }
+            return Err(RestoreError::NativePublicationUncertain {
+                active: canonical,
+                preserved: candidate,
+            });
+        }
+        let checked = async {
+            checkpoint(NativePublicationPoint::Published)?;
+            std::fs::File::open(&data_dir)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| RestoreError::Io)?;
+            checkpoint(NativePublicationPoint::Durable)?;
+            lock.validate_held()?;
+            let (states, _) = crate::backup::read_verified_store_tables(&canonical).await?;
+            if states.relations.is_none() || states.search.is_none() {
+                return Err(StoreError::StoreCorrupt.into());
+            }
+            if crate::backup::native_upgrade_manifest(&canonical)? != prepared_manifest {
+                return Err(StoreError::StoreCorrupt.into());
+            }
+            Ok::<_, RestoreError>(())
+        }
+        .await;
+        if let Err(cause) = checked {
+            if directory_identity(&canonical).ok() != Some(candidate_identity)
+                || (canonical_exists
+                    && directory_identity(&candidate).ok() != Some(previous_identity))
+            {
+                return Err(RestoreError::NativePublicationUncertain {
+                    active: canonical,
+                    preserved: candidate,
+                });
+            }
+            let active =
+                evertrace_capture::ConfinedRoot::open_owned_private(&canonical).map_err(|_| {
+                    RestoreError::NativePublicationUncertain {
+                        active: canonical.clone(),
+                        preserved: candidate.clone(),
+                    }
+                })?;
+            let rollback = if canonical_exists {
+                evertrace_capture::ConfinedRoot::open_owned_private(&candidate)
+                    .and_then(|old| parent.exchange_directories(&active, &old))
+            } else {
+                parent.publish_directory_noreplace(
+                    &active,
+                    candidate
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or(RestoreError::Io)?,
+                )
+            };
+            if rollback.is_err()
+                || std::fs::File::open(&data_dir)
+                    .and_then(|file| file.sync_all())
+                    .is_err()
+            {
+                return Err(RestoreError::NativePublicationUncertain {
+                    active: canonical,
+                    preserved: candidate,
+                });
+            }
+            if directory_identity(&candidate).ok() != Some(candidate_identity) {
+                return Err(RestoreError::NativePublicationUncertain {
+                    active: canonical,
+                    preserved: candidate,
+                });
+            }
+            let rolled_back = evertrace_capture::ConfinedRoot::open_owned_private(&candidate)
+                .map_err(|_| RestoreError::ResidualCandidate {
+                    directory: candidate.clone(),
+                    cause: Box::new(RestoreError::Io),
+                })?;
+            remove_owned_candidate_tree(&candidate, &rolled_back).map_err(|cause| {
                 RestoreError::ResidualCandidate {
                     directory: candidate.clone(),
                     cause: Box::new(cause),
                 }
             })?;
-            return Err(RestoreError::Io);
+            return Err(cause);
         }
-        return Err(RestoreError::NativePublicationUncertain {
-            active: canonical,
-            preserved: candidate,
-        });
-    }
-    let checked = async {
-        checkpoint(NativePublicationPoint::Published)?;
-        std::fs::File::open(data_dir)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| RestoreError::Io)?;
-        checkpoint(NativePublicationPoint::Durable)?;
-        lock.validate_held()?;
-        let (states, _) = crate::backup::read_verified_store_tables(&canonical).await?;
-        if states.relations.is_none() || states.search.is_none() {
-            return Err(StoreError::StoreCorrupt.into());
-        }
-        if crate::backup::native_upgrade_manifest(&canonical)? != prepared_manifest {
-            return Err(StoreError::StoreCorrupt.into());
-        }
-        Ok::<_, RestoreError>(())
-    }
-    .await;
-    if let Err(cause) = checked {
-        if directory_identity(&canonical).ok() != Some(candidate_identity)
-            || (canonical_exists && directory_identity(&candidate).ok() != Some(previous_identity))
-        {
-            return Err(RestoreError::NativePublicationUncertain {
-                active: canonical,
-                preserved: candidate,
-            });
-        }
-        let active =
-            evertrace_capture::ConfinedRoot::open_owned_private(&canonical).map_err(|_| {
-                RestoreError::NativePublicationUncertain {
-                    active: canonical.clone(),
-                    preserved: candidate.clone(),
-                }
-            })?;
-        let rollback = if canonical_exists {
-            evertrace_capture::ConfinedRoot::open_owned_private(&candidate)
-                .and_then(|old| parent.exchange_directories(&active, &old))
+        let retained_native = if canonical_exists {
+            if directory_identity(&candidate).ok() != Some(previous_identity) {
+                return Err(RestoreError::NativePublicationUncertain {
+                    active: canonical,
+                    preserved: candidate,
+                });
+            }
+            match validate_upgrade_container_entries(&candidate, table_names).and_then(|()| {
+                let old = evertrace_capture::ConfinedRoot::open_owned_private(&candidate)
+                    .map_err(|_| RestoreError::Io)?;
+                remove_owned_candidate_tree(&candidate, &old)
+            }) {
+                Ok(()) => Vec::new(),
+                Err(_) => vec![candidate],
+            }
         } else {
-            parent.publish_directory_noreplace(
-                &active,
-                candidate
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or(RestoreError::Io)?,
-            )
+            let mut retained = Vec::new();
+            for (path, custody) in source_tables {
+                let cleanup = (|| {
+                    custody
+                        .revalidate_stable()
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    let prefix =
+                        Path::new("store").join(path.file_name().ok_or(StoreError::InvalidPath)?);
+                    let expected = verification
+                        .files()
+                        .iter()
+                        .filter_map(|entry| {
+                            let relative =
+                                Path::new(&entry.relative_path).strip_prefix(&prefix).ok()?;
+                            let mut entry = entry.clone();
+                            entry.relative_path = if relative.as_os_str().is_empty() {
+                                "store".to_owned()
+                            } else {
+                                Path::new("store").join(relative).to_str()?.to_owned()
+                            };
+                            Some(entry)
+                        })
+                        .collect::<Vec<_>>();
+                    if expected.is_empty()
+                        || crate::backup::native_upgrade_manifest(&path)? != expected
+                    {
+                        return Err(StoreError::StoreCorrupt.into());
+                    }
+                    custody
+                        .revalidate_stable()
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    remove_owned_candidate_tree(&path, &custody)
+                })();
+                if cleanup.is_err() {
+                    retained.push(path);
+                }
+            }
+            retained
         };
-        if rollback.is_err()
-            || std::fs::File::open(data_dir)
-                .and_then(|file| file.sync_all())
-                .is_err()
-        {
-            return Err(RestoreError::NativePublicationUncertain {
-                active: canonical,
-                preserved: candidate,
-            });
-        }
-        if directory_identity(&candidate).ok() != Some(candidate_identity) {
-            return Err(RestoreError::NativePublicationUncertain {
-                active: canonical,
-                preserved: candidate,
-            });
-        }
-        let rolled_back =
-            evertrace_capture::ConfinedRoot::open_owned_private(&candidate).map_err(|_| {
-                RestoreError::ResidualCandidate {
-                    directory: candidate.clone(),
-                    cause: Box::new(RestoreError::Io),
-                }
-            })?;
-        remove_owned_candidate_tree(&candidate, &rolled_back).map_err(|cause| {
-            RestoreError::ResidualCandidate {
-                directory: candidate.clone(),
-                cause: Box::new(cause),
-            }
-        })?;
-        return Err(cause);
+        Ok(NativeUpgradeOutcome::Published {
+            backup,
+            migrated,
+            retained_native,
+        })
     }
-    let retained_native = if canonical_exists {
-        if directory_identity(&candidate).ok() != Some(previous_identity) {
-            return Err(RestoreError::NativePublicationUncertain {
-                active: canonical,
-                preserved: candidate,
-            });
-        }
-        match validate_upgrade_container_entries(&candidate, table_names).and_then(|()| {
-            let old = evertrace_capture::ConfinedRoot::open_owned_private(&candidate)
-                .map_err(|_| RestoreError::Io)?;
-            remove_owned_candidate_tree(&candidate, &old)
-        }) {
-            Ok(()) => Vec::new(),
-            Err(_) => vec![candidate],
-        }
-    } else {
-        let mut retained = Vec::new();
-        for (path, custody) in source_tables {
-            let cleanup = (|| {
-                custody
-                    .revalidate_stable()
-                    .map_err(|_| StoreError::StoreCorrupt)?;
-                let prefix =
-                    Path::new("store").join(path.file_name().ok_or(StoreError::InvalidPath)?);
-                let expected = verification
-                    .files()
-                    .iter()
-                    .filter_map(|entry| {
-                        let relative =
-                            Path::new(&entry.relative_path).strip_prefix(&prefix).ok()?;
-                        let mut entry = entry.clone();
-                        entry.relative_path = if relative.as_os_str().is_empty() {
-                            "store".to_owned()
-                        } else {
-                            Path::new("store").join(relative).to_str()?.to_owned()
-                        };
-                        Some(entry)
-                    })
-                    .collect::<Vec<_>>();
-                if expected.is_empty() || crate::backup::native_upgrade_manifest(&path)? != expected
-                {
-                    return Err(StoreError::StoreCorrupt.into());
-                }
-                custody
-                    .revalidate_stable()
-                    .map_err(|_| StoreError::StoreCorrupt)?;
-                remove_owned_candidate_tree(&path, &custody)
-            })();
-            if cleanup.is_err() {
-                retained.push(path);
-            }
-        }
-        retained
-    };
-    Ok(NativeUpgradeOutcome::Published {
-        backup,
-        migrated: profile == Some("L0001"),
-        retained_native,
-    })
 }
 
 fn reject_retained_upgrade_candidate(data_dir: &Path) -> Result<(), RestoreError> {

@@ -58,6 +58,163 @@ fn service(paths: &ManagedInstallPaths, body: &str) {
     fs::set_permissions(&paths.systemctl, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+#[tokio::test]
+async fn package_check_prepares_native_and_materials_without_publication() {
+    use evertrace_engine::maintenance::{check_package_upgrade, upgrade_offline};
+    use std::os::unix::fs::MetadataExt;
+    let (root, mut paths, _) = fixture();
+    paths.unit = root.path().join("config/systemd/user/evertraced.service");
+    install_offline(&paths, false).unwrap();
+    let connection =
+        evertrace_store::connection::CompatibilityStore::connect_local(&paths.data_root)
+            .await
+            .unwrap();
+    evertrace_store::L0001::apply(connection.connection())
+        .await
+        .unwrap();
+    drop(connection);
+    let native = serde_json::json!({"cwd": paths.data_root, "hook_event_name":"PreToolUse", "model":"test", "permission_mode":"default", "session_id":"package-pin", "tool_input":{"command":"true"}, "tool_name":"Bash", "tool_use_id":"one", "transcript_path":null, "turn_id":"one"});
+    invoke(&paths, &serde_json::to_vec(&native).unwrap());
+    let owned = [
+        paths.config.clone(),
+        paths.host_config.clone(),
+        paths.unit.clone(),
+        paths.data_root.join("hook-v1"),
+        paths.data_root.join("hooks/registry-v1.json"),
+        paths.data_root.join("hooks/pins/package-pin.pin"),
+        paths.data_root.join("hooks/generations/1/evertrace-hook"),
+        paths
+            .data_root
+            .join("hooks/generations/1/hook-runtime-v1.json"),
+        RuntimeSnapshot::snapshot_path(&paths.data_root),
+    ];
+    let before = owned
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    let package = root.path().join("next-package");
+    for invalid in [&package, paths.cli.parent().unwrap()] {
+        assert!(
+            check_package_upgrade(
+                &paths.data_root,
+                &paths.config,
+                &paths.host_config,
+                &paths.unit,
+                invalid,
+            )
+            .await
+            .is_err()
+        );
+        assert!(!paths.data_root.join("backups").exists());
+        assert!(!fs::read_dir(&paths.data_root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".upgrade-")
+        }));
+    }
+    fs::create_dir(&package).unwrap();
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+        fs::copy(paths.cli.parent().unwrap().join(name), package.join(name)).unwrap();
+        fs::set_permissions(package.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let checked = check_package_upgrade(
+        &paths.data_root,
+        &paths.config,
+        &paths.host_config,
+        &paths.unit,
+        &package,
+    )
+    .await
+    .unwrap();
+    assert!(checked.materials_validated && checked.migrated);
+    assert_eq!(checked.generation, Some(2));
+    assert!(!paths.data_root.join("store").exists());
+    assert!(matches!(
+        JournalWriter::open(&paths.data_root).await,
+        Err(evertrace_store::StoreError::UpgradeRequired)
+    ));
+    let id = checked
+        .backup
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("backup-")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let verified = evertrace_store::backup::verify_backup(&paths.data_root, id)
+        .await
+        .unwrap();
+    assert!(verified.table_states.relations.is_none());
+    assert!(!fs::read_dir(&paths.data_root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".upgrade-")
+    }));
+    upgrade_offline(&paths.data_root, &paths.config)
+        .await
+        .unwrap();
+    let canonical = paths.data_root.join("store");
+    let metadata = fs::metadata(&canonical).unwrap();
+    let backups_before = fs::read_dir(paths.data_root.join("backups"))
+        .unwrap()
+        .count();
+    let output = Command::new(&paths.cli)
+        .arg("--config")
+        .arg(&paths.config)
+        .args(["upgrade", "--check"])
+        .arg(&package)
+        .env("CODEX_HOME", paths.host_config.parent().unwrap())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.contains("scope=package_prepublication check=not-ready"),
+        "{output}"
+    );
+    assert!(output.contains("materials_validated=true"), "{output}");
+    assert!(output.contains("migrated=false"));
+    assert_eq!(
+        fs::read_dir(paths.data_root.join("backups"))
+            .unwrap()
+            .count(),
+        backups_before + 1
+    );
+    // Exit zero from a fake Hook must fail the real CAS/spool probe, then clean.
+    fs::write(package.join("evertrace-hook"), b"#!/bin/sh\nexit 0\n").unwrap();
+    let rejected = check_package_upgrade(
+        &paths.data_root,
+        &paths.config,
+        &paths.host_config,
+        &paths.unit,
+        &package,
+    )
+    .await
+    .unwrap();
+    assert!(!rejected.materials_validated);
+    assert!(rejected.backup.is_dir());
+    assert!(!fs::read_dir(&paths.data_root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".upgrade-")
+    }));
+    let after = fs::metadata(&canonical).unwrap();
+    assert_eq!((metadata.dev(), metadata.ino()), (after.dev(), after.ino()));
+    for (path, expected) in owned.iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), expected, "{}", path.display());
+    }
+}
+
 fn invoke(paths: &ManagedInstallPaths, bytes: &[u8]) {
     let mut child = Command::new(paths.data_root.join("hook-v1"))
         .arg("--launcher-root")
