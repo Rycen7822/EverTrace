@@ -145,6 +145,7 @@ impl LocalServer {
                 | Command::ConfigRead
                 | Command::ConfigWrite(_)
                 | Command::McpCall(_)
+                | Command::McpReturned { .. }
                 | Command::RecallCue(_)
                 | Command::SessionImportAdmin(_)
                 | Command::HumanGovernance(_) => Err(ErrorCode::InvalidInput),
@@ -331,6 +332,7 @@ where
     let connection_context = dto::ConnectionContext {
         connection_id,
         client_kind: handshake.client_kind,
+        mcp_returned: None,
     };
     let ack = ServerEnvelope::HandshakeAck(HandshakeAck {
         protocol_version: PROTOCOL_VERSION,
@@ -355,6 +357,7 @@ where
         options.frame_timeout,
     )
     .await?;
+    let mut pending_mcp_return = None;
     loop {
         let message = tokio::select! {
             result = read_frame::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout) => {
@@ -407,25 +410,68 @@ where
                 .await;
                 continue;
             }
-            let dispatched = match command_handler(
-                connection_context.clone(),
-                command.request_id,
-                command.command,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(code) => {
-                    let _ = send_wire_error(
+            let mut context = connection_context.clone();
+            let search = matches!(&command.command, Command::McpCall(call) if call.input.action == mcp::McpAction::Search);
+            if let Command::McpReturned { request_id } = &command.command {
+                if pending_mcp_return
+                    .as_ref()
+                    .is_some_and(|(sent_id, _)| sent_id == request_id)
+                    && context.client_kind == dto::ClientKind::Mcp
+                {
+                    context.mcp_returned = pending_mcp_return.take();
+                } else {
+                    send_wire_error(
                         &mut stream,
-                        code,
+                        ErrorCode::Untrusted,
                         Some(command.request_id),
                         negotiated_max as usize,
                         options,
                     )
-                    .await;
+                    .await?;
                     continue;
                 }
+            } else {
+                pending_mcp_return = None;
+            }
+            let dispatched =
+                match command_handler(context, command.request_id, command.command).await {
+                    Ok(value) => value,
+                    Err(code) => {
+                        let _ = send_wire_error(
+                            &mut stream,
+                            code,
+                            Some(command.request_id),
+                            negotiated_max as usize,
+                            options,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+            let returned = if search {
+                match &dispatched {
+                    Response::McpResult(result)
+                        if result.request_id == command.request_id
+                            && result.items.procedures.len() <= 2 =>
+                    {
+                        let revisions = result
+                            .items
+                            .procedures
+                            .iter()
+                            .map(|item| {
+                                item.object_revision_ref.as_deref().and_then(|value| {
+                                    value.parse::<evertrace_domain::revision::RevisionId>().ok()
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        revisions
+                            .filter(|items| !items.is_empty())
+                            .map(|items| (command.request_id, items))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
             };
             let response = ServerEnvelope::Response(response::ResponseEnvelope {
                 request_id: command.request_id,
@@ -449,6 +495,7 @@ where
                 options.frame_timeout,
             )
             .await?;
+            pending_mcp_return = returned;
         }
     }
 }
@@ -688,6 +735,7 @@ pub async fn request_health(
             | Response::RecoveryAction(_)
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)
+            | Response::McpReturned
             | Response::RecallCue(_)
             | Response::SessionImportAdmin(_)
             | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),
@@ -764,6 +812,7 @@ pub async fn request_recovery(
             | Response::RecoveryTerminal(_)
             | Response::McpBindingIssued(_)
             | Response::McpResult(_)
+            | Response::McpReturned
             | Response::RecallCue(_)
             | Response::SessionImportAdmin(_)
             | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),

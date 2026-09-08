@@ -1875,6 +1875,7 @@ mod tests {
                 completion_expr: ConstraintExpr::Exists {
                     field: ConstraintField::VerifierState,
                 },
+                stage_alignment: None,
                 actions: ProcedureActions {
                     stages: vec!["stage".into()],
                     branches: Vec::new(),

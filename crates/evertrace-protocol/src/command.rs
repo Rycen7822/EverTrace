@@ -17,7 +17,7 @@ pub struct CommandEnvelope {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Health,
     ConfigReload,
@@ -28,6 +28,10 @@ pub enum Command {
     RequestRecovery(RequestRecoveryCommand),
     IssueMcpBinding(McpBindingIssueCommand),
     McpCall(McpCallCommand),
+    /// Internal stdio transport receipt, not a public MCP action.
+    McpReturned {
+        request_id: RequestId,
+    },
     RecallCue(RecallCueCommand),
     SessionImportAdmin(SessionImportAdminCommand),
     HumanGovernance(HumanGovernanceRequest),

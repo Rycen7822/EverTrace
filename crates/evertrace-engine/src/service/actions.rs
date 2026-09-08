@@ -151,6 +151,75 @@ pub struct McpActionService {
 }
 
 impl McpActionService {
+    /// Called only with the final response revision set retained by the UDS connection.
+    pub async fn confirm_procedure_return(
+        &self,
+        original_request: RequestId,
+        acknowledgement: RequestId,
+        returned: &[RevisionId],
+    ) -> Result<(), McpServiceError> {
+        let original_id =
+            CommandId::from_uuid(original_request.as_uuid()).map_err(|_| McpServiceError::Store)?;
+        let original = self
+            .writer
+            .committed_command(original_id)
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        // The daemon calls this only for the protocol's same-connection,
+        // successfully returned Search set. No routed command means that set
+        // has no new usage eligibility, not that arbitrary requests are receipts.
+        let Some(original) = original else {
+            return Ok(());
+        };
+        let snapshot = self
+            .writer
+            .project()
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        let view = crate::procedure::ProcedureUsageCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| McpServiceError::Store)?;
+        let command_id =
+            CommandId::from_uuid(acknowledgement.as_uuid()).map_err(|_| McpServiceError::Store)?;
+        let now = unix_time_us_for_mcp();
+        let events = view
+            .confirmed_return_events(
+                ProposalCommandContext {
+                    command_id,
+                    occurred_at_us: now,
+                    effective_config_hash: self.runtime_snapshot.effective_config_hash,
+                    algorithm_revision: "s34-mcp-procedure-return-v1".into(),
+                },
+                &original.payloads,
+                returned,
+            )
+            .map_err(|_| McpServiceError::Store)?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let command =
+            JournalCommand::new(command_id, events).map_err(|_| McpServiceError::Store)?;
+        let expected = command
+            .events()
+            .iter()
+            .map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        if self
+            .writer
+            .commit_if_frontier(command, now, snapshot.frontier)
+            .await
+            .is_err()
+            && self
+                .writer
+                .committed_command(command_id)
+                .await
+                .map_err(|_| McpServiceError::Store)?
+                .is_none_or(|committed| committed.payloads != expected)
+        {
+            return Err(McpServiceError::Store);
+        }
+        Ok(())
+    }
+
     pub fn for_config(
         &self,
         config: &evertrace_domain::config::EffectiveConfig,

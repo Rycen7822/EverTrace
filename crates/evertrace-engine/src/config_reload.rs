@@ -196,6 +196,7 @@ impl ConfigReloadService {
     /// Poll the named file rather than an opened inode, so atomic replacement
     /// has exactly the same validation/commit path as an explicit reload.
     pub async fn watch_once(&self) -> Result<Option<ConfigReloadResult>, ConfigReloadError> {
+        let _serial = self.serial.lock().await;
         if self.stopped() {
             return Err(ConfigReloadError::Stopped);
         }
@@ -203,7 +204,9 @@ impl ConfigReloadService {
         if *self.observed.lock().await == input {
             return Ok(None);
         }
-        self.reload(ConfigReloadSource::Watcher).await.map(Some)
+        self.reload_inner(ConfigReloadSource::Watcher)
+            .await
+            .map(Some)
     }
 
     /// Recall owns cues, not operational configuration. Merge only its cue
@@ -686,6 +689,24 @@ mod tests {
             ConfigReloadOutcome::Applied
         );
         assert_eq!(reload.admit().await.unwrap().hash(), changed.hash());
+        // A watcher queued behind an explicit operation must compare the
+        // identity that operation actually committed, not its stale pre-lock read.
+        {
+            let serial = reload.serial.lock().await;
+            std::fs::write(&path, changed.to_toml().unwrap()).unwrap();
+            let watching = reload.watch_once();
+            tokio::pin!(watching);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut watching)
+                    .await
+                    .is_err()
+            );
+            reload.reload_inner(ConfigReloadSource::Cli).await.unwrap();
+            let frontier = writer.project().await.unwrap().frontier;
+            drop(serial);
+            assert!(watching.await.unwrap().is_none());
+            assert_eq!(writer.project().await.unwrap().frontier, frontier);
+        }
         std::fs::write(&path, initial.to_toml().unwrap()).unwrap();
         reload.fault.store(3, Ordering::Relaxed);
         assert!(matches!(

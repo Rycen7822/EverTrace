@@ -200,6 +200,7 @@ fn procedure_draft(evidence: String, support: RevisionId) -> ProcedureDraft {
             field: ConstraintField::ArtifactKind,
             value: ConstraintValue::Text("release".into()),
         },
+        stage_alignment: None,
         actions: ProcedureActions {
             stages: vec!["run the fixed release verifier".into()],
             branches: Vec::new(),
@@ -702,6 +703,40 @@ async fn auto_full_acceptance_is_atomic_probationary_rebuildable_and_fts_visible
 
 #[test]
 fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
+    let mut legacy = procedure_draft("evidence".into(), RevisionId::new_v7());
+    let legacy_json = serde_json::to_vec(&legacy).unwrap();
+    let legacy_toml = toml::to_string(&legacy).unwrap();
+    assert!(!legacy_toml.contains("stage_alignment"));
+    assert_eq!(
+        serde_json::to_vec(&serde_json::from_slice::<ProcedureDraft>(&legacy_json).unwrap())
+            .unwrap(),
+        legacy_json
+    );
+    assert_eq!(
+        toml::to_string(&toml::from_str::<ProcedureDraft>(&legacy_toml).unwrap()).unwrap(),
+        legacy_toml
+    );
+    let step = evertrace_domain::procedure::ProcedureStepAlignment {
+        entry: legacy.applicability_expr.clone(),
+        progress: legacy.applicability_expr.clone(),
+        completed: legacy.completion_expr.clone(),
+    };
+    legacy.stage_alignment = Some(evertrace_domain::procedure::ProcedureStageAlignment {
+        main: vec![step.clone(); legacy.actions.stages.len()],
+        branches: vec![],
+    });
+    legacy.actions.branches.clear();
+    assert!(legacy.validate().is_ok());
+    legacy
+        .stage_alignment
+        .as_mut()
+        .unwrap()
+        .main
+        .push(step.clone());
+    assert!(legacy.validate().is_err());
+    legacy.actions.stages = (0..65).map(|index| format!("step {index}")).collect();
+    legacy.stage_alignment.as_mut().unwrap().main = vec![step; 65];
+    assert!(legacy.validate().is_err());
     let (_, observation) = source("unit-verifier", "verifier", 1);
     let observation = observation.source_observation_id;
     let full = full_evidence(observation);
@@ -998,7 +1033,7 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
         revision: revision.clone(),
         publication: ProcedurePublicationState::ActiveStable,
         global_support: Some(evertrace_domain::semantic::GlobalSupportState::Valid),
-        phase: ProcedurePhase::AtEntry,
+        phase: Some(ProcedurePhase::AtEntry),
         lexical_rank: 2,
     };
     let mut probationary = stable.clone();
@@ -1044,6 +1079,21 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
         guardrail.items[0].done.as_ref().unwrap().verify,
         revision.draft.done.verify
     );
+    let mut unaligned = stable.clone();
+    unaligned.phase = None;
+    let unknown_phase = ProcedureRouter::route(
+        &context,
+        vec![unaligned],
+        &state,
+        None,
+        true,
+        false,
+        false,
+        false,
+    );
+    assert_eq!(unknown_phase.items[0].phase, None);
+    assert_eq!(unknown_phase.items[0].decision, ProcedureDecision::Defer);
+    assert!(unknown_phase.items[0].actions.is_none());
     let stale = ProcedureRouter::route(
         &context,
         vec![stable.clone()],

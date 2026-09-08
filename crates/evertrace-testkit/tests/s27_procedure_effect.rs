@@ -2644,6 +2644,7 @@ fn candidate(
                     field: ConstraintField::ArtifactKind,
                     value: ConstraintValue::Text("complete".into()),
                 },
+                stage_alignment: None,
                 actions: ProcedureActions {
                     stages: vec!["run verifier".into()],
                     branches: Vec::new(),
@@ -2663,7 +2664,7 @@ fn candidate(
         },
         publication: ProcedurePublicationState::ActiveStable,
         global_support: None,
-        phase: ProcedurePhase::AtEntry,
+        phase: Some(ProcedurePhase::AtEntry),
         lexical_rank,
     }
 }

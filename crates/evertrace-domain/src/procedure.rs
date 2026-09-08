@@ -106,6 +106,28 @@ pub struct ProcedureDone {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProcedureStepAlignment {
+    pub entry: ConstraintExpr,
+    pub progress: ConstraintExpr,
+    pub completed: ConstraintExpr,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcedureBranchAlignment {
+    pub at_main_step: usize,
+    pub steps: Vec<ProcedureStepAlignment>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcedureStageAlignment {
+    pub main: Vec<ProcedureStepAlignment>,
+    pub branches: Vec<ProcedureBranchAlignment>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcedureDraft {
     pub scope: ProcedureScope,
     pub title: String,
@@ -116,6 +138,8 @@ pub struct ProcedureDraft {
     pub applicability_expr: ConstraintExpr,
     pub avoid_expr: ConstraintExpr,
     pub completion_expr: ConstraintExpr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_alignment: Option<ProcedureStageAlignment>,
     pub actions: ProcedureActions,
     pub done: ProcedureDone,
     pub pitfalls: Vec<String>,
@@ -161,6 +185,36 @@ impl ProcedureDraft {
         }
         self.applicability_expr.validate()?;
         self.avoid_expr.validate()?;
+        if let Some(alignment) = &self.stage_alignment {
+            if alignment.main.len() != self.actions.stages.len()
+                || alignment.branches.len() != self.actions.branches.len()
+                || alignment.main.len()
+                    + alignment
+                        .branches
+                        .iter()
+                        .map(|branch| branch.steps.len())
+                        .sum::<usize>()
+                    > 64
+            {
+                return Err(SemanticError::InvalidProcedure);
+            }
+            for (mapping, branch) in alignment.branches.iter().zip(&self.actions.branches) {
+                if mapping.at_main_step >= alignment.main.len()
+                    || mapping.steps.len() != branch.stages.len()
+                {
+                    return Err(SemanticError::InvalidProcedure);
+                }
+            }
+            for step in alignment
+                .main
+                .iter()
+                .chain(alignment.branches.iter().flat_map(|branch| &branch.steps))
+            {
+                step.entry.validate()?;
+                step.progress.validate()?;
+                step.completed.validate()?;
+            }
+        }
         self.completion_expr.validate()
     }
 }

@@ -54,6 +54,11 @@ pub enum ClientKind {
 pub struct ConnectionContext {
     pub connection_id: String,
     pub client_kind: ClientKind,
+    /// Server-only association from a successfully sent, budgeted response.
+    pub mcp_returned: Option<(
+        evertrace_domain::ids::RequestId,
+        Vec<evertrace_domain::revision::RevisionId>,
+    )>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

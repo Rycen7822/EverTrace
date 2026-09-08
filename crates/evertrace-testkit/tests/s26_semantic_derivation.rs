@@ -124,6 +124,7 @@ fn procedure_application() -> ProviderSemanticApplication {
                 applicability_expr: condition.clone(),
                 avoid_expr: condition.clone(),
                 completion_expr: condition,
+                stage_alignment: None,
                 actions: ProcedureActions {
                     stages: vec!["validate direct evidence".into()],
                     branches: vec![],
@@ -163,6 +164,7 @@ fn response(content: serde_json::Value) -> Vec<u8> {
 
 fn input() -> ProtectedSemanticInput {
     ProtectedSemanticInput {
+        stage_trace: Default::default(),
         episode_id: WorkEpisodeId::new_v7(),
         episode_revision_id: RevisionId::new_v7(),
         task_id: TaskId::new_v7(),
@@ -1360,8 +1362,61 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
 async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     let temp = TempDir::new().unwrap();
     let mut seed = seed_store(&temp.path().join("store")).await;
+    let checkpoint = evertrace_domain::work::WorkCheckpoint::derive(
+        &seed.episode,
+        &[],
+        None,
+        evertrace_domain::work::CheckpointReason::Manual,
+    )
+    .unwrap();
+    let save = evertrace_engine::work::episode::save_checkpoint(
+        evertrace_engine::work::WorkCommandContext {
+            command_id: CommandId::new_v7(),
+            occurred_at_us: 2,
+            effective_config_hash: CONFIG,
+            algorithm_revision: "s26-mapped-checkpoint",
+        },
+        &seed.episode,
+        checkpoint,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    seed.writer.commit(&save, 2).await.unwrap();
+    seed.snapshot = seed.writer.project().await.unwrap();
+    seed.episode = seed
+        .snapshot
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::WorkEpisodeRecorded(value) => Some(*value),
+                _ => None,
+            }
+        })
+        .max_by_key(|episode| episode.revision_generation)
+        .unwrap();
     let direct_refs = seed.direct_refs();
     let mut provider_application = procedure_application();
+    let ProviderSemanticCandidate::ProcedureCandidate { content, .. } =
+        &mut provider_application.candidates[0]
+    else {
+        unreachable!()
+    };
+    let phase = |value: &str| ConstraintExpr::Eq {
+        field: ConstraintField::Phase,
+        value: evertrace_domain::semantic::ConstraintValue::Text(value.into()),
+    };
+    content.stage_alignment = Some(evertrace_domain::procedure::ProcedureStageAlignment {
+        main: vec![evertrace_domain::procedure::ProcedureStepAlignment {
+            entry: phase("implement"),
+            progress: phase("implement"),
+            completed: ConstraintExpr::Eq {
+                field: ConstraintField::VerifierState,
+                value: evertrace_domain::semantic::ConstraintValue::Text("passed".into()),
+            },
+        }],
+        branches: vec![],
+    });
     provider_application
         .progress_delta
         .push(SemanticStructuredDelta {
@@ -1393,7 +1448,18 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         })
         .await
         .unwrap();
-    let _ = stub.finish().await;
+    let request = stub.finish().await;
+    let boundary = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let request: serde_json::Value = serde_json::from_slice(&request[boundary..]).unwrap();
+    let input: serde_json::Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(input["stage_trace"]["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(input["to_watermark"], seed.episode.source_watermark);
+    assert_eq!(input["direct_delta"].as_array().unwrap().len(), 1);
     let SynthesisResolution::Success {
         digest,
         command: procedure_command,
@@ -1416,6 +1482,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         }
     );
     assert_eq!(draft.condition_ir_version, 1);
+    assert_eq!(draft.stage_alignment.as_ref().unwrap().main.len(), 1);
     assert_eq!(draft.evidence_refs, direct_refs);
     assert!(draft.support_revision_refs.is_empty());
     let mut forged_payloads = procedure_command

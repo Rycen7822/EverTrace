@@ -26,6 +26,7 @@ pub enum Response {
     RecoveryAction(RecoveryActionResponse),
     McpBindingIssued(McpBindingIssuedResponse),
     McpResult(Box<McpResultEnvelope>),
+    McpReturned,
     RecallCue(RecallCueResponse),
     SessionImportAdmin(SessionImportAdminResponse),
     HumanGovernance(HumanGovernanceResponse),

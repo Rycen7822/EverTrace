@@ -525,6 +525,7 @@ impl SynthesisPlanner {
             trigger: trigger_name(request.trigger),
             direct_delta: request.direct_delta.clone(),
             source_refs: request.selected_direct_refs.clone(),
+            stage_trace: crate::procedure::StageTrace::compile(request.snapshot, &episode)?,
         };
         let estimated_input = u64::try_from(
             serde_json::to_vec(&input)
@@ -646,6 +647,7 @@ impl SynthesisPlanner {
             &episode,
             &evidence_refs,
             request.occurred_at_us,
+            &input.stage_trace,
         ) {
             Ok(value) => value,
             Err(_) => {
@@ -1126,6 +1128,7 @@ fn materialize_application(
     episode: &WorkEpisode,
     evidence_refs: &[String],
     occurred_at_us: i64,
+    stage_trace: &crate::procedure::StageTrace,
 ) -> Result<SemanticDigestApplication, crate::semantic::SemanticServiceError> {
     if provider.candidates.len() > 1 || !provider.candidates.is_empty() && evidence_refs.is_empty()
     {
@@ -1217,12 +1220,16 @@ fn materialize_application(
                     applicability_expr: content.applicability_expr,
                     avoid_expr: content.avoid_expr,
                     completion_expr: content.completion_expr,
+                    stage_alignment: content.stage_alignment,
                     actions: content.actions,
                     done: content.done,
                     pitfalls: content.pitfalls,
                     evidence_refs: evidence_refs.to_vec(),
                     support_revision_refs: Vec::new(),
                 };
+                if !stage_trace.supports(&draft) {
+                    return Err(crate::semantic::SemanticServiceError::InvalidInput);
+                }
                 let payload = match operation {
                     ProviderProcedureOperation::Create => {
                         evertrace_domain::semantic::ProcedureProposalPayload::Create { draft }

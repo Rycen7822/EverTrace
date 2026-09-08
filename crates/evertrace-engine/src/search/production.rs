@@ -16,11 +16,20 @@ use thiserror::Error;
 
 pub struct ProductionSearch {
     index: SearchIndex,
+    procedure_revisions: Option<BTreeSet<String>>,
 }
 
 impl ProductionSearch {
     pub const fn new(index: SearchIndex) -> Self {
-        Self { index }
+        Self {
+            index,
+            procedure_revisions: None,
+        }
+    }
+
+    pub fn with_procedure_revisions(mut self, revisions: BTreeSet<String>) -> Self {
+        self.procedure_revisions = Some(revisions);
+        self
     }
 
     pub async fn search(&self, context: SearchContext) -> Result<SearchResult, SearchError> {
@@ -87,6 +96,7 @@ impl ProductionSearch {
         };
         let (source_role, authority) = source_filter(context.query_facets.source_boundary);
         let filter = SearchHardFilter {
+            procedure_revisions: self.procedure_revisions.clone(),
             task_id: context.task_id.map(|id| id.to_string()),
             repository_id: context.repository_id.map(|id| id.to_string()),
             worktree_id: context.worktree_id.map(|id| id.to_string()),

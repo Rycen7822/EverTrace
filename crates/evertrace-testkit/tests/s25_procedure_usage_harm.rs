@@ -1,5 +1,9 @@
 use std::{future::Future, path::PathBuf, pin::Pin};
 
+#[path = "../src/provider.rs"]
+#[allow(dead_code)]
+mod provider_stub;
+
 use evertrace_domain::{
     config::{GlobalPromotionConfig, PromotionLevel},
     evidence::{
@@ -446,6 +450,7 @@ fn procedure_draft(repository_id: RepositoryId, evidence: String) -> ProcedureDr
             field: ConstraintField::ArtifactKind,
             value: ConstraintValue::Text("release".into()),
         },
+        stage_alignment: None,
         actions: ProcedureActions {
             stages: vec!["run fixed verifier".into()],
             branches: Vec::new(),
@@ -469,6 +474,36 @@ fn proposal_context(at: i64) -> ProposalCommandContext {
         effective_config_hash: CONFIG,
         algorithm_revision: "s25-test-v1".into(),
     }
+}
+
+async fn record_returned(
+    writer: &mut JournalWriter,
+    usage: &ProcedureUsageRevision,
+    at: i64,
+) -> ProcedureUsageRevision {
+    assert_eq!(usage.stage, ProcedureUsageStage::Routed);
+    let view = ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    let (returned, command) = advance_procedure_usage(
+        &view,
+        proposal_context(at),
+        ProcedureUsageAdvance {
+            usage_id: usage.procedure_usage_id,
+            stage: ProcedureUsageStage::Returned,
+            attempt_ids: Vec::new(),
+            action_episode_revision_ids: Vec::new(),
+            verification_episode_revision_ids: Vec::new(),
+            action_operation_refs: Vec::new(),
+            verification_operation_refs: Vec::new(),
+            work_binding_revision_refs: Vec::new(),
+            scope_effect_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+        },
+        &ConstraintState::default(),
+        None,
+    )
+    .unwrap();
+    writer.commit(&command, at).await.unwrap();
+    returned
 }
 
 fn work_context(at: i64) -> WorkCommandContext {
@@ -625,6 +660,14 @@ struct ActiveProcedureFixture {
 }
 
 async fn active_procedure_fixture(label: &str, context_unbounded: bool) -> ActiveProcedureFixture {
+    active_procedure_fixture_with_draft(label, context_unbounded, |_| {}).await
+}
+
+async fn active_procedure_fixture_with_draft(
+    label: &str,
+    context_unbounded: bool,
+    configure: fn(&mut ProcedureDraft),
+) -> ActiveProcedureFixture {
     let temp = TempDir::new().unwrap();
     let store_path = temp.path().join(format!("procedure-{label}"));
     let mut writer = JournalWriter::open(&store_path).await.unwrap();
@@ -632,12 +675,20 @@ async fn active_procedure_fixture(label: &str, context_unbounded: bool) -> Activ
     let worktree_id = WorktreeId::new_v7();
     let snapshot_id = WorktreeSnapshotId::new_v7();
     let (worktree, worktree_snapshot) = worktree(repository_id, worktree_id, snapshot_id);
-    let (evidence_receipt, evidence_observation) = source(
+    let (mut evidence_receipt, evidence_observation) = source(
         &format!("{label}-evidence"),
         "procedure evidence",
         1,
         repository_id,
     );
+    let key = evertrace_capture::DeviceKeyStore::new(store_path.join("keys"))
+        .load_or_create()
+        .unwrap();
+    let cas = evertrace_capture::CasStore::open(store_path.join("cas")).unwrap();
+    evidence_receipt.cas_ref = cas
+        .put(&evertrace_capture::protect::protect(b"procedure evidence", &key).unwrap())
+        .unwrap()
+        .as_hex();
     let mut initial = vec![
         JournalPayload::RepositoryInstanceRecorded(Box::new(repository(repository_id))),
         JournalPayload::WorktreeInstanceRecorded(Box::new(worktree)),
@@ -674,6 +725,7 @@ async fn active_procedure_fixture(label: &str, context_unbounded: bool) -> Activ
                                 value: ConstraintValue::Text("toolchain-s25".into()),
                             };
                         }
+                        configure(&mut draft);
                         draft
                     },
                 })),
@@ -700,6 +752,10 @@ async fn active_procedure_fixture(label: &str, context_unbounded: bool) -> Activ
         repository_id,
     );
     acceptance_receipt.source_ref = proposal.proposal_id.to_string();
+    acceptance_receipt.cas_ref = cas
+        .put(&evertrace_capture::protect::protect(acceptance_payload.as_bytes(), &key).unwrap())
+        .unwrap()
+        .as_hex();
     writer
         .commit(
             &command(
@@ -911,7 +967,7 @@ async fn prepare_usage_evidence(
             revision: procedure.clone(),
             publication,
             global_support: None,
-            phase: ProcedurePhase::AtEntry,
+            phase: Some(ProcedurePhase::AtEntry),
             lexical_rank: 1,
         }],
         &constraints,
@@ -938,19 +994,25 @@ async fn prepare_usage_evidence(
         panic!("independent exposure must create one usage")
     };
     writer.commit(&begun, at).await.unwrap();
+    // This fixture models exposure before the later physical action. Routing
+    // alone no longer supplies that boundary.
+    let usage = record_returned(writer, &usage, at).await;
+    let at = at + 1;
 
-    let (intent_receipt, mut intent) = physical_source(
+    let (mut intent_receipt, mut intent) = physical_source(
         &format!("{label}-intent"),
         ObservationRole::Intent,
         repository_id,
         worktree_id,
     );
-    let (result_receipt, mut result_observation) = physical_source(
+    let (mut result_receipt, mut result_observation) = physical_source(
         &format!("{label}-result"),
         ObservationRole::Result,
         repository_id,
         worktree_id,
     );
+    intent_receipt.recorded_at_us = at;
+    result_receipt.recorded_at_us = at;
     match physical_case {
         PhysicalEvidenceCase::Exact => {}
         PhysicalEvidenceCase::PossibleDuplicate => {
@@ -1861,7 +1923,7 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
             revision: (*procedure).clone(),
             publication: ProcedurePublicationState::ActiveProbationary,
             global_support: None,
-            phase: ProcedurePhase::AtEntry,
+            phase: Some(ProcedurePhase::AtEntry),
             lexical_rank: 1,
         }]
     };
@@ -1919,9 +1981,9 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     )
     .unwrap()
     else {
-        panic!("the sealed guardrail-only DEFER must create a Returned usage")
+        panic!("the sealed guardrail-only DEFER must create a Routed usage")
     };
-    assert_eq!(deferred_usage.stage, ProcedureUsageStage::Returned);
+    assert_eq!(deferred_usage.stage, ProcedureUsageStage::Routed);
     assert_eq!(
         deferred_usage.route_decision,
         ProcedureUsageRouteDecision::Defer
@@ -2955,7 +3017,7 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
             revision: (*procedure).clone(),
             publication: ProcedurePublicationState::ActiveProbationary,
             global_support: None,
-            phase: ProcedurePhase::AtEntry,
+            phase: Some(ProcedurePhase::AtEntry),
             lexical_rank: 1,
         }],
         &constraints,
@@ -2968,7 +3030,7 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
     assert_eq!(routed.items[0].decision, ProcedureDecision::Apply);
     let usage_view = ProcedureUsageCurrentView::from_snapshot(&snapshot).unwrap();
     let mut forged_phase = routed.items[0].clone();
-    forged_phase.phase = ProcedurePhase::InProgress;
+    forged_phase.phase = Some(ProcedurePhase::InProgress);
     assert!(
         begin_procedure_usage(
             &usage_view,
@@ -2995,107 +3057,184 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
         panic!("first exact route exposure must create usage")
     };
     writer.commit(&usage_command, 7).await.unwrap();
-    let (post_intent_receipt, post_intent) = physical_source(
-        "post-intent",
-        ObservationRole::Intent,
-        repository_id,
-        worktree_id,
-    );
-    let (post_result_receipt, post_result_observation) = physical_source(
-        "post-result",
-        ObservationRole::Result,
-        repository_id,
-        worktree_id,
-    );
-    writer
-        .commit(
-            &command(
+    let usage = record_returned(&mut writer, &usage, 7).await;
+    let mut qualified = None;
+    for (label, recorded_at) in [("late-old", 6), ("post", 8)] {
+        let (mut post_intent_receipt, post_intent) = physical_source(
+            &format!("{label}-intent"),
+            ObservationRole::Intent,
+            repository_id,
+            worktree_id,
+        );
+        let (mut post_result_receipt, post_result_observation) = physical_source(
+            &format!("{label}-result"),
+            ObservationRole::Result,
+            repository_id,
+            worktree_id,
+        );
+        post_intent_receipt.recorded_at_us = recorded_at;
+        post_result_receipt.recorded_at_us = recorded_at;
+        post_intent_receipt.event_time_us = recorded_at;
+        post_result_receipt.event_time_us = recorded_at;
+        writer
+            .commit(
+                &command(
+                    10,
+                    source_payloads(post_intent_receipt, post_intent.clone()),
+                ),
                 10,
-                source_payloads(post_intent_receipt, post_intent.clone()),
-            ),
-            10,
-        )
-        .await
-        .unwrap();
-    writer
-        .commit(
-            &command(
+            )
+            .await
+            .unwrap();
+        writer
+            .commit(
+                &command(
+                    11,
+                    source_payloads(post_result_receipt, post_result_observation.clone()),
+                ),
                 11,
-                source_payloads(post_result_receipt, post_result_observation.clone()),
-            ),
-            11,
-        )
-        .await
-        .unwrap();
-    let post_normalized = PhysicalNormalizer::new(1)
-        .unwrap()
-        .normalize(&[post_intent.clone(), post_result_observation], None)
-        .unwrap();
-    let post_operation_id = post_normalized.operations[0].operation_id;
-    writer
-        .commit(
-            &post_normalized
-                .journal_command(CommandId::new_v7(), 12, CONFIG, "s25-test-v1")
-                .unwrap(),
-            12,
-        )
-        .await
-        .unwrap();
-    let post_binding_id = WorkBindingRevisionId::new_v7();
-    let mut post_attempt = adopted.clone();
-    post_attempt.revision_id = RevisionId::new_v7();
-    post_attempt.predecessor_revision_id = Some(adopted.revision_id);
-    post_attempt.revision_generation = 3;
-    post_attempt.source_watermark = 13;
-    post_attempt
-        .work_binding_revision_refs
-        .push(post_binding_id);
-    post_attempt.work_binding_revision_refs.sort();
-    let mut post_result = result.clone();
-    post_result.result_evidence_id = evertrace_domain::ids::ResultEvidenceId::new_v7();
-    post_result.revision_id = RevisionId::new_v7();
-    post_result.created_at_us = 13;
-    let post_result_ref = post_result.revision_id.to_string();
-    post_attempt
-        .parent_verification_refs
-        .push(post_result_ref.clone());
-    post_attempt.parent_verification_refs.sort();
-    post_attempt.outcome_refs.push(post_result_ref.clone());
-    post_attempt.outcome_refs.sort();
-    adopted.validate_successor(&post_attempt).unwrap();
-    let post_binding = WorkBindingRevision {
-        work_binding_revision_id: post_binding_id,
-        operation_id: post_operation_id,
-        revision_generation: 1,
-        predecessor_revision_id: None,
-        primary_binding: PrimaryWorkBinding {
-            task_id: Some(task.task_id),
-            workstream_id: Some(stream.workstream_id),
-            episode_id: adopted.episode_id,
-            attempt_id: Some(post_attempt.attempt_id),
-            experiment_run_id: Some(run.run_id),
-            competing_group_id: None,
-        },
-        secondary_bindings: Vec::new(),
-        scope_effect_refs: Vec::new(),
-        assignment_status: AssignmentStatus::Resolved,
-        evidence_refs: vec![post_intent.source_observation_id.to_string()],
-        resolver_version: 1,
-    };
-    writer
-        .commit(
-            &command(
+            )
+            .await
+            .unwrap();
+        let post_normalized = PhysicalNormalizer::new(1)
+            .unwrap()
+            .normalize(&[post_intent.clone(), post_result_observation], None)
+            .unwrap();
+        let post_operation_id = post_normalized.operations[0].operation_id;
+        writer
+            .commit(
+                &post_normalized
+                    .journal_command(CommandId::new_v7(), 12, CONFIG, "s25-test-v1")
+                    .unwrap(),
+                12,
+            )
+            .await
+            .unwrap();
+        let post_binding_id = WorkBindingRevisionId::new_v7();
+        let mut post_attempt = adopted.clone();
+        post_attempt.revision_id = RevisionId::new_v7();
+        post_attempt.predecessor_revision_id = Some(adopted.revision_id);
+        post_attempt.revision_generation = adopted.revision_generation + 1;
+        post_attempt.source_watermark = 13.max(adopted.source_watermark + 1);
+        post_attempt
+            .work_binding_revision_refs
+            .push(post_binding_id);
+        post_attempt.work_binding_revision_refs.sort();
+        let mut post_result = result.clone();
+        post_result.result_evidence_id = evertrace_domain::ids::ResultEvidenceId::new_v7();
+        post_result.revision_id = RevisionId::new_v7();
+        post_result.created_at_us = 13;
+        let post_result_ref = post_result.revision_id.to_string();
+        post_attempt
+            .parent_verification_refs
+            .push(post_result_ref.clone());
+        post_attempt.parent_verification_refs.sort();
+        post_attempt.outcome_refs.push(post_result_ref.clone());
+        post_attempt.outcome_refs.sort();
+        adopted.validate_successor(&post_attempt).unwrap();
+        let post_binding = WorkBindingRevision {
+            work_binding_revision_id: post_binding_id,
+            operation_id: post_operation_id,
+            revision_generation: 1,
+            predecessor_revision_id: None,
+            primary_binding: PrimaryWorkBinding {
+                task_id: Some(task.task_id),
+                workstream_id: Some(stream.workstream_id),
+                episode_id: adopted.episode_id,
+                attempt_id: Some(post_attempt.attempt_id),
+                experiment_run_id: Some(run.run_id),
+                competing_group_id: None,
+            },
+            secondary_bindings: Vec::new(),
+            scope_effect_refs: Vec::new(),
+            assignment_status: AssignmentStatus::Resolved,
+            evidence_refs: vec![post_intent.source_observation_id.to_string()],
+            resolver_version: 1,
+        };
+        writer
+            .commit(
+                &command(
+                    13,
+                    vec![
+                        JournalPayload::AttemptRecorded(Box::new(post_attempt.clone())),
+                        JournalPayload::WorkBindingRecorded(Box::new(post_binding.clone())),
+                        JournalPayload::ResultEvidenceRecorded(Box::new(post_result)),
+                    ],
+                ),
                 13,
-                vec![
-                    JournalPayload::AttemptRecorded(Box::new(post_attempt.clone())),
-                    JournalPayload::WorkBindingRecorded(Box::new(post_binding.clone())),
-                    JournalPayload::ResultEvidenceRecorded(Box::new(post_result)),
-                ],
-            ),
-            13,
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
+        if recorded_at < usage.created_at_us {
+            let snapshot = writer.project().await.unwrap();
+            let view = ProcedureUsageCurrentView::from_snapshot(&snapshot).unwrap();
+            assert!(
+                advance_procedure_usage(
+                    &view,
+                    proposal_context(14),
+                    ProcedureUsageAdvance {
+                        usage_id: usage.procedure_usage_id,
+                        stage: ProcedureUsageStage::Outcome,
+                        attempt_ids: vec![post_attempt.attempt_id],
+                        action_episode_revision_ids: vec![exposure_revision_id],
+                        verification_episode_revision_ids: vec![exposure_revision_id],
+                        action_operation_refs: vec![post_operation_id],
+                        verification_operation_refs: vec![post_operation_id],
+                        work_binding_revision_refs: vec![post_binding_id],
+                        scope_effect_refs: Vec::new(),
+                        evidence_refs: vec![post_result_ref.clone()],
+                    },
+                    &constraints,
+                    None
+                )
+                .is_err(),
+                "late ingestion cannot wash an action captured before confirmation"
+            );
+            let mut forged = usage.clone();
+            forged.usage_revision_id = RevisionId::new_v7();
+            forged.predecessor_revision_id = Some(usage.usage_revision_id);
+            forged.revision_generation += 1;
+            forged.stage = ProcedureUsageStage::Outcome;
+            forged.attempt_ids = vec![post_attempt.attempt_id];
+            forged.action_episode_revision_ids = vec![exposure_revision_id];
+            forged.verification_episode_revision_ids = vec![exposure_revision_id];
+            forged.action_operation_refs = vec![post_operation_id];
+            forged.verification_operation_refs = vec![post_operation_id];
+            forged.work_binding_revision_refs = vec![post_binding_id];
+            forged.evidence_refs.push(post_result_ref);
+            forged.evidence_refs.sort();
+            forged.evidence_refs.dedup();
+            forged.correlation_state = ProcedureCorrelationState::Resolved;
+            forged.action_aligned = ProcedureTruth::True;
+            forged.verifier_aligned = ProcedureTruth::True;
+            forged.outcome_supported = ProcedureTruth::True;
+            forged.source_watermark = snapshot.frontier;
+            forged.created_at_us = 14;
+            assert!(forged.validate());
+            assert!(usage.validate_successor(&forged));
+            assert!(
+                writer
+                    .commit(
+                        &command(
+                            14,
+                            vec![JournalPayload::ProcedureUsageRecorded(Box::new(forged))]
+                        ),
+                        14
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                writer.project().await.unwrap(),
+                snapshot,
+                "rejected association writes no poisoned successor"
+            );
+            adopted = post_attempt;
+        } else {
+            qualified = Some((post_normalized, post_binding, post_attempt, post_result_ref));
+        }
+    }
+    let (post_normalized, post_binding, post_attempt, post_result_ref) = qualified.unwrap();
     RealUsageStage {
         fixture: ActiveProcedureFixture {
             _temp,
@@ -3609,7 +3748,7 @@ async fn record_localized_harm_stage(stage: StableProcedureStage) -> LocalizedHa
             revision: (*procedure).clone(),
             publication: ProcedurePublicationState::ActiveStable,
             global_support: None,
-            phase: ProcedurePhase::AtEntry,
+            phase: Some(ProcedurePhase::AtEntry),
             lexical_rank: 1,
         }],
         &constraints,
@@ -3635,6 +3774,14 @@ async fn record_localized_harm_stage(stage: StableProcedureStage) -> LocalizedHa
     else {
         panic!("the independent failed attempt needs one sealed exposure")
     };
+    // Preserve a real legacy initial-Returned journal command in this chain.
+    // Production begin above now emits Routed; replay must still accept the
+    // prior closed payload without rewriting its bytes or exposure boundary.
+    let mut harm_usage = harm_usage;
+    harm_usage.stage = ProcedureUsageStage::Returned;
+    let mut legacy_events = harm_begin.events().to_vec();
+    legacy_events[0].payload = JournalPayload::ProcedureUsageRecorded(Box::new(harm_usage.clone()));
+    let harm_begin = JournalCommand::new(harm_begin.command_id(), legacy_events).unwrap();
     let committed_harm_usage = writer
         .commit_if_frontier(&harm_begin, 19, harm_snapshot.frontier)
         .await
@@ -3917,7 +4064,7 @@ async fn record_localized_harm_stage(stage: StableProcedureStage) -> LocalizedHa
             revision: (*procedure).clone(),
             publication: ProcedurePublicationState::ActiveProbationary,
             global_support: None,
-            phase: ProcedurePhase::AtEntry,
+            phase: Some(ProcedurePhase::AtEntry),
             lexical_rank: 1,
         }],
         &constraints,
@@ -3929,6 +4076,20 @@ async fn record_localized_harm_stage(stage: StableProcedureStage) -> LocalizedHa
     );
     assert_eq!(quarantined.items[0].decision, ProcedureDecision::Defer);
     assert!(quarantined.items[0].actions.is_none());
+    assert!(
+        matches!(
+            begin_procedure_usage(
+                &quarantined_view,
+                proposal_context(26),
+                &quarantined.items[0],
+                harm_action.workstream_id,
+                harm_action.exposure_episode_revision_id,
+            )
+            .unwrap(),
+            ProcedureUsageResolution::HistoricalRouteMismatch
+        ),
+        "a safe new DEFER is presentable without rewriting the historical APPLY usage"
+    );
     let dismissed = review_procedure_negative(
         &quarantined_view,
         proposal_context(26),
@@ -4181,7 +4342,7 @@ async fn confirm_harm_stage(stage: LocalizedHarmStage) -> HarmReviewedStage {
             revision: (*procedure).clone(),
             publication: ProcedurePublicationState::Suspended,
             global_support: None,
-            phase: ProcedurePhase::AtEntry,
+            phase: Some(ProcedurePhase::AtEntry),
             lexical_rank: 1,
         }],
         &constraints,
@@ -4478,4 +4639,1201 @@ async fn real_router_usage_outcome_quarantine_review_and_confirmed_harm_chain() 
     let stage = record_localized_harm_stage(stage).await;
     let stage = confirm_harm_stage(stage).await;
     replace_after_confirmed_harm_stage(stage).await;
+}
+
+#[tokio::test]
+async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
+    use evertrace_capture::{CaptureRecordInput, CaptureRuntime};
+    use evertrace_domain::{
+        config::EffectiveConfig,
+        work::{CheckpointReason, LaneLifecycleEvidence, LivenessState, WorkCheckpoint},
+    };
+    use evertrace_protocol::{
+        LocalClient,
+        command::{Command as Rpc, McpBindingIssueCommand},
+        dto::ClientKind,
+        mcp::{McpAction, McpToolInput},
+        response::Response,
+    };
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let mut fixture = active_procedure_fixture_with_draft("mcp", false, |draft| {
+        // All three conditions have typed current Work consumers. No fixture
+        // boolean is passed to the production router.
+        draft.completion_expr = ConstraintExpr::Eq {
+            field: ConstraintField::Phase,
+            value: ConstraintValue::Text("deliver".into()),
+        };
+    })
+    .await;
+    let mut config_source = EffectiveConfig::default().config().clone();
+    config_source.runtime.data_dir = fixture.store_path.to_string_lossy().into_owned();
+    config_source.llm.enabled = false;
+    let config = EffectiveConfig::new(config_source).unwrap();
+    let config_path = fixture._temp.path().join("mcp.toml");
+    fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime =
+        evertrace_engine::publish_recovery_runtime(&fixture.store_path, &config, None).unwrap();
+    let manifest = evertrace_codex::hook_input::native_generation_report(runtime.generation)
+        .unwrap()
+        .manifest()
+        .clone();
+    let manifest_id = manifest.adapter_manifest_id.clone();
+    let eligible = evertrace_codex::source_catalog::CODEX_ELIGIBLE_EVENT_MANIFEST.to_owned();
+    let (handle, writer_task) = spawn_writer(fixture.writer, 8).unwrap();
+    let (_, mut observation) = source("mcp-lifecycle", "session start", 5, fixture.repository_id);
+    observation.correlation.adapter_manifest_ref = manifest_id.clone();
+    observation.correlation.pairing_role = ObservationRole::Lifecycle;
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    let capture_input = CaptureRecordInput {
+        spool_record_id: None,
+        source_observation_id_hint: None,
+        source_instance_id: "mcp-lifecycle".into(),
+        source_revision: "initial".into(),
+        source_record_identity: None,
+        identity_strength: Some(IdentityStrength::SynthesizedBestEffort),
+        source_kind: EvidenceSourceKind::CodexHook,
+        identity_domain: "mcp-test-lifecycle".into(),
+        source_ref: "mcp-test-lifecycle".into(),
+        session_ref: "mcp-test-session".into(),
+        turn_ref: None,
+        tool_ref: None,
+        source_sequence: 0,
+        source_sequence_origin: Some(0),
+        task_id: None,
+        repository_instance_id: Some(fixture.repository_id.to_string()),
+        worktree_instance_id: Some(fixture.worktree_id.to_string()),
+        source_byte_range: None,
+        source_revision_mode: SourceRevisionMode::Append,
+        previous_source_revision: None,
+        close_watermark: None,
+        observation_role: ObservationRole::Lifecycle,
+        correlation: observation.correlation,
+        scope_effect_claims: Vec::new(),
+        lifecycle: Some(LaneLifecycleEvidence {
+            host_session_id: "mcp-test-session".into(),
+            agent_id: "mcp-test-agent".into(),
+            incarnation_ref: Some("mcp-test-incarnation".into()),
+            child_session_id: None,
+            host_lane_key: "mcp-test-lane".into(),
+            parent_host_lane_key: None,
+            spawn_event_ref: None,
+            terminal_event_ref: None,
+            terminal_kind: None,
+            host_final_return: false,
+            source_close_ref: None,
+            parent_session_end_ref: None,
+            liveness_probe_ref: None,
+            liveness_state: LivenessState::Live,
+            lane_sequence: 0,
+            adapter_manifest_ref: manifest_id.clone(),
+            eligible_event_manifest_ref: eligible.clone(),
+            delegated_goal_ref: None,
+            delegated_target_refs: Vec::new(),
+            delegated_acceptance_refs: Vec::new(),
+            reasoning_visibility: Vec::new(),
+        }),
+        unsupported_record_classification: None,
+        source_role: SourceRole::Host,
+        content_trust: ContentTrust::Observed,
+        capture_completeness: CaptureCompleteness::Partial,
+        surface_eligible: false,
+        adapter_revision: 1,
+        adapter_manifest_ref: manifest_id,
+        eligible_event_manifest_ref: eligible,
+        parser_revision: 1,
+        canonicalization_revision: 1,
+        event_time_us: None,
+        raw_payload: b"session start".to_vec(),
+    };
+    capture.capture(capture_input.clone()).unwrap();
+    capture.seal_active().unwrap();
+    drop(capture);
+    evertrace_engine::EvidenceIngestor::new(
+        runtime.clone(),
+        handle.clone(),
+        config.hash(),
+        "s25-mcp-capture-v1",
+    )
+    .unwrap()
+    .drain_once()
+    .await
+    .unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let ids = snapshot
+        .data_rows()
+        .filter_map(|row| {
+            let payload: JournalPayload =
+                serde_json::from_str(row.payload_json.as_deref()?).ok()?;
+            match payload {
+                JournalPayload::SourceReceiptRecorded(value)
+                    if value.source_ref == "mcp-test-lifecycle" =>
+                {
+                    Some(value.source_observation_id)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    evertrace_engine::capture::reconcile_observations_once(
+        evertrace_engine::capture::ReconcileInput {
+            runtime_snapshot: runtime,
+            adapter_manifests: vec![manifest.clone()],
+            liveness: Vec::new(),
+            reconciled_gaps: Vec::new(),
+            reconciled_outages: Vec::new(),
+            independent_source_reconciliations: Vec::new(),
+            effective_config_hash: config.hash(),
+            algorithm_revision: "s25-mcp-reconcile-v1".into(),
+            occurred_at_us: 6,
+            max_items: 16,
+        },
+        &handle,
+        &ids,
+    )
+    .await
+    .unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let lane = snapshot
+        .data_rows()
+        .find_map(|row| {
+            let payload: JournalPayload =
+                serde_json::from_str(row.payload_json.as_deref()?).ok()?;
+            match payload {
+                JournalPayload::ExecutionLaneRecorded(value) => Some(*value),
+                _ => None,
+            }
+        })
+        .expect("real reconciliation must produce the explicitly observed lane");
+    assert_ne!(
+        lane.coverage_level,
+        evertrace_domain::work::CoverageLevel::Full
+    );
+    let task = task(fixture.repository_id, fixture.worktree_id, 7);
+    let mut stream = workstream(task.task_id, fixture.repository_id, fixture.worktree_id, 7);
+    stream.execution_lane_ids = vec![lane.execution_lane_id];
+    handle
+        .commit(
+            command(
+                7,
+                vec![
+                    JournalPayload::TaskRecorded(Box::new(task.clone())),
+                    JournalPayload::WorkstreamRecorded(Box::new(stream.clone())),
+                ],
+            ),
+            7,
+        )
+        .await
+        .unwrap();
+    let mut episode = new_episode(&stream, None, 7).unwrap();
+    episode.execution_lane_ids = vec![lane.execution_lane_id];
+    episode.session_ids = vec![lane.host_session_id.clone()];
+    let receipt = snapshot
+        .data_rows()
+        .find_map(|row| {
+            let payload: JournalPayload =
+                serde_json::from_str(row.payload_json.as_deref()?).ok()?;
+            match payload {
+                JournalPayload::CaptureReceiptRecorded(value)
+                    if value.capture_receipt_revision_id
+                        == lane.active_capture_receipt_revision_id =>
+                {
+                    Some(*value)
+                }
+                _ => None,
+            }
+        })
+        .unwrap();
+    episode.capture_receipt_revision_ids = vec![receipt.capture_receipt_revision_id];
+    episode.capture_watermark = receipt.import_watermark;
+    episode.source_watermark = episode.source_watermark.max(receipt.import_watermark);
+    episode
+        .pending_semantic_delta
+        .as_mut()
+        .unwrap()
+        .through_watermark = episode.source_watermark;
+    episode.capture_gap_refs = receipt.capture_gap_marker_refs.clone();
+    episode.capture_outage_refs = receipt.capture_outage_interval_refs.clone();
+    episode.capture_summary =
+        evertrace_domain::work::CaptureSummary::from_receipts(&[receipt]).unwrap();
+    episode.validate().expect("typed episode");
+    let activation = activate_episode(
+        work_context(8),
+        &stream,
+        episode.clone(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("compile activation");
+    handle
+        .commit(activation, 8)
+        .await
+        .expect("admit activation");
+    let checkpoint = WorkCheckpoint::derive(&episode, &[], None, CheckpointReason::Manual).unwrap();
+    handle
+        .commit(
+            evertrace_engine::work::episode::save_checkpoint(
+                work_context(9),
+                &episode,
+                checkpoint,
+                None,
+            )
+            .unwrap()
+            .unwrap(),
+            9,
+        )
+        .await
+        .unwrap();
+    let snapshot = handle.project().await.unwrap();
+    // This is a synthetic provider, not an authenticated model. The candidate
+    // still traverses the real provider DTO, synthesis, proposal and acceptance.
+    let current_episode = snapshot
+        .data_rows()
+        .filter_map(|row| {
+            let payload: JournalPayload =
+                serde_json::from_str(row.payload_json.as_deref()?).ok()?;
+            match payload {
+                JournalPayload::WorkEpisodeRecorded(value)
+                    if value.episode_id == episode.episode_id =>
+                {
+                    Some(*value)
+                }
+                _ => None,
+            }
+        })
+        .max_by_key(|value| value.revision_generation)
+        .unwrap();
+    let phase = |value: &str| ConstraintExpr::Eq {
+        field: ConstraintField::PhaseKind,
+        value: ConstraintValue::Text(value.into()),
+    };
+    let step = |entry: &str, progress: &str, completed: &str| {
+        evertrace_domain::procedure::ProcedureStepAlignment {
+            entry: phase(entry),
+            progress: phase(progress),
+            completed: phase(completed),
+        }
+    };
+    let mapping = evertrace_domain::procedure::ProcedureStageAlignment {
+        main: vec![
+            step("verify", "verify", "execute"),
+            step("execute", "execute", "deliver"),
+        ],
+        branches: vec![evertrace_domain::procedure::ProcedureBranchAlignment {
+            at_main_step: 0,
+            steps: vec![
+                step("recover", "recover", "analyze"),
+                step("analyze", "analyze", "verify"),
+            ],
+        }],
+    };
+    let evidence = fixture.evidence_receipt.source_receipt_id.to_string();
+    let content = evertrace_engine::provider::ProviderProcedureContent {
+        title: "Declared mapped deterministic verification".into(),
+        summary: "Follow the declared typed boundaries".into(),
+        procedure_kind: ProcedureKind::Diagnostic,
+        when: fixture.procedure.draft.when.clone(),
+        applicability_expr: ConstraintExpr::Exists {
+            field: ConstraintField::Phase,
+        },
+        avoid_expr: phase("unknown"),
+        completion_expr: phase("deliver"),
+        stage_alignment: Some(mapping.clone()),
+        actions: ProcedureActions {
+            stages: vec!["mapped first action".into(), "mapped second action".into()],
+            branches: vec![evertrace_domain::procedure::ProcedureBranch {
+                label: "bounded recovery".into(),
+                condition: phase("recover"),
+                stages: vec!["mapped recover one".into(), "mapped recover two".into()],
+            }],
+            avoid: vec!["do not infer execution".into()],
+        },
+        done: fixture.procedure.draft.done.clone(),
+        pitfalls: vec![],
+    };
+    let provider_application = evertrace_engine::provider::ProviderSemanticApplication {
+        progress_delta: vec![evertrace_domain::semantic::SemanticStructuredDelta {
+            label: "mapping".into(),
+            value: "propose explicit boundaries".into(),
+            direct_refs: vec![evidence.clone()],
+        }],
+        decision_delta: vec![],
+        failed_routes: vec![],
+        resolved_items: vec![],
+        open_loops: vec![],
+        outcome_delta: vec![],
+        omissions: vec![],
+        candidates: vec![
+            evertrace_engine::provider::ProviderSemanticCandidate::ProcedureCandidate {
+                operation: evertrace_engine::provider::ProviderProcedureOperation::Create,
+                target_id: None,
+                base_revision_id: None,
+                content: Box::new(content),
+            },
+        ],
+        completeness: evertrace_domain::semantic::SemanticCompleteness::Complete,
+    };
+    let stub = provider_stub::ProviderStub::once(200, serde_json::to_vec(&serde_json::json!({
+        "choices": [{"message": {"content": serde_json::to_string(&provider_application).unwrap()}}],
+        "usage": {"prompt_tokens": 17, "completion_tokens": 5}
+    })).unwrap()).await;
+    let planner =
+        evertrace_engine::jobs::SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+            base_url: evertrace_domain::config::ValidatedBaseUrl::parse(&stub.base_url).unwrap(),
+            api_key_env: "PATH".into(),
+            ..Default::default()
+        });
+    let generated = planner
+        .execute(evertrace_engine::jobs::SynthesisRequest {
+            snapshot: &snapshot,
+            episode_revision_id: current_episode.revision_id,
+            trigger: evertrace_domain::semantic::SemanticDigestTrigger::StrategyPivot,
+            direct_delta: vec![evertrace_engine::provider::ProtectedDeltaItem {
+                kind: evertrace_engine::provider::ProtectedDeltaKind::Decision,
+                value: "propose explicit boundaries".into(),
+                direct_refs: vec![evidence.clone()],
+            }],
+            selected_direct_refs: vec![evidence],
+            command_id: CommandId::new_v7(),
+            occurred_at_us: 10,
+            algorithm_revision: "s25-mapped-provider".into(),
+            effective_config_hash: config.hash(),
+        })
+        .await
+        .unwrap();
+    let request = stub.finish().await;
+    let body = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let request: serde_json::Value = serde_json::from_slice(&request[body..]).unwrap();
+    let protected: serde_json::Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        protected["stage_trace"]["frames"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(protected["to_watermark"], current_episode.source_watermark);
+    let evertrace_engine::jobs::SynthesisResolution::Success {
+        command: generated, ..
+    } = generated
+    else {
+        panic!("mapped proposal must use real synthesis")
+    };
+    handle.commit(generated, 10).await.unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let view = SemanticCurrentView::from_snapshot(&snapshot).unwrap();
+    let proposal = view.proposals.values().find(|proposal| matches!(&proposal.payload, ProposalPayload::Procedure(payload) if payload.draft().stage_alignment.as_ref() == Some(&mapping))).unwrap().clone();
+    let ProposalPayload::Procedure(payload) = &proposal.payload else {
+        unreachable!()
+    };
+    payload.draft().validate().unwrap();
+    assert!(
+        payload
+            .draft()
+            .evidence_refs
+            .iter()
+            .all(|reference| proposal.source_cohort_refs.contains(reference))
+    );
+    assert!(
+        proposal.created_at_us <= 11,
+        "proposal time {}",
+        proposal.created_at_us
+    );
+    let acceptance_payload = tui_acceptance_event_payload(
+        proposal.proposal_id,
+        proposal.proposal_revision_id,
+        &proposal.fingerprint,
+    );
+    let (mut receipt, observation) = source(
+        "mapped-acceptance",
+        &acceptance_payload,
+        11,
+        fixture.repository_id,
+    );
+    receipt.source_ref = proposal.proposal_id.to_string();
+    let key = evertrace_capture::DeviceKeyStore::new(fixture.store_path.join("keys"))
+        .load_or_create()
+        .unwrap();
+    receipt.cas_ref = evertrace_capture::CasStore::open(fixture.store_path.join("cas"))
+        .unwrap()
+        .put(&evertrace_capture::protect::protect(acceptance_payload.as_bytes(), &key).unwrap())
+        .unwrap()
+        .as_hex();
+    handle
+        .commit(
+            command(11, source_payloads(receipt.clone(), observation.clone())),
+            11,
+        )
+        .await
+        .unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let view = SemanticCurrentView::from_snapshot(&snapshot).unwrap();
+    let ProcedureAcceptanceResolution::Command {
+        procedure,
+        command: accepted,
+        ..
+    } = accept_procedure(
+        &view,
+        proposal_context(12),
+        proposal.proposal_id,
+        ProcedureAcceptanceContext::Manual(AtomAcceptanceContext::RepositoryTui {
+            observation: Box::new(observation),
+            receipt: Box::new(receipt),
+        }),
+        None,
+        None,
+        &fixture.config,
+    )
+    .unwrap()
+    else {
+        panic!("accept generated declaration")
+    };
+    handle.commit(accepted, 12).await.unwrap();
+    fixture.procedure = procedure;
+    let snapshot = handle.project().await.unwrap();
+    let scenario = evertrace_engine::semantic::ScenarioCompiler::compile(
+        &snapshot,
+        evertrace_domain::semantic::ScenarioScope {
+            task_id: task.task_id,
+            repository_instance_id: Some(fixture.repository_id),
+            worktree_instance_id: Some(fixture.worktree_id),
+        },
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    handle
+        .commit(
+            evertrace_engine::semantic::ScenarioCompiler::journal_command(
+                CommandId::new_v7(),
+                scenario,
+                config.hash(),
+                10,
+            )
+            .unwrap(),
+            10,
+        )
+        .await
+        .unwrap();
+    handle.project().await.unwrap();
+    {
+        let index = evertrace_store::SearchIndex::open(&fixture.store_path)
+            .await
+            .unwrap();
+        let pinned = index.snapshot().await.unwrap();
+        let mapped = index.fts("mapped").await.unwrap();
+        assert!(
+            mapped.iter().any(|row| row.candidate_id.as_deref()
+                == Some(&fixture.procedure.revision_id.to_string())),
+            "accepted mapped revision must be indexed: {:?}",
+            index
+                .all()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|row| row.candidate_id.as_deref()
+                    == Some(&fixture.procedure.revision_id.to_string()))
+                .map(|row| &row.text)
+                .collect::<Vec<_>>()
+        );
+        let selected = pinned
+            .structured(
+                &[
+                    fixture.procedure.revision_id.to_string(),
+                    task.revision_id.to_string(),
+                ],
+                &evertrace_store::SearchHardFilter {
+                    procedure_revisions: Some(Default::default()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].candidate_id.as_deref(),
+            Some(task.revision_id.to_string().as_str()),
+            "publication filtering precedes the one-candidate native limit"
+        );
+    }
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let package = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let mut daemon = Daemon(
+        Command::new(package.join("evertraced"))
+            .arg("--config")
+            .arg(&config_path)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = fixture.store_path.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut hook = loop {
+        if let Ok(client) =
+            LocalClient::connect(&socket, "s25-mcp", ClientKind::Hook, Duration::from_secs(2)).await
+        {
+            break client;
+        }
+        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
+        assert!(Instant::now() < deadline, "daemon did not become available");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let query = "mapped";
+    for delivery in 0..11 {
+        if delivery >= 6 {
+            // Synthetic manual Work phase changes use the existing episode
+            // transition/checkpoint commands; neither the provider nor the
+            // route call supplies an evaluated phase or completion boolean.
+            daemon.0.kill().unwrap();
+            daemon.0.wait().unwrap();
+            let mut writer = JournalWriter::open(&fixture.store_path).await.unwrap();
+            let phase_name =
+                ["recover_one", "recover_two", "verify", "second", "deliver"][delivery - 6];
+            let runtime = evertrace_capture::RuntimeSnapshot::load(
+                &evertrace_capture::RuntimeSnapshot::snapshot_path(&fixture.store_path),
+            )
+            .unwrap();
+            let native_manifest = manifest.clone();
+            let mut synthetic_manifest = native_manifest.clone();
+            synthetic_manifest.adapter_version = "synthetic-s25-physical".into();
+            synthetic_manifest.event_identity =
+                evertrace_codex::adapter_manifest::EventIdentity::StableNative;
+            synthetic_manifest.eligible_event_manifest_refs = vec!["eligible-s25".into()];
+            synthetic_manifest.observable = evertrace_codex::source_catalog::ELIGIBLE_CAPABILITIES.iter().copied().filter(|value| *value != evertrace_codex::adapter_manifest::ObservableCapability::RawHiddenReasoning).collect();
+            synthetic_manifest.unavailable_by_design =
+                vec![evertrace_codex::adapter_manifest::ObservableCapability::RawHiddenReasoning];
+            synthetic_manifest.finalize_content_revision().unwrap();
+            // These are the fixture's separately declared synthetic Exact
+            // sources, not an upgrade of the weak native lifecycle above.
+            let mut physical = Vec::new();
+            for (suffix, role) in [
+                ("intent", ObservationRole::Intent),
+                ("result", ObservationRole::Result),
+            ] {
+                let (mut receipt, mut observation) = physical_source(
+                    &format!("mapped-{delivery}-{suffix}"),
+                    role,
+                    fixture.repository_id,
+                    fixture.worktree_id,
+                );
+                receipt.adapter_manifest_ref = synthetic_manifest.adapter_manifest_id.clone();
+                observation.correlation.adapter_manifest_ref =
+                    synthetic_manifest.adapter_manifest_id.clone();
+                receipt.close_watermark = None;
+                receipt.source_sequence_origin = Some(1);
+                receipt.cas_ref = evertrace_capture::CasStore::open(fixture.store_path.join("cas"))
+                    .unwrap()
+                    .put(&evertrace_capture::protect::protect(b"physical", &key).unwrap())
+                    .unwrap()
+                    .as_hex();
+                receipt.lifecycle = capture_input.lifecycle.clone();
+                receipt.source_session_ref = format!("s25-synthetic-session-{delivery}");
+                receipt.lifecycle.as_mut().unwrap().host_session_id =
+                    receipt.source_session_ref.clone();
+                receipt.lifecycle.as_mut().unwrap().host_lane_key = "s25-synthetic-lane".into();
+                observation.correlation.host_lane_key = Some("s25-synthetic-lane".into());
+                receipt.lifecycle.as_mut().unwrap().incarnation_ref =
+                    Some(format!("s25-synthetic-{delivery}"));
+                receipt.lifecycle.as_mut().unwrap().lane_sequence = physical.len() as u64;
+                receipt.lifecycle.as_mut().unwrap().adapter_manifest_ref =
+                    receipt.adapter_manifest_ref.clone();
+                receipt
+                    .lifecycle
+                    .as_mut()
+                    .unwrap()
+                    .eligible_event_manifest_ref = receipt.eligible_event_manifest_ref.clone();
+                receipt.validate().unwrap();
+                let mut payloads = source_payloads(receipt, observation.clone());
+                payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::CaptureReconciliation,
+                    target_id: observation.source_observation_id.to_string(),
+                    algorithm_revision: "s25-mapped-physical".into(),
+                    source_watermark: 1,
+                }));
+                writer
+                    .commit(
+                        &command(20 + delivery as i64, payloads),
+                        20 + delivery as i64,
+                    )
+                    .await
+                    .unwrap();
+                physical.push(observation);
+            }
+            let (phase_writer, phase_task) = spawn_writer(writer, 8).unwrap();
+            evertrace_engine::capture::reconcile_observations_once(
+                evertrace_engine::capture::ReconcileInput {
+                    adapter_manifests: vec![native_manifest, synthetic_manifest],
+                    runtime_snapshot: runtime,
+                    liveness: vec![],
+                    reconciled_gaps: vec![],
+                    reconciled_outages: vec![],
+                    independent_source_reconciliations: vec![],
+                    effective_config_hash: config.hash(),
+                    algorithm_revision: "s25-mapped-reconcile".into(),
+                    occurred_at_us: 20 + delivery as i64,
+                    max_items: 16,
+                },
+                &phase_writer,
+                &physical
+                    .iter()
+                    .map(|value| value.source_observation_id)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+            phase_writer.shutdown().await.unwrap();
+            phase_task.await.unwrap().unwrap();
+            writer = JournalWriter::open(&fixture.store_path).await.unwrap();
+            let snapshot = writer.project().await.unwrap();
+            let mut episodes = Vec::new();
+            let mut streams = Vec::new();
+            let mut old_scenario = None;
+            for row in snapshot.data_rows() {
+                let payload: JournalPayload =
+                    serde_json::from_str(row.payload_json.as_deref().unwrap()).unwrap();
+                match payload {
+                    JournalPayload::WorkEpisodeRecorded(value)
+                        if value.workstream_id == stream.workstream_id =>
+                    {
+                        episodes.push(*value)
+                    }
+                    JournalPayload::WorkstreamRecorded(value)
+                        if value.workstream_id == stream.workstream_id =>
+                    {
+                        streams.push(*value)
+                    }
+                    JournalPayload::ScenarioRecorded(value)
+                        if value.scope.task_id == task.task_id
+                            && old_scenario.as_ref().is_none_or(
+                                |old: &evertrace_domain::semantic::Scenario| {
+                                    old.revision_generation < value.revision_generation
+                                },
+                            ) =>
+                    {
+                        old_scenario = Some(*value);
+                    }
+                    _ => {}
+                }
+            }
+            let current_stream = streams
+                .into_iter()
+                .max_by_key(|value| value.source_watermark)
+                .unwrap();
+            let mut current = episodes
+                .into_iter()
+                .filter(|value| Some(value.episode_id) == current_stream.active_episode_id)
+                .max_by_key(|value| value.revision_generation)
+                .unwrap();
+            let operation_id = evertrace_store::SegmentationCurrentState::from_snapshot(&snapshot)
+                .unwrap()
+                .authority()
+                .operation_for_observation(physical[0].source_observation_id)
+                .unwrap()
+                .unwrap()
+                .operation_id;
+            let binding = WorkBindingRevision {
+                work_binding_revision_id: WorkBindingRevisionId::new_v7(),
+                operation_id,
+                revision_generation: 1,
+                predecessor_revision_id: None,
+                primary_binding: PrimaryWorkBinding {
+                    task_id: Some(task.task_id),
+                    workstream_id: Some(stream.workstream_id),
+                    episode_id: Some(current.episode_id),
+                    ..Default::default()
+                },
+                secondary_bindings: vec![],
+                scope_effect_refs: vec![],
+                assignment_status: AssignmentStatus::Resolved,
+                evidence_refs: vec![physical[0].source_observation_id.to_string()],
+                resolver_version: 1,
+            };
+            writer
+                .commit(
+                    &command(
+                        20 + delivery as i64,
+                        vec![JournalPayload::WorkBindingRecorded(Box::new(binding))],
+                    ),
+                    20 + delivery as i64,
+                )
+                .await
+                .unwrap();
+            let snapshot = writer.project().await.unwrap();
+            let state =
+                evertrace_store::SegmentationCurrentState::from_snapshot(&snapshot).unwrap();
+            let operation = state.authority().operation(operation_id).unwrap();
+            assert_eq!(
+                state
+                    .authority()
+                    .occurrence(operation.host_occurrence_id)
+                    .unwrap()
+                    .correlation_strength,
+                evertrace_domain::evidence::CorrelationStrength::Exact
+            );
+            assert!(
+                operation.execution_lane_id.is_some(),
+                "reconciliation must attach the synthetic operation"
+            );
+            assert!(
+                state
+                    .authority()
+                    .lane(operation.execution_lane_id.unwrap())
+                    .unwrap()
+                    .operation_ids
+                    .contains(&operation_id)
+            );
+            let mut segmenter = evertrace_engine::segmentation::IncrementalSegmenter::new(
+                &state,
+                current.episode_id,
+            )
+            .unwrap();
+            let evertrace_engine::segmentation::SegmentOutcome::Delta(step) = segmenter
+                .observe(
+                    &state,
+                    operation_id,
+                    evertrace_engine::segmentation::SegmentationFacts {
+                        sequence: snapshot.frontier,
+                        source_watermark: snapshot.frontier,
+                        target_family: "episode".into(),
+                        state_delta: evertrace_engine::segmentation::StateDeltaKind::Modified,
+                        error_signature: None,
+                        verifier_transition:
+                            evertrace_engine::segmentation::VerifierTransition::None,
+                        observed_phase_kind: Some(current.phase_contract.phase_kind),
+                        boundary_evidence: evertrace_engine::segmentation::BoundaryEvidence::None,
+                        evidence_refs: physical
+                            .iter()
+                            .map(|value| value.source_observation_id)
+                            .collect(),
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("synthetic Exact operation must form a real burst")
+            };
+            let receipts = snapshot
+                .data_rows()
+                .filter_map(|row| {
+                    match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?)
+                        .ok()?
+                    {
+                        JournalPayload::CaptureReceiptRecorded(value) => Some(*value),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let update = evertrace_engine::work::episode::save_segmentation_update(
+                work_context(20 + delivery as i64),
+                &current,
+                &step,
+                &receipts,
+            )
+            .unwrap();
+            current = update
+                .events()
+                .iter()
+                .find_map(|event| match &event.payload {
+                    JournalPayload::WorkEpisodeRecorded(value) => Some((**value).clone()),
+                    _ => None,
+                })
+                .unwrap();
+            writer.commit(&update, 20 + delivery as i64).await.unwrap();
+            let snapshot = writer.project().await.unwrap();
+            let mut candidate = current.clone();
+            candidate.revision_id = RevisionId::new_v7();
+            candidate.predecessor_revision_id = Some(current.revision_id);
+            candidate.revision_generation += 1;
+            candidate.source_watermark = snapshot.frontier;
+            candidate.pending_semantic_delta =
+                Some(evertrace_domain::work::PendingSemanticInterval {
+                    after_watermark: candidate.semantic_watermark,
+                    through_watermark: candidate.source_watermark,
+                });
+            candidate.boundary_status = evertrace_domain::work::BoundaryStatus::Candidate;
+            candidate.boundary_candidate = Some(evertrace_domain::work::BoundaryCandidateState {
+                candidate_phase_kind: Some(current.phase_contract.phase_kind),
+                candidate_watermark: snapshot.frontier,
+                evidence_refs: vec![physical[0].source_observation_id],
+                kind: evertrace_domain::work::BoundaryCandidateKind::Objective,
+                refinement_progress: 0,
+            });
+            current.validate_successor(&candidate).unwrap();
+            writer
+                .commit(
+                    &command(
+                        20 + delivery as i64,
+                        vec![JournalPayload::WorkEpisodeRecorded(Box::new(
+                            candidate.clone(),
+                        ))],
+                    ),
+                    20 + delivery as i64,
+                )
+                .await
+                .unwrap();
+            current = candidate;
+            let watermark = writer.project().await.unwrap().frontier + 1;
+            let mut closed = current.clone();
+            closed.revision_id = RevisionId::new_v7();
+            closed.predecessor_revision_id = Some(current.revision_id);
+            closed.revision_generation += 1;
+            closed.lifecycle_status = evertrace_domain::work::EpisodeLifecycle::Closed;
+            closed.boundary_status = evertrace_domain::work::BoundaryStatus::Confirmed;
+            closed.boundary_candidate = None;
+            closed.confirmation_watermark = watermark;
+            closed.source_watermark = watermark;
+            closed.pending_semantic_delta = Some(evertrace_domain::work::PendingSemanticInterval {
+                after_watermark: closed.semantic_watermark,
+                through_watermark: watermark,
+            });
+            let mut contract = current.phase_contract.clone();
+            contract.phase_label = phase_name.into();
+            contract.phase_kind = [
+                PhaseKind::Recover,
+                PhaseKind::Analyze,
+                PhaseKind::Verify,
+                PhaseKind::Execute,
+                PhaseKind::Deliver,
+            ][delivery - 6];
+            let mut next = evertrace_engine::work::episode::next_episode(
+                &current_stream,
+                &current,
+                contract,
+                None,
+                watermark,
+            )
+            .unwrap();
+            next.execution_lane_ids = current.execution_lane_ids.clone();
+            next.session_ids = current.session_ids.clone();
+            next.capture_receipt_revision_ids = current.capture_receipt_revision_ids.clone();
+            next.capture_watermark = current.capture_watermark;
+            next.capture_summary = current.capture_summary.clone();
+            next.capture_gap_refs = current.capture_gap_refs.clone();
+            next.capture_outage_refs = current.capture_outage_refs.clone();
+            let transition = evertrace_engine::work::episode::close_episode_and_optionally_open(
+                work_context(20 + delivery as i64),
+                &current_stream,
+                &current,
+                closed,
+                Some(&step),
+                Some(next.clone()),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+            writer
+                .commit(&transition, 20 + delivery as i64)
+                .await
+                .unwrap();
+            let checkpoint =
+                WorkCheckpoint::derive(&next, &[], None, CheckpointReason::Manual).unwrap();
+            let save = evertrace_engine::work::episode::save_checkpoint(
+                work_context(30 + delivery as i64),
+                &next,
+                checkpoint,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            writer.commit(&save, 30 + delivery as i64).await.unwrap();
+            let snapshot = writer.project().await.unwrap();
+            let scenario = evertrace_engine::semantic::ScenarioCompiler::compile(
+                &snapshot,
+                old_scenario.as_ref().unwrap().scope.clone(),
+                old_scenario.as_ref(),
+            )
+            .unwrap()
+            .unwrap();
+            writer
+                .commit(
+                    &evertrace_engine::semantic::ScenarioCompiler::journal_command(
+                        CommandId::new_v7(),
+                        scenario,
+                        config.hash(),
+                        40 + delivery as i64,
+                    )
+                    .unwrap(),
+                    40 + delivery as i64,
+                )
+                .await
+                .unwrap();
+            writer.project().await.unwrap();
+            drop(writer);
+            daemon = Daemon(
+                Command::new(package.join("evertraced"))
+                    .arg("--config")
+                    .arg(&config_path)
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            hook = loop {
+                if let Ok(client) = LocalClient::connect(
+                    &socket,
+                    "s25-mcp",
+                    ClientKind::Hook,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    break client;
+                }
+                assert!(daemon.0.try_wait().unwrap().is_none());
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+        }
+        if delivery > 0 {
+            let mut next = config.config().clone();
+            next.search.search_token_budget = if delivery == 1 { 0 } else { 600 };
+            next.procedure.include_probationary = delivery != 3;
+            let mut config_client = LocalClient::connect(
+                &socket,
+                "s25-config",
+                ClientKind::Cli,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let Response::ConfigDocument(document) = config_client
+                .request(RequestId::new_v7(), Rpc::ConfigRead)
+                .await
+                .unwrap()
+            else {
+                panic!("config read")
+            };
+            let reloaded = config_client
+                .request(
+                    RequestId::new_v7(),
+                    Rpc::ConfigWrite(evertrace_protocol::command::ConfigWriteCommand {
+                        source: EffectiveConfig::new(next).unwrap().to_toml().unwrap(),
+                        expected_file_hash: document.file_hash,
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(reloaded, Response::ConfigReload(_)));
+            hook =
+                LocalClient::connect(&socket, "s25-mcp", ClientKind::Hook, Duration::from_secs(2))
+                    .await
+                    .unwrap();
+        }
+        let mut grants = Vec::new();
+        for repetition in 0..if delivery == 4 { 2 } else { 1 } {
+            let Response::McpBindingIssued(grant) = hook
+                .request(
+                    RequestId::new_v7(),
+                    Rpc::IssueMcpBinding(McpBindingIssueCommand {
+                        session_id: lane.host_session_id.clone(),
+                        turn_id: "turn-mcp".into(),
+                        tool_use_id: format!("tool-mcp-{delivery}-{repetition}"),
+                        agent_id: Some(if delivery == 5 {
+                            "unobserved-agent".into()
+                        } else {
+                            lane.agent_id.clone()
+                        }),
+                        transcript_path: None,
+                        original_input: McpToolInput {
+                            action: McpAction::Search,
+                            workspace: fixture.worktree_id.to_string(),
+                            input: query.into(),
+                            refs: Vec::new(),
+                        },
+                        launcher_protocol_revision:
+                            evertrace_codex::binding::BINDING_PROTOCOL_REVISION,
+                    }),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("binding issue failed")
+            };
+            grants.push(grant);
+        }
+        let grant = &grants[0];
+        if delivery == 0 {
+            let mut disconnected =
+                LocalClient::connect(&socket, "s25-mcp", ClientKind::Mcp, Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            let response = disconnected
+                .request(
+                    RequestId::new_v7(),
+                    Rpc::McpCall(evertrace_protocol::command::McpCallCommand {
+                        input: McpToolInput {
+                            action: McpAction::Search,
+                            workspace: grant.bound_workspace.clone(),
+                            input: query.into(),
+                            refs: Vec::new(),
+                        },
+                        client_cwd: fixture._temp.path().to_string_lossy().into_owned(),
+                    }),
+                )
+                .await
+                .unwrap();
+            let Response::McpResult(result) = response else {
+                panic!("search response")
+            };
+            assert_eq!(result.items.procedures.len(), 1, "{result:?}");
+            drop(disconnected); // UDS response alone is not a confirmed stdout return.
+            continue;
+        }
+        let mut cli = Command::new(package.join("evertrace"))
+            .arg("--config")
+            .arg(&config_path)
+            .arg("mcp")
+            .env_clear()
+            .current_dir(fixture._temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = cli.stdin.take().unwrap();
+        writeln!(stdin, "{}", serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"s25","version":"1"}}})).unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+        for (index, grant) in grants.iter().enumerate() {
+            writeln!(stdin, "{}", serde_json::json!({"jsonrpc":"2.0","id":index + 1,"method":"tools/call","params":{"name":"evertrace","arguments":{"action":"search","workspace":grant.bound_workspace,"input":query,"refs":[]}}})).unwrap();
+        }
+        drop(stdin);
+        let output = cli.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let messages = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let result = &messages[1]["result"]["structuredContent"];
+        if delivery == 4 {
+            assert_eq!(messages.len(), 3);
+            assert_eq!(
+                messages[2]["result"]["structuredContent"]["items"]["procedures"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(result.is_object(), "delivery {delivery}: {messages:?}");
+        if delivery == 1 || delivery == 3 || delivery == 5 || delivery == 10 {
+            assert!(
+                result["items"]["procedures"].as_array().unwrap().is_empty(),
+                "{result}"
+            );
+            if delivery == 1 {
+                assert_eq!(
+                    result["truncated"], true,
+                    "the daemon's final budget removed the Procedure"
+                );
+            } else if delivery == 3 {
+                assert_eq!(
+                    result["status"], "no_match",
+                    "the unique mapped query has no other matches"
+                );
+            } else {
+                assert!(
+                    !result.to_string().contains("APPLY"),
+                    "missing exact Work context cannot route actions"
+                );
+            }
+            continue;
+        }
+        assert_eq!(
+            result["items"]["procedures"].as_array().unwrap().len(),
+            1,
+            "{result}"
+        );
+        let item = &result["items"]["procedures"][0];
+        // Entry comes from the accepted explicit IR and actual checkpoint,
+        // never the equality of a step's prose and a phase label.
+        assert_eq!(
+            item["object_revision_ref"],
+            fixture.procedure.revision_id.to_string()
+        );
+        assert!(item["text"].as_str().unwrap().contains("APPLY"), "{item}");
+        let text = item["text"].as_str().unwrap();
+        let expected = match delivery {
+            6 => "mapped recover one",
+            7 => "mapped recover two",
+            9 => "mapped second action",
+            _ => "mapped first action",
+        };
+        assert!(text.contains(expected), "delivery {delivery}: {item}");
+        if delivery == 7 {
+            assert!(!text.contains("mapped recover one"));
+        }
+        if delivery == 9 {
+            assert!(!text.contains("mapped first action"));
+        }
+    }
+    drop(hook);
+    drop(daemon);
+    fixture.writer = JournalWriter::open(&fixture.store_path).await.unwrap();
+    let snapshot = fixture.writer.project().await.unwrap();
+    let stages = snapshot
+        .data_rows()
+        .filter_map(|row| {
+            let payload: JournalPayload =
+                serde_json::from_str(row.payload_json.as_deref()?).ok()?;
+            match payload {
+                JournalPayload::ProcedureUsageRecorded(value) => Some(value.stage),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|stage| **stage == ProcedureUsageStage::Routed)
+            .count(),
+        7,
+        "disconnected and trimmed routes are not returns; real later searches reroute"
+    );
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|stage| **stage == ProcedureUsageStage::Returned)
+            .count(),
+        5
+    );
+    assert_eq!(snapshot, fixture.writer.full_projection().await.unwrap());
 }

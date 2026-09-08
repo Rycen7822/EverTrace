@@ -259,7 +259,7 @@ fn hard_eligible(
             == Some(evertrace_domain::semantic::GlobalSupportState::Valid))
         && !matches!(
             candidate.phase,
-            ProcedurePhase::AlreadyCompleted | ProcedurePhase::Incompatible
+            None | Some(ProcedurePhase::AlreadyCompleted | ProcedurePhase::Incompatible)
         )
         && candidate
             .revision

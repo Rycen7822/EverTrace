@@ -56,6 +56,8 @@ struct ProcedureHistoryIndex<'a> {
         )>,
     >,
     initial_usage_watermarks: BTreeMap<ProcedureUsageId, u64>,
+    legacy_returned_usages: BTreeSet<ProcedureUsageId>,
+    first_returned_times: BTreeMap<ProcedureUsageId, i64>,
 }
 
 impl<'a> ProcedureHistoryIndex<'a> {
@@ -69,6 +71,8 @@ impl<'a> ProcedureHistoryIndex<'a> {
             usages: BTreeMap::new(),
             reviews: BTreeMap::new(),
             initial_usage_watermarks: BTreeMap::new(),
+            legacy_returned_usages: BTreeSet::new(),
+            first_returned_times: BTreeMap::new(),
         };
         for (value, seq) in state.work_bindings.values() {
             index
@@ -99,11 +103,25 @@ impl<'a> ProcedureHistoryIndex<'a> {
                 .push((value, *seq));
         }
         for (value, seq) in state.procedure.usage_revision_entries() {
-            index
-                .initial_usage_watermarks
-                .entry(value.procedure_usage_id)
-                .and_modify(|watermark| *watermark = (*watermark).min(value.source_watermark))
-                .or_insert(value.source_watermark);
+            if value.revision_generation == 1
+                && value.stage == evertrace_domain::procedure::ProcedureUsageStage::Returned
+            {
+                index
+                    .legacy_returned_usages
+                    .insert(value.procedure_usage_id);
+            }
+            if value.stage >= evertrace_domain::procedure::ProcedureUsageStage::Returned {
+                index
+                    .first_returned_times
+                    .entry(value.procedure_usage_id)
+                    .and_modify(|time| *time = (*time).min(value.created_at_us))
+                    .or_insert(value.created_at_us);
+                index
+                    .initial_usage_watermarks
+                    .entry(value.procedure_usage_id)
+                    .and_modify(|watermark| *watermark = (*watermark).min(value.source_watermark))
+                    .or_insert(value.source_watermark);
+            }
             index
                 .usages
                 .entry(value.procedure_usage_id)
@@ -307,7 +325,11 @@ impl JournalAdmissionState {
                     .is_some_and(|state| *state == "valid");
                 if usage.source_watermark != self.frontier
                     || self.procedure.has_usage_anchor(usage)
-                    || usage.stage != evertrace_domain::procedure::ProcedureUsageStage::Returned
+                    || !matches!(
+                        usage.stage,
+                        evertrace_domain::procedure::ProcedureUsageStage::Routed
+                            | evertrace_domain::procedure::ProcedureUsageStage::Returned
+                    )
                     || !usage.attempt_ids.is_empty()
                     || !usage.action_operation_refs.is_empty()
                     || !usage.verification_operation_refs.is_empty()
@@ -478,6 +500,28 @@ impl JournalAdmissionState {
                         .iter()
                         .any(matches_episode));
             if operation_seq <= exposure_watermark
+                || !history
+                    .legacy_returned_usages
+                    .contains(&usage.procedure_usage_id)
+                    && operation.input_source_observation_refs.iter().any(|id| {
+                        self.source_observations
+                            .get(id)
+                            .is_none_or(|(observation, seq)| {
+                                *seq <= exposure_watermark
+                                    || *seq >= as_of_seq
+                                    || history
+                                        .first_returned_times
+                                        .get(&usage.procedure_usage_id)
+                                        .is_none_or(|returned_at| {
+                                            self.source_receipts
+                                                .get(&observation.source_receipt_ref)
+                                                .is_none_or(|(receipt, seq)| {
+                                                    *seq >= as_of_seq
+                                                        || receipt.recorded_at_us <= *returned_at
+                                                })
+                                        })
+                            })
+                    })
                 || operation.pairing_state != evertrace_domain::evidence::PairingState::Paired
                 || occurrence.correlation_strength
                     != evertrace_domain::evidence::CorrelationStrength::Exact

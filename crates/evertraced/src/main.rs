@@ -547,6 +547,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         mcp_output::bound_result(&mut result, output_action, target_bytes);
                         Ok(Response::McpResult(Box::new(result)))
                     }
+                    ProtocolCommand::McpReturned { request_id: original_request } => {
+                        let Some((expected, revisions)) = context.mcp_returned else {
+                            return Err(ErrorCode::Untrusted);
+                        };
+                        if context.client_kind != ClientKind::Mcp || expected != original_request {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        mcp_service.confirm_procedure_return(original_request, request_id, &revisions)
+                            .await.map_err(|_| ErrorCode::Internal)?;
+                        Ok(Response::McpReturned)
+                    }
                     ProtocolCommand::SessionImportAdmin(command) => {
                         if context.client_kind != ClientKind::Cli {
                             return Err(ErrorCode::Untrusted);

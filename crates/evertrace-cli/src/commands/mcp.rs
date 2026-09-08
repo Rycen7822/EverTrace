@@ -49,12 +49,36 @@ pub async fn run(config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
         if line.is_empty() {
             continue;
         }
-        let response =
-            dispatch_line(&line, &socket, &client_cwd, &mut lifecycle, &mut client).await;
+        let mut returned = None;
+        let response = dispatch_line(
+            &line,
+            &socket,
+            &client_cwd,
+            &mut lifecycle,
+            &mut client,
+            &mut returned,
+        )
+        .await;
         if let Some(response) = response {
             serde_json::to_writer(&mut stdout, &response)?;
             stdout.write_all(b"\n")?;
             stdout.flush()?;
+            if let Some(request_id) = returned {
+                let confirmed = match client.as_mut() {
+                    Some(connection) => matches!(
+                        connection
+                            .request(RequestId::new_v7(), Command::McpReturned { request_id })
+                            .await,
+                        Ok(Response::McpReturned)
+                    ),
+                    None => false,
+                };
+                // Output is already delivered. An unconfirmed receipt never
+                // retransmits it or turns that successful write into an error.
+                if !confirmed {
+                    client = None;
+                }
+            }
         }
     }
     Ok(())
@@ -66,6 +90,7 @@ async fn dispatch_line(
     client_cwd: &str,
     lifecycle: &mut Lifecycle,
     client: &mut Option<LocalClient>,
+    returned: &mut Option<RequestId>,
 ) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(value) => value,
@@ -161,6 +186,7 @@ async fn dispatch_line(
                 }
             }
             let request_id = RequestId::new_v7();
+            let search = input.action == evertrace_protocol::mcp::McpAction::Search;
             let response = client
                 .as_mut()
                 .expect("client was initialized")
@@ -182,6 +208,9 @@ async fn dispatch_line(
                 *client = None;
                 return Some(error_response(id, -32603, "unexpected daemon response"));
             };
+            if search && !envelope.items.procedures.is_empty() {
+                *returned = Some(request_id);
+            }
             Some(success_response(
                 id,
                 json!({

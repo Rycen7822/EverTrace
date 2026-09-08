@@ -315,6 +315,7 @@ fn procedure_draft(
             field: ConstraintField::ArtifactKind,
             value: ConstraintValue::Text("release".into()),
         },
+        stage_alignment: None,
         actions: ProcedureActions {
             stages: vec!["run the verifier".into()],
             branches: Vec::new(),

@@ -29,6 +29,8 @@ atom_candidate={"kind":"atom_candidate","operation":"create|replace|reclassify",
 atom_value={"text":string,"subject":string,"predicate":string,"object":string|null,"qualifiers":[{"name":string,"value":string}]}
 procedure_candidate={"kind":"procedure_candidate","operation":"create|replace","target_id":procedure_id|null,"base_revision_id":revision_id|null,"content":procedure_content}; create requires target_id=null and base_revision_id=null; replace requires both target_id and base_revision_id non-null
 procedure_content={"title":string,"summary":string,"procedure_kind":"workflow|diagnostic|guardrail","when":{"goals":[string],"targets":[string],"signals":[string],"stage":string,"requires":[string],"excludes":[string]},"applicability_expr":constraint_expr,"avoid_expr":constraint_expr,"completion_expr":constraint_expr,"actions":{"stages":[string],"branches":[{"label":string,"condition":constraint_expr,"stages":[string]}],"avoid":[string]},"done":{"success":[string],"abort":[string],"verify":[string]},"pitfalls":[string]}
+procedure_content may additionally contain stage_alignment={"main":[step_alignment],"branches":[{"at_main_step":zero_based_main_index,"steps":[step_alignment]}]}; step_alignment={"entry":constraint_expr,"progress":constraint_expr,"completed":constraint_expr}. The main/branch arrays must correspond exactly to actions by position, at most 64 total steps. Propose observable boundaries using only the supplied frozen stage_trace states and source_refs; conditions are declarations, never assertions that execution or verification occurred. Do not infer entry from no actions or stage text equality. Omit the mapping when the supplied typed facts cannot express the boundaries. stage_trace is not direct_delta and cannot supply new semantic delta watermarks.
+Stage alignment supports phase, phase_kind, failure_signature, verifier_state, experiment_state and revision_active. Free phase/failure_signature operands must occur in the frozen stage_trace, not merely elsewhere in your response. Closed phase_kind values are orient, inspect, reproduce, diagnose, design, implement, verify, execute, analyze, recover, deliver, unknown; verifier_state values are unverified, passed, failed, inconclusive; experiment_state values are unknown, queued, running, completed, failed, interrupted; revision_active is boolean. Valid future closed values may be declared before they are observed: this supplies no factual truth or execution evidence.
 applicability_expr={"kind":"always"}|{"kind":"constraint","expr":constraint_expr}
 constraint_expr={"op":"all|any","terms":[constraint_expr]}|{"op":"not","term":constraint_expr}|{"op":"eq","field":constraint_field,"value":constraint_value}|{"op":"in","field":constraint_field,"values":[constraint_value]}|{"op":"exists|changed","field":constraint_field}|{"op":"transitioned","field":constraint_field,"from":constraint_value,"to":constraint_value}
 constraint_field="agent_kind|task_kind|project_family|toolchain|operation_kind|phase_kind|artifact_kind|environment_profile|revision_active|verifier_state|phase|failure_signature|worktree_lineage|artifact_version|experiment_state"
@@ -58,6 +60,7 @@ pub struct ProtectedSemanticInput {
     pub trigger: &'static str,
     pub direct_delta: Vec<ProtectedDeltaItem>,
     pub source_refs: Vec<String>,
+    pub stage_trace: crate::procedure::StageTrace,
 }
 
 #[derive(Clone, Serialize)]
@@ -127,6 +130,8 @@ pub struct ProviderProcedureContent {
     pub applicability_expr: ConstraintExpr,
     pub avoid_expr: ConstraintExpr,
     pub completion_expr: ConstraintExpr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_alignment: Option<evertrace_domain::procedure::ProcedureStageAlignment>,
     pub actions: ProcedureActions,
     pub done: ProcedureDone,
     pub pitfalls: Vec<String>,

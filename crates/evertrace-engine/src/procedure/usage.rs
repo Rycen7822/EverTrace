@@ -1,5 +1,30 @@
 use super::*;
 
+struct CompiledRelativeContext {
+    phase: Option<ProcedurePhase>,
+    // Outer None is unknown; Some(None) is a verified current absence.
+    failure_signature: Option<Option<String>>,
+}
+
+impl CompiledRelativeContext {
+    fn quarantine_relevant(
+        &self,
+        prior: &evertrace_domain::procedure::ProcedureLocalContext,
+        repository: Option<evertrace_domain::ids::RepositoryId>,
+        worktree: Option<evertrace_domain::ids::WorktreeId>,
+    ) -> bool {
+        repository.is_none_or(|id| prior.repository_id == Some(id))
+            && worktree.is_none_or(|id| prior.worktree_id == Some(id))
+            && self
+                .phase
+                .is_none_or(|phase| prior.phase == usage_phase(phase))
+            && self
+                .failure_signature
+                .as_ref()
+                .is_none_or(|signature| &prior.failure_signature == signature)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProcedureUsageCurrentView {
     frontier: u64,
@@ -37,6 +62,13 @@ pub struct ProcedureUsageCurrentView {
         evertrace_domain::ids::OperationId,
         (evertrace_domain::evidence::Operation, u64),
     >,
+    observation_seqs: std::collections::BTreeMap<
+        evertrace_domain::ids::SourceObservationId,
+        (u64, evertrace_domain::ids::SourceReceiptId),
+    >,
+    receipt_times: std::collections::BTreeMap<evertrace_domain::ids::SourceReceiptId, i64>,
+    legacy_returned_usages: std::collections::BTreeSet<evertrace_domain::ids::ProcedureUsageId>,
+    first_returned_times: std::collections::BTreeMap<evertrace_domain::ids::ProcedureUsageId, i64>,
     host_occurrences: std::collections::BTreeMap<
         evertrace_domain::ids::HostOccurrenceId,
         (evertrace_domain::evidence::HostOccurrence, u64),
@@ -70,6 +102,438 @@ pub struct ProcedureUsageCurrentView {
 }
 
 impl ProcedureUsageCurrentView {
+    fn compile_relative_context(
+        &self,
+        revision: &ProcedureRevision,
+        episode: &evertrace_domain::work::WorkEpisode,
+        attempt: Option<&evertrace_domain::work::Attempt>,
+        constraints: &ConstraintState,
+    ) -> CompiledRelativeContext {
+        let completion = revision.draft.completion_expr.evaluate(constraints, None);
+        let aligned = attempt.is_some_and(|attempt| {
+            self.usages.values().any(|usage| {
+                usage.procedure_revision_id == revision.revision_id
+                    && usage.task_id == episode.task_id
+                    && usage.workstream_id == episode.workstream_id
+                    && self
+                        .episodes
+                        .get(&usage.exposure_episode_revision_id)
+                        .is_some_and(|old| old.episode_id == episode.episode_id)
+                    && usage.action_aligned == evertrace_domain::procedure::ProcedureTruth::True
+                    && !usage.action_operation_refs.is_empty()
+                    && validate_physical_usage(self, usage).is_ok_and(|(resolved, adopted)| {
+                        resolved && adopted == Some(attempt.attempt_id)
+                    })
+            })
+        });
+        let phase = if completion == ConstraintTruth::True {
+            Some(ProcedurePhase::AlreadyCompleted)
+        } else if completion == ConstraintTruth::False
+            && aligned
+            && revision.draft.actions.stages.len() == 1
+            && revision.draft.actions.branches.is_empty()
+        {
+            Some(
+                if attempt.is_some_and(|attempt| {
+                    attempt.verification == evertrace_domain::work::AttemptVerification::Failed
+                }) {
+                    ProcedurePhase::RecoverableDeviation
+                } else {
+                    ProcedurePhase::InProgress
+                },
+            )
+        } else {
+            None
+        };
+        CompiledRelativeContext {
+            phase,
+            failure_signature: attempt.map(|attempt| attempt.failure_signature.clone()),
+        }
+    }
+
+    fn operation_after_return(
+        &self,
+        usage_id: evertrace_domain::ids::ProcedureUsageId,
+        operation_id: &evertrace_domain::ids::OperationId,
+    ) -> bool {
+        let (Some(watermark), Some(returned_at), Some((operation, seq))) = (
+            self.usage_exposure_watermarks.get(&usage_id),
+            self.first_returned_times.get(&usage_id),
+            self.operations.get(operation_id),
+        ) else {
+            return false;
+        };
+        *seq > *watermark
+            && operation.input_source_observation_refs.iter().all(|id| {
+                self.observation_seqs.get(id).is_some_and(|(seq, receipt)| {
+                    *seq > *watermark
+                        && self
+                            .receipt_times
+                            .get(receipt)
+                            .is_some_and(|recorded_at| recorded_at > returned_at)
+                })
+            })
+    }
+
+    pub(crate) fn confirmed_return_events(
+        &self,
+        context: ProposalCommandContext,
+        routed: &[JournalPayload],
+        returned: &[RevisionId],
+    ) -> Result<Vec<JournalEventDraft>, SemanticServiceError> {
+        use evertrace_domain::procedure::ProcedureUsageStage;
+        if returned.is_empty() || returned.len() > 2 || routed.is_empty() || routed.len() > 2
+            || routed.iter().any(|payload| !matches!(payload,
+                JournalPayload::ProcedureUsageRecorded(usage) if usage.stage == ProcedureUsageStage::Routed))
+        {
+            return Err(SemanticServiceError::InvalidInput);
+        }
+        let mut events = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for revision in returned {
+            if !seen.insert(*revision) {
+                return Err(SemanticServiceError::InvalidInput);
+            }
+            let mut matching = routed.iter().filter_map(|payload| match payload {
+                JournalPayload::ProcedureUsageRecorded(usage)
+                    if usage.procedure_revision_id == *revision
+                        && usage.stage == ProcedureUsageStage::Routed =>
+                {
+                    Some(usage)
+                }
+                _ => None,
+            });
+            let Some(original) = matching.next() else {
+                // Historical exposure may share an envelope with a new route.
+                // It cannot authorize a new Returned event for this request.
+                continue;
+            };
+            if matching.next().is_some() {
+                return Err(SemanticServiceError::InvalidInput);
+            }
+            let current = self
+                .usages
+                .get(&original.procedure_usage_id)
+                .ok_or(SemanticServiceError::InvalidInput)?;
+            if current != original.as_ref() {
+                return Err(SemanticServiceError::InvalidInput);
+            }
+            let (_, command) = advance_procedure_usage(
+                self,
+                context.clone(),
+                ProcedureUsageAdvance {
+                    usage_id: original.procedure_usage_id,
+                    stage: ProcedureUsageStage::Returned,
+                    attempt_ids: Vec::new(),
+                    action_episode_revision_ids: Vec::new(),
+                    verification_episode_revision_ids: Vec::new(),
+                    action_operation_refs: Vec::new(),
+                    verification_operation_refs: Vec::new(),
+                    work_binding_revision_refs: Vec::new(),
+                    scope_effect_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+                &ConstraintState::default(),
+                None,
+            )?;
+            events.extend_from_slice(command.events());
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn reroute_pending_usage(
+        &self,
+        context: ProposalCommandContext,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> Result<JournalCommand, SemanticServiceError> {
+        if usage.stage != evertrace_domain::procedure::ProcedureUsageStage::Routed
+            || self.usages.get(&usage.procedure_usage_id) != Some(usage)
+        {
+            return Err(SemanticServiceError::InvalidInput);
+        }
+        let mut next = usage.clone();
+        next.usage_revision_id = RevisionId::new_v7();
+        next.predecessor_revision_id = Some(usage.usage_revision_id);
+        next.revision_generation = usage
+            .revision_generation
+            .checked_add(1)
+            .ok_or(SemanticServiceError::InvalidInput)?;
+        next.source_watermark = self.frontier;
+        next.created_at_us = context.occurred_at_us;
+        if !usage.validate_successor(&next) {
+            return Err(SemanticServiceError::InvalidInput);
+        }
+        usage_command(context, next, None)
+    }
+
+    pub(crate) fn route_search(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        anchor: &crate::service::McpQueryAnchor,
+        context: &SearchContext,
+        revisions: &[String],
+    ) -> Result<ProcedureRouteResult, SemanticServiceError> {
+        use evertrace_domain::{
+            semantic::{ConstraintBinding, ConstraintField, ConstraintValue, ScenarioScope},
+            work::{AttemptLifecycleStatus, AttemptVerification, EpisodeLifecycle},
+        };
+        let Some(episode) = anchor
+            .episode_revision_id
+            .and_then(|id| self.episodes.get(&id))
+            .filter(|episode| {
+                Some(episode.task_id) == anchor.task_id
+                    && Some(episode.workstream_id) == anchor.workstream_id
+                    && self.current_episode_revisions.get(&episode.episode_id)
+                        == Some(&episode.revision_id)
+                    && episode.lifecycle_status == EpisodeLifecycle::Open
+            })
+        else {
+            return Ok(ProcedureRouteResult {
+                status: "insufficient_context",
+                items: vec![],
+            });
+        };
+        let scenario_scope = ScenarioScope {
+            task_id: episode.task_id,
+            repository_instance_id: anchor.repository_id,
+            worktree_instance_id: anchor.worktree_id,
+        };
+        let mut checkpoint = None;
+        let mut scenario: Option<evertrace_domain::semantic::Scenario> = None;
+        for row in snapshot.data_rows().filter(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some("work_checkpoint" | "scenario")
+            )
+        }) {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(SemanticServiceError::InvalidInput)?,
+            )
+            .map_err(|_| SemanticServiceError::InvalidInput)?;
+            match payload {
+                JournalPayload::WorkCheckpointRecorded(value)
+                    if value.episode_id == episode.episode_id
+                        && value.source_watermark == episode.source_watermark
+                        && episode.checkpoint_refs.contains(&value.stable_key())
+                        && value.phase_contract == episode.phase_contract
+                        && value.attempt_revision_refs.len() == episode.attempt_ids.len()
+                        && value.attempt_revision_refs.iter().all(|reference| {
+                            episode.attempt_ids.contains(&reference.attempt_id)
+                                && self
+                                    .attempts
+                                    .get(&reference.attempt_id)
+                                    .is_some_and(|attempt| {
+                                        attempt.revision_id == reference.revision_id
+                                    })
+                        }) =>
+                {
+                    value
+                        .validate()
+                        .map_err(|_| SemanticServiceError::InvalidInput)?;
+                    if checkpoint
+                        .as_ref()
+                        .is_none_or(|(_, seq)| *seq < row.source_event_seq)
+                    {
+                        checkpoint = Some((*value, row.source_event_seq));
+                    }
+                }
+                JournalPayload::ScenarioRecorded(value)
+                    if value.scope == scenario_scope
+                        && scenario.as_ref().is_none_or(|old| {
+                            old.revision_generation < value.revision_generation
+                        }) =>
+                {
+                    scenario = Some(*value);
+                }
+                _ => {}
+            }
+        }
+        let scenario_fresh = checkpoint.is_some()
+            && scenario.as_ref().is_some_and(|scenario| {
+                scenario.active_lineage.active_episode_id == Some(episode.episode_id)
+                    && crate::semantic::ScenarioCompiler::compile(
+                        snapshot,
+                        scenario_scope.clone(),
+                        Some(scenario),
+                    )
+                    .is_ok_and(|update| update.is_none())
+            });
+        let mut constraints = ConstraintState::default();
+        let active_attempt = scenario_fresh
+            .then(|| {
+                scenario
+                    .as_ref()
+                    .and_then(|scenario| scenario.active_lineage.active_attempt_id)
+                    .and_then(|id| self.attempts.get(&id))
+                    .filter(|attempt| {
+                        let checkpoint = &checkpoint.as_ref().expect("fresh checkpoint").0;
+                        checkpoint.active_attempt_ids.as_slice() == [attempt.attempt_id]
+                            && checkpoint.attempt_revision_refs.iter().any(|reference| {
+                                reference.attempt_id == attempt.attempt_id
+                                    && reference.revision_id == attempt.revision_id
+                            })
+                            && attempt.task_id == episode.task_id
+                            && attempt.workstream_id == episode.workstream_id
+                            && attempt.episode_id == Some(episode.episode_id)
+                            && attempt.repository_instance_id == anchor.repository_id
+                            && anchor
+                                .worktree_id
+                                .is_some_and(|id| attempt.worktree_instance_ids.contains(&id))
+                            && attempt.lifecycle_status == AttemptLifecycleStatus::Active
+                    })
+            })
+            .flatten();
+        if let Some((checkpoint, _)) = &checkpoint {
+            // These are typed current Work facts, not query text or guessed
+            // host state. All other constraint fields remain unknown.
+            let phase_kind = serde_json::to_value(checkpoint.phase_contract.phase_kind)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or(SemanticServiceError::InvalidInput)?;
+            constraints.bindings = vec![
+                ConstraintBinding {
+                    field: ConstraintField::PhaseKind,
+                    value: ConstraintValue::Text(phase_kind.clone()),
+                },
+                ConstraintBinding {
+                    field: ConstraintField::RevisionActive,
+                    value: ConstraintValue::Boolean(true),
+                },
+                ConstraintBinding {
+                    field: ConstraintField::Phase,
+                    value: ConstraintValue::Text(checkpoint.phase_contract.phase_label.clone()),
+                },
+            ];
+        }
+        if let Some(attempt) = active_attempt {
+            constraints.bindings.push(ConstraintBinding {
+                field: ConstraintField::VerifierState,
+                value: ConstraintValue::Text(
+                    match attempt.verification {
+                        AttemptVerification::Unverified => "unverified",
+                        AttemptVerification::Passed => "passed",
+                        AttemptVerification::Failed => "failed",
+                        AttemptVerification::Inconclusive => "inconclusive",
+                    }
+                    .into(),
+                ),
+            });
+            if let Some(signature) = &attempt.failure_signature {
+                constraints.bindings.push(ConstraintBinding {
+                    field: ConstraintField::FailureSignature,
+                    value: ConstraintValue::Text(signature.clone()),
+                });
+            }
+        }
+        constraints
+            .validate()
+            .map_err(|_| SemanticServiceError::InvalidInput)?;
+        let competing = !scenario_fresh
+            || scenario.as_ref().is_some_and(|scenario| {
+                !scenario
+                    .active_lineage
+                    .unresolved_competing_group_ids
+                    .is_empty()
+                    || scenario.active_workstreams.len() > 1
+            });
+        let trace = super::alignment::StageTrace::compile(snapshot, episode)?;
+        let candidates = revisions
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, value)| {
+                let id = value.parse::<RevisionId>().ok()?;
+                let revision = self.current_procedure_by_revision(id)?.clone();
+                let publication = self.publications.get(&id)?.0.to_state;
+                let global_support = (self
+                    .procedure_support
+                    .get(&id)
+                    .and_then(|value| value.as_deref())
+                    == Some("valid"))
+                .then_some(GlobalSupportState::Valid);
+                let aligned = trace.align(&revision.draft);
+                let mut compiled =
+                    self.compile_relative_context(&revision, episode, active_attempt, &constraints);
+                if revision.draft.stage_alignment.is_some() {
+                    compiled.phase = aligned.as_ref().map(|(phase, _)| *phase);
+                }
+                let candidate = ProcedureCandidate {
+                    revision,
+                    publication,
+                    global_support,
+                    phase: compiled.phase,
+                    lexical_rank: rank as u32,
+                };
+                let mut item = evaluate_candidate(
+                    context,
+                    candidate,
+                    if aligned.is_some() {
+                        trace.current().unwrap_or(&constraints)
+                    } else {
+                        &constraints
+                    },
+                    if aligned.is_some() {
+                        trace.previous()
+                    } else {
+                        None
+                    },
+                    scenario_fresh,
+                    if competing {
+                        ProcedureGuidanceMode::GuardrailOnly
+                    } else {
+                        ProcedureGuidanceMode::Normal
+                    },
+                )?;
+                if item.actions.is_some()
+                    && let Some((_, actions)) = aligned
+                {
+                    item.actions = Some(actions);
+                }
+                if self.quarantines.get(&id).is_some_and(|contexts| {
+                    contexts.iter().any(|prior| {
+                        compiled.quarantine_relevant(
+                            prior,
+                            anchor.repository_id,
+                            anchor.worktree_id,
+                        )
+                    })
+                }) {
+                    item.decision = ProcedureDecision::Defer;
+                    item.route_proof.decision = ProcedureDecision::Defer;
+                    item.mode = ProcedureGuidanceMode::GuardrailOnly;
+                    item.reason =
+                        if compiled.phase.is_none() || compiled.failure_signature.is_none() {
+                            "quarantine_context_unknown"
+                        } else {
+                            "local_quarantine"
+                        };
+                    item.actions = None;
+                    if let Some(done) = &mut item.done {
+                        done.success.clear();
+                    }
+                }
+                Some(item)
+            })
+            .collect();
+        Ok(select_route_result(candidates))
+    }
+    pub(crate) fn searchable_procedure_revisions(
+        &self,
+        include_probationary: bool,
+    ) -> std::collections::BTreeSet<String> {
+        self.current_procedures
+            .values()
+            .filter(|revision| {
+                self.publications.get(revision).is_some_and(|(event, _)| {
+                    event.to_state == ProcedurePublicationState::ActiveStable
+                        || include_probationary
+                            && event.to_state == ProcedurePublicationState::ActiveProbationary
+                })
+            })
+            .map(ToString::to_string)
+            .collect()
+    }
     pub(crate) fn current_procedure_by_revision(
         &self,
         revision_id: RevisionId,
@@ -99,6 +563,8 @@ impl ProcedureUsageCurrentView {
                         | "work_episode"
                         | "host_occurrence"
                         | "operation"
+                        | "source_observation"
+                        | "source_receipt"
                         | "scope_effect"
                         | "procedure_usage_revision"
                         | "procedure_negative_evidence"
@@ -113,6 +579,16 @@ impl ProcedureUsageCurrentView {
             let payload: JournalPayload = serde_json::from_str(payload_json)
                 .map_err(|_| SemanticServiceError::InvalidInput)?;
             match payload {
+                JournalPayload::SourceObservationRecorded(value) => {
+                    view.observation_seqs.insert(
+                        value.source_observation_id,
+                        (row.source_event_seq, value.source_receipt_ref),
+                    );
+                }
+                JournalPayload::SourceReceiptRecorded(value) => {
+                    view.receipt_times
+                        .insert(value.source_receipt_id, value.recorded_at_us);
+                }
                 JournalPayload::ProcedureRevisionRecorded(value) => {
                     let current = view
                         .current_procedures
@@ -292,12 +768,23 @@ impl ProcedureUsageCurrentView {
                     view.scope_effects.insert(value.scope_effect_id, *value);
                 }
                 JournalPayload::ProcedureUsageRecorded(value) => {
-                    view.usage_exposure_watermarks
-                        .entry(value.procedure_usage_id)
-                        .and_modify(|watermark| {
-                            *watermark = (*watermark).min(value.source_watermark)
-                        })
-                        .or_insert(value.source_watermark);
+                    if value.revision_generation == 1
+                        && value.stage == evertrace_domain::procedure::ProcedureUsageStage::Returned
+                    {
+                        view.legacy_returned_usages.insert(value.procedure_usage_id);
+                    }
+                    if value.stage >= evertrace_domain::procedure::ProcedureUsageStage::Returned {
+                        view.first_returned_times
+                            .entry(value.procedure_usage_id)
+                            .and_modify(|time| *time = (*time).min(value.created_at_us))
+                            .or_insert(value.created_at_us);
+                        view.usage_exposure_watermarks
+                            .entry(value.procedure_usage_id)
+                            .and_modify(|watermark| {
+                                *watermark = (*watermark).min(value.source_watermark)
+                            })
+                            .or_insert(value.source_watermark);
+                    }
                     if view
                         .usages
                         .get(&value.procedure_usage_id)
@@ -1472,6 +1959,10 @@ pub fn request_procedure_revision(
 #[derive(Debug)]
 pub enum ProcedureUsageResolution {
     NoDelta(evertrace_domain::procedure::ProcedureUsageRevision),
+    /// The current safe route differs from an immutable historical anchor.
+    /// It may be presented, but has no new usage/return eligibility.
+    HistoricalRouteMismatch,
+    UnprovenContext,
     Command {
         usage: evertrace_domain::procedure::ProcedureUsageRevision,
         command: JournalCommand,
@@ -1489,12 +1980,6 @@ pub fn begin_procedure_usage(
         .route_proof
         .task_id
         .ok_or(SemanticServiceError::InvalidInput)?;
-    let local_context = evertrace_domain::procedure::ProcedureLocalContext {
-        repository_id: routed.route_proof.repository_id,
-        worktree_id: routed.route_proof.worktree_id,
-        phase: usage_phase(routed.route_proof.phase),
-        failure_signature: routed.route_proof.failure_signature.clone(),
-    };
     if routed.procedure_id != routed.route_proof.procedure_id
         || routed.revision_id != routed.route_proof.revision_id
         || routed.decision != routed.route_proof.decision
@@ -1505,6 +1990,15 @@ pub fn begin_procedure_usage(
     {
         return Err(SemanticServiceError::InvalidInput);
     }
+    let Some(phase) = routed.route_proof.phase else {
+        return Ok(ProcedureUsageResolution::UnprovenContext);
+    };
+    let local_context = evertrace_domain::procedure::ProcedureLocalContext {
+        repository_id: routed.route_proof.repository_id,
+        worktree_id: routed.route_proof.worktree_id,
+        phase: usage_phase(phase),
+        failure_signature: routed.route_proof.failure_signature.clone(),
+    };
     let expected_decision = match routed.decision {
         ProcedureDecision::Apply => evertrace_domain::procedure::ProcedureUsageRouteDecision::Apply,
         ProcedureDecision::Defer => evertrace_domain::procedure::ProcedureUsageRouteDecision::Defer,
@@ -1530,10 +2024,11 @@ pub fn begin_procedure_usage(
         if matching.next().is_some()
             || existing.workstream_id != workstream_id
             || existing.decision_boundary_ref != decision_boundary_ref
-            || existing.route_decision != expected_decision
-            || existing.local_context != local_context
         {
             return Err(SemanticServiceError::InvalidInput);
+        }
+        if existing.route_decision != expected_decision || existing.local_context != local_context {
+            return Ok(ProcedureUsageResolution::HistoricalRouteMismatch);
         }
         return Ok(ProcedureUsageResolution::NoDelta(existing.clone()));
     }
@@ -1589,7 +2084,7 @@ pub fn begin_procedure_usage(
         exposure_episode_revision_id,
         decision_boundary_ref,
         route_decision: expected_decision,
-        stage: evertrace_domain::procedure::ProcedureUsageStage::Returned,
+        stage: evertrace_domain::procedure::ProcedureUsageStage::Routed,
         attempt_ids: Vec::new(),
         action_episode_revision_ids: Vec::new(),
         verification_episode_revision_ids: Vec::new(),
@@ -1655,6 +2150,17 @@ pub fn advance_procedure_usage(
         .procedures
         .get(&current.procedure_revision_id)
         .ok_or(SemanticServiceError::InvalidInput)?;
+    // An unproven temporal association must not poison the append-only usage
+    // references and prevent a later, genuinely post-return action from advancing.
+    if !view.legacy_returned_usages.contains(&request.usage_id)
+        && request
+            .action_operation_refs
+            .iter()
+            .chain(&request.verification_operation_refs)
+            .any(|id| !view.operation_after_return(request.usage_id, id))
+    {
+        return Err(SemanticServiceError::InvalidInput);
+    }
     let mut next = current.clone();
     next.usage_revision_id = RevisionId::new_v7();
     next.predecessor_revision_id = Some(current.usage_revision_id);
@@ -1807,13 +2313,17 @@ fn validate_physical_usage(
             .operations
             .get(operation_id)
             .ok_or(SemanticServiceError::InvalidInput)?;
-        if *seq
-            <= view
-                .usage_exposure_watermarks
-                .get(&usage.procedure_usage_id)
-                .copied()
-                .unwrap_or(usage.source_watermark)
-        {
+        let exposure = view
+            .usage_exposure_watermarks
+            .get(&usage.procedure_usage_id)
+            .copied();
+        if exposure.is_none_or(|watermark| {
+            *seq <= watermark
+                || !view
+                    .legacy_returned_usages
+                    .contains(&usage.procedure_usage_id)
+                    && !view.operation_after_return(usage.procedure_usage_id, operation_id)
+        }) {
             return Ok((false, adopted_attempt));
         }
         let bindings = usage
@@ -2068,6 +2578,76 @@ mod negative_review_selection_tests {
             VariableDeclaration,
         },
     };
+
+    #[test]
+    fn compiled_quarantine_context_distinguishes_unknown_from_known_difference() {
+        let (view, negative) = review_view(ResultKind::Passed);
+        let prior = view.negatives[&negative].local_context.as_ref().unwrap();
+        let mut compiled = CompiledRelativeContext {
+            phase: None,
+            failure_signature: None,
+        };
+        assert!(compiled.quarantine_relevant(prior, prior.repository_id, prior.worktree_id));
+        compiled.failure_signature = Some(Some("different-current-failure".into()));
+        assert!(!compiled.quarantine_relevant(prior, prior.repository_id, prior.worktree_id));
+        compiled.failure_signature = Some(prior.failure_signature.clone());
+        compiled.phase = Some(ProcedurePhase::InProgress);
+        assert!(!compiled.quarantine_relevant(prior, prior.repository_id, prior.worktree_id));
+        compiled.phase = Some(ProcedurePhase::AtEntry);
+        assert!(compiled.quarantine_relevant(prior, prior.repository_id, prior.worktree_id));
+        compiled.phase = None;
+        assert!(!compiled.quarantine_relevant(
+            prior,
+            Some(evertrace_domain::ids::RepositoryId::new_v7()),
+            prior.worktree_id
+        ));
+    }
+
+    #[test]
+    fn confirmation_uses_only_this_requests_routed_revision() {
+        let (view, _) = review_view(ResultKind::Passed);
+        let historical = view.usages.values().next().unwrap().clone();
+        let context = ProposalCommandContext {
+            command_id: evertrace_domain::ids::CommandId::new_v7(),
+            occurred_at_us: 20,
+            effective_config_hash: [1; 32],
+            algorithm_revision: "return-test-v1".into(),
+        };
+        assert!(
+            view.confirmed_return_events(
+                context.clone(),
+                &[JournalPayload::ProcedureUsageRecorded(Box::new(
+                    historical.clone()
+                ))],
+                &[historical.procedure_revision_id]
+            )
+            .is_err()
+        );
+        let mut unrelated_route = historical.clone();
+        unrelated_route.stage = ProcedureUsageStage::Routed;
+        unrelated_route.procedure_revision_id = RevisionId::new_v7();
+        assert!(
+            view.confirmed_return_events(
+                context.clone(),
+                &[JournalPayload::ProcedureUsageRecorded(Box::new(
+                    unrelated_route
+                ))],
+                &[historical.procedure_revision_id]
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let mut old_route = historical.clone();
+        old_route.stage = ProcedureUsageStage::Routed;
+        assert!(
+            view.confirmed_return_events(
+                context,
+                &[JournalPayload::ProcedureUsageRecorded(Box::new(old_route))],
+                &[historical.procedure_revision_id]
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn complete_current_replay_cohort_selects_one_closed_decision() {

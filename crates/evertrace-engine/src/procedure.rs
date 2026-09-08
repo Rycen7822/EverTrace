@@ -132,11 +132,12 @@ fn accept_procedure_inner(
     draft
         .validate()
         .map_err(|_| SemanticServiceError::InvalidInput)?;
-    if draft
-        .evidence_refs
-        .iter()
-        .any(|reference| !proposal.evidence_refs.contains(reference))
-    {
+    if draft.evidence_refs.iter().any(|reference| {
+        // Store validates both source sets. Synthesis proposals cite the
+        // digest as evidence and retain its verified direct sources here.
+        !proposal.evidence_refs.contains(reference)
+            && !proposal.source_cohort_refs.contains(reference)
+    }) {
         return Err(SemanticServiceError::InvalidInput);
     }
     let (procedure_id, generation, parent, old_state) = match payload.as_ref() {
@@ -428,7 +429,7 @@ pub struct ProcedureCandidate {
     pub revision: ProcedureRevision,
     pub publication: ProcedurePublicationState,
     pub global_support: Option<GlobalSupportState>,
-    pub phase: ProcedurePhase,
+    pub phase: Option<ProcedurePhase>,
     pub lexical_rank: u32,
 }
 
@@ -447,7 +448,7 @@ pub struct RoutedProcedure {
     pub publication: ProcedurePublicationState,
     pub mode: ProcedureGuidanceMode,
     pub reason: &'static str,
-    pub phase: ProcedurePhase,
+    pub phase: Option<ProcedurePhase>,
     pub lexical_rank: u32,
     pub actions: Option<ProcedureActions>,
     pub avoid: Vec<String>,
@@ -466,7 +467,7 @@ struct ProcedureRouteProof {
     task_id: Option<evertrace_domain::ids::TaskId>,
     repository_id: Option<evertrace_domain::ids::RepositoryId>,
     worktree_id: Option<evertrace_domain::ids::WorktreeId>,
-    phase: ProcedurePhase,
+    phase: Option<ProcedurePhase>,
     failure_signature: Option<String>,
     eligibility: ConstraintTruth,
 }
@@ -505,39 +506,43 @@ impl ProcedureRouter {
         } else {
             ProcedureGuidanceMode::Normal
         };
-        let mut routed = candidates
+        let routed = candidates
             .into_iter()
             .filter_map(|candidate| {
                 evaluate_candidate(context, candidate, current, previous, scenario_fresh, mode)
             })
             .collect::<Vec<_>>();
-        routed.sort_by_key(route_rank);
-        let apply = routed
-            .iter()
-            .position(|item| item.decision == ProcedureDecision::Apply)
-            .map(|index| routed.remove(index));
-        let apply_probationary = apply
-            .as_ref()
-            .is_some_and(|item| item.publication == ProcedurePublicationState::ActiveProbationary);
-        let defer = routed.into_iter().find(|item| {
-            item.decision == ProcedureDecision::Defer
-                && !(apply_probationary
-                    && item.publication == ProcedurePublicationState::ActiveProbationary)
-        });
-        let mut items = Vec::new();
-        if let Some(apply) = apply {
-            items.push(apply);
-        }
-        if let Some(defer) = defer {
-            items.push(defer);
-        }
-        if items.is_empty() {
-            empty()
-        } else {
-            ProcedureRouteResult {
-                status: "ok",
-                items,
-            }
+        select_route_result(routed)
+    }
+}
+
+fn select_route_result(mut routed: Vec<RoutedProcedure>) -> ProcedureRouteResult {
+    routed.sort_by_key(route_rank);
+    let apply = routed
+        .iter()
+        .position(|item| item.decision == ProcedureDecision::Apply)
+        .map(|index| routed.remove(index));
+    let apply_probationary = apply
+        .as_ref()
+        .is_some_and(|item| item.publication == ProcedurePublicationState::ActiveProbationary);
+    let defer = routed.into_iter().find(|item| {
+        item.decision == ProcedureDecision::Defer
+            && !(apply_probationary
+                && item.publication == ProcedurePublicationState::ActiveProbationary)
+    });
+    let mut items = Vec::new();
+    if let Some(apply) = apply {
+        items.push(apply);
+    }
+    if let Some(defer) = defer {
+        items.push(defer);
+    }
+    if items.is_empty() {
+        empty()
+    } else {
+        ProcedureRouteResult {
+            status: "ok",
+            items,
         }
     }
 }
@@ -559,7 +564,7 @@ fn evaluate_candidate(
             && candidate.global_support != Some(GlobalSupportState::Valid)
         || matches!(
             candidate.phase,
-            ProcedurePhase::AlreadyCompleted | ProcedurePhase::Incompatible
+            Some(ProcedurePhase::AlreadyCompleted | ProcedurePhase::Incompatible)
         )
     {
         return None;
@@ -585,12 +590,13 @@ fn evaluate_candidate(
     {
         return None;
     }
-    let recoverable = candidate.phase != ProcedurePhase::RecoverableDeviation
+    let recoverable = candidate.phase != Some(ProcedurePhase::RecoverableDeviation)
         || !candidate.revision.draft.actions.branches.is_empty()
         || !candidate.revision.draft.done.abort.is_empty();
     let (decision, reason) = if !scenario_fresh {
         (ProcedureDecision::Defer, "insufficient_context")
-    } else if applicability == ConstraintTruth::Unknown
+    } else if candidate.phase.is_none()
+        || applicability == ConstraintTruth::Unknown
         || avoid == ConstraintTruth::Unknown
         || completion == ConstraintTruth::Unknown
         || !recoverable
@@ -648,7 +654,7 @@ fn evaluate_candidate(
     })
 }
 
-fn route_rank(value: &RoutedProcedure) -> (u8, u8, ProcedurePhase, u32, ProcedureId) {
+fn route_rank(value: &RoutedProcedure) -> (u8, u8, Option<ProcedurePhase>, u32, ProcedureId) {
     (
         match value.decision {
             ProcedureDecision::Apply => 0,
@@ -704,6 +710,8 @@ fn empty() -> ProcedureRouteResult {
     }
 }
 
+pub(crate) mod alignment;
+pub use alignment::StageTrace;
 mod usage;
 pub use usage::*;
 mod effect;
