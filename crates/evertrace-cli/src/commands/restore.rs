@@ -1,8 +1,42 @@
 use std::{env, error::Error, path::PathBuf};
 
+fn candidate_host_diagnostic(
+    value: evertrace_protocol::dto::HostCanaryDiagnostic,
+) -> evertrace_engine::HostCanaryDiagnostic {
+    use evertrace_engine::{HostCanaryScope as TargetScope, HostCanaryStatus as Target};
+    use evertrace_protocol::dto::{HostCanaryScope as Scope, HostCanaryStatus as Status};
+    evertrace_engine::HostCanaryDiagnostic {
+        scope: match value.scope {
+            Scope::Installed => TargetScope::Installed,
+            Scope::Candidate {
+                check_id,
+                generation,
+            } => TargetScope::Candidate {
+                check_id,
+                generation,
+            },
+        },
+        status: match value.status {
+            Status::NotRun => Target::NotRun,
+            Status::Running => Target::Running,
+            Status::Unavailable => Target::Unavailable,
+            Status::BudgetExceeded => Target::BudgetExceeded,
+            Status::EvidenceMissing => Target::EvidenceMissing,
+            Status::TimedOut => Target::TimedOut,
+            Status::IdentityChanged => Target::IdentityChanged,
+            Status::Interrupted => Target::Interrupted,
+            Status::Observed => Target::Observed,
+        },
+        native_delivery_observed: value.native_delivery_observed,
+        mcp_claim_consumed: value.mcp_claim_consumed,
+        capture_receipt_observed: value.capture_receipt_observed,
+    }
+}
+
 pub async fn upgrade(
     config: Option<PathBuf>,
     check_package: Option<PathBuf>,
+    live_host: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let config_path = std::path::absolute(crate::resolve_config_path(config)?)?;
     let effective = super::config::load(Some(config_path.clone()))?;
@@ -23,10 +57,17 @@ pub async fn upgrade(
         let configuration = env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"));
+        if live_host.as_ref().is_some_and(|path| !path.is_absolute()) {
+            return Err("live Host executable must be absolute".into());
+        }
+        let host_config = std::path::absolute(host.join("config.toml"))?;
+        if live_host.is_some() {
+            crate::daemon_client::explain_live_host();
+        }
         let checked = evertrace_engine::maintenance::check_package_upgrade(
             &data_dir,
             &config_path,
-            &std::path::absolute(host.join("config.toml"))?,
+            &host_config,
             &std::path::absolute(configuration.join("systemd/user/evertraced.service"))?,
             &package,
             |socket| async move {
@@ -34,18 +75,48 @@ pub async fn upgrade(
                     .await
                     .is_ok_and(|health| health.validate())
             },
+            (
+                live_host.map(|path| evertrace_engine::HostCanaryRequest {
+                    host_executable: path.to_string_lossy().into_owned(),
+                    host_config: host_config.to_string_lossy().into_owned(),
+                }),
+                |socket, request| async move {
+                    crate::daemon_client::run_host_canary(
+                        &socket,
+                        std::path::Path::new(&request.host_executable),
+                        std::path::Path::new(&request.host_config),
+                    )
+                    .await
+                    .ok()
+                    .map(candidate_host_diagnostic)
+                },
+            ),
         )
         .await?;
         println!(
-            "scope=package_prepublication check=not-ready native_prepared=true migrated={} materials_validated={} candidate_native_verified={} candidate_daemon_verified={} host_verified=false generation={:?} backup={} candidate_removed=true",
+            "candidate_host={:?}; package_publication=not_implemented",
+            checked.candidate_host
+        );
+        println!(
+            "scope=package_prepublication check=not-ready native_prepared=true migrated={} materials_validated={} candidate_native_verified={} candidate_daemon_verified={} host_verified={} generation={:?} backup={} candidate_removed=true",
             checked.migrated,
             checked.materials_validated,
             checked.candidate_native_verified,
             checked.candidate_daemon_verified,
+            checked
+                .candidate_host
+                .as_ref()
+                .is_some_and(|value| value.status == evertrace_engine::HostCanaryStatus::Observed),
             checked.generation,
             checked.backup.display()
         );
-        return Err(if checked.materials_validated {
+        return Err(if checked
+            .candidate_host
+            .as_ref()
+            .is_some_and(|value| value.status == evertrace_engine::HostCanaryStatus::Observed)
+        {
+            "not-ready: package publication is not implemented"
+        } else if checked.materials_validated {
             "not-ready: candidate Host proof unavailable"
         } else {
             "not-ready: candidate package material validation failed"

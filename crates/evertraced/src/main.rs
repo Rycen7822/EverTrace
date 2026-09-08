@@ -79,6 +79,18 @@ fn map_host_canary(
     use evertrace_engine::HostCanaryStatus as Source;
     use evertrace_protocol::dto::HostCanaryStatus as Target;
     evertrace_protocol::dto::HostCanaryDiagnostic {
+        scope: match value.scope {
+            evertrace_engine::HostCanaryScope::Installed => {
+                evertrace_protocol::dto::HostCanaryScope::Installed
+            }
+            evertrace_engine::HostCanaryScope::Candidate {
+                check_id,
+                generation,
+            } => evertrace_protocol::dto::HostCanaryScope::Candidate {
+                check_id,
+                generation,
+            },
+        },
         status: match value.status {
             Source::NotRun => Target::NotRun,
             Source::Running => Target::Running,
@@ -122,8 +134,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         RuntimeMode::Normal
     };
     let engine = Arc::new(EngineService::from_toml(&source, mode)?);
+    if args.candidate.is_some() && engine.effective_config().config().llm.enabled {
+        return Err("candidate daemon requires llm.enabled=false".into());
+    }
     let home = env::var_os("HOME").map(PathBuf::from);
     let data_dir = resolve_data_dir(engine.data_dir(), home.as_deref(), |name| env::var_os(name))?;
+    if args.candidate.is_some() {
+        let candidate_config = std::path::absolute(&config_path)?;
+        // At most the explicit config may pre-exist; reject any native/other
+        // user asset before publishing runtime or opening a writer.
+        for entry in fs::read_dir(&data_dir)? {
+            if entry?.path() != candidate_config {
+                return Err("candidate daemon requires a fresh disposable root".into());
+            }
+        }
+    }
     let runtime_snapshot = publish_recovery_runtime(&data_dir, engine.effective_config(), None)?;
     let writer = open_writer(&data_dir).await?;
     evertrace_engine::initialize_runtime_spool(&runtime_snapshot)?;
@@ -134,13 +159,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_dir.clone(),
     );
     let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
-    let host_canary = evertrace_engine::HostCanaryService::new(
+    let mut host_canary = evertrace_engine::HostCanaryService::new(
         writer_handle.clone(),
         data_dir.clone(),
         std::path::absolute(&config_path)?,
         runtime_snapshot.effective_config_hash,
         mcp_bindings.clone(),
     );
+    if let Some((check_id, generation)) = args.candidate {
+        let executable = env::current_exe()?;
+        host_canary = host_canary.with_candidate(
+            check_id,
+            generation,
+            executable
+                .parent()
+                .ok_or("candidate package unavailable")?
+                .to_owned(),
+        )?;
+    }
     let current_session_catalog_report = Arc::new(RwLock::new(None));
     let session_import_admin = SessionImportAdminService::new(
         writer_handle.clone(),
@@ -1657,6 +1693,7 @@ fn map_human_error(error: HumanGovernanceError) -> ErrorCode {
 struct StartupArgs {
     config: Option<PathBuf>,
     maintenance: bool,
+    candidate: Option<(String, u64)>,
 }
 
 impl StartupArgs {
@@ -1664,20 +1701,39 @@ impl StartupArgs {
         let mut values = env::args_os().skip(1);
         let mut config = None;
         let mut maintenance = false;
+        let mut candidate = None;
         while let Some(value) = values.next() {
             if value == "--config" && config.is_none() {
                 config = Some(PathBuf::from(
                     values.next().ok_or("--config requires a path")?,
                 ));
+            } else if value == "--candidate-check" && candidate.is_none() {
+                let id = values
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .ok_or("candidate id required")?;
+                let generation = values
+                    .next()
+                    .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+                    .filter(|value| *value > 0)
+                    .ok_or("candidate generation required")?;
+                if id.len() > 128 {
+                    return Err("invalid candidate id");
+                }
+                candidate = Some((id, generation));
             } else if value == "--maintenance" && !maintenance {
                 maintenance = true;
             } else {
                 return Err("usage: evertraced [--config PATH] [--maintenance]");
             }
         }
+        if candidate.is_some() && (maintenance || config.is_none()) {
+            return Err("candidate requires explicit config and normal runtime");
+        }
         Ok(Self {
             config,
             maintenance,
+            candidate,
         })
     }
 }

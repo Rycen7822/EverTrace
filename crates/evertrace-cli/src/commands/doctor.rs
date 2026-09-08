@@ -16,6 +16,7 @@ pub async fn run(
         |name| env::var_os(name),
     )?;
     if let Some(host) = refresh_host {
+        daemon_client::explain_live_host();
         if !host.is_absolute() {
             return Err("Host executable must be absolute".into());
         }

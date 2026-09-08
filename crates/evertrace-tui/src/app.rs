@@ -2184,6 +2184,7 @@ mod tests {
             effective_config_hash: "0".repeat(64),
             algorithm_revision: 1,
             host_canary: Some(evertrace_protocol::dto::HostCanaryDiagnostic {
+                scope: evertrace_protocol::dto::HostCanaryScope::Installed,
                 status: evertrace_protocol::dto::HostCanaryStatus::EvidenceMissing,
                 native_delivery_observed: true,
                 mcp_claim_consumed: false,

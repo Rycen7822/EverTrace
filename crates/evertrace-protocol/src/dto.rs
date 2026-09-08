@@ -1512,10 +1512,18 @@ fn valid_hex(value: &str) -> bool {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostCanaryDiagnostic {
+    pub scope: HostCanaryScope,
     pub status: HostCanaryStatus,
     pub native_delivery_observed: bool,
     pub mcp_claim_consumed: bool,
     pub capture_receipt_observed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostCanaryScope {
+    Installed,
+    Candidate { check_id: String, generation: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1534,7 +1542,13 @@ pub enum HostCanaryStatus {
 
 impl HostCanaryDiagnostic {
     pub fn validate(&self) -> bool {
-        (!self.capture_receipt_observed || self.native_delivery_observed)
+        (match &self.scope {
+            HostCanaryScope::Installed => true,
+            HostCanaryScope::Candidate {
+                check_id,
+                generation,
+            } => *generation > 0 && check_id.parse::<evertrace_domain::ids::JobId>().is_ok(),
+        }) && (!self.capture_receipt_observed || self.native_delivery_observed)
             && match self.status {
                 HostCanaryStatus::Observed => {
                     self.native_delivery_observed && self.mcp_claim_consumed

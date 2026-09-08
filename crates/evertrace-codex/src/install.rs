@@ -1020,9 +1020,26 @@ pub struct PackageCheckPreflight {
 }
 
 /// Wiring for the caller-owned disposable package probe only.
+pub fn candidate_host_arguments() -> [String; 5] {
+    // Literal definitions remain stable across disposable roots. Environment is
+    // routing only; normal Host hook trust and candidate evidence still apply.
+    let command =
+        "exec \"$EVERTRACE_CANDIDATE_ROOT/hook-v1\" --launcher-root \"$EVERTRACE_CANDIDATE_ROOT\"";
+    let hooks = toml::Value::String(command.into()).to_string();
+    [
+        format!("hooks.PreToolUse=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
+        format!("hooks.PostToolUse=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
+        "mcp_servers.evertrace.command=\"/bin/sh\"".into(),
+        "mcp_servers.evertrace.env_vars=[\"EVERTRACE_CANDIDATE_PACKAGE\",\"EVERTRACE_CANDIDATE_CONFIG\"]".into(),
+        format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),
+    ]
+}
+
+/// Wiring for the caller-owned disposable package probe only.
 pub fn prepare_probe_generation(
     root: &Path,
     executable: &Path,
+    generation: u64,
     runtime: impl FnOnce(&Path) -> Result<(), InstallError>,
 ) -> Result<PathBuf, InstallError> {
     let required = package_metadata(executable)?
@@ -1035,13 +1052,16 @@ pub fn prepare_probe_generation(
     }
     let launcher = StableLauncher::open(root)?;
     launcher.install_launcher_binary(executable)?;
-    let directory = root.join(generation_relative(1, GENERATION_EXECUTABLE_NAME));
+    if generation == 0 {
+        return Err(InstallError::InvalidType);
+    }
+    let directory = root.join(generation_relative(generation, GENERATION_EXECUTABLE_NAME));
     ensure_private_directory(directory.parent().ok_or(InstallError::InvalidType)?)?;
     atomic_write(&directory, &package_bytes(executable)?, 0o700)?;
-    let snapshot = root.join(generation_relative(1, GENERATION_RUNTIME_NAME));
+    let snapshot = root.join(generation_relative(generation, GENERATION_RUNTIME_NAME));
     runtime(&snapshot)?;
     launcher.publish_generation(HookGeneration {
-        generation: 1,
+        generation,
         protocol_version: 1,
         executable: directory,
         runtime_snapshot: snapshot,

@@ -418,6 +418,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
                 &paths.unit,
                 invalid,
                 package_health,
+                (None, |_, _| async { None }),
             )
             .await
             .is_err()
@@ -496,6 +497,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         &paths.unit,
         &package,
         &health,
+        (None, |_, _| async { None }),
     )
     .await
     .unwrap();
@@ -554,6 +556,8 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         .arg(&paths.config)
         .args(["upgrade", "--check"])
         .arg(&package)
+        .arg("--live-host")
+        .arg(root.path().join("missing-host"))
         .env("CODEX_HOME", paths.host_config.parent().unwrap())
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .output()
@@ -565,6 +569,12 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         "{output}"
     );
     assert!(output.contains("materials_validated=true"), "{output}");
+    assert!(
+        output.contains("candidate_host=Some")
+            && output.contains("Candidate")
+            && output.contains("Unavailable"),
+        "{output}"
+    );
     assert!(
         output.contains(
             "candidate_native_verified=true candidate_daemon_verified=true host_verified=false"
@@ -587,6 +597,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         &paths.unit,
         &package,
         package_health,
+        (None, |_, _| async { None }),
     )
     .await
     .unwrap();
@@ -603,6 +614,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         &paths.unit,
         &package,
         &health,
+        (None, |_, _| async { None }),
     )
     .await
     .unwrap();
@@ -1092,6 +1104,168 @@ async fn doctor_reads_current_state_and_only_cli_refresh_runs_the_selected_host(
             .unwrap()
             .contains("Unavailable")
     );
+}
+
+#[tokio::test]
+async fn candidate_canary_rpc_is_scoped_and_never_updates_installed_current() {
+    use evertrace_protocol::{
+        LocalClient,
+        command::{Command as Rpc, RunHostCanaryCommand},
+        dto::{ClientKind, HostCanaryScope, HostCanaryStatus},
+        response::Response,
+    };
+    use std::time::{Duration, Instant};
+    let (root, paths, config) = fixture();
+    let mut config = config.config().clone();
+    config.llm.enabled = false;
+    fs::write(
+        &paths.config,
+        EffectiveConfig::new(config).unwrap().to_toml().unwrap(),
+    )
+    .unwrap();
+    fs::create_dir(&paths.data_root).unwrap();
+    fs::set_permissions(&paths.data_root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(paths.host_config.parent().unwrap()).unwrap();
+    fs::write(
+        &paths.host_config,
+        "# normal Host configuration remains unchanged\n",
+    )
+    .unwrap();
+    fs::set_permissions(&paths.host_config, fs::Permissions::from_mode(0o600)).unwrap();
+    let original_host = fs::read(&paths.host_config).unwrap();
+    let marker = root.path().join("candidate-host-arguments");
+    fs::write(&paths.host_executable, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.1.0'; elif [ \"$1\" = features ]; then echo 'hooks experimental true'; else printf '%s\\n' \"$EVERTRACE_CANDIDATE_ROOT\" \"$@\" > '{}'; fi\n", marker.display())).unwrap();
+    let check_id = evertrace_domain::ids::JobId::new_v7().to_string();
+    let unknown = paths.data_root.join("unrelated-user-file");
+    fs::write(&unknown, b"retain").unwrap();
+    let rejected = Command::new(&paths.daemon)
+        .arg("--config")
+        .arg(&paths.config)
+        .arg("--candidate-check")
+        .arg(&check_id)
+        .arg("7")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!rejected.success());
+    assert!(!paths.data_root.join("runtime").exists());
+    assert_eq!(fs::read(&unknown).unwrap(), b"retain");
+    fs::remove_file(unknown).unwrap();
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut daemon = Daemon(
+        Command::new(&paths.daemon)
+            .args(["--config"])
+            .arg(&paths.config)
+            .arg("--candidate-check")
+            .arg(&check_id)
+            .arg("7")
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!marker.exists());
+    let snapshot = evertrace_codex::install::StableLauncher::freeze_current_snapshot(
+        &paths.data_root,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(snapshot.generation, 7);
+    let mut client = LocalClient::connect(
+        &socket,
+        "s34-candidate",
+        ClientKind::Cli,
+        Duration::from_secs(35),
+    )
+    .await
+    .unwrap();
+    let request = || {
+        Rpc::RunHostCanary(RunHostCanaryCommand {
+            host_executable: paths.host_executable.to_string_lossy().into_owned(),
+            host_config: paths.host_config.to_string_lossy().into_owned(),
+        })
+    };
+    let Response::HostCanary(result) = client
+        .request(evertrace_domain::ids::RequestId::new_v7(), request())
+        .await
+        .unwrap()
+    else {
+        panic!("canary response");
+    };
+    assert_eq!(
+        result.scope,
+        HostCanaryScope::Candidate {
+            check_id,
+            generation: 7
+        }
+    );
+    assert_eq!(result.status, HostCanaryStatus::TimedOut); // Script output is not Host evidence.
+    assert!(!result.native_delivery_observed && !result.mcp_claim_consumed);
+    let arguments = fs::read_to_string(&marker).unwrap();
+    assert!(arguments.starts_with(paths.data_root.to_str().unwrap()));
+    for argument in evertrace_codex::install::candidate_host_arguments() {
+        assert!(arguments.contains(&argument));
+    }
+    assert!(arguments.contains(
+        "mcp_servers.evertrace.env_vars=[\"EVERTRACE_CANDIDATE_PACKAGE\",\"EVERTRACE_CANDIDATE_CONFIG\"]"
+    ));
+    assert!(!arguments.contains("ignore-user-config") && !arguments.contains("bypass"));
+    assert_eq!(fs::read(&paths.host_config).unwrap(), original_host);
+    assert!(
+        !fs::read_dir(paths.data_root.join("runtime"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("canary-"))
+    );
+    let doctor = Command::new(&paths.cli)
+        .arg("--config")
+        .arg(&paths.config)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(doctor.status.success());
+    assert!(
+        String::from_utf8(doctor.stdout)
+            .unwrap()
+            .contains("host_canary=not_run")
+    );
+    let launcher = paths.data_root.join("hook-v1");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&launcher)
+        .unwrap()
+        .write_all(b"changed")
+        .unwrap();
+    let Response::HostCanary(rejected) = client
+        .request(evertrace_domain::ids::RequestId::new_v7(), request())
+        .await
+        .unwrap()
+    else {
+        panic!("canary response");
+    };
+    assert_eq!(rejected.status, HostCanaryStatus::IdentityChanged);
 }
 
 #[test]

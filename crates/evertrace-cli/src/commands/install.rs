@@ -3,6 +3,7 @@ use std::{env, error::Error, path::PathBuf};
 pub async fn run(
     config: Option<PathBuf>,
     host_executable: Option<PathBuf>,
+    live_canary: bool,
 ) -> Result<(), Box<dyn Error>> {
     let uninstall = host_executable.is_none();
     if host_executable
@@ -69,7 +70,11 @@ pub async fn run(
         println!("config_backup={}", backup.display());
     }
     println!("data_preserved={}", paths.data_root.display());
-    if !uninstall {
+    if !uninstall && !live_canary {
+        println!("host_canary=not_run: explicit --live-canary or doctor --refresh-host required");
+    }
+    if !uninstall && live_canary {
+        crate::daemon_client::explain_live_host();
         let socket = paths.data_root.join("runtime/evertraced-v1.sock");
         match crate::daemon_client::health(&socket).await {
             Ok(_) => match crate::daemon_client::run_host_canary(

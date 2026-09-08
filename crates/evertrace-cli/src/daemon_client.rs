@@ -14,6 +14,12 @@ pub async fn health(socket: &Path) -> Result<HealthResponse, ProtocolError> {
     request_health(socket, env!("CARGO_PKG_VERSION"), Duration::from_secs(2)).await
 }
 
+pub fn explain_live_host() {
+    eprintln!(
+        "Live Host canary uses normal Host configuration/auth/provider and normal trust. Existing third-party Hook/notify/MCP behavior is not guaranteed side-effect-free; the fixed EverTrace task requests no business writes and changes no trust or installation."
+    );
+}
+
 pub async fn run_host_canary(
     socket: &Path,
     host_executable: &Path,

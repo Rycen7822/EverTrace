@@ -47,6 +47,7 @@ fn host_canary_request_and_current_diagnostic_are_closed() {
     injected["prompt"] = serde_json::json!("claim success");
     assert!(serde_json::from_value::<RunHostCanaryCommand>(injected).is_err());
     let mut diagnostic = HostCanaryDiagnostic {
+        scope: evertrace_protocol::dto::HostCanaryScope::Installed,
         status: HostCanaryStatus::Observed,
         native_delivery_observed: true,
         mcp_claim_consumed: false,
@@ -55,6 +56,17 @@ fn host_canary_request_and_current_diagnostic_are_closed() {
     assert!(!diagnostic.validate());
     diagnostic.mcp_claim_consumed = true;
     assert!(diagnostic.validate()); // CaptureComplete is not granted by this diagnostic.
+    diagnostic.scope = evertrace_protocol::dto::HostCanaryScope::Candidate {
+        check_id: evertrace_domain::ids::JobId::new_v7().to_string(),
+        generation: 7,
+    };
+    assert!(diagnostic.validate());
+    diagnostic.scope = evertrace_protocol::dto::HostCanaryScope::Candidate {
+        check_id: "invalid".into(),
+        generation: 0,
+    };
+    assert!(!diagnostic.validate());
+    diagnostic.scope = evertrace_protocol::dto::HostCanaryScope::Installed;
     diagnostic.status = HostCanaryStatus::TimedOut;
     assert!(!diagnostic.validate());
 }

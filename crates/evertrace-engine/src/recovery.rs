@@ -8,10 +8,16 @@ pub const RECOVERY_ALGORITHM_REVISION: &str = "s16_recovery_v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostCanaryDiagnostic {
+    pub scope: HostCanaryScope,
     pub status: HostCanaryStatus,
     pub native_delivery_observed: bool,
     pub mcp_claim_consumed: bool,
     pub capture_receipt_observed: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostCanaryScope {
+    Installed,
+    Candidate { check_id: String, generation: u64 },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostCanaryStatus {
@@ -34,6 +40,8 @@ pub struct HostCanaryRequest {
 /// cannot construct a capability manifest or modify a runtime snapshot.
 #[derive(Clone)]
 pub struct HostCanaryService {
+    candidate: Option<(String, u64, std::path::PathBuf)>,
+    candidate_assets: Vec<(std::path::PathBuf, [u64; 7])>,
     writer: crate::WriterHandle,
     data_root: std::path::PathBuf,
     config_path: std::path::PathBuf,
@@ -212,14 +220,19 @@ impl CanaryIdentity {
         config: &std::path::Path,
         request: &HostCanaryRequest,
         deadline: std::time::Instant,
+        candidate_package: Option<&std::path::Path>,
     ) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
-        let cli = evertrace_codex::install::validate_installed_wiring(
-            data,
-            config,
-            std::path::Path::new(&request.host_config),
-        )
-        .ok()?;
+        let cli = if let Some(package) = candidate_package {
+            package.join("evertrace")
+        } else {
+            evertrace_codex::install::validate_installed_wiring(
+                data,
+                config,
+                std::path::Path::new(&request.host_config),
+            )
+            .ok()?
+        };
         let snapshot =
             evertrace_codex::install::StableLauncher::freeze_current_snapshot(data, deadline)
                 .ok()?;
@@ -244,6 +257,9 @@ impl CanaryIdentity {
             std::path::PathBuf::from(&request.host_executable),
             evertrace_capture::RuntimeSnapshot::snapshot_path(data),
         ]);
+        if let Some(package) = candidate_package {
+            paths.extend([package.join("evertraced"), package.join("evertrace-hook")]);
+        }
         for path in &paths {
             let parent = path.parent()?;
             let metadata = std::fs::symlink_metadata(parent).ok()?;
@@ -282,6 +298,7 @@ impl CanaryIdentity {
 
 fn canary_diagnostic(status: HostCanaryStatus) -> HostCanaryDiagnostic {
     HostCanaryDiagnostic {
+        scope: HostCanaryScope::Installed,
         status,
         native_delivery_observed: false,
         mcp_claim_consumed: false,
@@ -393,6 +410,8 @@ impl HostCanaryService {
         bindings: crate::McpBindingAuthority,
     ) -> Self {
         Self {
+            candidate: None,
+            candidate_assets: Vec::new(),
             writer,
             data_root,
             config_path,
@@ -403,7 +422,68 @@ impl HostCanaryService {
         }
     }
 
+    /// Only the explicit disposable candidate daemon startup uses this mode.
+    pub fn with_candidate(
+        mut self,
+        check_id: String,
+        generation: u64,
+        package: std::path::PathBuf,
+    ) -> Result<Self, &'static str> {
+        if check_id.parse::<evertrace_domain::ids::JobId>().is_err() || generation == 0 {
+            return Err("invalid candidate identity");
+        }
+        evertrace_capture::ConfinedRoot::open_owned_private(&self.data_root)
+            .map_err(|_| "invalid candidate root")?;
+        for name in ["evertrace", "evertrace-hook", "evertraced"] {
+            let path = package.join(name);
+            let identity = canary_file_identity(&path).ok_or("invalid candidate package")?;
+            self.candidate_assets.push((path, identity));
+        }
+        let runtime = evertrace_capture::RuntimeSnapshot::load(
+            &evertrace_capture::RuntimeSnapshot::snapshot_path(&self.data_root),
+        )
+        .map_err(|_| "invalid candidate runtime")?;
+        evertrace_codex::install::prepare_probe_generation(
+            &self.data_root,
+            &package.join("evertrace-hook"),
+            generation,
+            |path| {
+                runtime
+                    .publish(path)
+                    .map_err(|_| evertrace_codex::install::InstallError::Io)
+            },
+        )
+        .map_err(|_| "candidate generation unavailable")?;
+        let snapshot = evertrace_codex::install::StableLauncher::freeze_current_snapshot(
+            &self.data_root,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
+        .map_err(|_| "candidate snapshot unavailable")?;
+        for path in snapshot.files.into_iter().map(|file| file.source).chain([
+            self.config_path.clone(),
+            evertrace_capture::RuntimeSnapshot::snapshot_path(&self.data_root),
+        ]) {
+            let identity = canary_file_identity(&path).ok_or("invalid candidate asset")?;
+            self.candidate_assets.push((path, identity));
+        }
+        self.candidate = Some((check_id, generation, package));
+        Ok(self)
+    }
+
+    fn scoped(&self, mut result: HostCanaryDiagnostic) -> HostCanaryDiagnostic {
+        if let Some((check_id, generation, _)) = &self.candidate {
+            result.scope = HostCanaryScope::Candidate {
+                check_id: check_id.clone(),
+                generation: *generation,
+            };
+        }
+        result
+    }
+
     pub fn current(&self) -> Option<HostCanaryDiagnostic> {
+        if self.candidate.is_some() {
+            return None;
+        }
         let mut current = self.current.lock().ok()?;
         let current = current.as_mut()?;
         if current
@@ -418,13 +498,18 @@ impl HostCanaryService {
 
     pub async fn run(&self, request: HostCanaryRequest) -> HostCanaryDiagnostic {
         let Ok(_permit) = self.running.try_lock() else {
-            return canary_diagnostic(HostCanaryStatus::Running);
+            return self.scoped(canary_diagnostic(HostCanaryStatus::Running));
         };
         let budget = std::time::Duration::from_secs(30);
         let deadline = std::time::Instant::now() + budget;
-        let result = tokio::time::timeout(budget, self.run_inner(request, deadline))
-            .await
-            .unwrap_or_else(|_| canary_diagnostic(HostCanaryStatus::TimedOut));
+        let result = self.scoped(
+            tokio::time::timeout(budget, self.run_inner(request, deadline))
+                .await
+                .unwrap_or_else(|_| canary_diagnostic(HostCanaryStatus::TimedOut)),
+        );
+        if self.candidate.is_some() {
+            return result;
+        }
         if let Ok(mut current) = self.current.lock() {
             if let Some(stored) = current.as_mut() {
                 stored.diagnostic = result.clone();
@@ -454,7 +539,9 @@ impl HostCanaryService {
             process::{Command, Stdio},
             time::{Duration, Instant},
         };
-        if let Ok(mut current) = self.current.lock() {
+        if self.candidate.is_none()
+            && let Ok(mut current) = self.current.lock()
+        {
             *current = None;
         }
         let host_config = std::path::Path::new(&request.host_config);
@@ -476,11 +563,24 @@ impl HostCanaryService {
         {
             return canary_diagnostic(Status::Unavailable);
         }
-        let Some(identity) =
-            CanaryIdentity::capture(&self.data_root, &self.config_path, &request, deadline)
-        else {
+        let Some(identity) = CanaryIdentity::capture(
+            &self.data_root,
+            &self.config_path,
+            &request,
+            deadline,
+            self.candidate
+                .as_ref()
+                .map(|(_, _, package)| package.as_path()),
+        ) else {
             return canary_diagnostic(Status::Unavailable);
         };
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|(_, generation, _)| *generation != identity.generation)
+        {
+            return canary_diagnostic(Status::IdentityChanged);
+        }
         let config_current = (|| {
             let file = evertrace_capture::open_regular_nofollow(&self.config_path).ok()?;
             let mut source = String::new();
@@ -502,6 +602,13 @@ impl HostCanaryService {
         })()
         .unwrap_or(false);
         if !config_current || !identity.valid() {
+            return canary_diagnostic(Status::IdentityChanged);
+        }
+        if self
+            .candidate_assets
+            .iter()
+            .any(|(path, expected)| canary_file_identity(path).as_ref() != Some(expected))
+        {
             return canary_diagnostic(Status::IdentityChanged);
         }
         let Ok(snapshot) = self.writer.project().await else {
@@ -539,7 +646,9 @@ impl HostCanaryService {
         if !self.bindings.begin_canary(&nonce, &workspace, deadline) {
             return canary_diagnostic(Status::Running);
         }
-        if let Ok(mut current) = self.current.lock() {
+        if self.candidate.is_none()
+            && let Ok(mut current) = self.current.lock()
+        {
             *current = Some(CurrentCanary {
                 identity: Some(identity.clone()),
                 diagnostic: canary_diagnostic(Status::Running),
@@ -595,7 +704,17 @@ impl HostCanaryService {
             return canary_diagnostic(Status::Unavailable);
         }
         let descriptor: std::os::fd::OwnedFd = child_output.into();
-        let spawned = Command::new(&request.host_executable)
+        let mut host_command = Command::new(&request.host_executable);
+        if let Some((_, _, package)) = &self.candidate {
+            for argument in evertrace_codex::install::candidate_host_arguments() {
+                host_command.arg("-c").arg(argument);
+            }
+            host_command
+                .env("EVERTRACE_CANDIDATE_ROOT", &self.data_root)
+                .env("EVERTRACE_CANDIDATE_CONFIG", &self.config_path)
+                .env("EVERTRACE_CANDIDATE_PACKAGE", package);
+        }
+        let spawned = host_command
             .args(["exec", "--sandbox", "read-only", "--cd"])
             .arg(&directory)
             .arg(prompt)
@@ -668,7 +787,9 @@ impl HostCanaryService {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         };
-        if let Ok(mut current) = self.current.lock() {
+        if self.candidate.is_none()
+            && let Ok(mut current) = self.current.lock()
+        {
             *current = Some(CurrentCanary {
                 identity: Some(identity),
                 diagnostic: result.clone(),

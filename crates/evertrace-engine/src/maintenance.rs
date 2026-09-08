@@ -166,6 +166,7 @@ pub struct PackageUpgradeCheck {
     pub materials_validated: bool,
     pub candidate_native_verified: bool,
     pub candidate_daemon_verified: bool,
+    pub candidate_host: Option<crate::HostCanaryDiagnostic>,
 }
 
 pub async fn verify_package_native(
@@ -177,19 +178,23 @@ pub async fn verify_package_native(
 
 /// Pre-publication only. The returned materials result never certifies a Host
 /// or package-ready state; the verified backup survives candidate disposal.
-pub async fn check_package_upgrade<F, Fut>(
+pub async fn check_package_upgrade<F, Fut, G, Run>(
     data_dir: &Path,
     config_path: &Path,
     host_config: &Path,
     unit: &Path,
     package: &Path,
     health: F,
+    live: (Option<crate::HostCanaryRequest>, G),
 ) -> Result<PackageUpgradeCheck, evertrace_store::restore::RestoreError>
 where
     F: Fn(std::path::PathBuf) -> Fut,
     Fut: std::future::Future<Output = bool>,
+    G: Fn(std::path::PathBuf, crate::HostCanaryRequest) -> Run,
+    Run: std::future::Future<Output = Option<crate::HostCanaryDiagnostic>>,
 {
     use evertrace_store::restore::{NativeUpgradePreparation, RestoreError};
+    let (live_host, canary) = live;
     let preflight = evertrace_codex::install::preflight_package_check(
         data_dir,
         config_path,
@@ -212,6 +217,7 @@ where
     let migrated = prepared.migrated();
     let mut candidate_native_verified = false;
     let mut candidate_daemon_verified = false;
+    let mut candidate_host = None;
     let validation = async {
         let mut runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
             .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
@@ -240,7 +246,9 @@ where
         )
         .await?;
         candidate_native_verified = true;
-        probe_package_daemon(package, &health).await?;
+        candidate_host =
+            probe_package_daemon(package, materials.generation, &health, live_host, &canary)
+                .await?;
         candidate_daemon_verified = true;
         materials
             .validate()
@@ -265,6 +273,7 @@ where
         materials_validated: validation.is_ok(),
         candidate_native_verified,
         candidate_daemon_verified,
+        candidate_host,
     })
 }
 
@@ -363,13 +372,18 @@ async fn run_package_native(
     result
 }
 
-async fn probe_package_daemon<F, Fut>(
+async fn probe_package_daemon<F, Fut, G, Run>(
     package: &Path,
+    generation: u64,
     health: &F,
-) -> Result<(), evertrace_store::restore::RestoreError>
+    live_host: Option<crate::HostCanaryRequest>,
+    canary: &G,
+) -> Result<Option<crate::HostCanaryDiagnostic>, evertrace_store::restore::RestoreError>
 where
     F: Fn(std::path::PathBuf) -> Fut,
     Fut: std::future::Future<Output = bool>,
+    G: Fn(std::path::PathBuf, crate::HostCanaryRequest) -> Run,
+    Run: std::future::Future<Output = Option<crate::HostCanaryDiagnostic>>,
 {
     use evertrace_store::restore::RestoreError;
     use std::{
@@ -433,13 +447,16 @@ where
         .map_err(|_| RestoreError::Io)?;
     file.sync_all().map_err(|_| RestoreError::Io)?;
     drop(file);
+    let check_id = JobId::new_v7().to_string();
+    let mut command = std::process::Command::new(package.join("evertraced"));
+    if live_host.is_none() {
+        command.env_clear().env("HOME", &root).env("XDG_CONFIG_HOME", &root);
+    }
     let mut daemon = PackageProbeChild(Some(
-        std::process::Command::new(package.join("evertraced"))
+        command
             .arg("--config")
             .arg(&config_path)
-            .env_clear()
-            .env("HOME", &root)
-            .env("XDG_CONFIG_HOME", &root)
+            .arg("--candidate-check").arg(&check_id).arg(generation.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -459,7 +476,7 @@ where
         let runtime_path = RuntimeSnapshot::snapshot_path(&root);
         let runtime = RuntimeSnapshot::load(&runtime_path).map_err(|_| invalid())?;
         if runtime.effective_config_hash != config.hash() { return Err(invalid()); }
-        let launcher = evertrace_codex::install::prepare_probe_generation(&root, &package.join("evertrace-hook"), |path| runtime.publish(path).map_err(|_| evertrace_codex::install::InstallError::Io)).map_err(|_| invalid())?;
+        let launcher = root.join("hook-v1");
         let native = serde_json::json!({
             "cwd": root, "hook_event_name":"PreToolUse", "model":"package-probe", "permission_mode":"default",
             "session_id":"package-daemon-probe", "tool_input":{"command":"printf package-daemon-probe"},
@@ -496,12 +513,17 @@ where
                 let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref).map_err(|_| invalid())?;
                 let (payload, _) = cas.read_bounded(&digest, 64 * 1024, 64 * 1024).map_err(|_| invalid())?;
                 if !payload.windows(b"package-daemon-probe".len()).any(|value| value == b"package-daemon-probe") { return Err(invalid()); }
-                return Ok(());
+                break;
             }
             drop(journal); drop(connection);
             if tokio::time::Instant::now() >= deadline { return Err(invalid()); }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        if let Some(request) = live_host {
+            let result = tokio::time::timeout(Duration::from_secs(35), canary(root.join("runtime/evertraced-v1.sock"), request)).await.map_err(|_| invalid())?.ok_or_else(invalid)?;
+            if result.scope != (crate::HostCanaryScope::Candidate { check_id: check_id.clone(), generation }) { return Err(invalid()); }
+            Ok(Some(result))
+        } else { Ok(None) }
     }.await;
     crate::recovery::finish_owned_child(&mut daemon.0, true).map_err(|_| {
         RestoreError::ResidualCandidate {

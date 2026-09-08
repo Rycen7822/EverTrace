@@ -15,11 +15,15 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         Command::ConfigCheck => config::check(args.config),
         Command::ConfigShowEffective => config::show_effective(args.config),
         Command::Doctor { refresh_host } => doctor::run(args.config, refresh_host).await,
-        Command::Upgrade { check_package } => restore::upgrade(args.config, check_package).await,
-        Command::Install { host_executable } => {
-            install::run(args.config, Some(host_executable)).await
-        }
-        Command::Uninstall => install::run(args.config, None).await,
+        Command::Upgrade {
+            check_package,
+            live_host,
+        } => restore::upgrade(args.config, check_package, live_host).await,
+        Command::Install {
+            host_executable,
+            live_canary,
+        } => install::run(args.config, Some(host_executable), live_canary).await,
+        Command::Uninstall => install::run(args.config, None, false).await,
         Command::Restore { backup } => restore::run(args.config, backup).await,
         Command::Mcp => mcp::run(args.config).await,
         Command::Tui => tui::run(args.config).await,

@@ -15,9 +15,11 @@ pub enum Command {
     },
     Upgrade {
         check_package: Option<PathBuf>,
+        live_host: Option<PathBuf>,
     },
     Install {
         host_executable: PathBuf,
+        live_canary: bool,
     },
     Uninstall,
     Restore {
@@ -63,7 +65,21 @@ impl Args {
                 }
                 Some(_) => return Err(usage()),
             };
-            Command::Upgrade { check_package }
+            let live_host = if check_package.is_some() {
+                match values.next() {
+                    None => None,
+                    Some(flag) if flag == "--live-host" => {
+                        Some(PathBuf::from(values.next().ok_or(usage())?))
+                    }
+                    _ => return Err(usage()),
+                }
+            } else {
+                None
+            };
+            Command::Upgrade {
+                check_package,
+                live_host,
+            }
         } else if command == "install" {
             Command::Install {
                 host_executable: PathBuf::from(
@@ -71,6 +87,11 @@ impl Args {
                         .next()
                         .ok_or("install requires an absolute Codex executable path")?,
                 ),
+                live_canary: match values.next() {
+                    None => false,
+                    Some(flag) if flag == "--live-canary" => true,
+                    _ => return Err(usage()),
+                },
             }
         } else if command == "uninstall" {
             Command::Uninstall
@@ -130,5 +151,48 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY]|install CODEX_EXECUTABLE|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]|install CODEX_EXECUTABLE [--live-canary]|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_lifecycle_requires_an_explicit_live_option() {
+        let parse = |args: &[&str]| Args::parse(args.iter().map(OsString::from));
+        assert!(matches!(
+            parse(&["install", "/host"]).unwrap().command,
+            Command::Install {
+                live_canary: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["install", "/host", "--live-canary"])
+                .unwrap()
+                .command,
+            Command::Install {
+                live_canary: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["upgrade", "--check", "/package"]).unwrap().command,
+            Command::Upgrade {
+                live_host: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["upgrade", "--check", "/package", "--live-host", "/host"])
+                .unwrap()
+                .command,
+            Command::Upgrade {
+                live_host: Some(_),
+                ..
+            }
+        ));
+        assert!(parse(&["upgrade", "--live-host", "/host"]).is_err());
+    }
 }
