@@ -1025,7 +1025,7 @@ impl JournalAdmissionState {
                         })
                         .copied()
                         .collect::<Vec<_>>();
-                    if successes.len() != 3 || event.evidence_refs.len() != 3 {
+                    if successes.len() < 3 || event.evidence_refs.len() != successes.len() {
                         return Err(StoreError::StoreCorrupt);
                     }
                     for (index, usage) in successes.iter().enumerate() {

@@ -317,6 +317,16 @@ fn config_numeric_and_duration_boundaries_are_strict() {
             "stable_min_outcome_supported = 2",
             false,
         ),
+        (
+            "stable_min_outcome_supported = 3",
+            "stable_min_outcome_supported = 256",
+            true,
+        ),
+        (
+            "stable_min_outcome_supported = 3",
+            "stable_min_outcome_supported = 257",
+            false,
+        ),
         ("search_token_budget = 600", "search_token_budget = 1", true),
         (
             "search_token_budget = 600",

@@ -191,6 +191,12 @@ impl McpActionService {
                 },
                 &original.payloads,
                 returned,
+                self.operation_config
+                    .as_ref()
+                    .ok_or(McpServiceError::Store)?
+                    .config()
+                    .procedure
+                    .stable_min_outcome_supported,
             )
             .map_err(|_| McpServiceError::Store)?;
         if events.is_empty() {

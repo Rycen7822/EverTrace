@@ -62,8 +62,8 @@ use evertrace_engine::{
         ProcedureDecision, ProcedureNegativeRequest, ProcedureNegativeResolution,
         ProcedureNegativeReviewProof, ProcedurePhase, ProcedureRouter, ProcedureUsageAdvance,
         ProcedureUsageCurrentView, ProcedureUsageResolution, RoutedProcedure, accept_procedure,
-        advance_procedure_usage, begin_procedure_usage, record_procedure_negative,
-        review_procedure_negative, route_procedures_with_quarantine,
+        advance_procedure_usage, begin_procedure_usage, promote_procedure_from_cohort,
+        record_procedure_negative, review_procedure_negative, route_procedures_with_quarantine,
     },
     semantic::{
         AtomAcceptanceContext, ProposalCommandContext, ProposalResolution, RevisionProposalService,
@@ -486,6 +486,7 @@ async fn record_returned(
     let (returned, command) = advance_procedure_usage(
         &view,
         proposal_context(at),
+        3,
         ProcedureUsageAdvance {
             usage_id: usage.procedure_usage_id,
             stage: ProcedureUsageStage::Returned,
@@ -837,6 +838,7 @@ struct PreparedUsageEvidence {
 async fn prepare_usage_evidence(
     writer: &mut JournalWriter,
     procedure: &evertrace_domain::procedure::ProcedureRevision,
+    stable_min_outcome_supported: u32,
     publication: ProcedurePublicationState,
     repository_id: RepositoryId,
     worktree_id: WorktreeId,
@@ -1208,6 +1210,7 @@ async fn prepare_usage_evidence(
     let (outcome, outcome_command) = advance_procedure_usage(
         &view,
         proposal_context(at),
+        stable_min_outcome_supported,
         ProcedureUsageAdvance {
             usage_id: usage.procedure_usage_id,
             stage: if matches!(
@@ -1267,6 +1270,7 @@ async fn prepare_usage_evidence(
 fn record_independent_success<'a>(
     writer: &'a mut JournalWriter,
     procedure: &'a evertrace_domain::procedure::ProcedureRevision,
+    stable_min_outcome_supported: u32,
     publication: ProcedurePublicationState,
     repository_id: RepositoryId,
     worktree_id: WorktreeId,
@@ -1280,6 +1284,7 @@ fn record_independent_success<'a>(
         let prepared = prepare_usage_evidence(
             writer,
             procedure,
+            stable_min_outcome_supported,
             publication,
             repository_id,
             worktree_id,
@@ -1450,6 +1455,171 @@ async fn s25_keeps_the_production_store_at_four_tables() {
 }
 
 #[tokio::test]
+async fn configured_promotion_uses_existing_exact_cohorts_without_new_usage() {
+    for required in [5, 3] {
+        let ActiveProcedureFixture {
+            _temp,
+            mut writer,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            procedure,
+            ..
+        } = active_procedure_fixture("configured-cohort", false).await;
+        let mut file = evertrace_domain::config::ConfigFile::default();
+        file.procedure.stable_min_outcome_supported = 5;
+        let config = evertrace_domain::config::EffectiveConfig::new(file).unwrap();
+        let threshold = config.config().procedure.stable_min_outcome_supported;
+        let mut refs = Vec::new();
+        for index in 0..required {
+            let at = 30 + i64::from(index);
+            let (usage, success, _) = record_independent_success(
+                &mut writer,
+                &procedure,
+                threshold,
+                ProcedurePublicationState::ActiveProbationary,
+                repository_id,
+                worktree_id,
+                snapshot_id,
+                at,
+                &format!("configured-{index}"),
+            )
+            .await;
+            assert!(!has_objective_success_state(&success));
+            writer.commit(&success, at).await.unwrap();
+            refs.push(usage.usage_revision_id);
+            if index == 2 {
+                let view =
+                    ProcedureUsageCurrentView::from_snapshot(&writer.project().await.unwrap())
+                        .unwrap();
+                assert!(
+                    promote_procedure_from_cohort(
+                        &view,
+                        proposal_context(40),
+                        procedure.revision_id,
+                        threshold,
+                        &refs
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
+        }
+        let before = writer.project().await.unwrap();
+        let view = ProcedureUsageCurrentView::from_snapshot(&before).unwrap();
+        let mut lowered = config.config().clone();
+        lowered.procedure.stable_min_outcome_supported = required;
+        let selected = evertrace_domain::config::EffectiveConfig::new(lowered).unwrap();
+        let mut context = proposal_context(40);
+        context.effective_config_hash = selected.hash();
+        let promotion = promote_procedure_from_cohort(
+            &view,
+            context,
+            procedure.revision_id,
+            selected.config().procedure.stable_min_outcome_supported,
+            &refs,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(promotion.events().len(), 1);
+        assert!(
+            matches!(&promotion.events()[0].payload, JournalPayload::ProcedureStateRecorded(event)
+            if event.evidence_refs.len() == required as usize)
+        );
+        for invalid in [2, 257] {
+            assert!(
+                promote_procedure_from_cohort(
+                    &view,
+                    proposal_context(40),
+                    procedure.revision_id,
+                    invalid,
+                    &refs
+                )
+                .is_err()
+            );
+        }
+        let mut duplicate = refs.clone();
+        duplicate.push(refs[0]);
+        assert!(
+            promote_procedure_from_cohort(
+                &view,
+                proposal_context(40),
+                procedure.revision_id,
+                3,
+                &duplicate
+            )
+            .is_err()
+        );
+        let mut unknown = refs.clone();
+        unknown[0] = RevisionId::new_v7();
+        assert!(
+            promote_procedure_from_cohort(
+                &view,
+                proposal_context(40),
+                procedure.revision_id,
+                3,
+                &unknown
+            )
+            .is_err()
+        );
+        let JournalPayload::ProcedureStateRecorded(mut forged) =
+            promotion.events()[0].payload.clone()
+        else {
+            unreachable!()
+        };
+        forged.evidence_refs.truncate(2);
+        assert!(
+            writer
+                .commit(
+                    &command(40, vec![JournalPayload::ProcedureStateRecorded(forged)]),
+                    40
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(writer.project().await.unwrap().frontier, before.frontier);
+        writer
+            .commit_if_frontier(&promotion, 40, before.frontier)
+            .await
+            .unwrap();
+        let after = writer.project().await.unwrap();
+        let usage_count = |snapshot: &evertrace_store::ProjectionSnapshot| {
+            snapshot
+                .data_rows()
+                .filter(|row| row.object_kind.as_deref() == Some("procedure_usage_revision"))
+                .count()
+        };
+        assert!(usage_count(&before) >= required as usize);
+        assert_eq!(usage_count(&before), usage_count(&after));
+        assert_eq!(after, writer.full_projection().await.unwrap());
+        let stable = ProcedureUsageCurrentView::from_snapshot(&after).unwrap();
+        for raised in [3, 5, 256] {
+            assert!(
+                promote_procedure_from_cohort(
+                    &stable,
+                    proposal_context(41),
+                    procedure.revision_id,
+                    raised,
+                    &refs
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(
+            promote_procedure_from_cohort(
+                &stable,
+                proposal_context(41),
+                procedure.revision_id,
+                3,
+                &unknown
+            )
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
 async fn promotion_cohort_is_exact_but_stable_success_batches_remain_legal() {
     let ActiveProcedureFixture {
         _temp,
@@ -1464,6 +1634,7 @@ async fn promotion_cohort_is_exact_but_stable_success_batches_remain_legal() {
         let (_, success, _) = record_independent_success(
             &mut writer,
             &procedure,
+            3,
             ProcedurePublicationState::ActiveProbationary,
             repository_id,
             worktree_id,
@@ -1478,6 +1649,7 @@ async fn promotion_cohort_is_exact_but_stable_success_batches_remain_legal() {
     let (mut extra_usage, extra_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -1489,6 +1661,7 @@ async fn promotion_cohort_is_exact_but_stable_success_batches_remain_legal() {
     let (trigger_usage, promotion_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -1500,7 +1673,7 @@ async fn promotion_cohort_is_exact_but_stable_success_batches_remain_legal() {
     assert_ne!(extra_usage.task_id, trigger_usage.task_id);
     assert!(has_objective_success_state(&extra_command));
     assert!(has_objective_success_state(&promotion_command));
-    let stable = promotion_command
+    let mut stable = promotion_command
         .events()
         .iter()
         .find_map(|event| match &event.payload {
@@ -1509,6 +1682,9 @@ async fn promotion_cohort_is_exact_but_stable_success_batches_remain_legal() {
         })
         .unwrap();
     let promotion_frontier = writer.project().await.unwrap().frontier;
+    // Additional command successes are legal; an unbacked extra cohort ref is not.
+    stable.evidence_refs.push(RevisionId::new_v7().to_string());
+    stable.evidence_refs.sort();
     extra_usage.source_watermark = promotion_frontier;
     let extra_cohort = command(
         33,
@@ -1528,6 +1704,7 @@ async fn promotion_cohort_is_exact_but_stable_success_batches_remain_legal() {
     let (fifth_usage, fifth_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveStable,
         repository_id,
         worktree_id,
@@ -1585,6 +1762,7 @@ async fn conflicted_and_possible_duplicate_physical_evidence_never_support_outco
         let prepared = prepare_usage_evidence(
             &mut writer,
             &procedure,
+            3,
             ProcedurePublicationState::ActiveProbationary,
             repository_id,
             worktree_id,
@@ -1648,6 +1826,7 @@ async fn same_continuation_split_and_overlapping_root_tasks_cannot_promote() {
         let first_prepared = prepare_usage_evidence(
             &mut writer,
             &procedure,
+            3,
             ProcedurePublicationState::ActiveProbationary,
             repository_id,
             worktree_id,
@@ -1670,6 +1849,7 @@ async fn same_continuation_split_and_overlapping_root_tasks_cannot_promote() {
         let second_prepared = prepare_usage_evidence(
             &mut writer,
             &procedure,
+            3,
             ProcedurePublicationState::ActiveProbationary,
             repository_id,
             worktree_id,
@@ -1718,6 +1898,7 @@ async fn same_continuation_split_and_overlapping_root_tasks_cannot_promote() {
         let candidate_prepared = prepare_usage_evidence(
             &mut writer,
             &procedure,
+            3,
             ProcedurePublicationState::ActiveProbationary,
             repository_id,
             worktree_id,
@@ -1760,6 +1941,22 @@ async fn same_continuation_split_and_overlapping_root_tasks_cannot_promote() {
             .await
             .unwrap_or_else(|error| panic!("{case} authentic command failed: {error:?}"));
         let projected = writer.project().await.unwrap();
+        let view = ProcedureUsageCurrentView::from_snapshot(&projected).unwrap();
+        assert!(
+            promote_procedure_from_cohort(
+                &view,
+                proposal_context(53),
+                procedure.revision_id,
+                3,
+                &[
+                    first.usage_revision_id,
+                    second.usage_revision_id,
+                    candidate.usage_revision_id
+                ],
+            )
+            .is_err(),
+            "{case} must also fail explicit cohort selection"
+        );
         assert!(!projected.data_rows().any(|row| {
             row.current_revision_id.as_deref() == Some(procedure.revision_id.to_string().as_str())
                 && row.publication_state.as_deref() == Some("active_stable")
@@ -1783,6 +1980,7 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     let (first, first_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -1795,6 +1993,7 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     let (second, second_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -1810,6 +2009,7 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     let third_prepared = prepare_usage_evidence(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -1829,6 +2029,7 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     let harm_prepared = prepare_usage_evidence(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -2017,6 +2218,7 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     let (third, third_command) = advance_procedure_usage(
         &active_harm_view,
         proposal_context(66),
+        3,
         ProcedureUsageAdvance {
             usage_id: third_prepared.usage.procedure_usage_id,
             stage: ProcedureUsageStage::Outcome,
@@ -2063,6 +2265,22 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     assert_eq!(writer.project().await.unwrap().frontier, before);
     writer.commit(&third_command, 66).await.unwrap();
     let projected = writer.project().await.unwrap();
+    assert!(
+        promote_procedure_from_cohort(
+            &ProcedureUsageCurrentView::from_snapshot(&projected).unwrap(),
+            proposal_context(66),
+            procedure.revision_id,
+            3,
+            &[
+                first.usage_revision_id,
+                second.usage_revision_id,
+                third.usage_revision_id
+            ],
+        )
+        .unwrap()
+        .is_none(),
+        "local harm blocks standalone promotion too"
+    );
     assert!(!projected.data_rows().any(|row| {
         row.current_revision_id.as_deref() == Some(procedure.revision_id.to_string().as_str())
             && row.publication_state.as_deref() == Some("active_stable")
@@ -2305,6 +2523,7 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     let (fourth, fourth_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -2369,6 +2588,7 @@ async fn review_hold_and_suspended_accept_later_negative_ledgers_without_same_st
         let prepared_usage = prepare_usage_evidence(
             &mut writer,
             &procedure,
+            3,
             ProcedurePublicationState::ActiveProbationary,
             repository_id,
             worktree_id,
@@ -3172,6 +3392,7 @@ async fn prepare_real_router_usage_stage() -> RealUsageStage {
                 advance_procedure_usage(
                     &view,
                     proposal_context(14),
+                    3,
                     ProcedureUsageAdvance {
                         usage_id: usage.procedure_usage_id,
                         stage: ProcedureUsageStage::Outcome,
@@ -3320,6 +3541,7 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
     let (outcome, outcome_command) = advance_procedure_usage(
         &view,
         proposal_context(14),
+        3,
         ProcedureUsageAdvance {
             usage_id: usage.procedure_usage_id,
             stage: ProcedureUsageStage::Outcome,
@@ -3383,6 +3605,7 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
         advance_procedure_usage(
             &stale_result_view,
             proposal_context(14),
+            3,
             ProcedureUsageAdvance {
                 usage_id: outcome.procedure_usage_id,
                 stage: ProcedureUsageStage::Outcome,
@@ -3469,6 +3692,7 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
         advance_procedure_usage(
             &stale_binding_view,
             proposal_context(14),
+            3,
             ProcedureUsageAdvance {
                 usage_id: outcome.procedure_usage_id,
                 stage: ProcedureUsageStage::Outcome,
@@ -3536,6 +3760,7 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
     let (_second_success, second_success_command, second_result_id) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -3569,6 +3794,7 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
     let (_third_success, third_success_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveProbationary,
         repository_id,
         worktree_id,
@@ -3638,6 +3864,7 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
     let (_fourth_success, fourth_success_command, _) = record_independent_success(
         &mut writer,
         &procedure,
+        3,
         ProcedurePublicationState::ActiveStable,
         repository_id,
         worktree_id,
@@ -3957,6 +4184,7 @@ async fn record_localized_harm_stage(stage: StableProcedureStage) -> LocalizedHa
     let (harm_action, harm_advance) = advance_procedure_usage(
         &harm_view,
         proposal_context(24),
+        3,
         ProcedureUsageAdvance {
             usage_id: harm_usage.procedure_usage_id,
             stage: ProcedureUsageStage::Completion,
@@ -4178,6 +4406,7 @@ async fn record_localized_harm_stage(stage: StableProcedureStage) -> LocalizedHa
     let (_post_review_usage, post_review_command) = advance_procedure_usage(
         &dismissed_view,
         proposal_context(27),
+        3,
         ProcedureUsageAdvance {
             usage_id: harm_action.procedure_usage_id,
             stage: ProcedureUsageStage::Completion,
@@ -4472,6 +4701,7 @@ async fn replace_after_confirmed_harm_stage(stage: HarmReviewedStage) {
         record_independent_success(
             &mut writer,
             &replacement,
+            3,
             ProcedurePublicationState::ActiveProbationary,
             repository_id,
             worktree_id,
@@ -4517,6 +4747,7 @@ async fn replace_after_confirmed_harm_stage(stage: HarmReviewedStage) {
     let (_later_replacement_usage, later_replacement_command) = advance_procedure_usage(
         &superseded_view,
         proposal_context(36),
+        3,
         ProcedureUsageAdvance {
             usage_id: replacement_success.procedure_usage_id,
             stage: ProcedureUsageStage::Outcome,

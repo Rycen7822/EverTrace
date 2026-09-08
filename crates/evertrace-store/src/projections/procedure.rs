@@ -285,56 +285,52 @@ impl ProcedureState {
             })
     }
 
-    fn promotion_evidence_refs(
+    fn valid_promotion_cohort(
         &self,
         tasks: &BTreeMap<evertrace_domain::ids::TaskId, (evertrace_domain::work::Task, u64)>,
-        trigger: &ProcedureUsageRevision,
-    ) -> Option<Vec<String>> {
-        if self.has_active_harm(trigger.procedure_revision_id) {
-            return None;
+        event: &ProcedureStateEvent,
+        payloads: &[&JournalPayload],
+    ) -> bool {
+        if self.has_active_harm(event.procedure_revision_id) || event.evidence_refs.len() < 3 {
+            return false;
         }
-        let mut prior_successes = self
+        let mut current = self
             .usages
             .values()
-            .filter(|(usage, _)| {
-                usage.procedure_revision_id == trigger.procedure_revision_id
+            .map(|(usage, _)| (usage.procedure_usage_id, usage))
+            .collect::<BTreeMap<_, _>>();
+        for payload in payloads {
+            if let JournalPayload::ProcedureUsageRecorded(usage) = payload {
+                current.insert(usage.procedure_usage_id, usage);
+            }
+        }
+        let cohort = current
+            .values()
+            .filter(|usage| {
+                usage.procedure_revision_id == event.procedure_revision_id
                     && usage.outcome_supported == evertrace_domain::procedure::ProcedureTruth::True
-                    && usage.task_id != trigger.task_id
+                    && event
+                        .evidence_refs
+                        .contains(&usage.usage_revision_id.to_string())
             })
-            .map(|(usage, _)| usage)
             .collect::<Vec<_>>();
-        prior_successes.sort_by_key(|usage| (usage.task_id, usage.usage_revision_id));
-        prior_successes.dedup_by_key(|usage| usage.task_id);
-        for first in 0..prior_successes.len() {
-            for second in (first + 1)..prior_successes.len() {
-                let mut cohort = [prior_successes[first], prior_successes[second], trigger];
-                cohort.sort_by_key(|usage| (usage.task_id, usage.usage_revision_id));
-                let independent = cohort.iter().enumerate().all(|(index, usage)| {
-                    let Some((task, _)) = tasks.get(&usage.task_id) else {
-                        return false;
-                    };
-                    task.continuation_of_task_id.is_none()
-                        && task.split_from_task_id.is_none()
-                        && cohort[..index].iter().all(|prior| {
-                            tasks.get(&prior.task_id).is_some_and(|(prior_task, _)| {
+        cohort.len() == event.evidence_refs.len()
+            && cohort.iter().enumerate().all(|(index, usage)| {
+                let Some((task, _)) = tasks.get(&usage.task_id) else {
+                    return false;
+                };
+                task.continuation_of_task_id.is_none()
+                    && task.split_from_task_id.is_none()
+                    && cohort[..index].iter().all(|prior| {
+                        prior.task_id != usage.task_id
+                            && tasks.get(&prior.task_id).is_some_and(|(prior_task, _)| {
                                 prior_task
                                     .request_root_refs
                                     .iter()
                                     .all(|reference| !task.request_root_refs.contains(reference))
                             })
-                        })
-                });
-                if independent {
-                    let mut refs = cohort
-                        .iter()
-                        .map(|usage| usage.usage_revision_id.to_string())
-                        .collect::<Vec<_>>();
-                    refs.sort();
-                    return Some(refs);
-                }
-            }
-        }
-        None
+                    })
+            })
     }
 
     pub(super) fn has_usage_anchor(&self, value: &ProcedureUsageRevision) -> bool {
@@ -460,57 +456,6 @@ impl ProcedureState {
                 return Err(StoreError::StoreCorrupt);
             }
         }
-        let mut successful_usages = BTreeMap::<RevisionId, Vec<&ProcedureUsageRevision>>::new();
-        for usage in payloads.iter().filter_map(|payload| match payload {
-            JournalPayload::ProcedureUsageRecorded(value)
-                if value.outcome_supported == evertrace_domain::procedure::ProcedureTruth::True =>
-            {
-                Some(value.as_ref())
-            }
-            _ => None,
-        }) {
-            successful_usages
-                .entry(usage.procedure_revision_id)
-                .or_default()
-                .push(usage);
-        }
-        let mut expected_promotion_refs = BTreeMap::<RevisionId, Vec<String>>::new();
-        for (procedure_revision_id, usages) in &successful_usages {
-            let current_state = self
-                .current_publication
-                .get(procedure_revision_id)
-                .map(|(event, _)| event.to_state)
-                .ok_or(StoreError::StoreCorrupt)?;
-            let promotion_states = payloads
-                .iter()
-                .filter(|payload| {
-                    matches!(payload,
-                        JournalPayload::ProcedureStateRecorded(event)
-                            if event.procedure_revision_id == *procedure_revision_id
-                                && event.to_state == ProcedurePublicationState::ActiveStable
-                                && event.reason == evertrace_domain::procedure::ProcedureStateReason::ObjectiveSuccesses)
-                })
-                .count();
-            if current_state != ProcedurePublicationState::ActiveProbationary {
-                if promotion_states != 0 {
-                    return Err(StoreError::StoreCorrupt);
-                }
-                continue;
-            }
-            let [usage] = usages.as_slice() else {
-                return Err(StoreError::StoreCorrupt);
-            };
-            match self.promotion_evidence_refs(tasks, usage) {
-                Some(evidence_refs) => {
-                    if promotion_states != 1 {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    expected_promotion_refs.insert(*procedure_revision_id, evidence_refs);
-                }
-                None if promotion_states == 0 => {}
-                None => return Err(StoreError::StoreCorrupt),
-            }
-        }
         for stable in payloads.iter().filter_map(|payload| {
             match payload {
             JournalPayload::ProcedureStateRecorded(value)
@@ -523,17 +468,9 @@ impl ProcedureState {
             _ => None,
         }
         }) {
-            let Some([usage]) = successful_usages
-                .get(&stable.procedure_revision_id)
-                .map(Vec::as_slice)
-            else {
-                return Err(StoreError::StoreCorrupt);
-            };
-            if expected_promotion_refs.get(&stable.procedure_revision_id)
-                != Some(&stable.evidence_refs)
-                || !stable
-                    .evidence_refs
-                    .contains(&usage.usage_revision_id.to_string())
+            if self.publication(stable.procedure_revision_id)
+                != Some(ProcedurePublicationState::ActiveProbationary)
+                || !self.valid_promotion_cohort(tasks, stable, &payloads)
             {
                 return Err(StoreError::StoreCorrupt);
             }

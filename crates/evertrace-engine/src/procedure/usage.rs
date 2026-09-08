@@ -180,6 +180,7 @@ impl ProcedureUsageCurrentView {
         context: ProposalCommandContext,
         routed: &[JournalPayload],
         returned: &[RevisionId],
+        stable_min_outcome_supported: u32,
     ) -> Result<Vec<JournalEventDraft>, SemanticServiceError> {
         use evertrace_domain::procedure::ProcedureUsageStage;
         if returned.is_empty() || returned.len() > 2 || routed.is_empty() || routed.len() > 2
@@ -221,6 +222,7 @@ impl ProcedureUsageCurrentView {
             let (_, command) = advance_procedure_usage(
                 self,
                 context.clone(),
+                stable_min_outcome_supported,
                 ProcedureUsageAdvance {
                     usage_id: original.procedure_usage_id,
                     stage: ProcedureUsageStage::Returned,
@@ -2132,6 +2134,7 @@ fn usage_phase(value: ProcedurePhase) -> evertrace_domain::procedure::ProcedureU
 pub fn advance_procedure_usage(
     view: &ProcedureUsageCurrentView,
     context: ProposalCommandContext,
+    stable_min_outcome_supported: u32,
     request: ProcedureUsageAdvance,
     constraints: &ConstraintState,
     previous_constraints: Option<&ConstraintState>,
@@ -2142,6 +2145,7 @@ pub fn advance_procedure_usage(
     ),
     SemanticServiceError,
 > {
+    validate_promotion_threshold(stable_min_outcome_supported)?;
     let current = view
         .usages
         .get(&request.usage_id)
@@ -2249,7 +2253,13 @@ pub fn advance_procedure_usage(
     if !current.validate_successor(&next) {
         return Err(SemanticServiceError::InvalidInput);
     }
-    let promotion = promotion_event(view, &next, context.occurred_at_us)?;
+    // Retain the existing three-success selection only. Larger configured
+    // cohorts are submitted explicitly, not searched with N nested loops.
+    let promotion = if stable_min_outcome_supported == 3 {
+        promotion_event(view, &next, context.occurred_at_us)?
+    } else {
+        None
+    };
     usage_command(context, next.clone(), promotion).map(|command| (next, command))
 }
 
@@ -2422,6 +2432,115 @@ fn validate_physical_usage(
     Ok((!operations.is_empty(), adopted_attempt))
 }
 
+/// Validate a specified current cohort and promote without manufacturing a
+/// usage successor. Cohort selection belongs to the calling planner; None is
+/// not a claim that no other qualifying cohort exists.
+pub fn promote_procedure_from_cohort(
+    view: &ProcedureUsageCurrentView,
+    context: ProposalCommandContext,
+    procedure_revision_id: RevisionId,
+    stable_min_outcome_supported: u32,
+    usage_revision_refs: &[RevisionId],
+) -> Result<Option<JournalCommand>, SemanticServiceError> {
+    validate_promotion_threshold(stable_min_outcome_supported)?;
+    if usage_revision_refs.len() > 256 {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    let current = view
+        .usages
+        .values()
+        .map(|usage| (usage.usage_revision_id, usage))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let cohort = usage_revision_refs
+        .iter()
+        .map(|id| {
+            current
+                .get(id)
+                .copied()
+                .ok_or(SemanticServiceError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(event) = cohort_promotion_event(
+        view,
+        procedure_revision_id,
+        &cohort,
+        stable_min_outcome_supported,
+        context.occurred_at_us,
+    )?
+    else {
+        return Ok(None);
+    };
+    JournalCommand::new(
+        context.command_id,
+        vec![JournalEventDraft::runtime(
+            context.occurred_at_us,
+            context.effective_config_hash,
+            context.algorithm_revision,
+            JournalPayload::ProcedureStateRecorded(Box::new(event)),
+        )],
+    )
+    .map(Some)
+    .map_err(SemanticServiceError::Store)
+}
+
+fn validate_promotion_threshold(threshold: u32) -> Result<(), SemanticServiceError> {
+    if !(3..=256).contains(&threshold) {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn cohort_promotion_event(
+    view: &ProcedureUsageCurrentView,
+    procedure_revision_id: RevisionId,
+    successes: &[&evertrace_domain::procedure::ProcedureUsageRevision],
+    threshold: u32,
+    occurred_at_us: i64,
+) -> Result<Option<ProcedureStateEvent>, SemanticServiceError> {
+    let procedure = view
+        .procedures
+        .get(&procedure_revision_id)
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    if view.current_procedures.get(&procedure.procedure_id) != Some(&procedure_revision_id)
+        || successes.iter().any(|usage| {
+            usage.procedure_revision_id != procedure_revision_id
+                || usage.outcome_supported != evertrace_domain::procedure::ProcedureTruth::True
+                || usage.created_at_us > occurred_at_us
+        })
+        || !independent_tasks(view, successes)
+    {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    let publication = view
+        .publications
+        .get(&procedure_revision_id)
+        .ok_or(SemanticServiceError::InvalidInput)?;
+    if publication.0.created_at_us > occurred_at_us {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    if successes.len() < threshold as usize
+        || publication.0.to_state != ProcedurePublicationState::ActiveProbationary
+        || view.has_local_quarantine(procedure_revision_id)
+    {
+        return Ok(None);
+    }
+    let mut evidence_refs = successes
+        .iter()
+        .map(|usage| usage.usage_revision_id.to_string())
+        .collect::<Vec<_>>();
+    evidence_refs.sort();
+    Ok(Some(ProcedureStateEvent {
+        state_event_id: RevisionId::new_v7(),
+        procedure_revision_id,
+        from_state: Some(ProcedurePublicationState::ActiveProbationary),
+        to_state: ProcedurePublicationState::ActiveStable,
+        reason: ProcedureStateReason::ObjectiveSuccesses,
+        resume_state: None,
+        evidence_refs,
+        created_at_us: occurred_at_us,
+    }))
+}
+
 fn promotion_event(
     view: &ProcedureUsageCurrentView,
     next: &evertrace_domain::procedure::ProcedureUsageRevision,
@@ -2460,7 +2579,7 @@ fn promotion_event(
                 next.clone(),
             ];
             cohort.sort_by_key(|usage| (usage.task_id, usage.usage_revision_id));
-            if independent_tasks(view, &cohort) {
+            if independent_tasks(view, &cohort.iter().collect::<Vec<_>>()) {
                 selected = Some(cohort);
                 break 'candidate;
             }
@@ -2469,26 +2588,18 @@ fn promotion_event(
     let Some(successes) = selected else {
         return Ok(None);
     };
-    let mut evidence_refs = successes
-        .iter()
-        .map(|usage| usage.usage_revision_id.to_string())
-        .collect::<Vec<_>>();
-    evidence_refs.sort();
-    Ok(Some(ProcedureStateEvent {
-        state_event_id: RevisionId::new_v7(),
-        procedure_revision_id: next.procedure_revision_id,
-        from_state: Some(ProcedurePublicationState::ActiveProbationary),
-        to_state: ProcedurePublicationState::ActiveStable,
-        reason: ProcedureStateReason::ObjectiveSuccesses,
-        resume_state: None,
-        evidence_refs,
-        created_at_us: occurred_at_us,
-    }))
+    cohort_promotion_event(
+        view,
+        next.procedure_revision_id,
+        &successes.iter().collect::<Vec<_>>(),
+        3,
+        occurred_at_us,
+    )
 }
 
 fn independent_tasks(
     view: &ProcedureUsageCurrentView,
-    usages: &[evertrace_domain::procedure::ProcedureUsageRevision],
+    usages: &[&evertrace_domain::procedure::ProcedureUsageRevision],
 ) -> bool {
     for (index, usage) in usages.iter().enumerate() {
         let Some(task) = view.tasks.get(&usage.task_id) else {
@@ -2501,10 +2612,11 @@ fn independent_tasks(
             let Some(other_task) = view.tasks.get(&other.task_id) else {
                 return false;
             };
-            if task
-                .request_root_refs
-                .iter()
-                .any(|value| other_task.request_root_refs.contains(value))
+            if task.task_id == other_task.task_id
+                || task
+                    .request_root_refs
+                    .iter()
+                    .any(|value| other_task.request_root_refs.contains(value))
             {
                 return false;
             }
@@ -2619,7 +2731,8 @@ mod negative_review_selection_tests {
                 &[JournalPayload::ProcedureUsageRecorded(Box::new(
                     historical.clone()
                 ))],
-                &[historical.procedure_revision_id]
+                &[historical.procedure_revision_id],
+                3,
             )
             .is_err()
         );
@@ -2632,7 +2745,8 @@ mod negative_review_selection_tests {
                 &[JournalPayload::ProcedureUsageRecorded(Box::new(
                     unrelated_route
                 ))],
-                &[historical.procedure_revision_id]
+                &[historical.procedure_revision_id],
+                3,
             )
             .unwrap()
             .is_empty()
@@ -2643,7 +2757,8 @@ mod negative_review_selection_tests {
             view.confirmed_return_events(
                 context,
                 &[JournalPayload::ProcedureUsageRecorded(Box::new(old_route))],
-                &[historical.procedure_revision_id]
+                &[historical.procedure_revision_id],
+                3,
             )
             .is_err()
         );

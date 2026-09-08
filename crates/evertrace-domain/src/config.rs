@@ -548,7 +548,7 @@ fn validate(config: &ConfigFile) -> Result<(), ConfigError> {
         86_400,
         "dreaming.max_wall_time",
     )?;
-    if config.procedure.stable_min_outcome_supported < 3 {
+    if !(3..=256).contains(&config.procedure.stable_min_outcome_supported) {
         return Err(ConfigError::OutOfRange(
             "procedure.stable_min_outcome_supported",
         ));

@@ -1872,37 +1872,6 @@ fn validate_semantic_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
             return Err(StoreError::InvalidInput);
         }
     }
-    for state in events.iter().filter_map(|event| match &event.payload {
-        JournalPayload::ProcedureStateRecorded(value)
-            if value.to_state
-                == evertrace_domain::procedure::ProcedurePublicationState::ActiveStable
-                && value.reason
-                    == evertrace_domain::procedure::ProcedureStateReason::ObjectiveSuccesses =>
-        {
-            Some(value.as_ref())
-        }
-        _ => None,
-    }) {
-        let usages = events
-            .iter()
-            .filter_map(|event| match &event.payload {
-                JournalPayload::ProcedureUsageRecorded(value)
-                    if value.procedure_revision_id == state.procedure_revision_id
-                        && value.outcome_supported
-                            == evertrace_domain::procedure::ProcedureTruth::True
-                        && state
-                            .evidence_refs
-                            .contains(&value.usage_revision_id.to_string()) =>
-                {
-                    Some(value.as_ref())
-                }
-                _ => None,
-            })
-            .count();
-        if usages != 1 {
-            return Err(StoreError::InvalidInput);
-        }
-    }
     Ok(())
 }
 
