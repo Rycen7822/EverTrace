@@ -2137,14 +2137,14 @@ mod tests {
                         version: 5,
                         frontier: 9,
                     },
-                    relations: HumanBackupTableState {
+                    relations: Some(HumanBackupTableState {
                         version: 6,
                         frontier: 6,
-                    },
-                    search: HumanBackupTableState {
+                    }),
+                    search: Some(HumanBackupTableState {
                         version: 7,
                         frontier: 7,
-                    },
+                    }),
                     committed_source_watermark_count: 2,
                     spool_source_watermark_count: 1,
                     live_cas_count: 3,

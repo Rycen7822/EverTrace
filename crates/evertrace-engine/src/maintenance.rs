@@ -43,6 +43,56 @@ const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v1";
 
+pub(crate) fn freeze_hook_backup(
+    data_dir: &Path,
+) -> Result<evertrace_store::backup::BackupHookBoundary, BackupError> {
+    let snapshot = evertrace_codex::install::StableLauncher::freeze_backup_snapshot(data_dir)
+        .map_err(|error| match error {
+            evertrace_codex::install::InstallError::ResourceExhausted => {
+                BackupError::ResourceExhausted
+            }
+            evertrace_codex::install::InstallError::LockBusy => BackupError::Io,
+            _ => BackupError::Corrupt,
+        })?;
+    Ok(evertrace_store::backup::BackupHookBoundary {
+        current_generation: snapshot.current_generation,
+        retained_generations: snapshot.retained_generations,
+        pin_count: snapshot.pin_count,
+        pinned_generation_count: snapshot.pinned_generation_count,
+        files: snapshot
+            .files
+            .into_iter()
+            .map(|file| evertrace_store::backup::BackupFrozenFile {
+                directories: file.directories,
+                source: file.source,
+                relative_path: file.relative_path,
+                device: file.device,
+                inode: file.inode,
+                length: file.length,
+                modified_seconds: file.modified_seconds,
+                modified_nanoseconds: file.modified_nanoseconds,
+                changed_seconds: file.changed_seconds,
+                changed_nanoseconds: file.changed_nanoseconds,
+            })
+            .collect(),
+    })
+}
+
+/// Uses no daemon, worker, provider or host-installation side effect.
+pub async fn upgrade_offline(
+    data_dir: &Path,
+    config_path: &Path,
+) -> Result<evertrace_store::restore::NativeUpgradeOutcome, evertrace_store::restore::RestoreError>
+{
+    evertrace_store::restore::upgrade_native(
+        data_dir,
+        config_path,
+        || freeze_hook_backup(data_dir),
+        verify_hook_backup_assets,
+    )
+    .await
+}
+
 pub enum OfflineRestoreOutcome {
     Historical { directory: std::path::PathBuf },
     Activated(evertrace_store::restore::RestoreActivated),

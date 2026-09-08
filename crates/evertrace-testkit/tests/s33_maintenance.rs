@@ -820,6 +820,348 @@ fn file_sha256(bytes: &[u8]) -> String {
     .unwrap()
 }
 
+#[tokio::test]
+async fn isolated_upgrade_publishes_native_container_without_moving_durable_inputs() {
+    use evertrace_store::restore::NativeUpgradeOutcome;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let connection = evertrace_store::connection::CompatibilityStore::connect_local(&data)
+        .await
+        .unwrap();
+    evertrace_store::L0001::apply(connection.connection())
+        .await
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        JournalWriter::open(&data).await,
+        Err(evertrace_store::StoreError::UpgradeRequired)
+    ));
+    assert!(!data.join("store").exists());
+    let mut configured = EffectiveConfig::default().config().clone();
+    configured.runtime.data_dir = data.to_str().unwrap().into();
+    let effective = EffectiveConfig::new(configured).unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, effective.to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut runtime = runtime_snapshot(&data);
+    runtime.effective_config_hash = effective.hash();
+    runtime
+        .publish(&RuntimeSnapshot::snapshot_path(&data))
+        .unwrap();
+    DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    let repository_id = RepositoryId::new_v7();
+    let CaptureOutcome::Durable { cas_digest, .. } = capture
+        .capture(capture_input(
+            "upgrade-before",
+            repository_id,
+            b"before backup",
+        ))
+        .unwrap()
+    else {
+        panic!("durable capture required")
+    };
+    let paths = [
+        &runtime.cas_dir,
+        &runtime.spool_dir,
+        &runtime.device_key_dir,
+    ];
+    let identities: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        })
+        .collect();
+    let binaries = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    std::fs::write(data.join("unknown-user-asset"), b"keep").unwrap();
+    let output = Command::new(binaries.join("evertrace"))
+        .arg("--config")
+        .arg(&config)
+        .arg("upgrade")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("upgrade=L0001_to_L0002"));
+    assert_eq!(
+        std::fs::read(data.join("unknown-user-asset")).unwrap(),
+        b"keep"
+    );
+    let backup = std::fs::read_dir(data.join("backups"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(
+        data.join("store")
+            .join(format!("{}.lance", evertrace_store::JOURNAL_TABLE))
+            .is_dir()
+    );
+    assert!(
+        !data
+            .join(format!("{}.lance", evertrace_store::OBJECTS_TABLE))
+            .exists()
+    );
+    assert!(
+        !data
+            .join(format!("{}.lance", evertrace_store::JOURNAL_TABLE))
+            .exists()
+    );
+    for (path, identity) in paths.iter().zip(identities) {
+        let metadata = std::fs::metadata(path).unwrap();
+        assert_eq!((metadata.dev(), metadata.ino()), identity);
+    }
+    assert!(
+        CasStore::open(runtime.cas_dir.clone())
+            .unwrap()
+            .read(&cas_digest.parse().unwrap())
+            .is_ok()
+    );
+    let CaptureOutcome::Durable { .. } = capture
+        .capture(capture_input(
+            "upgrade-after",
+            repository_id,
+            b"after publication",
+        ))
+        .unwrap()
+    else {
+        panic!("held capture runtime must remain usable")
+    };
+    let writer = JournalWriter::open(&data).await.unwrap();
+    assert_eq!(writer.full_projection().await.unwrap().frontier, 2);
+    drop(writer);
+    assert!(matches!(
+        evertrace_engine::maintenance::upgrade_offline(&data, &config)
+            .await
+            .unwrap(),
+        NativeUpgradeOutcome::Noop { retained_native } if retained_native.is_empty()
+    ));
+    let mut hook_correlation = correlation();
+    hook_correlation.pairing_role = ObservationRole::Result;
+    let hook_input = serde_json::json!({
+        "input_version": evertrace_codex::hook_input::CAPTURE_HOOK_INPUT_VERSION,
+        "spool_record_id": "upgrade-real-hook", "source_observation_id_hint": null,
+        "source_instance_id": "upgrade-real-hook", "source_revision": "revision-1",
+        "source_record_identity": "upgrade-real-hook", "identity_strength": "stable_native",
+        "source_kind": "codex_hook", "identity_domain": "codex-hook-v1",
+        "adapter_manifest_ref": "adapter-s33", "eligible_event_manifest_ref": "eligible-s33",
+        "source_revision_mode": "append", "previous_source_revision": null,
+        "source_ref": "upgrade-real-hook", "session_id": "upgrade-real-hook",
+        "turn_id": null, "tool_use_id": null, "event_kind": "post_tool_use",
+        "correlation": hook_correlation, "scope_effect_claims": [], "lifecycle": null,
+        "source_sequence": 1, "source_sequence_origin": null, "task_id": null,
+        "repository_instance_id": null, "worktree_instance_id": null,
+        "event_time_us": 1, "payload": "upgrade real hook evidence"
+    });
+    let bytes = serde_json::to_vec(&hook_input).unwrap();
+    evertrace_codex::hook_input::CaptureHookInput::from_json(&bytes).unwrap();
+    {
+        let mut child = Command::new(binaries.join("evertrace-hook"))
+            .arg("--runtime-snapshot")
+            .arg(RuntimeSnapshot::snapshot_path(&data))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&bytes).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+    drop(capture);
+    let (mut spool, _) =
+        DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+    spool.seal_active(runtime.generation).unwrap();
+    let replay = spool
+        .sealed_segments(16)
+        .unwrap()
+        .into_iter()
+        .map(|segment| {
+            (
+                segment.path().to_owned(),
+                std::fs::read(segment.path()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(spool);
+    let writer = JournalWriter::open(&data).await.unwrap();
+    let (handle, actor) = spawn_writer(writer, 32).unwrap();
+    let ingestor =
+        EvidenceIngestor::new(runtime.clone(), handle.clone(), effective.hash(), ALGORITHM)
+            .unwrap();
+    let drained = ingestor.drain_once().await.unwrap();
+    assert!(drained.committed_frames >= 3, "{drained:?}");
+    let snapshot = handle.project().await.unwrap();
+    let (_, receipt) = source_pair_for_instance(&snapshot, "upgrade-real-hook");
+    assert_eq!(receipt.source_instance_id.as_str(), "upgrade-real-hook");
+    let frontier = snapshot.frontier;
+    // Simulate an acknowledgement lost after commit by restoring the exact
+    // durable input bytes, not by issuing a new Hook capture/command identity.
+    for (path, bytes) in replay {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+    let replayed = ingestor.drain_once().await.unwrap();
+    assert_eq!(replayed.replayed_frames, drained.committed_frames);
+    assert_eq!(replayed.committed_frames, replayed.replayed_frames);
+    assert_eq!(handle.project().await.unwrap().frontier, frontier);
+    drop(ingestor);
+    drop(handle);
+    actor.await.unwrap().unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_revision"], "L0001");
+    assert!(manifest["table_states"]["relations"].is_null());
+}
+
+#[tokio::test]
+async fn isolated_upgrade_converts_flat_l0002_without_an_extra_migration() {
+    use evertrace_store::restore::NativeUpgradeOutcome;
+    use std::os::unix::fs::DirBuilderExt;
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let connection = evertrace_store::connection::CompatibilityStore::connect_local(&data)
+        .await
+        .unwrap();
+    evertrace_store::L0002::apply(connection.connection())
+        .await
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        JournalWriter::open(&data).await,
+        Err(evertrace_store::StoreError::UpgradeRequired)
+    ));
+    let effective = EffectiveConfig::default();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, effective.to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut runtime = runtime_snapshot(&data);
+    runtime.effective_config_hash = effective.hash();
+    runtime
+        .publish(&RuntimeSnapshot::snapshot_path(&data))
+        .unwrap();
+    CasStore::open(runtime.cas_dir.clone()).unwrap();
+    DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    let repository_id = RepositoryId::new_v7();
+    let outcome = evertrace_store::restore::upgrade_native(
+        &data,
+        &config,
+        || {
+            assert!(
+                StableLauncher::freeze_backup_snapshot(&data)
+                    .unwrap()
+                    .files
+                    .is_empty()
+            );
+            // The Store has already frozen its backup spool boundary. This new
+            // durable input must survive publication despite not belonging to it.
+            assert!(matches!(
+                capture
+                    .capture(capture_input(
+                        "upgrade-boundary",
+                        repository_id,
+                        b"after backup boundary"
+                    ))
+                    .unwrap(),
+                CaptureOutcome::Durable { .. }
+            ));
+            Ok(evertrace_store::backup::BackupHookBoundary {
+                current_generation: None,
+                retained_generations: Vec::new(),
+                pin_count: 0,
+                pinned_generation_count: 0,
+                files: Vec::new(),
+            })
+        },
+        |path, _| {
+            StableLauncher::verify_backup_snapshot(path)
+                .map_err(|_| evertrace_store::BackupError::Corrupt)?;
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        NativeUpgradeOutcome::Published {
+            migrated: false,
+            ref retained_native,
+            ..
+        } if retained_native.is_empty()
+    ));
+    for table in [
+        evertrace_store::OBJECTS_TABLE,
+        evertrace_store::JOURNAL_TABLE,
+        evertrace_store::RELATIONS_TABLE,
+        evertrace_store::SEARCH_TABLE,
+    ] {
+        assert!(!data.join(format!("{table}.lance")).exists());
+    }
+    drop(capture);
+    let writer = JournalWriter::open(&data).await.unwrap();
+    assert_eq!(writer.full_projection().await.unwrap().frontier, 2);
+    let (handle, actor) = spawn_writer(writer, 32).unwrap();
+    let ingestor =
+        EvidenceIngestor::new(runtime.clone(), handle.clone(), effective.hash(), ALGORITHM)
+            .unwrap();
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 1);
+    source_pair_for_instance(&handle.project().await.unwrap(), "hook-upgrade-boundary");
+    drop(ingestor);
+    drop(handle);
+    actor.await.unwrap().unwrap();
+    let flat = evertrace_store::connection::CompatibilityStore::connect_local(&data)
+        .await
+        .unwrap();
+    evertrace_store::L0002::apply(flat.connection())
+        .await
+        .unwrap();
+    drop(flat);
+    std::fs::remove_dir_all(
+        data.join("store")
+            .join(format!("{}.lance", evertrace_store::JOURNAL_TABLE)),
+    )
+    .unwrap();
+    assert!(
+        JournalWriter::open(&data).await.is_err(),
+        "corrupt canonical must never fall back to complete flat source"
+    );
+    assert!(
+        evertrace_engine::maintenance::upgrade_offline(&data, &config)
+            .await
+            .is_err()
+    );
+}
+
 fn runtime_snapshot(root: &Path) -> RuntimeSnapshot {
     let limits = SpoolLimits {
         high_watermark_bytes: 4 * 1024 * 1024,
@@ -2982,8 +3324,8 @@ async fn quiesced_backup_create_verify_preserves_post_boundary_hook_and_reopens_
     assert!(manifest.spool_cas_refs.contains(&second_pre_digest));
     assert_eq!(manifest.table_states.journal.checkpoint, manifest.frontier);
     assert_eq!(manifest.table_states.objects.checkpoint, manifest.frontier);
-    assert!(manifest.table_states.relations.checkpoint < manifest.frontier);
-    assert!(manifest.table_states.search.checkpoint < manifest.frontier);
+    assert!(manifest.table_states.relations.as_ref().unwrap().checkpoint < manifest.frontier);
+    assert!(manifest.table_states.search.as_ref().unwrap().checkpoint < manifest.frontier);
     assert_eq!(
         manifest.index_generation,
         evertrace_store::SEARCH_PROJECTION_GENERATION
@@ -3111,12 +3453,12 @@ async fn quiesced_backup_create_verify_preserves_post_boundary_hook_and_reopens_
         manifest.table_states.objects.checkpoint
     );
     assert_eq!(
-        summary.relations.frontier,
-        manifest.table_states.relations.checkpoint
+        summary.relations.as_ref().unwrap().frontier,
+        manifest.table_states.relations.as_ref().unwrap().checkpoint
     );
     assert_eq!(
-        summary.search.frontier,
-        manifest.table_states.search.checkpoint
+        summary.search.as_ref().unwrap().frontier,
+        manifest.table_states.search.as_ref().unwrap().checkpoint
     );
     assert_eq!(
         summary.index_generation,
@@ -3354,8 +3696,12 @@ async fn quiesced_backup_create_verify_preserves_post_boundary_hook_and_reopens_
     std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
 
     let mut ahead_checkpoint_manifest = canonical_manifest.clone();
-    ahead_checkpoint_manifest.table_states.relations.checkpoint =
-        ahead_checkpoint_manifest.frontier + 1;
+    ahead_checkpoint_manifest
+        .table_states
+        .relations
+        .as_mut()
+        .unwrap()
+        .checkpoint = ahead_checkpoint_manifest.frontier + 1;
     std::fs::write(
         &manifest_path,
         serde_json::to_vec(&ahead_checkpoint_manifest).unwrap(),

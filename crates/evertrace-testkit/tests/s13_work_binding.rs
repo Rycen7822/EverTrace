@@ -327,7 +327,10 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     assert!(first_context.is_resolved());
     assert_eq!(first_context.operation_id, operation_id);
     assert_eq!(first_context.task_id, Some(task.task_id));
-    let reader = CompatibilityStore::connect_local(&root).await.unwrap();
+    let reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
     let objects = reader
         .connection()
         .open_table(OBJECTS_TABLE)
@@ -420,7 +423,10 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     );
     let identity = WorkIdentityCurrentView::from_snapshot(&restart_snapshot).unwrap();
     let restart_rows = writer.journal_rows().await.unwrap().len();
-    let restart_reader = CompatibilityStore::connect_local(&root).await.unwrap();
+    let restart_reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
     let restart_objects = restart_reader
         .connection()
         .open_table(OBJECTS_TABLE)

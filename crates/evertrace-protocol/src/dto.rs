@@ -504,8 +504,8 @@ pub struct HumanBackupSummary {
     pub frontier: u64,
     pub journal: HumanBackupTableState,
     pub objects: HumanBackupTableState,
-    pub relations: HumanBackupTableState,
-    pub search: HumanBackupTableState,
+    pub relations: Option<HumanBackupTableState>,
+    pub search: Option<HumanBackupTableState>,
     pub committed_source_watermark_count: u32,
     pub spool_source_watermark_count: u32,
     pub live_cas_count: u32,
@@ -1301,11 +1301,17 @@ impl HumanBackupSummary {
             && self.journal.frontier == self.frontier
             && self.objects.version > 0
             && self.objects.frontier == self.frontier
-            && self.relations.version > 0
-            && self.relations.frontier <= self.frontier
-            && self.search.version > 0
-            && self.search.frontier <= self.frontier
-            && self.index_generation > 0
+            && match (&self.relations, &self.search) {
+                (None, None) => self.index_generation == 0,
+                (Some(relations), Some(search)) => {
+                    relations.version > 0
+                        && relations.frontier <= self.frontier
+                        && search.version > 0
+                        && search.frontier <= self.frontier
+                        && self.index_generation > 0
+                }
+                _ => false,
+            }
             && self.compiler_watermark == self.objects.frontier
             && self.effective_config_hash != [0; 32]
             && self.runtime_generation > 0

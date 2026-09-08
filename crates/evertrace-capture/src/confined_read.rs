@@ -137,6 +137,89 @@ pub struct ConfinedRoot {
 }
 
 impl ConfinedRoot {
+    /// Publish a private sibling directory without replacing any existing target.
+    /// The caller retains its writer lock and synchronizes this parent before
+    /// treating publication as durable.
+    /// An error can follow a successful rename: callers must inspect held
+    /// identities before rollback or cleanup, never infer that no mutation ran.
+    pub fn publish_directory_noreplace(
+        &self,
+        source: &ConfinedRoot,
+        destination: &str,
+    ) -> Result<(), ConfinedReadError> {
+        self.rename_directory(source, destination, None)
+    }
+
+    /// Atomically exchange two known sibling directories, including for rollback.
+    /// As with publication, a post-rename identity error does not undo the syscall.
+    pub fn exchange_directories(
+        &self,
+        source: &ConfinedRoot,
+        destination: &ConfinedRoot,
+    ) -> Result<(), ConfinedReadError> {
+        let name = destination
+            .locator
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or(ConfinedReadError::InvalidPath)?;
+        self.rename_directory(source, name, Some(destination))
+    }
+
+    fn rename_directory(
+        &self,
+        source: &ConfinedRoot,
+        destination: &str,
+        exchange: Option<&ConfinedRoot>,
+    ) -> Result<(), ConfinedReadError> {
+        if source.locator.parent() != Some(self.locator.as_path())
+            || Path::new(destination).components().count() != 1
+            || !matches!(
+                Path::new(destination).components().next(),
+                Some(Component::Normal(_))
+            )
+        {
+            return Err(ConfinedReadError::InvalidPath);
+        }
+        self.revalidate_stable()?;
+        source.revalidate_stable()?;
+        if let Some(target) = exchange {
+            if target.locator != self.locator.join(destination) {
+                return Err(ConfinedReadError::InvalidPath);
+            }
+            target.revalidate_stable()?;
+        }
+        let name = source
+            .locator
+            .file_name()
+            .ok_or(ConfinedReadError::InvalidPath)?;
+        rustix::fs::renameat_with(
+            &self.fd,
+            name,
+            &self.fd,
+            destination,
+            if exchange.is_some() {
+                rustix::fs::RenameFlags::EXCHANGE
+            } else {
+                rustix::fs::RenameFlags::NOREPLACE
+            },
+        )
+        .map_err(|_| ConfinedReadError::Io)?;
+        self.revalidate_stable()?;
+        let published = statat(&self.fd, destination, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ConfinedReadError::Io)?;
+        if !source.matches_root(&published)? {
+            return Err(ConfinedReadError::Changed);
+        }
+        if let Some(target) = exchange {
+            let previous = statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| ConfinedReadError::Io)?;
+            if !target.matches_root(&previous)? {
+                return Err(ConfinedReadError::Changed);
+            }
+        }
+        Ok(())
+    }
+
     pub fn open(root: &Path) -> Result<Self, ConfinedReadError> {
         let locator = std::fs::canonicalize(root).map_err(|_| ConfinedReadError::Io)?;
         let fd = open(

@@ -57,10 +57,7 @@ pub struct SearchHardFilter {
 
 impl SearchIndex {
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
-        let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
+        let connection = crate::connection::connect_native(data_dir).await?;
         let table = connection
             .open_table(SEARCH_TABLE)
             .execute()
@@ -110,10 +107,7 @@ impl SearchIndex {
     }
 
     async fn pinned_snapshot(&self) -> Result<SearchSnapshot, StoreError> {
-        let connection = lancedb::connect(self.data_dir.to_str().ok_or(StoreError::InvalidPath)?)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
+        let connection = crate::connection::connect_native(&self.data_dir).await?;
         let table = connection
             .open_table(SEARCH_TABLE)
             .execute()
@@ -153,10 +147,7 @@ impl SearchIndex {
     }
 
     async fn authoritative_frontier(&self) -> Result<u64, StoreError> {
-        let connection = lancedb::connect(self.data_dir.to_str().ok_or(StoreError::InvalidPath)?)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
+        let connection = crate::connection::connect_native(&self.data_dir).await?;
         let table = connection
             .open_table(JOURNAL_TABLE)
             .execute()

@@ -616,7 +616,10 @@ async fn journal_projection_replay_relations_and_no_delta_are_closed() {
             "evertrace_search"
         ]
     );
-    let reader = CompatibilityStore::connect_local(&root).await.unwrap();
+    let reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
     let objects = reader
         .connection()
         .open_table(OBJECTS_TABLE)

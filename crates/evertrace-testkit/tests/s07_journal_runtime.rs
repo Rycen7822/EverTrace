@@ -303,7 +303,10 @@ async fn dirty_outbox_projection_is_incremental_and_full_rebuild_is_identical() 
         .await
         .unwrap();
     writer.project().await.unwrap();
-    let reader = CompatibilityStore::connect_local(&root).await.unwrap();
+    let reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
     let objects = reader
         .connection()
         .open_table(OBJECTS_TABLE)
@@ -330,7 +333,10 @@ async fn dirty_outbox_projection_is_incremental_and_full_rebuild_is_identical() 
     assert_eq!(incremental, writer.full_projection().await.unwrap());
     drop(writer);
 
-    fs::remove_dir_all(root.join("evertrace_objects.lance")).unwrap();
+    fs::remove_dir_all(
+        evertrace_store::connection::native_root(&root).join("evertrace_objects.lance"),
+    )
+    .unwrap();
     let rebuilt = JournalWriter::open(&root).await.unwrap();
     assert_eq!(
         rebuilt.migration_outcome(),
@@ -439,7 +445,10 @@ async fn job_lease_recovery_watermark_config_and_stale_audit_rebuild() {
     assert_eq!(after_stale, writer.full_projection().await.unwrap());
     drop(writer);
 
-    fs::remove_dir_all(root.join("evertrace_objects.lance")).unwrap();
+    fs::remove_dir_all(
+        evertrace_store::connection::native_root(&root).join("evertrace_objects.lance"),
+    )
+    .unwrap();
     let rebuilt = JournalWriter::open(&root).await.unwrap();
     assert_eq!(
         rebuilt.migration_outcome(),

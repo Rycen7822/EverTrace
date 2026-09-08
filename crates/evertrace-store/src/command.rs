@@ -1939,6 +1939,8 @@ pub enum StoreError {
     StoreCorrupt,
     #[error("store migration failed")]
     Migration,
+    #[error("existing native store requires offline evertrace upgrade")]
+    UpgradeRequired,
     #[error("store projection failed")]
     Projection,
     #[error("store serialization failed")]

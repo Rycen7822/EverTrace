@@ -647,38 +647,9 @@ async fn create_quiesced_backup(
         .map_err(|_| WriterActorError::Store)?;
     drop(guard);
     drop(spool);
-    let hook_snapshot =
-        match evertrace_codex::install::StableLauncher::freeze_backup_snapshot(&data_dir) {
-            Ok(snapshot) => snapshot,
-            Err(evertrace_codex::install::InstallError::ResourceExhausted) => {
-                return Ok(Err(BackupError::ResourceExhausted));
-            }
-            Err(evertrace_codex::install::InstallError::LockBusy) => {
-                return Ok(Err(BackupError::Io));
-            }
-            Err(_) => return Ok(Err(BackupError::Corrupt)),
-        };
-    let hook = evertrace_store::backup::BackupHookBoundary {
-        current_generation: hook_snapshot.current_generation,
-        retained_generations: hook_snapshot.retained_generations,
-        pin_count: hook_snapshot.pin_count,
-        pinned_generation_count: hook_snapshot.pinned_generation_count,
-        files: hook_snapshot
-            .files
-            .into_iter()
-            .map(|file| evertrace_store::backup::BackupFrozenFile {
-                directories: file.directories,
-                source: file.source,
-                relative_path: file.relative_path,
-                device: file.device,
-                inode: file.inode,
-                length: file.length,
-                modified_seconds: file.modified_seconds,
-                modified_nanoseconds: file.modified_nanoseconds,
-                changed_seconds: file.changed_seconds,
-                changed_nanoseconds: file.changed_nanoseconds,
-            })
-            .collect(),
+    let hook = match super::super::maintenance::freeze_hook_backup(&data_dir) {
+        Ok(hook) => hook,
+        Err(error) => return Ok(Err(error)),
     };
     let boundary = evertrace_store::backup::BackupFrozenBoundary {
         spool: boundary,

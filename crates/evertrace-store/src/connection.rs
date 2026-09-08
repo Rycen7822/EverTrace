@@ -4,6 +4,61 @@ use arrow_array::RecordBatch;
 use lancedb::{Connection, Table, query::ExecutableQuery};
 use thiserror::Error;
 
+/// The state root owns locks, CAS and spool; only this child is a normal native store.
+pub fn native_root(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("store")
+}
+
+pub(crate) fn prepare_native_root(data_dir: &Path) -> Result<(), crate::StoreError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let native = native_root(data_dir);
+    match std::fs::symlink_metadata(&native) {
+        Ok(_) => {
+            evertrace_capture::ConfinedRoot::open_owned_private(&native)
+                .map_err(|_| crate::StoreError::StoreCorrupt)?;
+            let journal =
+                std::fs::symlink_metadata(native.join(format!("{}.lance", crate::JOURNAL_TABLE)))
+                    .map_err(|_| crate::StoreError::StoreCorrupt)?;
+            if !journal.is_dir() || journal.file_type().is_symlink() {
+                return Err(crate::StoreError::StoreCorrupt);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for table in [
+                crate::JOURNAL_TABLE,
+                crate::OBJECTS_TABLE,
+                crate::RELATIONS_TABLE,
+                crate::SEARCH_TABLE,
+            ] {
+                match std::fs::symlink_metadata(data_dir.join(format!("{table}.lance"))) {
+                    Ok(_) => return Err(crate::StoreError::UpgradeRequired),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(crate::StoreError::Io),
+                }
+            }
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&native)
+                .map_err(|_| crate::StoreError::Io)?;
+            std::fs::File::open(data_dir)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| crate::StoreError::Io)?;
+        }
+        Err(_) => return Err(crate::StoreError::Io),
+    }
+    Ok(())
+}
+
+pub(crate) async fn connect_native(data_dir: &Path) -> Result<Connection, crate::StoreError> {
+    let native = native_root(data_dir);
+    evertrace_capture::ConfinedRoot::open_owned_private(&native)
+        .map_err(|_| crate::StoreError::StoreCorrupt)?;
+    lancedb::connect(native.to_str().ok_or(crate::StoreError::InvalidPath)?)
+        .execute()
+        .await
+        .map_err(|_| crate::StoreError::LanceDb)
+}
+
 #[derive(Clone)]
 pub struct CompatibilityStore {
     connection: Connection,

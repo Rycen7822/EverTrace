@@ -570,11 +570,9 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
                             backup.objects.frontier
                         ),
                         format!(
-                            "backup relations/search: v{}@{} / v{}@{}",
-                            backup.relations.version,
-                            backup.relations.frontier,
-                            backup.search.version,
-                            backup.search.frontier
+                            "backup relations/search: {} / {}",
+                            backup.relations.as_ref().map_or_else(|| "absent".into(), |table| format!("v{}@{}", table.version, table.frontier)),
+                            backup.search.as_ref().map_or_else(|| "absent".into(), |table| format!("v{}@{}", table.version, table.frontier))
                         ),
                         format!(
                             "backup source/spool/cas: {}/{} watermarks; {} files/{} generations; {}/{} CAS",

@@ -61,8 +61,38 @@ pub struct BackupTableState {
 pub struct BackupTableStates {
     pub journal: BackupTableState,
     pub objects: BackupTableState,
-    pub relations: BackupTableState,
-    pub search: BackupTableState,
+    pub relations: Option<BackupTableState>,
+    pub search: Option<BackupTableState>,
+}
+
+impl BackupTableStates {
+    fn profile(&self) -> Result<&'static str, BackupError> {
+        match (&self.relations, &self.search) {
+            (None, None) => Ok("L0001"),
+            (Some(_), Some(_)) => Ok("L0002"),
+            _ => Err(BackupError::Corrupt),
+        }
+    }
+
+    fn validate(&self, frontier: u64) -> bool {
+        self.profile().is_ok()
+            && self.journal.version > 0
+            && self.journal.checkpoint == frontier
+            && self.objects.version > 0
+            && self.objects.checkpoint == frontier
+            && [&self.relations, &self.search]
+                .into_iter()
+                .flatten()
+                .all(|table| table.version > 0 && table.checkpoint <= frontier)
+    }
+
+    fn table_names(&self) -> Result<Vec<&'static str>, BackupError> {
+        let mut names = vec![crate::JOURNAL_TABLE, crate::OBJECTS_TABLE];
+        if self.profile()? == "L0002" {
+            names.extend([crate::RELATIONS_TABLE, crate::SEARCH_TABLE]);
+        }
+        Ok(names)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +250,30 @@ pub(crate) struct BackupPlan {
     backup_runtime: RuntimeSnapshot,
 }
 
+impl BackupPlan {
+    /// Upgrade retains its preflight backup and one native-only candidate.
+    pub(crate) fn check_upgrade_space(&self) -> Result<(), BackupError> {
+        let native_bytes = self
+            .manifest
+            .files
+            .iter()
+            .filter(|entry| Path::new(&entry.relative_path).starts_with("store"))
+            .try_fold(0u64, |total, entry| total.checked_add(entry.size))
+            .ok_or(BackupError::ResourceExhausted)?;
+        let needed = self
+            .manifest
+            .files
+            .iter()
+            .try_fold(native_bytes, |total, entry| total.checked_add(entry.size))
+            .and_then(|total| total.checked_add(COPY_SPACE_RESERVE))
+            .ok_or(BackupError::ResourceExhausted)?;
+        if fs2::available_space(&self.data_dir).map_err(|_| BackupError::Io)? < needed {
+            return Err(BackupError::ResourceExhausted);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct BackupStaging {
     backup_dir: PathBuf,
@@ -239,6 +293,10 @@ pub struct BackupVerification {
 }
 
 impl BackupVerification {
+    pub(crate) fn files(&self) -> &[BackupFileManifest] {
+        &self.manifest.files
+    }
+
     pub(crate) fn revalidate_gc_inputs(
         &self,
         deadline: std::time::Instant,
@@ -332,7 +390,7 @@ impl Write for BoundedCountWriter {
 }
 
 pub(crate) fn prepare_backup(
-    data_dir: &Path,
+    roots: (&Path, &Path),
     config_path: &Path,
     expected_runtime: &RuntimeSnapshot,
     backup_job_id: JobId,
@@ -340,6 +398,7 @@ pub(crate) fn prepare_backup(
     table_states: BackupTableStates,
     boundary: BackupFrozenBoundary,
 ) -> Result<BackupPlan, BackupError> {
+    let (data_dir, native_dir) = roots;
     let BackupFrozenBoundary { spool, hook } = boundary;
     expected_runtime
         .validate()
@@ -350,14 +409,7 @@ pub(crate) fn prepare_backup(
         != data_dir
         || expected_runtime.effective_config_hash == [0; 32]
         || snapshot.frontier == 0
-        || table_states.journal.version == 0
-        || table_states.journal.checkpoint != snapshot.frontier
-        || table_states.objects.version == 0
-        || table_states.objects.checkpoint != snapshot.frontier
-        || table_states.relations.version == 0
-        || table_states.relations.checkpoint > snapshot.frontier
-        || table_states.search.version == 0
-        || table_states.search.checkpoint > snapshot.frontier
+        || !table_states.validate(snapshot.frontier)
     {
         return Err(BackupError::InvalidInput);
     }
@@ -370,14 +422,9 @@ pub(crate) fn prepare_backup(
     remove_owned_staging(&staging_dir)?;
 
     let mut sources = Vec::new();
-    for table in [
-        crate::JOURNAL_TABLE,
-        crate::OBJECTS_TABLE,
-        crate::RELATIONS_TABLE,
-        crate::SEARCH_TABLE,
-    ] {
+    for table in table_states.table_names()? {
         collect_tree(
-            &data_dir.join(format!("{table}.lance")),
+            &native_dir.join(format!("{table}.lance")),
             &PathBuf::from("store").join(format!("{table}.lance")),
             &mut sources,
         )?;
@@ -538,7 +585,12 @@ pub(crate) fn prepare_backup(
     if scheduler.frontier != snapshot.frontier {
         return Err(BackupError::Corrupt);
     }
-    let index_generation = crate::SEARCH_PROJECTION_GENERATION;
+    let profile = table_states.profile()?;
+    let index_generation = if profile == "L0002" {
+        crate::SEARCH_PROJECTION_GENERATION
+    } else {
+        0
+    };
     let spool_source_watermarks = spool
         .source_watermarks
         .iter()
@@ -606,7 +658,7 @@ pub(crate) fn prepare_backup(
             hook_retained_generations: hook.retained_generations,
             hook_pin_count: hook.pin_count,
             session_pinned_hook_artifact_count: hook.pinned_generation_count,
-            schema_revision: "L0002".into(),
+            schema_revision: profile.into(),
             backup_algorithm_revision: QUIESCED_BACKUP_ALGORITHM_REVISION.into(),
             object_deletion_generation: object_deletions.generation,
             repository_purge_generation: scope_purges.generation,
@@ -1057,6 +1109,66 @@ pub(crate) fn copy_restore_candidate(
     destination: &Path,
     destination_root: &evertrace_capture::ConfinedRoot,
 ) -> Result<(), BackupError> {
+    copy_verified_candidate(verification, destination, destination_root, false)
+}
+
+pub(crate) fn copy_upgrade_native_candidate(
+    verification: &BackupVerification,
+    destination: &Path,
+    destination_root: &evertrace_capture::ConfinedRoot,
+) -> Result<(), BackupError> {
+    copy_verified_candidate(verification, destination, destination_root, true)
+}
+
+/// Ephemeral use of the same file manifest and streaming checksum algorithm:
+/// compare the prepared native tree with the published tree before writes resume.
+pub(crate) fn native_upgrade_manifest(
+    native: &Path,
+) -> Result<Vec<BackupFileManifest>, BackupError> {
+    let mut sources = Vec::new();
+    collect_tree(native, Path::new("store"), &mut sources)?;
+    sources.sort_by(|left, right| left.relative.cmp(&right.relative));
+    let mut files = Vec::with_capacity(sources.len());
+    for source in sources {
+        revalidate_source(&source)?;
+        let sha256 = if source.kind == BackupFileKind::Regular {
+            let mut file = open_source(&source)?;
+            let checksum = copy_exact_sha256_hex(&mut file, &mut io::sink(), source.identity.size)
+                .map_err(|_| BackupError::Corrupt)?;
+            file.sync_all().map_err(|_| BackupError::Io)?;
+            revalidate_source(&source)?;
+            Some(checksum)
+        } else {
+            File::open(&source.source)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| BackupError::Io)?;
+            revalidate_source(&source)?;
+            None
+        };
+        files.push(BackupFileManifest {
+            relative_path: source
+                .relative
+                .to_str()
+                .ok_or(BackupError::Corrupt)?
+                .to_owned(),
+            kind: source.kind,
+            size: if sha256.is_some() {
+                source.identity.size
+            } else {
+                0
+            },
+            sha256,
+        });
+    }
+    Ok(files)
+}
+
+fn copy_verified_candidate(
+    verification: &BackupVerification,
+    destination: &Path,
+    destination_root: &evertrace_capture::ConfinedRoot,
+    native_only: bool,
+) -> Result<(), BackupError> {
     destination_root
         .revalidate_stable()
         .map_err(|_| BackupError::IdentityChanged)?;
@@ -1064,7 +1176,15 @@ pub(crate) fn copy_restore_candidate(
         .map_err(|_| BackupError::IdentityChanged)?;
     for entry in &verification.manifest.files {
         let relative = strict_relative(&entry.relative_path)?;
-        let output_path = destination.join(&relative);
+        let output_relative = if native_only {
+            let Ok(native) = relative.strip_prefix("store") else {
+                continue;
+            };
+            native
+        } else {
+            relative.as_path()
+        };
+        let output_path = destination.join(output_relative);
         if entry.kind == BackupFileKind::Directory {
             ensure_staging_parents(destination, &output_path)?;
             continue;
@@ -1099,15 +1219,18 @@ pub(crate) fn copy_restore_candidate(
         }
         output.sync_all().map_err(|_| BackupError::Io)?;
     }
-    let manifest = serde_json::to_vec(&verification.manifest).map_err(|_| BackupError::Corrupt)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination.join(MANIFEST_NAME))
-        .map_err(|_| BackupError::Io)?;
-    output.write_all(&manifest).map_err(|_| BackupError::Io)?;
-    output.sync_all().map_err(|_| BackupError::Io)?;
+    if !native_only {
+        let manifest =
+            serde_json::to_vec(&verification.manifest).map_err(|_| BackupError::Corrupt)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination.join(MANIFEST_NAME))
+            .map_err(|_| BackupError::Io)?;
+        output.write_all(&manifest).map_err(|_| BackupError::Io)?;
+        output.sync_all().map_err(|_| BackupError::Io)?;
+    }
     source_root
         .revalidate_stable()
         .map_err(|_| BackupError::IdentityChanged)?;
@@ -1266,9 +1389,16 @@ pub(crate) async fn read_verified_store_tables(
     let mut expected_names = vec![
         crate::JOURNAL_TABLE.to_owned(),
         crate::OBJECTS_TABLE.to_owned(),
-        crate::RELATIONS_TABLE.to_owned(),
-        crate::SEARCH_TABLE.to_owned(),
     ];
+    let l0002 = names
+        .iter()
+        .any(|name| name == crate::RELATIONS_TABLE || name == crate::SEARCH_TABLE);
+    if l0002 {
+        expected_names.extend([
+            crate::RELATIONS_TABLE.to_owned(),
+            crate::SEARCH_TABLE.to_owned(),
+        ]);
+    }
     expected_names.sort();
     if names != expected_names {
         return Err(BackupError::Corrupt);
@@ -1283,16 +1413,28 @@ pub(crate) async fn read_verified_store_tables(
         .execute()
         .await
         .map_err(|_| BackupError::Corrupt)?;
-    let relations = connection
-        .open_table(crate::RELATIONS_TABLE)
-        .execute()
-        .await
-        .map_err(|_| BackupError::Corrupt)?;
-    let search = connection
-        .open_table(crate::SEARCH_TABLE)
-        .execute()
-        .await
-        .map_err(|_| BackupError::Corrupt)?;
+    let relations = if l0002 {
+        Some(
+            connection
+                .open_table(crate::RELATIONS_TABLE)
+                .execute()
+                .await
+                .map_err(|_| BackupError::Corrupt)?,
+        )
+    } else {
+        None
+    };
+    let search = if l0002 {
+        Some(
+            connection
+                .open_table(crate::SEARCH_TABLE)
+                .execute()
+                .await
+                .map_err(|_| BackupError::Corrupt)?,
+        )
+    } else {
+        None
+    };
     crate::journal::validate_journal_table(&journal)
         .await
         .map_err(map_store)?;
@@ -1307,12 +1449,26 @@ pub(crate) async fn read_verified_store_tables(
         .find(|row| row.row_id == crate::OBJECTS_CHECKPOINT_ID)
         .ok_or(BackupError::Corrupt)?
         .source_event_seq;
-    let relation_checkpoint = crate::relations::read_relation_checkpoint(&relations)
-        .await
-        .map_err(map_store)?;
-    let search_checkpoint = crate::search::read_search_checkpoint(&search)
-        .await
-        .map_err(map_store)?;
+    let relation_state = if let Some(table) = &relations {
+        Some(BackupTableState {
+            version: table.version().await.map_err(|_| BackupError::Corrupt)?,
+            checkpoint: crate::relations::read_relation_checkpoint(table)
+                .await
+                .map_err(map_store)?,
+        })
+    } else {
+        None
+    };
+    let search_state = if let Some(table) = &search {
+        Some(BackupTableState {
+            version: table.version().await.map_err(|_| BackupError::Corrupt)?,
+            checkpoint: crate::search::read_search_checkpoint(table)
+                .await
+                .map_err(map_store)?,
+        })
+    } else {
+        None
+    };
     let actual = BackupTableStates {
         journal: BackupTableState {
             version: journal.version().await.map_err(|_| BackupError::Corrupt)?,
@@ -1322,18 +1478,16 @@ pub(crate) async fn read_verified_store_tables(
             version: objects.version().await.map_err(|_| BackupError::Corrupt)?,
             checkpoint: object_checkpoint,
         },
-        relations: BackupTableState {
-            version: relations
-                .version()
-                .await
-                .map_err(|_| BackupError::Corrupt)?,
-            checkpoint: relation_checkpoint,
-        },
-        search: BackupTableState {
-            version: search.version().await.map_err(|_| BackupError::Corrupt)?,
-            checkpoint: search_checkpoint,
-        },
+        relations: relation_state,
+        search: search_state,
     };
+    if crate::JournalWriter::existing_profile(store_dir)
+        .await
+        .map_err(map_store)?
+        != Some(actual.profile()?)
+    {
+        return Err(BackupError::Corrupt);
+    }
     Ok((
         actual,
         ProjectionSnapshot {
@@ -1350,14 +1504,17 @@ async fn verify_backup_tables(
     let (actual, snapshot) = read_verified_store_tables(&directory.join("store")).await?;
     let journal_checkpoint = actual.journal.checkpoint;
     let object_checkpoint = actual.objects.checkpoint;
-    let relation_checkpoint = actual.relations.checkpoint;
-    let search_checkpoint = actual.search.checkpoint;
     if actual != manifest.table_states
         || journal_checkpoint != manifest.frontier
         || object_checkpoint != manifest.frontier
-        || relation_checkpoint > manifest.frontier
-        || search_checkpoint > manifest.frontier
-        || manifest.index_generation != crate::SEARCH_PROJECTION_GENERATION
+        || !actual.validate(manifest.frontier)
+        || manifest.schema_revision != actual.profile()?
+        || manifest.index_generation
+            != if actual.profile()? == "L0002" {
+                crate::SEARCH_PROJECTION_GENERATION
+            } else {
+                0
+            }
         || manifest.compiler_watermark != actual.objects.checkpoint
     {
         return Err(BackupError::Corrupt);
@@ -1581,20 +1738,18 @@ fn valid_hook_pin_path(path: &str) -> bool {
 fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
     if manifest.manifest_version != MANIFEST_VERSION
         || manifest.frontier == 0
-        || manifest.table_states.journal.version == 0
-        || manifest.table_states.journal.checkpoint != manifest.frontier
-        || manifest.table_states.objects.version == 0
-        || manifest.table_states.objects.checkpoint != manifest.frontier
-        || manifest.table_states.relations.version == 0
-        || manifest.table_states.relations.checkpoint > manifest.frontier
-        || manifest.table_states.search.version == 0
-        || manifest.table_states.search.checkpoint > manifest.frontier
-        || manifest.index_generation != crate::SEARCH_PROJECTION_GENERATION
+        || !manifest.table_states.validate(manifest.frontier)
+        || manifest.index_generation
+            != if manifest.schema_revision == "L0002" {
+                crate::SEARCH_PROJECTION_GENERATION
+            } else {
+                0
+            }
         || manifest.compiler_watermark != manifest.frontier
         || manifest.effective_config_hash == [0; 32]
         || manifest.runtime_generation == 0
         || !valid_hook_manifest(manifest)
-        || manifest.schema_revision != "L0002"
+        || manifest.schema_revision != manifest.table_states.profile()?
         || manifest.backup_algorithm_revision != QUIESCED_BACKUP_ALGORITHM_REVISION
         || manifest.files.is_empty()
         || manifest.files.len() > MAX_BACKUP_FILES
@@ -1730,19 +1885,26 @@ fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
             return Err(BackupError::Corrupt);
         }
     }
-    for table in [
-        "store/evertrace_journal.lance/",
-        "store/evertrace_objects.lance/",
-        "store/evertrace_relations.lance/",
-        "store/evertrace_search.lance/",
-    ] {
+    for table in manifest.table_states.table_names()? {
+        let prefix = format!("store/{table}.lance/");
         if !manifest
             .files
             .iter()
-            .any(|item| item.relative_path.starts_with(table))
+            .any(|item| item.relative_path.starts_with(&prefix))
         {
             return Err(BackupError::Corrupt);
         }
+    }
+    if manifest.table_states.profile()? == "L0001"
+        && manifest.files.iter().any(|item| {
+            item.relative_path
+                .starts_with("store/evertrace_relations.lance")
+                || item
+                    .relative_path
+                    .starts_with("store/evertrace_search.lance")
+        })
+    {
+        return Err(BackupError::Corrupt);
     }
     let regular_paths = manifest
         .files

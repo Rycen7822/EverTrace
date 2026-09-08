@@ -225,15 +225,61 @@ impl JournalWriter {
 
     pub(crate) async fn open_with_lock(lock: SiblingWriterLock) -> Result<Self, StoreError> {
         let data_dir = lock.data_dir().to_owned();
-        Self::open_at_with_lock(lock, &data_dir).await
+        crate::connection::prepare_native_root(&data_dir)?;
+        let native = crate::connection::native_root(&data_dir);
+        if Self::existing_profile(&native).await? == Some("L0001") {
+            return Err(StoreError::UpgradeRequired);
+        }
+        Self::open_at_with_lock(lock, &native).await
+    }
+
+    pub(crate) async fn existing_profile(
+        data_dir: &Path,
+    ) -> Result<Option<&'static str>, StoreError> {
+        let path = data_dir.join(format!("{JOURNAL_TABLE}.lance"));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Io),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok(_) => {}
+        }
+        let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
+            .execute()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let journal = connection
+            .open_table(JOURNAL_TABLE)
+            .execute()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        validate_journal_table(&journal).await?;
+        let rows = read_all_journal_rows(&journal).await?;
+        JournalAdmissionState::from_journal_rows(&rows)?;
+        let populated = !rows.is_empty();
+        let mut profile = None;
+        for row in rows {
+            if let JournalPayload::MigrationApplied(migration) = row.payload()? {
+                match migration.migration_id.as_str() {
+                    "L0001" if profile.is_none() => profile = Some("L0001"),
+                    "L0002" if profile == Some("L0001") => profile = Some("L0002"),
+                    _ => return Err(StoreError::StoreCorrupt),
+                }
+            }
+        }
+        if populated && profile.is_none() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(profile)
     }
 
     async fn open_at_with_lock(
         lock: SiblingWriterLock,
-        data_dir: &Path,
+        native_dir: &Path,
     ) -> Result<Self, StoreError> {
         lock.validate_held()?;
-        let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
+        let connection = lancedb::connect(native_dir.to_str().ok_or(StoreError::InvalidPath)?)
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
@@ -305,22 +351,22 @@ impl JournalWriter {
                     .map_err(|_| StoreError::LanceDb)?,
                 checkpoint: object_checkpoint,
             },
-            relations: crate::BackupTableState {
+            relations: Some(crate::BackupTableState {
                 version: self
                     .relations
                     .version()
                     .await
                     .map_err(|_| StoreError::LanceDb)?,
                 checkpoint: relation_checkpoint,
-            },
-            search: crate::BackupTableState {
+            }),
+            search: Some(crate::BackupTableState {
                 version: self
                     .search
                     .version()
                     .await
                     .map_err(|_| StoreError::LanceDb)?,
                 checkpoint: search_checkpoint,
-            },
+            }),
         })
     }
 
@@ -746,7 +792,7 @@ impl ClosedJournalWriter {
             Err(_) => return (self, Err(crate::BackupError::InvalidInput)),
         };
         let result = crate::backup::prepare_backup(
-            &data_dir,
+            (&data_dir, &crate::connection::native_root(&data_dir)),
             &config_path,
             &runtime,
             backup_job_id,
@@ -812,7 +858,9 @@ impl ClosedJournalWriter {
         if candidate.parent() != self.lock.data_dir.parent() {
             return Err(StoreError::InvalidPath);
         }
-        JournalWriter::open_at_with_lock(self.lock, candidate).await
+        crate::connection::prepare_native_root(candidate)?;
+        JournalWriter::open_at_with_lock(self.lock, &crate::connection::native_root(candidate))
+            .await
     }
 }
 

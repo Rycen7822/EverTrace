@@ -29,7 +29,7 @@ mod tests {
         .unwrap();
         writer.commit(&command, 1).await.unwrap();
 
-        let connection = lancedb::connect(root.to_str().unwrap())
+        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
             .execute()
             .await
             .unwrap();
@@ -223,7 +223,7 @@ mod tests {
         )
         .unwrap();
         writer.commit(&command, 1).await.unwrap();
-        let connection = lancedb::connect(root.to_str().unwrap())
+        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
             .execute()
             .await
             .unwrap();

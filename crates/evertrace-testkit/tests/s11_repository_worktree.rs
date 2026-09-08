@@ -2731,7 +2731,10 @@ async fn production_tables_stay_at_the_four_l0002_tables() {
     // A wrong-schema partial L0002 table makes opening the store fail closed.
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("store");
-    let reader = CompatibilityStore::connect_local(&root).await.unwrap();
+    let reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
     reader
         .connection()
         .create_empty_table("evertrace_relations", objects_schema())
@@ -2830,9 +2833,11 @@ async fn object_rows_only_use_s11_object_kinds_for_repository_data() {
         let row_id = format!("object:work:repository:{}", repository.repository_id);
         assert!(rows.iter().any(|row| row.row_id == row_id));
     }
-    let reader = CompatibilityStore::connect_local(&harness.temp.path().join("store"))
-        .await
-        .unwrap();
+    let reader = CompatibilityStore::connect_local(&evertrace_store::connection::native_root(
+        &harness.temp.path().join("store"),
+    ))
+    .await
+    .unwrap();
     let objects = reader
         .connection()
         .open_table(OBJECTS_TABLE)

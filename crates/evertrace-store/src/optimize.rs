@@ -515,7 +515,14 @@ mod tests {
         let temporary = tempfile::TempDir::new().unwrap();
         let data = temporary.path().join("data");
         let writer = crate::JournalWriter::open(&data).await.unwrap();
-        let runtime = RuntimeSnapshot {
+        let runtime = runtime_for(&data);
+        let cas = CasStore::open(runtime.cas_dir.clone()).unwrap();
+        DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+        (temporary, writer, runtime, cas)
+    }
+
+    fn runtime_for(data: &std::path::Path) -> RuntimeSnapshot {
+        RuntimeSnapshot {
             snapshot_version: evertrace_capture::runtime_snapshot::RUNTIME_SNAPSHOT_VERSION,
             generation: 1,
             device_key_dir: data.join("keys"),
@@ -537,10 +544,7 @@ mod tests {
             recall_cue_gate: evertrace_capture::runtime_snapshot::RecallCueGateMode::Disabled,
             recall_cue_adapter_manifest_id: None,
             recall_cues: Vec::new(),
-        };
-        let cas = CasStore::open(runtime.cas_dir.clone()).unwrap();
-        DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
-        (temporary, writer, runtime, cas)
+        }
     }
 
     fn blob(
@@ -553,6 +557,88 @@ mod tests {
             .unwrap();
         cas.put(&evertrace_capture::protect::protect(bytes, &key).unwrap())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn l0001_requires_upgrade_and_has_an_independently_verifiable_backup() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let temporary = tempfile::TempDir::new().unwrap();
+        let data = temporary.path().join("data");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&data)
+            .unwrap();
+        let connection = lancedb::connect(data.to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        crate::migrations::L0001::apply(&connection).await.unwrap();
+        drop(connection);
+        assert!(matches!(
+            crate::JournalWriter::open(&data).await,
+            Err(StoreError::UpgradeRequired)
+        ));
+        assert!(
+            !data
+                .join(format!("{}.lance", crate::RELATIONS_TABLE))
+                .exists()
+        );
+        let _lock = crate::SiblingWriterLock::acquire(&data).unwrap();
+        let (states, snapshot) = crate::backup::read_verified_store_tables(&data)
+            .await
+            .unwrap();
+        assert!(states.relations.is_none() && states.search.is_none());
+        let mut runtime = runtime_for(&data);
+        let config = evertrace_domain::config::EffectiveConfig::default();
+        runtime.effective_config_hash = config.hash();
+        runtime
+            .publish(&RuntimeSnapshot::snapshot_path(&data))
+            .unwrap();
+        let config_path = temporary.path().join("config.toml");
+        std::fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        CasStore::open(runtime.cas_dir.clone()).unwrap();
+        let (mut spool, _) =
+            DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+        let fence = evertrace_capture::MaintenanceFence::open(&data).unwrap();
+        let guard = fence.exclusive().unwrap();
+        let boundary = crate::backup::BackupFrozenBoundary {
+            spool: spool
+                .freeze_backup_boundary(&guard, runtime.generation)
+                .unwrap(),
+            hook: crate::backup::BackupHookBoundary {
+                current_generation: None,
+                retained_generations: Vec::new(),
+                pin_count: 0,
+                pinned_generation_count: 0,
+                files: Vec::new(),
+            },
+        };
+        drop(guard);
+        let id = JobId::new_v7();
+        let plan = crate::backup::prepare_backup(
+            (&data, &data),
+            &config_path,
+            &runtime,
+            id,
+            &snapshot,
+            states,
+            boundary,
+        )
+        .unwrap();
+        let staging = crate::backup::stage_backup(plan).unwrap();
+        let summary = crate::backup::verify_staged_backup(&staging).await.unwrap();
+        crate::backup::publish_backup(staging, summary).unwrap();
+        let backup = data.join(format!("backups/backup-{id}"));
+        let isolated = temporary.path().join("independent-backup");
+        std::fs::rename(backup, &isolated).unwrap();
+        drop((spool, fence, _lock));
+        std::fs::rename(&data, temporary.path().join("old-live")).unwrap();
+        let verified = crate::backup::prepare_verification_directory(&isolated, Some(id)).unwrap();
+        let summary = crate::backup::complete_backup_verification(verified)
+            .await
+            .unwrap();
+        assert!(summary.table_states.relations.is_none() && summary.table_states.search.is_none());
     }
 
     #[tokio::test]
@@ -574,10 +660,14 @@ mod tests {
         let writer = crate::JournalWriter::open(runtime.data_dir().unwrap())
             .await
             .unwrap();
-        let connection = lancedb::connect(runtime.data_dir().unwrap().to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
+        let connection = lancedb::connect(
+            crate::connection::native_root(runtime.data_dir().unwrap())
+                .to_str()
+                .unwrap(),
+        )
+        .execute()
+        .await
+        .unwrap();
         let journal = connection
             .open_table(crate::JOURNAL_TABLE)
             .execute()
@@ -885,10 +975,14 @@ mod tests {
         let frontier = writer.frontier();
         let mut rows = writer.journal_rows().await.unwrap();
         drop(writer);
-        let connection = lancedb::connect(runtime.data_dir().unwrap().to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
+        let connection = lancedb::connect(
+            crate::connection::native_root(runtime.data_dir().unwrap())
+                .to_str()
+                .unwrap(),
+        )
+        .execute()
+        .await
+        .unwrap();
         let journal = connection
             .open_table(crate::JOURNAL_TABLE)
             .execute()
