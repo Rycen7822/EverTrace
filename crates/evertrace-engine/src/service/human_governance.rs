@@ -380,7 +380,14 @@ pub struct HumanBackupSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HumanNativeHistoryCleanupAvailability {
+    ExternalReaderExclusionUnverified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanJobDetail {
+    /// Current capability, not a historical execution or terminal result.
+    pub native_history_cleanup_availability: Option<HumanNativeHistoryCleanupAvailability>,
     pub job_id: JobId,
     pub target_revision: String,
     pub target_watermark: u64,
@@ -4400,6 +4407,10 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                 None,
                 Some(HumanSystemDetail::Job {
                     detail: Box::new(HumanJobDetail {
+                        native_history_cleanup_availability: matches!(value.algorithm_revision.as_str(),
+                            evertrace_store::purge::OBJECT_DELETION_ALGORITHM_REVISION |
+                            evertrace_store::purge::REPOSITORY_SCOPE_PURGE_ALGORITHM_REVISION)
+                            .then_some(HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified),
                         job_id: value.job_id,
                         target_revision: value.target_revision,
                         target_watermark: value.target_watermark,

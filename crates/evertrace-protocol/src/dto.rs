@@ -537,6 +537,9 @@ pub struct HumanBackupSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanJobDetail {
+    /// Current capability only; never an execution audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_history_cleanup_availability: Option<HumanNativeHistoryCleanupAvailability>,
     pub job_id: JobId,
     pub target_revision: String,
     pub target_watermark: u64,
@@ -557,6 +560,12 @@ pub struct HumanJobDetail {
     pub backup_summary: Option<HumanBackupSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc_summary: Option<HumanGcSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanNativeHistoryCleanupAvailability {
+    ExternalReaderExclusionUnverified,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

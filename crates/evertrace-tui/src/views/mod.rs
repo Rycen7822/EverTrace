@@ -526,6 +526,13 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
                         detail.terminal_reason, detail.terminal_result_ref
                     ),
                 ]);
+                if let Some(evertrace_protocol::dto::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified) = &detail.native_history_cleanup_availability {
+                    lines.extend([
+                        "Native history cleanup: unavailable now".into(),
+                        "Product purge does not run this.".into(),
+                        "External reader exclusion is unverified.".into(),
+                    ]);
+                }
                 if let Some(gc) = &detail.gc_summary {
                     lines.extend([
                         format!(

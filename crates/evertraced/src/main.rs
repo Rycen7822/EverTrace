@@ -1298,6 +1298,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                 system_detail: item.system_detail.map(|detail| match detail {
                     EngineHumanSystemDetail::Job { detail } => {
                         let EngineHumanJobDetail {
+                            native_history_cleanup_availability,
                             job_id,
                             target_revision,
                             target_watermark,
@@ -1319,6 +1320,9 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                         } = *detail;
                         HumanSystemDetail::Job {
                             detail: Box::new(HumanJobDetail {
+                                native_history_cleanup_availability: native_history_cleanup_availability.map(|availability| match availability {
+                                    evertrace_engine::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified => evertrace_protocol::dto::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified,
+                                }),
                                 job_id,
                                 target_revision,
                                 target_watermark,

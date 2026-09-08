@@ -2127,6 +2127,7 @@ mod tests {
                 terminal_reason: Some(evertrace_protocol::dto::HumanJobTerminalReason::Completed),
                 terminal_result_ref: Some(format!("backup:{backup_job_id}")),
                 gc_summary: None,
+                native_history_cleanup_availability: None,
                 backup_summary: Some(HumanBackupSummary {
                     frontier: 9,
                     journal: HumanBackupTableState {
@@ -2423,12 +2424,15 @@ mod tests {
                 terminal_result_ref: None,
                 backup_summary: None,
                 gc_summary: None,
+                native_history_cleanup_availability: Some(evertrace_protocol::dto::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified),
             }),
         });
         app.state.detail = Some(job_detail.clone());
         let rendered = render_app(&app, 100, 30);
         assert!(rendered.contains(&job_id.to_string()));
         assert!(rendered.contains("objects_projection"));
+        assert!(rendered.contains("Native history cleanup: unavailable now"));
+        assert!(rendered.contains("External reader exclusion is unverified."));
         let mut forged = job_detail.clone();
         forged.stable_key = "runtime:job:forged".into();
         assert!(

@@ -2634,6 +2634,28 @@ async fn repository_purge_closes_immediately_batches_cas_and_resumes_after_reope
             .unwrap_or_else(|error| panic!("artifact revision {index}: {error:?}"));
     }
 
+    let native_reader = evertrace_store::connection::CompatibilityStore::connect_local(
+        &evertrace_store::connection::native_root(&store),
+    )
+    .await
+    .unwrap();
+    let held_objects = native_reader
+        .connection()
+        .open_table(evertrace_store::OBJECTS_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    let held_version = held_objects.version().await.unwrap();
+    held_objects.checkout(held_version).await.unwrap();
+    let held_rows = held_objects.count_rows(None).await.unwrap();
+    assert!(held_rows > 0);
+    assert!(
+        held_objects
+            .count_rows(Some(format!("object_id = '{target_id}'")))
+            .await
+            .unwrap()
+            > 0
+    );
     let before = handle.project().await.unwrap();
     let unavailable_space = HumanGovernanceService::new(handle.clone(), CONFIG)
         .detail(
@@ -2978,6 +3000,54 @@ async fn repository_purge_closes_immediately_batches_cas_and_resumes_after_reope
     let background = scheduler(handle.clone(), runtime.clone());
     background.run_once().await.unwrap();
     let terminal_frontier = handle.project().await.unwrap().frontier;
+    let service = HumanGovernanceService::new(handle.clone(), CONFIG);
+    let detail = service
+        .detail(
+            HumanSurface::System,
+            &format!("runtime:job:{}", purge_job.job_id),
+            terminal_frontier,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(HumanSystemDetail::Job { detail }) = detail.items[0].system_detail.as_ref() else {
+        panic!("purge job detail");
+    };
+    assert_eq!(detail.state, evertrace_engine::HumanJobState::Succeeded);
+    assert_eq!(
+        detail.terminal_reason,
+        Some(evertrace_engine::HumanJobTerminalReason::Completed)
+    );
+    assert_eq!(detail.native_history_cleanup_availability, Some(evertrace_engine::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified));
+    assert_eq!(held_objects.count_rows(None).await.unwrap(), held_rows);
+    assert_eq!(held_objects.version().await.unwrap(), held_version);
+    assert!(
+        held_objects
+            .count_rows(Some(format!("object_id = '{target_id}'")))
+            .await
+            .unwrap()
+            > 0
+    );
+    drop(held_objects);
+    drop(native_reader);
+    let after_release = service
+        .detail(
+            HumanSurface::System,
+            &format!("runtime:job:{}", purge_job.job_id),
+            terminal_frontier,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(HumanSystemDetail::Job {
+        detail: after_release,
+    }) = after_release.items[0].system_detail.as_ref()
+    else {
+        panic!("purge job detail");
+    };
+    assert_eq!(after_release, detail);
     background.run_once().await.unwrap();
     assert_eq!(handle.project().await.unwrap().frontier, terminal_frontier);
     let projected = handle.project().await.unwrap();
