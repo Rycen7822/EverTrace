@@ -554,10 +554,220 @@ pub struct SourceObservation {
     pub redaction_revision: u32,
     pub correlation: HostCorrelationEvidence,
     pub scope_effect_claims: Vec<ScopeEffectClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_local_evidence: Option<SourceLocalEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLocalProfile {
+    NativeHookV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLocalNamespace {
+    pub profile: SourceLocalProfile,
+    pub root_session: String,
+    pub thread: String,
+    pub rollout: String,
+}
+
+impl SourceLocalNamespace {
+    pub fn validate(&self) -> Result<(), EvidenceError> {
+        for value in [&self.root_session, &self.thread, &self.rollout] {
+            let parsed = uuid::Uuid::parse_str(value).map_err(|_| EvidenceError::Invalid)?;
+            if parsed.to_string() != *value {
+                return Err(EvidenceError::Invalid);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Immutable metadata read provenance, not current filesystem/trust authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLocalNamespaceWitness {
+    pub namespace: SourceLocalNamespace,
+    pub transcript_path: String,
+    pub filesystem_device: u64,
+    pub filesystem_inode: u64,
+    pub observed_file_length: u64,
+    pub metadata_length: u32,
+}
+
+impl SourceLocalNamespaceWitness {
+    pub fn validate(&self) -> Result<(), EvidenceError> {
+        self.namespace.validate()?;
+        validate_source_locator(&self.transcript_path)?;
+        if self.filesystem_inode == 0
+            || self.metadata_length == 0
+            || self.metadata_length > 64 * 1024
+            || u64::from(self.metadata_length) >= self.observed_file_length
+        {
+            return Err(EvidenceError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLocalNativeCall {
+    pub session_id: String,
+    pub agent_id: Option<String>,
+    pub transcript_path: Option<String>,
+    pub request_id: String,
+    pub turn_id: String,
+    pub tool_name: String,
+    pub namespace_witness: Option<SourceLocalNamespaceWitness>,
+}
+
+impl SourceLocalNativeCall {
+    pub fn accepts_witness(&self, witness: &SourceLocalNamespaceWitness) -> bool {
+        witness.validate().is_ok()
+            && witness.namespace.root_session == self.session_id
+            && self
+                .agent_id
+                .as_ref()
+                .is_none_or(|id| *id == witness.namespace.thread)
+            && self.transcript_path.as_deref() == Some(witness.transcript_path.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceLocalEvidence {
+    NativeCall(SourceLocalNativeCall),
+    NamespaceWitness {
+        witness: SourceLocalNamespaceWitness,
+        supported_call: SourceLocalNativeCall,
+        supported_observation_refs: Vec<SourceObservationId>,
+    },
+}
+
+impl SourceLocalEvidence {
+    pub fn validate(&self, role: ObservationRole) -> Result<(), EvidenceError> {
+        match self {
+            Self::NativeCall(call) => {
+                if !matches!(role, ObservationRole::Intent | ObservationRole::Result) {
+                    return Err(EvidenceError::Invalid);
+                }
+                for value in [
+                    &call.session_id,
+                    &call.request_id,
+                    &call.turn_id,
+                    &call.tool_name,
+                ] {
+                    validate_identifier(value)?;
+                }
+                if let Some(agent) = &call.agent_id {
+                    validate_identifier(agent)?;
+                }
+                if let Some(path) = &call.transcript_path {
+                    validate_source_locator(path)?;
+                }
+                if call
+                    .namespace_witness
+                    .as_ref()
+                    .is_some_and(|witness| !call.accepts_witness(witness))
+                {
+                    return Err(EvidenceError::Invalid);
+                }
+            }
+            Self::NamespaceWitness {
+                witness,
+                supported_call,
+                supported_observation_refs,
+            } => {
+                if role != ObservationRole::StateProbe
+                    || supported_observation_refs.is_empty()
+                    || supported_observation_refs.len() > 256
+                {
+                    return Err(EvidenceError::Invalid);
+                }
+                witness.validate()?;
+                Self::NativeCall(supported_call.clone()).validate(ObservationRole::Intent)?;
+                if !supported_call.accepts_witness(witness) {
+                    return Err(EvidenceError::Invalid);
+                }
+                require_unique(supported_observation_refs)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_source_locator(value: &str) -> Result<(), EvidenceError> {
+    if value.len() > 4096
+        || !value.starts_with('/')
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(EvidenceError::Invalid);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLocalPairingState {
+    SourcePaired,
+    Conflicted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLocalPairing {
+    pub namespace: SourceLocalNamespace,
+    pub request_id: String,
+    pub intent_observation_refs: Vec<SourceObservationId>,
+    pub result_observation_refs: Vec<SourceObservationId>,
+    pub namespace_witness_refs: Vec<SourceObservationId>,
+    pub state: SourceLocalPairingState,
+}
+
+impl SourceLocalPairing {
+    pub fn validate(&self) -> Result<(), EvidenceError> {
+        self.namespace.validate()?;
+        validate_identifier(&self.request_id)?;
+        for refs in [
+            &self.intent_observation_refs,
+            &self.result_observation_refs,
+            &self.namespace_witness_refs,
+        ] {
+            require_unique(refs)?;
+            if refs.len() > 256 {
+                return Err(EvidenceError::InvalidOperation);
+            }
+        }
+        if self.result_observation_refs.is_empty()
+            || self.namespace_witness_refs.is_empty()
+            || self
+                .intent_observation_refs
+                .iter()
+                .any(|id| self.result_observation_refs.contains(id))
+            || (self.state == SourceLocalPairingState::SourcePaired
+                && (self.intent_observation_refs.len() != 1
+                    || self.result_observation_refs.len() != 1))
+        {
+            return Err(EvidenceError::InvalidOperation);
+        }
+        Ok(())
+    }
 }
 
 impl SourceObservation {
     pub fn validate(&self) -> Result<(), EvidenceError> {
+        if let Some(evidence) = &self.source_local_evidence {
+            evidence.validate(self.observation_role)?;
+            if let SourceLocalEvidence::NativeCall(call) = evidence
+                && (self.correlation.native_request_id.as_deref() != Some(call.request_id.as_str())
+                    || self.correlation.exact_key().is_some())
+            {
+                return Err(EvidenceError::InvalidCorrelation);
+            }
+        }
         validate_digest(&self.payload_fingerprint)?;
         if self.source_observation_id
             != source_observation_id(
@@ -834,10 +1044,15 @@ pub struct Operation {
     pub operation_resolver_version: u32,
     pub operation_revision: u32,
     pub previous_operation_revision: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_local_pairing: Option<SourceLocalPairing>,
 }
 
 impl Operation {
     pub fn validate(&self) -> Result<(), EvidenceError> {
+        if let Some(pairing) = &self.source_local_pairing {
+            pairing.validate()?;
+        }
         if self.operation_resolver_version == 0
             || self.operation_revision == 0
             || self.previous_operation_revision.is_some_and(|previous| {

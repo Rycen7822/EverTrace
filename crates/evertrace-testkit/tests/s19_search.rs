@@ -75,6 +75,7 @@ fn snapshot(root: &Path) -> RuntimeSnapshot {
 
 fn input(record: &str, sequence: u64, text: &str, role: SourceRole) -> CaptureRecordInput {
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(format!("s19-{record}")),
         source_observation_id_hint: None,
         source_instance_id: "source-s19".into(),

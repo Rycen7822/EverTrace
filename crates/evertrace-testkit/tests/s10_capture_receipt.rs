@@ -550,6 +550,7 @@ fn capture_input(sequence: u64, manifest_ref: &str) -> CaptureRecordInput {
         _ => ObservationRole::Lifecycle,
     };
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(format!("spool-{sequence}")),
         source_observation_id_hint: None,
         source_instance_id: "source-a".into(),

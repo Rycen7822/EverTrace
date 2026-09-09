@@ -782,6 +782,7 @@ fn exact_observation(cas: CasId, bytes: &[u8]) -> (SourceReceipt, SourceObservat
         lifecycle: None,
     };
     let observation = SourceObservation {
+        source_local_evidence: None,
         source_observation_id: observation_id,
         source_instance_id: instance,
         source_revision: revision,

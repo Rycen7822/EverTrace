@@ -72,6 +72,8 @@ pub struct CaptureRecordBody {
     pub observation_role: ObservationRole,
     pub correlation: HostCorrelationEvidence,
     pub scope_effect_claims: Vec<ScopeEffectClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_local_evidence: Option<evertrace_domain::evidence::SourceLocalEvidence>,
     pub lifecycle: Option<LaneLifecycleEvidence>,
     pub unsupported_record_classification: Option<UnsupportedRecordClassification>,
     pub source_role: SourceRole,
@@ -154,6 +156,16 @@ impl CaptureRecordBody {
     }
 
     pub fn validate(&self) -> Result<(), SpoolFrameError> {
+        if let Some(evidence) = &self.source_local_evidence {
+            evidence
+                .validate(self.observation_role)
+                .map_err(|_| SpoolFrameError::Invalid)?;
+            if self.source_kind != evertrace_domain::evidence::EvidenceSourceKind::CodexHook
+                || self.identity_domain != "native-hook-delivery-v1"
+            {
+                return Err(SpoolFrameError::Invalid);
+            }
+        }
         let observation_id = self.observation_id()?;
         if self.body_version != CAPTURE_RECORD_BODY_VERSION
             || self

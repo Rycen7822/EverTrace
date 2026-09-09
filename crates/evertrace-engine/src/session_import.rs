@@ -33,14 +33,12 @@ use evertrace_store::{
     SessionImportCurrentView, SessionImportEvent, SessionImportEventKind, SessionMetadata,
     SourceKind, WorkspaceResolutionKind, repository::RepositoryCurrentView,
 };
-use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{WriterActorError, WriterHandle, repository::read_report_repository_trust};
 
-pub(crate) const MAX_RECORD_BYTES: usize = 64 * 1024;
-const HEADER_CHUNK_BYTES: usize = 4 * 1024;
+pub(crate) use evertrace_codex::session_import::MAX_RECORD_BYTES;
 const SOURCE_FORMAT: &str = "codex_rollout_jsonl_v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -657,94 +655,9 @@ impl CatalogReader<'_> {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionMetaRecord {
-    #[serde(rename = "ordinal")]
-    _ordinal: Option<u64>,
-    #[serde(rename = "timestamp")]
-    _timestamp: String,
-    #[serde(rename = "type")]
-    record_type: String,
-    pub(crate) payload: SessionMetaPayload,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionMetaPayload {
-    pub(crate) id: String,
-    #[serde(rename = "session_id")]
-    pub(crate) session_id: Option<String>,
-    cwd: Option<String>,
-    originator: Option<String>,
-    #[serde(rename = "cli_version")]
-    _cli_version: Option<String>,
-    #[serde(rename = "source")]
-    _source: Option<serde::de::IgnoredAny>,
-    model_provider: Option<String>,
-    #[serde(rename = "timestamp")]
-    _payload_timestamp: Option<String>,
-    #[serde(rename = "agent_nickname")]
-    _agent_nickname: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "agent_path")]
-    _agent_path: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "context_window")]
-    _context_window: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "history_mode")]
-    _history_mode: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "multi_agent_version")]
-    _multi_agent_version: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "parent_thread_id")]
-    _parent_thread_id: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "thread_source")]
-    _thread_source: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "base_instructions")]
-    _base_instructions: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "instructions")]
-    _instructions: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "forked_from_id")]
-    _forked_from_id: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "forked_from_ordinal_exclusive")]
-    _forked_from_ordinal_exclusive: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "agent_role", alias = "agent_type")]
-    _agent_role: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "dynamic_tools")]
-    _dynamic_tools: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "selected_capability_roots")]
-    _selected_capability_roots: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "memory_mode")]
-    _memory_mode: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "history_base")]
-    _history_base: Option<serde::de::IgnoredAny>,
-    #[serde(rename = "subagent_history_start_ordinal")]
-    _subagent_history_start_ordinal: Option<serde::de::IgnoredAny>,
-    #[serde(default, deserialize_with = "deserialize_session_git")]
-    git: SessionGit,
-}
-
-#[derive(Default)]
-enum SessionGit {
-    #[default]
-    Missing,
-    Object(SessionGitObject),
-    Null,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SessionGitObject {
-    commit_hash: Option<String>,
-    branch: Option<String>,
-    repository_url: Option<String>,
-}
-
-fn deserialize_session_git<'de, D>(deserializer: D) -> Result<SessionGit, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<SessionGitObject>::deserialize(deserializer)
-        .map(|value| value.map_or(SessionGit::Null, SessionGit::Object))
-}
+use evertrace_codex::session_import::{SessionGit, SessionMetaRecord};
+#[cfg(test)]
+use evertrace_codex::session_import::{SessionGitObject, SessionMetaPayload};
 
 fn resolve_workspace(
     workspace: Option<&str>,
@@ -790,62 +703,9 @@ fn resolve_workspace(
     ))
 }
 
-// Fixed rust-v0.153.4 rollout basename. The catalog key remains the thread,
-// not the optional distinct rollout suffix and not the shared Hook session.
 pub(crate) fn session_id_from_name(name: &str) -> Result<String, SessionCatalogError> {
-    let core = name
-        .strip_prefix("rollout-")
-        .and_then(|value| value.strip_suffix(".jsonl"))
-        .ok_or(SessionCatalogError::Unsupported)?;
-    let timestamp = core.get(..19).ok_or(SessionCatalogError::Unsupported)?;
-    if !valid_rollout_timestamp(timestamp) || core.get(19..20) != Some("-") {
-        return Err(SessionCatalogError::Unsupported);
-    }
-    let ids = core.get(20..).ok_or(SessionCatalogError::Unsupported)?;
-    let (thread, rollout) = ids.split_once('_').unwrap_or((ids, ids));
-    if !native_uuid(thread) || !native_uuid(rollout) {
-        return Err(SessionCatalogError::Unsupported);
-    }
-    Ok(thread.to_owned())
-}
-
-fn native_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if [8, 13, 18, 23].contains(&index) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-            }
-        })
-}
-
-fn valid_rollout_timestamp(value: &str) -> bool {
-    if value.len() != 19
-        || !value.bytes().enumerate().all(|(index, byte)| match index {
-            4 | 7 | 13 | 16 => byte == b'-',
-            10 => byte == b'T',
-            _ => byte.is_ascii_digit(),
-        })
-    {
-        return false;
-    }
-    let number = |range: std::ops::Range<usize>| value[range].parse::<u32>().unwrap_or(u32::MAX);
-    let year = number(0..4);
-    let month = number(5..7);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
-            29
-        }
-        2 => 28,
-        _ => return false,
-    };
-    (1..=days).contains(&number(8..10))
-        && number(11..13) < 24
-        && number(14..16) < 60
-        && number(17..19) < 60
+    evertrace_codex::session_import::session_id_from_name(name)
+        .map_err(|_| SessionCatalogError::Unsupported)
 }
 
 pub(crate) fn read_session_header(
@@ -855,52 +715,16 @@ pub(crate) fn read_session_header(
     remaining: &mut usize,
     deadline: Instant,
 ) -> Result<SessionMetaRecord, SessionCatalogError> {
-    let thread = session_id_from_name(
-        relative
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or(SessionCatalogError::Unsupported)?,
-    )?;
-    let mut bytes = Vec::new();
-    loop {
-        let limit = HEADER_CHUNK_BYTES
-            .min(*remaining)
-            // The record bound excludes its required newline; read budget does not.
-            .min(MAX_RECORD_BYTES + 1 - bytes.len());
-        if limit == 0 {
-            return Err(SessionCatalogError::Budget);
-        }
-        let chunk = root
-            .read_range(relative, identity, bytes.len() as u64, limit, deadline)
-            .map_err(map_read)?;
-        *remaining -= chunk.bytes.len();
-        if let Some(newline) = chunk.bytes.iter().position(|byte| *byte == b'\n') {
-            bytes.extend_from_slice(&chunk.bytes[..newline]);
-            let header: SessionMetaRecord =
-                serde_json::from_slice(&bytes).map_err(|_| SessionCatalogError::Unsupported)?;
-            if Instant::now() >= deadline {
-                return Err(SessionCatalogError::Budget);
-            }
-            if header.record_type != "session_meta"
-                || header.payload.id != thread
-                || header
-                    .payload
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|id| !native_uuid(id))
-            {
-                return Err(SessionCatalogError::Unsupported);
-            }
-            return Ok(header);
-        }
-        if bytes.len() + chunk.bytes.len() > MAX_RECORD_BYTES {
-            return Err(SessionCatalogError::Budget);
-        }
-        if chunk.eof {
-            return Err(SessionCatalogError::Unsupported);
-        }
-        bytes.extend_from_slice(&chunk.bytes);
-    }
+    let name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(SessionCatalogError::Unsupported)?;
+    session_id_from_name(name)?;
+    let bytes = root
+        .read_first_record(relative, identity, MAX_RECORD_BYTES, remaining, deadline)
+        .map_err(map_read)?;
+    evertrace_codex::session_import::parse_session_header(name, &bytes)
+        .map_err(|_| SessionCatalogError::Unsupported)
 }
 
 fn require_directory_component(

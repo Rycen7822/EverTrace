@@ -177,6 +177,7 @@ fn capture_input(report: &HostProbeReport) -> CaptureRecordInput {
     let manifest = report.manifest();
     let role = ObservationRole::Lifecycle;
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some("s29-capture-record".into()),
         source_observation_id_hint: None,
         source_instance_id: "s29-capture-source".into(),
@@ -365,6 +366,7 @@ fn bound_operation_rows(episode_row: &ObjectRow, surface_row: &ObjectRow) -> [Ob
     };
     let operation_id = OperationId::new_v7();
     let operation = Operation {
+        source_local_pairing: None,
         operation_id,
         host_occurrence_id: HostOccurrenceId::from_digest([0x39; 32]),
         execution_lane_id: None,

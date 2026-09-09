@@ -1358,6 +1358,7 @@ fn correlation() -> HostCorrelationEvidence {
 
 fn capture_input(label: &str, repository_id: RepositoryId, payload: &[u8]) -> CaptureRecordInput {
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(format!("spool-{label}")),
         source_observation_id_hint: None,
         source_instance_id: format!("hook-{label}"),

@@ -166,6 +166,7 @@ fn exact_observation() -> (SourceReceipt, SourceObservation) {
         lifecycle: None,
     };
     let observation = SourceObservation {
+        source_local_evidence: None,
         source_observation_id: observation_id,
         source_instance_id: instance,
         source_revision: revision,
@@ -757,6 +758,7 @@ fn multi_scope_relation_dto_keeps_one_operation_and_typed_competing_target() {
     effect_b.scope_effect_id = evertrace_domain::ids::ScopeEffectId::new_v7();
     effect_b.effect_role = EffectRole::Mutate;
     let operation = evertrace_domain::evidence::Operation {
+        source_local_pairing: None,
         operation_id,
         host_occurrence_id: evertrace_domain::ids::HostOccurrenceId::from_digest([1; 32]),
         execution_lane_id: None,

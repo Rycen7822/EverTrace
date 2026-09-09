@@ -111,6 +111,60 @@ pub fn native_generation_report(
 }
 
 impl CaptureHookInput {
+    /// Recognizes only the ordinary, independently weak native-delivery profile.
+    /// Internal v5 callers do not gain namespace authority by supplying a field.
+    pub fn native_source_call(&self) -> Option<evertrace_domain::evidence::SourceLocalNativeCall> {
+        if self.identity_domain != "native-hook-delivery-v1"
+            || self.source_kind != EvidenceSourceKind::CodexHook
+        {
+            return None;
+        }
+        let call = native_call_from_raw(self.payload.as_bytes(), self.correlation.pairing_role)?;
+        if call.session_id != self.session_id
+            || Some(&call.turn_id) != self.turn_id.as_ref()
+            || Some(&call.request_id) != self.tool_use_id.as_ref()
+        {
+            return None;
+        }
+        Some(call)
+    }
+}
+
+pub fn native_call_from_raw(
+    bytes: &[u8],
+    role: evertrace_domain::evidence::ObservationRole,
+) -> Option<evertrace_domain::evidence::SourceLocalNativeCall> {
+    let raw = crate::binding::NativeToolUse::<serde_json::Value>::from_json(bytes).ok()?;
+    raw.validate_host_fields().ok()?;
+    let actual_role = match raw.hook_event_name {
+        crate::binding::NativeToolUseEvent::PreToolUse => {
+            evertrace_domain::evidence::ObservationRole::Intent
+        }
+        crate::binding::NativeToolUseEvent::PostToolUse => {
+            evertrace_domain::evidence::ObservationRole::Result
+        }
+    };
+    if actual_role != role {
+        return None;
+    }
+    let call = evertrace_domain::evidence::SourceLocalNativeCall {
+        session_id: raw.session_id,
+        agent_id: raw.agent_id,
+        transcript_path: raw.transcript_path,
+        request_id: raw.tool_use_id,
+        turn_id: raw.turn_id,
+        tool_name: raw.tool_name,
+        namespace_witness: None,
+    };
+    // An unsupported optional declaration must not break the existing weak
+    // capture path (for example, a non-absolute external transcript locator).
+    evertrace_domain::evidence::SourceLocalEvidence::NativeCall(call.clone())
+        .validate(role)
+        .ok()?;
+    Some(call)
+}
+
+impl CaptureHookInput {
     /// One native delivery is one local weak source, never a host sequence or
     /// retry identity. The launcher invokes this once after selecting its pin.
     pub fn from_native(

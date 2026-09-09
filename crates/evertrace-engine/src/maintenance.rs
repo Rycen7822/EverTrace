@@ -3457,6 +3457,7 @@ mod idle_tests {
         let observation = receipt.source_observation_id;
         let operation_id = OperationId::new_v7();
         let operation = Operation {
+            source_local_pairing: None,
             operation_id,
             host_occurrence_id: HostOccurrenceId::from_digest([2; 32]),
             execution_lane_id: None,

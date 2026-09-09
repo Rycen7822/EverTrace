@@ -86,6 +86,7 @@ fn unavailable_correlation() -> HostCorrelationEvidence {
 
 fn input(record: &str, payload: &[u8]) -> CaptureRecordInput {
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(format!("spool-{record}")),
         source_observation_id_hint: None,
         source_instance_id: "hook-instance-a".into(),
@@ -413,6 +414,230 @@ async fn replay_after_lost_ack_is_idempotent_and_same_payload_distinct_records_r
         .map(|row| row.object_id.clone().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(observations.len(), 2);
+}
+
+#[tokio::test]
+async fn native_first_ingest_freezes_probe_without_rewriting_old_observations() {
+    use evertrace_codex::{
+        binding::NativeToolUse,
+        hook_input::{CaptureHookInput, native_generation_report},
+    };
+    use evertrace_domain::evidence::{SourceLocalEvidence, SourceLocalPairingState};
+    use evertrace_engine::capture::{ReconcileInput, reconcile_once};
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let transcript = temp.path().join("sessions/2026/09/09/rollout-2026-09-09T00-00-00-01a083a5-79c1-7343-821a-a8e571f9ad26.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let session = "01a083a5-79c1-7343-821a-a8e571f9ad26";
+    // Synthetic external format, parsed through the same bounded native reader.
+    fs::write(&transcript, format!("{{\"ordinal\":0,\"timestamp\":\"now\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\",\"session_id\":\"{session}\"}}}}\n")).unwrap();
+    let (snapshot, mut runtime) = prepare(temp.path());
+    for (event, turn) in [
+        ("PostToolUse", "earlier-result"),
+        ("PostToolUse", "turn-result"),
+        ("PreToolUse", "turn-intent"),
+    ] {
+        let mut raw = serde_json::json!({"cwd":temp.path(), "model":"controlled", "permission_mode":"default", "hook_event_name":event, "session_id":session,
+            "turn_id":turn, "tool_use_id":"call-one", "tool_name":"Bash", "tool_input":{"command":"printf one"}, "transcript_path":transcript});
+        if event == "PostToolUse" {
+            raw["tool_response"] = "one".into();
+        }
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        evertrace_engine::repository::observe_native_session_catalog_root(&bytes).unwrap();
+        let native = NativeToolUse::from_json(&bytes).unwrap();
+        let normalized = CaptureHookInput::from_native(native, 1).unwrap();
+        let mut unqualified = raw.clone();
+        unqualified["transcript_path"] = "relative-unqualified".into();
+        let unqualified = CaptureHookInput::from_native(
+            NativeToolUse::from_json(&serde_json::to_vec(&unqualified).unwrap()).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(
+            unqualified.native_source_call().is_none(),
+            "optional evidence failure preserves ordinary weak input"
+        );
+        let mut record = input(turn, &bytes);
+        record.source_instance_id = normalized.source_instance_id;
+        record.source_revision = normalized.source_revision;
+        record.source_record_identity = None;
+        record.identity_strength = normalized.identity_strength;
+        record.identity_domain = normalized.identity_domain;
+        record.source_ref = normalized.source_ref;
+        record.session_ref = normalized.session_id;
+        record.turn_ref = normalized.turn_id;
+        record.tool_ref = normalized.tool_use_id;
+        record.source_sequence = 0;
+        record.source_sequence_origin = Some(0);
+        record.observation_role = normalized.correlation.pairing_role;
+        record.correlation = normalized.correlation;
+        record.adapter_manifest_ref = normalized.adapter_manifest_ref;
+        record.eligible_event_manifest_ref = normalized.eligible_event_manifest_ref;
+        record.capture_completeness = CaptureCompleteness::Partial;
+        runtime.capture(record).unwrap();
+    }
+    let original_bytes = fs::read(runtime.spool().active_path()).unwrap();
+    assert!(
+        scan_frames(&original_bytes)
+            .unwrap()
+            .frames
+            .iter()
+            .all(|frame| decode_record_body(&frame.record.record_body)
+                .unwrap()
+                .source_local_evidence
+                .is_none())
+    );
+    for frame in scan_frames(&original_bytes).unwrap().frames {
+        let body = decode_record_body(&frame.record.record_body).unwrap();
+        let cas = CasStore::open_existing(snapshot.cas_dir.clone()).unwrap();
+        let bytes = cas.read(&body.cas_ref.parse().unwrap()).unwrap();
+        assert!(
+            evertrace_codex::hook_input::native_call_from_raw(&bytes, body.observation_role)
+                .is_some()
+        );
+    }
+    drop(runtime);
+    let writer = open_writer(&temp.path().join("database")).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 8).unwrap();
+    let ingestor =
+        EvidenceIngestor::new(snapshot.clone(), handle.clone(), [1; 32], "native-test").unwrap();
+    let reconcile = ReconcileInput {
+        runtime_snapshot: snapshot.clone(),
+        adapter_manifests: vec![native_generation_report(1).unwrap().manifest().clone()],
+        liveness: vec![],
+        reconciled_gaps: vec![],
+        reconciled_outages: vec![],
+        independent_source_reconciliations: vec![],
+        effective_config_hash: [1; 32],
+        algorithm_revision: "native-test".into(),
+        occurred_at_us: 1,
+        max_items: 16,
+    };
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 3);
+    reconcile_once(reconcile.clone(), &handle).await.unwrap();
+    // Original records are now committed, while their separately durable
+    // successful namespace probes have not yet been ingested.
+    let first = handle.project().await.unwrap();
+    assert_eq!(object_kind_count(&first.rows, "source_observation"), 3);
+    let old_rows = first
+        .rows
+        .iter()
+        .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
+        .cloned()
+        .collect::<Vec<_>>();
+    fs::remove_file(&transcript).unwrap();
+    let earlier_id = decode_record_body(
+        &scan_frames(&original_bytes).unwrap().frames[0]
+            .record
+            .record_body,
+    )
+    .unwrap()
+    .observation_id()
+    .unwrap();
+    let (spool, _) = evertrace_capture::DurableSpool::open(
+        snapshot.spool_dir.clone(),
+        snapshot.spool_limits().unwrap(),
+    )
+    .unwrap();
+    let selected = spool
+        .read_durable_records(16, 2 * 1024 * 1024)
+        .unwrap()
+        .iter()
+        .filter_map(|record| {
+            let body = decode_record_body(&record.record_body).unwrap();
+            match &body.source_local_evidence {
+                Some(SourceLocalEvidence::NamespaceWitness {
+                    supported_observation_refs,
+                    ..
+                }) if !supported_observation_refs.contains(&earlier_id) => {
+                    Some(body.observation_id().unwrap())
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    drop(spool);
+    assert_eq!(selected.len(), 2);
+    // Delay only the earliest result's real durable witness. Its raw record
+    // was already committed first; neither the record nor probe is fabricated.
+    assert_eq!(
+        ingestor
+            .drain_observations_once(&selected)
+            .await
+            .unwrap()
+            .committed_frames,
+        2
+    );
+    reconcile_once(reconcile.clone(), &handle).await.unwrap();
+    let view = handle.project().await.unwrap();
+    for row in old_rows {
+        assert_eq!(
+            view.rows.iter().find(|new| new.row_id == row.row_id),
+            Some(&row)
+        );
+    }
+    let operations = view
+        .rows
+        .iter()
+        .filter(|row| row.object_kind.as_deref() == Some("operation"))
+        .map(|row| {
+            serde_json::from_str::<JournalPayload>(row.payload_json.as_deref().unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(operations.len(), 1);
+    let JournalPayload::OperationDerived(operation) = &operations[0] else {
+        panic!("operation");
+    };
+    assert_eq!(
+        operation.source_local_pairing.as_ref().unwrap().state,
+        SourceLocalPairingState::SourcePaired
+    );
+    assert_eq!(operation.result_source_observation_refs.len(), 1);
+    assert!(operation.input_source_observation_refs.is_empty());
+    assert_eq!(
+        operation.pairing_state,
+        evertrace_domain::evidence::PairingState::NotApplicable
+    );
+    assert!(view.rows.iter().any(|row| row.payload_json.as_ref().is_some_and(|json|
+        matches!(serde_json::from_str::<JournalPayload>(json), Ok(JournalPayload::SourceObservationRecorded(value)) if matches!(value.source_local_evidence, Some(SourceLocalEvidence::NamespaceWitness { .. }))))));
+    assert_eq!(ingestor.drain_once().await.unwrap().replayed_frames, 2);
+    reconcile_once(reconcile.clone(), &handle).await.unwrap();
+    let view = handle.project().await.unwrap();
+    let latest = view
+        .rows
+        .iter()
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        .filter_map(|payload| match payload {
+            JournalPayload::OperationDerived(value) => Some(value),
+            _ => None,
+        })
+        .max_by_key(|value| value.operation_revision)
+        .unwrap();
+    assert_eq!(latest.operation_id, operation.operation_id);
+    assert_eq!(latest.host_occurrence_id, operation.host_occurrence_id);
+    assert_eq!(latest.operation_revision, 2);
+    assert_eq!(
+        latest.source_local_pairing.as_ref().unwrap().state,
+        SourceLocalPairingState::Conflicted
+    );
+    let replay = snapshot.spool_dir.join("main/replay.sealed");
+    fs::write(&replay, &original_bytes).unwrap();
+    fs::set_permissions(&replay, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(ingestor.drain_once().await.unwrap().replayed_frames, 3);
+    assert_eq!(
+        reconcile_once(reconcile, &handle)
+            .await
+            .unwrap()
+            .physical_normalization_recorded,
+        0
+    );
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let writer = JournalWriter::open(&temp.path().join("database"))
+        .await
+        .unwrap();
+    assert_eq!(writer.full_projection().await.unwrap(), view);
 }
 
 #[tokio::test]

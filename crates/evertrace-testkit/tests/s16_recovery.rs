@@ -330,6 +330,7 @@ fn unavailable_correlation() -> HostCorrelationEvidence {
 
 fn capture_input(request: &RecoveryCaptureRequest) -> CaptureRecordInput {
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some("physical-spool-record".into()),
         source_observation_id_hint: None,
         source_instance_id: "source-s16".into(),

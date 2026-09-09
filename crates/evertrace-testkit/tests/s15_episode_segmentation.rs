@@ -131,6 +131,7 @@ fn source_evidence(sequence: u64) -> (SourceReceipt, SourceObservation) {
         lifecycle: None,
     };
     let observation = SourceObservation {
+        source_local_evidence: None,
         source_observation_id: observation_id,
         source_instance_id: instance,
         source_revision: revision,
@@ -409,6 +410,7 @@ fn try_token_with(
     .parse()
     .unwrap();
     let mut operation = Operation {
+        source_local_pairing: None,
         operation_id: OperationId::new_v7(),
         host_occurrence_id: occurrence.host_occurrence_id,
         execution_lane_id: Some(lane_id),

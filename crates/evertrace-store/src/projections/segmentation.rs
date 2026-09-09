@@ -1099,6 +1099,7 @@ mod tests {
             previous_normalization_revision: None,
         };
         let operation = Operation {
+            source_local_pairing: None,
             operation_id,
             host_occurrence_id: occurrence_id,
             execution_lane_id: Some(lane_id),

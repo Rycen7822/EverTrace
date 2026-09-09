@@ -4763,6 +4763,7 @@ fn acceptance_capture_input(
     scope: AcceptanceCaptureScope,
 ) -> Result<CaptureRecordInput, HumanGovernanceError> {
     Ok(CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(record_id.into()),
         source_observation_id_hint: None,
         source_instance_id: format!("tui-acceptance:{}", proposal.proposal_id),

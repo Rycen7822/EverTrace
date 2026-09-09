@@ -92,6 +92,7 @@ fn unavailable_correlation() -> HostCorrelationEvidence {
 
 fn input(id: &str, payload: &str) -> CaptureRecordInput {
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(id.into()),
         source_observation_id_hint: None,
         source_instance_id: format!("source-instance-{id}"),
@@ -459,6 +460,7 @@ fn hook_path_is_daemon_independent_secret_safe_and_shadow_only() {
     );
     let outcome = runtime
         .capture(CaptureRecordInput {
+            source_local_evidence: None,
             spool_record_id: parsed.spool_record_id,
             source_observation_id_hint: parsed.source_observation_id_hint,
             source_instance_id: parsed.source_instance_id,

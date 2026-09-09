@@ -1,6 +1,6 @@
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -23,6 +23,41 @@ use serde_json::Value;
 use thiserror::Error;
 
 const SESSION_ROOT_PROBE_BUDGET: Duration = Duration::from_millis(50);
+
+pub(crate) fn freeze_native_namespace(
+    call: &evertrace_domain::evidence::SourceLocalNativeCall,
+) -> Option<evertrace_domain::evidence::SourceLocalNamespaceWitness> {
+    use evertrace_codex::session_import::{
+        MAX_RECORD_BYTES, namespace_from_header, native_session_path,
+    };
+    let deadline = Instant::now() + SESSION_ROOT_PROBE_BUDGET;
+    let (root, relative) = native_session_path(call.transcript_path.as_deref()?).ok()?;
+    let root = ConfinedRoot::open_external_source(&root).ok()?;
+    let identity = match root.read(
+        &relative,
+        ConfinedReadLimits {
+            single_file_remaining: 0,
+            untracked_total_remaining: 0,
+            bundle_remaining: 0,
+            deadline,
+        },
+    ) {
+        Ok(file) => file.identity,
+        Err(ConfinedReadError::LimitExceeded { metadata, .. }) => metadata.identity,
+        Err(_) => return None,
+    };
+    let mut remaining = MAX_RECORD_BYTES + 1;
+    let bytes = root
+        .read_first_record(
+            &relative,
+            identity,
+            MAX_RECORD_BYTES,
+            &mut remaining,
+            deadline,
+        )
+        .ok()?;
+    namespace_from_header(call, &bytes, identity.device, identity.inode, identity.size).ok()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SessionCatalogObservationError {
@@ -379,50 +414,6 @@ fn read_repository_trust_at(
 fn codex_session_path(
     transcript: &str,
 ) -> Result<(PathBuf, PathBuf), SessionCatalogObservationError> {
-    let path = Path::new(transcript);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
-        return Err(SessionCatalogObservationError::UnsupportedLayout);
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
-    if crate::session_import::session_id_from_name(file_name).is_err() {
-        return Err(SessionCatalogObservationError::UnsupportedLayout);
-    }
-    let day = path
-        .parent()
-        .ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
-    let month = day
-        .parent()
-        .ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
-    let year = month
-        .parent()
-        .ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
-    let root = year
-        .parent()
-        .ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
-    if root.file_name().and_then(|value| value.to_str()) != Some("sessions") {
-        return Err(SessionCatalogObservationError::UnsupportedLayout);
-    }
-    if !numeric_component(year, 4) || !numeric_component(month, 2) || !numeric_component(day, 2) {
-        return Err(SessionCatalogObservationError::UnsupportedLayout);
-    }
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| SessionCatalogObservationError::UnsupportedLayout)?
-        .to_path_buf();
-    Ok((root.to_path_buf(), relative))
-}
-
-fn numeric_component(path: &Path, width: usize) -> bool {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| {
-            value.len() == width && value.bytes().all(|byte| byte.is_ascii_digit())
-        })
+    evertrace_codex::session_import::native_session_path(transcript)
+        .map_err(|_| SessionCatalogObservationError::UnsupportedLayout)
 }

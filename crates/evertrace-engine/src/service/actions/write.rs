@@ -93,6 +93,7 @@ impl McpActionService {
             },
         );
         let capture = CaptureRecordInput {
+            source_local_evidence: None,
             spool_record_id: Some(format!("mcp-{record_key}")),
             source_observation_id_hint: Some(observation_id.to_string()),
             source_instance_id: source_instance_text,

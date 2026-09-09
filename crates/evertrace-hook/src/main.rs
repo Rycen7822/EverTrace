@@ -86,8 +86,50 @@ fn read_input() -> Result<Vec<u8>, ()> {
     Ok(bytes)
 }
 
+fn freeze_native_namespace(
+    call: &evertrace_domain::evidence::SourceLocalNativeCall,
+    deadline: Instant,
+) -> Option<evertrace_domain::evidence::SourceLocalNamespaceWitness> {
+    use evertrace_capture::{ConfinedReadError, ConfinedReadLimits, ConfinedRoot};
+    use evertrace_codex::session_import::{
+        MAX_RECORD_BYTES, namespace_from_header, native_session_path,
+    };
+    let (root, relative) = native_session_path(call.transcript_path.as_deref()?).ok()?;
+    let root = ConfinedRoot::open_external_source(&root).ok()?;
+    let identity = match root.read(
+        &relative,
+        ConfinedReadLimits {
+            single_file_remaining: 0,
+            untracked_total_remaining: 0,
+            bundle_remaining: 0,
+            deadline,
+        },
+    ) {
+        Ok(file) => file.identity,
+        Err(ConfinedReadError::LimitExceeded { metadata, .. }) => metadata.identity,
+        Err(_) => return None,
+    };
+    let mut remaining = MAX_RECORD_BYTES + 1;
+    let bytes = root
+        .read_first_record(
+            &relative,
+            identity,
+            MAX_RECORD_BYTES,
+            &mut remaining,
+            deadline,
+        )
+        .ok()?;
+    namespace_from_header(call, &bytes, identity.device, identity.inode, identity.size).ok()
+}
+
 fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> Result<(), ()> {
     let snapshot = RuntimeSnapshot::load(snapshot_path).map_err(|_| ())?;
+    // External metadata is frozen before opening/locking the capture spool.
+    let source_local_evidence = input.native_source_call().map(|mut call| {
+        call.namespace_witness =
+            freeze_native_namespace(&call, started + Duration::from_millis(50));
+        evertrace_domain::evidence::SourceLocalEvidence::NativeCall(call)
+    });
     let mut runtime = CaptureRuntime::open_for_admission(snapshot.clone()).map_err(|_| ())?;
     let cue_session_id = input.session_id.clone();
     let cue_adapter_manifest_ref = input.adapter_manifest_ref.clone();
@@ -102,6 +144,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
     let configured_timeout =
         Duration::from_millis(u64::from(snapshot.recovery_preflight_timeout_ms));
     let record = CaptureRecordInput {
+        source_local_evidence,
         spool_record_id: input.spool_record_id,
         source_observation_id_hint: input.source_observation_id_hint,
         source_instance_id: input.source_instance_id,

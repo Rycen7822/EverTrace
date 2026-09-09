@@ -830,6 +830,7 @@ fn action_capture_input(
     let observation_id = observation_ids[usize::from(frame.sequence == 2)];
     let terminal = frame.terminal_kind;
     Ok(CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: None,
         source_observation_id_hint: None,
         source_instance_id: format!("recovery-{}", request.request_id),

@@ -4,7 +4,8 @@ use evertrace_domain::{
     evidence::{
         CanonicalEventFamily, CorrelationAdmission, CorrelationStrength, EffectRole,
         FieldProvenanceEntry, HostOccurrence, HostOccurrenceExactKey, NormalizationState,
-        ObservationRole, Operation, PairingState, ScopeEffect, ScopeEffectClaim, SourceObservation,
+        ObservationRole, Operation, OperationKind, PairingState, ScopeEffect, ScopeEffectClaim,
+        SourceLocalEvidence, SourceLocalPairing, SourceLocalPairingState, SourceObservation,
         host_occurrence_id_for_exact, host_occurrence_id_for_nonexact,
     },
     ids::{
@@ -223,6 +224,8 @@ impl PhysicalNormalizer {
         }
         occurrences.sort_by_key(|value| value.host_occurrence_id);
 
+        let logical = source_local_pairs(observations, &occurrences, previous)?;
+
         let mut operations = Vec::new();
         let mut scope_effects = Vec::new();
         for occurrence in &occurrences {
@@ -231,9 +234,12 @@ impl PhysicalNormalizer {
                 .iter()
                 .map(|id| by_id.get(id).copied().ok_or(NormalizeError::InvalidResult))
                 .collect::<Result<Vec<_>, _>>()?;
+            let logical_pairing = logical.get(&occurrence.host_occurrence_id).cloned();
+            // A source-limited call is not a physical classification or a scope effect.
             let Some(operation_kind) = occurrence
                 .canonical_event_family
                 .and_then(CanonicalEventFamily::operation_kind)
+                .or_else(|| logical_pairing.as_ref().map(|_| OperationKind::Other))
             else {
                 continue;
             };
@@ -279,6 +285,7 @@ impl PhysicalNormalizer {
             inputs.sort();
             results.sort();
             let mut operation = Operation {
+                source_local_pairing: logical_pairing,
                 operation_id,
                 host_occurrence_id: occurrence.host_occurrence_id,
                 execution_lane_id: None,
@@ -324,6 +331,145 @@ impl PhysicalNormalizer {
         result.validate()?;
         Ok(result)
     }
+}
+
+// Input order is the authoritative observation journal order in the production
+// caller. Keep the first result anchor across later reconciliation batches.
+fn source_local_pairs(
+    observations: &[SourceObservation],
+    occurrences: &[HostOccurrence],
+    previous: Option<&NormalizationSnapshot>,
+) -> Result<BTreeMap<HostOccurrenceId, SourceLocalPairing>, NormalizeError> {
+    let mut calls = BTreeMap::new();
+    let mut witnesses: BTreeMap<SourceObservationId, Vec<_>> = BTreeMap::new();
+    for observation in observations {
+        if let Some(SourceLocalEvidence::NativeCall(call)) = &observation.source_local_evidence {
+            calls.insert(observation.source_observation_id, call.clone());
+            if let Some(witness) = &call.namespace_witness {
+                witnesses
+                    .entry(observation.source_observation_id)
+                    .or_default()
+                    .push((observation.source_observation_id, witness.clone()));
+            }
+        }
+    }
+    for observation in observations {
+        if let Some(SourceLocalEvidence::NamespaceWitness {
+            witness,
+            supported_call,
+            supported_observation_refs,
+        }) = &observation.source_local_evidence
+        {
+            for id in supported_observation_refs {
+                if let Some(existing) = calls.get(id) {
+                    let mut existing = existing.clone();
+                    existing.namespace_witness = None;
+                    let mut supported = supported_call.clone();
+                    supported.namespace_witness = None;
+                    if existing != supported {
+                        return Err(NormalizeError::InvalidInput);
+                    }
+                } else {
+                    calls.insert(*id, supported_call.clone());
+                }
+                witnesses
+                    .entry(*id)
+                    .or_default()
+                    .push((observation.source_observation_id, witness.clone()));
+            }
+        }
+    }
+    let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for observation in observations {
+        let id = observation.source_observation_id;
+        let (Some(call), Some(proofs)) = (calls.get(&id), witnesses.get(&id)) else {
+            continue;
+        };
+        let Some((_, first)) = proofs.first() else {
+            continue;
+        };
+        if !matches!(
+            observation.observation_role,
+            ObservationRole::Intent | ObservationRole::Result
+        ) || observation.correlation.exact_key().is_some()
+            || proofs.iter().any(|(_, witness)| {
+                !call.accepts_witness(witness) || witness.namespace != first.namespace
+            })
+        {
+            return Err(NormalizeError::InvalidInput);
+        }
+        groups
+            .entry((first.namespace.clone(), call.request_id.clone()))
+            .or_default()
+            .push((observation, call, proofs));
+    }
+    let mut result = BTreeMap::new();
+    for ((namespace, request_id), members) in groups {
+        let results = members
+            .iter()
+            .filter(|(o, _, _)| o.observation_role == ObservationRole::Result)
+            .map(|(o, _, _)| o.source_observation_id)
+            .collect::<Vec<_>>();
+        let Some(first_result) = results.first() else {
+            continue;
+        };
+        let anchor = previous
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.operations)
+            .find(|operation| {
+                operation
+                    .source_local_pairing
+                    .as_ref()
+                    .is_some_and(|pairing| {
+                        pairing.namespace == namespace && pairing.request_id == request_id
+                    })
+            })
+            .map(|operation| operation.host_occurrence_id)
+            .or_else(|| {
+                occurrences
+                    .iter()
+                    .find(|occurrence| occurrence.source_observation_refs == [*first_result])
+                    .map(|occurrence| occurrence.host_occurrence_id)
+            })
+            .ok_or(NormalizeError::InvalidInput)?;
+        let intents = members
+            .iter()
+            .filter(|(o, _, _)| o.observation_role == ObservationRole::Intent)
+            .map(|(o, _, _)| o.source_observation_id)
+            .collect::<Vec<_>>();
+        if intents.is_empty() && results.len() == 1 {
+            continue;
+        }
+        let same_tool = members
+            .iter()
+            .all(|(_, call, _)| call.tool_name == members[0].1.tool_name);
+        // Even identical repeated deliveries are conflicts, not retry deduplication.
+        let state = if intents.len() == 1 && results.len() == 1 && same_tool {
+            SourceLocalPairingState::SourcePaired
+        } else {
+            SourceLocalPairingState::Conflicted
+        };
+        let mut pairing = SourceLocalPairing {
+            namespace,
+            request_id,
+            intent_observation_refs: intents,
+            result_observation_refs: results,
+            namespace_witness_refs: members
+                .iter()
+                .flat_map(|(_, _, proofs)| proofs.iter().map(|(id, _)| *id))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            state,
+        };
+        pairing.intent_observation_refs.sort();
+        pairing.result_observation_refs.sort();
+        pairing
+            .validate()
+            .map_err(|_| NormalizeError::InvalidResult)?;
+        result.insert(anchor, pairing);
+    }
+    Ok(result)
 }
 
 fn build_exact_occurrence(

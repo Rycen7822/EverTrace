@@ -1158,6 +1158,7 @@ fn capture_input(
     visibility: RecordVisibility,
 ) -> CaptureRecordInput {
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(format!(
             "session-import-{}-{start}-{end}",
             current.session_id

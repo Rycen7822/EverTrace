@@ -65,6 +65,7 @@ pub struct CaptureRecordInput {
     pub observation_role: ObservationRole,
     pub correlation: HostCorrelationEvidence,
     pub scope_effect_claims: Vec<ScopeEffectClaim>,
+    pub source_local_evidence: Option<evertrace_domain::evidence::SourceLocalEvidence>,
     pub lifecycle: Option<evertrace_domain::work::LaneLifecycleEvidence>,
     pub unsupported_record_classification: Option<UnsupportedRecordClassification>,
     pub source_role: SourceRole,
@@ -348,6 +349,7 @@ impl CaptureRuntime {
             })
             .collect();
         let body = CaptureRecordBody {
+            source_local_evidence: input.source_local_evidence.clone(),
             body_version: crate::frame::CAPTURE_RECORD_BODY_VERSION,
             command_id,
             source_instance_id,

@@ -476,6 +476,48 @@ impl ConfinedRoot {
         self.revalidate_stable()
     }
 
+    /// Reads one newline-terminated record using the same confined range reader.
+    /// The record bound excludes its newline; the total I/O budget includes it.
+    pub fn read_first_record(
+        &self,
+        relative: &Path,
+        expected: ConfinedFileIdentity,
+        max_record_bytes: usize,
+        remaining: &mut usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, ConfinedReadError> {
+        let bound = max_record_bytes
+            .checked_add(1)
+            .ok_or(ConfinedReadError::Arithmetic)?;
+        let mut bytes = Vec::new();
+        loop {
+            let limit = 4096.min(*remaining).min(bound - bytes.len());
+            if limit == 0 {
+                return Err(ConfinedReadError::LimitExceeded {
+                    kind: ConfinedLimitKind::SingleFile,
+                    metadata: ConfinedFileMetadata { identity: expected },
+                });
+            }
+            let chunk = self.read_range(relative, expected, bytes.len() as u64, limit, deadline)?;
+            *remaining -= chunk.bytes.len();
+            if let Some(newline) = chunk.bytes.iter().position(|byte| *byte == b'\n') {
+                bytes.extend_from_slice(&chunk.bytes[..newline]);
+                check_deadline(deadline)?;
+                return Ok(bytes);
+            }
+            if bytes.len() + chunk.bytes.len() > max_record_bytes {
+                return Err(ConfinedReadError::LimitExceeded {
+                    kind: ConfinedLimitKind::SingleFile,
+                    metadata: ConfinedFileMetadata { identity: expected },
+                });
+            }
+            if chunk.eof {
+                return Err(ConfinedReadError::UnsupportedType);
+            }
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+    }
+
     pub fn read_range(
         &self,
         relative: &Path,

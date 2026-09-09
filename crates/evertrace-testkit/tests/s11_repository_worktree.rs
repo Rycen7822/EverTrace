@@ -2381,6 +2381,7 @@ fn observation(
     };
     let fingerprint = payload_fingerprint(1, b"x", None).unwrap();
     let observation = SourceObservation {
+        source_local_evidence: None,
         source_observation_id: observation_id,
         source_instance_id: instance,
         source_revision: revision,

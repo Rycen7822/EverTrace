@@ -134,6 +134,7 @@ fn observation(
     };
     let fingerprint = payload_fingerprint(1, b"x", None).unwrap();
     let observation = SourceObservation {
+        source_local_evidence: None,
         source_observation_id: observation_id,
         source_instance_id: instance,
         source_revision: revision,
@@ -263,6 +264,243 @@ fn exact_cross_source_pairing_keeps_provenance_and_derives_one_operation() {
     assert_eq!(
         snapshot.occurrences[0].host_occurrence_id,
         host_occurrence_id_for_exact(snapshot.occurrences[0].exact_key.as_ref().unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn source_local_calls_keep_one_result_anchor_across_turns_and_conflicts() {
+    use evertrace_domain::evidence::{
+        SourceLocalEvidence, SourceLocalNamespace, SourceLocalNamespaceWitness,
+        SourceLocalNativeCall, SourceLocalPairingState, SourceLocalProfile,
+    };
+    // Synthetic namespace evidence exercises the normalizer, not filesystem
+    // authority; real reader and durable ingestion are covered by S08/runtime.
+    let make = |record: &str, role: ObservationRole, rollout: &str, turn: &str, tool: &str| {
+        let mut correlation = nonexact_correlation(record, CorrelationAdmission::Unavailable);
+        correlation.canonical_event_family = None;
+        correlation.host_instance_id = None;
+        correlation.host_trace_lineage_id = None;
+        correlation.host_lane_key = None;
+        correlation.physical_execution_ordinal = None;
+        correlation.native_request_id = Some("logical-call".into());
+        correlation
+            .field_provenance
+            .retain(|claim| claim.field == CorrelationField::NativeRequestId);
+        let (_, mut value) = observation(record, role, correlation, vec![]);
+        value.identity_strength = IdentityStrength::SynthesizedBestEffort;
+        value.capture_completeness = CaptureCompleteness::Partial;
+        let session = "01a083a5-79c1-7343-821a-a8e571f9ad26";
+        let path = format!(
+            "/private/sessions/2026/09/09/rollout-2026-09-09T00-00-00-{session}_{rollout}.jsonl"
+        );
+        value.source_local_evidence =
+            Some(SourceLocalEvidence::NativeCall(SourceLocalNativeCall {
+                session_id: session.into(),
+                agent_id: None,
+                transcript_path: Some(path.clone()),
+                request_id: "logical-call".into(),
+                turn_id: turn.into(),
+                tool_name: tool.into(),
+                namespace_witness: Some(SourceLocalNamespaceWitness {
+                    namespace: SourceLocalNamespace {
+                        profile: SourceLocalProfile::NativeHookV1,
+                        root_session: session.into(),
+                        thread: session.into(),
+                        rollout: rollout.into(),
+                    },
+                    transcript_path: path,
+                    filesystem_device: 1,
+                    filesystem_inode: 2,
+                    observed_file_length: 101,
+                    metadata_length: 100,
+                }),
+            }));
+        value
+    };
+    let first_rollout = "01a083a5-79c1-7343-821a-a8e571f9ad26";
+    let intent = make(
+        "intent",
+        ObservationRole::Intent,
+        first_rollout,
+        "before",
+        "Bash",
+    );
+    let result = make(
+        "result",
+        ObservationRole::Result,
+        first_rollout,
+        "later-turn",
+        "Bash",
+    );
+    assert!(
+        normalizer()
+            .normalize(std::slice::from_ref(&intent), None)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
+    let first = normalizer()
+        .normalize(&[result.clone(), intent.clone()], None)
+        .unwrap();
+    assert_eq!(first.operations.len(), 1);
+    let operation = &first.operations[0];
+    assert_eq!(
+        operation.source_local_pairing.as_ref().unwrap().state,
+        SourceLocalPairingState::SourcePaired
+    );
+    assert!(
+        first
+            .occurrences
+            .iter()
+            .all(|occurrence| occurrence.source_observation_refs.len() == 1
+                && occurrence.correlation_strength != CorrelationStrength::Exact)
+    );
+    let duplicate = make(
+        "duplicate",
+        ObservationRole::Result,
+        first_rollout,
+        "another-turn",
+        "apply_patch",
+    );
+    let conflict = normalizer()
+        .normalize(
+            &[duplicate.clone(), intent.clone(), result.clone()],
+            Some(&first),
+        )
+        .unwrap();
+    assert_eq!(conflict.operations.len(), 1);
+    assert_eq!(conflict.operations[0].operation_id, operation.operation_id);
+    assert_eq!(
+        conflict.operations[0].host_occurrence_id,
+        operation.host_occurrence_id
+    );
+    assert_eq!(
+        conflict.operations[0].operation_revision,
+        operation.operation_revision + 1
+    );
+    assert_eq!(
+        conflict.operations[0]
+            .source_local_pairing
+            .as_ref()
+            .unwrap()
+            .state,
+        SourceLocalPairingState::Conflicted
+    );
+    assert_eq!(
+        normalizer()
+            .normalize(
+                &[duplicate, intent.clone(), result.clone()],
+                Some(&conflict)
+            )
+            .unwrap(),
+        conflict
+    );
+    let mut earlier = make(
+        "earlier-unwitnessed",
+        ObservationRole::Result,
+        first_rollout,
+        "earlier-turn",
+        "Bash",
+    );
+    let Some(SourceLocalEvidence::NativeCall(mut supported_call)) =
+        earlier.source_local_evidence.take()
+    else {
+        unreachable!()
+    };
+    let witness = supported_call.namespace_witness.take().unwrap();
+    let before_witness = normalizer()
+        .normalize(&[earlier.clone(), result.clone(), intent.clone()], None)
+        .unwrap();
+    assert_eq!(
+        before_witness.operations[0].host_occurrence_id,
+        operation.host_occurrence_id
+    );
+    let (_, mut proof) = observation(
+        "late-witness",
+        ObservationRole::StateProbe,
+        nonexact_correlation("late-witness", CorrelationAdmission::Unavailable),
+        vec![],
+    );
+    proof.correlation.canonical_event_family = None;
+    proof
+        .correlation
+        .field_provenance
+        .retain(|claim| claim.field != CorrelationField::CanonicalEventFamily);
+    proof.source_local_evidence = Some(SourceLocalEvidence::NamespaceWitness {
+        witness,
+        supported_call,
+        supported_observation_refs: vec![earlier.source_observation_id],
+    });
+    let after_witness = normalizer()
+        .normalize(
+            &[earlier, result.clone(), intent.clone(), proof],
+            Some(&before_witness),
+        )
+        .unwrap();
+    assert_eq!(after_witness.operations.len(), 1);
+    assert_eq!(
+        after_witness.operations[0].operation_id,
+        before_witness.operations[0].operation_id
+    );
+    assert_eq!(
+        after_witness.operations[0].host_occurrence_id,
+        operation.host_occurrence_id
+    );
+    assert_eq!(
+        after_witness.operations[0]
+            .source_local_pairing
+            .as_ref()
+            .unwrap()
+            .state,
+        SourceLocalPairingState::Conflicted
+    );
+    let other = "01a083a7-5416-7550-a05e-987296759358";
+    let mut child = make(
+        "child-intent",
+        ObservationRole::Intent,
+        other,
+        "before",
+        "Bash",
+    );
+    if let Some(SourceLocalEvidence::NativeCall(call)) = &mut child.source_local_evidence {
+        call.agent_id = Some(other.into());
+        call.namespace_witness.as_mut().unwrap().namespace.thread = other.into();
+    }
+    assert!(
+        normalizer()
+            .normalize(&[result.clone(), child], None)
+            .unwrap()
+            .operations
+            .is_empty(),
+        "shared root session/request cannot pair a child intent with a root result"
+    );
+    let isolated = normalizer()
+        .normalize(
+            &[
+                intent,
+                result,
+                make(
+                    "revert-intent",
+                    ObservationRole::Intent,
+                    other,
+                    "before",
+                    "Bash",
+                ),
+                make(
+                    "revert-result",
+                    ObservationRole::Result,
+                    other,
+                    "after",
+                    "Bash",
+                ),
+            ],
+            Some(&first),
+        )
+        .unwrap();
+    assert_eq!(
+        isolated.operations.len(),
+        2,
+        "distinct current rollouts never pair or deduplicate"
     );
 }
 

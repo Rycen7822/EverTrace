@@ -222,6 +222,7 @@ fn source(
         lifecycle: None,
     };
     let observation = SourceObservation {
+        source_local_evidence: None,
         source_observation_id: observation_id,
         source_instance_id: instance,
         source_revision: revision,
@@ -4923,6 +4924,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
     observation.correlation.pairing_role = ObservationRole::Lifecycle;
     let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
     let capture_input = CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: None,
         source_observation_id_hint: None,
         source_instance_id: "mcp-lifecycle".into(),

@@ -422,6 +422,7 @@ impl FrozenMemoryExportCapture<'_> {
         let outcome = self
             .runtime
             .capture(CaptureRecordInput {
+                source_local_evidence: None,
                 spool_record_id: Some(format!(
                     "evertrace-frozen-memory-export-v1:{record_identity}"
                 )),

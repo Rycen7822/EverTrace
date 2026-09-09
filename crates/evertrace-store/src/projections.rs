@@ -1645,11 +1645,266 @@ fn current_payload(row: &ObjectRow) -> Result<NamedCurrentDependency, StoreError
     })
 }
 
+fn validate_source_local_relations(
+    observations: &BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    receipts: &BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    occurrences: &BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
+    operations: &BTreeMap<OperationId, (Operation, u64)>,
+) -> Result<(), StoreError> {
+    use evertrace_domain::evidence::{
+        EvidenceSourceKind, ObservationRole, SourceLocalEvidence, SourceLocalPairingState,
+    };
+    let error = StoreError::StoreCorrupt;
+    for (observation, _) in observations
+        .values()
+        .filter(|(value, _)| value.source_local_evidence.is_some())
+    {
+        let receipt = &receipts
+            .get(&observation.source_receipt_ref)
+            .ok_or(error)?
+            .0;
+        if receipt.source_kind != EvidenceSourceKind::CodexHook
+            || receipt.identity_domain != "native-hook-delivery-v1"
+        {
+            return Err(error);
+        }
+        match observation.source_local_evidence.as_ref().ok_or(error)? {
+            SourceLocalEvidence::NativeCall(call) => {
+                if call.session_id != receipt.source_session_ref {
+                    return Err(error);
+                }
+            }
+            SourceLocalEvidence::NamespaceWitness {
+                witness,
+                supported_call,
+                supported_observation_refs,
+            } => {
+                for id in supported_observation_refs {
+                    let original = &observations.get(id).ok_or(error)?.0;
+                    let receipt = &receipts.get(&original.source_receipt_ref).ok_or(error)?.0;
+                    if receipt.source_kind != EvidenceSourceKind::CodexHook
+                        || receipt.identity_domain != "native-hook-delivery-v1"
+                        || receipt.source_session_ref != supported_call.session_id
+                        || original.correlation.native_request_id.as_deref()
+                            != Some(supported_call.request_id.as_str())
+                        || !matches!(
+                            original.observation_role,
+                            ObservationRole::Intent | ObservationRole::Result
+                        )
+                        || !supported_call.accepts_witness(witness)
+                    {
+                        return Err(error);
+                    }
+                    if let Some(SourceLocalEvidence::NativeCall(call)) =
+                        &original.source_local_evidence
+                    {
+                        let mut call = call.clone();
+                        call.namespace_witness = None;
+                        let mut supported = supported_call.clone();
+                        supported.namespace_witness = None;
+                        if call != supported {
+                            return Err(error);
+                        }
+                    } else if original.source_local_evidence.is_some() {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+    // Only witnesses already present at this Operation revision's frontier
+    // participate. Later evidence dirties normalization without retroactively
+    // making the previously committed revision invalid.
+    let mut qualified = BTreeMap::<_, Vec<_>>::new();
+    for (proof_id, (proof, proof_seq)) in observations {
+        let (call, witness, supported) = match &proof.source_local_evidence {
+            Some(SourceLocalEvidence::NativeCall(call)) => {
+                let Some(witness) = &call.namespace_witness else {
+                    continue;
+                };
+                (call, witness, std::slice::from_ref(proof_id))
+            }
+            Some(SourceLocalEvidence::NamespaceWitness {
+                witness,
+                supported_call,
+                supported_observation_refs,
+            }) => (
+                supported_call,
+                witness,
+                supported_observation_refs.as_slice(),
+            ),
+            None => continue,
+        };
+        for id in supported {
+            let (observation, observed_seq) = observations.get(id).ok_or(error)?;
+            if observation.correlation.exact_key().is_some() {
+                return Err(error);
+            }
+            qualified
+                .entry((witness.namespace.clone(), call.request_id.clone()))
+                .or_default()
+                .push((*id, *proof_id, (*observed_seq).max(*proof_seq)));
+        }
+    }
+    let mut keys = BTreeSet::new();
+    for (operation, seq) in operations.values() {
+        let Some(pairing) = &operation.source_local_pairing else {
+            continue;
+        };
+        if !keys.insert((pairing.namespace.clone(), pairing.request_id.clone())) {
+            return Err(error);
+        }
+        let mut expected_intents = BTreeSet::new();
+        let mut expected_results = BTreeSet::new();
+        let mut expected_proofs = BTreeSet::new();
+        for (id, proof, qualified_seq) in qualified
+            .get(&(pairing.namespace.clone(), pairing.request_id.clone()))
+            .ok_or(error)?
+        {
+            if qualified_seq > seq {
+                continue;
+            }
+            match observations[id].0.observation_role {
+                ObservationRole::Intent => {
+                    expected_intents.insert(*id);
+                }
+                ObservationRole::Result => {
+                    expected_results.insert(*id);
+                }
+                _ => return Err(error),
+            }
+            expected_proofs.insert(*proof);
+        }
+        if expected_intents != pairing.intent_observation_refs.iter().copied().collect()
+            || expected_results != pairing.result_observation_refs.iter().copied().collect()
+            || expected_proofs != pairing.namespace_witness_refs.iter().copied().collect()
+        {
+            return Err(error);
+        }
+        let occurrence = &occurrences
+            .get(&operation.host_occurrence_id)
+            .ok_or(error)?
+            .0;
+        if occurrence.source_observation_refs.len() != 1
+            || !pairing
+                .result_observation_refs
+                .contains(&occurrence.source_observation_refs[0])
+            || operation.pairing_state != occurrence.pairing_state
+        {
+            return Err(error);
+        }
+        let mut tools = BTreeSet::new();
+        for (ids, role) in [
+            (&pairing.intent_observation_refs, ObservationRole::Intent),
+            (&pairing.result_observation_refs, ObservationRole::Result),
+        ] {
+            for id in ids {
+                let (observation, observed_seq) = observations.get(id).ok_or(error)?;
+                if observation.observation_role != role
+                    || observed_seq > seq
+                    || observation.correlation.exact_key().is_some()
+                {
+                    return Err(error);
+                }
+                let mut supported = false;
+                for proof in &pairing.namespace_witness_refs {
+                    let (proof_observation, proof_seq) = observations.get(proof).ok_or(error)?;
+                    if proof_seq > seq {
+                        return Err(error);
+                    }
+                    let (call, witness) = match proof_observation.source_local_evidence.as_ref() {
+                        Some(SourceLocalEvidence::NativeCall(call)) if proof == id => {
+                            (call, call.namespace_witness.as_ref().ok_or(error)?)
+                        }
+                        Some(SourceLocalEvidence::NamespaceWitness {
+                            witness,
+                            supported_call,
+                            supported_observation_refs,
+                        }) if supported_observation_refs.contains(id) => (supported_call, witness),
+                        _ => continue,
+                    };
+                    if witness.namespace != pairing.namespace
+                        || call.request_id != pairing.request_id
+                        || !call.accepts_witness(witness)
+                    {
+                        return Err(error);
+                    }
+                    tools.insert(call.tool_name.as_str());
+                    supported = true;
+                }
+                if !supported {
+                    return Err(error);
+                }
+            }
+        }
+        let paired = pairing.intent_observation_refs.len() == 1
+            && pairing.result_observation_refs.len() == 1
+            && tools.len() == 1;
+        if (pairing.state == SourceLocalPairingState::SourcePaired) != paired {
+            return Err(error);
+        }
+        let first = pairing
+            .result_observation_refs
+            .iter()
+            .min_by_key(|id| observations[id].1)
+            .ok_or(error)?;
+        // The first revision fixes the earliest result qualified at creation.
+        // A later witness may qualify an older result, but cannot move that anchor.
+        if operation.operation_revision == 1 && occurrence.source_observation_refs[0] != *first {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn collect_normalization_dependencies(
     snapshot: &ProjectionSnapshot,
     selected: &SourceObservation,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
+    use evertrace_domain::evidence::SourceLocalEvidence;
+    if let Some(evidence) = &selected.source_local_evidence {
+        let call = match evidence {
+            SourceLocalEvidence::NativeCall(call) => call,
+            SourceLocalEvidence::NamespaceWitness { supported_call, .. } => supported_call,
+        };
+        let mut ids = BTreeSet::from([selected.source_observation_id]);
+        for row in snapshot.data_rows().filter(|row| {
+            row.object_kind.as_deref() == Some("source_observation")
+                && row
+                    .payload_json
+                    .as_deref()
+                    .is_some_and(|json| json.contains("\"source_local_evidence\""))
+        }) {
+            let dependency = current_payload(row)?;
+            let JournalPayload::SourceObservationRecorded(value) = &dependency.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let (other, supported) = match &value.source_local_evidence {
+                Some(SourceLocalEvidence::NativeCall(other)) => (other, &[][..]),
+                Some(SourceLocalEvidence::NamespaceWitness {
+                    supported_call,
+                    supported_observation_refs,
+                    ..
+                }) => (supported_call, supported_observation_refs.as_slice()),
+                None => continue,
+            };
+            if other.session_id == call.session_id && other.request_id == call.request_id {
+                ids.insert(value.source_observation_id);
+                ids.extend(supported.iter().copied());
+                dependencies.insert(dependency)?;
+            }
+        }
+        for id in &ids {
+            let row = snapshot
+                .row(&format!("object:evidence:source_observation:{id}"))
+                .ok_or(StoreError::StoreCorrupt)?;
+            dependencies.insert(current_payload(row)?)?;
+        }
+        // New dirty facts include already-watermarked predecessors. The new
+        // fact's watermark ends this work; no periodic rescan or busy retry.
+        collect_observation_relations(snapshot, &ids, dependencies)?;
+    }
     let exact_key = selected.correlation.exact_key();
     let partial_ref = selected
         .correlation
@@ -6877,6 +7132,12 @@ impl JournalAdmissionState {
     }
 
     fn validate_relations(&self) -> Result<(), StoreError> {
+        validate_source_local_relations(
+            &self.source_observations,
+            &self.source_receipts,
+            &self.host_occurrences,
+            &self.operations,
+        )?;
         validate_capture_relations(
             &self.execution_lanes,
             &self.capture_receipts,
@@ -8874,6 +9135,15 @@ fn replace_operation(
     seq: u64,
 ) -> Result<(), StoreError> {
     value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    if let Some((current, _)) = values.get(&value.operation_id)
+        && let Some(previous) = &current.source_local_pairing
+        && (current.host_occurrence_id != value.host_occurrence_id
+            || value.source_local_pairing.as_ref().is_none_or(|next| {
+                next.namespace != previous.namespace || next.request_id != previous.request_id
+            }))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
     match values.get(&value.operation_id) {
         None if value.operation_revision != 1 || value.previous_operation_revision.is_some() => {
             return Err(StoreError::StoreCorrupt);
@@ -10597,6 +10867,12 @@ impl ReducerState {
     }
 
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
+        validate_source_local_relations(
+            &self.source_observations,
+            &self.source_receipts,
+            &self.host_occurrences,
+            &self.operations,
+        )?;
         self.s23.validate(
             &self.atom_revisions,
             &self.proposal_revisions,
@@ -12202,6 +12478,7 @@ mod tests {
 
     fn operation(revision: u32, previous: Option<u32>) -> Operation {
         Operation {
+            source_local_pairing: None,
             operation_id: OperationId::new_v7(),
             host_occurrence_id: HostOccurrenceId::from_digest([0x71; 32]),
             execution_lane_id: None,

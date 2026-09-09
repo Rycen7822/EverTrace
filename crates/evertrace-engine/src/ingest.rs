@@ -223,6 +223,170 @@ impl EvidenceIngestor {
         self.drain_segments(&spool, segments, selected, false).await
     }
 
+    async fn verify_namespace_support(
+        &self,
+        original: &crate::capture::VerifiedCapture,
+        cas: &CasStore,
+        remaining: &mut (u64, u64),
+    ) -> Result<(), IngestError> {
+        use evertrace_domain::evidence::SourceLocalEvidence;
+        let Some(SourceLocalEvidence::NamespaceWitness {
+            supported_call,
+            supported_observation_refs,
+            ..
+        }) = &original.body.source_local_evidence
+        else {
+            return Ok(());
+        };
+        let snapshot = self.writer.project().await.map_err(map_writer_error)?;
+        let view =
+            evertrace_store::projections::RecoveryEvidenceCurrentView::from_snapshot(&snapshot)
+                .map_err(|_| IngestError::StoreCorrupt)?;
+        for id in supported_observation_refs {
+            let observation = view.observation(*id).ok_or(IngestError::InvalidRecord)?;
+            let receipt = view
+                .receipt_for_observation(*id)
+                .ok_or(IngestError::InvalidRecord)?;
+            let digest = CasDigest::from_str(&receipt.cas_ref).map_err(|_| IngestError::Cas)?;
+            let (bytes, encoded) = cas
+                .read_bounded(&digest, remaining.0, remaining.1)
+                .map_err(|_| IngestError::Cas)?;
+            remaining.0 -= encoded;
+            remaining.1 -= bytes.len() as u64;
+            let call = evertrace_codex::hook_input::native_call_from_raw(
+                &bytes,
+                observation.observation_role,
+            )
+            .ok_or(IngestError::InvalidRecord)?;
+            let mut claimed = supported_call.clone();
+            claimed.namespace_witness = None;
+            if call != claimed || receipt.protected_length != bytes.len() as u64 {
+                return Err(IngestError::InvalidRecord);
+            }
+        }
+        Ok(())
+    }
+
+    fn freeze_namespace_probe(
+        &self,
+        original: &crate::capture::VerifiedCapture,
+        records: &[SpoolRecord],
+        cas: &CasStore,
+        remaining: &mut (u64, u64),
+    ) -> Result<(), IngestError> {
+        use evertrace_domain::evidence::{
+            CaptureCompleteness, ContentTrust, IdentityStrength, ObservationRole,
+            SourceLocalEvidence,
+        };
+        let call = original
+            .native_call
+            .as_ref()
+            .ok_or(IngestError::InvalidRecord)?;
+        let record_id = format!("native-namespace:{}", original.body.command_id);
+        let mut found = records
+            .iter()
+            .filter(|record| record.spool_record_id == record_id);
+        if let Some(record) = found.next() {
+            if found.next().is_some() {
+                return Err(IngestError::InvalidRecord);
+            }
+            let (body, _) =
+                decode_validated_record_body(record).map_err(|_| IngestError::InvalidRecord)?;
+            let evidence = body
+                .source_local_evidence
+                .as_ref()
+                .ok_or(IngestError::InvalidRecord)?;
+            let SourceLocalEvidence::NamespaceWitness {
+                supported_call,
+                supported_observation_refs,
+                ..
+            } = evidence
+            else {
+                return Err(IngestError::InvalidRecord);
+            };
+            if supported_call != call
+                || supported_observation_refs != &[original.observation.source_observation_id]
+                || body.source_instance_id.as_str() != record_id
+            {
+                return Err(IngestError::InvalidRecord);
+            }
+            let digest = CasDigest::from_str(&body.cas_ref).map_err(|_| IngestError::Cas)?;
+            let (bytes, encoded) = cas
+                .read_bounded(&digest, remaining.0, remaining.1)
+                .map_err(|_| IngestError::Cas)?;
+            remaining.0 -= encoded;
+            remaining.1 -= bytes.len() as u64;
+            let raw: SourceLocalEvidence =
+                serde_json::from_slice(&bytes).map_err(|_| IngestError::InvalidRecord)?;
+            if &raw != evidence {
+                return Err(IngestError::InvalidRecord);
+            }
+            return Ok(());
+        }
+        let Some(witness) = crate::repository::freeze_native_namespace(call) else {
+            return Ok(());
+        };
+        let evidence = SourceLocalEvidence::NamespaceWitness {
+            witness,
+            supported_call: call.clone(),
+            supported_observation_refs: vec![original.observation.source_observation_id],
+        };
+        let raw_payload = serde_json::to_vec(&evidence).map_err(|_| IngestError::InvalidRecord)?;
+        let mut correlation = original.body.correlation.clone();
+        correlation.pairing_role = ObservationRole::StateProbe;
+        correlation.native_request_id = None;
+        correlation.field_provenance.clear();
+        let input = evertrace_capture::CaptureRecordInput {
+            source_local_evidence: Some(evidence),
+            spool_record_id: Some(record_id.clone()),
+            source_observation_id_hint: None,
+            source_instance_id: record_id.clone(),
+            source_revision: "initial".into(),
+            source_record_identity: None,
+            identity_strength: Some(IdentityStrength::SynthesizedBestEffort),
+            source_kind: original.body.source_kind,
+            identity_domain: original.body.identity_domain.clone(),
+            source_ref: record_id,
+            session_ref: call.session_id.clone(),
+            turn_ref: Some(call.turn_id.clone()),
+            tool_ref: Some(call.request_id.clone()),
+            source_sequence: 0,
+            source_sequence_origin: Some(0),
+            task_id: None,
+            repository_instance_id: None,
+            worktree_instance_id: None,
+            source_byte_range: None,
+            source_revision_mode: SourceRevisionMode::Append,
+            previous_source_revision: None,
+            close_watermark: None,
+            observation_role: ObservationRole::StateProbe,
+            correlation,
+            scope_effect_claims: vec![],
+            lifecycle: None,
+            unsupported_record_classification: None,
+            source_role: SourceRole::Host,
+            content_trust: ContentTrust::Observed,
+            capture_completeness: CaptureCompleteness::Partial,
+            surface_eligible: false,
+            adapter_revision: original.body.adapter_revision,
+            adapter_manifest_ref: original.body.adapter_manifest_ref.clone(),
+            eligible_event_manifest_ref: original.body.eligible_event_manifest_ref.clone(),
+            parser_revision: original.body.parser_revision,
+            canonicalization_revision: original.body.canonicalization_revision,
+            event_time_us: None,
+            raw_payload,
+        };
+        let Ok(mut runtime) =
+            evertrace_capture::CaptureRuntime::open_for_admission(self.snapshot.clone())
+        else {
+            return Ok(());
+        };
+        let _ = runtime
+            .capture(input)
+            .map_err(|_| IngestError::InvalidRecord)?;
+        Ok(())
+    }
+
     async fn drain_segments(
         &self,
         spool: &DurableSpool,
@@ -246,6 +410,9 @@ impl EvidenceIngestor {
         let mut prefix_projection = None;
         let mut prefix_states = BTreeMap::new();
         let mut terminal_segments = Vec::new();
+        // One bounded immutable-witness recovery scan per drain, never one
+        // scan per frame or a periodic search through acknowledged history.
+        let mut namespace_records = None;
         let mut remaining = if bounded {
             (64 * 1024 * 1024, 64 * 1024 * 1024)
         } else {
@@ -410,13 +577,36 @@ impl EvidenceIngestor {
                     .map(|event| event.payload)
                     .collect::<Vec<_>>();
                     if committed_command.payloads != expected {
-                        return Err(IngestError::StoreCorrupt);
+                        return Err(IngestError::IdempotencyConflict);
                     }
                     committed += 1;
                     progress.committed_frames += 1;
                     progress.replayed_frames += 1;
                     progress.projected_surfaces += surface_count;
                     continue;
+                }
+                self.verify_namespace_support(&verified, &cas, &mut remaining)
+                    .await?;
+                if selected.is_none()
+                    && verified.native_call.is_some()
+                    && !matches!(&verified.body.source_local_evidence,
+                        Some(evertrace_domain::evidence::SourceLocalEvidence::NativeCall(call)) if call.namespace_witness.is_some())
+                {
+                    if namespace_records.is_none() {
+                        namespace_records = Some(
+                            spool.read_durable_records(MAX_SEGMENTS_PER_DRAIN, 64 * 1024 * 1024),
+                        );
+                    }
+                    match namespace_records.as_ref().ok_or(IngestError::Spool)? {
+                        Ok(records) => {
+                            self.freeze_namespace_probe(&verified, records, &cas, &mut remaining)?
+                        }
+                        Err(evertrace_capture::SpoolError::ResourceExhausted) => {
+                            // Incomplete recovery cannot establish absence. Keep
+                            // this observation weak rather than remeasure.
+                        }
+                        Err(error) => return Err(map_spool(*error)),
+                    }
                 }
                 let command = JournalCommand::new(
                     verified.body.command_id,

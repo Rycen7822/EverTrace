@@ -359,6 +359,7 @@ mod controlled_projection_proof {
             CorrelationField::PhysicalExecutionOrdinal,
         ];
         CaptureRecordInput {
+            source_local_evidence: None,
             spool_record_id: Some(format!("spool-{record}")),
             source_observation_id_hint: None,
             source_instance_id: "s27-controlled-source".into(),

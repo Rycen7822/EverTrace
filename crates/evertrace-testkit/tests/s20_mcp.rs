@@ -235,6 +235,7 @@ fn capture_input(
     repository_id: Option<RepositoryId>,
 ) -> CaptureRecordInput {
     CaptureRecordInput {
+        source_local_evidence: None,
         spool_record_id: Some(format!("s20-{label}")),
         source_observation_id_hint: None,
         source_instance_id: "source-s20".into(),

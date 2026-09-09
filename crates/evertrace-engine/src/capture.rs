@@ -46,6 +46,7 @@ pub(crate) struct VerifiedCapture {
     pub receipt: SourceReceipt,
     pub observation: SourceObservation,
     pub surface: Option<EvidenceSurface>,
+    pub native_call: Option<evertrace_domain::evidence::SourceLocalNativeCall>,
 }
 
 fn protected_presentation(
@@ -206,6 +207,7 @@ pub(crate) fn verify_capture_frame_presented(
         payload_fingerprint(body.canonicalization_revision, &protected, secret_digest)
             .map_err(|_| IngestError::InvalidRecord)?;
     let observation = SourceObservation {
+        source_local_evidence: body.source_local_evidence.clone(),
         source_observation_id: observation_id,
         source_instance_id: body.source_instance_id.clone(),
         source_revision: body.source_revision.clone(),
@@ -230,11 +232,47 @@ pub(crate) fn verify_capture_frame_presented(
         .map_err(|_| IngestError::InvalidRecord)?;
     let surface = build_evidence_surface(&receipt, &observation, &protected, body.surface_eligible)
         .map_err(|_| IngestError::InvalidRecord)?;
+    let native_call = if body.identity_domain == "native-hook-delivery-v1"
+        && body.source_kind == evertrace_domain::evidence::EvidenceSourceKind::CodexHook
+        && matches!(
+            body.observation_role,
+            evertrace_domain::evidence::ObservationRole::Intent
+                | evertrace_domain::evidence::ObservationRole::Result
+        ) {
+        evertrace_codex::hook_input::native_call_from_raw(&protected, body.observation_role).filter(
+            |call| {
+                call.session_id == body.source_session_ref
+                    && body.correlation.native_request_id.as_deref()
+                        == Some(call.request_id.as_str())
+            },
+        )
+    } else {
+        None
+    };
+    if let Some(evidence) = &body.source_local_evidence {
+        match evidence {
+            evertrace_domain::evidence::SourceLocalEvidence::NativeCall(declared) => {
+                let mut declared = declared.clone();
+                declared.namespace_witness = None;
+                if native_call.as_ref() != Some(&declared) {
+                    return Err(IngestError::InvalidRecord);
+                }
+            }
+            evertrace_domain::evidence::SourceLocalEvidence::NamespaceWitness { .. } => {
+                let raw: evertrace_domain::evidence::SourceLocalEvidence =
+                    serde_json::from_slice(&protected).map_err(|_| IngestError::InvalidRecord)?;
+                if &raw != evidence {
+                    return Err(IngestError::InvalidRecord);
+                }
+            }
+        }
+    }
     Ok(VerifiedCapture {
         body,
         receipt,
         observation,
         surface,
+        native_call,
     })
 }
 
@@ -664,6 +702,7 @@ struct CurrentCaptureState {
     source_receipts: Vec<SourceReceipt>,
     source_receipt_event_seq: BTreeMap<SourceObservationId, u64>,
     source_observations: BTreeMap<SourceObservationId, SourceObservation>,
+    observation_event_seq: BTreeMap<SourceObservationId, u64>,
     host_occurrences: Vec<evertrace_domain::evidence::HostOccurrence>,
     operations: Vec<evertrace_domain::evidence::Operation>,
     scope_effects: Vec<evertrace_domain::evidence::ScopeEffect>,
@@ -698,6 +737,9 @@ impl CurrentCaptureState {
                     state.source_receipts.push(*value);
                 }
                 JournalPayload::SourceObservationRecorded(value) => {
+                    state
+                        .observation_event_seq
+                        .insert(value.source_observation_id, dependency.source_event_seq);
                     state
                         .source_observations
                         .insert(value.source_observation_id, *value);
@@ -1049,14 +1091,18 @@ fn normalize_selected_dirty(
         operations: normalization_state.operations.clone(),
         scope_effects: normalization_state.scope_effects.clone(),
     };
+    let mut ordered_observations = normalization_state
+        .source_observations
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    ordered_observations.sort_by_key(|value| {
+        normalization_state.observation_event_seq[&value.source_observation_id]
+    });
     let normalized = crate::PhysicalNormalizer::new(1)
         .map_err(|_| ReconcileError::Domain)?
         .normalize(
-            &normalization_state
-                .source_observations
-                .values()
-                .cloned()
-                .collect::<Vec<_>>(),
+            &ordered_observations,
             (!previous.occurrences.is_empty()).then_some(&previous),
         )
         .map_err(|_| ReconcileError::Domain)?;
@@ -1080,6 +1126,15 @@ fn normalize_selected_dirty(
             .find(|current| current.operation_id == operation.operation_id)
             != Some(operation);
         if changed {
+            if operation.source_local_pairing.is_some()
+                && !payloads.iter().any(|payload| matches!(payload,
+                    JournalPayload::HostOccurrenceNormalized(value) if value.host_occurrence_id == operation.host_occurrence_id)) {
+                // Preserve the existing normalization command's closed physical
+                // support requirement without changing the old occurrence.
+                let anchor = normalized.occurrences.iter().find(|value| value.host_occurrence_id == operation.host_occurrence_id)
+                    .ok_or(ReconcileError::Domain)?;
+                payloads.push(JournalPayload::HostOccurrenceNormalized(Box::new(anchor.clone())));
+            }
             payloads.push(JournalPayload::OperationDerived(Box::new(
                 operation.clone(),
             )));

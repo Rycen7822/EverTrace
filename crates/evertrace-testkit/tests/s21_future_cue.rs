@@ -172,6 +172,7 @@ fn user_source(
         lifecycle: None,
     };
     let observation = SourceObservation {
+        source_local_evidence: None,
         source_observation_id: observation_id,
         source_instance_id: instance,
         source_revision: revision,
