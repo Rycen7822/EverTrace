@@ -632,6 +632,8 @@ pub enum HumanSystemDetail {
         body_state: String,
         access: String,
         workspace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_read_restrictions: Option<Vec<RepositoryId>>,
     },
     Job {
         detail: Box<HumanJobDetail>,
@@ -1517,8 +1519,12 @@ impl HumanSystemDetail {
                 body_state,
                 access,
                 workspace,
+                repository_read_restrictions,
             } => {
                 valid_ref(session_id)
+                    && repository_read_restrictions.as_ref().is_none_or(|ids| {
+                        ids.len() <= 16 && ids.windows(2).all(|pair| pair[0] < pair[1])
+                    })
                     && valid_ref(source_instance_id)
                     && item.object_kind == "session_import_current"
                     && matches!(

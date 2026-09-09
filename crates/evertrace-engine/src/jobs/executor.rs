@@ -56,6 +56,7 @@ enum WriterRequest {
     },
     SessionImportContext {
         source: String,
+        repository_locator: Option<(evertrace_domain::repository::FilesystemIdentity, String)>,
         reply: oneshot::Sender<Result<Option<SessionImportContext>, WriterActorError>>,
     },
     SessionImportContexts {
@@ -181,6 +182,25 @@ impl WriterHandle {
         self.sender
             .send(WriterRequest::SessionImportContext {
                 source: source.to_owned(),
+                repository_locator: None,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn session_import_context_with_repository(
+        &self,
+        source: &str,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+        common_dir: &str,
+    ) -> Result<Option<SessionImportContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SessionImportContext {
+                source: source.to_owned(),
+                repository_locator: Some((identity, common_dir.to_owned())),
                 reply,
             })
             .await
@@ -552,12 +572,19 @@ async fn run_writer(
                     .map_err(map_store_error);
                 let _ = reply.send(result);
             }
-            WriterRequest::SessionImportContext { source, reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .session_import_context(&source)
-                    .map_err(map_store_error);
+            WriterRequest::SessionImportContext {
+                source,
+                repository_locator,
+                reply,
+            } => {
+                let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                let result = match repository_locator {
+                    Some((identity, path)) => {
+                        writer.session_import_context_with_repository(&source, identity, &path)
+                    }
+                    None => writer.session_import_context(&source),
+                }
+                .map_err(map_store_error);
                 let _ = reply.send(result);
             }
             WriterRequest::SessionImportContexts {

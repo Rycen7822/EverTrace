@@ -3312,6 +3312,15 @@ impl JournalAdmissionState {
         frontier: u64,
         source: &str,
     ) -> Result<Option<crate::SessionImportContext>, StoreError> {
+        self.session_import_context_with_repository(frontier, source, None)
+    }
+
+    pub(crate) fn session_import_context_with_repository(
+        &self,
+        frontier: u64,
+        source: &str,
+        repository_locator: Option<(evertrace_domain::repository::FilesystemIdentity, &str)>,
+    ) -> Result<Option<crate::SessionImportContext>, StoreError> {
         let Some(current) = self.session_imports.get(source) else {
             return Ok(None);
         };
@@ -3343,7 +3352,110 @@ impl JournalAdmissionState {
             .resolved_worktree_instance_id
             .and_then(|id| self.worktrees.get(&id))
             .map(|(value, _)| value.clone());
-        let repository_purged = current
+        let candidates = current
+            .metadata
+            .read_restrictions()
+            .chain(self.repositories.values().filter_map(|(repository, _)| {
+                current
+                    .metadata
+                    .repository_candidate(repository)
+                    .then_some(repository.repository_id)
+            }))
+            .chain(self.worktrees.values().filter_map(|(worktree, _)| {
+                worktree
+                    .path_history
+                    .iter()
+                    .any(|path| current.metadata.workspace_matches_path(&path.path))
+                    .then_some(worktree.repository_instance_id)
+            }));
+        let located = self.repositories.values().filter_map(|(repository, _)| {
+            repository_locator
+                .is_some_and(|(identity, path)| {
+                    repository.common_dir_filesystem == Some(identity)
+                        || repository.git_common_dir_path.as_deref() == Some(path)
+                })
+                .then_some(repository.repository_id)
+        });
+        let mut read_ids = BTreeSet::new();
+        for id in candidates.chain(located) {
+            read_ids.insert(id);
+            if read_ids.len() > crate::session_import::MAX_REPOSITORY_READ_RESTRICTIONS {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let read_repositories = read_ids
+            .iter()
+            .map(|id| {
+                self.repositories
+                    .get(id)
+                    .map(|(value, _)| value.clone())
+                    .ok_or(StoreError::StoreCorrupt)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let read_worktrees = self
+            .worktrees
+            .values()
+            .filter(|(worktree, _)| read_ids.contains(&worktree.repository_instance_id))
+            .take(65)
+            .map(|(worktree, _)| worktree.clone())
+            .collect::<Vec<_>>();
+        if read_worktrees.len() > 64 {
+            return Err(StoreError::InvalidInput);
+        }
+        // Current snapshots are always present, regardless of historical size.
+        // One additional snapshot per repository/HEAD suffices for continuity;
+        // an omitted HEAD is explicitly unknown, never a negative proof.
+        let mut read_snapshots = read_worktrees
+            .iter()
+            .filter_map(|worktree| worktree.current_snapshot_id)
+            .filter_map(|id| self.worktree_snapshots.get(&id))
+            .map(|(snapshot, _)| snapshot.clone())
+            .collect::<Vec<_>>();
+        let mut incomplete_history = BTreeSet::new();
+        if repository_locator.is_some() {
+            let related_worktrees = read_worktrees
+                .iter()
+                .map(|tree| (tree.worktree_instance_id, tree.repository_instance_id))
+                .collect::<BTreeMap<_, _>>();
+            // Borrow head strings from admission state, not the bounded output
+            // vector that is extended below.
+            let mut represented_heads = read_worktrees
+                .iter()
+                .filter_map(|tree| {
+                    tree.current_snapshot_id
+                        .and_then(|id| self.worktree_snapshots.get(&id))
+                        .map(|(snapshot, _)| {
+                            (tree.repository_instance_id, snapshot.head_oid.as_deref())
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            for (snapshot, _) in self.worktree_snapshots.values() {
+                let Some(repository_id) = related_worktrees.get(&snapshot.worktree_instance_id)
+                else {
+                    continue;
+                };
+                let head = (*repository_id, snapshot.head_oid.as_deref());
+                if represented_heads.contains(&head) {
+                    continue;
+                }
+                if read_snapshots.len() < 64 {
+                    represented_heads.insert(head);
+                    read_snapshots.push(snapshot.clone());
+                } else {
+                    incomplete_history.insert(*repository_id);
+                }
+            }
+        }
+        let repository_purged = read_repositories.iter().any(|repository| {
+            current
+                .metadata
+                .read_restrictions()
+                .any(|id| id == repository.repository_id)
+                && self
+                    .scope_purges
+                    .current(repository.repository_id)
+                    .is_some()
+        }) || current
             .metadata
             .resolved_repository_instance_id
             .is_some_and(|id| self.scope_purges.current(id).is_some())
@@ -3365,6 +3477,10 @@ impl JournalAdmissionState {
             repository,
             worktree,
             repository_purged,
+            read_repositories,
+            read_worktrees,
+            read_snapshots,
+            incomplete_repository_history: incomplete_history.into_iter().collect(),
         }))
     }
 
@@ -3724,13 +3840,21 @@ fn derive_repository_scope_purge_preview(
         .session_imports
         .values()
         .filter(|session| {
-            session.metadata.resolved_repository_instance_id == Some(repository_id)
+            session
+                .metadata
+                .read_restrictions()
+                .any(|id| id == repository_id)
                 || session
                     .metadata
                     .resolved_worktree_instance_id
                     .is_some_and(|id| worktree_ids.contains(&id))
         })
         .map(crate::session_import::SessionImportCurrent::source_key)
+        .collect::<BTreeSet<_>>();
+    let target_source_instances = target_session_ids
+        .iter()
+        .filter_map(|key| inputs.session_imports.get(key))
+        .map(crate::session_import::SessionImportCurrent::source_instance)
         .collect::<BTreeSet<_>>();
     let target_snapshot_ids = inputs
         .worktree_snapshots
@@ -3746,12 +3870,23 @@ fn derive_repository_scope_purge_preview(
         .values()
         .filter_map(|(receipt, _)| {
             (receipt.repository_instance_id == Some(repository_id)
+                || target_source_instances.contains(receipt.source_instance_id.as_str())
                 || receipt
                     .worktree_instance_id
                     .is_some_and(|id| worktree_ids.contains(&id)))
             .then_some(receipt)
         })
         .collect::<Vec<_>>();
+    if target_receipts.iter().any(|receipt| {
+        receipt
+            .repository_instance_id
+            .is_some_and(|id| id != repository_id)
+            || receipt
+                .worktree_instance_id
+                .is_some_and(|id| !worktree_ids.contains(&id))
+    }) {
+        cross_scope_dependency = true;
+    }
     let target_observations = target_receipts
         .iter()
         .map(|receipt| receipt.source_observation_id)
@@ -4893,6 +5028,13 @@ fn job_targets_repository(
 }
 
 impl RepositoryClosureKeys {
+    fn imports_source(&self, instance: &SourceInstanceId) -> bool {
+        let source = instance.as_str();
+        crate::session_import::is_session_import_source(source)
+            && self
+                .session_ids
+                .contains(source.strip_prefix("codex-session:").unwrap_or(source))
+    }
     pub(crate) fn references_non_journal_row(&self, row: &ObjectRow) -> Result<bool, StoreError> {
         let Some(repository_id) = self.repository_id else {
             return Ok(false);
@@ -4982,22 +5124,29 @@ impl RepositoryClosureKeys {
                     || matches!(
                         &event.event,
                         crate::session_import::SessionImportEventKind::MetadataObserved { metadata }
-                            if metadata.resolved_repository_instance_id == Some(repository_id)
+                            if metadata.read_restrictions().any(|id| id == repository_id)
                                 || metadata
                                     .resolved_worktree_instance_id
                                     .is_some_and(|id| self.worktree_ids.contains(&id))
                     )
             }
-            JournalPayload::SourceRevisionRecorded(value) => self.source_revisions.contains(&(
-                value.source_instance_id.clone(),
-                value.source_revision.clone(),
-            )),
-            JournalPayload::SourceIngestWatermark(value) => self.source_revisions.contains(&(
-                value.source_instance_id.clone(),
-                value.source_revision.clone(),
-            )),
+            JournalPayload::SourceRevisionRecorded(value) => {
+                self.imports_source(&value.source_instance_id)
+                    || self.source_revisions.contains(&(
+                        value.source_instance_id.clone(),
+                        value.source_revision.clone(),
+                    ))
+            }
+            JournalPayload::SourceIngestWatermark(value) => {
+                self.imports_source(&value.source_instance_id)
+                    || self.source_revisions.contains(&(
+                        value.source_instance_id.clone(),
+                        value.source_revision.clone(),
+                    ))
+            }
             JournalPayload::SourceReceiptRecorded(value) => {
-                self.source_receipt_ids.contains(&value.source_receipt_id)
+                self.imports_source(&value.source_instance_id)
+                    || self.source_receipt_ids.contains(&value.source_receipt_id)
                     || self
                         .source_observation_ids
                         .contains(&value.source_observation_id)
@@ -5006,9 +5155,12 @@ impl RepositoryClosureKeys {
                         .worktree_instance_id
                         .is_some_and(|id| self.worktree_ids.contains(&id))
             }
-            JournalPayload::SourceObservationRecorded(value) => self
-                .source_observation_ids
-                .contains(&value.source_observation_id),
+            JournalPayload::SourceObservationRecorded(value) => {
+                self.imports_source(&value.source_instance_id)
+                    || self
+                        .source_observation_ids
+                        .contains(&value.source_observation_id)
+            }
             JournalPayload::EvidenceSurfaceRecorded(value) => {
                 self.source_observation_ids
                     .contains(&value.source_observation_revision_ref)
@@ -7364,6 +7516,14 @@ impl JournalAdmissionState {
                 self.recall_ledger.apply(*value, seq)?;
             }
             JournalPayload::SessionImportEventRecorded(value) => {
+                if let crate::SessionImportEventKind::MetadataObserved { metadata } = &value.event
+                    && metadata
+                        .repository_read_restrictions
+                        .as_ref()
+                        .is_some_and(|ids| ids.iter().any(|id| !self.repositories.contains_key(id)))
+                {
+                    return Err(StoreError::InvalidInput);
+                }
                 let next = crate::session_import::apply_session_event(
                     self.session_imports.get(&value.source_key()),
                     &value,
@@ -8350,6 +8510,14 @@ fn apply_event(
             state.recall_ledger.apply(*value, row.seq)?;
         }
         JournalPayload::SessionImportEventRecorded(value) => {
+            if let crate::SessionImportEventKind::MetadataObserved { metadata } = &value.event
+                && metadata
+                    .repository_read_restrictions
+                    .as_ref()
+                    .is_some_and(|ids| ids.iter().any(|id| !state.repositories.contains_key(id)))
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
             let next = crate::session_import::apply_session_event(
                 state.session_imports.get(&value.source_key()),
                 &value,
@@ -9659,6 +9827,15 @@ impl ReducerState {
             state.restore_row(row, payload)?;
         }
         state.deletions.validate_restored()?;
+        if state.session_imports.values().any(|current| {
+            current
+                .metadata
+                .repository_read_restrictions
+                .as_ref()
+                .is_some_and(|ids| ids.iter().any(|id| !state.repositories.contains_key(id)))
+        }) {
+            return Err(StoreError::StoreCorrupt);
+        }
         state.scope_purges.validate_restored()?;
         state.rebuild_revision_currents()?;
         state.validate_evidence_relations()?;
@@ -12171,6 +12348,21 @@ mod tests {
         objects::read_object_rows,
         writer::JournalWriter,
     };
+
+    #[test]
+    fn import_purge_source_fence_uses_instances_across_revisions() {
+        let source = "session-rollout:thread:019d0000-0000-7000-8000-000000000029";
+        let closure = RepositoryClosureKeys {
+            session_ids: ["thread".to_owned(), source.to_owned()]
+                .into_iter()
+                .collect(),
+            ..RepositoryClosureKeys::default()
+        };
+        assert!(closure.imports_source(&SourceInstanceId::parse("codex-session:thread").unwrap()));
+        assert!(closure.imports_source(&SourceInstanceId::parse(source).unwrap()));
+        assert!(!closure.imports_source(&SourceInstanceId::parse("thread").unwrap()));
+        assert!(!closure.imports_source(&SourceInstanceId::parse("codex-session:other").unwrap()));
+    }
 
     #[test]
     fn import_current_is_source_local_and_selection_wraps_at_actual_cursor() {

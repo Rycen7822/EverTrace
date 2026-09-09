@@ -71,9 +71,59 @@ impl McpActionService {
         };
         let mut classified = Vec::new();
         let mut classification_omitted = BTreeSet::new();
+        let candidate_ids = found
+            .candidates
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.candidate_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let selected = scope
+            .snapshot
+            .data_rows()
+            .filter(|row| {
+                candidate_ids.contains(row.row_id.as_str())
+                    || row
+                        .object_id
+                        .as_deref()
+                        .is_some_and(|id| candidate_ids.contains(id))
+                    || row
+                        .current_revision_id
+                        .as_deref()
+                        .is_some_and(|id| candidate_ids.contains(id))
+            })
+            .take(65)
+            .collect::<Vec<_>>();
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        let blocked = crate::session_import::blocked_source_rows(
+            &self.writer,
+            report.as_ref(),
+            &scope.snapshot,
+            &selected,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
+        let blocked_candidates = selected
+            .iter()
+            .filter(|row| blocked.contains(&row.row_id))
+            .flat_map(|row| {
+                [
+                    row.object_id.as_deref(),
+                    row.current_revision_id.as_deref(),
+                    Some(row.row_id.as_str()),
+                ]
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
         let now = unix_time_us_for_mcp();
         let mut procedure_revisions = Vec::new();
         for candidate in found.candidates.into_iter().take(3) {
+            if blocked_candidates.contains(candidate.candidate_id.as_str()) {
+                classification_omitted.insert(candidate.candidate_id);
+                continue;
+            }
             if candidate.object_kind.as_deref() == Some("procedure_revision") {
                 procedure_revisions.push(candidate.candidate_id);
                 continue;
@@ -446,6 +496,28 @@ impl McpActionService {
                 [],
             ));
         };
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        if !crate::session_import::blocked_source_rows(
+            &self.writer,
+            report.as_ref(),
+            &scope.snapshot,
+            &[row],
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?
+        .is_empty()
+        {
+            return Ok(empty_result(
+                request_id,
+                McpServiceStatus::NotFound,
+                &scope_label(&scope),
+                "current",
+                ["source_read_restricted"],
+            ));
+        }
         let payload = if row.object_kind.as_deref() == Some("source_receipt") {
             let receipt = match row
                 .payload_json

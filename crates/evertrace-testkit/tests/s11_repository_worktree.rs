@@ -561,6 +561,19 @@ async fn linked_worktree_move_prune_and_recreate_follow_identity_rules() {
         worktree_at(&view, &linked).unwrap().kind,
         WorktreeKind::Linked
     );
+    harness.refresh(&linked).await;
+    let linked_view = harness.view().await;
+    assert_eq!(only_repository(&linked_view).repository_id, repository_id);
+    assert_eq!(
+        only_repository(&linked_view).current_path,
+        repo.to_str().unwrap()
+    );
+    assert_eq!(
+        worktree_at(&linked_view, &linked)
+            .unwrap()
+            .worktree_instance_id,
+        linked_id
+    );
 
     // `git worktree move`: same instance, path history extended.
     git(
@@ -577,7 +590,13 @@ async fn linked_worktree_move_prune_and_recreate_follow_identity_rules() {
     let view = harness.view().await;
     let linked_after_move = view.worktrees.get(&linked_id).unwrap();
     assert_eq!(view.worktrees.len(), 2);
-    assert_eq!(linked_after_move.worktree_revision, 2);
+    assert_eq!(
+        linked_after_move.worktree_revision,
+        worktree_at(&linked_view, &linked)
+            .unwrap()
+            .worktree_revision
+            + 1
+    );
     assert_eq!(linked_after_move.lifecycle, WorktreeLifecycle::Active);
     assert_eq!(
         linked_after_move.current_path.as_deref(),

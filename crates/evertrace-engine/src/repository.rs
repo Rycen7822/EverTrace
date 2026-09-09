@@ -15,8 +15,8 @@ mod integration;
 mod resolver;
 mod session_catalog;
 pub(crate) use session_catalog::{
-    SESSION_ROOT_PROBE_BUDGET, freeze_native_namespace, read_report_repository_trust_before,
-    read_report_worktree_trust_before,
+    SESSION_ROOT_PROBE_BUDGET, freeze_native_namespace, read_report_path_trust_before,
+    read_report_repository_trust_before,
 };
 
 pub(crate) use git_probe::with_probe_deadline;
@@ -28,6 +28,9 @@ pub use git_probe::{
     probe_affected_path_git_proof_pinned, probe_is_ancestor, probe_patch_equivalence,
     probe_recovery_capture, probe_recovery_capture_scoped, probe_recovery_capture_scoped_pinned,
     probe_repository, probe_repository_pinned, remote_fingerprint,
+};
+pub(crate) use git_probe::{
+    WorkspaceGitLocation, probe_repository_identity, workspace_git_location,
 };
 pub use integration::{IntegrationEvidence, resolve_integration};
 pub use resolver::{

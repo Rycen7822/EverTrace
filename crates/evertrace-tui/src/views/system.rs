@@ -155,6 +155,7 @@ mod tests {
             system_detail: Some(HumanSystemDetail::SessionImport {
                 session_id: "019d0000-0000-7000-8000-000000000001".into(),
                 source_instance_id: source.into(),
+                repository_read_restrictions: Some(Vec::new()),
                 body_state: "Partial".into(),
                 access: "Approved".into(),
                 workspace: "NonRepository".into(),

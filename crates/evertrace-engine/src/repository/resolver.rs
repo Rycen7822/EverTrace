@@ -131,7 +131,7 @@ impl RepositoryResolution {
             .map_err(|_| RepositoryResolveError::InvalidInput)
     }
 
-    fn payloads(&self) -> Vec<JournalPayload> {
+    pub(crate) fn payloads(&self) -> Vec<JournalPayload> {
         self.repositories
             .iter()
             .cloned()
@@ -185,17 +185,29 @@ pub struct RepositoryResolveInput<'a> {
 pub fn resolve_repository(
     input: &RepositoryResolveInput<'_>,
 ) -> Result<RepositoryResolution, RepositoryResolveError> {
-    let evidence = input.evidence;
-    if evidence.probe_schema_version != GIT_PROBE_SCHEMA_VERSION
-        || evidence.evidence_refs.is_empty()
-        || evidence.occurred_at_us < 0
-    {
-        return Err(RepositoryResolveError::InvalidEvidence);
+    input.resolve_with_incomplete_history(&BTreeSet::new())
+}
+
+impl RepositoryResolveInput<'_> {
+    /// Import discovery may supply a bounded history/ancestry view. A positive
+    /// candidate is usable only if no other identity candidate is still unknown.
+    pub(crate) fn resolve_with_incomplete_history(
+        &self,
+        incomplete_history: &BTreeSet<RepositoryId>,
+    ) -> Result<RepositoryResolution, RepositoryResolveError> {
+        let input = self;
+        let evidence = input.evidence;
+        if evidence.probe_schema_version != GIT_PROBE_SCHEMA_VERSION
+            || evidence.evidence_refs.is_empty()
+            || evidence.occurred_at_us < 0
+        {
+            return Err(RepositoryResolveError::InvalidEvidence);
+        }
+        if let Some(reason) = evidence.unavailable_reason {
+            return Ok(resolve_unavailable(input, reason));
+        }
+        resolve_established(input, incomplete_history)
     }
-    if let Some(reason) = evidence.unavailable_reason {
-        return Ok(resolve_unavailable(input, reason));
-    }
-    resolve_established(input)
 }
 
 fn resolve_unavailable(
@@ -284,6 +296,7 @@ fn resolve_unavailable(
 
 fn resolve_established(
     input: &RepositoryResolveInput<'_>,
+    incomplete_history: &BTreeSet<RepositoryId>,
 ) -> Result<RepositoryResolution, RepositoryResolveError> {
     let evidence = input.evidence;
     let view = input.view;
@@ -345,17 +358,42 @@ fn resolve_established(
         identity_matches
             .iter()
             .copied()
-            .filter(|repository| candidate_continuity_positive(input, repository))
+            .filter(|repository| {
+                // An empty bounded history cannot establish historical unbornness.
+                (evidence.head_oid.is_some()
+                    || !incomplete_history.contains(&repository.repository_id))
+                    && candidate_continuity_positive(input, repository)
+            })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
     match positive.as_slice() {
+        [repository]
+            if identity_matches.iter().any(|other| {
+                other.repository_id != repository.repository_id
+                    && incomplete_history.contains(&other.repository_id)
+            }) =>
+        {
+            Ok(RepositoryResolution::empty(
+                ResolutionKind::Ambiguous,
+                Some("continuity_history_incomplete".into()),
+            ))
+        }
         [repository] => resolve_existing_repository(input, repository, &root),
         [] if !complete => Ok(RepositoryResolution::empty(
             ResolutionKind::Ambiguous,
             Some("continuity_evidence_incomplete".into()),
         )),
+        [] if identity_matches
+            .iter()
+            .any(|repository| incomplete_history.contains(&repository.repository_id)) =>
+        {
+            Ok(RepositoryResolution::empty(
+                ResolutionKind::Ambiguous,
+                Some("continuity_history_incomplete".into()),
+            ))
+        }
         [] => {
             let derived_from = match identity_matches.as_slice() {
                 // A single identity candidate keeps the re-init semantics:
@@ -451,7 +489,23 @@ fn resolve_existing_repository(
     let evidence = input.evidence;
     let view = input.view;
     let mut resolution = RepositoryResolution::empty(ResolutionKind::NoDelta, None);
-    let moved = repository.current_path != root;
+    // A probe of a linked worktree is not a move of its repository. Git's
+    // common-admin entry, not the selected worktree, locates the main root.
+    let repository_root = if evidence.git_dir != evidence.common_dir {
+        evidence
+            .worktree_entries
+            .iter()
+            .find(|entry| entry.gitdir.is_some() && entry.gitdir == evidence.common_dir)
+            .map(|entry| entry.path.as_str())
+            .or_else(|| {
+                (repository.git_common_dir_path == evidence.common_dir)
+                    .then_some(repository.current_path.as_str())
+            })
+            .ok_or(RepositoryResolveError::InvalidEvidence)?
+    } else {
+        root
+    };
+    let moved = repository.current_path != repository_root;
     let remotes_changed = repository.remote_fingerprints != evidence.remote_fingerprints;
     if !continuity_probe_complete(evidence) {
         // An incomplete continuity probe never rewrites identity either way.
@@ -472,11 +526,11 @@ fn resolve_existing_repository(
         // proven move is always fully proven.
         let assessment = LineageAssessment::Proven;
         let mut history = repository.path_history.clone();
-        history.push(path_observation(root, evidence));
+        history.push(path_observation(repository_root, evidence));
         let successor = RepositoryInstance {
             repository_revision: repository.repository_revision + 1,
             predecessor_revision: Some(repository.repository_revision),
-            current_path: root.to_owned(),
+            current_path: repository_root.to_owned(),
             path_history: history,
             git_common_dir_path: evidence.common_dir.clone(),
             identity_evidence_refs: union_refs(

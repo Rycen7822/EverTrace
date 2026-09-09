@@ -708,12 +708,14 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
                 body_state,
                 access,
                 workspace,
+                repository_read_restrictions,
             } => {
                 lines.extend([
                     format!("session: {session_id}"),
                     format!("source: {source_instance_id}"),
                     format!("body: {body_state}"),
                     format!("access: {access}; workspace: {workspace}"),
+                    format!("repository read restrictions: {repository_read_restrictions:?}"),
                 ]);
             }
             HumanSystemDetail::Config {

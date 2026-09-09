@@ -216,6 +216,18 @@ fn submitted(
         && observation.capture_completeness == CaptureCompleteness::Partial
 }
 
+fn archived_claim(
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+    observation: &evertrace_domain::evidence::SourceObservation,
+    session: &str,
+) -> bool {
+    receipt.source_session_ref == session
+        && receipt.source_kind == EvidenceSourceKind::CodexSessionJsonl
+        && evertrace_store::is_session_import_source(receipt.source_instance_id.as_str())
+        && observation.source_role == SourceRole::Imported
+        && observation.content_trust == ContentTrust::ImportedClaim
+}
+
 fn repository_visible(
     snapshot: &ProjectionSnapshot,
     binding: &McpResolvedScope,
@@ -856,6 +868,10 @@ impl McpActionService {
         let mut items = vec![];
         let mut truncated = false;
         let mut next_refs = vec![];
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
         if requested.is_empty() {
             // Current rows already contain canonical, validated payloads. This
             // lexical prefilter only avoids decoding unrelated sessions; typed
@@ -870,8 +886,9 @@ impl McpActionService {
                 row.object_kind.as_deref() == Some("source_receipt")
                     && row.payload_json.as_deref().is_some_and(|json| {
                         json.contains(&needle)
-                            && json.contains("\"source_kind\":\"codex_hook\"")
-                            && json.contains("\"observation_role\":\"message\"")
+                            && ((json.contains("\"source_kind\":\"codex_hook\"")
+                                && json.contains("\"observation_role\":\"message\""))
+                                || json.contains("\"source_kind\":\"codex_session_jsonl\""))
                     })
             }) {
                 recent.insert((row.source_event_seq, row.row_id.as_str()), row);
@@ -880,8 +897,20 @@ impl McpActionService {
                     truncated = true;
                 }
             }
+            let selected = recent.values().copied().collect::<Vec<_>>();
+            let blocked = crate::session_import::blocked_source_rows(
+                &self.writer,
+                report.as_ref(),
+                &snapshot,
+                &selected,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?;
             let mut remaining = 8 * 1024 * 1024usize;
             for (_, row) in recent.into_iter().rev() {
+                if blocked.contains(&row.row_id) {
+                    continue;
+                }
                 let Some(reference) = &row.object_id else {
                     continue;
                 };
@@ -895,7 +924,11 @@ impl McpActionService {
                 let Some((receipt, observation)) = source_pair(&snapshot, reference)? else {
                     continue;
                 };
-                if !submitted(&receipt, &observation, session) {
+                if !submitted(&receipt, &observation, session)
+                    && !(archived_claim(&receipt, &observation, session)
+                        && receipt.unsupported_record_classification.is_none()
+                        && receipt.observation_role != ObservationRole::StateProbe)
+                {
                     continue;
                 }
                 if let Some(repository) = receipt.repository_instance_id
@@ -913,18 +946,39 @@ impl McpActionService {
                 if !text.to_lowercase().contains(&input.to_lowercase()) {
                     continue;
                 }
-                items.push(evidence_item(row, text, ContentTrust::Observed));
+                items.push(evidence_item(row, text, observation.content_trust));
                 if items.len() == 3 {
                     truncated = true;
                     break;
                 }
             }
         } else {
+            let selected = requested
+                .iter()
+                .take(3)
+                .filter_map(|reference| {
+                    select_object_row(&snapshot, reference)
+                        .ok()
+                        .flatten()
+                        .map(|(row, _)| row)
+                })
+                .collect::<Vec<_>>();
+            let blocked = crate::session_import::blocked_source_rows(
+                &self.writer,
+                report.as_ref(),
+                &snapshot,
+                &selected,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?;
             for reference in requested.iter().take(3) {
                 let Some((row, true)) = select_object_row(&snapshot, reference).ok().flatten()
                 else {
                     continue;
                 };
+                if blocked.contains(&row.row_id) {
+                    continue;
+                }
                 let task = reference
                     .parse::<TaskId>()
                     .ok()
@@ -966,7 +1020,8 @@ impl McpActionService {
                         ));
                     }
                 } else if let Some((receipt, observation)) = source_pair(&snapshot, reference)?
-                    && submitted(&receipt, &observation, session)
+                    && (submitted(&receipt, &observation, session)
+                        || archived_claim(&receipt, &observation, session))
                 {
                     if let Some(repository) = receipt.repository_instance_id
                         && !repository_visible(
@@ -982,7 +1037,7 @@ impl McpActionService {
                     items.push(evidence_item(
                         row,
                         presentation_text(&receipt),
-                        ContentTrust::Observed,
+                        observation.content_trust,
                     ));
                 }
             }

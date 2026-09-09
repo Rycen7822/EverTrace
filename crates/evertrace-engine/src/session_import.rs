@@ -37,7 +37,7 @@ use evertrace_store::{
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{WriterActorError, WriterHandle, repository::read_report_repository_trust_before};
+use crate::{WriterActorError, WriterHandle};
 
 pub(crate) use evertrace_codex::session_import::MAX_RECORD_BYTES;
 const SOURCE_FORMAT: &str = "codex_rollout_jsonl_v1";
@@ -209,7 +209,7 @@ impl SessionCatalogService {
     ) -> Result<usize, SessionImportServiceError> {
         let mut cursor = self.cursor.lock().await;
         let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let repositories = RepositoryCurrentView::from_snapshot(&snapshot)
+        let mut repositories = RepositoryCurrentView::from_snapshot(&snapshot)
             .map_err(|_| SessionImportServiceError::Corrupt)?;
         let current = SessionImportCurrentView::from_snapshot(&snapshot)
             .map_err(|_| SessionImportServiceError::Corrupt)?;
@@ -244,8 +244,30 @@ impl SessionCatalogService {
             })?;
         let occurred_at_us = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
         let mut payloads = Vec::new();
-        for (source_key, item) in updates {
+        let preflight_deadline = Instant::now() + std::time::Duration::from_millis(250);
+        for (source_key, mut item) in updates {
             let old = current.sessions.get(&source_key);
+            let location = workspace_location(&item.metadata, preflight_deadline)
+                .ok()
+                .flatten();
+            discover_source_repository(
+                &item.metadata,
+                &item.source_instance_id,
+                RepositoryDiscoveryView {
+                    current: &mut repositories,
+                    incomplete_history: &[],
+                },
+                occurred_at_us,
+                preflight_deadline,
+                &mut payloads,
+                location.as_ref(),
+            )?;
+            retain_read_restrictions(
+                &mut item.metadata,
+                old.map(|old| &old.metadata),
+                &repositories,
+                location.as_ref(),
+            )?;
             if old.is_some_and(|old| old.metadata == item.metadata) {
                 continue;
             }
@@ -471,6 +493,8 @@ impl SessionImportAdminService {
         });
         let repositories = RepositoryCurrentView::from_snapshot(&snapshot)
             .map_err(|_| SessionImportServiceError::Corrupt)?;
+        let purges = evertrace_store::purge::ScopePurgeCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
         let mut events = Vec::new();
         let mut unavailable = 0;
         let mut changed = 0;
@@ -492,54 +516,125 @@ impl SessionImportAdminService {
                     ) {
                         continue;
                     }
-                    match current.metadata.workspace_resolution_kind {
-                        WorkspaceResolutionKind::Repository => {
-                            if !current
-                                .metadata
-                                .resolved_worktree_instance_id
-                                .zip(report.as_ref())
-                                .is_some_and(|(worktree_id, report)| {
-                                    read_report_repository_trust_before(
-                                        report,
-                                        &repositories,
-                                        worktree_id,
-                                        deadline,
-                                    )
-                                    .state
-                                        == RepositoryTrustState::Trusted
-                                })
-                            {
-                                unavailable += 1;
-                                continue;
-                            }
-                        }
-                        WorkspaceResolutionKind::NonRepository => {}
-                        WorkspaceResolutionKind::Ambiguous
-                        | WorkspaceResolutionKind::Unavailable => {
-                            unavailable += 1;
-                            continue;
-                        }
+                    let mut prepared_current = current.clone();
+                    let location = workspace_location(&current.metadata, deadline)
+                        .ok()
+                        .flatten();
+                    retain_read_restrictions(
+                        &mut prepared_current.metadata,
+                        Some(&current.metadata),
+                        &repositories,
+                        location.as_ref(),
+                    )?;
+                    if current.metadata.repository_read_restrictions.is_none() {
+                        prepared_current.metadata.workspace_resolution_kind =
+                            WorkspaceResolutionKind::Ambiguous;
+                        prepared_current.metadata.resolved_repository_instance_id = None;
+                        prepared_current.metadata.resolved_worktree_instance_id = None;
+                    }
+                    if prepared_current.metadata.read_restrictions().any(|id| {
+                        repositories
+                            .repositories
+                            .get(&id)
+                            .zip(report.as_ref())
+                            .is_none_or(|(repository, report)| {
+                                crate::repository::read_report_path_trust_before(
+                                    report,
+                                    Some(repository_trust_path(
+                                        &prepared_current.metadata,
+                                        repository,
+                                        location.as_ref(),
+                                        repositories.worktrees.values(),
+                                    )),
+                                    deadline,
+                                )
+                                .state
+                                    != RepositoryTrustState::Trusted
+                            })
+                    }) || purges.events.keys().any(|id| {
+                        prepared_current
+                            .metadata
+                            .read_restrictions()
+                            .any(|restriction| restriction == *id)
+                    }) {
+                        unavailable += 1;
+                        continue;
+                    }
+                    if prepared_current.metadata != current.metadata {
+                        prepared_current.revision += 1;
+                        events.push(JournalEventDraft::runtime(
+                            occurred_at_us,
+                            self.effective_config_hash,
+                            "session_import_preflight",
+                            JournalPayload::SessionImportEventRecorded(Box::new(
+                                SessionImportEvent {
+                                    source_instance_id: current.source_instance_id.clone(),
+                                    session_id: current.session_id.clone(),
+                                    revision: prepared_current.revision,
+                                    predecessor_revision: Some(current.revision),
+                                    occurred_at_us,
+                                    event: SessionImportEventKind::MetadataObserved {
+                                        metadata: Box::new(prepared_current.metadata.clone()),
+                                    },
+                                },
+                            )),
+                        ));
                     }
                     queue_command(
                         request_id,
-                        current,
+                        &prepared_current,
                         occurred_at_us,
                         self.effective_config_hash,
                     )?
                 }
                 SessionImportAdminAction::RevokeAccess => {
-                    if current.metadata.workspace_resolution_kind
-                        != WorkspaceResolutionKind::NonRepository
-                    {
-                        unavailable += 1;
-                        continue;
+                    if current.access_decision.is_none() {
+                        let archived = self
+                            .writer
+                            .session_import_context(&current.source_key())
+                            .await
+                            .map_err(map_writer)?
+                            .is_some_and(|context| {
+                                context.watermark.is_some() || context.previous_revision.is_some()
+                            });
+                        if !archived {
+                            unavailable += 1;
+                            continue;
+                        }
                     }
                     if current.access_decision == Some(SessionAccessDecision::Revoked) {
                         continue;
                     }
+                    let mut prepared_current = current.clone();
+                    if current.metadata.repository_read_restrictions.is_none() {
+                        retain_read_restrictions(
+                            &mut prepared_current.metadata,
+                            Some(&current.metadata),
+                            &repositories,
+                            None,
+                        )?;
+                        prepared_current.revision += 1;
+                        events.push(JournalEventDraft::runtime(
+                            occurred_at_us,
+                            self.effective_config_hash,
+                            "session_import_preflight",
+                            JournalPayload::SessionImportEventRecorded(Box::new(
+                                SessionImportEvent {
+                                    session_id: current.session_id.clone(),
+                                    source_instance_id: current.source_instance_id.clone(),
+                                    revision: prepared_current.revision,
+                                    predecessor_revision: Some(current.revision),
+                                    occurred_at_us,
+                                    event: SessionImportEventKind::MetadataObserved {
+                                        metadata: Box::new(prepared_current.metadata.clone()),
+                                    },
+                                },
+                            )),
+                        ));
+                    }
                     revoke_command(
                         request_id,
-                        current,
+                        &prepared_current,
                         active_import_job(&snapshot, &current.source_key())?,
                         occurred_at_us,
                         self.effective_config_hash,
@@ -702,6 +797,7 @@ fn unavailable_metadata(metadata: &SessionMetadata) -> SessionMetadata {
     metadata.workspace_resolution_kind = WorkspaceResolutionKind::Unavailable;
     metadata.resolved_repository_instance_id = None;
     metadata.resolved_worktree_instance_id = None;
+    metadata.metadata_state = MetadataState::Partial;
     metadata
 }
 
@@ -976,8 +1072,21 @@ impl CatalogReader<'_> {
         self.read_bytes = self.budget.max_metadata_bytes - remaining;
         let header = result?;
         let workspace = header.payload.cwd.as_deref();
-        let (resolution, repository_id, worktree_id) =
-            resolve_workspace(workspace, &header.payload.git, self.repositories)?;
+        let (_, rollout) = evertrace_codex::session_import::rollout_ids_from_name(
+            relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(SessionCatalogError::Unsupported)?,
+        )
+        .map_err(|_| SessionCatalogError::Unsupported)?;
+        let source_instance = format!("session-rollout:{session_id}:{rollout}");
+        let started_at_us = source_timestamp_us(&header._timestamp);
+        let (resolution, repository_id, worktree_id) = resolve_workspace(
+            workspace,
+            &header.payload.git,
+            started_at_us.map(|time| (source_instance.as_str(), time)),
+            self.repositories,
+        )?;
         let fingerprint = session_source_fingerprint(identity);
         let source_revision =
             session_source_revision(identity).map_err(|_| SessionCatalogError::Unsupported)?;
@@ -996,7 +1105,7 @@ impl CatalogReader<'_> {
             metadata: SessionMetadata {
                 source_path: relative.to_string_lossy().into_owned(),
                 source_format: SOURCE_FORMAT.into(),
-                started_at_us: None,
+                started_at_us,
                 ended_at_us: None,
                 host: header.payload.originator,
                 model_profile: header.payload.model_provider,
@@ -1006,6 +1115,7 @@ impl CatalogReader<'_> {
                 workspace_resolution_kind: resolution,
                 resolved_repository_instance_id: repository_id,
                 resolved_worktree_instance_id: worktree_id,
+                repository_read_restrictions: None,
                 file_size: identity.size,
                 file_mtime_us: identity
                     .mtime_seconds
@@ -1027,9 +1137,633 @@ use evertrace_codex::session_import::{SessionGit, SessionMetaRecord};
 #[cfg(test)]
 use evertrace_codex::session_import::{SessionGitObject, SessionMetaPayload};
 
+fn retain_read_restrictions(
+    metadata: &mut SessionMetadata,
+    old: Option<&SessionMetadata>,
+    repositories: &RepositoryCurrentView,
+    location: Option<&crate::repository::WorkspaceGitLocation>,
+) -> Result<(), SessionImportServiceError> {
+    let mut restrictions = metadata
+        .read_restrictions()
+        .collect::<std::collections::BTreeSet<_>>();
+    let candidates = old
+        .into_iter()
+        .flat_map(SessionMetadata::read_restrictions)
+        .chain(repositories.repositories.values().filter_map(|repository| {
+            repository_candidate_at(metadata, repository, location)
+                .then_some(repository.repository_id)
+        }))
+        .chain(repositories.worktrees.values().filter_map(|worktree| {
+            worktree
+                .path_history
+                .iter()
+                .any(|path| {
+                    location.map_or_else(
+                        || metadata.workspace_matches_path(&path.path),
+                        |location| Path::new(&path.path) == location.worktree_path,
+                    )
+                })
+                .then_some(worktree.repository_instance_id)
+        }));
+    for id in candidates {
+        restrictions.insert(id);
+        if restrictions.len() > evertrace_store::MAX_REPOSITORY_READ_RESTRICTIONS {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+    }
+    metadata.repository_read_restrictions = Some(restrictions.into_iter().collect());
+    Ok(())
+}
+
+fn workspace_location(
+    metadata: &SessionMetadata,
+    deadline: Instant,
+) -> Result<
+    Option<crate::repository::WorkspaceGitLocation>,
+    evertrace_domain::repository::ProbeUnavailableReason,
+> {
+    metadata
+        .workspace_hint
+        .as_deref()
+        .map(|workspace| crate::repository::workspace_git_location(Path::new(workspace), deadline))
+        .unwrap_or(Ok(None))
+}
+
+fn repository_candidate_at(
+    metadata: &SessionMetadata,
+    repository: &evertrace_domain::repository::RepositoryInstance,
+    location: Option<&crate::repository::WorkspaceGitLocation>,
+) -> bool {
+    location.map_or_else(
+        || metadata.repository_candidate(repository),
+        |location| {
+            repository.common_dir_filesystem == Some(location.common_dir_filesystem)
+                || Path::new(&repository.current_path) == location.worktree_path
+                || repository
+                    .path_history
+                    .iter()
+                    .any(|path| Path::new(&path.path) == location.worktree_path)
+        },
+    )
+}
+
+fn workspace_registered<'a>(
+    location: &crate::repository::WorkspaceGitLocation,
+    repository: &evertrace_domain::repository::RepositoryInstance,
+    mut worktrees: impl Iterator<Item = &'a evertrace_domain::repository::WorktreeInstance>,
+) -> bool {
+    repository.common_dir_filesystem == Some(location.common_dir_filesystem)
+        && worktrees.any(|worktree| {
+            worktree.repository_instance_id == repository.repository_id
+                && worktree.current_path.as_deref().map(Path::new)
+                    == Some(location.worktree_path.as_path())
+                && worktree
+                    .git_admin_path_history
+                    .last()
+                    .is_some_and(|path| Path::new(&path.path) == location.git_dir)
+        })
+}
+
+fn repository_trust_path<'a>(
+    metadata: &SessionMetadata,
+    repository: &'a evertrace_domain::repository::RepositoryInstance,
+    location: Option<&'a crate::repository::WorkspaceGitLocation>,
+    worktrees: impl Iterator<Item = &'a evertrace_domain::repository::WorktreeInstance>,
+) -> &'a str {
+    if let Some(location) = location
+        .filter(|location| repository.common_dir_filesystem == Some(location.common_dir_filesystem))
+        && let Some(path) = location.worktree_path.to_str()
+    {
+        return path;
+    }
+    worktrees
+        .filter(|worktree| worktree.repository_instance_id == repository.repository_id)
+        .flat_map(|worktree| worktree.path_history.iter())
+        .filter(|path| metadata.workspace_matches_path(&path.path))
+        .max_by_key(|path| path.path.len())
+        .map_or(repository.current_path.as_str(), |path| path.path.as_str())
+}
+
+struct RepositoryDiscoveryView<'a> {
+    current: &'a mut RepositoryCurrentView,
+    incomplete_history: &'a [evertrace_domain::ids::RepositoryId],
+}
+
+fn discover_source_repository(
+    metadata: &SessionMetadata,
+    source: &str,
+    repositories: RepositoryDiscoveryView<'_>,
+    occurred_at_us: i64,
+    deadline: Instant,
+    payloads: &mut Vec<JournalPayload>,
+    location: Option<&crate::repository::WorkspaceGitLocation>,
+) -> Result<(), SessionImportServiceError> {
+    let RepositoryDiscoveryView {
+        current: repositories,
+        incomplete_history,
+    } = repositories;
+    let Some(workspace) = metadata.workspace_hint.as_deref() else {
+        return Ok(());
+    };
+    let Some(location) = location else {
+        return Ok(());
+    };
+    if Instant::now() >= deadline
+        || repositories.repositories.values().any(|repository| {
+            workspace_registered(location, repository, repositories.worktrees.values())
+        })
+    {
+        return Ok(());
+    }
+    let Ok(root) = ConfinedRoot::open_external_source(Path::new(workspace)) else {
+        return Ok(());
+    };
+    // Probe current HEADs first. Historical snapshot count must not consume
+    // the Git quantum before current positive continuity can be considered.
+    let identity_candidates = repositories
+        .repositories
+        .values()
+        .filter(|repository| {
+            repository.common_dir_filesystem == Some(location.common_dir_filesystem)
+        })
+        .map(|repository| repository.repository_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let heads = repositories
+        .worktrees
+        .values()
+        .filter(|tree| identity_candidates.contains(&tree.repository_instance_id))
+        .filter_map(|tree| tree.current_snapshot_id)
+        .filter_map(|id| repositories.snapshots.get(&id))
+        .filter_map(|snapshot| snapshot.head_oid.as_ref())
+        .filter_map(|head| crate::repository::GitOid::parse(head).ok())
+        .take(64)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut incomplete_history = incomplete_history
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for snapshot in repositories.snapshots.values() {
+        if let Some(head) = snapshot.head_oid.as_ref()
+            && !heads.iter().any(|probed| probed.as_str() == head)
+            && let Some(tree) = repositories.worktrees.get(&snapshot.worktree_instance_id)
+        {
+            incomplete_history.insert(tree.repository_instance_id);
+        }
+    }
+    let evidence = crate::repository::probe_repository_identity(
+        Path::new(workspace),
+        &[format!("session_import_preflight:{source}")],
+        occurred_at_us,
+        deadline,
+        &heads,
+    )
+    .map_err(|_| SessionImportServiceError::Unavailable)?;
+    if root.revalidate().is_err()
+        || evidence.unavailable_reason.is_some()
+        || evidence.common_dir_filesystem != Some(location.common_dir_filesystem)
+        || evidence.git_dir.as_deref().map(Path::new) != Some(location.git_dir.as_path())
+        || workspace_location(metadata, deadline)
+            .ok()
+            .flatten()
+            .as_ref()
+            != Some(location)
+    {
+        return Ok(());
+    }
+    let resolution = crate::repository::RepositoryResolveInput {
+        view: repositories,
+        evidence: &evidence,
+        derived_from_hint: None,
+    }
+    .resolve_with_incomplete_history(&incomplete_history)
+    .map_err(|_| SessionImportServiceError::Unavailable)?;
+    payloads.extend(resolution.payloads());
+    for repository in resolution.repositories {
+        repositories
+            .repositories
+            .insert(repository.repository_id, repository);
+    }
+    for worktree in resolution.worktrees {
+        repositories
+            .worktrees
+            .insert(worktree.worktree_instance_id, worktree);
+    }
+    for snapshot in resolution.snapshots {
+        repositories
+            .snapshots
+            .insert(snapshot.worktree_snapshot_id, snapshot);
+    }
+    for transition in resolution.transitions {
+        repositories
+            .transitions
+            .insert(transition.worktree_transition_id, transition);
+    }
+    for integration in resolution.integrations {
+        repositories
+            .integrations
+            .insert(integration.integration_event_id, integration);
+    }
+    Ok(())
+}
+
+/// Current restrictions for already durable receipts. Source-file availability
+/// and approval for a newer revision do not authorize or invalidate old CAS.
+pub(crate) fn source_read_allowed(
+    report: &HostProbeReport,
+    context: &evertrace_store::SessionImportContext,
+    deadline: Instant,
+) -> bool {
+    let current = &context.current;
+    let restrictions = current
+        .metadata
+        .read_restrictions()
+        .collect::<std::collections::BTreeSet<_>>();
+    let Ok(location) = workspace_location(&current.metadata, deadline) else {
+        return false;
+    };
+    let owner = location.as_ref().and_then(|location| {
+        let mut matches = context.read_repositories.iter().filter(|repository| {
+            workspace_registered(location, repository, context.read_worktrees.iter())
+        });
+        let owner = matches.next()?;
+        matches.next().is_none().then_some(owner.repository_id)
+    });
+    if location.is_some() && owner.is_none() {
+        return false;
+    }
+    if context.repository_purged
+        || current.access_decision == Some(SessionAccessDecision::Revoked)
+        || context
+            .read_repositories
+            .iter()
+            .filter(|repository| {
+                restrictions.contains(&repository.repository_id)
+                    || repository_candidate_at(&current.metadata, repository, location.as_ref())
+                    || (location.is_none()
+                        && context.read_worktrees.iter().any(|worktree| {
+                            worktree.repository_instance_id == repository.repository_id
+                                && worktree
+                                    .path_history
+                                    .iter()
+                                    .any(|path| current.metadata.workspace_matches_path(&path.path))
+                        }))
+            })
+            .any(|repository| {
+                let trust_path = repository_trust_path(
+                    &current.metadata,
+                    repository,
+                    location.as_ref(),
+                    context.read_worktrees.iter(),
+                );
+                !restrictions.contains(&repository.repository_id)
+                    || crate::repository::read_report_path_trust_before(
+                        report,
+                        Some(trust_path),
+                        deadline,
+                    )
+                    .state
+                        != RepositoryTrustState::Trusted
+            })
+    {
+        return false;
+    }
+    Instant::now() < deadline
+}
+
+pub(crate) fn source_ingest_read_allowed(
+    report: &HostProbeReport,
+    context: &evertrace_store::SessionImportContext,
+    deadline: Instant,
+) -> bool {
+    let current = &context.current;
+    if current.metadata.repository_read_restrictions.is_none()
+        || current.metadata.metadata_state != MetadataState::Indexed
+        || (current.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
+            && current.access_decision != Some(SessionAccessDecision::Approved))
+        || !source_read_allowed(report, context, deadline)
+    {
+        return false;
+    }
+    source_header_current(report, current, deadline).is_some_and(|header| {
+        !matches!(header.payload.git, SessionGit::Object(_))
+            || !context.read_repositories.is_empty()
+    })
+}
+
+fn source_header_current(
+    report: &HostProbeReport,
+    current: &SessionImportCurrent,
+    deadline: Instant,
+) -> Option<SessionMetaRecord> {
+    let path = report
+        .session_catalog_roots()
+        .iter()
+        .find(|root| root.root_kind == SessionCatalogRootKind::CodexSessions)
+        .and_then(|root| root.canonical_absolute_path.as_deref())?;
+    let Ok(qualified) = qualify_requested_session_root(
+        report,
+        SessionCatalogRootKind::CodexSessions,
+        Path::new(path),
+    ) else {
+        return None;
+    };
+    let Ok(root) = ConfinedRoot::open_external_source(qualified.path()) else {
+        return None;
+    };
+    let relative = Path::new(&current.metadata.source_path);
+    let Ok(Some(identity)) = root.probe_regular_file(relative, deadline) else {
+        return None;
+    };
+    if session_source_fingerprint(identity).to_string() != current.metadata.source_fingerprint {
+        return None;
+    }
+    let mut remaining = MAX_RECORD_BYTES;
+    let Ok(header) = read_session_header(&root, relative, identity, &mut remaining, deadline)
+    else {
+        return None;
+    };
+    if header.payload.id != current.session_id || Instant::now() >= deadline {
+        return None;
+    }
+    Some(header)
+}
+
+/// The explicit job can finish source preflight even when optional metadata
+/// backfill is disabled. Only this source's bounded admission context is used.
+pub(crate) async fn preflight_import_context(
+    writer: &WriterHandle,
+    report: &HostProbeReport,
+    context: &evertrace_store::SessionImportContext,
+    config_hash: [u8; 32],
+) -> Result<bool, SessionImportServiceError> {
+    let prepare_started = Instant::now();
+    let allowance = std::time::Duration::from_millis(250);
+    let location = workspace_location(&context.current.metadata, prepare_started + allowance)
+        .map_err(|_| SessionImportServiceError::Unavailable)?;
+    let needs_discovery = location.as_ref().is_some_and(|location| {
+        !context.read_repositories.iter().any(|repository| {
+            workspace_registered(location, repository, context.read_worktrees.iter())
+        })
+    });
+    let preparation_time = prepare_started.elapsed();
+    let located_context = if needs_discovery {
+        let location = location
+            .as_ref()
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        let fresh = writer
+            .session_import_context_with_repository(
+                &context.current.source_key(),
+                location.common_dir_filesystem,
+                location
+                    .common_dir
+                    .to_str()
+                    .ok_or(SessionImportServiceError::Unavailable)?,
+            )
+            .await
+            .map_err(map_writer)?
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        if fresh.current != context.current || fresh.job != context.job {
+            return Ok(true);
+        }
+        Some(fresh)
+    } else {
+        None
+    };
+    let context = located_context.as_ref().unwrap_or(context);
+    let current = &context.current;
+    if context.repository_purged || current.access_decision == Some(SessionAccessDecision::Revoked)
+    {
+        return Ok(false);
+    }
+    let mut repositories = RepositoryCurrentView {
+        frontier: context.frontier,
+        repositories: context
+            .read_repositories
+            .iter()
+            .cloned()
+            .map(|value| (value.repository_id, value))
+            .collect(),
+        worktrees: context
+            .read_worktrees
+            .iter()
+            .cloned()
+            .map(|value| (value.worktree_instance_id, value))
+            .collect(),
+        snapshots: context
+            .read_snapshots
+            .iter()
+            .cloned()
+            .map(|value| (value.worktree_snapshot_id, value))
+            .collect(),
+        ..RepositoryCurrentView::default()
+    };
+    let deadline = Instant::now() + allowance.saturating_sub(preparation_time);
+    let mut metadata = current.metadata.clone();
+    retain_read_restrictions(
+        &mut metadata,
+        Some(&current.metadata),
+        &repositories,
+        location.as_ref(),
+    )?;
+    if !needs_discovery && metadata == current.metadata {
+        return Ok(false);
+    }
+    let header = source_header_current(report, current, deadline)
+        .ok_or(SessionImportServiceError::Unavailable)?;
+    let occurred = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
+    let mut payloads = Vec::new();
+    discover_source_repository(
+        &metadata,
+        &current.source_instance(),
+        RepositoryDiscoveryView {
+            current: &mut repositories,
+            incomplete_history: &context.incomplete_repository_history,
+        },
+        occurred,
+        deadline,
+        &mut payloads,
+        location.as_ref(),
+    )?;
+    retain_read_restrictions(
+        &mut metadata,
+        Some(&current.metadata),
+        &repositories,
+        location.as_ref(),
+    )?;
+    if current.metadata.repository_read_restrictions.is_none() {
+        metadata.started_at_us = source_timestamp_us(&header._timestamp);
+        let source = current.source_instance();
+        let (kind, repository, worktree) = resolve_workspace(
+            metadata.workspace_hint.as_deref(),
+            &header.payload.git,
+            metadata.started_at_us.map(|at| (source.as_str(), at)),
+            &repositories,
+        )
+        .map_err(|_| SessionImportServiceError::Unavailable)?;
+        metadata.workspace_resolution_kind = kind;
+        metadata.resolved_repository_instance_id = repository;
+        metadata.resolved_worktree_instance_id = worktree;
+    }
+    if metadata != current.metadata {
+        metadata_events(
+            Some(current),
+            current.session_id.clone(),
+            current.source_instance_id.clone(),
+            metadata,
+            occurred,
+            &mut payloads,
+        )?;
+    }
+    if payloads.is_empty() {
+        return Ok(false);
+    }
+    if payloads.iter().any(|payload| matches!(payload, JournalPayload::SessionImportEventRecorded(event)
+        if matches!(event.event, SessionImportEventKind::BodyStateAdvanced { body_state: SessionBodyState::BlockedScopeUnresolved, .. })))
+        && let Some(mut job) = context.job.clone()
+    {
+        job.state = JobStatus::Failed;
+        job.lease_until_us = None;
+        job.terminal = Some(Box::new(JobTerminalAudit { outcome: JobTerminalOutcome::Failed, reason: JobTerminalReason::SourceUnavailable, result_ref: Some(format!("session_import:{}", current.source_key())) }));
+        payloads.push(JournalPayload::JobState(job));
+    }
+    let command = command(
+        RequestId::new_v7(),
+        "session_import_preflight",
+        occurred,
+        config_hash,
+        SourceKind::System,
+        payloads,
+    )?;
+    writer
+        .commit_if_frontier(command, occurred, context.frontier)
+        .await
+        .map_err(map_writer)?;
+    Ok(true)
+}
+
+/// Resolve only the requested evidence rows. A single bounded observation
+/// join is shared by the request; neither receipt bodies nor a global trust
+/// cache are retained.
+pub(crate) async fn blocked_source_rows(
+    writer: &WriterHandle,
+    report: Option<&HostProbeReport>,
+    snapshot: &evertrace_store::ProjectionSnapshot,
+    rows: &[&evertrace_store::ObjectRow],
+) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
+    if rows.len() > 64 {
+        return Err(SessionImportServiceError::Unavailable);
+    }
+    let mut sources = BTreeMap::new();
+    let mut observations = BTreeMap::new();
+    for row in rows {
+        if !matches!(
+            row.object_kind.as_deref(),
+            Some("source_receipt" | "source_observation" | "evidence_surface")
+        ) {
+            continue;
+        }
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(SessionImportServiceError::Corrupt)?,
+        )
+        .map_err(|_| SessionImportServiceError::Corrupt)?;
+        match payload {
+            JournalPayload::SourceReceiptRecorded(receipt) => {
+                sources.insert(
+                    row.row_id.clone(),
+                    receipt.source_instance_id.as_str().to_owned(),
+                );
+            }
+            JournalPayload::SourceObservationRecorded(observation) => {
+                sources.insert(
+                    row.row_id.clone(),
+                    observation.source_instance_id.as_str().to_owned(),
+                );
+            }
+            JournalPayload::EvidenceSurfaceRecorded(surface) => {
+                observations.insert(
+                    format!(
+                        "object:evidence:source_observation:{}",
+                        surface.source_observation_revision_ref
+                    ),
+                    row.row_id.clone(),
+                );
+            }
+            _ => return Err(SessionImportServiceError::Corrupt),
+        }
+    }
+    for row in snapshot
+        .data_rows()
+        .filter(|row| observations.contains_key(&row.row_id))
+    {
+        let Some(target) = observations.get(&row.row_id) else {
+            continue;
+        };
+        let JournalPayload::SourceObservationRecorded(observation) = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(SessionImportServiceError::Corrupt)?,
+        )
+        .map_err(|_| SessionImportServiceError::Corrupt)?
+        else {
+            return Err(SessionImportServiceError::Corrupt);
+        };
+        sources.insert(
+            target.clone(),
+            observation.source_instance_id.as_str().to_owned(),
+        );
+    }
+    if observations
+        .values()
+        .any(|target| !sources.contains_key(target))
+    {
+        return Err(SessionImportServiceError::Corrupt);
+    }
+    let mut contexts = BTreeMap::new();
+    for source in sources
+        .values()
+        .filter(|source| evertrace_store::is_session_import_source(source))
+    {
+        if contexts.contains_key(source) {
+            continue;
+        }
+        let key = source.strip_prefix("codex-session:").unwrap_or(source);
+        let context = writer
+            .session_import_context(key)
+            .await
+            .map_err(map_writer)?;
+        contexts.insert(source.clone(), context);
+    }
+    // Actor admission is control-plane preparation, not filesystem probe time.
+    // All sources share one bounded read quantum after their current contexts
+    // have been obtained; no per-source deadline renewal.
+    let deadline = Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET;
+    let permissions = contexts
+        .into_iter()
+        .map(|(source, context)| {
+            let allowed = context
+                .as_ref()
+                .zip(report)
+                .is_some_and(|(context, report)| {
+                    context.current.source_instance() == source
+                        && source_read_allowed(report, context, deadline)
+                });
+            (source, allowed)
+        })
+        .collect::<BTreeMap<_, _>>();
+    Ok(sources
+        .into_iter()
+        .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row))
+        .collect())
+}
+
 fn resolve_workspace(
     workspace: Option<&str>,
     git: &SessionGit,
+    source_time: Option<(&str, i64)>,
     repositories: &RepositoryCurrentView,
 ) -> Result<
     (
@@ -1042,25 +1776,40 @@ fn resolve_workspace(
     let Some(workspace) = workspace else {
         return Ok((WorkspaceResolutionKind::Unavailable, None, None));
     };
-    let mut matches = repositories
-        .worktrees
-        .values()
-        .filter(|worktree| worktree.current_path.as_deref() == Some(workspace));
+    let (SessionGit::Object(object), Some((source, at))) = (git, source_time) else {
+        return Ok((WorkspaceResolutionKind::Ambiguous, None, None));
+    };
+    let Some(head) = object.commit_hash.as_deref() else {
+        return Ok((WorkspaceResolutionKind::Ambiguous, None, None));
+    };
+    // A current locator/HEAD (even an ancestor) does not identify the old
+    // instance. Require source-linked, source-time S11 path and snapshot proof.
+    let mut matches = repositories.worktrees.values().filter(|worktree| {
+        worktree.path_history.iter().any(|path| {
+            path.path == workspace
+                && path.first_observed_at_us <= at
+                && path.last_observed_at_us >= at
+                && path
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference == source)
+        }) && repositories.snapshots.values().any(|snapshot| {
+            snapshot.worktree_instance_id == worktree.worktree_instance_id
+                && snapshot.head_oid.as_deref() == Some(head)
+                && snapshot.captured_at_us == at
+                && snapshot
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference == source)
+        })
+    });
     let Some(worktree) = matches.next() else {
-        return Ok(match git {
-            SessionGit::Null => (WorkspaceResolutionKind::NonRepository, None, None),
-            SessionGit::Object(object) => {
-                let _ = (&object.commit_hash, &object.branch, &object.repository_url);
-                (WorkspaceResolutionKind::Ambiguous, None, None)
-            }
-            SessionGit::Missing => (WorkspaceResolutionKind::Unavailable, None, None),
-        });
+        return Ok((WorkspaceResolutionKind::Ambiguous, None, None));
     };
     if matches.next().is_some()
         || !repositories
             .repositories
             .contains_key(&worktree.repository_instance_id)
-        || matches!(git, SessionGit::Null | SessionGit::Missing)
     {
         return Ok((WorkspaceResolutionKind::Ambiguous, None, None));
     }
@@ -1069,6 +1818,63 @@ fn resolve_workspace(
         Some(worktree.repository_instance_id),
         Some(worktree.worktree_instance_id),
     ))
+}
+
+fn source_timestamp_us(value: &str) -> Option<i64> {
+    let value = value.strip_suffix('Z')?;
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.len() != 19
+        || whole.get(4..5)? != "-"
+        || whole.get(7..8)? != "-"
+        || whole.get(10..11)? != "T"
+        || whole.get(13..14)? != ":"
+        || whole.get(16..17)? != ":"
+        || fraction.len() > 6
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let number = |start, end| whole.get(start..end)?.parse::<i64>().ok();
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second) = (number(11, 13)?, number(14, 16)?, number(17, 19)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > months[usize::try_from(month - 1).ok()?]
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+    {
+        return None;
+    }
+    let leap_days = |year: i64| year / 4 - year / 100 + year / 400;
+    let days = 365 * (year - 1970) + leap_days(year - 1) - leap_days(1969)
+        + months[..usize::try_from(month - 1).ok()?]
+            .iter()
+            .sum::<i64>()
+        + day
+        - 1;
+    let micros = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i64>().ok()? * 10_i64.pow(u32::try_from(6 - fraction.len()).ok()?)
+    };
+    Some(((days * 24 + hour) * 60 * 60 + minute * 60 + second) * 1_000_000 + micros)
 }
 
 pub(crate) fn session_id_from_name(name: &str) -> Result<String, SessionCatalogError> {
@@ -1162,7 +1968,7 @@ fn queue_command(
 ) -> Result<JournalCommand, SessionImportServiceError> {
     let mut revision = current.revision;
     let mut payloads = Vec::new();
-    if current.metadata.workspace_resolution_kind == WorkspaceResolutionKind::NonRepository
+    if current.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
         && current.access_decision != Some(SessionAccessDecision::Approved)
     {
         revision += 1;
@@ -1392,6 +2198,8 @@ fn metadata_events(
                 BodyStateReason::SourceReplaced,
             ))
         } else if scope_unavailable
+            && (metadata.repository_read_restrictions.is_none()
+                || old.access_decision != Some(SessionAccessDecision::Approved))
             && !matches!(
                 old.body_state,
                 SessionBodyState::NotImported
@@ -1568,7 +2376,7 @@ mod tests {
         assert_eq!(catalog[0].session_id, session_id);
         assert_eq!(
             catalog[0].metadata.workspace_resolution_kind,
-            WorkspaceResolutionKind::NonRepository
+            WorkspaceResolutionKind::Ambiguous
         );
         let encoded = serde_json::to_string(&catalog[0].metadata).unwrap();
         assert!(!encoded.contains("BODY_CANARY"));
@@ -1620,7 +2428,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             conflict.sessions[0].metadata.workspace_resolution_kind,
-            WorkspaceResolutionKind::NonRepository
+            WorkspaceResolutionKind::Ambiguous
         );
         let next = catalog_codex_sessions_after(
             &report,
@@ -1633,7 +2441,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             next.sessions[0].metadata.workspace_resolution_kind,
-            WorkspaceResolutionKind::NonRepository
+            WorkspaceResolutionKind::Ambiguous
         );
         fs::remove_dir_all(adapter).unwrap();
     }
@@ -1827,6 +2635,7 @@ mod tests {
             resolve_workspace(
                 payload.cwd.as_deref(),
                 &payload.git,
+                None,
                 &RepositoryCurrentView::default()
             )
             .unwrap()
@@ -1839,6 +2648,170 @@ mod tests {
             "payload": { "id": "session", "git": null, "future": true }
         }));
         assert!(unknown.is_err());
+        for git in [SessionGit::Missing, SessionGit::Null] {
+            assert_eq!(
+                resolve_workspace(
+                    Some("/missing"),
+                    &git,
+                    None,
+                    &RepositoryCurrentView::default()
+                )
+                .unwrap(),
+                (WorkspaceResolutionKind::Ambiguous, None, None)
+            );
+        }
+        assert_eq!(
+            source_timestamp_us("1970-01-01T00:00:01.001Z"),
+            Some(1_001_000)
+        );
+        assert_eq!(source_timestamp_us("2026-02-29T00:00:00Z"), None);
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=Probe",
+                "-c",
+                "user.email=probe@invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let source = "session-rollout:session:019d0000-0000-7000-8000-000000000029";
+        let at = source_timestamp_us("2026-08-30T00:00:00Z").unwrap();
+        let evidence = crate::repository::probe_repository_identity(
+            &root,
+            &[source.into()],
+            at,
+            Instant::now() + Duration::from_secs(1),
+            &[],
+        )
+        .unwrap();
+        assert!(evidence.unavailable_reason.is_none());
+        assert!(evidence.tracked_diff_digest.is_none() && evidence.index_digest.is_none());
+        let resolution =
+            crate::repository::resolve_repository(&crate::repository::RepositoryResolveInput {
+                view: &RepositoryCurrentView::default(),
+                evidence: &evidence,
+                derived_from_hint: None,
+            })
+            .unwrap();
+        let mut view = RepositoryCurrentView::default();
+        for repository in resolution.repositories {
+            view.repositories
+                .insert(repository.repository_id, repository);
+        }
+        for worktree in resolution.worktrees {
+            view.worktrees
+                .insert(worktree.worktree_instance_id, worktree);
+        }
+        for snapshot in resolution.snapshots {
+            view.snapshots
+                .insert(snapshot.worktree_snapshot_id, snapshot);
+        }
+        let repository = *view.repositories.keys().next().unwrap();
+        let incomplete = std::collections::BTreeSet::from([repository]);
+        let resolve_bounded =
+            |view: &RepositoryCurrentView,
+             evidence: &crate::repository::GitProbeEvidence,
+             incomplete: &std::collections::BTreeSet<_>| {
+                crate::repository::RepositoryResolveInput {
+                    view,
+                    evidence,
+                    derived_from_hint: None,
+                }
+                .resolve_with_incomplete_history(incomplete)
+                .unwrap()
+            };
+        assert_eq!(
+            resolve_bounded(&view, &evidence, &incomplete).kind,
+            Some(crate::repository::ResolutionKind::NoDelta)
+        );
+        let mut negative = evidence.clone();
+        let foreign = crate::repository::GitOid::parse(&"f".repeat(40)).unwrap();
+        negative.head_oid = Some(foreign.clone());
+        negative.head_ancestors.clear();
+        negative.ref_tips = vec![("refs/heads/foreign".into(), foreign)];
+        let refused = resolve_bounded(&view, &negative, &incomplete);
+        assert_eq!(
+            refused.kind,
+            Some(crate::repository::ResolutionKind::Ambiguous)
+        );
+        assert!(refused.payloads().is_empty());
+        let mut competing = view.clone();
+        let mut other = competing.repositories[&repository].clone();
+        other.repository_id = evertrace_domain::ids::RepositoryId::new_v7();
+        let other_id = other.repository_id;
+        competing.repositories.insert(other_id, other);
+        let refused = resolve_bounded(
+            &competing,
+            &evidence,
+            &std::collections::BTreeSet::from([other_id]),
+        );
+        assert_eq!(
+            refused.kind,
+            Some(crate::repository::ResolutionKind::Ambiguous)
+        );
+        assert!(refused.payloads().is_empty());
+        // A represented old HEAD is still positive evidence even when the
+        // current snapshot has changed and other history remains unexamined.
+        let mut historical = view.clone();
+        let snapshot = historical.snapshots.values_mut().next().unwrap();
+        let mut old = snapshot.clone();
+        old.worktree_snapshot_id = evertrace_domain::ids::WorktreeSnapshotId::new_v7();
+        snapshot.head_oid = negative
+            .head_oid
+            .as_ref()
+            .map(|head| head.as_str().to_owned());
+        historical.snapshots.insert(old.worktree_snapshot_id, old);
+        let selected = resolve_bounded(&historical, &evidence, &incomplete);
+        assert!(selected.repositories.is_empty());
+        assert_ne!(
+            selected.kind,
+            Some(crate::repository::ResolutionKind::Ambiguous)
+        );
+        let git = SessionGit::Object(SessionGitObject {
+            commit_hash: evidence.head_oid.map(|head| head.as_str().to_owned()),
+            branch: None,
+            repository_url: None,
+        });
+        assert_eq!(
+            resolve_workspace(root.to_str(), &git, None, &view)
+                .unwrap()
+                .0,
+            WorkspaceResolutionKind::Ambiguous
+        );
+        assert_eq!(
+            resolve_workspace(root.to_str(), &git, Some(("different-source", at)), &view)
+                .unwrap()
+                .0,
+            WorkspaceResolutionKind::Ambiguous
+        );
+        assert_eq!(
+            resolve_workspace(root.to_str(), &git, Some((source, at + 1)), &view)
+                .unwrap()
+                .0,
+            WorkspaceResolutionKind::Ambiguous
+        );
+        let resolved = resolve_workspace(root.to_str(), &git, Some((source, at)), &view).unwrap();
+        assert_eq!(resolved.0, WorkspaceResolutionKind::Repository);
+        assert!(resolved.1.is_some() && resolved.2.is_some());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1954,7 +2927,7 @@ mod tests {
             current.sessions[&source_b]
                 .metadata
                 .workspace_resolution_kind,
-            WorkspaceResolutionKind::NonRepository
+            WorkspaceResolutionKind::Ambiguous
         );
         for _ in 0..4 {
             assert_eq!(scan(&mut cursor, &mut current, 8192).unwrap(), 0);
@@ -1977,7 +2950,7 @@ mod tests {
         }
         assert_eq!(
             current.sessions[&source].metadata.workspace_resolution_kind,
-            WorkspaceResolutionKind::NonRepository
+            WorkspaceResolutionKind::Ambiguous
         );
         assert_eq!(current.sessions[&source].access_decision, None);
 
@@ -2023,7 +2996,7 @@ mod tests {
         let relocated = &current.sessions[&source];
         assert_eq!(
             relocated.metadata.workspace_resolution_kind,
-            WorkspaceResolutionKind::NonRepository
+            WorkspaceResolutionKind::Ambiguous
         );
         assert_eq!(
             relocated.metadata.source_path,

@@ -1432,7 +1432,7 @@ impl BackgroundScheduler {
         completed += self.run_gc_round().await?;
         let mut retryable = false;
         if optional_allowed && self.import_settings.historical_metadata_backfill {
-            let report = Arc::clone(&self.report).read_owned().await;
+            let report = self.report.read().await.clone();
             if let Some(report) = report.as_ref() {
                 match self.catalog.refresh(report).await {
                     Ok(changed) => completed += changed,

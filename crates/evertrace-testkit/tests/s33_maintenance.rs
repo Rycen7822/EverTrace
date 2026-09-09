@@ -1867,6 +1867,7 @@ async fn repository_pending_revokes_target_producers_and_rejects_successors() {
         workspace_resolution_kind: WorkspaceResolutionKind::Repository,
         resolved_repository_instance_id: Some(repository_id),
         resolved_worktree_instance_id: Some(worktree_id),
+        repository_read_restrictions: None,
         file_size: 128,
         file_mtime_us: 1,
         source_fingerprint: "cd".repeat(32),

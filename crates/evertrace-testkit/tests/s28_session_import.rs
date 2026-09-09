@@ -145,6 +145,901 @@ async fn frozen_memory_export_maps_to_l0_pending_proposal_and_provenance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_only_archive_later_restriction_closes_reads_and_purge_after_restart() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = temp.path().join("workspace");
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/08/30");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&dated).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000029";
+    let source = format!("session-rollout:{session}:{session}");
+    let transcript = dated.join(format!("rollout-2026-08-30T00-00-00-{session}.jsonl"));
+    let header = serde_json::json!({"timestamp":"2026-08-30T00:00:00Z", "type":"session_meta", "payload":{"id":session,"session_id":session,"cwd":workspace}});
+    let message = serde_json::json!({"timestamp":"2026-08-30T00:00:01Z", "type":"event_msg", "payload":{"type":"user_message","message":"source-only preserved claim"}});
+    let body = format!("{header}\n{message}\n");
+    fs::write(&transcript, &body).unwrap();
+    let report_value =
+        observe_session_catalog_report(transcript.to_str(), session, "source-only", None).unwrap();
+    let report = Arc::new(RwLock::new(Some(report_value.clone())));
+    let data = temp.path().join("data");
+    let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 1);
+    let initial = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        initial.current.metadata.repository_read_restrictions,
+        Some(Vec::new())
+    );
+    assert_eq!(
+        initial.current.metadata.resolved_repository_instance_id,
+        None
+    );
+    assert_eq!(initial.current.access_decision, None);
+    let mut unknown = initial.current.metadata.clone();
+    unknown.repository_read_restrictions =
+        Some(vec![evertrace_domain::ids::RepositoryId::new_v7()]);
+    let invalid = evertrace_store::JournalCommand::new(
+        evertrace_domain::ids::CommandId::new_v7(),
+        vec![evertrace_store::JournalEventDraft::runtime(
+            9,
+            CONFIG,
+            "session_import_preflight",
+            JournalPayload::SessionImportEventRecorded(Box::new(
+                evertrace_store::SessionImportEvent {
+                    session_id: session.into(),
+                    source_instance_id: Some(source.clone()),
+                    revision: initial.current.revision + 1,
+                    predecessor_revision: Some(initial.current.revision),
+                    occurred_at_us: 9,
+                    event: evertrace_store::SessionImportEventKind::MetadataObserved {
+                        metadata: Box::new(unknown),
+                    },
+                },
+            )),
+        )],
+    )
+    .unwrap();
+    assert!(
+        writer
+            .commit_if_frontier(invalid, 9, initial.frontier)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap(),
+        initial
+    );
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+    let request = RequestId::new_v7();
+    assert_eq!(
+        admin
+            .handle(request, session, SessionImportAdminAction::QueueImport, 10)
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let worker =
+        SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap()
+            .for_config(Arc::new(
+                evertrace_domain::config::EffectiveConfig::default(),
+            ))
+            .unwrap();
+    let budget = SessionImportBudget {
+        max_bytes: 64 * 1024,
+        max_records: 2,
+        max_work_time: Duration::from_millis(250),
+    };
+    let mut records = 0;
+    for _ in 0..2 {
+        let progress = worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_records: 2 - records,
+                    ..budget
+                },
+            )
+            .await
+            .unwrap();
+        assert!(progress.records > 0);
+        records += progress.records;
+        if progress.completed {
+            break;
+        }
+    }
+    assert_eq!(records, 2);
+    let snapshot = writer.project().await.unwrap();
+    let originals = snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+        .map(|row| (row.row_id.clone(), row.payload_json.clone().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(originals.len(), 2);
+    let human = evertrace_engine::HumanGovernanceService::new(writer.clone(), CONFIG)
+        .with_session_report(Arc::clone(&report));
+    let detail = human
+        .detail(
+            evertrace_engine::HumanSurface::Explorer,
+            &originals[0].0,
+            snapshot.frontier,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(detail.items[0].evidence_detail.is_some());
+    assert!(originals.iter().all(|(_, raw)| {
+        matches!(serde_json::from_str::<JournalPayload>(raw).unwrap(), JournalPayload::SourceReceiptRecorded(receipt)
+            if receipt.repository_instance_id.is_none() && receipt.worktree_instance_id.is_none())
+    }));
+    let bindings = evertrace_engine::McpBindingAuthority::new(
+        DeviceKeyStore::new(temp.path().join("keys"))
+            .load_or_create()
+            .unwrap(),
+    );
+    let mcp = evertrace_engine::McpActionService::open(
+        bindings.clone(),
+        &data,
+        writer.clone(),
+        runtime(temp.path()),
+    )
+    .await
+    .unwrap()
+    .with_session_report(Arc::clone(&report));
+    let read = |restricted: bool| {
+        let mcp = &mcp;
+        let bindings = &bindings;
+        let report_value = &report_value;
+        let workspace = &workspace;
+        let originals = &originals;
+        let human = &human;
+        let writer = &writer;
+        async move {
+            let mut texts = Vec::new();
+            for (action, input) in [
+                (
+                    evertrace_engine::McpServiceAction::Get,
+                    originals[0]
+                        .0
+                        .strip_prefix("object:evidence:source_receipt:")
+                        .unwrap(),
+                ),
+                (evertrace_engine::McpServiceAction::Search, "source-only"),
+            ] {
+                let grant = bindings
+                    .issue_with_report(
+                        evertrace_engine::McpBindingIssue {
+                            session_id: session.into(),
+                            turn_id: "turn".into(),
+                            tool_use_id: "source-only".into(),
+                            agent_id: None,
+                            action: if action == evertrace_engine::McpServiceAction::Get {
+                                "get"
+                            } else {
+                                "search"
+                            }
+                            .into(),
+                            workspace: "@active".into(),
+                            input: input.into(),
+                            refs: vec![],
+                            launcher_protocol_revision: 1,
+                        },
+                        Some(Arc::new(report_value.clone())),
+                    )
+                    .unwrap();
+                let result = mcp
+                    .handle(
+                        "source-only-read",
+                        evertrace_engine::McpServiceRequest {
+                            request_id: RequestId::new_v7(),
+                            action,
+                            workspace: grant.bound_workspace,
+                            input: input.into(),
+                            refs: vec![],
+                            client_cwd: workspace.to_str().unwrap().into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.items.is_empty(),
+                    restricted,
+                    "{action:?}: {result:?}"
+                );
+                assert!(result.items.iter().all(|item| item.content_trust
+                    == evertrace_domain::evidence::ContentTrust::ImportedClaim));
+                texts.extend(
+                    result
+                        .items
+                        .into_iter()
+                        .map(|item| (item.object_ref, item.text)),
+                );
+            }
+            let snapshot = writer.project().await.unwrap();
+            let detail = human
+                .detail(
+                    evertrace_engine::HumanSurface::Explorer,
+                    &originals[0].0,
+                    snapshot.frontier,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(detail.items[0].evidence_detail.is_none(), restricted);
+            texts
+        }
+    };
+    let archived_output = read(false).await;
+    let cas = evertrace_capture::CasStore::open_existing(temp.path().join("cas")).unwrap();
+    let JournalPayload::SourceReceiptRecorded(receipt) =
+        serde_json::from_str(&originals[0].1).unwrap()
+    else {
+        panic!("receipt")
+    };
+    let digest = evertrace_capture::CasStore::parse_digest(&receipt.cas_ref).unwrap();
+    let archived_bytes = cas.read(&digest).unwrap();
+    fs::write(&transcript, format!("{body}{message}\n")).unwrap();
+    assert_eq!(read(false).await, archived_output);
+    assert!(worker.process_checkpoint(&source, budget).await.is_err());
+    let moved = temp.path().join("moved.jsonl");
+    fs::rename(&transcript, &moved).unwrap();
+    assert_eq!(read(false).await, archived_output);
+    fs::remove_file(&moved).unwrap();
+    assert_eq!(read(false).await, archived_output);
+    assert_eq!(cas.read(&digest).unwrap(), archived_bytes);
+    assert!(worker.process_checkpoint(&source, budget).await.is_err());
+    // Restore the source as a replacement revision, never restore approval.
+    fs::write(&transcript, &body).unwrap();
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 1);
+    let replaced = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replaced.current.access_decision, None);
+    assert_eq!(read(false).await, archived_output);
+    assert!(worker.process_checkpoint(&source, budget).await.is_err());
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                SessionImportAdminAction::RevokeAccess,
+                11
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Revoked
+    );
+    read(true).await;
+    fs::write(&transcript, format!("{header}\n")).unwrap();
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 1);
+    assert_eq!(
+        writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap()
+            .current
+            .access_decision,
+        Some(evertrace_store::SessionAccessDecision::Revoked)
+    );
+    read(true).await;
+    fs::write(&transcript, &body).unwrap();
+    catalog.refresh(&report_value).await.unwrap();
+    // Explicit new-revision consent is independent of the unchanged old CAS.
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                SessionImportAdminAction::QueueImport,
+                12
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    fs::remove_dir(&workspace).unwrap();
+    read(false).await;
+    fs::create_dir(&workspace).unwrap();
+
+    // The same original Missing source is now associated with a current,
+    // normally discovered unborn repository. No manual registration or approval.
+    fs::write(&transcript, format!("{body}{message}\n")).unwrap();
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 1);
+    let status = std::process::Command::new("git")
+        .args(["init", "-q", "--initial-branch=main"])
+        .current_dir(&workspace)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"untrusted\"\n",
+            serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let preflight = worker.process_checkpoint(&source, budget).await.unwrap();
+    assert_eq!(
+        (preflight.records, preflight.bytes, preflight.completed),
+        (0, 0, false)
+    );
+    let restricted = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let repository = restricted
+        .current
+        .metadata
+        .repository_read_restrictions
+        .as_ref()
+        .unwrap()[0];
+    assert_eq!(
+        restricted.current.metadata.resolved_repository_instance_id,
+        None
+    );
+    assert_eq!(
+        restricted.current.metadata.resolved_worktree_instance_id,
+        None
+    );
+    assert_eq!(
+        restricted.current.access_decision,
+        Some(evertrace_store::SessionAccessDecision::Approved)
+    );
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 0);
+    assert_eq!(
+        writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap()
+            .frontier,
+        restricted.frontier
+    );
+    assert_eq!(
+        admin
+            .handle(request, session, SessionImportAdminAction::QueueImport, 10)
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::NoDelta
+    );
+    let before = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.current.body_state, SessionBodyState::Queued);
+    assert!(worker.process_checkpoint(&source, budget).await.is_err());
+    let after = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before, after);
+    let snapshot = writer.project().await.unwrap();
+    let detail = human
+        .detail(
+            evertrace_engine::HumanSurface::Explorer,
+            &originals[0].0,
+            snapshot.frontier,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(detail.items[0].evidence_detail.is_none());
+    read(true).await;
+    let repository_revision = before
+        .read_repositories
+        .iter()
+        .find(|value| value.repository_id == repository)
+        .unwrap()
+        .repository_revision;
+    let preview = evertrace_store::projections::repository_scope_purge_preview(
+        &snapshot,
+        repository,
+        repository_revision,
+    )
+    .unwrap();
+    assert_eq!(preview.affected_session_count, 1);
+    assert_eq!(preview.exclusive_cas_refs.len(), 2);
+    assert!(preview.affected_evidence_receipt_capture_count >= 4);
+    // Pure closure negative: a source-wide restriction must not erase a
+    // receipt carrying an independent historical repository scope. This
+    // synthetic view is never committed or used by the real-input oracle.
+    let mut foreign_scope = snapshot.clone();
+    let row = foreign_scope
+        .rows
+        .iter_mut()
+        .find(|row| row.row_id == originals[0].0)
+        .unwrap();
+    let JournalPayload::SourceReceiptRecorded(mut receipt) =
+        serde_json::from_str(row.payload_json.as_ref().unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    let foreign = evertrace_domain::ids::RepositoryId::new_v7();
+    receipt.repository_instance_id = Some(foreign);
+    row.repository_id = Some(foreign.to_string());
+    row.payload_json =
+        Some(serde_json::to_string(&JournalPayload::SourceReceiptRecorded(receipt)).unwrap());
+    assert!(
+        evertrace_store::projections::repository_scope_purge_preview(
+            &foreign_scope,
+            repository,
+            repository_revision,
+        )
+        .unwrap()
+        .blockers
+        .contains(&evertrace_domain::purge::RepositoryPurgeBlocker::CrossScopeDependency)
+    );
+    for (id, raw) in &originals {
+        assert_eq!(snapshot.row(id).unwrap().payload_json.as_ref(), Some(raw));
+    }
+    writer.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let reopened = JournalWriter::open(&data).await.unwrap();
+    assert_eq!(
+        reopened.session_import_context(&source).unwrap().unwrap(),
+        after
+    );
+    assert_eq!(reopened.project().await.unwrap(), snapshot);
+    reopened.full_projection().await.unwrap();
+    assert_eq!(reopened.project().await.unwrap(), snapshot);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nearest_git_restricts_nested_source_and_external_linked_worktree_converges() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let main = temp.path().join("main");
+    let nested = main.join("nested");
+    let linked = temp.path().join("external");
+    fs::create_dir_all(&nested).unwrap();
+    let git = |path: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&main, &["init", "-q", "--initial-branch=main"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/08/30");
+    fs::create_dir_all(&dated).unwrap();
+    let trust_config = format!(
+        "[projects.{}]\ntrust_level = \"trusted\"\n[projects.{}]\ntrust_level = \"untrusted\"\n[projects.{}]\ntrust_level = \"trusted\"\n",
+        serde_json::to_string(main.to_str().unwrap()).unwrap(),
+        serde_json::to_string(nested.to_str().unwrap()).unwrap(),
+        serde_json::to_string(linked.to_str().unwrap()).unwrap(),
+    );
+    fs::write(adapter.join("config.toml"), &trust_config).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000030";
+    let mut files = Vec::new();
+    let mut sources = Vec::new();
+    for (ordinal, workspace) in [&main, &nested, &linked].into_iter().enumerate() {
+        let rollout = format!("019d0000-0000-7000-8000-00000000003{ordinal}");
+        let path = dated.join(format!(
+            "rollout-2026-08-30T00-00-00-{session}_{rollout}.jsonl"
+        ));
+        let header = serde_json::json!({"timestamp":"2026-08-30T00:00:00Z", "type":"session_meta", "payload":{"id":session,"session_id":session,"cwd":workspace}});
+        let message = serde_json::json!({"timestamp":"2026-08-30T00:00:01Z", "type":"event_msg", "payload":{"type":"user_message","message":"nested source archived claim"}});
+        fs::write(&path, format!("{header}\n{message}\n")).unwrap();
+        files.push(path);
+        sources.push(format!("session-rollout:{session}:{rollout}"));
+    }
+    let report_value =
+        observe_session_catalog_report(files[0].to_str(), session, "nearest-git", None).unwrap();
+    let report = Arc::new(RwLock::new(Some(report_value.clone())));
+    let data = temp.path().join("data");
+    let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 3);
+    let initial = writer
+        .session_import_context(&sources[1])
+        .await
+        .unwrap()
+        .unwrap();
+    let repository_a = initial
+        .current
+        .metadata
+        .repository_read_restrictions
+        .as_ref()
+        .unwrap()[0];
+    assert_eq!(
+        initial.current.metadata.resolved_repository_instance_id,
+        None
+    );
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                SessionImportAdminAction::QueueImport,
+                10
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let worker =
+        SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap()
+            .for_config(Arc::new(
+                evertrace_domain::config::EffectiveConfig::default(),
+            ))
+            .unwrap();
+    let budget = SessionImportBudget {
+        max_bytes: 64 * 1024,
+        max_records: 2,
+        max_work_time: Duration::from_millis(250),
+    };
+    let mut records = 0;
+    for _ in 0..2 {
+        let progress = worker
+            .process_checkpoint(
+                &sources[1],
+                SessionImportBudget {
+                    max_records: 2 - records,
+                    ..budget
+                },
+            )
+            .await
+            .unwrap();
+        assert!(progress.records > 0);
+        records += progress.records;
+        if records == 2 {
+            break;
+        }
+    }
+    assert_eq!(records, 2);
+    let old_context = writer
+        .session_import_context(&sources[1])
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = writer.project().await.unwrap();
+    let receipt_row = snapshot
+        .data_rows()
+        .find(|row| row.object_kind.as_deref() == Some("source_receipt"))
+        .unwrap()
+        .row_id
+        .clone();
+    let human = evertrace_engine::HumanGovernanceService::new(writer.clone(), CONFIG)
+        .with_session_report(Arc::clone(&report));
+    assert!(
+        human
+            .detail(
+                evertrace_engine::HumanSurface::Explorer,
+                &receipt_row,
+                snapshot.frontier,
+                None
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .items[0]
+            .evidence_detail
+            .is_some()
+    );
+    let body = fs::read_to_string(&files[1]).unwrap();
+    fs::write(&files[1], format!("{body}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"later\"}}}}\n")).unwrap();
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 1);
+    git(&nested, &["init", "-q", "--initial-branch=main"]);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let before = writer
+        .session_import_context(&sources[1])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        human
+            .detail(
+                evertrace_engine::HumanSurface::Explorer,
+                &receipt_row,
+                before.frontier,
+                None
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .items[0]
+            .evidence_detail
+            .is_none()
+    );
+    assert_eq!(
+        writer
+            .session_import_context(&sources[1])
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let preflight = worker
+        .process_checkpoint(&sources[1], budget)
+        .await
+        .unwrap();
+    assert_eq!((preflight.records, preflight.bytes), (0, 0));
+    let restricted = writer
+        .session_import_context(&sources[1])
+        .await
+        .unwrap()
+        .unwrap();
+    let restrictions = restricted
+        .current
+        .metadata
+        .repository_read_restrictions
+        .as_ref()
+        .unwrap();
+    assert_eq!(restrictions.len(), 2);
+    assert!(restrictions.contains(&repository_a));
+    assert_eq!(restricted.watermark, old_context.watermark);
+    assert!(
+        worker
+            .process_checkpoint(&sources[1], budget)
+            .await
+            .is_err()
+    );
+    // The source was catalogued before this external worktree existed. Its
+    // preflight must locate the already-known common-dir identity, not allocate
+    // a duplicate repository from its initially empty path-candidate context.
+    // Synthetic historical snapshots go through the real journal; the current
+    // snapshot and its positive real-Git HEAD evidence remain untouched.
+    let history = (1..=65)
+        .map(|ordinal| {
+            let mut historical = initial.read_snapshots[0].clone();
+            historical.worktree_snapshot_id = evertrace_domain::ids::WorktreeSnapshotId::new_v7();
+            historical.head_oid = Some(format!("{ordinal:040x}"));
+            historical.evidence_refs = vec![format!("test:old-snapshot:{ordinal}")];
+            evertrace_store::JournalEventDraft::runtime(
+                historical.captured_at_us,
+                CONFIG,
+                "test_history",
+                JournalPayload::WorktreeSnapshotRecorded(Box::new(historical)),
+            )
+        })
+        .collect();
+    let command =
+        evertrace_store::JournalCommand::new(evertrace_domain::ids::CommandId::new_v7(), history)
+            .unwrap();
+    let before_history = writer.project().await.unwrap();
+    writer
+        .commit_if_frontier(command, 20, before_history.frontier)
+        .await
+        .unwrap();
+    let repository = &initial.read_repositories[0];
+    let bounded = writer
+        .session_import_context_with_repository(
+            &sources[2],
+            repository.common_dir_filesystem.unwrap(),
+            repository.git_common_dir_path.as_deref().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(bounded.read_snapshots.len() <= 64);
+    assert!(
+        bounded
+            .read_snapshots
+            .iter()
+            .any(|snapshot| snapshot.worktree_snapshot_id
+                == initial.read_snapshots[0].worktree_snapshot_id)
+    );
+    assert!(
+        bounded
+            .incomplete_repository_history
+            .contains(&repository_a)
+    );
+    // Its own Host trust is authoritative, not the main worktree's trust.
+    fs::write(
+        adapter.join("config.toml"),
+        trust_config.replacen("\"trusted\"", "\"untrusted\"", 1),
+    )
+    .unwrap();
+    let preflight = worker
+        .process_checkpoint(&sources[2], budget)
+        .await
+        .unwrap();
+    assert_eq!((preflight.records, preflight.bytes), (0, 0));
+    let external = writer
+        .session_import_context(&sources[2])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        external.current.metadata.repository_read_restrictions,
+        Some(vec![repository_a])
+    );
+    assert_eq!(
+        external.current.metadata.resolved_repository_instance_id,
+        None
+    );
+    assert_eq!(
+        external.current.metadata.resolved_worktree_instance_id,
+        None
+    );
+    assert_eq!(
+        external
+            .read_repositories
+            .iter()
+            .find(|repo| repo.repository_id == repository_a)
+            .unwrap()
+            .current_path,
+        main.to_str().unwrap()
+    );
+    let mut records = 0;
+    for _ in 0..2 {
+        let progress = worker
+            .process_checkpoint(
+                &sources[2],
+                SessionImportBudget {
+                    max_records: 2 - records,
+                    ..budget
+                },
+            )
+            .await
+            .unwrap();
+        assert!(progress.records > 0);
+        records += progress.records;
+        if records == 2 {
+            break;
+        }
+    }
+    assert_eq!(records, 2);
+    let snapshot = writer.project().await.unwrap();
+    let external_receipt = snapshot.data_rows().find(|row| {
+        row.object_kind.as_deref() == Some("source_receipt")
+            && row.payload_json.as_ref().is_some_and(|raw| matches!(serde_json::from_str::<JournalPayload>(raw).unwrap(), JournalPayload::SourceReceiptRecorded(receipt) if receipt.source_instance_id.as_str() == sources[2]))
+    }).unwrap();
+    assert!(
+        human
+            .detail(
+                evertrace_engine::HumanSurface::Explorer,
+                &external_receipt.row_id,
+                snapshot.frontier,
+                None
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .items[0]
+            .evidence_detail
+            .is_some()
+    );
+    let repositories =
+        evertrace_store::repository::RepositoryCurrentView::from_snapshot(&snapshot).unwrap();
+    assert_eq!(repositories.repositories.len(), 2);
+    assert!(repositories.snapshots.len() > 64);
+    assert_eq!(
+        repositories
+            .worktrees
+            .values()
+            .find(|tree| tree.current_path.as_deref() == linked.to_str())
+            .unwrap()
+            .repository_instance_id,
+        repository_a
+    );
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 0);
+    // The catalog's full history view must also avoid spending its Git quantum
+    // on every historical HEAD before recognizing this same current identity.
+    let another_linked = temp.path().join("another-external");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            another_linked.to_str().unwrap(),
+        ],
+    );
+    let rollout = "019d0000-0000-7000-8000-000000000033";
+    let header = serde_json::json!({"timestamp":"2026-08-30T00:00:00Z", "type":"session_meta", "payload":{"id":session,"session_id":session,"cwd":another_linked}});
+    fs::write(
+        dated.join(format!(
+            "rollout-2026-08-30T00-00-00-{session}_{rollout}.jsonl"
+        )),
+        format!("{header}\n"),
+    )
+    .unwrap();
+    assert_eq!(catalog.refresh(&report_value).await.unwrap(), 1);
+    let newly_catalogued = writer
+        .session_import_context(&format!("session-rollout:{session}:{rollout}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        newly_catalogued
+            .current
+            .metadata
+            .repository_read_restrictions,
+        Some(vec![repository_a])
+    );
+    assert_eq!(
+        newly_catalogued
+            .current
+            .metadata
+            .resolved_repository_instance_id,
+        None
+    );
+    assert_eq!(newly_catalogued.current.access_decision, None);
+    let final_snapshot = writer.project().await.unwrap();
+    let final_repositories =
+        evertrace_store::repository::RepositoryCurrentView::from_snapshot(&final_snapshot).unwrap();
+    assert_eq!(final_repositories.repositories.len(), 2);
+    assert!(
+        final_repositories
+            .worktrees
+            .values()
+            .any(
+                |tree| tree.current_path.as_deref() == another_linked.to_str()
+                    && tree.repository_instance_id == repository_a
+            )
+    );
+    drop(worker);
+    drop(admin);
+    drop(catalog);
+    drop(human);
+    drop(writer);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let temp = TempDir::new().unwrap();
     let adapter = temp.path().join("adapter");

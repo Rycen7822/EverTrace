@@ -12,7 +12,7 @@ use evertrace_capture::{
     ConfinedRoot, DeviceKey, DeviceKeyStore, DurableSpool, RuntimeSnapshot, protect,
 };
 use evertrace_codex::{
-    HostProbeReport, adapter_manifest::SessionCatalogRootKind, policy::RepositoryTrustState,
+    HostProbeReport, adapter_manifest::SessionCatalogRootKind,
     source_catalog::qualify_requested_session_root,
 };
 use evertrace_domain::{
@@ -27,10 +27,9 @@ use evertrace_domain::{
 };
 use evertrace_store::{
     BodyStateReason, EventScope, JobLease, JobStatus, JobTerminalAudit, JobTerminalOutcome,
-    JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload, SessionAccessDecision,
-    SessionBodyState, SessionImportContext, SessionImportCurrent, SessionImportEvent,
-    SessionImportEventKind, SessionImportPrefixRecord, SessionImportPrefixRequest, SourceKind,
-    WorkspaceResolutionKind,
+    JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload, SessionBodyState,
+    SessionImportContext, SessionImportCurrent, SessionImportEvent, SessionImportEventKind,
+    SessionImportPrefixRecord, SessionImportPrefixRequest, SourceKind,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -38,7 +37,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     EvidenceIngestor, WriterHandle,
-    repository::{SESSION_ROOT_PROBE_BUDGET, read_report_worktree_trust_before},
+    repository::SESSION_ROOT_PROBE_BUDGET,
     session_import::{MAX_RECORD_BYTES, session_source_fingerprint},
 };
 
@@ -175,6 +174,21 @@ impl SessionImportWorker {
             .clone()
             .ok_or(SessionImportError::Unavailable)?;
         let current = &context.current;
+        if crate::session_import::preflight_import_context(
+            &self.writer,
+            &report,
+            &context,
+            self.runtime.effective_config_hash,
+        )
+        .await
+        .map_err(|_| SessionImportError::Unavailable)?
+        {
+            return Ok(SessionImportProgress {
+                records: 0,
+                bytes: 0,
+                completed: false,
+            });
+        }
         let (root, relative, identity) = match self.authorized_source(
             &report,
             &context,
@@ -994,34 +1008,6 @@ impl SessionImportWorker {
             &root_path,
         )
         .map_err(|_| SessionImportError::Unavailable)?;
-        match current.metadata.workspace_resolution_kind {
-            WorkspaceResolutionKind::Repository => {
-                let worktree_id = current
-                    .metadata
-                    .resolved_worktree_instance_id
-                    .ok_or(SessionImportError::Unavailable)?;
-                let worktree = context
-                    .worktree
-                    .as_ref()
-                    .filter(|worktree| {
-                        worktree.worktree_instance_id == worktree_id
-                            && Some(worktree.repository_instance_id)
-                                == current.metadata.resolved_repository_instance_id
-                            && context.repository.as_ref().is_some_and(|repo| {
-                                repo.repository_id == worktree.repository_instance_id
-                            })
-                    })
-                    .ok_or(SessionImportError::Unavailable)?;
-                if read_report_worktree_trust_before(report, Some(worktree), deadline).state
-                    != RepositoryTrustState::Trusted
-                {
-                    return Err(SessionImportError::Unavailable);
-                }
-            }
-            WorkspaceResolutionKind::NonRepository
-                if current.access_decision == Some(SessionAccessDecision::Approved) => {}
-            _ => return Err(SessionImportError::Unavailable),
-        }
         let relative = PathBuf::from(&current.metadata.source_path);
         let parent = relative.parent().ok_or(SessionImportError::Unsupported)?;
         let file_name = relative
@@ -1056,6 +1042,9 @@ impl SessionImportWorker {
                 != current.metadata.source_fingerprint
         {
             return Err(SessionImportError::Changed);
+        }
+        if !crate::session_import::source_ingest_read_allowed(report, context, deadline) {
+            return Err(SessionImportError::Unavailable);
         }
         Ok((root, relative, identity))
     }

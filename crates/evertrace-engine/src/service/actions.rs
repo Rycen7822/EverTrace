@@ -149,9 +149,18 @@ pub struct McpActionService {
     writer: WriterHandle,
     runtime_snapshot: RuntimeSnapshot,
     operation_config: Option<std::sync::Arc<evertrace_domain::config::EffectiveConfig>>,
+    session_report:
+        Option<std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
 }
 
 impl McpActionService {
+    pub fn with_session_report(
+        mut self,
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Self {
+        self.session_report = Some(report);
+        self
+    }
     /// Called only with the final response revision set retained by the UDS connection.
     pub async fn confirm_procedure_return(
         &self,
@@ -263,6 +272,7 @@ impl McpActionService {
             writer,
             runtime_snapshot,
             operation_config: None,
+            session_report: None,
         }
     }
 

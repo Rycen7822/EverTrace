@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 pub const SESSION_IMPORT_ROW_PREFIX: &str = "runtime:session_import:";
+pub const MAX_REPOSITORY_READ_RESTRICTIONS: usize = 16;
 
 /// A source-local read from the writer's committed admission state, not a
 /// projection barrier or a partial ProjectionSnapshot.
@@ -25,6 +26,13 @@ pub struct SessionImportContext {
     pub repository: Option<evertrace_domain::repository::RepositoryInstance>,
     pub worktree: Option<evertrace_domain::repository::WorktreeInstance>,
     pub repository_purged: bool,
+    pub read_repositories: Vec<evertrace_domain::repository::RepositoryInstance>,
+    pub read_worktrees: Vec<evertrace_domain::repository::WorktreeInstance>,
+    pub read_snapshots: Vec<evertrace_domain::repository::WorktreeSnapshot>,
+    /// Repository HEAD history not fully represented by read_snapshots. This
+    /// transient query result must never be interpreted as complete negative
+    /// continuity evidence; it is not a journal field or projected state.
+    pub incomplete_repository_history: Vec<RepositoryId>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +139,8 @@ pub struct SessionMetadata {
     pub workspace_resolution_kind: WorkspaceResolutionKind,
     pub resolved_repository_instance_id: Option<RepositoryId>,
     pub resolved_worktree_instance_id: Option<WorktreeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_read_restrictions: Option<Vec<RepositoryId>>,
     pub file_size: u64,
     pub file_mtime_us: i64,
     pub source_fingerprint: String,
@@ -265,6 +275,21 @@ impl SessionImportCurrent {
             return Err(StoreError::InvalidInput);
         }
         self.metadata.validate()?;
+        if self.metadata.repository_read_restrictions.is_some() {
+            if self.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
+                && matches!(
+                    self.body_state,
+                    SessionBodyState::Queued
+                        | SessionBodyState::Importing
+                        | SessionBodyState::Partial
+                        | SessionBodyState::Imported
+                )
+                && self.access_decision != Some(SessionAccessDecision::Approved)
+            {
+                return Err(StoreError::InvalidInput);
+            }
+            return Ok(());
+        }
         match self.metadata.workspace_resolution_kind {
             WorkspaceResolutionKind::Repository => {
                 if self.access_decision.is_some() {
@@ -302,7 +327,43 @@ impl SessionImportCurrent {
 }
 
 impl SessionMetadata {
+    pub fn workspace_matches_path(&self, path: &str) -> bool {
+        self.workspace_hint.as_deref().is_some_and(|workspace| {
+            std::path::Path::new(workspace).is_absolute()
+                && std::path::Path::new(path).is_absolute()
+                && std::path::Path::new(workspace).starts_with(path)
+        })
+    }
+
+    pub fn repository_candidate(
+        &self,
+        repository: &evertrace_domain::repository::RepositoryInstance,
+    ) -> bool {
+        self.workspace_matches_path(&repository.current_path)
+            || repository
+                .path_history
+                .iter()
+                .any(|path| self.workspace_matches_path(&path.path))
+    }
+
+    pub fn read_restrictions(&self) -> impl Iterator<Item = RepositoryId> + '_ {
+        self.repository_read_restrictions
+            .iter()
+            .flatten()
+            .copied()
+            .chain(self.resolved_repository_instance_id)
+    }
+
     pub fn validate(&self) -> Result<(), StoreError> {
+        if let Some(restrictions) = &self.repository_read_restrictions
+            && (restrictions.len() > MAX_REPOSITORY_READ_RESTRICTIONS
+                || restrictions.windows(2).any(|pair| pair[0] >= pair[1])
+                || self
+                    .resolved_repository_instance_id
+                    .is_some_and(|id| restrictions.binary_search(&id).is_err()))
+        {
+            return Err(StoreError::InvalidInput);
+        }
         if !valid_text(&self.source_path, 4096)
             || !valid_text(&self.source_format, 64)
             || self.file_mtime_us < 0
@@ -378,6 +439,20 @@ pub fn apply_session_event(
             Err(StoreError::InvalidInput)
         }
         (Some(old), SessionImportEventKind::MetadataObserved { metadata }) => {
+            match &metadata.repository_read_restrictions {
+                None if old.metadata.repository_read_restrictions.is_some() => {
+                    return Err(StoreError::InvalidInput);
+                }
+                Some(restrictions)
+                    if old
+                        .metadata
+                        .read_restrictions()
+                        .any(|id| restrictions.binary_search(&id).is_err()) =>
+                {
+                    return Err(StoreError::InvalidInput);
+                }
+                _ => {}
+            }
             if &old.metadata == metadata.as_ref() {
                 return Err(StoreError::InvalidInput);
             }
@@ -398,8 +473,12 @@ pub fn apply_session_event(
             next.revision = event.revision;
             next.metadata = metadata.as_ref().clone();
             next.source_event_seq = seq;
-            if source_changed
-                || metadata.workspace_resolution_kind != WorkspaceResolutionKind::NonRepository
+            if (source_changed
+                || (metadata.repository_read_restrictions.is_none()
+                    && metadata.workspace_resolution_kind
+                        != WorkspaceResolutionKind::NonRepository))
+                && !(metadata.repository_read_restrictions.is_some()
+                    && old.access_decision == Some(SessionAccessDecision::Revoked))
             {
                 next.access_decision = None;
             }
@@ -407,7 +486,9 @@ pub fn apply_session_event(
             Ok(next)
         }
         (Some(old), SessionImportEventKind::AccessDecision { decision, .. }) => {
-            if old.metadata.workspace_resolution_kind != WorkspaceResolutionKind::NonRepository {
+            if old.metadata.repository_read_restrictions.is_none()
+                && old.metadata.workspace_resolution_kind != WorkspaceResolutionKind::NonRepository
+            {
                 return Err(StoreError::InvalidInput);
             }
             if old.access_decision == Some(*decision) {
@@ -425,7 +506,7 @@ pub fn apply_session_event(
                 return Err(StoreError::InvalidInput);
             }
             if *body_state == SessionBodyState::Queued
-                && old.metadata.workspace_resolution_kind == WorkspaceResolutionKind::NonRepository
+                && old.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
                 && old.access_decision != Some(SessionAccessDecision::Approved)
             {
                 return Err(StoreError::InvalidInput);
@@ -635,6 +716,7 @@ mod tests {
             workspace_resolution_kind: WorkspaceResolutionKind::NonRepository,
             resolved_repository_instance_id: None,
             resolved_worktree_instance_id: None,
+            repository_read_restrictions: None,
             file_size: 10,
             file_mtime_us: 1,
             source_fingerprint: fingerprint.into(),
@@ -666,6 +748,7 @@ mod tests {
         );
         let bytes = serde_json::to_vec(&old).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("source_instance_id"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("repository_read_restrictions"));
         let decoded: SessionImportEvent = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
         let legacy = apply_session_event(None, &decoded, 1).unwrap();
@@ -682,6 +765,147 @@ mod tests {
         next.predecessor_revision = Some(1);
         assert!(
             apply_session_event(restore_current(&legacy_row).unwrap().as_ref(), &next, 3).is_err()
+        );
+    }
+
+    #[test]
+    fn read_restrictions_are_monotone_without_granting_approval() {
+        let digest = "1".repeat(64);
+        let mut metadata = metadata(&digest, &digest);
+        metadata.workspace_resolution_kind = WorkspaceResolutionKind::Ambiguous;
+        let old = apply_session_event(
+            None,
+            &event(
+                1,
+                SessionImportEventKind::MetadataObserved {
+                    metadata: Box::new(metadata.clone()),
+                },
+            ),
+            1,
+        )
+        .unwrap();
+        metadata.repository_read_restrictions = Some(Vec::new());
+        let observed = apply_session_event(
+            Some(&old),
+            &event(
+                2,
+                SessionImportEventKind::MetadataObserved {
+                    metadata: Box::new(metadata.clone()),
+                },
+            ),
+            2,
+        )
+        .unwrap();
+        assert_eq!(observed.access_decision, None);
+        assert_eq!(
+            restore_current(&current_row(&observed, 1).unwrap()).unwrap(),
+            Some(observed.clone())
+        );
+        let approved = apply_session_event(
+            Some(&observed),
+            &event(
+                3,
+                SessionImportEventKind::AccessDecision {
+                    decision: SessionAccessDecision::Approved,
+                    local_request_ref: RequestId::new_v7(),
+                    provenance_refs: vec!["local_cli:request".into()],
+                },
+            ),
+            3,
+        )
+        .unwrap();
+        let repository = RepositoryId::new_v7();
+        metadata.repository_read_restrictions = Some(vec![repository]);
+        let restricted_event = event(
+            4,
+            SessionImportEventKind::MetadataObserved {
+                metadata: Box::new(metadata.clone()),
+            },
+        );
+        let restricted = apply_session_event(Some(&approved), &restricted_event, 4).unwrap();
+        assert_eq!(
+            restricted.access_decision,
+            Some(SessionAccessDecision::Approved)
+        );
+        assert_eq!(restricted.metadata.resolved_repository_instance_id, None);
+        assert!(
+            apply_session_event(
+                Some(&restricted),
+                &event(5, restricted_event.event.clone()),
+                5
+            )
+            .is_err()
+        );
+        for dropped in [None, Some(Vec::new())] {
+            let mut invalid = metadata.clone();
+            invalid.repository_read_restrictions = dropped;
+            assert!(
+                apply_session_event(
+                    Some(&restricted),
+                    &event(
+                        5,
+                        SessionImportEventKind::MetadataObserved {
+                            metadata: Box::new(invalid),
+                        }
+                    ),
+                    5
+                )
+                .is_err()
+            );
+        }
+        let mut invalid = metadata.clone();
+        invalid.repository_read_restrictions = Some(vec![repository, repository]);
+        assert!(invalid.validate().is_err());
+        let mut reversed = vec![repository, RepositoryId::new_v7()];
+        reversed.sort_unstable_by(|a, b| b.cmp(a));
+        invalid.repository_read_restrictions = Some(reversed);
+        assert!(invalid.validate().is_err());
+        metadata.source_revision = SourceRevision::parse("2".repeat(64)).unwrap();
+        let replaced = apply_session_event(
+            Some(&restricted),
+            &event(
+                5,
+                SessionImportEventKind::MetadataObserved {
+                    metadata: Box::new(metadata),
+                },
+            ),
+            5,
+        )
+        .unwrap();
+        assert_eq!(replaced.access_decision, None);
+        assert_eq!(
+            replaced.metadata.repository_read_restrictions,
+            Some(vec![repository])
+        );
+        let revoked = apply_session_event(
+            Some(&replaced),
+            &event(
+                6,
+                SessionImportEventKind::AccessDecision {
+                    decision: SessionAccessDecision::Revoked,
+                    local_request_ref: RequestId::new_v7(),
+                    provenance_refs: vec!["local_cli:revoke".into()],
+                },
+            ),
+            6,
+        )
+        .unwrap();
+        let mut replacement = revoked.metadata.clone();
+        replacement.source_revision = SourceRevision::parse("3".repeat(64)).unwrap();
+        let still_revoked = apply_session_event(
+            Some(&revoked),
+            &event(
+                7,
+                SessionImportEventKind::MetadataObserved {
+                    metadata: Box::new(replacement),
+                },
+            ),
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            still_revoked.access_decision,
+            Some(SessionAccessDecision::Revoked)
         );
     }
 

@@ -1208,6 +1208,7 @@ pub fn probe_repository(
         limits,
         known_admin_paths,
         known_head_oids,
+        false,
     )
 }
 
@@ -1241,7 +1242,209 @@ pub fn probe_repository_pinned(
         limits,
         known_admin_paths,
         known_head_oids,
+        false,
     )
+}
+
+/// Current repository discovery reads identity and refs, never worktree content.
+pub(crate) fn probe_repository_identity(
+    candidate_path: &Path,
+    evidence_refs: &[String],
+    occurred_at_us: i64,
+    deadline: Instant,
+    known_head_oids: &[GitOid],
+) -> Result<GitProbeEvidence, RepositoryProbeError> {
+    with_probe_deadline(deadline, || {
+        probe_repository_impl(
+            candidate_path,
+            None,
+            HostTrustDecision::Unknown,
+            evidence_refs,
+            occurred_at_us,
+            &ProbeLimits::default(),
+            &[],
+            known_head_oids,
+            true,
+        )
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceGitLocation {
+    pub worktree_path: PathBuf,
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+    pub common_dir_filesystem: FilesystemIdentity,
+}
+
+fn admin_read_error(error: evertrace_capture::ConfinedReadError) -> ProbeUnavailableReason {
+    match error {
+        evertrace_capture::ConfinedReadError::Deadline => ProbeUnavailableReason::Timeout,
+        _ => ProbeUnavailableReason::CorruptAdminMetadata,
+    }
+}
+
+fn admin_text(
+    root: &evertrace_capture::ConfinedRoot,
+    name: &str,
+    deadline: Instant,
+) -> Result<Option<String>, ProbeUnavailableReason> {
+    let Some(identity) = root
+        .probe_regular_file(Path::new(name), deadline)
+        .map_err(admin_read_error)?
+    else {
+        return Ok(None);
+    };
+    if identity.size > 4096 {
+        return Err(ProbeUnavailableReason::CorruptAdminMetadata);
+    }
+    let bytes = root
+        .read_range(Path::new(name), identity, 0, 4097, deadline)
+        .map_err(admin_read_error)?;
+    let text =
+        String::from_utf8(bytes.bytes).map_err(|_| ProbeUnavailableReason::CorruptAdminMetadata)?;
+    let text = text.trim_end_matches(['\r', '\n']);
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return Err(ProbeUnavailableReason::CorruptAdminMetadata);
+    }
+    Ok(Some(text.into()))
+}
+
+// Resolve Git's relative admin pointers, checking every traversed directory
+// before lexical '..' removal. A symlink cannot change the pointer's meaning.
+fn admin_pointer(
+    base: &Path,
+    value: &str,
+    deadline: Instant,
+) -> Result<PathBuf, ProbeUnavailableReason> {
+    let mut path = if Path::new(value).is_absolute() {
+        PathBuf::from("/")
+    } else {
+        base.to_owned()
+    };
+    for (depth, component) in Path::new(value).components().enumerate() {
+        if depth >= 64 || Instant::now() >= deadline {
+            return Err(ProbeUnavailableReason::Timeout);
+        }
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !path.pop() {
+                    return Err(ProbeUnavailableReason::CorruptAdminMetadata);
+                }
+            }
+            std::path::Component::Normal(part) => path.push(part),
+            _ => return Err(ProbeUnavailableReason::CorruptAdminMetadata),
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| map_fs_error(&error))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(ProbeUnavailableReason::CorruptAdminMetadata);
+        }
+    }
+    Ok(path)
+}
+
+/// One bounded filesystem-only locator for both discovery and read gates.
+/// The nearest .git wins; ordinary names HEAD/objects alone are not Git.
+pub(crate) fn workspace_git_location(
+    candidate: &Path,
+    deadline: Instant,
+) -> Result<Option<WorkspaceGitLocation>, ProbeUnavailableReason> {
+    use evertrace_capture::ConfinedRoot;
+    if !candidate.is_absolute() {
+        return Err(ProbeUnavailableReason::PathMissing);
+    }
+    let deadline =
+        SHARED_PROBE_DEADLINE.with(|slot| slot.get().map_or(deadline, |value| value.min(deadline)));
+    for (depth, ancestor) in candidate.ancestors().enumerate() {
+        if depth >= 64 || Instant::now() >= deadline {
+            return Err(ProbeUnavailableReason::Timeout);
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(ProbeUnavailableReason::CorruptAdminMetadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(map_fs_error(&error)),
+        }
+        let marker = match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(map_fs_error(&error)),
+        };
+        if marker.is_none() {
+            // A bare admin directory has a coherent triad, not one generic
+            // file/directory name. Missing components are not probe errors.
+            let mut present = 0;
+            for name in ["HEAD", "objects", "refs"] {
+                match std::fs::symlink_metadata(ancestor.join(name)) {
+                    Ok(_) => present += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(map_fs_error(&error)),
+                }
+            }
+            if present != 3 {
+                continue;
+            }
+        }
+        let root = ConfinedRoot::open_external_source(ancestor).map_err(admin_read_error)?;
+        let git_dir = match marker {
+            Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                ancestor.join(".git")
+            }
+            Some(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let pointer = admin_text(&root, ".git", deadline)?
+                    .ok_or(ProbeUnavailableReason::CorruptAdminMetadata)?;
+                admin_pointer(
+                    ancestor,
+                    pointer
+                        .strip_prefix("gitdir: ")
+                        .ok_or(ProbeUnavailableReason::CorruptAdminMetadata)?,
+                    deadline,
+                )?
+            }
+            Some(_) => return Err(ProbeUnavailableReason::CorruptAdminMetadata),
+            None => ancestor.to_owned(),
+        };
+        let admin = ConfinedRoot::open_external_source(&git_dir).map_err(admin_read_error)?;
+        let head = admin_text(&admin, "HEAD", deadline)?
+            .ok_or(ProbeUnavailableReason::CorruptAdminMetadata)?;
+        if !head.starts_with("ref: refs/") && GitOid::parse(&head).is_err() {
+            return Err(ProbeUnavailableReason::CorruptAdminMetadata);
+        }
+        let common_dir = match admin_text(&admin, "commondir", deadline)? {
+            Some(pointer) => admin_pointer(&git_dir, &pointer, deadline)?,
+            None => git_dir.clone(),
+        };
+        let common = ConfinedRoot::open_external_source(&common_dir).map_err(admin_read_error)?;
+        for name in ["objects", "refs"] {
+            let directory = ConfinedRoot::open_external_source(&common_dir.join(name))
+                .map_err(admin_read_error)?;
+            directory.revalidate().map_err(admin_read_error)?;
+        }
+        root.revalidate().map_err(admin_read_error)?;
+        admin.revalidate().map_err(admin_read_error)?;
+        common.revalidate().map_err(admin_read_error)?;
+        if Instant::now() >= deadline {
+            return Err(ProbeUnavailableReason::Timeout);
+        }
+        return Ok(Some(WorkspaceGitLocation {
+            worktree_path: ancestor.to_owned(),
+            git_dir,
+            common_dir,
+            common_dir_filesystem: FilesystemIdentity {
+                device: common.identity().device,
+                inode: common.identity().inode,
+            },
+        }));
+    }
+    Ok(None)
+}
+
+pub(crate) fn workspace_has_git_signs(
+    candidate: &Path,
+    deadline: Instant,
+) -> Result<bool, ProbeUnavailableReason> {
+    workspace_git_location(candidate, deadline).map(|location| location.is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1254,6 +1457,7 @@ fn probe_repository_impl(
     limits: &ProbeLimits,
     known_admin_paths: &[String],
     known_head_oids: &[GitOid],
+    identity_only: bool,
 ) -> Result<GitProbeEvidence, RepositoryProbeError> {
     limits.validate()?;
     if occurred_at_us < 0 || evidence_refs.is_empty() || !candidate_path.is_absolute() {
@@ -1262,7 +1466,7 @@ fn probe_repository_impl(
     let candidate = pinned.map_or(candidate_path, |(logical, _)| logical);
     let candidate = candidate.to_string_lossy().into_owned();
     let refs = evidence_refs.to_vec();
-    if !trust.permits_content_probe() {
+    if !identity_only && !trust.permits_content_probe() {
         return Ok(GitProbeEvidence::unavailable(
             candidate,
             occurred_at_us,
@@ -1322,16 +1526,21 @@ fn probe_repository_impl(
             evidence.unavailable_reason = Some(ProbeUnavailableReason::Timeout);
             return Ok(evidence);
         }
-        Ok(_) => {
+        Ok(output) => {
             // Git refused the directory. If admin metadata exists, Git
             // rejected it: corrupt, not absent.
-            evidence.unavailable_reason = Some(
-                if std::fs::symlink_metadata(command_cwd.join(".git")).is_ok() {
-                    ProbeUnavailableReason::CorruptAdminMetadata
-                } else {
-                    ProbeUnavailableReason::NonGit
-                },
-            );
+            evidence.unavailable_reason = Some(if output.truncated {
+                ProbeUnavailableReason::CorruptAdminMetadata
+            } else {
+                match workspace_has_git_signs(
+                    &command_cwd,
+                    Instant::now() + std::time::Duration::from_millis(limits.max_duration_ms),
+                ) {
+                    Ok(false) if output.code == Some(128) => ProbeUnavailableReason::NonGit,
+                    Ok(_) => ProbeUnavailableReason::CorruptAdminMetadata,
+                    Err(reason) => reason,
+                }
+            });
             return Ok(evidence);
         }
         Err(reason) => {
@@ -1409,8 +1618,22 @@ fn probe_repository_impl(
         }
     }
     probe_head(&command_cwd, limits, &mut evidence);
-    probe_status(&command_cwd, limits, &mut evidence);
-    probe_index(&command_cwd, limits, &mut evidence);
+    if identity_only {
+        evidence.omissions.extend(
+            [
+                ProbeField::TrackedDiff,
+                ProbeField::Index,
+                ProbeField::UntrackedManifest,
+            ]
+            .map(|field| ProbeOmission {
+                field,
+                reason: ProbeUnavailableReason::TrustDenied,
+            }),
+        );
+    } else {
+        probe_status(&command_cwd, limits, &mut evidence);
+        probe_index(&command_cwd, limits, &mut evidence);
+    }
     probe_refs(&command_cwd, limits, &mut evidence);
     probe_continuity(&command_cwd, limits, &mut evidence, known_head_oids);
     probe_remotes(&command_cwd, limits, &mut evidence);
@@ -2635,5 +2858,83 @@ mod tests {
             ..ProbeLimits::default()
         };
         assert_eq!(limits.validate(), Err(RepositoryProbeError::InvalidInput));
+    }
+
+    #[test]
+    fn import_identity_probe_separates_absence_ancestor_unborn_and_failed_git() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = std::env::temp_dir().join(format!(
+            "evertrace-import-identity-{}",
+            evertrace_domain::ids::CommandId::new_v7()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plain = temp.join("plain");
+        let nested = plain.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(nested.join("objects")).unwrap();
+        std::fs::write(nested.join("HEAD"), b"ordinary application data\n").unwrap();
+        let refs = vec!["session_import_preflight:test".into()];
+        let probe = |path: &Path| {
+            probe_repository_identity(
+                path,
+                &refs,
+                1,
+                Instant::now() + Duration::from_millis(250),
+                &[],
+            )
+            .unwrap()
+        };
+        assert!(
+            !workspace_has_git_signs(&nested, Instant::now() + Duration::from_millis(250)).unwrap()
+        );
+        assert_eq!(
+            probe(&nested).unavailable_reason,
+            Some(ProbeUnavailableReason::NonGit)
+        );
+        test_git(&plain, &["init", "-q", "--initial-branch=main"]);
+        assert!(
+            workspace_has_git_signs(&nested, Instant::now() + Duration::from_millis(250)).unwrap()
+        );
+        let unborn = probe(&nested);
+        assert_eq!(unborn.unavailable_reason, None);
+        assert!(unborn.head_oid.is_none());
+        assert!(unborn.common_dir_filesystem.is_some());
+        assert!(
+            unborn.tracked_diff_digest.is_none()
+                && unborn.index_digest.is_none()
+                && unborn.untracked_manifest_digest.is_none()
+        );
+        let broken = temp.join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join(".git"), b"not a git admin pointer\n").unwrap();
+        assert!(
+            workspace_has_git_signs(&broken, Instant::now() + Duration::from_millis(250)).is_err()
+        );
+        assert_ne!(
+            probe(&broken).unavailable_reason,
+            Some(ProbeUnavailableReason::NonGit)
+        );
+        assert_eq!(
+            workspace_has_git_signs(&nested, Instant::now()),
+            Err(ProbeUnavailableReason::Timeout)
+        );
+        assert_eq!(
+            probe_repository_identity(&nested, &refs, 1, Instant::now(), &[])
+                .unwrap()
+                .unavailable_reason,
+            Some(ProbeUnavailableReason::Timeout)
+        );
+        let bare = temp.join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        test_git(&bare, &["init", "-q", "--bare"]);
+        assert!(
+            workspace_has_git_signs(&bare, Instant::now() + Duration::from_millis(250)).unwrap()
+        );
+        assert_ne!(
+            probe(&bare).unavailable_reason,
+            Some(ProbeUnavailableReason::NonGit)
+        );
+        std::fs::remove_dir_all(&temp).unwrap();
     }
 }

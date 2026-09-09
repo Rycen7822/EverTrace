@@ -256,6 +256,22 @@ impl JournalWriter {
             .session_import_prefix_page(self.frontier(), request)
     }
 
+    pub fn session_import_context_with_repository(
+        &self,
+        source: &str,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+        common_dir: &str,
+    ) -> Result<Option<crate::SessionImportContext>, StoreError> {
+        if common_dir.len() > 4096 || !std::path::Path::new(common_dir).is_absolute() {
+            return Err(StoreError::InvalidInput);
+        }
+        self.admission_state.session_import_context_with_repository(
+            self.frontier(),
+            source,
+            Some((identity, common_dir)),
+        )
+    }
+
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
         let lock = SiblingWriterLock::acquire(data_dir)?;
         Self::open_with_lock(lock).await

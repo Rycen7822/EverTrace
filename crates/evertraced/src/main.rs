@@ -256,7 +256,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_snapshot.effective_config_hash,
         runtime_snapshot.clone(),
         engine.effective_config().config().global_promotion.clone(),
-    );
+    )
+    .with_session_report(Arc::clone(&current_session_catalog_report));
     human_governance.reconcile_reserved_once().await?;
     let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
     let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
@@ -280,7 +281,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writer_handle.clone(),
         runtime_snapshot.clone(),
     )
-    .await?;
+    .await?
+    .with_session_report(Arc::clone(&current_session_catalog_report));
     let recovery_service =
         RecoveryBarrierService::new(runtime_snapshot.clone(), writer_handle.clone());
     let recall_cue_service = RecallCueService::new(
@@ -1610,7 +1612,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                     }
                 }),
                 system_detail: item.system_detail.map(|detail| match detail {
-                    EngineHumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace } => HumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace },
+                    EngineHumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions } => HumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions },
                     EngineHumanSystemDetail::Job { detail } => {
                         let EngineHumanJobDetail {
                             native_history_cleanup_availability,

@@ -445,6 +445,7 @@ pub enum HumanSystemDetail {
         body_state: String,
         access: String,
         workspace: String,
+        repository_read_restrictions: Option<Vec<evertrace_domain::ids::RepositoryId>>,
     },
     Job {
         detail: Box<HumanJobDetail>,
@@ -680,9 +681,51 @@ pub struct HumanGovernanceService {
     effective_config_hash: [u8; 32],
     runtime_snapshot: Option<RuntimeSnapshot>,
     global_promotion: GlobalPromotionConfig,
+    session_report:
+        Option<std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
 }
 
 impl HumanGovernanceService {
+    pub fn with_session_report(
+        mut self,
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Self {
+        self.session_report = Some(report);
+        self
+    }
+
+    async fn restrict_import_evidence(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        items: &mut [HumanSummary],
+    ) -> Result<(), HumanGovernanceError> {
+        let selected = items
+            .iter()
+            .map(|item| item.stable_key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let rows = snapshot
+            .data_rows()
+            .filter(|row| selected.contains(row.row_id.as_str()))
+            .collect::<Vec<_>>();
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        let blocked = crate::session_import::blocked_source_rows(
+            &self.writer,
+            report.as_ref(),
+            snapshot,
+            &rows,
+        )
+        .await
+        .map_err(|_| HumanGovernanceError::Store)?;
+        for item in items {
+            if blocked.contains(&item.stable_key) {
+                item.evidence_detail = None;
+            }
+        }
+        Ok(())
+    }
     pub fn for_config(
         &self,
         config: &evertrace_domain::config::EffectiveConfig,
@@ -704,6 +747,7 @@ impl HumanGovernanceService {
             effective_config_hash,
             runtime_snapshot: None,
             global_promotion: GlobalPromotionConfig::default(),
+            session_report: None,
         }
     }
 
@@ -718,6 +762,7 @@ impl HumanGovernanceService {
             effective_config_hash,
             runtime_snapshot: Some(runtime_snapshot),
             global_promotion,
+            session_report: None,
         }
     }
 
@@ -928,7 +973,12 @@ impl HumanGovernanceService {
         if expected_frontier.is_some_and(|frontier| frontier != snapshot.frontier) {
             return Ok(Err(snapshot.frontier));
         }
-        Ok(Ok(page(&snapshot, surface, after, usize::from(limit))?))
+        let mut result = page(&snapshot, surface, after, usize::from(limit))?;
+        if surface == HumanSurface::Explorer {
+            self.restrict_import_evidence(&snapshot, &mut result.items)
+                .await?;
+        }
+        Ok(Ok(result))
     }
 
     pub async fn list_system(
@@ -1041,6 +1091,9 @@ impl HumanGovernanceService {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if surface == HumanSurface::Explorer {
+            self.restrict_import_evidence(&snapshot, &mut items).await?;
+        }
         if let Some((index, backup_job_id, validation_result)) =
             items.iter().enumerate().find_map(|(index, item)| {
                 let HumanSystemDetail::Job { detail } = item.system_detail.as_ref()? else {
@@ -4464,6 +4517,7 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
                     .access_decision
                     .map_or_else(|| "None".to_owned(), |value| format!("{value:?}")),
                 workspace: format!("{:?}", source.metadata.workspace_resolution_kind),
+                repository_read_restrictions: source.metadata.repository_read_restrictions,
             }),
         ));
     }

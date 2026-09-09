@@ -339,6 +339,27 @@ pub(crate) fn read_report_worktree_trust_before(
     worktree: Option<&evertrace_domain::repository::WorktreeInstance>,
     deadline: Instant,
 ) -> RepositoryTrustResult {
+    read_report_path_trust_before(
+        report,
+        worktree
+            .filter(|value| value.validate().is_ok())
+            .and_then(|value| {
+                value
+                    .current_path
+                    .as_deref()
+                    .or_else(|| value.path_history.last().map(|item| item.path.as_str()))
+            }),
+        deadline,
+    )
+}
+
+/// The path is a verified current candidate or a recorded repository locator;
+/// it selects a Host trust entry, never grants historical Worktree identity.
+pub(crate) fn read_report_path_trust_before(
+    report: &HostProbeReport,
+    repository_path: Option<&str>,
+    deadline: Instant,
+) -> RepositoryTrustResult {
     let unknown = || RepositoryTrustResult {
         state: RepositoryTrustState::Unknown,
         canonical_repository_path: None,
@@ -361,12 +382,12 @@ pub(crate) fn read_report_worktree_trust_before(
     let Some(adapter_root) = qualified.path().parent() else {
         return unknown();
     };
-    read_repository_trust_at(adapter_root, worktree, deadline)
+    read_repository_trust_at(adapter_root, repository_path, deadline)
 }
 
 fn read_repository_trust_at(
     adapter_root: &Path,
-    worktree: Option<&evertrace_domain::repository::WorktreeInstance>,
+    repository_path: Option<&str>,
     deadline: Instant,
 ) -> RepositoryTrustResult {
     let unknown = || RepositoryTrustResult {
@@ -374,13 +395,7 @@ fn read_repository_trust_at(
         canonical_repository_path: None,
         evidence_refs: Vec::new(),
     };
-    let Some(worktree) = worktree else {
-        return unknown();
-    };
-    if worktree.lifecycle != WorktreeLifecycle::Active || worktree.validate().is_err() {
-        return unknown();
-    }
-    let Some(path) = worktree.current_path.as_deref() else {
+    let Some(path) = repository_path else {
         return unknown();
     };
     let Ok(confined) = ConfinedRoot::open_external_source(adapter_root) else {
