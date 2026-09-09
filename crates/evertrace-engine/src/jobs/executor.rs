@@ -2,7 +2,8 @@ use evertrace_store::{
     BackupError, BackupSummary, CommitOutcome, CommittedCommand, DurableJob, JobStatus,
     JournalCommand, JournalWriter, ObjectDeletionCurrentView, ProjectionSnapshot, ProjectionWorker,
     RecallCurrentContext, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
-    ReconciliationFrontier, RuntimeSchedulerView, ScopePurgeCurrentView, StoreError,
+    ReconciliationFrontier, RuntimeSchedulerView, ScopePurgeCurrentView, SessionImportContext,
+    SessionImportPrefixPage, SessionImportPrefixRequest, SessionImportSelection, StoreError,
 };
 use std::{
     collections::BTreeSet,
@@ -52,6 +53,19 @@ enum WriterRequest {
     RecallCurrentContexts {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<RecallCurrentContext>, WriterActorError>>,
+    },
+    SessionImportContext {
+        source: String,
+        reply: oneshot::Sender<Result<Option<SessionImportContext>, WriterActorError>>,
+    },
+    SessionImportContexts {
+        after: Option<String>,
+        limit: usize,
+        reply: oneshot::Sender<Result<SessionImportSelection, WriterActorError>>,
+    },
+    SessionImportPrefixPage {
+        request: SessionImportPrefixRequest,
+        reply: oneshot::Sender<Result<SessionImportPrefixPage, WriterActorError>>,
     },
     ReconciliationFrontier {
         limit: usize,
@@ -154,6 +168,50 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::RecallCurrentContexts { limit, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn session_import_context(
+        &self,
+        source: &str,
+    ) -> Result<Option<SessionImportContext>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SessionImportContext {
+                source: source.to_owned(),
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn session_import_contexts(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<SessionImportSelection, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SessionImportContexts {
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn session_import_prefix_page(
+        &self,
+        request: SessionImportPrefixRequest,
+    ) -> Result<SessionImportPrefixPage, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SessionImportPrefixPage { request, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -491,6 +549,34 @@ async fn run_writer(
                     .as_ref()
                     .ok_or(WriterActorError::Stopped)?
                     .recall_current_contexts(limit)
+                    .map_err(map_store_error);
+                let _ = reply.send(result);
+            }
+            WriterRequest::SessionImportContext { source, reply } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .session_import_context(&source)
+                    .map_err(map_store_error);
+                let _ = reply.send(result);
+            }
+            WriterRequest::SessionImportContexts {
+                after,
+                limit,
+                reply,
+            } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .session_import_contexts(after.as_deref(), limit)
+                    .map_err(map_store_error);
+                let _ = reply.send(result);
+            }
+            WriterRequest::SessionImportPrefixPage { request, reply } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .session_import_prefix_page(&request)
                     .map_err(map_store_error);
                 let _ = reply.send(result);
             }

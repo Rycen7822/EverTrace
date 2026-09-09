@@ -12,6 +12,55 @@ use std::str::FromStr;
 
 pub const SESSION_IMPORT_ROW_PREFIX: &str = "runtime:session_import:";
 
+/// A source-local read from the writer's committed admission state, not a
+/// projection barrier or a partial ProjectionSnapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionImportContext {
+    pub frontier: u64,
+    pub current: SessionImportCurrent,
+    pub job: Option<crate::DurableJob>,
+    pub watermark: Option<crate::SourceIngestWatermark>,
+    pub previous_revision: Option<SourceRevision>,
+    pub recorded_prefix_end: Option<u64>,
+    pub repository: Option<evertrace_domain::repository::RepositoryInstance>,
+    pub worktree: Option<evertrace_domain::repository::WorktreeInstance>,
+    pub repository_purged: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionImportSelection {
+    pub contexts: Vec<SessionImportContext>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionImportPrefixRecord {
+    pub start: u64,
+    pub end: u64,
+    pub cas_ref: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionImportPrefixRequest {
+    pub source: String,
+    pub revision: SourceRevision,
+    pub after: u64,
+    pub end: u64,
+    pub max_records: usize,
+    pub max_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionImportPrefixPage {
+    pub frontier: u64,
+    pub records: Vec<SessionImportPrefixRecord>,
+    pub has_more: bool,
+}
+
+pub fn is_session_import_source(instance: &str) -> bool {
+    instance.starts_with("codex-session:") || instance.starts_with("session-rollout:")
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceResolutionKind {
@@ -111,6 +160,8 @@ pub enum SessionImportEventKind {
 #[serde(deny_unknown_fields)]
 pub struct SessionImportEvent {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instance_id: Option<String>,
     pub revision: u64,
     pub predecessor_revision: Option<u64>,
     pub occurred_at_us: i64,
@@ -121,6 +172,8 @@ pub struct SessionImportEvent {
 #[serde(deny_unknown_fields)]
 pub struct SessionImportCurrent {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instance_id: Option<String>,
     pub revision: u64,
     pub metadata: SessionMetadata,
     pub access_decision: Option<SessionAccessDecision>,
@@ -142,7 +195,7 @@ impl SessionImportCurrentView {
                 continue;
             };
             if value.source_event_seq > snapshot.frontier
-                || sessions.insert(value.session_id.clone(), value).is_some()
+                || sessions.insert(value.source_key(), value).is_some()
             {
                 return Err(StoreError::StoreCorrupt);
             }
@@ -155,8 +208,15 @@ impl SessionImportCurrentView {
 }
 
 impl SessionImportEvent {
+    pub fn source_key(&self) -> String {
+        self.source_instance_id
+            .clone()
+            .unwrap_or_else(|| self.session_id.clone())
+    }
+
     pub fn validate(&self) -> Result<(), StoreError> {
         if !valid_text(&self.session_id, 512)
+            || !valid_source_instance(&self.session_id, self.source_instance_id.as_deref())
             || self.revision == 0
             || self.occurred_at_us < 0
             || self.predecessor_revision != self.revision.checked_sub(1).filter(|v| *v != 0)
@@ -184,8 +244,24 @@ impl SessionImportEvent {
 }
 
 impl SessionImportCurrent {
+    pub fn source_key(&self) -> String {
+        self.source_instance_id
+            .clone()
+            .unwrap_or_else(|| self.session_id.clone())
+    }
+
+    pub fn source_instance(&self) -> String {
+        self.source_instance_id
+            .clone()
+            .unwrap_or_else(|| format!("codex-session:{}", self.session_id))
+    }
+
     pub fn validate(&self) -> Result<(), StoreError> {
-        if !valid_text(&self.session_id, 512) || self.revision == 0 || self.source_event_seq == 0 {
+        if !valid_text(&self.session_id, 512)
+            || !valid_source_instance(&self.session_id, self.source_instance_id.as_deref())
+            || self.revision == 0
+            || self.source_event_seq == 0
+        {
             return Err(StoreError::InvalidInput);
         }
         self.metadata.validate()?;
@@ -283,6 +359,7 @@ pub fn apply_session_event(
         (None, SessionImportEventKind::MetadataObserved { metadata }) if event.revision == 1 => {
             let next = SessionImportCurrent {
                 session_id: event.session_id.clone(),
+                source_instance_id: event.source_instance_id.clone(),
                 revision: 1,
                 metadata: metadata.as_ref().clone(),
                 access_decision: None,
@@ -295,6 +372,7 @@ pub fn apply_session_event(
         (None, _) => Err(StoreError::InvalidInput),
         (Some(old), _)
             if old.session_id != event.session_id
+                || old.source_instance_id != event.source_instance_id
                 || event.predecessor_revision != Some(old.revision) =>
         {
             Err(StoreError::InvalidInput)
@@ -303,10 +381,10 @@ pub fn apply_session_event(
             if &old.metadata == metadata.as_ref() {
                 return Err(StoreError::InvalidInput);
             }
-            let source_changed = old.metadata.source_path != metadata.source_path
-                || old.metadata.source_revision != metadata.source_revision
+            let source_changed = old.metadata.source_revision != metadata.source_revision
                 || metadata.file_size < old.metadata.file_size
-                || (metadata.file_size == old.metadata.file_size
+                || (metadata.source_path == old.metadata.source_path
+                    && metadata.file_size == old.metadata.file_size
                     && old.metadata.file_mtime_us != metadata.file_mtime_us);
             if source_changed
                 && !matches!(
@@ -369,7 +447,7 @@ pub fn session_import_row_id(session_id: &str) -> String {
 pub fn current_row(value: &SessionImportCurrent, generation: u64) -> Result<ObjectRow, StoreError> {
     value.validate()?;
     Ok(ObjectRow {
-        row_id: session_import_row_id(&value.session_id),
+        row_id: session_import_row_id(&value.source_key()),
         row_kind: ObjectRowKind::Data,
         row_class: Some(ObjectRowClass::Runtime),
         object_family: None,
@@ -409,7 +487,7 @@ pub fn restore_current(row: &ObjectRow) -> Result<Option<SessionImportCurrent>, 
         .ok_or(StoreError::StoreCorrupt)?;
     let value: SessionImportCurrent =
         serde_json::from_str(json).map_err(|_| StoreError::StoreCorrupt)?;
-    if row.row_id != session_import_row_id(&value.session_id)
+    if row.row_id != session_import_row_id(&value.source_key())
         || row.row_class != Some(ObjectRowClass::Runtime)
         || row.object_id.is_some()
         || row.current_revision_id.as_deref() != Some(&value.revision.to_string())
@@ -512,6 +590,23 @@ fn reason_matches(state: SessionBodyState, reason: BodyStateReason) -> bool {
     )
 }
 
+fn valid_source_instance(session: &str, source: Option<&str>) -> bool {
+    source.is_none_or(|source| {
+        source
+            .strip_prefix(&format!("session-rollout:{session}:"))
+            .is_some_and(|rollout| {
+                rollout.len() == 36
+                    && rollout.bytes().enumerate().all(|(i, b)| {
+                        if [8, 13, 18, 23].contains(&i) {
+                            b == b'-'
+                        } else {
+                            b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+                        }
+                    })
+            })
+    })
+}
+
 fn valid_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -551,12 +646,43 @@ mod tests {
 
     fn event(revision: u64, event: SessionImportEventKind) -> SessionImportEvent {
         SessionImportEvent {
+            source_instance_id: None,
             session_id: "session-a".into(),
             revision,
             predecessor_revision: revision.checked_sub(1).filter(|value| *value != 0),
             occurred_at_us: i64::try_from(revision).unwrap(),
             event,
         }
+    }
+
+    #[test]
+    fn optional_source_preserves_legacy_bytes_and_separates_rows() {
+        let digest = "1".repeat(64);
+        let old = event(
+            1,
+            SessionImportEventKind::MetadataObserved {
+                metadata: Box::new(metadata(&digest, &digest)),
+            },
+        );
+        let bytes = serde_json::to_vec(&old).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("source_instance_id"));
+        let decoded: SessionImportEvent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+        let legacy = apply_session_event(None, &decoded, 1).unwrap();
+        let legacy_row = current_row(&legacy, 1).unwrap();
+        assert_eq!(legacy_row.row_id, session_import_row_id("session-a"));
+        assert_eq!(legacy.source_instance(), "codex-session:session-a");
+        let mut next = old;
+        next.source_instance_id =
+            Some("session-rollout:session-a:019d0000-0000-7000-8000-000000000002".into());
+        let separate = apply_session_event(None, &next, 2).unwrap();
+        assert_ne!(current_row(&separate, 1).unwrap().row_id, legacy_row.row_id);
+        assert_eq!(restore_current(&legacy_row).unwrap(), Some(legacy));
+        next.revision = 2;
+        next.predecessor_revision = Some(1);
+        assert!(
+            apply_session_event(restore_current(&legacy_row).unwrap().as_ref(), &next, 3).is_err()
+        );
     }
 
     #[test]

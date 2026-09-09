@@ -8,6 +8,7 @@ pub use frozen_memory_export::{
 };
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -36,7 +37,7 @@ use evertrace_store::{
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{WriterActorError, WriterHandle, repository::read_report_repository_trust};
+use crate::{WriterActorError, WriterHandle, repository::read_report_repository_trust_before};
 
 pub(crate) use evertrace_codex::session_import::MAX_RECORD_BYTES;
 const SOURCE_FORMAT: &str = "codex_rollout_jsonl_v1";
@@ -51,6 +52,7 @@ pub struct SessionCatalogBudget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogedSession {
     pub session_id: String,
+    pub source_instance_id: String,
     pub metadata: SessionMetadata,
 }
 
@@ -77,6 +79,11 @@ pub enum SessionImportAdminOutcome {
     Queued,
     Revoked,
     NoDelta,
+    Partial {
+        changed: u32,
+        unavailable: u32,
+        remaining: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -104,7 +111,81 @@ pub struct SessionImportAdminService {
 pub struct SessionCatalogService {
     writer: WriterHandle,
     effective_config_hash: [u8; 32],
-    cursor: Arc<Mutex<Option<String>>>,
+    cursor: Arc<Mutex<CatalogCursor>>,
+}
+
+#[derive(Clone, Default)]
+struct CatalogCursor {
+    after: Option<String>,
+    round_root: Option<(u64, u64)>,
+    recovery: BTreeMap<String, SourceObservation>,
+    recovery_after: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct SourceObservation {
+    unique: Option<CatalogedSession>,
+    conflicting: bool,
+}
+
+impl SourceObservation {
+    fn observe(&mut self, item: &CatalogedSession) {
+        if let Some(previous) = &self.unique {
+            if previous.metadata.source_path != item.metadata.source_path
+                || previous.metadata.source_fingerprint != item.metadata.source_fingerprint
+            {
+                self.conflicting = true;
+            }
+        } else {
+            self.unique = Some(item.clone());
+        }
+    }
+}
+
+impl CatalogCursor {
+    fn begin_round(&mut self, current: &SessionImportCurrentView, root: ConfinedFileIdentity) {
+        let identity = (root.device, root.inode);
+        if self.after.is_some() {
+            if self.round_root != Some(identity) {
+                self.invalidate();
+            }
+            return;
+        }
+        self.round_root = Some(identity);
+        self.recovery.clear();
+        // The same small source bound as an admin batch; rotate the starting
+        // source so an unresolved group cannot monopolize later scan rounds.
+        let eligible = current.sessions.iter().filter(|(_, source)| {
+            source.metadata.workspace_resolution_kind == WorkspaceResolutionKind::Unavailable
+        });
+        let mut last = None;
+        for (key, _) in eligible
+            .clone()
+            .filter(|(key, _)| {
+                self.recovery_after
+                    .as_ref()
+                    .is_none_or(|after| *key > after)
+            })
+            .chain(eligible.filter(|(key, _)| {
+                self.recovery_after
+                    .as_ref()
+                    .is_some_and(|after| *key <= after)
+            }))
+            .take(16)
+        {
+            self.recovery
+                .insert(key.clone(), SourceObservation::default());
+            last = Some(key.clone());
+        }
+        if last.is_some() {
+            self.recovery_after = last;
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.recovery.clear();
+        self.round_root = None;
+    }
 }
 
 impl SessionCatalogService {
@@ -118,7 +199,7 @@ impl SessionCatalogService {
         Self {
             writer,
             effective_config_hash,
-            cursor: Arc::new(Mutex::new(None)),
+            cursor: Arc::new(Mutex::new(CatalogCursor::default())),
         }
     }
 
@@ -130,6 +211,8 @@ impl SessionCatalogService {
         let snapshot = self.writer.project().await.map_err(map_writer)?;
         let repositories = RepositoryCurrentView::from_snapshot(&snapshot)
             .map_err(|_| SessionImportServiceError::Corrupt)?;
+        let current = SessionImportCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
         let path = report
             .session_catalog_roots()
             .iter()
@@ -137,7 +220,7 @@ impl SessionCatalogService {
             .and_then(|root| root.canonical_absolute_path.as_deref())
             .map(PathBuf::from)
             .ok_or(SessionImportServiceError::Unavailable)?;
-        let page = catalog_codex_sessions_after(
+        let mut page = catalog_codex_sessions_after(
             report,
             &path,
             &repositories,
@@ -146,66 +229,45 @@ impl SessionCatalogService {
                 max_metadata_bytes: 4 * 1024 * 1024,
                 deadline: Instant::now() + std::time::Duration::from_millis(250),
             },
-            cursor.as_deref(),
-            256,
+            cursor.after.as_deref(),
+            64,
         )
-        .map_err(|_| SessionImportServiceError::Unavailable)?;
-        let current = SessionImportCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        .map_err(|_| {
+            cursor.invalidate();
+            SessionImportServiceError::Unavailable
+        })?;
+        let mut next_cursor = cursor.clone();
+        let updates = reconcile_catalog_page(&mut page, &repositories, &current, &mut next_cursor)
+            .map_err(|_| {
+                cursor.invalidate();
+                SessionImportServiceError::Unavailable
+            })?;
         let occurred_at_us = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
         let mut payloads = Vec::new();
-        let mut last_examined = cursor.clone();
-        let mut changed = 0_usize;
-        for item in page.sessions {
-            let old = current.sessions.get(&item.session_id);
-            let mut metadata = item.metadata;
-            if let Some(old) = old {
-                if old.metadata.source_path == metadata.source_path
-                    && metadata.file_size > old.metadata.file_size
-                {
-                    metadata.source_revision = old.metadata.source_revision.clone();
-                } else if old.metadata.source_path == metadata.source_path
-                    && (metadata.file_size < old.metadata.file_size
-                        || (metadata.file_size == old.metadata.file_size
-                            && metadata.file_mtime_us != old.metadata.file_mtime_us))
-                {
-                    metadata.source_revision =
-                        SourceRevision::parse(metadata.source_fingerprint.clone())
-                            .map_err(|_| SessionImportServiceError::Corrupt)?;
-                }
-                if old.metadata == metadata {
-                    last_examined = Some(metadata.source_path.clone());
-                    continue;
-                }
+        for (source_key, item) in updates {
+            let old = current.sessions.get(&source_key);
+            if old.is_some_and(|old| old.metadata == item.metadata) {
+                continue;
             }
             metadata_events(
                 old,
                 item.session_id,
-                metadata,
+                old.map_or_else(
+                    || Some(item.source_instance_id),
+                    |old| old.source_instance_id.clone(),
+                ),
+                item.metadata,
                 occurred_at_us,
                 &mut payloads,
             )?;
-            changed += 1;
-            last_examined = payloads.iter().rev().find_map(|payload| match payload {
-                JournalPayload::SessionImportEventRecorded(event) => match &event.event {
-                    SessionImportEventKind::MetadataObserved { metadata } => {
-                        Some(metadata.source_path.clone())
-                    }
-                    _ => None,
-                },
-                _ => None,
-            });
-            if changed == 64 {
-                break;
-            }
         }
         if payloads.is_empty() {
-            *cursor = if page.has_more {
-                page.last_scanned
+            *cursor = next_cursor;
+            return if page.unavailable {
+                Err(SessionImportServiceError::Unavailable)
             } else {
-                None
+                Ok(usize::from(page.has_more))
             };
-            return Ok(usize::from(page.has_more));
         }
         let terminal_sessions = payloads
             .iter()
@@ -220,14 +282,11 @@ impl SessionCatalogService {
                         SessionImportEventKind::BodyStateAdvanced {
                             body_state: SessionBodyState::SourceReplaced,
                             ..
-                        } => Some((event.session_id.clone(), JobTerminalReason::SourceReplaced)),
+                        } => Some((event.source_key(), JobTerminalReason::SourceReplaced)),
                         SessionImportEventKind::BodyStateAdvanced {
                             body_state: SessionBodyState::BlockedScopeUnresolved,
                             ..
-                        } => Some((
-                            event.session_id.clone(),
-                            JobTerminalReason::SourceUnavailable,
-                        )),
+                        } => Some((event.source_key(), JobTerminalReason::SourceUnavailable)),
                         _ => None,
                     }
                 }
@@ -258,7 +317,7 @@ impl SessionCatalogService {
                         }
                     ) =>
                 {
-                    Some((event.session_id.clone(), event.revision))
+                    Some((event.source_key(), event.revision))
                 }
                 _ => None,
             })
@@ -306,13 +365,16 @@ impl SessionCatalogService {
         self.writer
             .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
             .await
-            .map_err(map_writer)?;
-        *cursor = if changed == 64 || page.has_more {
-            last_examined
+            .map_err(|error| {
+                cursor.invalidate();
+                map_writer(error)
+            })?;
+        *cursor = next_cursor;
+        if page.unavailable {
+            Err(SessionImportServiceError::Unavailable)
         } else {
-            None
-        };
-        Ok(count)
+            Ok(count)
+        }
     }
 }
 
@@ -345,82 +407,177 @@ impl SessionImportAdminService {
         if !valid_session_id(session_id) || occurred_at_us < 0 {
             return Err(SessionImportServiceError::Unavailable);
         }
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        if let Some(committed) = self
+            .writer
+            .committed_command(command_id)
+            .await
+            .map_err(map_writer)?
+        {
+            let matches = committed.payloads.iter().any(|payload| {
+                let JournalPayload::SessionImportEventRecorded(event) = payload else {
+                    return false;
+                };
+                event.session_id == session_id
+                    && matches!(
+                        (&event.event, action),
+                        (
+                            SessionImportEventKind::BodyStateAdvanced {
+                                body_state: SessionBodyState::Queued,
+                                ..
+                            },
+                            SessionImportAdminAction::QueueImport
+                        ) | (
+                            SessionImportEventKind::AccessDecision {
+                                decision: SessionAccessDecision::Revoked,
+                                ..
+                            },
+                            SessionImportAdminAction::RevokeAccess
+                        )
+                    )
+            });
+            return if matches {
+                Ok(SessionImportAdminOutcome::NoDelta)
+            } else {
+                Err(SessionImportServiceError::Corrupt)
+            };
+        }
         let report = Arc::clone(&self.report).read_owned().await;
         let snapshot = self.writer.project().await.map_err(map_writer)?;
         let sessions = SessionImportCurrentView::from_snapshot(&snapshot)
             .map_err(|_| SessionImportServiceError::Corrupt)?;
-        let current = sessions
+        if !sessions
             .sessions
-            .get(session_id)
-            .ok_or(SessionImportServiceError::Unavailable)?;
-        match action {
-            SessionImportAdminAction::QueueImport => {
-                if matches!(
-                    current.body_state,
-                    SessionBodyState::Queued
-                        | SessionBodyState::Importing
-                        | SessionBodyState::Imported
-                        | SessionBodyState::Partial
-                ) {
-                    return Ok(SessionImportAdminOutcome::NoDelta);
+            .values()
+            .any(|current| current.session_id == session_id)
+        {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+        let sources = sessions.sessions.values().filter(|current| {
+            current.session_id == session_id
+                && match action {
+                    SessionImportAdminAction::QueueImport => !matches!(
+                        current.body_state,
+                        SessionBodyState::Queued
+                            | SessionBodyState::Importing
+                            | SessionBodyState::Imported
+                            | SessionBodyState::Partial
+                    ),
+                    SessionImportAdminAction::RevokeAccess => {
+                        current.access_decision != Some(SessionAccessDecision::Revoked)
+                    }
                 }
-                match current.metadata.workspace_resolution_kind {
-                    WorkspaceResolutionKind::Repository => {
-                        let worktree_id = current
-                            .metadata
-                            .resolved_worktree_instance_id
-                            .ok_or(SessionImportServiceError::Unavailable)?;
-                        let repositories = RepositoryCurrentView::from_snapshot(&snapshot)
-                            .map_err(|_| SessionImportServiceError::Corrupt)?;
-                        let report = report
-                            .as_ref()
-                            .ok_or(SessionImportServiceError::Unavailable)?;
-                        if read_report_repository_trust(report, &repositories, worktree_id).state
-                            != RepositoryTrustState::Trusted
-                        {
-                            return Err(SessionImportServiceError::Unavailable);
+        });
+        let repositories = RepositoryCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        let mut events = Vec::new();
+        let mut unavailable = 0;
+        let mut changed = 0;
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut remaining = 0_u32;
+        for current in sources {
+            if changed == 16 || Instant::now() >= deadline {
+                remaining = remaining.saturating_add(1);
+                continue;
+            }
+            let prepared = match action {
+                SessionImportAdminAction::QueueImport => {
+                    if matches!(
+                        current.body_state,
+                        SessionBodyState::Queued
+                            | SessionBodyState::Importing
+                            | SessionBodyState::Imported
+                            | SessionBodyState::Partial
+                    ) {
+                        continue;
+                    }
+                    match current.metadata.workspace_resolution_kind {
+                        WorkspaceResolutionKind::Repository => {
+                            if !current
+                                .metadata
+                                .resolved_worktree_instance_id
+                                .zip(report.as_ref())
+                                .is_some_and(|(worktree_id, report)| {
+                                    read_report_repository_trust_before(
+                                        report,
+                                        &repositories,
+                                        worktree_id,
+                                        deadline,
+                                    )
+                                    .state
+                                        == RepositoryTrustState::Trusted
+                                })
+                            {
+                                unavailable += 1;
+                                continue;
+                            }
+                        }
+                        WorkspaceResolutionKind::NonRepository => {}
+                        WorkspaceResolutionKind::Ambiguous
+                        | WorkspaceResolutionKind::Unavailable => {
+                            unavailable += 1;
+                            continue;
                         }
                     }
-                    WorkspaceResolutionKind::NonRepository => {}
-                    WorkspaceResolutionKind::Ambiguous | WorkspaceResolutionKind::Unavailable => {
-                        return Err(SessionImportServiceError::Unavailable);
+                    queue_command(
+                        request_id,
+                        current,
+                        occurred_at_us,
+                        self.effective_config_hash,
+                    )?
+                }
+                SessionImportAdminAction::RevokeAccess => {
+                    if current.metadata.workspace_resolution_kind
+                        != WorkspaceResolutionKind::NonRepository
+                    {
+                        unavailable += 1;
+                        continue;
                     }
+                    if current.access_decision == Some(SessionAccessDecision::Revoked) {
+                        continue;
+                    }
+                    revoke_command(
+                        request_id,
+                        current,
+                        active_import_job(&snapshot, &current.source_key())?,
+                        occurred_at_us,
+                        self.effective_config_hash,
+                    )?
                 }
-                let command = queue_command(
-                    request_id,
-                    current,
-                    occurred_at_us,
-                    self.effective_config_hash,
-                )?;
-                self.writer
-                    .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
-                    .await
-                    .map_err(map_writer)?;
-                Ok(SessionImportAdminOutcome::Queued)
-            }
-            SessionImportAdminAction::RevokeAccess => {
-                if current.metadata.workspace_resolution_kind
-                    != WorkspaceResolutionKind::NonRepository
-                {
-                    return Err(SessionImportServiceError::Unavailable);
-                }
-                if current.access_decision == Some(SessionAccessDecision::Revoked) {
-                    return Ok(SessionImportAdminOutcome::NoDelta);
-                }
-                let command = revoke_command(
-                    request_id,
-                    current,
-                    active_import_job(&snapshot, session_id)?,
-                    occurred_at_us,
-                    self.effective_config_hash,
-                )?;
-                self.writer
-                    .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
-                    .await
-                    .map_err(map_writer)?;
-                Ok(SessionImportAdminOutcome::Revoked)
-            }
+            };
+            events.extend_from_slice(prepared.events());
+            changed += 1;
         }
+        if !events.is_empty() {
+            let command = JournalCommand::new(
+                CommandId::from_uuid(request_id.as_uuid())
+                    .map_err(|_| SessionImportServiceError::Corrupt)?,
+                events,
+            )
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+            self.writer
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .await
+                .map_err(map_writer)?;
+        }
+        if unavailable > 0 && changed == 0 && remaining == 0 {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+        if unavailable > 0 || remaining > 0 {
+            return Ok(SessionImportAdminOutcome::Partial {
+                changed,
+                unavailable,
+                remaining,
+            });
+        }
+        if changed == 0 {
+            return Ok(SessionImportAdminOutcome::NoDelta);
+        }
+        Ok(match action {
+            SessionImportAdminAction::QueueImport => SessionImportAdminOutcome::Queued,
+            SessionImportAdminAction::RevokeAccess => SessionImportAdminOutcome::Revoked,
+        })
     }
 }
 
@@ -430,16 +587,31 @@ pub fn catalog_codex_sessions(
     repositories: &RepositoryCurrentView,
     budget: SessionCatalogBudget,
 ) -> Result<Vec<CatalogedSession>, SessionCatalogError> {
-    Ok(
-        catalog_codex_sessions_after(report, requested_root, repositories, budget, None, 256)?
-            .sessions,
-    )
+    let page =
+        catalog_codex_sessions_after(report, requested_root, repositories, budget, None, 256)?;
+    if page.unavailable {
+        return Err(SessionCatalogError::Unsupported);
+    }
+    let mut sources: BTreeMap<String, CatalogedSession> = BTreeMap::new();
+    for item in page.sessions {
+        if let Some(old) = sources.get_mut(&item.source_instance_id) {
+            old.metadata = unavailable_metadata(&old.metadata);
+        } else {
+            sources.insert(item.source_instance_id.clone(), item);
+        }
+    }
+    let mut sessions = sources.into_values().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| left.metadata.source_path.cmp(&right.metadata.source_path));
+    Ok(sessions)
 }
 
 struct CatalogPage {
+    root: ConfinedRoot,
     sessions: Vec<CatalogedSession>,
     last_scanned: Option<String>,
     has_more: bool,
+    unavailable: bool,
+    remaining: SessionCatalogBudget,
 }
 
 fn catalog_codex_sessions_after(
@@ -471,23 +643,24 @@ fn catalog_codex_sessions_after(
         max_sessions,
         last_scanned: None,
         has_more: false,
+        unavailable: false,
     };
     reader.walk()?;
     qualified.revalidate().map_err(map_root)?;
     reader
         .sessions
-        .sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    if reader
-        .sessions
-        .windows(2)
-        .any(|pair| pair[0].session_id == pair[1].session_id)
-    {
-        return Err(SessionCatalogError::Unsupported);
-    }
+        .sort_by(|left, right| left.metadata.source_path.cmp(&right.metadata.source_path));
     Ok(CatalogPage {
         sessions: reader.sessions,
         last_scanned: reader.last_scanned,
         has_more: reader.has_more,
+        unavailable: reader.unavailable,
+        remaining: SessionCatalogBudget {
+            max_entries: budget.max_entries - reader.seen_entries,
+            max_metadata_bytes: budget.max_metadata_bytes - reader.read_bytes,
+            deadline: budget.deadline,
+        },
+        root,
     })
 }
 
@@ -502,47 +675,219 @@ struct CatalogReader<'a> {
     max_sessions: usize,
     last_scanned: Option<String>,
     has_more: bool,
+    unavailable: bool,
+}
+
+fn current_catalog_source<'a>(
+    current: &'a SessionImportCurrentView,
+    item: &CatalogedSession,
+) -> Option<&'a SessionImportCurrent> {
+    current
+        .sessions
+        .get(&item.session_id)
+        .filter(|old| {
+            Path::new(&old.metadata.source_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| evertrace_codex::session_import::rollout_ids_from_name(name).ok())
+                .is_some_and(|(thread, rollout)| {
+                    item.source_instance_id == format!("session-rollout:{thread}:{rollout}")
+                })
+        })
+        .or_else(|| current.sessions.get(&item.source_instance_id))
+}
+
+fn unavailable_metadata(metadata: &SessionMetadata) -> SessionMetadata {
+    let mut metadata = metadata.clone();
+    metadata.workspace_resolution_kind = WorkspaceResolutionKind::Unavailable;
+    metadata.resolved_repository_instance_id = None;
+    metadata.resolved_worktree_instance_id = None;
+    metadata
+}
+
+impl CatalogPage {
+    fn probe(
+        &mut self,
+        relative: &str,
+        repositories: &RepositoryCurrentView,
+    ) -> Result<Option<CatalogedSession>, SessionCatalogError> {
+        self.remaining.max_entries = self
+            .remaining
+            .max_entries
+            .checked_sub(1)
+            .ok_or(SessionCatalogError::Budget)?;
+        let Some(identity) = self
+            .root
+            .probe_regular_file(Path::new(relative), self.remaining.deadline)
+            .map_err(map_read)?
+        else {
+            return Ok(None);
+        };
+        let mut reader = CatalogReader {
+            root: &self.root,
+            repositories,
+            budget: self.remaining,
+            seen_entries: 0,
+            read_bytes: 0,
+            sessions: Vec::new(),
+            after: None,
+            max_sessions: 1,
+            last_scanned: None,
+            has_more: false,
+            unavailable: false,
+        };
+        let result = reader.read_header(PathBuf::from(relative), identity);
+        self.remaining.max_metadata_bytes -= reader.read_bytes;
+        result.map(Some)
+    }
+}
+
+fn reconcile_catalog_page(
+    page: &mut CatalogPage,
+    repositories: &RepositoryCurrentView,
+    current: &SessionImportCurrentView,
+    cursor: &mut CatalogCursor,
+) -> Result<BTreeMap<String, CatalogedSession>, SessionCatalogError> {
+    cursor.begin_round(current, page.root.identity());
+    if page.unavailable {
+        cursor.invalidate();
+    }
+    let mut updates: BTreeMap<String, CatalogedSession> = BTreeMap::new();
+    for mut item in std::mem::take(&mut page.sessions) {
+        let old = current_catalog_source(current, &item);
+        let key = old.map_or_else(
+            || item.source_instance_id.clone(),
+            |old| old.source_key().to_owned(),
+        );
+        if let Some(observation) = cursor.recovery.get_mut(&key) {
+            observation.observe(&item);
+        }
+        if let Some(previous) = updates.get_mut(&key) {
+            if previous.metadata.source_path != item.metadata.source_path {
+                previous.metadata =
+                    unavailable_metadata(old.map_or(&previous.metadata, |old| &old.metadata));
+            }
+            continue;
+        }
+        if let Some(old) = old {
+            let mut unavailable =
+                old.metadata.workspace_resolution_kind == WorkspaceResolutionKind::Unavailable;
+            if old.metadata.source_path != item.metadata.source_path {
+                match page.probe(&old.metadata.source_path, repositories) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => unavailable = true,
+                    Err(_) => {
+                        unavailable = true;
+                        page.unavailable = true;
+                        cursor.invalidate();
+                    }
+                }
+            }
+            if unavailable {
+                // A successful page cannot erase a conflict observed elsewhere
+                // in the round (or lost on restart). Keep the incumbent intact.
+                item.metadata = unavailable_metadata(&old.metadata);
+            }
+        }
+        updates.insert(key, item);
+    }
+    if !page.has_more && !page.unavailable {
+        let mut recovered = Vec::new();
+        for (key, observation) in &cursor.recovery {
+            let Some(item) = &observation.unique else {
+                continue;
+            };
+            if observation.conflicting
+                || (updates.len() + recovered.len() >= 64 && !updates.contains_key(key))
+            {
+                continue;
+            }
+            let old = &current.sessions[key];
+            let result = (|| {
+                let confirmed = page
+                    .probe(&item.metadata.source_path, repositories)?
+                    .ok_or(SessionCatalogError::Changed)?;
+                if confirmed.source_instance_id != item.source_instance_id
+                    || confirmed.metadata.source_fingerprint != item.metadata.source_fingerprint
+                {
+                    return Err(SessionCatalogError::Changed);
+                }
+                if old.metadata.source_path != item.metadata.source_path
+                    && page
+                        .probe(&old.metadata.source_path, repositories)?
+                        .is_some()
+                {
+                    return Ok(None);
+                }
+                Ok(Some(confirmed))
+            })();
+            match result {
+                Ok(Some(item)) => recovered.push((key.clone(), item)),
+                Ok(None) => {}
+                Err(_) => {
+                    page.unavailable = true;
+                    break;
+                }
+            }
+        }
+        if !page.unavailable {
+            updates.extend(recovered);
+        }
+    }
+    for (key, item) in &mut updates {
+        if let Some(old) = current.sessions.get(key) {
+            let metadata = &mut item.metadata;
+            if metadata.workspace_resolution_kind == WorkspaceResolutionKind::Unavailable {
+                *metadata = unavailable_metadata(&old.metadata);
+            } else if metadata.source_fingerprint == old.metadata.source_fingerprint
+                || metadata.file_size > old.metadata.file_size
+                || (metadata.source_path != old.metadata.source_path
+                    && metadata.file_size == old.metadata.file_size)
+            {
+                // A verified relocation retains the logical revision. The body
+                // worker still validates the original protected prefix.
+                metadata.source_revision = old.metadata.source_revision.clone();
+            } else {
+                metadata.source_revision =
+                    SourceRevision::parse(metadata.source_fingerprint.clone())
+                        .map_err(|_| SessionCatalogError::Unsupported)?;
+            }
+        }
+    }
+    page.root.revalidate().map_err(map_read)?;
+    cursor.after = if page.has_more {
+        page.last_scanned.clone()
+    } else {
+        None
+    };
+    if page.unavailable || !page.has_more {
+        cursor.invalidate();
+    }
+    Ok(updates)
 }
 
 impl CatalogReader<'_> {
     fn walk(&mut self) -> Result<(), SessionCatalogError> {
-        let after = self
-            .after
-            .map(|value| {
-                let mut parts = value.split('/');
-                let parsed = [parts.next(), parts.next(), parts.next(), parts.next()];
-                if parsed.iter().any(|part| part.is_none()) || parts.next().is_some() {
-                    return Err(SessionCatalogError::Unsupported);
-                }
-                Ok(parsed.map(Option::unwrap))
-            })
-            .transpose()?;
-        'catalog: for year in self.directory(None)? {
+        for year in self.directory(None)? {
             require_directory_component(&year.name, 4, &year.entry_type)?;
-            if after.is_some_and(|parts| year.name.as_str() < parts[0]) {
+            if self.completed_directory(&year.name) {
                 continue;
             }
             let year_path = PathBuf::from(&year.name);
             for month in self.directory(Some(&year_path))? {
                 require_directory_component(&month.name, 2, &month.entry_type)?;
-                if after.is_some_and(|parts| {
-                    year.name.as_str() == parts[0] && month.name.as_str() < parts[1]
-                }) {
+                let month_path = year_path.join(&month.name);
+                if self.completed_directory(&month_path.to_string_lossy()) {
                     continue;
                 }
-                let month_path = year_path.join(&month.name);
                 for day in self.directory(Some(&month_path))? {
                     require_directory_component(&day.name, 2, &day.entry_type)?;
-                    if after.is_some_and(|parts| {
-                        year.name.as_str() == parts[0]
-                            && month.name.as_str() == parts[1]
-                            && (day.name.as_str() < parts[2]
-                                || (day.name.as_str() == parts[2] && parts[3].is_empty()))
-                    }) {
+                    let day_path = month_path.join(&day.name);
+                    if self.completed_directory(&day_path.to_string_lossy()) {
                         continue;
                     }
-                    let day_path = month_path.join(&day.name);
-                    for file in self.directory(Some(&day_path))? {
+                    let mut files = self.directory(Some(&day_path))?.into_iter().peekable();
+                    while let Some(file) = files.next() {
                         if file.entry_type != ConfinedEntryType::File {
                             return Err(SessionCatalogError::Unsupported);
                         }
@@ -551,22 +896,36 @@ impl CatalogReader<'_> {
                         if self.after.is_some_and(|after| key.as_str() <= after) {
                             continue;
                         }
-                        if self.sessions.len() == self.max_sessions {
-                            self.has_more = true;
-                            break 'catalog;
-                        }
                         self.last_scanned = Some(key);
-                        self.read_header(relative, file.identity)?;
-                    }
-                    if self.sessions.len() == self.max_sessions {
-                        self.last_scanned = Some(format!("{}/", day_path.to_string_lossy()));
-                        self.has_more = true;
-                        break 'catalog;
+                        match self.read_header(relative, file.identity) {
+                            Ok(item) => self.sessions.push(item),
+                            Err(SessionCatalogError::Unsupported) => self.unavailable = true,
+                            Err(error) => return Err(error),
+                        }
+                        if self.sessions.len() == self.max_sessions {
+                            // Do not open the next date just to look ahead: it
+                            // may exceed this page's directory-entry budget.
+                            self.has_more = true;
+                            if files.peek().is_none() {
+                                self.last_scanned =
+                                    Some(format!("{}/", day_path.to_string_lossy()));
+                            }
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    fn completed_directory(&self, path: &str) -> bool {
+        self.after.is_some_and(|after| {
+            path < after
+                && after
+                    .strip_prefix(path)
+                    .is_none_or(|tail| tail == "/" || !tail.starts_with('/'))
+        })
     }
 
     fn directory(
@@ -594,7 +953,7 @@ impl CatalogReader<'_> {
         &mut self,
         relative: PathBuf,
         identity: ConfinedFileIdentity,
-    ) -> Result<(), SessionCatalogError> {
+    ) -> Result<CatalogedSession, SessionCatalogError> {
         let session_id = session_id_from_name(
             relative
                 .file_name()
@@ -622,7 +981,17 @@ impl CatalogReader<'_> {
         let fingerprint = session_source_fingerprint(identity);
         let source_revision =
             session_source_revision(identity).map_err(|_| SessionCatalogError::Unsupported)?;
-        self.sessions.push(CatalogedSession {
+        Ok(CatalogedSession {
+            source_instance_id: {
+                let name = relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(SessionCatalogError::Unsupported)?;
+                let (thread, rollout) =
+                    evertrace_codex::session_import::rollout_ids_from_name(name)
+                        .map_err(|_| SessionCatalogError::Unsupported)?;
+                format!("session-rollout:{thread}:{rollout}")
+            },
             session_id,
             metadata: SessionMetadata {
                 source_path: relative.to_string_lossy().into_owned(),
@@ -650,8 +1019,7 @@ impl CatalogReader<'_> {
                 parser_version: 1,
                 metadata_state: MetadataState::Indexed,
             },
-        });
-        Ok(())
+        })
     }
 }
 
@@ -800,6 +1168,7 @@ fn queue_command(
         revision += 1;
         payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
             SessionImportEvent {
+                source_instance_id: current.source_instance_id.clone(),
                 session_id: current.session_id.clone(),
                 revision,
                 predecessor_revision: Some(revision - 1),
@@ -815,6 +1184,7 @@ fn queue_command(
     revision += 1;
     payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
         SessionImportEvent {
+            source_instance_id: current.source_instance_id.clone(),
             session_id: current.session_id.clone(),
             revision,
             predecessor_revision: Some(revision - 1),
@@ -826,9 +1196,13 @@ fn queue_command(
         },
     )));
     payloads.push(JournalPayload::JobState(DurableJob {
-        job_id: JobId::from_uuid(request_id.as_uuid())
-            .map_err(|_| SessionImportServiceError::Corrupt)?,
-        idempotency_key: format!("session_import:{}", current.session_id),
+        job_id: if current.source_instance_id.is_some() {
+            JobId::new_v7()
+        } else {
+            JobId::from_uuid(request_id.as_uuid())
+                .map_err(|_| SessionImportServiceError::Corrupt)?
+        },
+        idempotency_key: format!("session_import:{}", current.source_key()),
         target_revision: current.metadata.source_revision.as_str().to_owned(),
         target_watermark: current.source_event_seq,
         target_generation: revision,
@@ -873,6 +1247,7 @@ fn revoke_command(
         revision += 1;
         payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
             SessionImportEvent {
+                source_instance_id: current.source_instance_id.clone(),
                 session_id: current.session_id.clone(),
                 revision,
                 predecessor_revision: Some(revision - 1),
@@ -887,6 +1262,7 @@ fn revoke_command(
     revision += 1;
     payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
         SessionImportEvent {
+            source_instance_id: current.source_instance_id.clone(),
             session_id: current.session_id.clone(),
             revision,
             predecessor_revision: Some(revision - 1),
@@ -904,7 +1280,7 @@ fn revoke_command(
         job.terminal = Some(Box::new(JobTerminalAudit {
             outcome: JobTerminalOutcome::Failed,
             reason: JobTerminalReason::Revoked,
-            result_ref: Some(format!("session_import:{}", current.session_id)),
+            result_ref: Some(format!("session_import:{}", current.source_key())),
         }));
         payloads.push(JournalPayload::JobState(job));
     }
@@ -990,16 +1366,17 @@ fn command(
 fn metadata_events(
     old: Option<&SessionImportCurrent>,
     session_id: String,
+    source_instance_id: Option<String>,
     metadata: SessionMetadata,
     occurred_at_us: i64,
     payloads: &mut Vec<JournalPayload>,
 ) -> Result<(), SessionImportServiceError> {
     let mut revision = old.map_or(0, |value| value.revision);
     if let Some(old) = old {
-        let source_changed = old.metadata.source_path != metadata.source_path
-            || old.metadata.source_revision != metadata.source_revision
+        let source_changed = old.metadata.source_revision != metadata.source_revision
             || metadata.file_size < old.metadata.file_size
-            || (metadata.file_size == old.metadata.file_size
+            || (metadata.source_path == old.metadata.source_path
+                && metadata.file_size == old.metadata.file_size
                 && metadata.file_mtime_us != old.metadata.file_mtime_us);
         let scope_unavailable = matches!(
             metadata.workspace_resolution_kind,
@@ -1034,6 +1411,7 @@ fn metadata_events(
             revision += 1;
             payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
                 SessionImportEvent {
+                    source_instance_id: source_instance_id.clone(),
                     session_id: session_id.clone(),
                     revision,
                     predecessor_revision: Some(revision - 1),
@@ -1044,14 +1422,14 @@ fn metadata_events(
         }
     }
     let append_arrived = old.is_some_and(|old| {
-        old.metadata.source_path == metadata.source_path
-            && old.metadata.source_revision == metadata.source_revision
+        old.metadata.source_revision == metadata.source_revision
             && metadata.file_size > old.metadata.file_size
             && old.body_state == SessionBodyState::Imported
     });
     revision += 1;
     payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
         SessionImportEvent {
+            source_instance_id: source_instance_id.clone(),
             session_id: session_id.clone(),
             revision,
             predecessor_revision: revision.checked_sub(1).filter(|value| *value != 0),
@@ -1065,6 +1443,7 @@ fn metadata_events(
         revision += 1;
         payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
             SessionImportEvent {
+                source_instance_id: source_instance_id.clone(),
                 session_id,
                 revision,
                 predecessor_revision: Some(revision - 1),
@@ -1193,6 +1572,69 @@ mod tests {
         );
         let encoded = serde_json::to_string(&catalog[0].metadata).unwrap();
         assert!(!encoded.contains("BODY_CANARY"));
+        let rollout = "019d0000-0000-7000-8000-000000000002";
+        let second = dated.join(format!(
+            "rollout-2026-08-30T00-00-01-{session_id}_{rollout}.jsonl"
+        ));
+        fs::write(&second, format!("{header}\n")).unwrap();
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o600)).unwrap();
+        let budget = || SessionCatalogBudget {
+            max_entries: 16,
+            max_metadata_bytes: 4096,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let first = catalog_codex_sessions_after(
+            &report,
+            &sessions,
+            &RepositoryCurrentView::default(),
+            budget(),
+            None,
+            1,
+        )
+        .unwrap();
+        let next = catalog_codex_sessions_after(
+            &report,
+            &sessions,
+            &RepositoryCurrentView::default(),
+            budget(),
+            first.last_scanned.as_deref(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.sessions[0].session_id, next.sessions[0].session_id);
+        assert_ne!(
+            first.sessions[0].source_instance_id,
+            next.sessions[0].source_instance_id
+        );
+        let duplicate = dated.join(format!("rollout-2026-08-30T00-00-02-{session_id}.jsonl"));
+        fs::write(&duplicate, format!("{header}\n")).unwrap();
+        fs::set_permissions(&duplicate, fs::Permissions::from_mode(0o600)).unwrap();
+        let conflict = catalog_codex_sessions_after(
+            &report,
+            &sessions,
+            &RepositoryCurrentView::default(),
+            budget(),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            conflict.sessions[0].metadata.workspace_resolution_kind,
+            WorkspaceResolutionKind::NonRepository
+        );
+        let next = catalog_codex_sessions_after(
+            &report,
+            &sessions,
+            &RepositoryCurrentView::default(),
+            budget(),
+            conflict.last_scanned.as_deref(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            next.sessions[0].metadata.workspace_resolution_kind,
+            WorkspaceResolutionKind::NonRepository
+        );
         fs::remove_dir_all(adapter).unwrap();
     }
 
@@ -1280,15 +1722,16 @@ mod tests {
         let original = dated.join(format!("rollout-2026-09-09T12-00-00-{thread}.jsonl"));
         fs::write(&original, &encoded).unwrap();
         fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(
-            catalog_codex_sessions(
-                &report,
-                &sessions,
-                &RepositoryCurrentView::default(),
-                budget(2 * MAX_RECORD_BYTES)
-            ),
-            Err(SessionCatalogError::Unsupported)
-        ));
+        let both = catalog_codex_sessions(
+            &report,
+            &sessions,
+            &RepositoryCurrentView::default(),
+            budget(2 * MAX_RECORD_BYTES),
+        )
+        .unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].session_id, both[1].session_id);
+        assert_ne!(both[0].source_instance_id, both[1].source_instance_id);
         fs::remove_file(&original).unwrap();
         header["ordinal"] = "0".into();
         fs::write(&transcript, format!("{header}\n")).unwrap();
@@ -1399,6 +1842,203 @@ mod tests {
     }
 
     #[test]
+    fn catalog_conflicts_across_dates_require_a_complete_valid_recovery_round() {
+        let adapter = temp_root();
+        let sessions = adapter.join("sessions");
+        let thread = "019d0000-0000-7000-8000-000000000001";
+        let rollout_b = "019d0000-0000-7000-8000-000000000002";
+        let source = format!("session-rollout:{thread}:{thread}");
+        let source_b = format!("session-rollout:{thread}:{rollout_b}");
+        let a = sessions.join(format!(
+            "2026/08/28/rollout-2026-08-28T00-00-00-{thread}.jsonl"
+        ));
+        let b = sessions.join(format!(
+            "2026/08/29/rollout-2026-08-29T00-00-00-{thread}_{rollout_b}.jsonl"
+        ));
+        let duplicate = sessions.join(format!(
+            "2026/08/30/rollout-2026-08-30T00-00-00-{thread}.jsonl"
+        ));
+        let header = format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": "2026-08-30T00:00:00Z", "type": "session_meta",
+                "payload": { "id": thread, "session_id": thread, "cwd": "/nonrepo", "git": null }
+            })
+        );
+        fs::create_dir_all(&adapter).unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+        for path in [&a, &b, &duplicate] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &header).unwrap();
+        }
+        let report =
+            observe_session_catalog_report(a.to_str(), thread, "cross-page", None).unwrap();
+        let mut cursor = CatalogCursor::default();
+        let mut current = SessionImportCurrentView {
+            frontier: 0,
+            sessions: BTreeMap::new(),
+        };
+        // The real bounded reader and reconciliation owner are exercised here;
+        // Store/admin/worker integration is covered by the S28 fixture.
+        let scan = |cursor: &mut CatalogCursor, current: &mut SessionImportCurrentView, bytes| {
+            let page = catalog_codex_sessions_after(
+                &report,
+                &sessions,
+                &RepositoryCurrentView::default(),
+                SessionCatalogBudget {
+                    max_entries: 32,
+                    max_metadata_bytes: bytes,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                },
+                cursor.after.as_deref(),
+                1,
+            );
+            let mut page = match page {
+                Ok(page) => page,
+                Err(error) => {
+                    cursor.invalidate();
+                    return Err(error);
+                }
+            };
+            let updates = reconcile_catalog_page(
+                &mut page,
+                &RepositoryCurrentView::default(),
+                current,
+                cursor,
+            )?;
+            let mut changed = 0;
+            for (key, item) in updates {
+                match current.sessions.get_mut(&key) {
+                    Some(old) if old.metadata != item.metadata => {
+                        old.metadata = item.metadata;
+                        old.revision += 1;
+                        changed += 1;
+                    }
+                    Some(_) => {}
+                    None => {
+                        current.sessions.insert(
+                            key,
+                            SessionImportCurrent {
+                                session_id: item.session_id,
+                                source_instance_id: Some(item.source_instance_id),
+                                revision: 1,
+                                metadata: item.metadata,
+                                access_decision: None,
+                                body_state: SessionBodyState::NotImported,
+                                source_event_seq: 0,
+                            },
+                        );
+                        changed += 1;
+                    }
+                }
+            }
+            if page.unavailable {
+                Err(SessionCatalogError::Unavailable)
+            } else {
+                Ok(changed)
+            }
+        };
+        for _ in 0..4 {
+            scan(&mut cursor, &mut current, 8192).unwrap();
+        }
+        let incumbent = current.sessions[&source].clone();
+        assert_eq!(
+            incumbent.metadata.workspace_resolution_kind,
+            WorkspaceResolutionKind::Unavailable
+        );
+        assert_eq!(
+            incumbent.metadata.source_path,
+            a.strip_prefix(&sessions).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            current.sessions[&source_b]
+                .metadata
+                .workspace_resolution_kind,
+            WorkspaceResolutionKind::NonRepository
+        );
+        for _ in 0..4 {
+            assert_eq!(scan(&mut cursor, &mut current, 8192).unwrap(), 0);
+        }
+        assert_eq!(current.sessions[&source], incumbent);
+
+        fs::remove_file(&duplicate).unwrap();
+        cursor = CatalogCursor::default(); // restart loses the opposite locator
+        assert_eq!(scan(&mut cursor, &mut current, 8192).unwrap(), 0);
+        assert_eq!(current.sessions[&source], incumbent); // a half round is no proof
+        assert_eq!(
+            scan(&mut cursor, &mut current, 1),
+            Err(SessionCatalogError::Budget)
+        );
+        scan(&mut cursor, &mut current, 8192).unwrap();
+        scan(&mut cursor, &mut current, 8192).unwrap();
+        assert_eq!(current.sessions[&source], incumbent); // interrupted round cannot recover
+        for _ in 0..3 {
+            scan(&mut cursor, &mut current, 8192).unwrap();
+        }
+        assert_eq!(
+            current.sessions[&source].metadata.workspace_resolution_kind,
+            WorkspaceResolutionKind::NonRepository
+        );
+        assert_eq!(current.sessions[&source].access_decision, None);
+
+        fs::write(&duplicate, &header).unwrap();
+        for _ in 0..4 {
+            scan(&mut cursor, &mut current, 8192).unwrap();
+        }
+        assert_eq!(
+            current.sessions[&source].metadata.workspace_resolution_kind,
+            WorkspaceResolutionKind::Unavailable
+        );
+        cursor = CatalogCursor::default();
+        scan(&mut cursor, &mut current, 8192).unwrap(); // already passed incumbent date
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o666)).unwrap();
+        scan(&mut cursor, &mut current, 8192).unwrap();
+        assert_eq!(
+            scan(&mut cursor, &mut current, 8192),
+            Err(SessionCatalogError::Unavailable)
+        );
+        assert_eq!(
+            current.sessions[&source].metadata.source_path,
+            incumbent.metadata.source_path
+        );
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o600)).unwrap();
+        scan(&mut cursor, &mut current, 8192).unwrap();
+        fs::remove_file(&a).unwrap();
+        cursor = CatalogCursor::default();
+        scan(&mut cursor, &mut current, 8192).unwrap();
+        scan(&mut cursor, &mut current, 8192).unwrap();
+        assert_eq!(
+            current.sessions[&source].metadata.workspace_resolution_kind,
+            WorkspaceResolutionKind::Unavailable
+        );
+        // A changed observation at the round endpoint also fails closed.
+        fs::write(&duplicate, format!("{header}\n")).unwrap();
+        assert_eq!(
+            scan(&mut cursor, &mut current, 8192),
+            Err(SessionCatalogError::Unavailable)
+        );
+        for _ in 0..3 {
+            scan(&mut cursor, &mut current, 8192).unwrap();
+        }
+        let relocated = &current.sessions[&source];
+        assert_eq!(
+            relocated.metadata.workspace_resolution_kind,
+            WorkspaceResolutionKind::NonRepository
+        );
+        assert_eq!(
+            relocated.metadata.source_path,
+            duplicate.strip_prefix(&sessions).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            relocated.metadata.source_revision,
+            incumbent.metadata.source_revision
+        );
+        assert_eq!(relocated.access_decision, None);
+        assert_eq!(current.sessions[&source_b].revision, 1);
+        fs::remove_dir_all(adapter).unwrap();
+    }
+
+    #[test]
     fn catalog_cursor_eventually_visits_more_than_256_sessions() {
         let adapter = temp_root();
         let sessions = adapter.join("sessions");
@@ -1462,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_cursor_skips_completed_days_under_one_shared_entry_budget() {
+    fn catalog_cursor_pages_headers_with_complete_bounded_identity_enumeration() {
         let adapter = temp_root();
         let sessions = adapter.join("sessions");
         let mut transcript = None;

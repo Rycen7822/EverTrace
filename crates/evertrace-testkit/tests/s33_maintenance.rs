@@ -1875,6 +1875,7 @@ async fn repository_pending_revokes_target_producers_and_rejects_successors() {
         metadata_state: MetadataState::Indexed,
     };
     let metadata_event = SessionImportEvent {
+        source_instance_id: None,
         session_id: session_id.into(),
         revision: 1,
         predecessor_revision: None,
@@ -1901,6 +1902,7 @@ async fn repository_pending_revokes_target_producers_and_rejects_successors() {
         .unwrap();
     let job_id = JobId::new_v7();
     let queued = SessionImportEvent {
+        source_instance_id: None,
         session_id: session_id.into(),
         revision: 2,
         predecessor_revision: Some(1),
@@ -2156,6 +2158,7 @@ async fn repository_pending_revokes_target_producers_and_rejects_successors() {
     );
 
     let metadata_successor = SessionImportEvent {
+        source_instance_id: None,
         session_id: session_id.into(),
         revision: 3,
         predecessor_revision: Some(2),

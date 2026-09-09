@@ -476,6 +476,55 @@ impl ConfinedRoot {
         self.revalidate_stable()
     }
 
+    /// Inspect one locator under the caller's shared deadline. Only a confirmed
+    /// missing component beneath a revalidated root is absence; unsafe or
+    /// replaced ancestors and all other open errors remain failures.
+    pub fn probe_regular_file(
+        &self,
+        relative: &Path,
+        deadline: Instant,
+    ) -> Result<Option<ConfinedFileIdentity>, ConfinedReadError> {
+        check_deadline(deadline)?;
+        self.revalidate()?;
+        let components = strict_components(relative)?;
+        let (leaf, parents) = components
+            .split_last()
+            .ok_or(ConfinedReadError::InvalidPath)?;
+        let Some((parent, identities)) = self.open_directory_chain_if_exists(parents, deadline)?
+        else {
+            return Ok(None);
+        };
+        let fd = match openat(
+            &parent,
+            *leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                self.confirm_missing(&parent, leaf, parents, &identities, deadline)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(map_open_error(error)),
+        };
+        let opened = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&opened)?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
+            return Err(ConfinedReadError::UnsupportedType);
+        }
+        let entry =
+            statat(&parent, *leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&entry)?;
+        let observed = identity(&opened)?;
+        if identity(&entry)? != observed {
+            return Err(ConfinedReadError::Changed);
+        }
+        self.validate_directory_chain(parents, &identities, deadline)?;
+        self.revalidate()?;
+        check_deadline(deadline)?;
+        Ok(Some(observed))
+    }
+
     /// Reads one newline-terminated record using the same confined range reader.
     /// The record bound excludes its newline; the total I/O budget includes it.
     pub fn read_first_record(
@@ -606,6 +655,15 @@ impl ConfinedRoot {
         components: &[&OsStr],
         deadline: Instant,
     ) -> Result<(OwnedFd, Vec<ConfinedFileIdentity>), ConfinedReadError> {
+        self.open_directory_chain_if_exists(components, deadline)?
+            .ok_or(ConfinedReadError::Io)
+    }
+
+    fn open_directory_chain_if_exists(
+        &self,
+        components: &[&OsStr],
+        deadline: Instant,
+    ) -> Result<Option<(OwnedFd, Vec<ConfinedFileIdentity>)>, ConfinedReadError> {
         if self.external_source {
             self.revalidate_stable()?;
         }
@@ -617,21 +675,50 @@ impl ConfinedRoot {
         )
         .map_err(|_| ConfinedReadError::Io)?;
         let mut identities = Vec::with_capacity(components.len());
-        for component in components {
+        for (index, component) in components.iter().enumerate() {
             check_deadline(deadline)?;
-            let next = openat(
+            let next = match openat(
                 &current,
                 *component,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
-            )
-            .map_err(map_open_error)?;
+            ) {
+                Ok(next) => next,
+                Err(rustix::io::Errno::NOENT) => {
+                    self.confirm_missing(
+                        &current,
+                        component,
+                        &components[..index],
+                        &identities,
+                        deadline,
+                    )?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(map_open_error(error)),
+            };
             let stat = fstat(&next).map_err(|_| ConfinedReadError::Io)?;
             self.validate_external_entry(&stat)?;
             identities.push(identity(&stat)?);
             current = next;
         }
-        Ok((current, identities))
+        Ok(Some((current, identities)))
+    }
+
+    fn confirm_missing(
+        &self,
+        directory: &OwnedFd,
+        name: &OsStr,
+        parents: &[&OsStr],
+        identities: &[ConfinedFileIdentity],
+        deadline: Instant,
+    ) -> Result<(), ConfinedReadError> {
+        match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(rustix::io::Errno::NOENT) => {}
+            _ => return Err(ConfinedReadError::Changed),
+        }
+        self.validate_directory_chain(parents, identities, deadline)?;
+        self.revalidate()?;
+        check_deadline(deadline)
     }
 
     fn validate_directory_chain(
@@ -1282,6 +1369,28 @@ mod tests {
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o644)).unwrap();
         let confined = ConfinedRoot::open_external_source(&source).unwrap();
         let file = confined.read(Path::new("dated/file"), limits(32)).unwrap();
+        assert_eq!(
+            confined
+                .probe_regular_file(Path::new("dated/file"), limits(32).deadline)
+                .unwrap(),
+            Some(file.identity)
+        );
+        assert_eq!(
+            confined
+                .probe_regular_file(Path::new("dated/missing"), limits(32).deadline)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            confined
+                .probe_regular_file(Path::new("missing/leaf"), limits(32).deadline)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            confined.probe_regular_file(Path::new("missing/leaf"), Instant::now()),
+            Err(ConfinedReadError::Deadline)
+        );
         assert!(
             confined
                 .revalidate_file(Path::new("dated/file"), file.identity)
@@ -1330,6 +1439,11 @@ mod tests {
                 .is_ok()
         );
         std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            confined
+                .probe_regular_file(Path::new("dated/missing"), limits(32).deadline)
+                .is_err()
+        );
         assert!(confined.open_regular_file(Path::new("dated/file")).is_err());
         assert!(
             confined
@@ -1338,6 +1452,11 @@ mod tests {
         );
         std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            confined
+                .probe_regular_file(Path::new("dated/file"), limits(32).deadline)
+                .is_err()
+        );
         assert!(
             confined
                 .revalidate_file(Path::new("dated/file"), file.identity)
@@ -1376,6 +1495,23 @@ mod tests {
         assert!(confined.read(Path::new("dated/file"), limits(32)).is_err());
         symlink("dated", source.join("alias")).unwrap();
         assert!(confined.open_regular_file(Path::new("alias/old")).is_err());
+        assert!(
+            confined
+                .probe_regular_file(Path::new("alias/missing"), limits(32).deadline)
+                .is_err()
+        );
+        assert!(
+            confined
+                .probe_regular_file(Path::new("dated/file/missing"), limits(32).deadline)
+                .is_err()
+        );
+        std::fs::rename(&source, outer.join("previous-sessions")).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        assert!(
+            confined
+                .probe_regular_file(Path::new("missing/leaf"), limits(32).deadline)
+                .is_err()
+        );
         std::fs::remove_dir_all(outer).unwrap();
     }
 

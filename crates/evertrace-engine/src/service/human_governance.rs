@@ -439,6 +439,13 @@ pub struct HumanJobDetail {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HumanSystemDetail {
+    SessionImport {
+        session_id: String,
+        source_instance_id: String,
+        body_state: String,
+        access: String,
+        workspace: String,
+    },
     Job {
         detail: Box<HumanJobDetail>,
     },
@@ -4442,6 +4449,24 @@ type HumanTypedDetails = (
 );
 
 fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGovernanceError> {
+    if let Some(source) = evertrace_store::session_import::restore_current(row)
+        .map_err(|_| HumanGovernanceError::Store)?
+    {
+        return Ok((
+            None,
+            None,
+            None,
+            Some(HumanSystemDetail::SessionImport {
+                session_id: source.session_id.clone(),
+                source_instance_id: source.source_instance(),
+                body_state: format!("{:?}", source.body_state),
+                access: source
+                    .access_decision
+                    .map_or_else(|| "None".to_owned(), |value| format!("{value:?}")),
+                workspace: format!("{:?}", source.metadata.workspace_resolution_kind),
+            }),
+        ));
+    }
     let kind = match row.object_kind.as_deref() {
         Some(kind) => kind,
         None if row.row_class == Some(ObjectRowClass::Runtime) => "runtime_event",

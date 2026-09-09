@@ -1,9 +1,4 @@
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
 use evertrace_capture::{
     DeviceKeyStore, RUNTIME_SNAPSHOT_VERSION, RecallCueGateMode, RecoveryGateMode, RuntimeSnapshot,
@@ -285,11 +280,11 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert!(matches!(
         worker
             .process_checkpoint(
-                session_id,
+                &format!("session-rollout:{session_id}:{session_id}"),
                 SessionImportBudget {
                     max_bytes: 64 * 1024,
                     max_records: 16,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    max_work_time: Duration::from_millis(250),
                 }
             )
             .await,
@@ -299,7 +294,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(
         SessionImportCurrentView::from_snapshot(&before_import)
             .unwrap()
-            .sessions[session_id]
+            .sessions[&format!("session-rollout:{session_id}:{session_id}")]
             .body_state,
         SessionBodyState::Queued
     );
@@ -313,11 +308,11 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     for (checkpoint, expected_complete) in [false, false, true].into_iter().enumerate() {
         let progress = worker
             .process_checkpoint(
-                session_id,
+                &format!("session-rollout:{session_id}:{session_id}"),
                 SessionImportBudget {
                     max_bytes: 64 * 1024,
                     max_records: 16,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    max_work_time: Duration::from_millis(250),
                 },
             )
             .await
@@ -329,7 +324,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let projected = handle.project().await.unwrap();
     let current = SessionImportCurrentView::from_snapshot(&projected).unwrap();
     assert_eq!(
-        current.sessions[session_id].body_state,
+        current.sessions[&format!("session-rollout:{session_id}:{session_id}")].body_state,
         SessionBodyState::Imported
     );
     assert_eq!(
@@ -346,7 +341,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
             .is_some_and(|payload| matches!(
                 payload,
                 JournalPayload::SourceIngestWatermark(value)
-                    if value.source_instance_id.as_str() == format!("codex-session:{session_id}")
+                    if value.source_instance_id.as_str() == format!("session-rollout:{session_id}:{session_id}")
                         && value.confirmed_prefix_digest.is_some()
             ))
     }));
@@ -370,18 +365,49 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(
         SessionImportCurrentView::from_snapshot(&handle.project().await.unwrap())
             .unwrap()
-            .sessions[session_id]
+            .sessions[&format!("session-rollout:{session_id}:{session_id}")]
             .body_state,
         SessionBodyState::Queued
     );
-    assert_eq!(
-        worker
+    // The appended file invalidates the old full-file proof. Revalidate its
+    // committed 34-record prefix in three bounded, read-only work units.
+    let source_a = format!("session-rollout:{session_id}:{session_id}");
+    let before_prefix = handle
+        .session_import_context(&source_a)
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..3 {
+        let prefix = worker
             .process_checkpoint(
-                session_id,
+                &source_a,
                 SessionImportBudget {
                     max_bytes: 64 * 1024,
                     max_records: 16,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefix.records, 0);
+        assert!(prefix.bytes > 0 && !prefix.completed);
+        assert_eq!(
+            handle
+                .session_import_context(&source_a)
+                .await
+                .unwrap()
+                .unwrap(),
+            before_prefix
+        );
+    }
+    assert_eq!(
+        worker
+            .process_checkpoint(
+                &format!("session-rollout:{session_id}:{session_id}"),
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
                 },
             )
             .await
@@ -418,11 +444,11 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert!(
         worker
             .process_checkpoint(
-                session_id,
+                &format!("session-rollout:{session_id}:{session_id}"),
                 SessionImportBudget {
                     max_bytes: 64 * 1024,
                     max_records: 16,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    max_work_time: Duration::from_millis(250),
                 },
             )
             .await
@@ -431,7 +457,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let replaced = SessionImportCurrentView::from_snapshot(&handle.project().await.unwrap())
         .unwrap()
         .sessions
-        .remove(session_id)
+        .remove(&format!("session-rollout:{session_id}:{session_id}"))
         .unwrap();
     assert_eq!(replaced.body_state, SessionBodyState::SourceReplaced);
     assert!(replaced.access_decision.is_none());
@@ -450,11 +476,11 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     for (checkpoint, expected_completed) in [false, false, true].into_iter().enumerate() {
         let progress = worker
             .process_checkpoint(
-                session_id,
+                &format!("session-rollout:{session_id}:{session_id}"),
                 SessionImportBudget {
                     max_bytes: 64 * 1024,
                     max_records: 16,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    max_work_time: Duration::from_millis(250),
                 },
             )
             .await
@@ -476,7 +502,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(
         SessionImportCurrentView::from_snapshot(&handle.project().await.unwrap())
             .unwrap()
-            .sessions[session_id]
+            .sessions[&format!("session-rollout:{session_id}:{session_id}")]
             .body_state,
         SessionBodyState::SourceReplaced
     );
@@ -495,11 +521,11 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert!(
         worker
             .process_checkpoint(
-                session_id,
+                &format!("session-rollout:{session_id}:{session_id}"),
                 SessionImportBudget {
                     max_bytes: 64 * 1024,
                     max_records: 16,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    max_work_time: Duration::from_millis(250),
                 },
             )
             .await
@@ -551,7 +577,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(
         SessionImportCurrentView::from_snapshot(&replaced_projection)
             .unwrap()
-            .sessions[session_id]
+            .sessions[&format!("session-rollout:{session_id}:{session_id}")]
             .body_state,
         SessionBodyState::SourceReplaced
     );
@@ -562,7 +588,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
             .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
             .filter(|payload| {
                 matches!(payload, JournalPayload::JobState(job)
-                    if job.idempotency_key == format!("session_import:{session_id}")
+                    if job.idempotency_key == format!("session_import:session-rollout:{session_id}:{session_id}")
                         && matches!(job.state, JobStatus::Queued | JobStatus::Leased))
             })
             .count(),
@@ -587,7 +613,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
                 SessionImportBudget {
                     max_bytes: 64 * 1024,
                     max_records: 16,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    max_work_time: Duration::from_millis(250),
                 },
             )
             .await
@@ -598,14 +624,204 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(
         SessionImportCurrentView::from_snapshot(&projected)
             .unwrap()
-            .sessions[session_id]
+            .sessions[&format!("session-rollout:{session_id}:{session_id}")]
             .body_state,
         SessionBodyState::Failed
     );
 
+    // A second real-format rollout remains the same logical session, but owns
+    // its approval, job, physical byte positions and protected-prefix chain.
+    let rollout_b = "019d0000-0000-7000-8000-000000000029";
+    let source_b = format!("session-rollout:{session_id}:{rollout_b}");
+    let second = dated.join(format!(
+        "rollout-2026-08-30T00-00-01-{session_id}_{rollout_b}.jsonl"
+    ));
+    let unknown = serde_json::json!({"ordinal": 1, "type": "event_msg", "payload": {"type": "unrecognized_history_event"}});
+    fs::write(&second, format!("{header}\n{unknown}\n{visible}\n")).unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(catalog.refresh(&replaced_report).await.unwrap(), 1);
+    assert_eq!(catalog.refresh(&replaced_report).await.unwrap(), 0);
+    let sources =
+        SessionImportCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    assert_eq!(sources.sessions.len(), 2);
+    assert!(sources.sessions[&source_b].access_decision.is_none());
+    assert_eq!(sources.sessions[&source_b].session_id, session_id);
+    let request = RequestId::new_v7();
+    assert_eq!(
+        admin
+            .handle(
+                request,
+                session_id,
+                SessionImportAdminAction::QueueImport,
+                20
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    let queued = handle.project().await.unwrap();
+    let ids = queued
+        .data_rows()
+        .filter_map(|row| row.payload_json.as_deref())
+        .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        .filter_map(|payload| match payload {
+            JournalPayload::JobState(job)
+                if job.kind == "session_import_v1" && job.state == JobStatus::Queued =>
+            {
+                Some(job.job_id)
+            }
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        admin
+            .handle(
+                request,
+                session_id,
+                SessionImportAdminAction::QueueImport,
+                21
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::NoDelta
+    );
+    assert_eq!(handle.project().await.unwrap().frontier, queued.frontier);
+    let partial = worker
+        .process_checkpoint(
+            &source_b,
+            SessionImportBudget {
+                max_bytes: 64 * 1024,
+                max_records: 1,
+                max_work_time: Duration::from_millis(250),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!partial.completed);
+    assert!(partial.records > 0);
+    let moved_date = sessions.join("2026/08/31");
+    fs::create_dir(&moved_date).unwrap();
+    fs::set_permissions(&moved_date, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(&second, moved_date.join(second.file_name().unwrap())).unwrap();
+    assert_eq!(catalog.refresh(&replaced_report).await.unwrap(), 1);
+    let moved = SessionImportCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    assert_eq!(
+        moved.sessions[&source_b].metadata.source_revision,
+        sources.sessions[&source_b].metadata.source_revision
+    );
+    assert_eq!(
+        moved.sessions[&source_b].body_state,
+        SessionBodyState::Partial
+    );
+    assert_eq!(
+        moved.sessions[&source_b].access_decision,
+        Some(evertrace_store::SessionAccessDecision::Approved)
+    );
+    let before_moved_prefix = handle
+        .session_import_context(&source_b)
+        .await
+        .unwrap()
+        .unwrap();
+    let prefix = worker
+        .process_checkpoint(
+            &source_b,
+            SessionImportBudget {
+                max_bytes: 64 * 1024,
+                max_records: 16,
+                max_work_time: Duration::from_millis(250),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(prefix.records, 0);
+    assert!(prefix.bytes > 0 && !prefix.completed);
+    assert_eq!(
+        handle
+            .session_import_context(&source_b)
+            .await
+            .unwrap()
+            .unwrap(),
+        before_moved_prefix
+    );
+    let complete = worker
+        .process_checkpoint(
+            &source_b,
+            SessionImportBudget {
+                max_bytes: 64 * 1024,
+                max_records: 16,
+                max_work_time: Duration::from_millis(250),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(complete.completed);
+    let sources =
+        SessionImportCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    assert_eq!(
+        sources.sessions[&source_b].body_state,
+        SessionBodyState::Imported
+    );
+    assert_eq!(
+        sources.sessions[&format!("session-rollout:{session_id}:{session_id}")].body_state,
+        SessionBodyState::Queued
+    );
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session_id,
+                SessionImportAdminAction::RevokeAccess,
+                22
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Revoked
+    );
+    let projected = handle.project().await.unwrap();
+    assert!(
+        SessionImportCurrentView::from_snapshot(&projected)
+            .unwrap()
+            .sessions
+            .values()
+            .all(|source| source.access_decision
+                == Some(evertrace_store::SessionAccessDecision::Revoked))
+    );
+    let detail = evertrace_engine::HumanGovernanceService::new(handle.clone(), CONFIG)
+        .detail(
+            evertrace_engine::HumanSurface::System,
+            &evertrace_store::session_import::session_import_row_id(&source_b),
+            projected.frontier,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(detail.items[0].system_detail.as_ref(), Some(evertrace_engine::HumanSystemDetail::SessionImport { session_id: actual, source_instance_id, access, .. }) if actual == session_id && source_instance_id == &source_b && access == "Revoked")
+    );
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
     let reopened = JournalWriter::open(&data_dir).await.unwrap();
+    let tables_before_context = reopened.backup_table_states().await.unwrap();
+    let point = reopened.session_import_context(&source_b).unwrap().unwrap();
+    assert_eq!(point.frontier, projected.frontier);
+    assert_eq!(
+        point.current,
+        SessionImportCurrentView::from_snapshot(&projected)
+            .unwrap()
+            .sessions[&source_b]
+    );
+    assert_eq!(
+        point.watermark.unwrap().source_sequence,
+        fs::metadata(moved_date.join(second.file_name().unwrap()))
+            .unwrap()
+            .len()
+    );
+    assert_eq!(
+        reopened.backup_table_states().await.unwrap(),
+        tables_before_context
+    );
     assert_eq!(reopened.project().await.unwrap(), projected);
     reopened.full_projection().await.unwrap();
     assert_eq!(reopened.project().await.unwrap(), projected);

@@ -31,9 +31,16 @@ pub async fn run(
     println!(
         "{}",
         match response {
-            SessionImportAdminResponse::Queued => "queued",
-            SessionImportAdminResponse::Revoked => "revoked",
-            SessionImportAdminResponse::NoDelta => "no_delta",
+            SessionImportAdminResponse::Queued => "queued".to_owned(),
+            SessionImportAdminResponse::Revoked => "revoked".to_owned(),
+            SessionImportAdminResponse::NoDelta => "no_delta".to_owned(),
+            SessionImportAdminResponse::Partial {
+                changed,
+                unavailable,
+                remaining,
+            } => format!(
+                "partial changed={changed} unavailable={unavailable} remaining={remaining}; inspect source rows before retry"
+            ),
         }
     );
     Ok(())

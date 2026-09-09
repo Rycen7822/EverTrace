@@ -450,13 +450,9 @@ impl EvidenceIngestor {
                 )?;
                 let surface_count = usize::from(verified.surface.is_some());
                 let recorded_at_us = verified.body.recorded_at_us;
-                let digest = if verified
-                    .body
-                    .source_instance_id
-                    .as_str()
-                    .strip_prefix("codex-session:")
-                    .is_some()
-                {
+                let digest = if evertrace_store::session_import::is_session_import_source(
+                    verified.body.source_instance_id.as_str(),
+                ) {
                     let range = verified
                         .receipt
                         .source_byte_range

@@ -589,11 +589,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .handle(request_id, &session_id, action, occurred_at_us)
                             .await
                             .map_err(|_| ErrorCode::InvalidInput)?;
-                        if outcome == SessionImportAdminOutcome::Queued {
+                        if matches!(outcome, SessionImportAdminOutcome::Queued | SessionImportAdminOutcome::Partial { changed: 1.., .. }) {
                             let next = (*session_import_wakeup.borrow()).wrapping_add(1);
                             session_import_wakeup.send_replace(next);
                         }
                         Ok(Response::SessionImportAdmin(match outcome {
+                            SessionImportAdminOutcome::Partial { changed, unavailable, remaining } => SessionImportAdminResponse::Partial { changed, unavailable, remaining },
                             SessionImportAdminOutcome::Queued => SessionImportAdminResponse::Queued,
                             SessionImportAdminOutcome::Revoked => {
                                 SessionImportAdminResponse::Revoked
@@ -1609,6 +1610,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                     }
                 }),
                 system_detail: item.system_detail.map(|detail| match detail {
+                    EngineHumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace } => HumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace },
                     EngineHumanSystemDetail::Job { detail } => {
                         let EngineHumanJobDetail {
                             native_history_cleanup_availability,

@@ -2250,11 +2250,12 @@ fn validate_evidence_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
         && normalization_dirty.is_empty()
         && events.iter().any(|event| match &event.payload {
             JournalPayload::SessionImportEventRecorded(session) => {
-                watermarks[0]
-                    .source_instance_id
-                    .as_str()
-                    .strip_prefix("codex-session:")
-                    == Some(session.session_id.as_str())
+                watermarks[0].source_instance_id.as_str()
+                    == session
+                        .source_instance_id
+                        .as_deref()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("codex-session:{}", session.session_id))
             }
             _ => false,
         })

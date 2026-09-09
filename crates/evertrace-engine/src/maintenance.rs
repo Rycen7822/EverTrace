@@ -104,7 +104,7 @@ use crate::{
 };
 
 const TOTAL_LIMIT: usize = 32;
-const PER_LANE_LIMIT: usize = 8;
+pub(crate) const PER_LANE_LIMIT: usize = 8;
 const CAPTURE_PROBE_LIMIT: usize = TOTAL_LIMIT + PER_LANE_LIMIT;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const CAPTURE_ALGORITHM_REVISION: &str = "capture-reconciliation-v1";
@@ -1219,7 +1219,7 @@ fn import_target_is_current(
     let sessions =
         evertrace_store::session_import::SessionImportCurrentView::from_snapshot(snapshot)?;
     Ok(sessions.sessions.values().any(|session| {
-        job.idempotency_key == format!("session_import:{}", session.session_id)
+        job.idempotency_key == format!("session_import:{}", session.source_key())
             && job.target_revision == session.metadata.source_revision.as_str()
             && job.target_generation <= session.revision
             && job.target_watermark <= session.source_event_seq
@@ -2047,7 +2047,7 @@ impl BackgroundScheduler {
                     SessionImportBudget {
                         max_bytes,
                         max_records: import_job.job.budget.max_items.min(16) as usize,
-                        deadline: std::time::Instant::now() + Duration::from_millis(wall_time_ms),
+                        max_work_time: Duration::from_millis(wall_time_ms),
                     },
                 )
                 .await

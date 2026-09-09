@@ -231,6 +231,31 @@ impl JournalWriter {
             .recall_current_contexts(self.next_seq.saturating_sub(1), limit)
     }
 
+    pub fn session_import_context(
+        &self,
+        source: &str,
+    ) -> Result<Option<crate::SessionImportContext>, StoreError> {
+        self.admission_state
+            .session_import_context(self.frontier(), source)
+    }
+
+    pub fn session_import_contexts(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::SessionImportSelection, StoreError> {
+        self.admission_state
+            .session_import_contexts(self.frontier(), after, limit)
+    }
+
+    pub fn session_import_prefix_page(
+        &self,
+        request: &crate::SessionImportPrefixRequest,
+    ) -> Result<crate::SessionImportPrefixPage, StoreError> {
+        self.admission_state
+            .session_import_prefix_page(self.frontier(), request)
+    }
+
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
         let lock = SiblingWriterLock::acquire(data_dir)?;
         Self::open_with_lock(lock).await

@@ -16,6 +16,7 @@ mod resolver;
 mod session_catalog;
 pub(crate) use session_catalog::{
     SESSION_ROOT_PROBE_BUDGET, freeze_native_namespace, read_report_repository_trust_before,
+    read_report_worktree_trust_before,
 };
 
 pub(crate) use git_probe::with_probe_deadline;

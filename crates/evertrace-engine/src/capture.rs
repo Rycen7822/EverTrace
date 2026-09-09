@@ -149,6 +149,7 @@ pub(crate) fn verify_capture_frame_presented(
         .as_deref()
         .map(parse_digest)
         .transpose()?;
+    let completeness = effective_import_completeness(&body);
     let receipt_id = source_receipt_id(
         &body.source_instance_id,
         &body.source_revision,
@@ -183,7 +184,7 @@ pub(crate) fn verify_capture_frame_presented(
         close_watermark: body.close_watermark,
         observation_role: body.observation_role,
         unsupported_record_classification: body.unsupported_record_classification,
-        capture_completeness: body.capture_completeness,
+        capture_completeness: completeness,
         archive_mode: body.archive_mode,
         cas_ref: body.cas_ref.clone(),
         protected_length: body.protected_length,
@@ -218,7 +219,7 @@ pub(crate) fn verify_capture_frame_presented(
         source_receipt_ref: receipt_id,
         source_role: body.source_role,
         content_trust: body.content_trust,
-        capture_completeness: body.capture_completeness,
+        capture_completeness: completeness,
         adapter_revision: body.adapter_revision,
         parser_revision: body.parser_revision,
         canonicalization_revision: body.canonicalization_revision,
@@ -274,6 +275,101 @@ pub(crate) fn verify_capture_frame_presented(
         surface,
         native_call,
     })
+}
+
+fn effective_import_completeness(
+    body: &evertrace_capture::CaptureRecordBody,
+) -> evertrace_domain::evidence::CaptureCompleteness {
+    use evertrace_domain::evidence::{
+        CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceSourceKind,
+        HostCorrelationEvidence, SourceRevisionMode, SourceRole, UnsupportedRecordClassification,
+    };
+    if body.capture_completeness != CaptureCompleteness::Complete
+        || !matches!(
+            body.unsupported_record_classification,
+            Some(
+                UnsupportedRecordClassification::UnknownRecordType
+                    | UnsupportedRecordClassification::Reasoning
+            )
+        )
+        || body.surface_eligible
+    {
+        return body.capture_completeness;
+    }
+    let canonical_uuid = |text: &str| {
+        text.len() == 36
+            && text.bytes().enumerate().all(|(index, byte)| {
+                if [8, 13, 18, 23].contains(&index) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                }
+            })
+    };
+    let source = body.source_instance_id.as_str();
+    let session = &body.source_session_ref;
+    let source_matches = canonical_uuid(session)
+        && (source == format!("codex-session:{session}")
+            || source
+                .strip_prefix(&format!("session-rollout:{session}:"))
+                .is_some_and(canonical_uuid));
+    let range_matches = body.source_byte_range.as_ref().is_some_and(|range| {
+        range.start < range.end
+            && range.end == body.source_sequence
+            && body.source_record_identity.as_str()
+                == format!("bytes:{}-{}", range.start, range.end)
+    });
+    // This is the exact importer v1 overclaim, after the original frame/CAS
+    // checks. Preserve the durable body and identities; only derived evidence
+    // is narrowed. Other contradictory Complete frames still fail validation.
+    if body.source_kind == EvidenceSourceKind::CodexSessionJsonl
+        && body.identity_domain == "codex-session-jsonl-v1"
+        && body.source_ref == format!("session:{session}")
+        && source_matches
+        && range_matches
+        && body.source_sequence_origin == Some(0)
+        && body.identity_strength == IdentityStrength::StableSourceSequence
+        && body.source_observation_id_hint.is_none()
+        && body.source_revision_mode == SourceRevisionMode::Append
+        && body.previous_source_revision.is_none()
+        && body.close_watermark.is_none()
+        && body.task_id.is_none()
+        && body.repository_instance_id.is_some() == body.worktree_instance_id.is_some()
+        && body.observation_role == ObservationRole::Other
+        && body.source_role == SourceRole::Imported
+        && body.content_trust == ContentTrust::ImportedClaim
+        && body.adapter_revision == 1
+        && body.parser_revision == 1
+        && body.canonicalization_revision == 1
+        && body.adapter_manifest_ref == "codex-session-import-v1"
+        && body.eligible_event_manifest_ref == "codex-session-import-events-v1"
+        && body.source_local_evidence.is_none()
+        && body.scope_effect_claims.is_empty()
+        && body.lifecycle.is_none()
+        && body.recovery_preflight.is_none()
+        && body.correlation
+            == (HostCorrelationEvidence {
+                occurrence_schema_version: 1,
+                host_instance_id: None,
+                host_trace_lineage_id: None,
+                host_lane_key: None,
+                canonical_event_family: None,
+                native_request_id: None,
+                physical_execution_ordinal: None,
+                pairing_role: ObservationRole::Other,
+                field_provenance: Vec::new(),
+                adapter_manifest_ref: "codex-session-import-v1".into(),
+                adapter_revision: 1,
+                strong_gate_receipt_ref: None,
+                admission: CorrelationAdmission::Unavailable,
+                partial_correlation_ref: None,
+                possible_duplicate_group_id: None,
+            })
+    {
+        CaptureCompleteness::Partial
+    } else {
+        body.capture_completeness
+    }
 }
 
 fn parse_digest(value: &str) -> Result<[u8; 32], IngestError> {

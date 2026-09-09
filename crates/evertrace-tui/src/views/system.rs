@@ -38,10 +38,16 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
             "\nObject Forget: available in Explorer\nRepository/session purge: unavailable\nBackup create/verify: durable jobs (B/V)\nGC + normal prune (G): 24 h grace / 30 d versions\nRestore: offline CLI only\nConfiguration write: unavailable",
         );
     }
-    f.render_widget(
-        components::table("System", body).scroll((state.detail_scroll, 0)),
-        a,
-    )
+    let mut widget = components::table("System", body).scroll((state.detail_scroll, 0));
+    if state.detail.as_ref().is_some_and(|item| {
+        matches!(
+            item.system_detail,
+            Some(evertrace_protocol::dto::HumanSystemDetail::SessionImport { .. })
+        )
+    }) {
+        widget = widget.wrap(ratatui::widgets::Wrap { trim: false });
+    }
+    f.render_widget(widget, a)
 }
 
 fn append_canary(
@@ -127,5 +133,63 @@ mod tests {
         assert!(text.contains("fts_metadata: Inconsistent"));
         assert!(text.contains("llm_daily_calls: Exhausted"));
         assert!(text.contains("Host canary: not_run"));
+        let source = "session-rollout:019d0000-0000-7000-8000-000000000001:019d0000-0000-7000-8000-000000000002";
+        use evertrace_protocol::dto::{
+            HumanItemCategory, HumanItemKind, HumanObjectFamily, HumanRowClass, HumanSnapshotItem,
+            HumanSystemDetail,
+        };
+        let item = HumanSnapshotItem {
+            evidence_detail: None,
+            work_detail: None,
+            item_kind: HumanItemKind::Generic,
+            proposal: None,
+            proposal_review: None,
+            support_detail: None,
+            competing_detail: None,
+            forget_preview: None,
+            repository_purge_preview: None,
+            negative_review: None,
+            recovery_detail: None,
+            worktree_detail: None,
+            execution_integrity_detail: None,
+            system_detail: Some(HumanSystemDetail::SessionImport {
+                session_id: "019d0000-0000-7000-8000-000000000001".into(),
+                source_instance_id: source.into(),
+                body_state: "Partial".into(),
+                access: "Approved".into(),
+                workspace: "NonRepository".into(),
+            }),
+            stable_key: format!("runtime:session_import:{source}"),
+            row_class: HumanRowClass::Runtime,
+            family: HumanObjectFamily::Runtime,
+            category: HumanItemCategory::SessionImport,
+            object_kind: "session_import_current".into(),
+            object_ref: None,
+            revision_ref: None,
+            lifecycle: None,
+            epistemic: None,
+            authority: None,
+            publication_state: None,
+            support_state: None,
+            scope_ref: None,
+            source_event_seq: 1,
+        };
+        let state = AppState {
+            detail: Some(item),
+            ..AppState::default()
+        };
+        terminal
+            .draw(|frame| render(frame, frame.area(), &state))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains(source));
+        assert!(text.contains("body: Partial"));
+        assert!(text.contains("access: Approved; workspace: NonRepository"));
     }
 }

@@ -331,6 +331,14 @@ pub(crate) fn read_report_repository_trust_before(
     worktree_id: WorktreeId,
     deadline: Instant,
 ) -> RepositoryTrustResult {
+    read_report_worktree_trust_before(report, current.worktrees.get(&worktree_id), deadline)
+}
+
+pub(crate) fn read_report_worktree_trust_before(
+    report: &HostProbeReport,
+    worktree: Option<&evertrace_domain::repository::WorktreeInstance>,
+    deadline: Instant,
+) -> RepositoryTrustResult {
     let unknown = || RepositoryTrustResult {
         state: RepositoryTrustState::Unknown,
         canonical_repository_path: None,
@@ -353,13 +361,12 @@ pub(crate) fn read_report_repository_trust_before(
     let Some(adapter_root) = qualified.path().parent() else {
         return unknown();
     };
-    read_repository_trust_at(adapter_root, current, worktree_id, deadline)
+    read_repository_trust_at(adapter_root, worktree, deadline)
 }
 
 fn read_repository_trust_at(
     adapter_root: &Path,
-    current: &RepositoryCurrentView,
-    worktree_id: WorktreeId,
+    worktree: Option<&evertrace_domain::repository::WorktreeInstance>,
     deadline: Instant,
 ) -> RepositoryTrustResult {
     let unknown = || RepositoryTrustResult {
@@ -367,7 +374,7 @@ fn read_repository_trust_at(
         canonical_repository_path: None,
         evidence_refs: Vec::new(),
     };
-    let Some(worktree) = current.worktrees.get(&worktree_id) else {
+    let Some(worktree) = worktree else {
         return unknown();
     };
     if worktree.lifecycle != WorktreeLifecycle::Active || worktree.validate().is_err() {

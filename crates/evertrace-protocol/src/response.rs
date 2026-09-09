@@ -53,6 +53,11 @@ pub enum SessionImportAdminResponse {
     Queued,
     Revoked,
     NoDelta,
+    Partial {
+        changed: u32,
+        unavailable: u32,
+        remaining: u32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

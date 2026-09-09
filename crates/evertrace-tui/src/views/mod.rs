@@ -702,6 +702,20 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
                     ]);
                 }
             }
+            HumanSystemDetail::SessionImport {
+                session_id,
+                source_instance_id,
+                body_state,
+                access,
+                workspace,
+            } => {
+                lines.extend([
+                    format!("session: {session_id}"),
+                    format!("source: {source_instance_id}"),
+                    format!("body: {body_state}"),
+                    format!("access: {access}; workspace: {workspace}"),
+                ]);
+            }
             HumanSystemDetail::Config {
                 config_version,
                 effective_config_hash,

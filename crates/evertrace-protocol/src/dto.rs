@@ -626,6 +626,13 @@ pub struct HumanConservativePruneResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanSystemDetail {
+    SessionImport {
+        session_id: String,
+        source_instance_id: String,
+        body_state: String,
+        access: String,
+        workspace: String,
+    },
     Job {
         detail: Box<HumanJobDetail>,
     },
@@ -1503,6 +1510,35 @@ impl HumanSystemDetail {
                                         .iter()
                                         .all(|result| result.bytes_removed.is_some())))
                     })
+            }
+            Self::SessionImport {
+                session_id,
+                source_instance_id,
+                body_state,
+                access,
+                workspace,
+            } => {
+                valid_ref(session_id)
+                    && valid_ref(source_instance_id)
+                    && item.object_kind == "session_import_current"
+                    && matches!(
+                        body_state.as_str(),
+                        "NotImported"
+                            | "Queued"
+                            | "Importing"
+                            | "Imported"
+                            | "BlockedUntrusted"
+                            | "BlockedUnapproved"
+                            | "BlockedScopeUnresolved"
+                            | "Partial"
+                            | "Failed"
+                            | "SourceReplaced"
+                    )
+                    && matches!(access.as_str(), "None" | "Approved" | "Revoked")
+                    && matches!(
+                        workspace.as_str(),
+                        "Repository" | "NonRepository" | "Ambiguous" | "Unavailable"
+                    )
             }
             Self::Config {
                 config_version,
