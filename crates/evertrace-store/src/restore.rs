@@ -55,13 +55,25 @@ async fn upgrade_native_inner(
     .await?
     {
         NativeUpgradePreparation::Unchanged(outcome) => Ok(outcome),
-        NativeUpgradePreparation::Prepared(prepared) => prepared.publish(checkpoint).await,
+        NativeUpgradePreparation::Prepared(prepared) => {
+            prepared
+                .publish(checkpoint, || PackagePublication::Committed)
+                .await
+        }
     }
 }
 
 pub enum NativeUpgradePreparation {
     Unchanged(NativeUpgradeOutcome),
     Prepared(Box<PreparedNativeUpgrade>),
+}
+
+/// Result of the one synchronous asset publication boundary. Restored means
+/// every adapter-owned change has been demonstrably undone, not merely failed.
+pub enum PackagePublication {
+    Committed,
+    Restored,
+    Uncertain,
 }
 
 pub struct PreparedNativeUpgrade {
@@ -304,6 +316,12 @@ async fn prepare_upgrade_inner(
 }
 
 impl PreparedNativeUpgrade {
+    pub async fn publish_package(
+        self,
+        publish: impl FnOnce() -> PackagePublication,
+    ) -> Result<NativeUpgradeOutcome, RestoreError> {
+        self.publish(|_| Ok(()), publish).await
+    }
     pub fn path(&self) -> &Path {
         &self.candidate
     }
@@ -329,6 +347,7 @@ impl PreparedNativeUpgrade {
     async fn publish(
         self,
         checkpoint: impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
+        publish_package: impl FnOnce() -> PackagePublication,
     ) -> Result<NativeUpgradeOutcome, RestoreError> {
         let Self {
             lock,
@@ -365,6 +384,13 @@ impl PreparedNativeUpgrade {
                 directory: candidate.clone(),
                 cause: Box::new(cause),
             })?;
+        // Package material must have left this native-only closure before swap.
+        if crate::backup::native_upgrade_manifest(&candidate)? != prepared_manifest {
+            return Err(RestoreError::ResidualCandidate {
+                directory: candidate,
+                cause: Box::new(StoreError::StoreCorrupt.into()),
+            });
+        }
         // No semantic write resumes until publication, directory sync and validation
         // have all succeeded. Flat source tables are never moved or overwritten.
         let publish = if canonical_exists {
@@ -397,7 +423,7 @@ impl PreparedNativeUpgrade {
                 preserved: candidate,
             });
         }
-        let checked = async {
+        let mut checked = async {
             checkpoint(NativePublicationPoint::Published)?;
             std::fs::File::open(&data_dir)
                 .and_then(|file| file.sync_all())
@@ -414,6 +440,18 @@ impl PreparedNativeUpgrade {
             Ok::<_, RestoreError>(())
         }
         .await;
+        if checked.is_ok() {
+            match publish_package() {
+                PackagePublication::Committed => {}
+                PackagePublication::Restored => checked = Err(RestoreError::Io),
+                PackagePublication::Uncertain => {
+                    return Err(RestoreError::NativePublicationUncertain {
+                        active: canonical,
+                        preserved: candidate,
+                    });
+                }
+            }
+        }
         if let Err(cause) = checked {
             if directory_identity(&canonical).ok() != Some(candidate_identity)
                 || (canonical_exists
@@ -535,7 +573,7 @@ impl PreparedNativeUpgrade {
     }
 }
 
-fn reject_retained_upgrade_candidate(data_dir: &Path) -> Result<(), RestoreError> {
+pub(crate) fn reject_retained_upgrade_candidate(data_dir: &Path) -> Result<(), RestoreError> {
     // No name grants cleanup authority. Bound this preflight before any backup
     // or candidate copy, including the otherwise-Noop canonical path.
     const MAX_ROOT_ENTRIES: usize = 4096;
@@ -657,6 +695,20 @@ async fn rebuild_upgrade_native(native: &Path) -> Result<(), RestoreError> {
     crate::query::L0002ProjectionWorker::new(journal, relations, search)
         .rebuild_for_restore(&projected)
         .await?;
+    Ok(())
+}
+
+/// Before service recovery, verify the unchanged old native side under the
+/// sibling lock and reject every uncertain upgrade remnant. No repair runs.
+pub async fn verify_package_resume(
+    data: &Path,
+    original: &evertrace_capture::ConfinedRoot,
+) -> Result<(), RestoreError> {
+    let _lock = crate::SiblingWriterLock::acquire(data)?;
+    reject_retained_upgrade_candidate(data)?;
+    original.revalidate().map_err(|_| RestoreError::Io)?;
+    verify_package_native(&crate::connection::native_root(data), &data.join("cas")).await?;
+    original.revalidate().map_err(|_| RestoreError::Io)?;
     Ok(())
 }
 
@@ -2061,6 +2113,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn package_callback_controls_finalize_rollback_and_restart_admission() {
+        for disposition in [
+            PackagePublication::Committed,
+            PackagePublication::Restored,
+            PackagePublication::Uncertain,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            let config = upgrade_fixture(&data, true).await;
+            let old = std::fs::metadata(data.join("store")).unwrap().ino();
+            let NativeUpgradePreparation::Prepared(prepared) =
+                prepare_native_upgrade(&data, &config, empty_hook, |_, _| Ok(()))
+                    .await
+                    .unwrap()
+            else {
+                panic!("package always prepares");
+            };
+            let candidate = prepared.path().to_owned();
+            let new = std::fs::metadata(&candidate).unwrap().ino();
+            let uncertain = matches!(disposition, PackagePublication::Uncertain);
+            let committed = matches!(disposition, PackagePublication::Committed);
+            let result = prepared
+                .publish_package(|| {
+                    assert_eq!(std::fs::metadata(data.join("store")).unwrap().ino(), new);
+                    assert!(crate::SiblingWriterLock::acquire(&data).is_err());
+                    disposition
+                })
+                .await;
+            assert_eq!(
+                std::fs::metadata(data.join("store")).unwrap().ino(),
+                if committed || uncertain { new } else { old }
+            );
+            assert_eq!(candidate.exists(), uncertain);
+            if uncertain {
+                assert!(matches!(
+                    result,
+                    Err(RestoreError::NativePublicationUncertain { .. })
+                ));
+                assert!(matches!(
+                    crate::JournalWriter::open(&data).await,
+                    Err(StoreError::UpgradeRequired)
+                ));
+            } else {
+                assert_eq!(result.is_ok(), committed);
+                if committed {
+                    crate::JournalWriter::open(&data).await.unwrap();
+                } else {
+                    assert_eq!(
+                        crate::JournalWriter::existing_profile(&data.join("store"))
+                            .await
+                            .unwrap(),
+                        Some("L0001")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_upgrade_preserves_replaced_flat_table() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
@@ -2156,6 +2267,15 @@ mod tests {
                     crate::JournalWriter::existing_profile(&data).await.unwrap(),
                     Some("L0001")
                 );
+            } else if canonical {
+                assert!(matches!(
+                    crate::JournalWriter::open(&data).await,
+                    Err(StoreError::UpgradeRequired)
+                ));
+                let (_, snapshot) = crate::backup::read_verified_store_tables(&data.join("store"))
+                    .await
+                    .unwrap();
+                assert_eq!(snapshot.frontier, 3);
             } else {
                 let writer = crate::JournalWriter::open(&data).await.unwrap();
                 assert_eq!(writer.full_projection().await.unwrap().frontier, 3);

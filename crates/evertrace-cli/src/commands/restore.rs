@@ -40,6 +40,7 @@ pub async fn upgrade(
     config: Option<PathBuf>,
     check_package: Option<PathBuf>,
     live_host: Option<PathBuf>,
+    commit: bool,
 ) -> Result<(), Box<dyn Error>> {
     let config_path = std::path::absolute(crate::resolve_config_path(config)?)?;
     let effective = super::config::load(Some(config_path.clone()))?;
@@ -67,12 +68,20 @@ pub async fn upgrade(
         if live_host.is_some() {
             crate::daemon_client::explain_live_host();
         }
-        let checked = evertrace_engine::maintenance::check_package_upgrade(
+        if commit && live_host.is_none() {
+            return Err(
+                "package publication requires --live-host and a current candidate proof".into(),
+            );
+        }
+        let checked = evertrace_engine::maintenance::package_upgrade(
             &data_dir,
             &config_path,
             &host_config,
             &std::path::absolute(configuration.join("systemd/user/evertraced.service"))?,
-            &package,
+            (
+                &package,
+                commit.then_some(std::path::Path::new("/usr/bin/systemctl")),
+            ),
             |socket| async move {
                 crate::daemon_client::health(&socket)
                     .await
@@ -96,10 +105,41 @@ pub async fn upgrade(
             ),
         )
         .await?;
+        if checked.published {
+            for path in &checked.retained_native {
+                println!("retained_native={}", path.display());
+            }
+            println!("candidate_host={:?}", checked.candidate_host);
+            println!(
+                "scope=package upgrade=committed generation={:?} backup={} service_running={:?} service_error={}",
+                checked.generation,
+                checked.backup.display(),
+                checked.service_running,
+                checked.service_error
+            );
+            if checked.service_running.is_none() {
+                println!(
+                    "manual_start_executable={} config={}",
+                    package.join("evertraced").display(),
+                    config_path.display()
+                );
+            }
+            return if checked.service_error {
+                Err("package committed; service did not resume, no rollback performed".into())
+            } else {
+                Ok(())
+            };
+        }
         println!(
-            "candidate_host={:?}; package_publication=not_implemented",
+            "candidate_host={:?}; package_publication=not_performed",
             checked.candidate_host
         );
+        if let Some(recovery) = checked.service_recovery {
+            println!(
+                "previous_service_recovery={recovery} service_error={}",
+                checked.service_error
+            );
+        }
         println!(
             "scope=package_prepublication check=not-ready native_prepared=true migrated={} materials_validated={} candidate_native_verified={} candidate_daemon_verified={} host_verified={} generation={:?} backup={} candidate_removed=true",
             checked.migrated,
@@ -118,7 +158,7 @@ pub async fn upgrade(
             .as_ref()
             .is_some_and(evertrace_engine::HostCanaryDiagnostic::installed_path_observed)
         {
-            "not-ready: package publication is not implemented"
+            "check complete: no package publication requested"
         } else if checked.materials_validated {
             "not-ready: candidate Host proof unavailable"
         } else {

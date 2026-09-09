@@ -167,6 +167,54 @@ pub struct PackageUpgradeCheck {
     pub candidate_native_verified: bool,
     pub candidate_daemon_verified: bool,
     pub candidate_host: Option<crate::HostCanaryDiagnostic>,
+    pub published: bool,
+    pub service_running: Option<bool>,
+    pub service_error: bool,
+    pub service_recovery: Option<&'static str>,
+    pub retained_native: Vec<std::path::PathBuf>,
+}
+
+#[derive(Debug, Error)]
+pub enum PackageUpgradeError {
+    #[error(transparent)]
+    Preparation(#[from] evertrace_store::restore::RestoreError),
+    #[error("package upgrade did not complete: {cause}; previous service recovery={recovery}")]
+    Service {
+        cause: evertrace_store::restore::RestoreError,
+        recovery: &'static str,
+    },
+    #[error(
+        "service quiesce failed: {cause}; service may have stopped; previous service recovery={recovery}"
+    )]
+    Quiesce {
+        cause: evertrace_codex::install::InstallError,
+        recovery: &'static str,
+    },
+}
+
+async fn resume_unpublished_service(
+    service: &evertrace_codex::install::PackageService,
+    data: &Path,
+    original: Option<&evertrace_capture::ConfinedRoot>,
+    eligible: bool,
+) -> &'static str {
+    if !eligible {
+        return "withheld_uncertain";
+    }
+    let Some(original) = original else {
+        return "withheld_unverified_native";
+    };
+    if evertrace_store::restore::verify_package_resume(data, original)
+        .await
+        .is_err()
+    {
+        return "withheld_unverified_native";
+    }
+    match service.resume() {
+        Ok(Some(_)) => "restored",
+        Ok(None) => "not_managed_or_unchanged",
+        Err(_) => "failed",
+    }
 }
 
 pub async fn verify_package_native(
@@ -186,7 +234,34 @@ pub async fn check_package_upgrade<F, Fut, G, Run>(
     package: &Path,
     health: F,
     live: (Option<crate::HostCanaryRequest>, G),
-) -> Result<PackageUpgradeCheck, evertrace_store::restore::RestoreError>
+) -> Result<PackageUpgradeCheck, PackageUpgradeError>
+where
+    F: Fn(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+    G: Fn(std::path::PathBuf, crate::HostCanaryRequest) -> Run,
+    Run: std::future::Future<Output = Option<crate::HostCanaryDiagnostic>>,
+{
+    package_upgrade(
+        data_dir,
+        config_path,
+        host_config,
+        unit,
+        (package, None),
+        health,
+        live,
+    )
+    .await
+}
+
+pub async fn package_upgrade<F, Fut, G, Run>(
+    data_dir: &Path,
+    config_path: &Path,
+    host_config: &Path,
+    unit: &Path,
+    package_mode: (&Path, Option<&Path>),
+    health: F,
+    live: (Option<crate::HostCanaryRequest>, G),
+) -> Result<PackageUpgradeCheck, PackageUpgradeError>
 where
     F: Fn(std::path::PathBuf) -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -194,8 +269,12 @@ where
     Run: std::future::Future<Output = Option<crate::HostCanaryDiagnostic>>,
 {
     use evertrace_store::restore::{NativeUpgradePreparation, RestoreError};
+    let (package, systemctl) = package_mode;
     let (live_host, canary) = live;
-    let preflight = evertrace_codex::install::preflight_package_check(
+    if systemctl.is_some() && live_host.is_none() {
+        return Err(RestoreError::Store(evertrace_store::StoreError::InvalidInput).into());
+    }
+    let mut preflight = evertrace_codex::install::preflight_package_check(
         data_dir,
         config_path,
         host_config,
@@ -203,78 +282,258 @@ where
         package,
     )
     .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
-    let preparation = evertrace_store::restore::prepare_native_upgrade(
-        data_dir,
-        config_path,
-        || freeze_hook_backup(data_dir),
-        verify_hook_backup_assets,
-    )
-    .await?;
-    let NativeUpgradePreparation::Prepared(prepared) = preparation else {
-        return Err(evertrace_store::StoreError::InvalidInput.into());
-    };
-    let backup = prepared.backup().to_owned();
-    let migrated = prepared.migrated();
-    let mut candidate_native_verified = false;
-    let mut candidate_daemon_verified = false;
-    let mut candidate_host = None;
-    let validation = async {
-        let mut runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
-            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
-        runtime.recovery_gate = evertrace_capture::RecoveryGateMode::Disabled;
-        runtime.recovery_adapter_manifest_id = None;
-        runtime.recall_cue_gate = evertrace_capture::RecallCueGateMode::Disabled;
-        runtime.recall_cue_adapter_manifest_id = None;
-        runtime.recall_cues.clear();
-        let materials = evertrace_codex::install::prepare_package_check(
-            preflight,
-            prepared.path(),
-            |destination| {
-                runtime
-                    .publish(destination)
-                    .map_err(|_| evertrace_codex::install::InstallError::Io)
-            },
-        )
+    preflight
+        .bind_runtime_source(&RuntimeSnapshot::snapshot_path(data_dir))
         .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
-        let candidate_runtime = RuntimeSnapshot::load(&materials.runtime)
-            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
-        probe_package_capture(prepared.path(), &materials.executable, &candidate_runtime)?;
-        run_package_native(
-            &package.join("evertraced"),
-            prepared.path(),
-            &backup.join("cas"),
+    let original_native = evertrace_capture::ConfinedRoot::open_owned_private(
+        &evertrace_store::connection::native_root(data_dir),
+    )
+    .ok();
+    let service = if let Some(path) = systemctl {
+        match evertrace_codex::install::PackageService::quiesce(&preflight, path) {
+            Ok(service) => Some(service),
+            Err((service, cause)) => {
+                let recovery = resume_unpublished_service(
+                    &service,
+                    data_dir,
+                    original_native.as_ref(),
+                    preflight.revalidate_original().is_ok(),
+                )
+                .await;
+                return Err(PackageUpgradeError::Quiesce { cause, recovery });
+            }
+        }
+    } else {
+        None
+    };
+    let mut may_resume = false;
+    let result: Result<PackageUpgradeCheck, RestoreError> = async {
+        let generation = preflight.generation();
+        let preparation = evertrace_store::restore::prepare_native_upgrade(
+            data_dir,
+            config_path,
+            || freeze_hook_backup(data_dir),
+            verify_hook_backup_assets,
         )
-        .await?;
-        candidate_native_verified = true;
-        candidate_host =
-            probe_package_daemon(package, materials.generation, &health, live_host, &canary)
-                .await?;
-        candidate_daemon_verified = true;
-        materials
-            .validate()
+        .await;
+        let preparation = match preparation {
+            Ok(value) => value,
+            Err(error) => {
+                may_resume = preflight.revalidate_original().is_ok();
+                return Err(error);
+            }
+        };
+        let NativeUpgradePreparation::Prepared(prepared) = preparation else {
+            may_resume = preflight.revalidate_original().is_ok();
+            return Err(evertrace_store::StoreError::InvalidInput.into());
+        };
+        let backup = prepared.backup().to_owned();
+        let migrated = prepared.migrated();
+        let mut candidate_native_verified = false;
+        let mut candidate_daemon_verified = false;
+        let mut candidate_host = None;
+        let validation = async {
+            let mut runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
+                .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+            runtime.generation = runtime.generation.checked_add(1).ok_or(RestoreError::Io)?;
+            runtime.recovery_gate = evertrace_capture::RecoveryGateMode::Disabled;
+            runtime.recovery_adapter_manifest_id = None;
+            runtime.recall_cue_gate = evertrace_capture::RecallCueGateMode::Disabled;
+            runtime.recall_cue_adapter_manifest_id = None;
+            runtime.recall_cues.clear();
+            let materials = evertrace_codex::install::prepare_package_check(
+                preflight,
+                prepared.path(),
+                |destination| {
+                    runtime
+                        .publish(destination)
+                        .map_err(|_| evertrace_codex::install::InstallError::Io)
+                },
+            )
             .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
-        Ok::<_, RestoreError>(materials.generation)
+            let candidate_runtime = RuntimeSnapshot::load(&materials.runtime)
+                .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+            probe_package_capture(prepared.path(), &materials.executable, &candidate_runtime)?;
+            run_package_native(
+                &package.join("evertraced"),
+                prepared.path(),
+                &backup.join("cas"),
+            )
+            .await?;
+            candidate_native_verified = true;
+            candidate_host =
+                probe_package_daemon(package, materials.generation, &health, live_host, &canary)
+                    .await?;
+            candidate_daemon_verified = true;
+            materials
+                .validate()
+                .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+            Ok::<_, RestoreError>(materials)
+        }
+        .await;
+        if systemctl.is_some()
+            && validation.is_ok()
+            && candidate_host
+                .as_ref()
+                .is_some_and(crate::HostCanaryDiagnostic::installed_path_observed)
+        {
+            let mut materials = validation?;
+            materials
+                .stage_generation(data_dir)
+                .map_err(|_| RestoreError::ResidualCandidate {
+                    directory: data_dir.to_owned(),
+                    cause: Box::new(evertrace_store::StoreError::InvalidInput.into()),
+                })?;
+            let fence = evertrace_capture::MaintenanceFence::open(data_dir).map_err(|_| {
+                RestoreError::ResidualCandidate {
+                    directory: data_dir.to_owned(),
+                    cause: Box::new(RestoreError::Io),
+                }
+            })?;
+            let mut called = false;
+            let outcome = prepared
+                .publish_package(|| {
+                    called = true;
+                    let Ok(_guard) = fence.exclusive() else {
+                        return evertrace_store::restore::PackagePublication::Uncertain;
+                    };
+                    match materials.commit(data_dir, &RuntimeSnapshot::snapshot_path(data_dir)) {
+                        evertrace_codex::install::PackageCommit::Committed => {
+                            evertrace_store::restore::PackagePublication::Committed
+                        }
+                        evertrace_codex::install::PackageCommit::Restored
+                            if materials.discard_staged().is_ok() =>
+                        {
+                            evertrace_store::restore::PackagePublication::Restored
+                        }
+                        _ => evertrace_store::restore::PackagePublication::Uncertain,
+                    }
+                })
+                .await;
+            if !called
+                && outcome.is_err()
+                && !matches!(
+                    outcome,
+                    Err(RestoreError::NativePublicationUncertain { .. })
+                )
+            {
+                materials
+                    .discard_staged()
+                    .map_err(|_| RestoreError::ResidualCandidate {
+                        directory: data_dir.to_owned(),
+                        cause: Box::new(RestoreError::Io),
+                    })?;
+            }
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if !matches!(
+                        error,
+                        RestoreError::NativePublicationUncertain { .. }
+                            | RestoreError::ResidualCandidate { .. }
+                    ) {
+                        may_resume = true;
+                    }
+                    return Err(error);
+                }
+            };
+            let retained_native = match outcome {
+                evertrace_store::restore::NativeUpgradeOutcome::Published {
+                    retained_native, ..
+                }
+                | evertrace_store::restore::NativeUpgradeOutcome::Noop { retained_native } => {
+                    retained_native
+                }
+                evertrace_store::restore::NativeUpgradeOutcome::Empty => Vec::new(),
+            };
+            let resumed = if !retained_native.is_empty() {
+                Err(evertrace_codex::install::InstallError::Io)
+            } else {
+                service.as_ref().expect("commit service").resume()
+            };
+            let mut service_running = resumed.as_ref().map_or(Some(false), |value| *value);
+            let mut service_error = resumed.is_err();
+            if service_running == Some(true) {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+                loop {
+                    if tokio::time::timeout_at(
+                        deadline,
+                        health(data_dir.join("runtime/evertraced-v1.sock")),
+                    )
+                    .await
+                    .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        service_running = Some(false);
+                        service_error = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            return Ok(PackageUpgradeCheck {
+                backup,
+                migrated,
+                generation: Some(generation),
+                materials_validated: true,
+                candidate_native_verified,
+                candidate_daemon_verified,
+                candidate_host,
+                published: true,
+                service_running,
+                service_error,
+                service_recovery: None,
+                retained_native,
+            });
+        }
+        // Both failed and successful checks dispose only this owned candidate while
+        // the same sibling lock is still held. Unknown residuals are explicit errors.
+        if matches!(&validation, Err(RestoreError::ResidualCandidate { directory, .. }) if directory.starts_with(prepared.path()))
+        {
+            return validation.map(|_| unreachable!());
+        }
+        prepared.discard()?;
+        if matches!(&validation, Err(RestoreError::ResidualCandidate { .. })) {
+            return validation.map(|_| unreachable!());
+        }
+        may_resume = validation.is_ok();
+        Ok(PackageUpgradeCheck {
+            backup,
+            migrated,
+            generation: validation
+                .as_ref()
+                .ok()
+                .map(|materials| materials.generation),
+            materials_validated: validation.is_ok(),
+            candidate_native_verified,
+            candidate_daemon_verified,
+            candidate_host,
+            published: false,
+            retained_native: Vec::new(),
+            service_running: None,
+            service_error: false,
+            service_recovery: None,
+        })
     }
     .await;
-    // Both failed and successful checks dispose only this owned candidate while
-    // the same sibling lock is still held. Unknown residuals are explicit errors.
-    if matches!(&validation, Err(RestoreError::ResidualCandidate { directory, .. }) if directory.starts_with(prepared.path()))
-    {
-        return validation.map(|_| unreachable!());
+    let Some(service) = service else {
+        return result.map_err(Into::into);
+    };
+    if result.as_ref().is_ok_and(|value| value.published) {
+        return result.map_err(Into::into);
     }
-    prepared.discard()?;
-    if matches!(&validation, Err(RestoreError::ResidualCandidate { .. })) {
-        return validation.map(|_| unreachable!());
+    let recovery =
+        resume_unpublished_service(&service, data_dir, original_native.as_ref(), may_resume).await;
+    match result {
+        Err(cause) => Err(PackageUpgradeError::Service { cause, recovery }),
+        Ok(mut value) => {
+            value.service_error = !matches!(recovery, "restored" | "not_managed_or_unchanged");
+            value.service_recovery = Some(recovery);
+            Ok(value)
+        }
     }
-    Ok(PackageUpgradeCheck {
-        backup,
-        migrated,
-        generation: validation.as_ref().ok().copied(),
-        materials_validated: validation.is_ok(),
-        candidate_native_verified,
-        candidate_daemon_verified,
-        candidate_host,
-    })
 }
 
 pub enum OfflineRestoreOutcome {

@@ -90,10 +90,15 @@ struct InstallFile {
     backup_identity: Option<HookFileIdentity>,
     temporary: Option<PathBuf>,
     changed: bool,
+    mode: u32,
 }
 
 impl InstallFile {
     fn read(path: &Path) -> Result<Self, InstallError> {
+        Self::read_bounded(path, MAX_CONFIG_BYTES, 0o600)
+    }
+
+    fn read_bounded(path: &Path, limit: u64, mode: u32) -> Result<Self, InstallError> {
         let parent_path = path.parent().ok_or(InstallError::InvalidType)?;
         for ancestor in parent_path.ancestors() {
             let metadata = fs::symlink_metadata(ancestor).map_err(map_io)?;
@@ -112,7 +117,7 @@ impl InstallFile {
                     || metadata.file_type().is_symlink()
                     || metadata.uid() != current_uid()?
                     || metadata.mode() & 0o022 != 0
-                    || metadata.len() > MAX_CONFIG_BYTES
+                    || metadata.len() > limit
                 {
                     return Err(InstallError::InvalidType);
                 }
@@ -138,6 +143,7 @@ impl InstallFile {
             backup_identity: None,
             temporary: None,
             changed: false,
+            mode,
         })
     }
 
@@ -202,6 +208,8 @@ impl InstallFile {
             self.temporary = Some(temporary.clone());
             let result = (|| {
                 file.write_all(&bytes).map_err(map_io)?;
+                file.set_permissions(fs::Permissions::from_mode(self.mode))
+                    .map_err(map_io)?;
                 file.sync_all().map_err(map_io)?;
                 self.revalidate(self.original.as_ref().map(|(id, _)| id))?;
                 fs::rename(&temporary, &self.path).map_err(map_io)?;
@@ -248,6 +256,7 @@ impl InstallFile {
             if fs::read(backup).map_err(map_io)? != *original {
                 return Err(InstallError::InvalidType);
             }
+            fs::set_permissions(backup, fs::Permissions::from_mode(self.mode)).map_err(map_io)?;
             fs::rename(backup, &self.path).map_err(map_io)?;
         } else if self.published.is_some() {
             fs::remove_file(&self.path).map_err(map_io)?;
@@ -1271,10 +1280,294 @@ pub struct UnpublishedPackage {
     snapshot: CurrentHookSnapshot,
     host: InstallFile,
     service: InstallFile,
+    staged: Option<(PathBuf, File)>,
+    inputs: Vec<InstallFile>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageCommit {
+    Committed,
+    Restored,
+    Uncertain,
 }
 
 impl UnpublishedPackage {
+    pub fn discard_staged(&self) -> Result<(), InstallError> {
+        let Some((directory, held)) = &self.staged else {
+            return Ok(());
+        };
+        let actual = fs::symlink_metadata(directory).map_err(map_io)?;
+        let held = held.metadata().map_err(map_io)?;
+        if !actual.is_dir()
+            || actual.file_type().is_symlink()
+            || (actual.dev(), actual.ino()) != (held.dev(), held.ino())
+        {
+            return Err(InstallError::InvalidType);
+        }
+        let owned = self
+            .assets
+            .iter()
+            .filter(|(path, _)| path.parent() == Some(directory.as_path()))
+            .collect::<Vec<_>>();
+        for entry in fs::read_dir(directory).map_err(map_io)?.take(5) {
+            if !owned
+                .iter()
+                .any(|(path, _)| *path == entry.as_ref().map(|v| v.path()).unwrap_or_default())
+            {
+                return Err(InstallError::InvalidType);
+            }
+        }
+        for (path, identity) in &owned {
+            let metadata = fs::symlink_metadata(path).map_err(map_io)?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || hook_file_identity(&metadata) != *identity
+            {
+                return Err(InstallError::InvalidType);
+            }
+        }
+        for (path, _) in owned {
+            fs::remove_file(path).map_err(map_io)?;
+        }
+        fs::remove_dir(directory).map_err(map_io)?;
+        File::open(directory.parent().ok_or(InstallError::InvalidType)?)
+            .and_then(|file| file.sync_all())
+            .map_err(map_io)
+    }
+    /// Move the already verified small files without replacing a destination or
+    /// copying native data. Hard-link/unlink retains the exact file inode.
+    pub fn stage_generation(&mut self, data: &Path) -> Result<(), InstallError> {
+        self.validate()?;
+        let source = self
+            .executable
+            .parent()
+            .ok_or(InstallError::InvalidType)?
+            .to_owned();
+        let directory = data
+            .join(generation_relative(
+                self.generation,
+                GENERATION_EXECUTABLE_NAME,
+            ))
+            .parent()
+            .ok_or(InstallError::InvalidType)?
+            .to_owned();
+        validate_private_directory(directory.parent().ok_or(InstallError::InvalidType)?)?;
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(map_io)?;
+        let held = File::open(&directory).map_err(map_io)?;
+        let identity = held.metadata().map_err(map_io)?;
+        self.staged = Some((directory.clone(), held));
+        for path in [
+            &mut self.executable,
+            &mut self.runtime,
+            &mut self.host_configuration,
+            &mut self.service_unit,
+        ] {
+            validate_private_directory(&directory)?;
+            let actual = fs::symlink_metadata(&directory).map_err(map_io)?;
+            if (actual.dev(), actual.ino()) != (identity.dev(), identity.ino()) {
+                return Err(InstallError::InvalidType);
+            }
+            let index = self
+                .assets
+                .iter()
+                .position(|(asset, _)| asset == path)
+                .ok_or(InstallError::InvalidType)?;
+            let file = File::open(&*path).map_err(map_io)?;
+            if hook_file_identity(&file.metadata().map_err(map_io)?) != self.assets[index].1 {
+                return Err(InstallError::InvalidType);
+            }
+            let destination = directory.join(path.file_name().ok_or(InstallError::InvalidType)?);
+            fs::hard_link(&*path, &destination).map_err(map_io)?;
+            let linked = hook_file_identity(&file.metadata().map_err(map_io)?);
+            if private_file_identity(
+                &destination,
+                if path.file_name().and_then(|v| v.to_str()) == Some(GENERATION_EXECUTABLE_NAME) {
+                    0o700
+                } else {
+                    0o600
+                },
+            )? != linked
+                || hook_file_identity(&fs::symlink_metadata(&*path).map_err(map_io)?) != linked
+            {
+                return Err(InstallError::InvalidType);
+            }
+            fs::remove_file(&*path).map_err(map_io)?;
+            *path = destination;
+            self.assets[index] = (
+                path.clone(),
+                hook_file_identity(&file.metadata().map_err(map_io)?),
+            );
+        }
+        self.staged
+            .as_ref()
+            .ok_or(InstallError::InvalidType)?
+            .1
+            .sync_all()
+            .map_err(map_io)?;
+        fs::remove_dir(&source).map_err(map_io)?;
+        for parent in [
+            source.parent().ok_or(InstallError::InvalidType)?,
+            directory.parent().ok_or(InstallError::InvalidType)?,
+        ] {
+            File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(map_io)?;
+        }
+        self.validate()
+    }
+
+    /// Called synchronously under the caller's capture fence and native writer
+    /// lock. Registry publication is last; no service/Host runs in this boundary.
+    pub fn commit(&mut self, data: &Path, current_runtime: &Path) -> PackageCommit {
+        let launcher = StableLauncher {
+            root: data.to_owned(),
+        };
+        launcher
+            .with_lock(|| Ok(self.commit_locked(&launcher, current_runtime, |_| Ok(()))))
+            .unwrap_or(PackageCommit::Uncertain)
+    }
+
+    fn commit_locked(
+        &mut self,
+        launcher: &StableLauncher,
+        current_runtime: &Path,
+        checkpoint: impl Fn(usize) -> Result<(), InstallError>,
+    ) -> PackageCommit {
+        let mut edits = Vec::new();
+        let prepared = (|| {
+            self.validate()?;
+            let mut registry = launcher.read_registry()?;
+            if registry
+                .generations
+                .iter()
+                .any(|g| g.generation >= self.generation)
+            {
+                return Err(InstallError::InvalidRegistry);
+            }
+            let generation = HookGeneration {
+                generation: self.generation,
+                protocol_version: 1,
+                executable: self.executable.clone(),
+                runtime_snapshot: self.runtime.clone(),
+                compatible: true,
+            };
+            validate_generation(&launcher.root, &generation)?;
+            registry.generations.push(generation);
+            registry.current_generation = self.generation;
+            let mut binary =
+                InstallFile::read_bounded(&launcher.launcher_path(), 256 * 1024 * 1024, 0o700)?;
+            binary.desired = Some(package_bytes(&self.executable)?);
+            let mut runtime = InstallFile::read(current_runtime)?;
+            runtime.desired = Some(read_private_file_bounded(
+                &self.runtime,
+                0o600,
+                MAX_CONFIG_BYTES,
+            )?);
+            let mut current = InstallFile::read(&launcher.registry_path())?;
+            current.desired =
+                Some(serde_json::to_vec(&registry).map_err(|_| InstallError::InvalidRegistry)?);
+            edits.extend([binary, runtime, current]);
+            Ok::<_, InstallError>(())
+        })();
+        if prepared.is_err() {
+            return if self.validate().is_ok() {
+                PackageCommit::Restored
+            } else {
+                PackageCommit::Uncertain
+            };
+        }
+        let published = (|| {
+            self.host.publish()?;
+            checkpoint(0)?;
+            self.service.publish()?;
+            checkpoint(1)?;
+            for (index, edit) in edits.iter_mut().enumerate() {
+                edit.publish()?;
+                checkpoint(index + 2)?;
+            }
+            for edit in [&self.host, &self.service].into_iter().chain(edits.iter()) {
+                edit.revalidate(if edit.changed {
+                    edit.published.as_ref()
+                } else {
+                    edit.original.as_ref().map(|(id, _)| id)
+                })?;
+            }
+            Ok::<_, InstallError>(())
+        })();
+        if published.is_ok() {
+            let cleaned = (|| {
+                for edit in [&self.host, &self.service].into_iter().chain(edits.iter()) {
+                    if let Some(path) = &edit.backup {
+                        if Some(private_file_identity(path, 0o600)?) != edit.backup_identity {
+                            return Err(InstallError::InvalidType);
+                        }
+                        fs::remove_file(path).map_err(map_io)?;
+                        edit.parent.sync_all().map_err(map_io)?;
+                    }
+                }
+                for path in [&self.host_configuration, &self.service_unit] {
+                    let expected = self
+                        .assets
+                        .iter()
+                        .find(|(asset, _)| asset == path)
+                        .ok_or(InstallError::InvalidType)?;
+                    if private_file_identity(path, 0o600)? != expected.1 {
+                        return Err(InstallError::InvalidType);
+                    }
+                    fs::remove_file(path).map_err(map_io)?;
+                }
+                File::open(self.runtime.parent().ok_or(InstallError::InvalidType)?)
+                    .and_then(|file| file.sync_all())
+                    .map_err(map_io)
+            })();
+            return if cleaned.is_ok() {
+                PackageCommit::Committed
+            } else {
+                PackageCommit::Uncertain
+            };
+        }
+        let mut restored = true;
+        for edit in edits.iter().rev().chain([&self.service, &self.host]) {
+            restored &= edit.rollback().is_ok();
+            if !edit.changed {
+                restored &= edit
+                    .revalidate(edit.original.as_ref().map(|(id, _)| id))
+                    .is_ok();
+            }
+        }
+        for input in &self.inputs {
+            if input.path != current_runtime {
+                restored &= input
+                    .revalidate(input.original.as_ref().map(|(id, _)| id))
+                    .is_ok();
+            }
+        }
+        for file in &self.snapshot.files {
+            if file.source != launcher.launcher_path() && file.source != launcher.registry_path() {
+                restored &= revalidate_frozen_file(file).is_ok();
+            }
+        }
+        if restored {
+            PackageCommit::Restored
+        } else {
+            PackageCommit::Uncertain
+        }
+    }
     pub fn validate(&self) -> Result<(), InstallError> {
+        if let Some((directory, held)) = &self.staged {
+            validate_private_directory(directory)?;
+            let actual = fs::symlink_metadata(directory).map_err(map_io)?;
+            let original = held.metadata().map_err(map_io)?;
+            if (actual.dev(), actual.ino()) != (original.dev(), original.ino()) {
+                return Err(InstallError::InvalidType);
+            }
+        }
+        for input in &self.inputs {
+            input.revalidate(input.original.as_ref().map(|(id, _)| id))?;
+        }
         self.host
             .revalidate(self.host.original.as_ref().map(|(identity, _)| identity))?;
         self.service
@@ -1318,6 +1611,116 @@ pub struct PackageCheckPreflight {
     snapshot: CurrentHookSnapshot,
     host: InstallFile,
     service: InstallFile,
+    inputs: Vec<InstallFile>,
+}
+
+impl PackageCheckPreflight {
+    pub fn revalidate_original(&self) -> Result<(), InstallError> {
+        for file in [&self.host, &self.service]
+            .into_iter()
+            .chain(self.inputs.iter())
+        {
+            file.revalidate(file.original.as_ref().map(|(identity, _)| identity))?;
+        }
+        for file in &self.snapshot.files {
+            revalidate_frozen_file(file)?;
+        }
+        Ok(())
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn bind_runtime_source(&mut self, path: &Path) -> Result<(), InstallError> {
+        let runtime = InstallFile::read(path)?;
+        if runtime.original.is_none() {
+            return Err(InstallError::InvalidType);
+        }
+        self.inputs.push(runtime);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct PackageService {
+    executable: PathBuf,
+    previous: Option<(bool, bool)>,
+}
+
+impl PackageService {
+    pub fn quiesce(
+        preflight: &PackageCheckPreflight,
+        executable: &Path,
+    ) -> Result<Self, (Self, InstallError)> {
+        let mut service = Self {
+            executable: executable.to_owned(),
+            previous: None,
+        };
+        let result = (|| {
+            preflight.revalidate_original()?;
+            if !executable.try_exists().map_err(map_io)? {
+                return Ok(());
+            }
+            package_metadata(executable)?;
+            let (status, fragment) = user_service(
+                executable,
+                &[
+                    "show",
+                    "evertraced.service",
+                    "--property=FragmentPath",
+                    "--value",
+                ],
+            )?;
+            if status != 0 {
+                return Ok(());
+            }
+            if fragment.trim()
+                != preflight
+                    .service
+                    .path
+                    .to_str()
+                    .ok_or(InstallError::InvalidType)?
+            {
+                return Err(InstallError::InvalidType);
+            }
+            let enabled = user_service(executable, &["is-enabled", "evertraced.service"])?;
+            let active = user_service(executable, &["is-active", "evertraced.service"])?;
+            if !matches!(enabled.1.trim(), "enabled" | "disabled")
+                || !matches!(active.1.trim(), "active" | "inactive" | "failed")
+            {
+                return Err(InstallError::InvalidType);
+            }
+            service.previous = Some((enabled.1.trim() == "enabled", active.1.trim() == "active"));
+            require_service(executable, &["disable", "--now", "evertraced.service"])?;
+            let active = user_service(executable, &["is-active", "evertraced.service"])?;
+            if !matches!(active.1.trim(), "inactive" | "failed") {
+                return Err(InstallError::InvalidType);
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(service),
+            Err(error) => Err((service, error)),
+        }
+    }
+
+    /// Only after the native lock is released. Failure never authorizes rollback.
+    pub fn resume(&self) -> Result<Option<bool>, InstallError> {
+        let Some((enabled, active)) = self.previous else {
+            return Ok(None);
+        };
+        require_service(&self.executable, &["daemon-reload"])?;
+        require_service(
+            &self.executable,
+            &[
+                if enabled { "enable" } else { "disable" },
+                "evertraced.service",
+            ],
+        )?;
+        if active {
+            require_service(&self.executable, &["start", "evertraced.service"])?;
+        }
+        Ok(Some(active))
+    }
 }
 
 /// Wiring for the caller-owned disposable package probe only.
@@ -1465,6 +1868,7 @@ pub fn preflight_package_check(
         snapshot,
         host,
         service,
+        inputs: vec![InstallFile::read(config)?],
     })
 }
 
@@ -1482,6 +1886,7 @@ pub fn prepare_package_check(
         snapshot,
         host,
         service,
+        inputs,
     } = preflight;
     let directory = candidate.join("package");
     let needed = package_metadata(&package.join("evertrace-hook"))?
@@ -1505,6 +1910,8 @@ pub fn prepare_package_check(
         snapshot,
         host,
         service,
+        staged: None,
+        inputs,
     };
     atomic_write(
         &result.executable,
@@ -2609,4 +3016,146 @@ fn current_uid() -> Result<u32, InstallError> {
 
 fn map_io(_: io::Error) -> InstallError {
     InstallError::Io
+}
+
+#[cfg(test)]
+mod package_publication_tests {
+    use super::*;
+
+    #[test]
+    fn asset_failures_restore_only_owned_edits_and_keep_old_pins() {
+        // Small adapter-only files test rollback; they are not binary/Host proof.
+        for failure in 0..=7 {
+            let root =
+                std::env::temp_dir().join(format!("evertrace-package-assets-{}", install_nonce()));
+            DirBuilder::new().mode(0o700).create(&root).unwrap();
+            let data = root.join("data");
+            let old = root.join("old");
+            let new = root.join("new");
+            let candidate = root.join("candidate");
+            for path in [&data, &old, &new, &candidate] {
+                DirBuilder::new().mode(0o700).create(path).unwrap();
+            }
+            for package in [&old, &new] {
+                for name in ["evertrace", "evertrace-hook", "evertraced"] {
+                    atomic_write(
+                        &package.join(name),
+                        b"#!/bin/sh\necho 'configuration is valid'\n",
+                        0o700,
+                    )
+                    .unwrap();
+                }
+            }
+            let config = root.join("config.toml");
+            let host = root.join("host.toml");
+            let unit = root.join("evertraced.service");
+            let runtime = root.join("runtime.snapshot");
+            atomic_write(&config, b"config_version = 1\n", 0o600).unwrap();
+            atomic_write(&runtime, b"old operation runtime", 0o600).unwrap();
+            prepare_probe_generation(&data, &old.join("evertrace-hook"), 1, |path| {
+                atomic_write(path, b"old pinned runtime", 0o600)
+            })
+            .unwrap();
+            let launcher = StableLauncher::open(&data).unwrap();
+            let pinned = launcher.resolve_for_session("old-session").unwrap();
+            let pin =
+                private_file_identity(&data.join("hooks/pins/old-session.pin"), 0o600).unwrap();
+            let old_executable = private_file_identity(&pinned.executable, 0o700).unwrap();
+            atomic_write(
+                &host,
+                &wiring(&data, &old.join("evertrace"), &config).unwrap(),
+                0o600,
+            )
+            .unwrap();
+            atomic_write(
+                &unit,
+                &unit_bytes(&old.join("evertraced"), &config).unwrap(),
+                0o600,
+            )
+            .unwrap();
+            let original = [
+                host.clone(),
+                unit.clone(),
+                launcher.launcher_path(),
+                runtime.clone(),
+                launcher.registry_path(),
+            ]
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            });
+            let preflight = preflight_package_check(&data, &config, &host, &unit, &new).unwrap();
+            let mut materials = prepare_package_check(preflight, &candidate, |path| {
+                atomic_write(path, b"new operation runtime", 0o600)
+            })
+            .unwrap();
+            let inode = private_file_identity(&materials.executable, 0o700)
+                .unwrap()
+                .inode;
+            materials.stage_generation(&data).unwrap();
+            assert_eq!(
+                private_file_identity(&materials.executable, 0o700)
+                    .unwrap()
+                    .inode,
+                inode
+            );
+            assert!(!candidate.join("package").exists());
+            let outcome = launcher
+                .with_lock(|| {
+                    Ok(materials.commit_locked(&launcher, &runtime, |point| {
+                        if failure == 5 && point == 0 {
+                            fs::write(&host, b"# concurrent Host state\n").unwrap();
+                            return Err(InstallError::Io);
+                        }
+                        if failure == 7 && point == 0 {
+                            fs::write(&config, b"# concurrent source configuration\n").unwrap();
+                            return Err(InstallError::Io);
+                        }
+                        if point == failure {
+                            Err(InstallError::Io)
+                        } else {
+                            Ok(())
+                        }
+                    }))
+                })
+                .unwrap();
+            assert_eq!(
+                outcome,
+                if matches!(failure, 5 | 7) {
+                    PackageCommit::Uncertain
+                } else if failure == 6 {
+                    PackageCommit::Committed
+                } else {
+                    PackageCommit::Restored
+                }
+            );
+            if failure == 5 {
+                assert_eq!(fs::read(&host).unwrap(), b"# concurrent Host state\n");
+            } else if failure == 7 {
+                assert_eq!(
+                    fs::read(&config).unwrap(),
+                    b"# concurrent source configuration\n"
+                );
+            } else if failure == 6 {
+                assert_eq!(launcher.read_registry().unwrap().current_generation, 2);
+                assert_eq!(fs::read(&runtime).unwrap(), b"new operation runtime");
+                assert!(!materials.host_configuration.exists());
+                assert!(!materials.service_unit.exists());
+            } else {
+                for (path, bytes) in original {
+                    assert_eq!(fs::read(path).unwrap(), bytes);
+                }
+                materials.discard_staged().unwrap();
+            }
+            assert_eq!(
+                private_file_identity(&pinned.executable, 0o700).unwrap(),
+                old_executable
+            );
+            assert_eq!(
+                private_file_identity(&data.join("hooks/pins/old-session.pin"), 0o600).unwrap(),
+                pin
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

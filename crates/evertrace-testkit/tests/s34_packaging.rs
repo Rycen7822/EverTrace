@@ -1403,6 +1403,21 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         .map(|path| fs::read(path).unwrap())
         .collect::<Vec<_>>();
     let package = root.path().join("next-package");
+    let refused = std::process::Command::new(&paths.cli)
+        .env_clear()
+        .env("HOME", root.path())
+        .env("CODEX_HOME", paths.host_config.parent().unwrap())
+        .args([
+            "--config",
+            paths.config.to_str().unwrap(),
+            "upgrade",
+            package.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires --live-host"));
+    assert!(!paths.data_root.join("backups").exists());
     for invalid in [&package, paths.cli.parent().unwrap()] {
         assert!(
             check_package_upgrade(
@@ -1668,6 +1683,84 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     assert_eq!((metadata.dev(), metadata.ino()), (after.dev(), after.ino()));
     for (path, expected) in owned.iter().zip(before) {
         assert_eq!(fs::read(path).unwrap(), expected, "{}", path.display());
+    }
+}
+
+#[tokio::test]
+async fn package_prepare_failure_restores_service_only_with_verified_old_side() {
+    let (root, paths, _) = fixture();
+    install_offline(&paths, false).unwrap();
+    drop(JournalWriter::open(&paths.data_root).await.unwrap());
+    evertrace_capture::CasStore::open(paths.data_root.join("cas")).unwrap();
+    let package = root.path().join("next");
+    fs::create_dir(&package).unwrap();
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
+    // Only preflight is reached: these small scripts are not candidate proof.
+    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+        let path = package.join(name);
+        fs::write(&path, "#!/bin/sh\necho 'configuration is valid'\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let log = root.path().join("service.log");
+    let stopped = root.path().join("stopped");
+    let control = root.path().join("control");
+    fs::write(&paths.systemctl, format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\nshift\ncase \"$1\" in\nshow) echo '{unit}';;\nis-enabled) echo enabled;;\nis-active) if [ -f '{stopped}' ]; then if [ \"$(cat '{control}')\" = 3 ]; then echo broken; else echo inactive; fi; else echo active; fi;;\ndisable) touch '{stopped}';;\nstart) [ \"$(cat '{control}')\" != 2 ];;\n*) exit 0;;\nesac\n",
+        log=log.display(),unit=paths.unit.display(),stopped=stopped.display(),control=control.display()
+    )).unwrap();
+    fs::set_permissions(&paths.systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+    // A regular file makes backup preparation fail before candidate creation.
+    fs::write(paths.data_root.join("backups"), b"owned test obstruction").unwrap();
+    for case in 0..4 {
+        fs::write(&control, case.to_string()).unwrap();
+        fs::write(&log, b"").unwrap();
+        if stopped.exists() {
+            fs::remove_file(&stopped).unwrap();
+        }
+        let unknown = paths.data_root.join(".upgrade-unknown");
+        if case == 1 {
+            fs::create_dir(&unknown).unwrap();
+        }
+        let error = match evertrace_engine::maintenance::package_upgrade(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+            &paths.unit,
+            (&package, Some(&paths.systemctl)),
+            |_| async { panic!("no candidate daemon before preparation succeeds") },
+            (
+                Some(evertrace_engine::HostCanaryRequest {
+                    host_executable: paths.host_executable.to_string_lossy().into_owned(),
+                    host_config: paths.host_config.to_string_lossy().into_owned(),
+                }),
+                |_, _| async { panic!("no Host before preparation succeeds") },
+            ),
+        )
+        .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("preparation must fail"),
+        };
+        assert!(stopped.exists());
+        let calls = fs::read_to_string(&log).unwrap();
+        if case == 1 {
+            assert!(error.contains("withheld_unverified_native"), "{error}");
+            assert!(!calls.contains("--user start"));
+            fs::remove_dir(unknown).unwrap();
+        } else {
+            assert!(calls.contains("--user start"), "{calls}: {error}");
+            assert!(
+                error.contains(if case == 2 {
+                    "recovery=failed"
+                } else {
+                    "recovery=restored"
+                }),
+                "{error}"
+            );
+        }
+        if case == 3 {
+            assert!(error.contains("service may have stopped"));
+        }
     }
 }
 

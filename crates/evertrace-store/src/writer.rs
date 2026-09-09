@@ -225,6 +225,8 @@ impl JournalWriter {
 
     pub(crate) async fn open_with_lock(lock: SiblingWriterLock) -> Result<Self, StoreError> {
         let data_dir = lock.data_dir().to_owned();
+        crate::restore::reject_retained_upgrade_candidate(&data_dir)
+            .map_err(|_| StoreError::UpgradeRequired)?;
         crate::connection::prepare_native_root(&data_dir)?;
         let native = crate::connection::native_root(&data_dir);
         if Self::existing_profile(&native).await? == Some("L0001") {

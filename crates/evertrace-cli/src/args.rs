@@ -19,6 +19,7 @@ pub enum Command {
     Upgrade {
         check_package: Option<PathBuf>,
         live_host: Option<PathBuf>,
+        commit: bool,
     },
     Install {
         host_executable: PathBuf,
@@ -59,12 +60,17 @@ impl Args {
                 backup: PathBuf::from(values.next().ok_or("restore requires a backup path")?),
             }
         } else if command == "upgrade" {
+            let mut commit = false;
             let check_package = match values.next() {
                 None => None,
                 Some(flag) if flag == "--check" => {
                     Some(PathBuf::from(values.next().ok_or(
                         "upgrade --check requires an explicit package directory",
                     )?))
+                }
+                Some(package) if !package.as_encoded_bytes().starts_with(b"-") => {
+                    commit = true;
+                    Some(PathBuf::from(package))
                 }
                 Some(_) => return Err(usage()),
             };
@@ -82,6 +88,7 @@ impl Args {
             Command::Upgrade {
                 check_package,
                 live_host,
+                commit,
             }
         } else if command == "install" {
             Command::Install {
@@ -168,7 +175,7 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]|install CODEX_EXECUTABLE [--live-canary]|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]|upgrade PACKAGE_DIRECTORY --live-host CODEX_EXECUTABLE|install CODEX_EXECUTABLE [--live-canary]|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
 }
 
 #[cfg(test)]
@@ -211,5 +218,11 @@ mod tests {
             }
         ));
         assert!(parse(&["upgrade", "--live-host", "/host"]).is_err());
+        assert!(matches!(
+            parse(&["upgrade", "/package", "--live-host", "/host"])
+                .unwrap()
+                .command,
+            Command::Upgrade { commit: true, .. }
+        ));
     }
 }

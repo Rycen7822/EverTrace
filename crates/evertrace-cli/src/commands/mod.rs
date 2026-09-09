@@ -19,7 +19,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         Command::Upgrade {
             check_package,
             live_host,
-        } => restore::upgrade(args.config, check_package, live_host).await,
+            commit,
+        } => restore::upgrade(args.config, check_package, live_host, commit).await,
         Command::Install {
             host_executable,
             live_canary,
