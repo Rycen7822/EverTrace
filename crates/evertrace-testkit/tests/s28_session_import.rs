@@ -168,6 +168,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let session_id = "019d0000-0000-7000-8000-000000000028";
     let transcript = dated.join(format!("rollout-2026-08-30T00-00-00-{session_id}.jsonl"));
     let header = serde_json::json!({
+        "ordinal": 0,
         "timestamp": "2026-08-30T00:00:00Z",
         "type": "session_meta",
         "payload": {
@@ -180,6 +181,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
         }
     });
     let visible = serde_json::json!({
+        "ordinal": 1,
         "timestamp": "2026-08-30T00:00:01Z",
         "type": "event_msg",
         "payload": {"type": "user_message", "message": "bounded import proof"}

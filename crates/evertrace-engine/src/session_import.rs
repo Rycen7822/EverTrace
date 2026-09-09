@@ -660,6 +660,8 @@ impl CatalogReader<'_> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionMetaRecord {
+    #[serde(rename = "ordinal")]
+    _ordinal: Option<u64>,
     #[serde(rename = "timestamp")]
     _timestamp: String,
     #[serde(rename = "type")]
@@ -1392,7 +1394,7 @@ mod tests {
             "rollout-2026-09-09T12-00-00-{thread}_{rollout}.jsonl"
         ));
         // Synthetic fixed-format metadata: object source and instructions are ignored.
-        let mut header = serde_json::json!({"timestamp":"2026-09-09T12:00:00Z", "type":"session_meta",
+        let mut header = serde_json::json!({"ordinal":0, "timestamp":"2026-09-09T12:00:00Z", "type":"session_meta",
             "payload":{"id":thread, "session_id":session, "source":{"subagent":{"thread_spawn":{"parent_thread_id":session}}},
                 "base_instructions":{"text":"PRIVATE_INSTRUCTIONS".repeat(1200)},
                 "history_base":{"thread_id":session,"ordinal":4}, "agent_role":"worker"}});
@@ -1464,6 +1466,13 @@ mod tests {
             Err(SessionCatalogError::Unsupported)
         ));
         fs::remove_file(&original).unwrap();
+        header["ordinal"] = "0".into();
+        fs::write(&transcript, format!("{header}\n")).unwrap();
+        assert!(
+            observe_session_catalog_report(transcript.to_str(), session, "invalid-ordinal", None)
+                .is_err()
+        );
+        header["ordinal"] = 0.into();
         header["payload"]["id"] = session.into();
         fs::write(&transcript, format!("{header}\n")).unwrap();
         assert!(

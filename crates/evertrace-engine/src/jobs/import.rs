@@ -926,6 +926,24 @@ mod tests {
     use super::fair_sessions;
 
     #[test]
+    fn record_ordinal_is_optional_typed_metadata_only() {
+        let mut record = serde_json::json!({"type":"event_msg", "payload":{"type":"user_message", "message":"bounded"}});
+        assert!(
+            super::classify_record(&serde_json::to_vec(&record).unwrap())
+                .unwrap()
+                .surface_eligible
+        );
+        record["ordinal"] = 1.into();
+        assert!(
+            super::classify_record(&serde_json::to_vec(&record).unwrap())
+                .unwrap()
+                .surface_eligible
+        );
+        record["ordinal"] = "1".into();
+        assert!(super::classify_record(&serde_json::to_vec(&record).unwrap()).is_err());
+    }
+
+    #[test]
     fn fair_cursor_reaches_sessions_beyond_the_first_batch() {
         let queued = (0..40)
             .map(|value| format!("session-{value:02}"))
@@ -1064,6 +1082,8 @@ struct RecordVisibility {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecordKind {
+    #[serde(rename = "ordinal")]
+    _ordinal: Option<u64>,
     #[serde(rename = "type")]
     record_type: String,
     payload: serde_json::Value,
