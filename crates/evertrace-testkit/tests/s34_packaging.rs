@@ -796,7 +796,7 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
                 .env("HOME", paths.data_root.parent().unwrap())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap(),
         )
@@ -1373,7 +1373,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     let host_with_token = format!(
         "{}\n[model_providers.private_test]\napi_key = \"fictional-package-token-never-copy\"\n",
         fs::read_to_string(&paths.host_config).unwrap()
-    );
+    ).replace("# END EverTrace managed wiring v1", "[hooks.state.review]\ntrusted_hash = 'keep-host-state'\n[projects.\"/private/work\"]\ntrust_level = 'trusted'\n[mcp_servers.evertrace.tools.evertrace]\napproval_mode = 'approve'\n# END EverTrace managed wiring v1");
     fs::write(&paths.host_config, &host_with_token).unwrap();
     let connection =
         evertrace_store::connection::CompatibilityStore::connect_local(&paths.data_root)
@@ -1454,6 +1454,11 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     assert!(staged.ends_with("# END EverTrace managed wiring v1\n"));
     assert!(!staged.contains("fictional-package-token-never-copy"));
     assert!(!staged.contains("model_providers"));
+    assert!(
+        !staged.contains("trusted_hash")
+            && !staged.contains("approval_mode")
+            && !staged.contains("projects")
+    );
     assert!(staged.contains("mcp_servers.evertrace") && staged.contains("PreToolUse"));
     materials.validate().unwrap();
     fs::write(
@@ -1462,6 +1467,37 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     )
     .unwrap();
     assert!(materials.validate().is_err());
+    drop(materials);
+    drop(materials_root);
+    let materials_root = TempDir::new().unwrap();
+    let preflight = evertrace_codex::install::preflight_package_check(
+        &paths.data_root,
+        &paths.config,
+        &paths.host_config,
+        &paths.unit,
+        &package,
+    )
+    .unwrap();
+    let materials =
+        evertrace_codex::install::prepare_package_check(preflight, materials_root.path(), |path| {
+            runtime
+                .publish(path)
+                .map_err(|_| evertrace_codex::install::InstallError::Io)
+        })
+        .unwrap();
+    materials.validate().unwrap();
+    fs::write(
+        &paths.host_config,
+        format!("{host_with_token}\n# concurrent Host state write\n"),
+    )
+    .unwrap();
+    assert!(materials.validate().is_err()); // Full-file optimistic check, not wiring hash.
+    assert!(
+        fs::read_to_string(&paths.host_config)
+            .unwrap()
+            .ends_with("# concurrent Host state write\n")
+    );
+    fs::write(&paths.host_config, &host_with_token).unwrap();
     assert_eq!(
         fs::read_to_string(&paths.host_config).unwrap(),
         host_with_token
@@ -2422,12 +2458,14 @@ async fn installed_native_capture_is_weak_durable_and_replay_safe() {
     );
     let result = probe.await.unwrap();
     assert_eq!(result.status, HostCanaryStatus::TimedOut);
+    assert!(result.qualification.is_none());
     assert!(
         !result.native_delivery_observed
             && !result.mcp_claim_consumed
             && !result.capture_receipt_observed
     );
     assert_eq!(canary.current().unwrap().status, HostCanaryStatus::TimedOut);
+    assert_eq!(canary.current(), Some(result.clone()));
     let restarted = HostCanaryService::new(
         handle.clone(),
         paths.data_root.clone(),
@@ -2499,6 +2537,9 @@ async fn installed_native_capture_is_weak_durable_and_replay_safe() {
         canary.current().unwrap().status,
         HostCanaryStatus::IdentityChanged
     );
+    let invalidated = canary.current().unwrap();
+    assert!(invalidated.qualification.is_none());
+    assert!(!invalidated.native_delivery_observed && !invalidated.mcp_claim_consumed);
     assert!(
         fs::read_dir(paths.data_root.join("runtime"))
             .unwrap()
@@ -2531,11 +2572,61 @@ fn owned_merge_idempotence_uninstall_and_unknown_owner() {
     );
     let installed = fs::read(&paths.host_config).unwrap();
     let launcher = evertrace_codex::install::StableLauncher::open(&paths.data_root).unwrap();
+    let wiring_hash = || {
+        evertrace_codex::install::installed_wiring_hash(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+        )
+        .unwrap()
+        .1
+    };
+    let hash = wiring_hash();
+    let mut with_comment = installed.clone();
+    with_comment.extend_from_slice(b"\n# unrelated user setting\n");
+    fs::write(&paths.host_config, with_comment).unwrap();
+    assert_eq!(wiring_hash(), hash); // User TOML is not the wiring digest domain.
+    fs::write(&paths.host_config, &installed).unwrap();
+    let arguments = evertrace_codex::install::candidate_host_arguments();
+    let candidate_hash = evertrace_codex::install::candidate_wiring_hash(&arguments);
+    let mut reordered = arguments.clone();
+    reordered.swap(1, 3);
+    assert_ne!(
+        evertrace_codex::install::candidate_wiring_hash(&reordered),
+        candidate_hash
+    );
     let pinned = launcher
         .resolve_for_session("retained-installed-session")
         .unwrap();
     assert!(install_offline(&paths, false).unwrap().backups.is_empty());
     assert_eq!(fs::read(&paths.host_config).unwrap(), installed);
+    // Shape written by the real 0.153.4 normal review experiment. State is
+    // deliberately inside the markers, but is not an EverTrace declaration.
+    let host_state = "\n[hooks.state.\"private:pre_tool_use:0:0\"]\ntrusted_hash = 'sha256:review-state' # keep exact\n[projects.\"/private/work\"]\ntrust_level = 'trusted'\n[mcp_servers.evertrace.tools.evertrace]\napproval_mode = 'approve'\n";
+    let with_state = String::from_utf8(installed.clone()).unwrap().replace(
+        "# END EverTrace managed wiring v1",
+        &format!("{host_state}# END EverTrace managed wiring v1"),
+    );
+    fs::write(&paths.host_config, &with_state).unwrap();
+    assert_eq!(wiring_hash(), hash);
+    assert!(install_offline(&paths, false).unwrap().backups.is_empty());
+    assert_eq!(fs::read_to_string(&paths.host_config).unwrap(), with_state);
+    install_offline(&paths, true).unwrap();
+    let uninstalled = fs::read_to_string(&paths.host_config).unwrap();
+    assert!(uninstalled.contains(host_state));
+    assert!(!uninstalled.contains("--launcher-root"));
+    install_offline(&paths, false).unwrap();
+    assert!(
+        fs::read_to_string(&paths.host_config)
+            .unwrap()
+            .contains(host_state)
+    );
+    assert_eq!(wiring_hash(), hash);
+    let ambiguous = format!("{with_state}# BEGIN EverTrace managed wiring v1\n");
+    fs::write(&paths.host_config, &ambiguous).unwrap();
+    assert!(install_offline(&paths, false).is_err());
+    assert_eq!(fs::read_to_string(&paths.host_config).unwrap(), ambiguous);
+    fs::write(&paths.host_config, &installed).unwrap();
     fs::write(paths.data_root.join("user-data"), b"keep").unwrap();
     // Literal output of the pre-edit package's real isolated install, checked
     // against 5643caa's owned format; not generated by the new compatibility helper.
@@ -2575,7 +2666,15 @@ enabled_tools = ["evertrace"]
         .is_err()
     );
     install_offline(&paths, false).unwrap();
-    assert_eq!(fs::read(&paths.host_config).unwrap(), installed);
+    assert_eq!(wiring_hash(), hash);
+    assert!(
+        fs::read_to_string(&paths.host_config)
+            .unwrap()
+            .starts_with(&format!(
+                "{original}{}",
+                historical.split("# END EverTrace").next().unwrap()
+            ))
+    ); // Existing array positions survive adding the submission declaration.
     let edited_old = format!(
         "{original}{}",
         historical.replace("timeout = 3", "timeout = 4")
@@ -2585,7 +2684,9 @@ enabled_tools = ["evertrace"]
     assert_eq!(fs::read_to_string(&paths.host_config).unwrap(), edited_old);
     fs::write(&paths.host_config, format!("{original}{historical}")).unwrap();
     install_offline(&paths, true).unwrap();
-    assert_eq!(fs::read_to_string(&paths.host_config).unwrap(), original);
+    let removed = fs::read_to_string(&paths.host_config).unwrap();
+    assert!(removed.starts_with(original));
+    assert!(removed[original.len()..].trim().is_empty());
     assert_eq!(
         fs::read(paths.data_root.join("user-data")).unwrap(),
         b"keep"
@@ -2839,6 +2940,7 @@ async fn candidate_canary_rpc_is_scoped_and_never_updates_installed_current() {
         }
     );
     assert_eq!(result.status, HostCanaryStatus::TimedOut); // Script output is not Host evidence.
+    assert!(result.qualification.is_none());
     assert!(!result.native_delivery_observed && !result.mcp_claim_consumed);
     let arguments = fs::read_to_string(&marker).unwrap();
     assert!(arguments.starts_with(paths.data_root.to_str().unwrap()));
@@ -2886,6 +2988,7 @@ async fn candidate_canary_rpc_is_scoped_and_never_updates_installed_current() {
         panic!("canary response");
     };
     assert_eq!(rejected.status, HostCanaryStatus::IdentityChanged);
+    assert!(rejected.qualification.is_none());
 }
 
 #[test]

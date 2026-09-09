@@ -1644,6 +1644,104 @@ pub struct HostCanaryDiagnostic {
     pub native_delivery_observed: bool,
     pub mcp_claim_consumed: bool,
     pub capture_receipt_observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<HostCanaryQualification>,
+}
+
+/// Fixed display/check projection of the daemon's evaluated current report.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCanaryQualification {
+    pub hook_activation: CanaryHookActivation,
+    pub mcp_binding: CanaryMcpBinding,
+    pub mcp_mechanism: CanaryMcpMechanism,
+    pub capture: CanaryGateQualification,
+    pub recovery: CanaryGateQualification,
+    pub active_search_due: CanaryGateQualification,
+    pub strong_normalization: CanaryGateQualification,
+    pub project_policy: CanaryGateQualification,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryHookActivation {
+    Missing,
+    PendingTrust,
+    Active,
+    Disabled,
+    HashChanged,
+    CanaryFailed,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryMcpBinding {
+    Exact,
+    ConnectionScoped,
+    CwdOnly,
+    Unavailable,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryMcpMechanism {
+    DirectProtocol,
+    HookStamped,
+    ConnectionLease,
+    Cwd,
+    None,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryGateResult {
+    Enabled,
+    Disabled,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryGateReason {
+    RequirementsSatisfied,
+    MissingEvidence,
+    EvidenceIntegrityFailed,
+    ManifestInsufficient,
+    SourceNotClosed,
+    GapOrOutage,
+    PairingIncomplete,
+    SubagentTraceIncomplete,
+    RecoveryNotFenced,
+    RecoveryCanaryFailed,
+    HookInactive,
+    CueBoundaryUnavailable,
+    SessionBindingUnproven,
+    IdentityUnstable,
+    CorrelationUnproven,
+    PolicySurfaceUndeclared,
+    PolicyNotLoaded,
+    PolicyReadbackMismatch,
+    PolicyRevoked,
+    PolicyScopeUnresolved,
+    TrustUnavailable,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryGateQualification {
+    pub result: CanaryGateResult,
+    pub reason: CanaryGateReason,
+}
+
+impl HostCanaryQualification {
+    fn validate(&self) -> bool {
+        [
+            &self.capture,
+            &self.recovery,
+            &self.active_search_due,
+            &self.strong_normalization,
+            &self.project_policy,
+        ]
+        .into_iter()
+        .all(|gate| {
+            (gate.result == CanaryGateResult::Enabled)
+                == (gate.reason == CanaryGateReason::RequirementsSatisfied)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1669,13 +1767,17 @@ pub enum HostCanaryStatus {
 
 impl HostCanaryDiagnostic {
     pub fn validate(&self) -> bool {
-        (match &self.scope {
-            HostCanaryScope::Installed => true,
-            HostCanaryScope::Candidate {
-                check_id,
-                generation,
-            } => *generation > 0 && check_id.parse::<evertrace_domain::ids::JobId>().is_ok(),
-        }) && (!self.capture_receipt_observed || self.native_delivery_observed)
+        self.qualification
+            .as_ref()
+            .is_none_or(HostCanaryQualification::validate)
+            && (match &self.scope {
+                HostCanaryScope::Installed => true,
+                HostCanaryScope::Candidate {
+                    check_id,
+                    generation,
+                } => *generation > 0 && check_id.parse::<evertrace_domain::ids::JobId>().is_ok(),
+            })
+            && (!self.capture_receipt_observed || self.native_delivery_observed)
             && match self.status {
                 HostCanaryStatus::Observed => {
                     self.native_delivery_observed && self.mcp_claim_consumed

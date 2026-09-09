@@ -13,6 +13,20 @@ pub struct HostCanaryDiagnostic {
     pub native_delivery_observed: bool,
     pub mcp_claim_consumed: bool,
     pub capture_receipt_observed: bool,
+    pub qualification: Option<evertrace_codex::probe::HostProbeQualification>,
+}
+
+impl HostCanaryDiagnostic {
+    /// This proves only the observed delivery and binding mechanisms, never
+    /// CaptureComplete, unique execution lanes, recovery, policy or @due.
+    pub fn installed_path_observed(&self) -> bool {
+        self.status == HostCanaryStatus::Observed
+            && self.qualification.as_ref().is_some_and(|value| {
+                value.hook_activation == evertrace_codex::HookActivation::Active
+                    && value.mcp_binding == evertrace_codex::McpSessionBinding::Exact
+                    && value.mcp_mechanism == evertrace_codex::McpBindingMechanism::HookStamped
+            })
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostCanaryScope {
@@ -36,8 +50,8 @@ pub struct HostCanaryRequest {
     pub host_config: String,
 }
 
-/// One process-local installed-path probe. Its result is diagnostic only: it
-/// cannot construct a capability manifest or modify a runtime snapshot.
+/// One process-local installed-path probe. Its evaluated report is for current
+/// diagnostics/checks only; it never modifies pinned/runtime capability gates.
 #[derive(Clone)]
 pub struct HostCanaryService {
     candidate: Option<(String, u64, std::path::PathBuf)>,
@@ -54,15 +68,24 @@ pub struct HostCanaryService {
 struct CurrentCanary {
     identity: Option<CanaryIdentity>,
     diagnostic: HostCanaryDiagnostic,
+    report: Option<evertrace_codex::HostProbeReport>,
 }
 
 struct CanaryEvidence {
     processed: std::collections::BTreeSet<evertrace_domain::ids::SourceReceiptId>,
     remaining: (u64, u64),
-    pre: std::collections::BTreeMap<String, String>,
-    post: std::collections::BTreeMap<String, String>,
-    session: Option<String>,
+    pre: std::collections::BTreeMap<String, CanaryDelivery>,
+    post: std::collections::BTreeMap<String, CanaryDelivery>,
+    session: Option<(String, Option<String>)>,
     conflicted: bool,
+    report: Option<evertrace_codex::HostProbeReport>,
+}
+
+struct CanaryDelivery {
+    source_ref: String,
+    observation: evertrace_domain::ids::SourceObservationId,
+    receipt: evertrace_domain::ids::SourceReceiptId,
+    protected_digest: String,
 }
 
 impl Default for CanaryEvidence {
@@ -74,6 +97,7 @@ impl Default for CanaryEvidence {
             post: Default::default(),
             session: None,
             conflicted: false,
+            report: None,
         }
     }
 }
@@ -117,6 +141,25 @@ impl CanaryEvidence {
 #[cfg(test)]
 mod canary_evidence_tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_booleans_do_not_replace_an_evaluated_report() {
+        let mut diagnostic = canary_diagnostic(HostCanaryStatus::Observed);
+        diagnostic.native_delivery_observed = true;
+        diagnostic.mcp_claim_consumed = true;
+        assert!(!diagnostic.installed_path_observed());
+        let report = evertrace_codex::HostProbeReport::evaluate(
+            &evertrace_codex::ProbeContext::unobserved_codex(),
+            &evertrace_codex::ProbeEvidence::empty(),
+        )
+        .unwrap();
+        diagnostic.qualification = Some(report.qualification());
+        assert!(!diagnostic.installed_path_observed());
+        diagnostic.status = HostCanaryStatus::EvidenceMissing;
+        diagnostic.mcp_claim_consumed = false;
+        let timeout = canary_timeout(diagnostic);
+        assert_eq!(timeout, canary_diagnostic(HostCanaryStatus::TimedOut));
+    }
 
     #[test]
     fn repeated_frontiers_do_not_reread_receipts_or_recharge_cas_budget() {
@@ -188,6 +231,18 @@ struct CanaryIdentity {
     files: Vec<(std::path::PathBuf, [u64; 7])>,
     directories: Vec<(std::path::PathBuf, u64, u64)>,
     generation: u64,
+    wiring_hash: String,
+    wiring: CanaryWiring,
+}
+
+#[derive(Clone)]
+enum CanaryWiring {
+    Installed {
+        data: std::path::PathBuf,
+        config: std::path::PathBuf,
+        host: std::path::PathBuf,
+    },
+    Candidate([String; 6]),
 }
 
 fn canary_file_identity(path: &std::path::Path) -> Option<[u64; 7]> {
@@ -223,15 +278,29 @@ impl CanaryIdentity {
         candidate_package: Option<&std::path::Path>,
     ) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
-        let cli = if let Some(package) = candidate_package {
-            package.join("evertrace")
+        let (cli, wiring_hash, wiring) = if let Some(package) = candidate_package {
+            let arguments = evertrace_codex::install::candidate_host_arguments();
+            (
+                package.join("evertrace"),
+                evertrace_codex::install::candidate_wiring_hash(&arguments),
+                CanaryWiring::Candidate(arguments),
+            )
         } else {
-            evertrace_codex::install::validate_installed_wiring(
+            let (cli, hash) = evertrace_codex::install::installed_wiring_hash(
                 data,
                 config,
                 std::path::Path::new(&request.host_config),
             )
-            .ok()?
+            .ok()?;
+            (
+                cli,
+                hash,
+                CanaryWiring::Installed {
+                    data: data.to_owned(),
+                    config: config.to_owned(),
+                    host: request.host_config.clone().into(),
+                },
+            )
         };
         let snapshot =
             evertrace_codex::install::StableLauncher::freeze_current_snapshot(data, deadline)
@@ -278,7 +347,22 @@ impl CanaryIdentity {
             files,
             directories,
             generation,
+            wiring_hash,
+            wiring,
         })
+    }
+    fn wiring_valid(&self) -> bool {
+        self.valid()
+            && match &self.wiring {
+                CanaryWiring::Installed { data, config, host } => {
+                    evertrace_codex::install::installed_wiring_hash(data, config, host)
+                        .is_ok_and(|(_, hash)| hash == self.wiring_hash)
+                }
+                CanaryWiring::Candidate(arguments) => {
+                    evertrace_codex::install::candidate_wiring_hash(arguments) == self.wiring_hash
+                }
+            }
+            && self.valid()
     }
     fn valid(&self) -> bool {
         use std::os::unix::fs::MetadataExt;
@@ -303,6 +387,14 @@ fn canary_diagnostic(status: HostCanaryStatus) -> HostCanaryDiagnostic {
         native_delivery_observed: false,
         mcp_claim_consumed: false,
         capture_receipt_observed: false,
+        qualification: None,
+    }
+}
+
+fn canary_timeout(previous: HostCanaryDiagnostic) -> HostCanaryDiagnostic {
+    HostCanaryDiagnostic {
+        scope: previous.scope,
+        ..canary_diagnostic(HostCanaryStatus::TimedOut)
     }
 }
 
@@ -389,6 +481,7 @@ impl Drop for CanaryRun {
             && let Some(current) = current.as_mut()
         {
             current.diagnostic = canary_diagnostic(HostCanaryStatus::Interrupted);
+            current.report = None;
         }
         if std::fs::symlink_metadata(&self.directory).is_ok_and(|value| {
             value.is_dir()
@@ -499,8 +592,11 @@ impl HostCanaryService {
             .is_some_and(|identity| !identity.valid())
         {
             current.diagnostic = canary_diagnostic(HostCanaryStatus::IdentityChanged);
+            current.report = None;
         }
-        Some(current.diagnostic.clone())
+        let mut diagnostic = current.diagnostic.clone();
+        diagnostic.qualification = current.report.as_ref().map(|report| report.qualification());
+        Some(diagnostic)
     }
 
     pub async fn run(&self, request: HostCanaryRequest) -> HostCanaryDiagnostic {
@@ -512,7 +608,7 @@ impl HostCanaryService {
         let result = self.scoped(
             tokio::time::timeout(budget, self.run_inner(request, deadline))
                 .await
-                .unwrap_or_else(|_| canary_diagnostic(HostCanaryStatus::TimedOut)),
+                .unwrap_or_else(|_| canary_timeout(canary_diagnostic(HostCanaryStatus::Running))),
         );
         if self.candidate.is_some() {
             return result;
@@ -520,11 +616,13 @@ impl HostCanaryService {
         if let Ok(mut current) = self.current.lock() {
             if let Some(stored) = current.as_mut() {
                 stored.diagnostic = result.clone();
+                stored.diagnostic.qualification = None;
             } else {
                 // A failed preflight is still the current attempt, not NotRun.
                 *current = Some(CurrentCanary {
                     identity: None,
                     diagnostic: result.clone(),
+                    report: None,
                 });
             }
         }
@@ -659,6 +757,7 @@ impl HostCanaryService {
             *current = Some(CurrentCanary {
                 identity: Some(identity.clone()),
                 diagnostic: canary_diagnostic(Status::Running),
+                report: None,
             });
         }
         // Git initialization is local only; no user repository or credentials are copied.
@@ -713,7 +812,10 @@ impl HostCanaryService {
         let descriptor: std::os::fd::OwnedFd = child_output.into();
         let mut host_command = Command::new(&request.host_executable);
         if let Some((_, _, package)) = &self.candidate {
-            for argument in evertrace_codex::install::candidate_host_arguments() {
+            let CanaryWiring::Candidate(arguments) = &identity.wiring else {
+                return canary_diagnostic(Status::IdentityChanged);
+            };
+            for argument in arguments {
                 host_command.arg("-c").arg(argument);
             }
             host_command
@@ -737,6 +839,7 @@ impl HostCanaryService {
         run.child = Some(child);
         let mut output_bytes = 0usize;
         let mut host_finished = false;
+        let mut last_evidence = canary_diagnostic(Status::EvidenceMissing);
         let result = loop {
             let mut buffer = [0u8; 4096];
             for _ in 0..17 {
@@ -760,7 +863,10 @@ impl HostCanaryService {
                 break canary_diagnostic(Status::IdentityChanged);
             }
             if Instant::now() >= deadline {
-                break canary_diagnostic(Status::TimedOut);
+                if !identity.wiring_valid() {
+                    break canary_diagnostic(Status::IdentityChanged);
+                }
+                break canary_timeout(last_evidence);
             }
             let exited = match run.finish_child(false) {
                 Ok(status) => status,
@@ -781,25 +887,33 @@ impl HostCanaryService {
                         &nonce,
                         &directory,
                         &command,
-                        identity.generation,
+                        &identity,
                         &mut evidence,
                     )
                     .await;
-                if !identity.valid() {
+                if !identity.wiring_valid() {
                     result = canary_diagnostic(Status::IdentityChanged);
                 }
                 if result.status != Status::EvidenceMissing {
                     break result;
                 }
+                last_evidence = result;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         };
         if self.candidate.is_none()
             && let Ok(mut current) = self.current.lock()
         {
+            let mut diagnostic = result.clone();
+            diagnostic.qualification = None;
             *current = Some(CurrentCanary {
                 identity: Some(identity),
-                diagnostic: result.clone(),
+                diagnostic,
+                report: if result.qualification.is_some() {
+                    evidence.report.take()
+                } else {
+                    None
+                },
             });
         }
         run.completed = true;
@@ -812,12 +926,12 @@ impl HostCanaryService {
         nonce: &str,
         directory: &std::path::Path,
         command: &str,
-        generation: u64,
+        identity: &CanaryIdentity,
         evidence: &mut CanaryEvidence,
     ) -> HostCanaryDiagnostic {
         use HostCanaryStatus as Status;
         let mut result = canary_diagnostic(Status::EvidenceMissing);
-        let binding_session = self.bindings.canary_session(nonce);
+        let binding_claim = self.bindings.canary_claim(nonce);
         let Ok(snapshot) = self.writer.project().await else {
             return result;
         };
@@ -825,7 +939,7 @@ impl HostCanaryService {
             return result;
         };
         let mut context = evertrace_codex::ProbeContext::unobserved_codex();
-        context.adapter_revision = format!("native-hook-v1-generation-{generation}");
+        context.adapter_revision = format!("native-hook-v1-generation-{}", identity.generation);
         let Ok(report) = evertrace_codex::HostProbeReport::evaluate(
             &context,
             &evertrace_codex::ProbeEvidence::empty(),
@@ -835,6 +949,7 @@ impl HostCanaryService {
         let mut observations = std::collections::BTreeSet::new();
         let mut receipts = Vec::new();
         let mut capture_receipts = Vec::new();
+        let mut pairings = Vec::new();
         let mut examined = 0usize;
         for row in snapshot
             .data_rows()
@@ -863,6 +978,14 @@ impl HostCanaryService {
                     }
                     capture_receipts.push(value);
                 }
+                Ok(evertrace_store::JournalPayload::OperationDerived(value)) => {
+                    if let Some(pairing) = value.source_local_pairing {
+                        if pairings.len() >= 64 {
+                            return canary_diagnostic(Status::BudgetExceeded);
+                        }
+                        pairings.push(pairing);
+                    }
+                }
                 _ => {}
             }
         }
@@ -870,6 +993,7 @@ impl HostCanaryService {
         for receipt in receipts {
             if !observations.contains(&receipt.source_receipt_id)
                 || receipt.adapter_manifest_ref != report.manifest().adapter_manifest_id
+                || receipt.source_kind != evertrace_domain::evidence::EvidenceSourceKind::CodexHook
             {
                 continue;
             }
@@ -908,46 +1032,124 @@ impl HostCanaryService {
             {
                 continue;
             }
+            let session = (native.session_id.clone(), native.agent_id.clone());
             if evidence
                 .session
                 .as_ref()
-                .is_some_and(|session| *session != native.session_id)
+                .is_some_and(|previous| *previous != session)
             {
                 evidence.conflicted = true;
                 continue;
             }
-            evidence.session = Some(native.session_id);
-            match native.hook_event_name {
-                evertrace_codex::binding::NativeToolUseEvent::PreToolUse => {
-                    evidence.pre.insert(native.tool_use_id, source_ref);
-                }
-                evertrace_codex::binding::NativeToolUseEvent::PostToolUse => {
-                    evidence.post.insert(native.tool_use_id, source_ref);
-                }
+            evidence.session = Some(session);
+            let destination = match native.hook_event_name {
+                evertrace_codex::binding::NativeToolUseEvent::PreToolUse => &mut evidence.pre,
+                evertrace_codex::binding::NativeToolUseEvent::PostToolUse => &mut evidence.post,
+            };
+            let delivery = CanaryDelivery {
+                source_ref,
+                observation: receipt.source_observation_id,
+                receipt: receipt.source_receipt_id,
+                protected_digest: evertrace_capture::CasStore::parse_digest(&receipt.cas_ref)
+                    .expect("read_once verified this CAS reference")
+                    .as_hex(),
+            };
+            if destination.insert(native.tool_use_id, delivery).is_some() {
+                evidence.conflicted = true;
             }
         }
         if evidence.conflicted {
             return result;
         }
-        result.mcp_claim_consumed =
-            evidence.session.is_some() && evidence.session == binding_session;
+        result.mcp_claim_consumed = binding_claim.as_ref().is_some_and(|claim| {
+            evidence.session.as_ref()
+                == Some(&(
+                    claim.anchor.session_id.clone(),
+                    claim.anchor.agent_id.clone(),
+                ))
+        });
+        let mut matched = None;
         for (tool, before) in &evidence.pre {
-            if live_refs.contains(before)
+            if live_refs.contains(&before.source_ref)
                 && let Some(after) = evidence.post.get(tool)
-                && live_refs.contains(after)
+                && live_refs.contains(&after.source_ref)
+                && pairings.iter().any(|pairing| {
+                    pairing.state
+                        == evertrace_domain::evidence::SourceLocalPairingState::SourcePaired
+                        && pairing.request_id == *tool
+                        && pairing.intent_observation_refs == [before.observation]
+                        && pairing.result_observation_refs == [after.observation]
+                })
             {
                 result.native_delivery_observed = true;
+                matched = Some((before, after));
                 result.capture_receipt_observed |= capture_receipts.iter().any(|receipt| {
                     receipt
                         .adapter_manifest_ids
                         .contains(&report.manifest().adapter_manifest_id)
-                        && receipt.source_revision_refs.contains(before)
-                        && receipt.source_revision_refs.contains(after)
+                        && receipt.source_revision_refs.contains(&before.source_ref)
+                        && receipt.source_revision_refs.contains(&after.source_ref)
                 });
             }
         }
         if result.native_delivery_observed && result.mcp_claim_consumed {
             result.status = Status::Observed;
+        }
+        if let Some((before, after)) = matched {
+            use evertrace_codex::{
+                capability::{CanaryStatus, McpBindingEvidence},
+                hook_input::HookActivationEvidence,
+            };
+            let refs = vec![
+                before.receipt.to_string(),
+                after.receipt.to_string(),
+                before.observation.to_string(),
+                after.observation.to_string(),
+            ];
+            let mut compiled = evertrace_codex::ProbeEvidence::empty();
+            compiled.hook = Some(HookActivationEvidence {
+                wiring_detected: true,
+                // The selected Host executed the owned wiring in this run;
+                // no trust bypass is added by this invocation.
+                trusted: true,
+                enabled: true,
+                expected_hash: Some(identity.wiring_hash.clone()),
+                observed_hash: Some(identity.wiring_hash.clone()),
+                canary: CanaryStatus::Passed,
+                evidence_refs: refs.clone(),
+                protected_digest: Some(before.protected_digest.clone()),
+            });
+            if result.mcp_claim_consumed
+                && let Some(claim) = binding_claim
+            {
+                let mut refs = refs;
+                refs.push(format!("mcp-claim:{}", claim.token));
+                compiled.mcp = Some(McpBindingEvidence::HookStampedClaim {
+                    claim_id: claim.token,
+                    session_id: claim.anchor.session_id,
+                    // One local monotonic origin at actual claim issuance.
+                    issued_at: 0,
+                    expires_at: claim.expires_at.duration_since(claim.issued_at).as_nanos() as u64,
+                    observed_at: claim.consumed_at.duration_since(claim.issued_at).as_nanos()
+                        as u64,
+                    call_hash_matches: true,
+                    parameter_matches: true,
+                    atomically_consumed: true,
+                    replayed: false,
+                    tampered: false,
+                    rewrite_conflict: false,
+                    daemon_generation_matches: true,
+                    evidence_refs: refs,
+                    protected_digest: before.protected_digest.clone(),
+                });
+            }
+            context.evidence_source = evertrace_codex::EvidenceSourceKind::ObservedHostCanary;
+            if let Ok(report) = evertrace_codex::HostProbeReport::evaluate(&context, &compiled) {
+                result.qualification = Some(report.qualification());
+                evidence.report = Some(report);
+            } else {
+                return canary_diagnostic(Status::Unavailable);
+            }
         }
         // These one-record weak sources do not establish CaptureReceipt or any
         // stable host sequence, normalization, recovery, policy or @due gate.

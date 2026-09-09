@@ -4,6 +4,27 @@ use evertrace_protocol::resolve_data_dir;
 
 use crate::{commands::config, daemon_client};
 
+fn print_canary(result: &evertrace_protocol::dto::HostCanaryDiagnostic) {
+    println!("host_canary={:?} scope={:?}", result.status, result.scope);
+    let Some(report) = &result.qualification else {
+        println!("host_qualification=unavailable: no current evaluated report");
+        return;
+    };
+    println!(
+        "hook={:?} mcp_binding={:?} mechanism={:?}; unique_execution_context=unproven",
+        report.hook_activation, report.mcp_binding, report.mcp_mechanism
+    );
+    for (name, gate) in [
+        ("capture", &report.capture),
+        ("recovery", &report.recovery),
+        ("active_search_due", &report.active_search_due),
+        ("strong_normalization", &report.strong_normalization),
+        ("project_policy", &report.project_policy),
+    ] {
+        println!("{name}={:?} reason={:?}", gate.result, gate.reason);
+    }
+}
+
 pub async fn run(
     config_path: Option<PathBuf>,
     refresh_host: Option<PathBuf>,
@@ -30,11 +51,11 @@ pub async fn run(
             &host_home.join("config.toml"),
         )
         .await?;
-        println!("host_canary={result:?}; capability qualification remains independent");
+        print_canary(&result);
     }
     let health = daemon_client::health(&data_dir.join("runtime/evertraced-v1.sock")).await?;
     match &health.host_canary {
-        Some(result) => println!("host_canary={result:?}; installed-path diagnosis only"),
+        Some(result) => print_canary(result),
         None => println!("host_canary=not_run: no current observation in this daemon"),
     }
     println!("refresh: doctor --refresh-host /absolute/host");

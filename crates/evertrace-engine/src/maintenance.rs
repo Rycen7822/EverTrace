@@ -522,6 +522,7 @@ where
         if let Some(request) = live_host {
             let result = tokio::time::timeout(Duration::from_secs(35), canary(root.join("runtime/evertraced-v1.sock"), request)).await.map_err(|_| invalid())?.ok_or_else(invalid)?;
             if result.scope != (crate::HostCanaryScope::Candidate { check_id: check_id.clone(), generation }) { return Err(invalid()); }
+            if result.status == crate::HostCanaryStatus::Observed && !result.installed_path_observed() { return Err(invalid()); }
             Ok(Some(result))
         } else { Ok(None) }
     }.await;

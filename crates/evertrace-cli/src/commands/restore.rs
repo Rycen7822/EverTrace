@@ -30,6 +30,9 @@ fn candidate_host_diagnostic(
         native_delivery_observed: value.native_delivery_observed,
         mcp_claim_consumed: value.mcp_claim_consumed,
         capture_receipt_observed: value.capture_receipt_observed,
+        qualification: value
+            .qualification
+            .and_then(|value| serde_json::from_value(serde_json::to_value(value).ok()?).ok()),
     }
 }
 
@@ -106,14 +109,14 @@ pub async fn upgrade(
             checked
                 .candidate_host
                 .as_ref()
-                .is_some_and(|value| value.status == evertrace_engine::HostCanaryStatus::Observed),
+                .is_some_and(evertrace_engine::HostCanaryDiagnostic::installed_path_observed),
             checked.generation,
             checked.backup.display()
         );
         return Err(if checked
             .candidate_host
             .as_ref()
-            .is_some_and(|value| value.status == evertrace_engine::HostCanaryStatus::Observed)
+            .is_some_and(evertrace_engine::HostCanaryDiagnostic::installed_path_observed)
         {
             "not-ready: package publication is not implemented"
         } else if checked.materials_validated {

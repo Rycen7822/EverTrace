@@ -74,8 +74,20 @@ struct CanaryBindingObservation {
     nonce: String,
     workspace: String,
     deadline: Instant,
-    session: Option<String>,
+    started_at: Instant,
+    consumed: Option<CanaryConsumedClaim>,
     conflicted: bool,
+}
+
+/// Captured only after the existing exact-call MAC and atomic consume checks.
+/// This is one probe's transient mechanism evidence, not a connection/lane lease.
+#[derive(Clone)]
+pub(crate) struct CanaryConsumedClaim {
+    pub token: String,
+    pub anchor: BindingAnchor,
+    pub issued_at: Instant,
+    pub expires_at: Instant,
+    pub consumed_at: Instant,
 }
 
 struct McpClaim {
@@ -107,17 +119,24 @@ impl McpBindingAuthority {
             nonce: nonce.into(),
             workspace: workspace.into(),
             deadline,
-            session: None,
+            started_at: Instant::now(),
+            consumed: None,
             conflicted: false,
         });
         true
     }
 
-    pub(crate) fn canary_session(&self, nonce: &str) -> Option<String> {
+    #[cfg(test)]
+    fn canary_session(&self, nonce: &str) -> Option<String> {
+        self.canary_claim(nonce)
+            .map(|value| value.anchor.session_id)
+    }
+
+    pub(crate) fn canary_claim(&self, nonce: &str) -> Option<CanaryConsumedClaim> {
         let state = self.state.lock().ok()?;
         let value = state.canary.as_ref()?;
         (value.nonce == nonce && !value.conflicted && Instant::now() < value.deadline)
-            .then(|| value.session.clone())
+            .then(|| value.consumed.clone())
             .flatten()
     }
 
@@ -289,14 +308,17 @@ impl McpBindingAuthority {
                     && original.workspace == observation.workspace
                     && original.refs.is_empty()
                 {
-                    if observation
-                        .session
-                        .as_ref()
-                        .is_some_and(|session| *session != claim.anchor.session_id)
-                    {
+                    let issued_at = claim.expires_at - MCP_CLAIM_TTL;
+                    if issued_at < observation.started_at || observation.consumed.is_some() {
                         observation.conflicted = true;
                     } else {
-                        observation.session = Some(claim.anchor.session_id.clone());
+                        observation.consumed = Some(CanaryConsumedClaim {
+                            token,
+                            anchor: claim.anchor.clone(),
+                            issued_at,
+                            expires_at: claim.expires_at,
+                            consumed_at: now,
+                        });
                     }
                 }
                 Ok(McpResolvedScope {
@@ -462,6 +484,10 @@ mod tests {
         let resolved = authority
             .resolve(&call(&grant.bound_workspace, "nonce-current"))
             .unwrap();
+        let observed = authority.canary_claim("nonce-current").unwrap();
+        assert!(observed.issued_at <= observed.consumed_at);
+        assert!(observed.consumed_at < observed.expires_at);
+        assert!(!observed.token.is_empty());
         assert_eq!(
             authority.canary_session("nonce-current"),
             Some(resolved.anchor.unwrap().session_id)
@@ -484,6 +510,14 @@ mod tests {
         assert!(authority.begin_canary("next", "path_hint:/tmp/canary", deadline));
         let restarted = McpBindingAuthority::new(authority.device_key.clone());
         assert!(restarted.canary_session("next").is_none());
+        authority.end_canary("next");
+        let early = call("path_hint:/tmp/canary", "issued-before-probe");
+        let grant = authority.issue(issue_for(&early)).unwrap();
+        assert!(authority.begin_canary("issued-before-probe", "path_hint:/tmp/canary", deadline,));
+        authority
+            .resolve(&call(&grant.bound_workspace, "issued-before-probe"))
+            .unwrap();
+        assert!(authority.canary_claim("issued-before-probe").is_none());
     }
 
     #[test]

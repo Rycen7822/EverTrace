@@ -119,6 +119,14 @@ fn map_host_canary(
         native_delivery_observed: value.native_delivery_observed,
         mcp_claim_consumed: value.mcp_claim_consumed,
         capture_receipt_observed: value.capture_receipt_observed,
+        // Only the fixed display projection crosses the protocol boundary;
+        // the evaluated report/evidence remains owned by this daemon.
+        qualification: value.qualification.map(|value| {
+            serde_json::from_value(
+                serde_json::to_value(value).expect("qualification serialization"),
+            )
+            .expect("closed qualification DTO matches adapter codes")
+        }),
     }
 }
 
@@ -913,6 +921,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut config_poll = tokio::time::interval(std::time::Duration::from_secs(1));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_watch_failure = None;
+    // Keep the signal receiver alive while a selected maintenance branch awaits.
+    // Recreating it inside select loses signals received between loop polls.
+    let shutdown_signal = wait_for_signal()?;
+    tokio::pin!(shutdown_signal);
     loop {
         tokio::select! {
             _ = config_poll.tick() => {
@@ -1070,7 +1082,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 drop(dispatch);
                 request.complete(result);
             }
-            signal = wait_for_signal() => {
+            signal = &mut shutdown_signal => {
                 signal?;
                 let _ = shutdown_tx.send(true);
                 let _ = session_import_shutdown_tx.send(true);
@@ -1942,18 +1954,66 @@ fn default_config_path() -> Option<PathBuf> {
         .map(|base| base.join("evertrace/config.toml"))
 }
 
-async fn wait_for_signal() -> Result<(), std::io::Error> {
+fn wait_for_signal()
+-> Result<impl std::future::Future<Output = Result<(), std::io::Error>>, std::io::Error> {
     #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    Ok(async move {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = interrupt.recv() => Ok(()),
+                _ = terminate.recv() => Ok(()),
+            }
         }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await
+    })
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_tests {
+    #[tokio::test]
+    async fn termination_is_retained_while_another_branch_is_awaiting() {
+        let mut delivered =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let interrupted_select = super::wait_for_signal().unwrap();
+        drop(interrupted_select);
+        assert!(
+            std::process::Command::new("/usr/bin/kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        delivered.recv().await.unwrap();
+        // Re-registering after a selected branch finishes cannot recover TERM.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                super::wait_for_signal().unwrap(),
+            )
+            .await
+            .is_err()
+        );
+        let signal = super::wait_for_signal().unwrap();
+        // A maintenance branch can await without polling the signal future.
+        // Its registered receiver must retain TERM throughout that interval.
+        assert!(
+            std::process::Command::new("/usr/bin/kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        delivered.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal)
+            .await
+            .expect("TERM received during maintenance must not be lost")
+            .unwrap();
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
 }
 
 fn hex(bytes: &[u8]) -> String {

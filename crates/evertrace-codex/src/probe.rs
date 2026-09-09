@@ -367,7 +367,45 @@ pub struct HostProbeReport {
     session_catalog_roots: Vec<SessionCatalogRootResult>,
 }
 
+/// Read-only projection of an evaluated report. This is not probe input and
+/// cannot enable runtime capabilities or reconstruct its underlying evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProbeQualification {
+    pub hook_activation: crate::capability::HookActivation,
+    pub mcp_binding: McpSessionBinding,
+    pub mcp_mechanism: crate::capability::McpBindingMechanism,
+    pub capture: GateQualification,
+    pub recovery: GateQualification,
+    pub active_search_due: GateQualification,
+    pub strong_normalization: GateQualification,
+    pub project_policy: GateQualification,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateQualification {
+    pub result: GateResult,
+    pub reason: GateReason,
+}
+
 impl HostProbeReport {
+    pub fn qualification(&self) -> HostProbeQualification {
+        let gate = |value: &GateReceipt| GateQualification {
+            result: value.result,
+            reason: value.reason,
+        };
+        HostProbeQualification {
+            hook_activation: self.hook.activation,
+            mcp_binding: self.mcp.binding,
+            mcp_mechanism: self.mcp.mechanism,
+            capture: gate(&self.capture),
+            recovery: gate(&self.recovery),
+            active_search_due: gate(&self.active_search_due),
+            strong_normalization: gate(&self.strong_normalization),
+            project_policy: gate(&self.project_policy),
+        }
+    }
     pub const fn manifest(&self) -> &AdapterCapabilityManifest {
         &self.manifest
     }

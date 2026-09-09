@@ -3165,6 +3165,33 @@ async fn quiesced_backup_create_verify_preserves_post_boundary_hook_and_reopens_
     let (handle, actor) = spawn_writer(writer, 32).unwrap();
 
     let effective = EffectiveConfig::default();
+    // Ordinary native catalog current is not a JournalPayload, but must survive
+    // both backup watermark collection and independent backup verification.
+    let catalog_root = root.path().join("host");
+    let dated = catalog_root.join("sessions/2026/09/09");
+    std::fs::create_dir_all(&dated).unwrap();
+    std::fs::set_permissions(&catalog_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000033";
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    let header = serde_json::json!({"ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta","payload":{"id":session,"session_id":session,"cwd":"/not-a-repository","originator":"codex_cli_rs","model_provider":"local","git":null}});
+    std::fs::write(&transcript, format!("{header}\n")).unwrap();
+    let report = evertrace_engine::repository::observe_session_catalog_report(
+        transcript.to_str(),
+        session,
+        "catalog-backup",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        evertrace_engine::session_import::SessionCatalogService::new(
+            handle.clone(),
+            effective.hash()
+        )
+        .refresh(&report)
+        .await
+        .unwrap(),
+        1
+    );
     let config_path = root.path().join("config.toml");
     std::fs::write(&config_path, effective.to_toml().unwrap()).unwrap();
     std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();

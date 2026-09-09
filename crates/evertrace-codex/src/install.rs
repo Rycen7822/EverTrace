@@ -23,6 +23,7 @@ const GENERATION_EXECUTABLE_NAME: &str = "evertrace-hook";
 const GENERATION_RUNTIME_NAME: &str = "hook-runtime-v1.json";
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
 const MAX_PIN_BYTES: u64 = 64;
+
 const MAX_HOOK_SNAPSHOT_FILES: usize = 4096;
 
 pub const fn shadow_canary_diagnostic(durable_frame_observed: bool) -> Option<HookDiagnostic> {
@@ -295,8 +296,9 @@ fn wiring(data_root: &Path, cli: &Path, config: &Path) -> Result<Vec<u8>, Instal
     .into_bytes())
 }
 
-fn owned_wiring(bytes: &[u8]) -> Result<&[u8], InstallError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?;
+fn wiring_markers(
+    text: &str,
+) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), InstallError> {
     let start = text.find(OWNED_BEGIN).ok_or(InstallError::InvalidType)?;
     let end = text[start..]
         .find(OWNED_END)
@@ -309,61 +311,318 @@ fn owned_wiring(bytes: &[u8]) -> Result<&[u8], InstallError> {
     {
         return Err(InstallError::InvalidType);
     }
-    Ok(&bytes[start..end])
+    Ok((start..start + OWNED_BEGIN.len(), end - OWNED_END.len()..end))
+}
+
+type LocatedFields = BTreeMap<toml::Spanned<String>, toml::Spanned<toml::Value>>;
+
+#[derive(Deserialize)]
+struct WiringLocations {
+    hooks: HookLocations,
+    mcp_servers: BTreeMap<String, toml::Spanned<LocatedFields>>,
+}
+
+#[derive(Default, Deserialize)]
+struct HookLocations {
+    #[serde(default, rename = "PreToolUse")]
+    pre: Vec<toml::Spanned<LocatedHook>>,
+    #[serde(default, rename = "PostToolUse")]
+    post: Vec<toml::Spanned<LocatedHook>>,
+    #[serde(default, rename = "UserPromptSubmit")]
+    submit: Vec<toml::Spanned<LocatedHook>>,
+}
+
+#[derive(Deserialize)]
+struct LocatedHook {
+    matcher: Option<toml::Spanned<String>>,
+    hooks: Vec<toml::Spanned<LocatedFields>>,
+}
+
+struct WiringDeclarations {
+    canonical: Vec<u8>,
+    unowned: toml::Value,
+    // Values can change in place without moving arrays or Host state.
+    values: BTreeMap<String, (std::ops::Range<usize>, toml::Value)>,
+    removals: Vec<std::ops::Range<usize>>,
+    end: usize,
+}
+
+fn validate_mcp_approval_state(value: &toml::Value) -> Result<(), InstallError> {
+    let tools = value.as_table().ok_or(InstallError::InvalidType)?;
+    let tool = tools
+        .get("evertrace")
+        .and_then(toml::Value::as_table)
+        .ok_or(InstallError::InvalidType)?;
+    if tools.len() != 1
+        || tool.len() != 1
+        || tool
+            .get("approval_mode")
+            .and_then(toml::Value::as_str)
+            .is_none()
+    {
+        return Err(InstallError::InvalidType);
+    }
+    Ok(())
+}
+
+fn trim_empty_wiring_tables(value: &mut toml::Value) {
+    if let Some(servers) = value
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_table_mut)
+        && servers
+            .get("evertrace")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|v| v.is_empty())
+    {
+        servers.remove("evertrace");
+    }
+    for key in ["hooks", "mcp_servers"] {
+        if value
+            .get(key)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|v| v.is_empty())
+        {
+            value.as_table_mut().expect("TOML document").remove(key);
+        }
+    }
+}
+
+fn wiring_declarations(bytes: &[u8]) -> Result<WiringDeclarations, InstallError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?;
+    let (begin, end) = wiring_markers(text)?;
+    let within = |span: &std::ops::Range<usize>| span.start >= begin.end && span.end <= end.start;
+    let locations: WiringLocations = toml::from_str(text).map_err(|_| InstallError::InvalidType)?;
+    let mut unowned: toml::Value = toml::from_str(text).map_err(|_| InstallError::InvalidType)?;
+    let mut projected = toml::Table::new();
+    let mut hooks = toml::Table::new();
+    let mut values = BTreeMap::new();
+    let mut removals = vec![begin.clone(), end.clone()];
+    for (event, entries) in [
+        ("PreToolUse", locations.hooks.pre),
+        ("PostToolUse", locations.hooks.post),
+        ("UserPromptSubmit", locations.hooks.submit),
+    ] {
+        let selected: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| within(&item.span()))
+            .collect();
+        if selected.is_empty() && event == "UserPromptSubmit" {
+            continue;
+        }
+        let [(index, entry)] = selected.as_slice() else {
+            return Err(InstallError::InvalidType);
+        };
+        let actual = unowned["hooks"][event]
+            .as_array_mut()
+            .ok_or(InstallError::InvalidType)?
+            .remove(*index);
+        if unowned["hooks"][event]
+            .as_array()
+            .is_some_and(|v| v.is_empty())
+        {
+            unowned["hooks"]
+                .as_table_mut()
+                .ok_or(InstallError::InvalidType)?
+                .remove(event);
+        }
+        hooks.insert(event.into(), toml::Value::Array(vec![actual]));
+        removals.push(entry.span());
+        if let Some(matcher) = &entry.get_ref().matcher {
+            let span = matcher.span();
+            let start = text[..span.start].rfind('\n').map_or(0, |i| i + 1);
+            if text[start..span.start].trim() != "matcher =" {
+                return Err(InstallError::InvalidType);
+            }
+            removals.push(start..span.end);
+            values.insert(
+                format!("{event}.matcher"),
+                (span, toml::Value::String(matcher.get_ref().clone())),
+            );
+        }
+        let [command] = entry.get_ref().hooks.as_slice() else {
+            return Err(InstallError::InvalidType);
+        };
+        removals.push(command.span());
+        for (key, value) in command.get_ref() {
+            removals.push(key.span().start..value.span().end);
+            values.insert(
+                format!("{event}.{}", key.get_ref()),
+                (value.span(), value.get_ref().clone()),
+            );
+        }
+    }
+    projected.insert("hooks".into(), toml::Value::Table(hooks));
+    let server = locations
+        .mcp_servers
+        .get("evertrace")
+        .ok_or(InstallError::InvalidType)?;
+    if !within(&server.span()) {
+        return Err(InstallError::InvalidType);
+    }
+    removals.push(server.span());
+    let mut mcp = toml::Table::new();
+    for (key, value) in server.get_ref() {
+        if key.get_ref() == "tools" {
+            validate_mcp_approval_state(value.get_ref())?;
+            continue;
+        }
+        if !["command", "args", "enabled_tools"].contains(&key.get_ref().as_str()) {
+            return Err(InstallError::InvalidType);
+        }
+        mcp.insert(key.get_ref().clone(), value.get_ref().clone());
+        removals.push(key.span().start..value.span().end);
+        values.insert(
+            format!("mcp.{}", key.get_ref()),
+            (value.span(), value.get_ref().clone()),
+        );
+        unowned["mcp_servers"]["evertrace"]
+            .as_table_mut()
+            .ok_or(InstallError::InvalidType)?
+            .remove(key.get_ref());
+    }
+    projected.insert(
+        "mcp_servers".into(),
+        toml::Value::Table(toml::Table::from_iter([(
+            "evertrace".into(),
+            toml::Value::Table(mcp),
+        )])),
+    );
+    if removals.iter().skip(2).any(|span| !within(span)) {
+        return Err(InstallError::InvalidType);
+    }
+    trim_empty_wiring_tables(&mut unowned);
+    let canonical = format!(
+        "{OWNED_BEGIN}{}{OWNED_END}",
+        toml::to_string(&projected).map_err(|_| InstallError::InvalidType)?
+    )
+    .into_bytes();
+    Ok(WiringDeclarations {
+        canonical,
+        unowned,
+        values,
+        removals,
+        end: end.start,
+    })
+}
+
+fn owned_wiring(bytes: &[u8]) -> Result<Vec<u8>, InstallError> {
+    Ok(wiring_declarations(bytes)?.canonical)
 }
 
 fn merge_wiring(original: &[u8], owned: &[u8], uninstall: bool) -> Result<Vec<u8>, InstallError> {
+    replace_wiring(original, owned, (!uninstall).then_some(owned))
+}
+
+fn replace_wiring(
+    original: &[u8],
+    expected: &[u8],
+    replacement: Option<&[u8]>,
+) -> Result<Vec<u8>, InstallError> {
     let text = std::str::from_utf8(original).map_err(|_| InstallError::InvalidType)?;
-    let parsed: toml::Value = toml::from_str(text).map_err(|_| InstallError::InvalidType)?;
-    let owned = std::str::from_utf8(owned).map_err(|_| InstallError::InvalidType)?;
-    let result = if let Some(start) = text.find(OWNED_BEGIN) {
-        let end = text[start..]
-            .find(OWNED_END)
-            .map(|end| start + end + OWNED_END.len())
-            .ok_or(InstallError::InvalidType)?;
-        let actual = &text[start..end];
-        if (actual != owned && actual != previous_tool_wiring(owned)?)
-            || text[end..].contains(OWNED_BEGIN)
-        {
+    let mut parsed: toml::Value = toml::from_str(text).map_err(|_| InstallError::InvalidType)?;
+    let expected = wiring_declarations(expected)?;
+    let mut edits = Vec::new();
+    let unowned;
+    if text.contains(OWNED_BEGIN) {
+        let actual = wiring_declarations(original)?;
+        let old = previous_tool_wiring(
+            std::str::from_utf8(&expected.canonical).map_err(|_| InstallError::InvalidType)?,
+        )?;
+        if actual.canonical != expected.canonical && actual.canonical != old.as_bytes() {
             return Err(InstallError::InvalidType);
         }
-        if uninstall {
-            format!("{}{}", &text[..start], &text[end..])
+        unowned = actual.unowned;
+        if let Some(replacement) = replacement {
+            let target = wiring_declarations(replacement)?;
+            for (key, (range, value)) in &actual.values {
+                let (_, desired) = target.values.get(key).ok_or(InstallError::InvalidType)?;
+                if value != desired {
+                    edits.push((range.clone(), desired.to_string()));
+                }
+            }
+            if !actual.values.contains_key("UserPromptSubmit.command") {
+                let value: toml::Value = toml::from_str(
+                    std::str::from_utf8(&target.canonical)
+                        .map_err(|_| InstallError::InvalidType)?,
+                )
+                .map_err(|_| InstallError::InvalidType)?;
+                let mut extra = toml::Table::new();
+                extra.insert(
+                    "hooks".into(),
+                    toml::Value::Table(toml::Table::from_iter([(
+                        "UserPromptSubmit".into(),
+                        value["hooks"]["UserPromptSubmit"].clone(),
+                    )])),
+                );
+                edits.push((
+                    actual.end..actual.end,
+                    toml::to_string(&extra).map_err(|_| InstallError::InvalidType)?,
+                ));
+            }
         } else {
-            format!("{}{}{}", &text[..start], owned, &text[end..])
+            edits.extend(
+                actual
+                    .removals
+                    .into_iter()
+                    .map(|range| (range, String::new())),
+            );
         }
     } else {
-        if text.contains(OWNED_END)
-            || parsed
-                .get("mcp_servers")
-                .and_then(|servers| servers.get("evertrace"))
-                .is_some()
-        {
+        if text.contains(OWNED_END) {
             return Err(InstallError::InvalidType);
         }
-        if uninstall {
-            text.to_owned()
-        } else {
-            format!(
-                "{text}{}{owned}",
-                if text.is_empty() || text.ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                }
-            )
+        if let Some(server) = parsed.get("mcp_servers").and_then(|v| v.get("evertrace")) {
+            let table = server.as_table().ok_or(InstallError::InvalidType)?;
+            if table.len() != 1 {
+                return Err(InstallError::InvalidType);
+            }
+            validate_mcp_approval_state(table.get("tools").ok_or(InstallError::InvalidType)?)?;
         }
-    };
+        trim_empty_wiring_tables(&mut parsed);
+        unowned = parsed;
+        if let Some(replacement) = replacement {
+            edits.push((
+                text.len()..text.len(),
+                format!(
+                    "\n{}",
+                    std::str::from_utf8(replacement).map_err(|_| InstallError::InvalidType)?
+                ),
+            ));
+        }
+    }
+    edits.sort_by_key(|(span, _)| span.start);
+    if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+        return Err(InstallError::InvalidType);
+    }
+    let mut result = text.to_owned();
+    for (span, replacement) in edits.into_iter().rev() {
+        result.replace_range(span, &replacement);
+    }
     if result.len() as u64 > MAX_CONFIG_BYTES {
         return Err(InstallError::ResourceExhausted);
     }
-    toml::from_str::<toml::Value>(&result).map_err(|_| InstallError::InvalidType)?;
+    let remaining = if let Some(replacement) = replacement {
+        let after = wiring_declarations(result.as_bytes())?;
+        if after.canonical != owned_wiring(replacement)? {
+            return Err(InstallError::InvalidType);
+        }
+        after.unowned
+    } else {
+        let mut after: toml::Value =
+            toml::from_str(&result).map_err(|_| InstallError::InvalidType)?;
+        trim_empty_wiring_tables(&mut after);
+        after
+    };
+    if remaining != unowned {
+        return Err(InstallError::InvalidType);
+    }
     Ok(result.into_bytes())
 }
 
-// Exact predecessor emitted by the same owned template before submission
-// coverage. This is only a write/uninstall compatibility check, not evidence
-// of current installed coverage or tolerance for user edits.
+// The predecessor declaration set emitted before submission coverage. This is
+// only a write/uninstall compatibility check, not current coverage or permission
+// to accept changed execution fields.
 fn previous_tool_wiring(owned: &str) -> Result<String, InstallError> {
     let body = owned
         .strip_prefix(OWNED_BEGIN)
@@ -389,6 +648,26 @@ pub fn validate_installed_wiring(
     config: &Path,
     host_config: &Path,
 ) -> Result<PathBuf, InstallError> {
+    validated_installed_wiring(data_root, config, host_config).map(|(cli, _)| cli)
+}
+
+/// Digest only normalized verified declarations, never Host state or user TOML.
+pub fn installed_wiring_hash(
+    data_root: &Path,
+    config: &Path,
+    host_config: &Path,
+) -> Result<(PathBuf, String), InstallError> {
+    use sha2::{Digest, Sha256};
+    let (cli, file) = validated_installed_wiring(data_root, config, host_config)?;
+    let (_, bytes) = file.original.as_ref().ok_or(InstallError::InvalidType)?;
+    Ok((cli, format!("{:x}", Sha256::digest(owned_wiring(bytes)?))))
+}
+
+fn validated_installed_wiring(
+    data_root: &Path,
+    config: &Path,
+    host_config: &Path,
+) -> Result<(PathBuf, InstallFile), InstallError> {
     let file = InstallFile::read(host_config)?;
     let (_, bytes) = file.original.as_ref().ok_or(InstallError::InvalidType)?;
     let text = std::str::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?;
@@ -408,7 +687,7 @@ pub fn validate_installed_wiring(
         return Err(InstallError::InvalidType);
     }
     file.revalidate(file.original.as_ref().map(|(identity, _)| identity))?;
-    Ok(cli)
+    Ok((cli, file))
 }
 
 fn ensure_install_parent(path: &Path) -> Result<(), InstallError> {
@@ -1000,16 +1279,14 @@ impl UnpublishedPackage {
             .revalidate(self.host.original.as_ref().map(|(identity, _)| identity))?;
         self.service
             .revalidate(self.service.original.as_ref().map(|(identity, _)| identity))?;
+        let host_wiring = owned_wiring(
+            self.host
+                .desired
+                .as_deref()
+                .ok_or(InstallError::InvalidType)?,
+        )?;
         for (path, expected) in [
-            (
-                &self.host_configuration,
-                owned_wiring(
-                    self.host
-                        .desired
-                        .as_deref()
-                        .ok_or(InstallError::InvalidType)?,
-                )?,
-            ),
+            (&self.host_configuration, host_wiring.as_slice()),
             (
                 &self.service_unit,
                 self.service
@@ -1058,6 +1335,13 @@ pub fn candidate_host_arguments() -> [String; 6] {
         "mcp_servers.evertrace.env_vars=[\"EVERTRACE_CANDIDATE_PACKAGE\",\"EVERTRACE_CANDIDATE_CONFIG\"]".into(),
         format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),
     ]
+}
+
+/// The ordered session arguments themselves are the candidate's wiring.
+pub fn candidate_wiring_hash(arguments: &[String; 6]) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(arguments).expect("string array serialization");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Wiring for the caller-owned disposable package probe only.
@@ -1158,11 +1442,10 @@ pub fn preflight_package_check(
     }
     let mut host = InstallFile::read(host_config)?;
     let old_host = &host.original.as_ref().ok_or(InstallError::InvalidType)?.1;
-    let without_old = merge_wiring(old_host, &wiring(data, &old_cli, config)?, true)?;
-    let proposed = merge_wiring(
-        &without_old,
-        &wiring(data, &package.join("evertrace"), config)?,
-        false,
+    let proposed = replace_wiring(
+        old_host,
+        &wiring(data, &old_cli, config)?,
+        Some(&wiring(data, &package.join("evertrace"), config)?),
     )?;
     let mut service = InstallFile::read(unit)?;
     let expected_unit = unit_bytes(&old_package.join("evertraced"), config)?;
@@ -1231,7 +1514,7 @@ pub fn prepare_package_check(
     prepare_runtime(&result.runtime)?;
     atomic_write(
         &result.host_configuration,
-        owned_wiring(
+        &owned_wiring(
             result
                 .host
                 .desired

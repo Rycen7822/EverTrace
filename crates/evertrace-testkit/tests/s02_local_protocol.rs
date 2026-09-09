@@ -52,10 +52,36 @@ fn host_canary_request_and_current_diagnostic_are_closed() {
         native_delivery_observed: true,
         mcp_claim_consumed: false,
         capture_receipt_observed: false,
+        qualification: None,
     };
     assert!(!diagnostic.validate());
     diagnostic.mcp_claim_consumed = true;
     assert!(diagnostic.validate()); // CaptureComplete is not granted by this diagnostic.
+    assert!(
+        serde_json::to_value(&diagnostic)
+            .unwrap()
+            .get("qualification")
+            .is_none()
+    );
+    let gate = serde_json::json!({"result":"disabled","reason":"missing_evidence"});
+    let summary = serde_json::json!({
+        "hook_activation":"active", "mcp_binding":"exact", "mcp_mechanism":"hook_stamped",
+        "capture":gate, "recovery":gate, "active_search_due":gate,
+        "strong_normalization":gate, "project_policy":gate
+    });
+    diagnostic.qualification = Some(serde_json::from_value(summary.clone()).unwrap());
+    assert!(diagnostic.validate());
+    let mut inconsistent = summary.clone();
+    inconsistent["capture"]["result"] = serde_json::json!("enabled");
+    diagnostic.qualification = Some(serde_json::from_value(inconsistent).unwrap());
+    assert!(!diagnostic.validate());
+    let mut unknown = summary;
+    unknown["capture"]["reason"] = serde_json::json!("arbitrary_assertion");
+    assert!(
+        serde_json::from_value::<evertrace_protocol::dto::HostCanaryQualification>(unknown)
+            .is_err()
+    );
+    diagnostic.qualification = None;
     diagnostic.scope = evertrace_protocol::dto::HostCanaryScope::Candidate {
         check_id: evertrace_domain::ids::JobId::new_v7().to_string(),
         generation: 7,
@@ -69,6 +95,11 @@ fn host_canary_request_and_current_diagnostic_are_closed() {
     diagnostic.scope = evertrace_protocol::dto::HostCanaryScope::Installed;
     diagnostic.status = HostCanaryStatus::TimedOut;
     assert!(!diagnostic.validate());
+    diagnostic.native_delivery_observed = false;
+    diagnostic.mcp_claim_consumed = false;
+    diagnostic.capture_receipt_observed = false;
+    diagnostic.qualification = None;
+    assert!(diagnostic.validate());
 }
 
 fn request_id() -> RequestId {

@@ -1602,6 +1602,12 @@ fn backup_watermarks(
     let mut source = Vec::new();
     let mut outbox = 0_u64;
     for row in snapshot.data_rows() {
+        if crate::session_import::restore_current(row)
+            .map_err(map_store)?
+            .is_some()
+        {
+            continue;
+        }
         let Some(json) = row.payload_json.as_deref() else {
             return Err(BackupError::Corrupt);
         };
@@ -2407,6 +2413,16 @@ mod tests {
         assert_eq!(watermarks[0].source_sequence, 3);
         assert_eq!(watermarks[1].source_instance_id.as_str(), "source-b");
         assert_eq!(watermarks[1].source_sequence, 900);
+        let mut invalid = watermark_row("source-a", "revision-a", 3);
+        invalid.object_kind = Some("session_import_current".into());
+        invalid.payload_json = Some("{}".into());
+        assert_eq!(
+            backup_watermarks(&ProjectionSnapshot {
+                frontier: 3,
+                rows: vec![invalid]
+            }),
+            Err(BackupError::Corrupt)
+        );
     }
 
     #[test]
