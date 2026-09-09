@@ -17,6 +17,9 @@ use tokio::{
 };
 
 enum WriterRequest {
+    ReadDiagnostics {
+        reply: oneshot::Sender<evertrace_store::NativeDiagnostics>,
+    },
     MarkGc {
         runtime: Box<evertrace_capture::RuntimeSnapshot>,
         cursor: evertrace_capture::cas::CasGcCursor,
@@ -79,6 +82,17 @@ pub struct WriterHandle {
 }
 
 impl WriterHandle {
+    pub async fn read_diagnostics(
+        &self,
+    ) -> Result<evertrace_store::NativeDiagnostics, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ReadDiagnostics { reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)
+    }
+
     pub async fn mark_gc(
         &self,
         runtime: evertrace_capture::RuntimeSnapshot,
@@ -437,6 +451,14 @@ async fn run_writer(
                     recall_frontier.send_replace(frontier);
                     background_frontier.send_replace(frontier);
                 }
+            }
+            WriterRequest::ReadDiagnostics { reply } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .read_diagnostics()
+                    .await;
+                let _ = reply.send(result);
             }
             WriterRequest::Project { reply } => {
                 let result = writer

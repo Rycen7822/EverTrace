@@ -2822,7 +2822,14 @@ async fn doctor_reads_current_state_and_only_cli_refresh_runs_the_selected_host(
         dto::ClientKind,
     };
     use std::time::{Duration, Instant};
-    let (_root, paths, _) = fixture();
+    let (_root, paths, config) = fixture();
+    let mut config = config.config().clone();
+    config.llm.enabled = false;
+    fs::write(
+        &paths.config,
+        EffectiveConfig::new(config).unwrap().to_toml().unwrap(),
+    )
+    .unwrap();
     install_offline(&paths, false).unwrap();
     let marker = paths.data_root.join("host-probe-called");
     fs::write(
@@ -2877,11 +2884,73 @@ async fn doctor_reads_current_state_and_only_cli_refresh_runs_the_selected_host(
     };
     let read = doctor(false);
     assert!(read.status.success());
+    let read_text = String::from_utf8(read.stdout).unwrap();
+    assert!(read_text.contains("host_canary=not_run"));
+    assert!(read_text.contains("llm_daily_calls=Disabled"));
+    assert!(read_text.contains("journal: schema=Some(true)"));
+    assert!(read_text.contains("fts_metadata=Checked"));
+    assert!(read_text.contains("journal_content=NotChecked"));
+    assert!(read_text.contains("acceptance_a_f=NotRun"));
+    let mut system = LocalClient::connect(
+        &socket,
+        "s34-test",
+        ClientKind::Cli,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    let response = system
+        .request(
+            evertrace_domain::ids::RequestId::new_v7(),
+            Rpc::HumanGovernance(evertrace_protocol::dto::HumanGovernanceRequest::Read {
+                request: evertrace_protocol::dto::HumanReadRequest::List {
+                    surface: evertrace_protocol::dto::HumanSurface::System,
+                    expected_frontier: None,
+                    after: None,
+                    limit: 1,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let evertrace_protocol::response::Response::HumanGovernance(system_response) = response else {
+        panic!("current System response missing")
+    };
+    let evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
+        diagnostics: Some(report),
+        ..
+    } = &system_response
+    else {
+        panic!("current System diagnostics missing")
+    };
+    assert!(report.validate());
+    assert!(read_text.contains(&format!("diagnostics_config_hash={}", report.config_hash)));
     assert!(
-        String::from_utf8(read.stdout)
-            .unwrap()
-            .contains("host_canary=not_run")
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "fts_metadata"
+                && check.state == evertrace_protocol::dto::HumanDiagnosticState::Checked)
     );
+    assert!(system_response.validate());
+    let encoded = evertrace_protocol::frame::canonical_json(&system_response).unwrap();
+    assert!(encoded.len() < 16 * 1024);
+    let mut small_frame = Vec::new();
+    assert!(matches!(
+        evertrace_protocol::frame::write_frame_sync(&mut small_frame, &system_response, 1024),
+        Err(evertrace_protocol::frame::FrameError::Oversize)
+    ));
+    assert!(small_frame.is_empty());
+    let mut app = evertrace_tui::App::new();
+    app.dispatch(evertrace_tui::UiCommand::Navigate(
+        evertrace_tui::Route::System,
+    ));
+    app.handle(evertrace_tui::AppEvent::HumanRead {
+        surface: evertrace_protocol::dto::HumanSurface::System,
+        locator: evertrace_tui::HumanReadLocator::List,
+        response: system_response.clone(),
+    });
+    assert_eq!(app.state().human.as_ref(), Some(&system_response));
     assert!(!marker.exists());
     let mut hook = LocalClient::connect(
         &socket,
@@ -2917,6 +2986,44 @@ async fn doctor_reads_current_state_and_only_cli_refresh_runs_the_selected_host(
         String::from_utf8(current.stdout)
             .unwrap()
             .contains("Unavailable")
+    );
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    for name in ["cas", "spool"] {
+        let path = paths.data_root.join(name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o770)).unwrap();
+        let invalid = doctor(false);
+        assert!(!invalid.status.success());
+        assert!(
+            String::from_utf8(invalid.stdout)
+                .unwrap()
+                .contains(&format!(
+                    "{name}_metadata: expected_type=true private=false"
+                ))
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let down = doctor(false);
+    assert!(!down.status.success());
+    let down = String::from_utf8(down.stdout).unwrap();
+    assert!(down.contains("config=valid") && down.contains("daemon=unavailable"));
+    fs::write(&paths.config, "not valid = [toml\nDOCTOR_SECRET_MARKER").unwrap();
+    let invalid = doctor(false);
+    assert!(!invalid.status.success());
+    let invalid_output = format!(
+        "{}{}",
+        String::from_utf8(invalid.stdout).unwrap(),
+        String::from_utf8(invalid.stderr).unwrap()
+    );
+    assert!(invalid_output.contains("config=invalid_or_unreadable"));
+    assert!(!invalid_output.contains("DOCTOR_SECRET_MARKER"));
+    assert_eq!(
+        fs::read_to_string(&paths.config).unwrap(),
+        "not valid = [toml\nDOCTOR_SECRET_MARKER"
     );
 }
 

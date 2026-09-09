@@ -768,6 +768,8 @@ pub struct HumanActionResult {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
     Snapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<Box<HumanDiagnostics>>,
         frontier: u64,
         status: HumanSnapshotStatus,
         degraded_reasons: Vec<HumanDegradedReason>,
@@ -888,10 +890,112 @@ impl HumanActionRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanDiagnosticState {
+    Checked,
+    Unavailable,
+    Inconsistent,
+    NotChecked,
+    NotRun,
+    Disabled,
+    Exhausted,
+    Historical,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanDiagnosticCheck {
+    pub name: String,
+    pub state: HumanDiagnosticState,
+    pub count: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanTableDiagnostic {
+    pub schema_matches: Option<bool>,
+    pub version: Option<u64>,
+    pub checkpoint: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanDiagnostics {
+    pub config_version: u32,
+    pub algorithm_revision: u32,
+    pub config_hash: String,
+    pub observed_at_us: i64,
+    pub tables: Vec<HumanTableDiagnostic>,
+    pub checks: Vec<HumanDiagnosticCheck>,
+    pub host: Option<HostCanaryDiagnostic>,
+}
+
+impl HumanDiagnostics {
+    pub fn validate(&self) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        self.config_version == 1
+            && self.algorithm_revision != 0
+            && self.observed_at_us >= 0
+            && self.config_hash.len() == 64
+            && self
+                .config_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            && self.tables.len() == 4
+            && self.checks.len() <= 40
+            && self.checks.iter().all(|check| {
+                seen.insert(&check.name)
+                    && matches!(
+                        check.name.as_str(),
+                        "projection_checkpoints"
+                            | "fts_metadata"
+                            | "journal_content"
+                            | "objects_rows"
+                            | "relations_content"
+                            | "search_content"
+                            | "spool_metadata"
+                            | "cas_metadata"
+                            | "spool_frames"
+                            | "cas_content"
+                            | "jobs_queued"
+                            | "jobs_leased"
+                            | "jobs_failed_history"
+                            | "backup_create_history"
+                            | "backup_verify_history"
+                            | "backup_content_current"
+                            | "purge_current"
+                            | "native_history_cleanup"
+                            | "llm_daily_calls"
+                            | "llm_daily_input_tokens"
+                            | "llm_daily_output_tokens"
+                            | "llm_daily_wall_time_us"
+                            | "provider_connectivity"
+                            | "acceptance_a_f"
+                            | "backup_manifest_sample"
+                            | "backup_sample_declared_bytes"
+                            | "runtime_generation"
+                            | "runtime_snapshot_version"
+                            | "recovery_classifier_revision"
+                            | "spool_high_watermark_bytes"
+                            | "spool_low_watermark_bytes"
+                            | "spool_max_main_files"
+                            | "object_deletion_current"
+                    )
+            })
+            && self
+                .host
+                .as_ref()
+                .is_none_or(HostCanaryDiagnostic::validate)
+    }
+}
+
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
             Self::Snapshot {
+                diagnostics,
                 status,
                 degraded_reasons,
                 items,
@@ -908,6 +1012,7 @@ impl HumanGovernanceResponse {
                         .all(|pair| pair[0].stable_key < pair[1].stable_key)
                     && items.iter().all(HumanSnapshotItem::validate)
                     && next_cursor.as_deref().is_none_or(valid_ref)
+                    && diagnostics.as_ref().is_none_or(|value| value.validate())
             }
             Self::Action { result } => result.validate(),
             Self::Conflict {

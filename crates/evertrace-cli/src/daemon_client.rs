@@ -14,6 +14,41 @@ pub async fn health(socket: &Path) -> Result<HealthResponse, ProtocolError> {
     request_health(socket, env!("CARGO_PKG_VERSION"), Duration::from_secs(2)).await
 }
 
+pub async fn system_diagnostics(
+    socket: &Path,
+) -> Result<evertrace_protocol::dto::HumanDiagnostics, ProtocolError> {
+    use evertrace_protocol::dto::{
+        HumanGovernanceRequest, HumanGovernanceResponse, HumanReadRequest, HumanSurface,
+    };
+    let mut client = LocalClient::connect(
+        socket,
+        env!("CARGO_PKG_VERSION"),
+        ClientKind::Cli,
+        Duration::from_secs(10),
+    )
+    .await?;
+    match client
+        .request(
+            RequestId::new_v7(),
+            Command::HumanGovernance(HumanGovernanceRequest::Read {
+                request: HumanReadRequest::List {
+                    surface: HumanSurface::System,
+                    expected_frontier: None,
+                    after: None,
+                    limit: 1,
+                },
+            }),
+        )
+        .await?
+    {
+        Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
+            diagnostics: Some(value),
+            ..
+        }) if value.validate() => Ok(*value),
+        _ => Err(ProtocolError::UnexpectedMessage),
+    }
+}
+
 pub fn explain_live_host() {
     eprintln!(
         "Live Host canary uses normal Host configuration/auth/provider and normal trust. Existing third-party Hook/notify/MCP behavior is not guaranteed side-effect-free; the fixed EverTrace task requests no business writes and changes no trust or installation."

@@ -27,6 +27,19 @@ use crate::{
     search::SEARCH_TABLE,
 };
 
+/// Existing native handles only: no replay, projection repair, or content verification.
+pub struct NativeDiagnostics {
+    pub tables: [NativeDiagnosticTable; 4],
+    pub fts_index_present: Option<bool>,
+    pub objects: Option<ProjectionSnapshot>,
+}
+
+pub struct NativeDiagnosticTable {
+    pub schema_matches: Option<bool>,
+    pub version: Option<u64>,
+    pub checkpoint: Option<u64>,
+}
+
 pub(crate) struct GcAuthority {
     references: std::collections::BTreeSet<String>,
     backup_root: Option<evertrace_capture::confined_read::ConfinedRoot>,
@@ -328,6 +341,57 @@ impl JournalWriter {
             admission_state,
             migration_outcome,
         })
+    }
+
+    pub async fn read_diagnostics(&self) -> NativeDiagnostics {
+        let mut tables = Vec::with_capacity(4);
+        for (table, expected, checkpoint) in [
+            (
+                &self.journal,
+                crate::journal::journal_schema(),
+                read_journal_frontier(&self.journal).await,
+            ),
+            (
+                &self.objects,
+                crate::objects::objects_schema(),
+                read_object_checkpoint(&self.objects).await,
+            ),
+            (
+                &self.relations,
+                crate::relations::relations_schema(),
+                crate::relations::read_relation_checkpoint(&self.relations).await,
+            ),
+            (
+                &self.search,
+                crate::search::search_schema(),
+                crate::search::read_search_checkpoint(&self.search).await,
+            ),
+        ] {
+            tables.push(NativeDiagnosticTable {
+                schema_matches: table.schema().await.ok().map(|schema| schema == expected),
+                version: table.version().await.ok(),
+                checkpoint: checkpoint.ok(),
+            });
+        }
+        let objects = match tables[1].checkpoint {
+            Some(frontier) => validate_objects_table(&self.objects)
+                .await
+                .ok()
+                .map(|rows| ProjectionSnapshot { frontier, rows }),
+            None => None,
+        };
+        let fts_index_present = self.search.list_indices().await.ok().map(|indices| {
+            indices.len() == 1
+                && indices[0].columns == ["text"]
+                && matches!(indices[0].index_type, lancedb::index::IndexType::FTS)
+        });
+        NativeDiagnostics {
+            tables: tables
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("four fixed native tables")),
+            fts_index_present,
+            objects,
+        }
     }
 
     pub async fn backup_table_states(&self) -> Result<crate::BackupTableStates, StoreError> {
@@ -985,6 +1049,41 @@ mod tests {
         DirtyTarget, DirtyTargetKind, JournalEventDraft, JournalPayload, SourceCloseRange,
         SourceCloseReconciliation, reduce_journal,
     };
+
+    #[tokio::test]
+    async fn diagnostics_read_existing_tables_without_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = JournalWriter::open(&temp.path().join("data"))
+            .await
+            .unwrap();
+        let before = writer.backup_table_states().await.unwrap();
+        let read = writer.read_diagnostics().await;
+        assert!(
+            read.tables
+                .iter()
+                .all(|table| table.schema_matches == Some(true))
+        );
+        assert_eq!(read.fts_index_present, Some(true));
+        assert!(read.objects.is_some());
+        assert_eq!(writer.backup_table_states().await.unwrap(), before);
+        let index = writer.search.list_indices().await.unwrap().remove(0);
+        writer.search.drop_index(&index.name).await.unwrap();
+        assert_eq!(
+            writer.read_diagnostics().await.fts_index_present,
+            Some(false)
+        );
+        // Corrupt only this disposable derived checkpoint; diagnostics must not rebuild it.
+        writer.search.delete("true").await.unwrap();
+        let version = writer.search.version().await.unwrap();
+        let read = writer.read_diagnostics().await;
+        assert_eq!(read.tables[3].checkpoint, None);
+        assert_eq!(writer.search.version().await.unwrap(), version);
+        assert!(
+            crate::search::read_search_checkpoint(&writer.search)
+                .await
+                .is_err()
+        );
+    }
 
     fn capture_pair(
         lane_id: ExecutionLaneId,

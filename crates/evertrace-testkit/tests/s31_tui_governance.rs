@@ -732,15 +732,22 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     let mut mismatched_item = proposal_item.clone();
     mismatched_item.object_ref = Some(RevisionProposalId::new_v7().to_string());
     let mismatched = HumanGovernanceResponse::Snapshot {
+        diagnostics: None,
         frontier: 1,
         status: HumanSnapshotStatus::Ready,
         degraded_reasons: Vec::new(),
         items: vec![mismatched_item],
         next_cursor: None,
     };
+    assert!(
+        !serde_json::to_string(&mismatched)
+            .unwrap()
+            .contains("diagnostics")
+    );
     assert!(!mismatched.validate());
     assert!(
         !HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 1,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: vec![HumanDegradedReason::CurrentJobFailed],
@@ -782,6 +789,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         deprecate_available: false,
     });
     let support_response = |item| HumanGovernanceResponse::Snapshot {
+        diagnostics: None,
         frontier: 1,
         status: HumanSnapshotStatus::Ready,
         degraded_reasons: Vec::new(),
@@ -818,6 +826,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     assert!(pending.validate());
     assert!(
         !HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 1,
             status: HumanSnapshotStatus::Degraded,
             degraded_reasons: vec![
@@ -833,6 +842,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     zero_sequence.source_event_seq = 0;
     assert!(
         !HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 1,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -867,6 +877,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         item.revision_ref = None;
         assert!(
             HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -878,6 +889,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         item.object_kind.push_str("_history");
         assert!(
             !HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -931,6 +943,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         surface: WireSurface::Inbox,
         locator: evertrace_tui::HumanReadLocator::List,
         response: HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 7,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -946,6 +959,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
             expected_revision_ref: Some(revision_id.to_string()),
         },
         response: HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 7,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -962,6 +976,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         surface: WireSurface::Inbox,
         locator: evertrace_tui::HumanReadLocator::List,
         response: HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 8,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -977,6 +992,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
             expected_revision_ref: attempt_item.revision_ref.clone(),
         },
         response: HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 8,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -1087,6 +1103,54 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
         .unwrap();
 
     let service = HumanGovernanceService::new(handle.clone(), CONFIG);
+    // Fixture preparation, not a System read side effect: publish the existing projection.
+    handle.project().await.unwrap();
+    let before_diagnostics = handle.read_diagnostics().await.unwrap();
+    let mut diagnostic_config = evertrace_domain::config::EffectiveConfig::default()
+        .config()
+        .clone();
+    diagnostic_config.llm.enabled = false;
+    let report_page = service
+        .list_system(
+            &evertrace_domain::config::EffectiveConfig::new(diagnostic_config).unwrap(),
+            None,
+            None,
+            None,
+            HUMAN_PAGE_LIMIT,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report_page.status,
+        evertrace_engine::HumanSnapshotStatus::Ready
+    );
+    let report = report_page.diagnostics.unwrap();
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "jobs_failed_history"
+                && check.state == evertrace_engine::HumanDiagnosticState::Historical
+                && check.count == Some(1))
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "llm_daily_calls"
+                && check.state == evertrace_engine::HumanDiagnosticState::Disabled)
+    );
+    let after_diagnostics = handle.read_diagnostics().await.unwrap();
+    assert_eq!(before_diagnostics.objects, after_diagnostics.objects);
+    assert!(
+        before_diagnostics
+            .tables
+            .iter()
+            .zip(&after_diagnostics.tables)
+            .all(|(before, after)| before.version == after.version
+                && before.checkpoint == after.checkpoint)
+    );
     let first = service
         .list(HumanSurface::System, None, None, HUMAN_PAGE_LIMIT)
         .await

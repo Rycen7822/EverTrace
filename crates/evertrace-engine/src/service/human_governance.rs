@@ -1,3 +1,8 @@
+mod diagnostics;
+pub use diagnostics::{
+    HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
@@ -600,6 +605,7 @@ pub struct HumanRepositoryPurgePreview {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanPage {
+    pub diagnostics: Option<HumanDiagnostics>,
     pub frontier: u64,
     pub status: HumanSnapshotStatus,
     pub degraded_reasons: Vec<HumanDegradedReason>,
@@ -899,15 +905,74 @@ impl HumanGovernanceService {
         if limit == 0 || limit > MAX_PAGE || after.is_some_and(|value| !valid_ref(value)) {
             return Err(HumanGovernanceError::InvalidInput);
         }
-        let snapshot = self
-            .writer
-            .project()
-            .await
-            .map_err(|_| HumanGovernanceError::Store)?;
+        let snapshot = if surface == HumanSurface::System {
+            self.writer
+                .read_diagnostics()
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?
+                .objects
+                .ok_or(HumanGovernanceError::Store)?
+        } else {
+            self.writer
+                .project()
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?
+        };
         if expected_frontier.is_some_and(|frontier| frontier != snapshot.frontier) {
             return Ok(Err(snapshot.frontier));
         }
         Ok(Ok(page(&snapshot, surface, after, usize::from(limit))?))
+    }
+
+    pub async fn list_system(
+        &self,
+        config: &evertrace_domain::config::EffectiveConfig,
+        host: Option<crate::HostCanaryDiagnostic>,
+        expected_frontier: Option<u64>,
+        after: Option<&str>,
+        limit: u16,
+    ) -> Result<Result<HumanPage, u64>, HumanGovernanceError> {
+        if limit == 0 || limit > MAX_PAGE || after.is_some_and(|value| !valid_ref(value)) {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
+        let native = self
+            .writer
+            .read_diagnostics()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let observed_frontier = native.tables[0]
+            .checkpoint
+            .or(native.tables[1].checkpoint)
+            .ok_or(HumanGovernanceError::Store)?;
+        let mut diagnostic =
+            diagnostics::compile(config, self.runtime_snapshot.as_ref(), &native, host);
+        let current_page = native.objects.as_ref().and_then(|snapshot| {
+            page(snapshot, HumanSurface::System, after, usize::from(limit)).ok()
+        });
+        if current_page.is_none()
+            && let Some(check) = diagnostic
+                .checks
+                .iter_mut()
+                .find(|check| check.name == "objects_rows")
+        {
+            check.state = HumanDiagnosticState::Unavailable;
+        }
+        let mut result = current_page.unwrap_or_else(|| HumanPage {
+            frontier: observed_frontier,
+            status: HumanSnapshotStatus::Ready,
+            degraded_reasons: Vec::new(),
+            items: Vec::new(),
+            next_cursor: None,
+            diagnostics: None,
+        });
+        if expected_frontier.is_some_and(|frontier| frontier != result.frontier) {
+            return Ok(Err(result.frontier));
+        }
+        // Failed terminal jobs remain visible history, not a permanent global health verdict.
+        result.status = HumanSnapshotStatus::Ready;
+        result.degraded_reasons.clear();
+        result.diagnostics = Some(diagnostic);
+        Ok(Ok(result))
     }
 
     pub async fn detail(
@@ -1038,6 +1103,7 @@ impl HumanGovernanceService {
         }
         let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
+            diagnostics: None,
             frontier: snapshot.frontier,
             status,
             degraded_reasons,
@@ -1130,6 +1196,7 @@ impl HumanGovernanceService {
         let (selected, next_cursor) = rows;
         let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
+            diagnostics: None,
             frontier: snapshot.frontier,
             status,
             degraded_reasons,
@@ -3315,6 +3382,7 @@ fn page(
     let next_cursor = (selected.len() > limit).then(|| selected[limit - 1].row_id.clone());
     selected.truncate(limit);
     Ok(HumanPage {
+        diagnostics: None,
         frontier: snapshot.frontier,
         status,
         degraded_reasons,

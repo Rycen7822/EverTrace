@@ -67,4 +67,7 @@ pub use search::{
     SearchIndex, SearchProjectionRow, SearchSnapshot, read_search_rows, search_schema,
 };
 pub use session_import::*;
-pub use writer::{ClosedJournalWriter, CommittedCommand, JournalWriter, SiblingWriterLock};
+pub use writer::{
+    ClosedJournalWriter, CommittedCommand, JournalWriter, NativeDiagnosticTable, NativeDiagnostics,
+    SiblingWriterLock,
+};

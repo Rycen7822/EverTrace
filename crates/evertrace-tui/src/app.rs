@@ -532,6 +532,9 @@ impl App {
                 self.state.competing_candidate_selection = 0;
                 let last = snapshot_item_count(&self.state).saturating_sub(1);
                 self.state.selection = self.state.selection.saturating_add(1).min(last);
+                if self.state.route == crate::Route::System {
+                    self.state.detail_scroll = self.state.detail_scroll.saturating_add(1);
+                }
             }
             UiCommand::SelectPrevious => {
                 if self.state.detail.is_some() {
@@ -542,7 +545,10 @@ impl App {
                 self.state.detail_message = None;
                 self.state.proposal_confirmation = None;
                 self.state.competing_candidate_selection = 0;
-                self.state.selection = self.state.selection.saturating_sub(1)
+                self.state.selection = self.state.selection.saturating_sub(1);
+                if self.state.route == crate::Route::System {
+                    self.state.detail_scroll = self.state.detail_scroll.saturating_sub(1);
+                }
             }
             UiCommand::PrepareProposal(decision) => {
                 if self.state.write_queued {
@@ -2179,6 +2185,7 @@ mod tests {
         }));
         let mut app = App::new();
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 9,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -2365,6 +2372,7 @@ mod tests {
             assert!(current.contains(label), "missing {label}");
         }
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 9,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -2420,6 +2428,7 @@ mod tests {
             surface: evertrace_protocol::dto::HumanSurface::Explorer,
             locator: HumanReadLocator::List,
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -2508,6 +2517,7 @@ mod tests {
         worktree_detail.recovery_detail = bundle_detail.recovery_detail;
         assert!(
             !HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -2522,6 +2532,7 @@ mod tests {
         lane_detail.revision_ref = Some(format!("{lane_id}@1"));
         assert!(
             HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -2555,6 +2566,7 @@ mod tests {
         lane_detail.object_kind = "capture_receipt".into();
         assert!(
             !HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -2568,6 +2580,7 @@ mod tests {
         wrong_family.category = HumanItemCategory::Evidence;
         assert!(
             !HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -2624,6 +2637,7 @@ mod tests {
         forged.stable_key = "runtime:job:forged".into();
         assert!(
             !HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -2635,6 +2649,7 @@ mod tests {
         job_detail.object_kind = "session_import_current".into();
         assert!(
             !HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 1,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -2774,6 +2789,7 @@ mod tests {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
             locator: HumanReadLocator::List,
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 9,
                 status: HumanSnapshotStatus::Degraded,
                 degraded_reasons: vec![HumanDegradedReason::CurrentJobFailed],
@@ -2829,6 +2845,7 @@ mod tests {
                 expected_revision_ref: Some(revision_id.to_string()),
             },
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 9,
                 status: HumanSnapshotStatus::Degraded,
                 degraded_reasons: vec![HumanDegradedReason::CurrentJobFailed],
@@ -2996,6 +3013,7 @@ mod tests {
             deprecate_available: true,
         });
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 11,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -3142,6 +3160,7 @@ mod tests {
             reauthorization: None,
         });
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 10,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -3196,6 +3215,7 @@ mod tests {
                 expected_frontier: 10,
             },
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 10,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -3221,6 +3241,7 @@ mod tests {
         atom.lifecycle = Some("active".into());
         atom.revision_ref = Some(evertrace_domain::revision::RevisionId::new_v7().to_string());
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 11,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -3276,6 +3297,7 @@ mod tests {
             surface: evertrace_protocol::dto::HumanSurface::Explorer,
             locator: HumanReadLocator::List,
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 3,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -3301,6 +3323,7 @@ mod tests {
             eligible_attempt_ids: candidates.clone(),
         });
         let snapshot = HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
             frontier: 7,
             status: HumanSnapshotStatus::Ready,
             degraded_reasons: Vec::new(),
@@ -3349,6 +3372,7 @@ mod tests {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
             locator: HumanReadLocator::List,
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 8,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -3407,6 +3431,7 @@ mod tests {
             surface: evertrace_protocol::dto::HumanSurface::Explorer,
             locator: HumanReadLocator::List,
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 12,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -3447,6 +3472,7 @@ mod tests {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
             locator: HumanReadLocator::List,
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 4,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -3459,6 +3485,7 @@ mod tests {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
             locator: first_locator,
             response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
                 frontier: 4,
                 status: HumanSnapshotStatus::Ready,
                 degraded_reasons: Vec::new(),
@@ -3541,6 +3568,7 @@ mod tests {
                 request_id: evertrace_domain::ids::RequestId::new_v7(),
                 response: evertrace_protocol::response::Response::HumanGovernance(
                     evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
+                        diagnostics: None,
                         frontier: 1,
                         status: evertrace_protocol::dto::HumanSnapshotStatus::Ready,
                         degraded_reasons: vec![],

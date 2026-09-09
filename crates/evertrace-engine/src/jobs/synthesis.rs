@@ -397,13 +397,7 @@ impl SynthesisPlanner {
         if occurred_at_us < 0 {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let today = occurred_at_us / DAY_US;
-        let used_wall_time_us = prior_runs(snapshot)?
-            .into_iter()
-            .filter(|run| run.created_at_us / DAY_US == today)
-            .fold(0_u64, |total, run| {
-                total.saturating_add(run.quota_usage.wall_time_us)
-            });
+        let used_wall_time_us = recorded_daily_usage(snapshot, occurred_at_us)?.wall_time_us;
         Ok(std::time::Duration::from_micros(
             self.llm
                 .daily_wall_time_budget
@@ -493,23 +487,7 @@ impl SynthesisPlanner {
         }) {
             return Ok(SynthesisResolution::NoDelta);
         }
-        let today = request.occurred_at_us / DAY_US;
-        let daily = prior
-            .iter()
-            .filter(|run| run.created_at_us / DAY_US == today)
-            .fold(DerivationQuotaUsage::default(), |mut total, run| {
-                total.input_tokens = total
-                    .input_tokens
-                    .saturating_add(run.quota_usage.input_tokens);
-                total.output_tokens = total
-                    .output_tokens
-                    .saturating_add(run.quota_usage.output_tokens);
-                total.calls = total.calls.saturating_add(run.quota_usage.calls);
-                total.wall_time_us = total
-                    .wall_time_us
-                    .saturating_add(run.quota_usage.wall_time_us);
-                total
-            });
+        let daily = daily_usage(&prior, request.occurred_at_us);
         let episode_successes = prior
             .iter()
             .filter(|run| {
@@ -992,6 +970,35 @@ fn current_episode(
     Ok((*episode).clone())
 }
 
+pub(crate) fn recorded_daily_usage(
+    snapshot: &ProjectionSnapshot,
+    occurred_at_us: i64,
+) -> Result<DerivationQuotaUsage, crate::semantic::SemanticServiceError> {
+    if occurred_at_us < 0 {
+        return Err(crate::semantic::SemanticServiceError::InvalidInput);
+    }
+    Ok(daily_usage(&prior_runs(snapshot)?, occurred_at_us))
+}
+
+fn daily_usage(prior: &[SemanticDerivationRun], occurred_at_us: i64) -> DerivationQuotaUsage {
+    prior
+        .iter()
+        .filter(|run| run.created_at_us / DAY_US == occurred_at_us / DAY_US)
+        .fold(DerivationQuotaUsage::default(), |mut total, run| {
+            total.input_tokens = total
+                .input_tokens
+                .saturating_add(run.quota_usage.input_tokens);
+            total.output_tokens = total
+                .output_tokens
+                .saturating_add(run.quota_usage.output_tokens);
+            total.calls = total.calls.saturating_add(run.quota_usage.calls);
+            total.wall_time_us = total
+                .wall_time_us
+                .saturating_add(run.quota_usage.wall_time_us);
+            total
+        })
+}
+
 fn prior_runs(
     snapshot: &ProjectionSnapshot,
 ) -> Result<Vec<SemanticDerivationRun>, crate::semantic::SemanticServiceError> {
@@ -1447,5 +1454,43 @@ fn trigger_name(trigger: SemanticDigestTrigger) -> &'static str {
         SemanticDigestTrigger::ExperimentTerminal => "experiment_terminal",
         SemanticDigestTrigger::BudgetBackstop => "budget_backstop",
         SemanticDigestTrigger::EpisodeFinalization => "episode_finalization",
+    }
+}
+
+#[cfg(test)]
+mod daily_usage_tests {
+    use super::*;
+
+    #[test]
+    fn daily_reduction_preserves_day_boundary_and_saturating_usage() {
+        let run = SemanticDerivationRun {
+            derivation_run_id: evertrace_domain::ids::SemanticDerivationRunId::new_v7(),
+            episode_id: evertrace_domain::ids::WorkEpisodeId::new_v7(),
+            episode_revision_id: evertrace_domain::revision::RevisionId::new_v7(),
+            from_watermark: 0,
+            to_watermark: 1,
+            selected_direct_refs: vec!["source:one".into()],
+            job_fingerprint: [0; 32],
+            status: DerivationRunStatus::ProviderFailed,
+            quota_usage: DerivationQuotaUsage {
+                calls: 1,
+                input_tokens: u64::MAX,
+                output_tokens: 2,
+                wall_time_us: 3,
+            },
+            model_id: "test".into(),
+            prompt_hash: [0; 32],
+            schema_version: 1,
+            algorithm_revision: "test".into(),
+            effective_config_hash: [0; 32],
+            created_at_us: DAY_US,
+        };
+        let mut previous_day = run.clone();
+        previous_day.created_at_us = DAY_US - 1;
+        let used = daily_usage(&[previous_day, run.clone(), run], DAY_US + 1);
+        assert_eq!(used.calls, 2);
+        assert_eq!(used.input_tokens, u64::MAX);
+        assert_eq!(used.output_tokens, 4);
+        assert_eq!(used.wall_time_us, 6);
     }
 }

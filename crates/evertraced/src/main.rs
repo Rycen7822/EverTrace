@@ -617,14 +617,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     expected_frontier,
                                     after,
                                     limit,
-                                } => match human_governance
-                                    .list(
+                                } => match if surface == HumanSurface::System {
+                                    human_governance.list_system(&config_snapshot, host_canary.current(),
+                                        expected_frontier, after.as_deref(), limit).await
+                                } else { human_governance.list(
                                         map_human_surface(surface),
                                         expected_frontier,
                                         after.as_deref(),
                                         limit,
-                                    )
-                                    .await
+                                    ).await }
                                     .map_err(map_human_error)?
                                 {
                                     Ok(page) => map_human_page(page),
@@ -1213,6 +1214,7 @@ fn map_human_surface(surface: HumanSurface) -> EngineHumanSurface {
 
 fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse {
     HumanGovernanceResponse::Snapshot {
+        diagnostics: page.diagnostics.map(|value| Box::new(map_diagnostics(value))),
         frontier: page.frontier,
         status: match page.status {
             evertrace_engine::HumanSnapshotStatus::Ready => HumanSnapshotStatus::Ready,
@@ -1746,6 +1748,50 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             })
             .collect(),
         next_cursor: page.next_cursor,
+    }
+}
+
+fn map_diagnostics(
+    value: evertrace_engine::HumanDiagnostics,
+) -> evertrace_protocol::dto::HumanDiagnostics {
+    use evertrace_engine::HumanDiagnosticState as S;
+    use evertrace_protocol::dto::{
+        HumanDiagnosticCheck, HumanDiagnosticState as T, HumanDiagnostics, HumanTableDiagnostic,
+    };
+    HumanDiagnostics {
+        config_version: value.config_version,
+        algorithm_revision: value.algorithm_revision,
+        config_hash: value.config_hash,
+        observed_at_us: value.observed_at_us,
+        tables: value
+            .tables
+            .into_iter()
+            .map(|table| HumanTableDiagnostic {
+                schema_matches: table.schema_matches,
+                version: table.version,
+                checkpoint: table.checkpoint,
+            })
+            .collect(),
+        checks: value
+            .checks
+            .into_iter()
+            .map(|check| HumanDiagnosticCheck {
+                name: check.name.to_owned(),
+                state: match check.state {
+                    S::Checked => T::Checked,
+                    S::Unavailable => T::Unavailable,
+                    S::Inconsistent => T::Inconsistent,
+                    S::NotChecked => T::NotChecked,
+                    S::NotRun => T::NotRun,
+                    S::Disabled => T::Disabled,
+                    S::Exhausted => T::Exhausted,
+                    S::Historical => T::Historical,
+                },
+                count: check.count,
+                limit: check.limit,
+            })
+            .collect(),
+        host: value.host.map(map_host_canary),
     }
 }
 

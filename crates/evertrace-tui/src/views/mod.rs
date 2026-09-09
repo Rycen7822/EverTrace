@@ -20,6 +20,7 @@ pub(super) fn snapshot_rows(state: &AppState, empty: &str) -> String {
             degraded_reasons,
             items,
             next_cursor,
+            ..
         }) => {
             let mut lines = vec![format!(
                 "frontier:{frontier} status:{status:?}{}{}",
