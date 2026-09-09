@@ -153,21 +153,28 @@ impl SessionImportWorker {
         ) {
             return Err(SessionImportError::Unavailable);
         }
+        // Unavailable source permissions/trust are a preflight failure, not a lease.
+        // A subsequent fresh check can resume without waiting on our unused claim.
+        let source = match self.authorized_source(report, &snapshot, current, budget.deadline) {
+            Err(error @ (SessionImportError::Unavailable | SessionImportError::Budget)) => {
+                return Err(error);
+            }
+            source => source,
+        };
         self.claim_job(&snapshot, session_id).await?;
-        let (root, relative, identity) =
-            match self.authorized_source(report, &snapshot, current, budget.deadline) {
-                Ok(value) => value,
-                Err(SessionImportError::Changed) => {
-                    self.advance(
-                        current,
-                        SessionBodyState::SourceReplaced,
-                        BodyStateReason::SourceReplaced,
-                    )
-                    .await?;
-                    return Err(SessionImportError::Changed);
-                }
-                Err(error) => return Err(error),
-            };
+        let (root, relative, identity) = match source {
+            Ok(value) => value,
+            Err(SessionImportError::Changed) => {
+                self.advance(
+                    current,
+                    SessionBodyState::SourceReplaced,
+                    BodyStateReason::SourceReplaced,
+                )
+                .await?;
+                return Err(SessionImportError::Changed);
+            }
+            Err(error) => return Err(error),
+        };
         let (offset, previous_revision) =
             source_position(&snapshot, session_id, &current.metadata.source_revision)?;
         let prior_digest = match self
@@ -184,33 +191,6 @@ impl SessionImportWorker {
             Err(SessionImportError::Changed) => {
                 self.mark_source_replaced(current, identity).await?;
                 return Err(SessionImportError::Changed);
-            }
-            Err(SessionImportError::Unavailable) => {
-                let blocked = match current.metadata.workspace_resolution_kind {
-                    WorkspaceResolutionKind::Repository => Some((
-                        SessionBodyState::BlockedUntrusted,
-                        BodyStateReason::TrustUnavailable,
-                    )),
-                    WorkspaceResolutionKind::NonRepository
-                        if current.access_decision != Some(SessionAccessDecision::Approved) =>
-                    {
-                        Some((
-                            SessionBodyState::BlockedUnapproved,
-                            BodyStateReason::ApprovalUnavailable,
-                        ))
-                    }
-                    WorkspaceResolutionKind::Ambiguous | WorkspaceResolutionKind::Unavailable => {
-                        Some((
-                            SessionBodyState::BlockedScopeUnresolved,
-                            BodyStateReason::ScopeUnresolved,
-                        ))
-                    }
-                    WorkspaceResolutionKind::NonRepository => None,
-                };
-                if let Some((state, reason)) = blocked {
-                    self.advance(current, state, reason).await?;
-                }
-                return Err(SessionImportError::Unavailable);
             }
             Err(error) => return Err(error),
         };
@@ -256,7 +236,7 @@ impl SessionImportWorker {
                     CHUNK_BYTES.min(remaining),
                     budget.deadline,
                 )
-                .map_err(|_| SessionImportError::Changed)?;
+                .map_err(map_source_read)?;
             if chunk.bytes.is_empty() && !chunk.eof {
                 return Err(SessionImportError::Changed);
             }
@@ -359,12 +339,16 @@ impl SessionImportWorker {
         if observations.is_empty() {
             if eof && pending.is_empty() {
                 let latest = self.current(session_id).await?;
+                root.revalidate_file(&relative, identity)
+                    .map_err(map_source_read)?;
                 self.advance(
                     &latest,
                     SessionBodyState::Imported,
                     BodyStateReason::Completed,
                 )
                 .await?;
+                root.revalidate_file(&relative, identity)
+                    .map_err(map_source_read)?;
                 if let Some(digest) = prior_digest {
                     *self.verified_prefix.lock().await = Some(VerifiedPrefix {
                         source_revision: current.metadata.source_revision.clone(),
@@ -404,6 +388,8 @@ impl SessionImportWorker {
             .cloned()
             .ok_or(SessionImportError::Unavailable)?;
         let completed = eof && pending.is_empty();
+        root.revalidate_file(&relative, identity)
+            .map_err(map_source_read)?;
         self.advance(
             &latest,
             if completed {
@@ -418,6 +404,8 @@ impl SessionImportWorker {
             },
         )
         .await?;
+        root.revalidate_file(&relative, identity)
+            .map_err(map_source_read)?;
         *self.verified_prefix.lock().await = Some(VerifiedPrefix {
             source_revision: current.metadata.source_revision.clone(),
             identity,
@@ -555,7 +543,7 @@ impl SessionImportWorker {
                     usize::try_from(length).map_err(|_| SessionImportError::Budget)?,
                     deadline,
                 )
-                .map_err(|_| SessionImportError::Changed)?;
+                .map_err(map_source_read)?;
             if range.bytes.len()
                 != usize::try_from(length).map_err(|_| SessionImportError::Budget)?
                 || range.bytes.last() != Some(&b'\n')
@@ -873,11 +861,11 @@ impl SessionImportWorker {
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or(SessionImportError::Unsupported)?;
-        let root = ConfinedRoot::open_owned_private(qualified.path())
+        let root = ConfinedRoot::open_external_source(qualified.path())
             .map_err(|_| SessionImportError::Unavailable)?;
         let entries = root
             .list_directory(Some(parent), 1024, deadline)
-            .map_err(|_| SessionImportError::Changed)?;
+            .map_err(map_source_read)?;
         let mut matches = entries
             .iter()
             .filter(|entry| entry.name == file_name && entry.entry_type == ConfinedEntryType::File);
@@ -893,6 +881,15 @@ impl SessionImportWorker {
             return Err(SessionImportError::Changed);
         }
         Ok((root, relative, identity))
+    }
+}
+
+fn map_source_read(error: evertrace_capture::ConfinedReadError) -> SessionImportError {
+    match error {
+        evertrace_capture::ConfinedReadError::Changed => SessionImportError::Changed,
+        evertrace_capture::ConfinedReadError::Deadline
+        | evertrace_capture::ConfinedReadError::LimitExceeded { .. } => SessionImportError::Budget,
+        _ => SessionImportError::Unavailable,
     }
 }
 

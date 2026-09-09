@@ -166,9 +166,10 @@ fn manifest_is_closed_round_trippable_and_relation_checked() {
 #[test]
 fn session_root_requires_current_observed_canary_and_pinned_filesystem_identity() {
     let temp = tempfile::TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let root = temp.path().join("sessions");
     fs::create_dir(&root).unwrap();
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
     let session_id = "019d0000-0000-7000-8000-000000000028";
     let dated = root.join("2026/08/30");
     fs::create_dir_all(&dated).unwrap();
@@ -180,7 +181,7 @@ fn session_root_requires_current_observed_canary_and_pinned_filesystem_identity(
         format!("{header}\nBODY_CANARY_MUST_NOT_BE_READ\n"),
     )
     .unwrap();
-    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o644)).unwrap();
     let native = serde_json::json!({
         "cwd": temp.path().to_string_lossy(),
         "hook_event_name": "PreToolUse",
@@ -242,7 +243,7 @@ fn session_root_requires_current_observed_canary_and_pinned_filesystem_identity(
         ),
     )
     .unwrap();
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(
         evertrace_codex::policy::parse_repository_trust(
             &fs::read(&config).unwrap(),
@@ -255,6 +256,22 @@ fn session_root_requires_current_observed_canary_and_pinned_filesystem_identity(
         read_native_repository_trust(&serde_json::to_vec(&native).unwrap(), &current, worktree_id);
     assert_eq!(
         trust.state,
+        evertrace_codex::policy::RepositoryTrustState::Trusted
+    );
+    let observed = evertrace_engine::repository::observe_session_catalog_report(
+        transcript.to_str(),
+        session_id,
+        "tool-session-root",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        evertrace_engine::repository::read_report_repository_trust(
+            &observed,
+            &current,
+            worktree_id
+        )
+        .state,
         evertrace_codex::policy::RepositoryTrustState::Trusted
     );
     fs::write(

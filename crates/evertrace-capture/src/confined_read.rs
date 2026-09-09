@@ -134,6 +134,7 @@ pub struct ConfinedRoot {
     owner: u32,
     mode: u32,
     locator_chain: Option<Vec<(OsString, ConfinedFileIdentity)>>,
+    external_source: bool,
 }
 
 impl ConfinedRoot {
@@ -171,6 +172,12 @@ impl ConfinedRoot {
         destination: &str,
         exchange: Option<&ConfinedRoot>,
     ) -> Result<(), ConfinedReadError> {
+        if self.external_source
+            || source.external_source
+            || exchange.is_some_and(|root| root.external_source)
+        {
+            return Err(ConfinedReadError::UnsupportedType);
+        }
         if source.locator.parent() != Some(self.locator.as_path())
             || Path::new(destination).components().count() != 1
             || !matches!(
@@ -239,6 +246,7 @@ impl ConfinedRoot {
             owner: stat.st_uid,
             mode: stat.st_mode,
             locator_chain: None,
+            external_source: false,
         })
     }
 
@@ -247,6 +255,16 @@ impl ConfinedRoot {
     /// writable by group or other users. The returned descriptor remains the
     /// authority for all subsequent child cwd and probe operations.
     pub fn open_owned_private(root: &Path) -> Result<Self, ConfinedReadError> {
+        Self::open_owned(root, false)
+    }
+
+    /// Read-only Host sources may be public-readable below a private ancestor.
+    /// This does not authorize body import or change recovery/mutation roots.
+    pub fn open_external_source(root: &Path) -> Result<Self, ConfinedReadError> {
+        Self::open_owned(root, true)
+    }
+
+    fn open_owned(root: &Path, external_source: bool) -> Result<Self, ConfinedReadError> {
         if !root.is_absolute() {
             return Err(ConfinedReadError::InvalidPath);
         }
@@ -301,14 +319,19 @@ impl ConfinedRoot {
         {
             return Err(ConfinedReadError::UnsupportedType);
         }
-        Ok(Self {
+        let result = Self {
             fd,
             locator: root.to_path_buf(),
             identity: identity(&opened)?,
             owner: opened.st_uid,
             mode: opened.st_mode,
             locator_chain: Some(locator_chain),
-        })
+            external_source,
+        };
+        if external_source {
+            result.revalidate_stable()?;
+        }
+        Ok(result)
     }
 
     pub fn read(
@@ -326,6 +349,9 @@ impl ConfinedRoot {
         relative: &Path,
         limits: ConfinedReadLimits,
     ) -> Result<ConfinedFile, ConfinedReadError> {
+        if self.external_source {
+            return Err(ConfinedReadError::UnsupportedType);
+        }
         self.read_impl(relative, limits, false, || {})
     }
 
@@ -361,6 +387,7 @@ impl ConfinedRoot {
             }
             let stat = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|_| ConfinedReadError::Io)?;
+            self.validate_external_entry(&stat)?;
             let entry_type = match FileType::from_raw_mode(stat.st_mode) {
                 FileType::RegularFile => ConfinedEntryType::File,
                 FileType::Directory => ConfinedEntryType::Directory,
@@ -379,6 +406,17 @@ impl ConfinedRoot {
             }
         }
         entries.sort();
+        if self.external_source {
+            for entry in &entries {
+                check_deadline(deadline)?;
+                let stat = statat(&directory, entry.name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| ConfinedReadError::Io)?;
+                self.validate_external_entry(&stat)?;
+                if identity(&stat)? != entry.identity {
+                    return Err(ConfinedReadError::Changed);
+                }
+            }
+        }
         let after = identity(&fstat(&directory).map_err(|_| ConfinedReadError::Io)?)?;
         if before != after {
             return Err(ConfinedReadError::Changed);
@@ -404,14 +442,38 @@ impl ConfinedRoot {
             Mode::empty(),
         )
         .map_err(map_open_error)?;
-        if FileType::from_raw_mode(fstat(&fd).map_err(|_| ConfinedReadError::Io)?.st_mode)
-            != FileType::RegularFile
-        {
+        let opened = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&opened)?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
             return Err(ConfinedReadError::UnsupportedType);
+        }
+        if self.external_source {
+            let entry = statat(&parent, *leaf, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| ConfinedReadError::Io)?;
+            self.validate_external_entry(&entry)?;
+            if identity(&entry)? != identity(&opened)? {
+                return Err(ConfinedReadError::Changed);
+            }
         }
         self.validate_directory_chain(parents, &identities, deadline)?;
         self.revalidate_stable()?;
         Ok(fd.into())
+    }
+
+    /// Recheck a checkpoint's already-read source without reading body bytes.
+    /// Uses the existing bounded metadata-open window, not an expired body-IO deadline.
+    pub fn revalidate_file(
+        &self,
+        relative: &Path,
+        expected: ConfinedFileIdentity,
+    ) -> Result<(), ConfinedReadError> {
+        let file = self.open_regular_file(relative)?;
+        let current = fstat(&file).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&current)?;
+        if identity(&current)? != expected {
+            return Err(ConfinedReadError::Changed);
+        }
+        self.revalidate_stable()
     }
 
     pub fn read_range(
@@ -434,11 +496,12 @@ impl ConfinedRoot {
         let fd = openat(
             &parent,
             *leaf,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(map_open_error)?;
         let before = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&before)?;
         if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
             || identity(&before)? != expected
             || offset > expected.size
@@ -447,6 +510,16 @@ impl ConfinedRoot {
         }
         let remaining = expected.size - offset;
         if remaining == 0 {
+            if self.external_source {
+                let after = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+                let entry = statat(&parent, *leaf, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| ConfinedReadError::Io)?;
+                self.validate_external_entry(&after)?;
+                self.validate_external_entry(&entry)?;
+                if identity(&after)? != expected || identity(&entry)? != expected {
+                    return Err(ConfinedReadError::Changed);
+                }
+            }
             self.validate_directory_chain(parents, &identities, deadline)?;
             self.revalidate()?;
             return Ok(ConfinedFileRange {
@@ -468,6 +541,8 @@ impl ConfinedRoot {
         let after = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
         let entry =
             statat(&parent, *leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&after)?;
+        self.validate_external_entry(&entry)?;
         if identity(&after)? != expected || identity(&entry)? != expected {
             return Err(ConfinedReadError::Changed);
         }
@@ -489,6 +564,9 @@ impl ConfinedRoot {
         components: &[&OsStr],
         deadline: Instant,
     ) -> Result<(OwnedFd, Vec<ConfinedFileIdentity>), ConfinedReadError> {
+        if self.external_source {
+            self.revalidate_stable()?;
+        }
         let mut current = openat(
             &self.fd,
             OsStr::new("."),
@@ -506,7 +584,9 @@ impl ConfinedRoot {
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-            identities.push(identity(&fstat(&next).map_err(|_| ConfinedReadError::Io)?)?);
+            let stat = fstat(&next).map_err(|_| ConfinedReadError::Io)?;
+            self.validate_external_entry(&stat)?;
+            identities.push(identity(&stat)?);
             current = next;
         }
         Ok((current, identities))
@@ -531,9 +611,10 @@ impl ConfinedRoot {
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-            if identity(&entry)? != identities[index]
-                || identity(&fstat(&next).map_err(|_| ConfinedReadError::Io)?)? != identities[index]
-            {
+            let stat = fstat(&next).map_err(|_| ConfinedReadError::Io)?;
+            self.validate_external_entry(&entry)?;
+            self.validate_external_entry(&stat)?;
+            if identity(&entry)? != identities[index] || identity(&stat)? != identities[index] {
                 return Err(ConfinedReadError::Changed);
             }
             opened.push(next);
@@ -581,6 +662,9 @@ impl ConfinedRoot {
         before_read: impl FnOnce(),
     ) -> Result<ConfinedFile, ConfinedReadError> {
         check_deadline(limits.deadline)?;
+        if self.external_source {
+            self.revalidate_stable()?;
+        }
         let components = strict_components(relative)?;
         let (leaf, parents) = components
             .split_last()
@@ -599,6 +683,7 @@ impl ConfinedRoot {
             )
             .map_err(map_open_error)?;
             let stat = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+            self.validate_external_entry(&stat)?;
             if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
                 return Err(ConfinedReadError::UnsupportedType);
             }
@@ -615,6 +700,7 @@ impl ConfinedRoot {
         )
         .map_err(map_open_error)?;
         let before = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&before)?;
         if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
             return Err(ConfinedReadError::UnsupportedType);
         }
@@ -662,6 +748,8 @@ impl ConfinedRoot {
         let after = fstat(&fd).map_err(|_| ConfinedReadError::Io)?;
         let entry =
             statat(parent, *leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ConfinedReadError::Io)?;
+        self.validate_external_entry(&after)?;
+        self.validate_external_entry(&entry)?;
         if identity(&after)? != before_identity || identity(&entry)? != before_identity {
             return Err(ConfinedReadError::Changed);
         }
@@ -674,6 +762,8 @@ impl ConfinedRoot {
             let entry = statat(containing, *component, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|_| ConfinedReadError::Io)?;
             let opened = fstat(&owned_parents[index]).map_err(|_| ConfinedReadError::Io)?;
+            self.validate_external_entry(&entry)?;
+            self.validate_external_entry(&opened)?;
             if identity(&entry)? != parent_identities[index]
                 || identity(&opened)? != parent_identities[index]
             {
@@ -714,7 +804,9 @@ impl ConfinedRoot {
     }
 
     fn matches_original_root(&self, stat: &Stat) -> Result<bool, ConfinedReadError> {
-        Ok(self.matches_root(stat)? && identity(stat)? == self.identity)
+        // External root authority is its no-follow inode and current permission
+        // boundary, not directory timestamps changed by unrelated Host entries.
+        Ok(self.matches_root(stat)? && (self.external_source || identity(stat)? == self.identity))
     }
 
     fn revalidate_locator_chain(&self) -> Result<(), ConfinedReadError> {
@@ -727,6 +819,14 @@ impl ConfinedRoot {
             Mode::empty(),
         )
         .map_err(|_| ConfinedReadError::Io)?;
+        let mut private = false;
+        if self.external_source {
+            validate_external_ancestor(
+                &fstat(&current).map_err(|_| ConfinedReadError::Io)?,
+                self.owner,
+                &mut private,
+            )?;
+        }
         for (component, expected_identity) in expected {
             let entry = statat(&current, component, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|_| ConfinedReadError::Io)?;
@@ -737,15 +837,27 @@ impl ConfinedRoot {
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
+            let opened = fstat(&next).map_err(|_| ConfinedReadError::Io)?;
+            if self.external_source {
+                validate_external_ancestor(&entry, self.owner, &mut private)?;
+                validate_external_ancestor(&opened, self.owner, &mut private)?;
+            }
             if !same_file_identity(&identity(&entry)?, expected_identity)
-                || !same_file_identity(
-                    &identity(&fstat(&next).map_err(|_| ConfinedReadError::Io)?)?,
-                    expected_identity,
-                )
+                || !same_file_identity(&identity(&opened)?, expected_identity)
             {
                 return Err(ConfinedReadError::Changed);
             }
             current = next;
+        }
+        if self.external_source && !private {
+            return Err(ConfinedReadError::UnsupportedType);
+        }
+        Ok(())
+    }
+
+    fn validate_external_entry(&self, stat: &Stat) -> Result<(), ConfinedReadError> {
+        if self.external_source && (stat.st_uid != self.owner || stat.st_mode & 0o022 != 0) {
+            return Err(ConfinedReadError::UnsupportedType);
         }
         Ok(())
     }
@@ -756,8 +868,33 @@ impl ConfinedRoot {
             && current.device == self.identity.device
             && current.inode == self.identity.inode
             && stat.st_uid == self.owner
-            && stat.st_mode == self.mode)
+            && if self.external_source {
+                stat.st_mode & 0o022 == 0
+            } else {
+                stat.st_mode == self.mode
+            })
     }
+}
+
+fn validate_external_ancestor(
+    stat: &Stat,
+    owner: u32,
+    private: &mut bool,
+) -> Result<(), ConfinedReadError> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || if *private {
+            stat.st_uid != owner || stat.st_mode & 0o022 != 0
+        } else {
+            // A sticky writable parent protects root/current-UID child entries;
+            // the next component must satisfy this same owner check.
+            (stat.st_uid != 0 && stat.st_uid != owner)
+                || (stat.st_mode & 0o022 != 0 && stat.st_mode & 0o1000 == 0)
+        }
+    {
+        return Err(ConfinedReadError::UnsupportedType);
+    }
+    *private |= stat.st_uid == owner && stat.st_mode & 0o077 == 0;
+    Ok(())
 }
 
 fn same_file_identity(left: &ConfinedFileIdentity, right: &ConfinedFileIdentity) -> bool {
@@ -1085,6 +1222,137 @@ mod tests {
         );
         std::fs::remove_dir_all(root).expect("cleanup replacement");
         std::fs::remove_dir_all(displaced).expect("cleanup original");
+    }
+
+    #[test]
+    fn external_source_rechecks_private_ancestor_and_public_readonly_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+        let outer = root();
+        let source = outer.join("sessions");
+        let middle = source.join("dated");
+        std::fs::create_dir_all(&middle).unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for path in [&source, &middle] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let leaf = middle.join("file");
+        std::fs::write(&leaf, b"content").unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let confined = ConfinedRoot::open_external_source(&source).unwrap();
+        let file = confined.read(Path::new("dated/file"), limits(32)).unwrap();
+        assert!(
+            confined
+                .revalidate_file(Path::new("dated/file"), file.identity)
+                .is_ok()
+        );
+        assert!(confined.open_regular_file(Path::new("dated/file")).is_ok());
+        assert!(
+            confined
+                .list_directory(Some(Path::new("dated")), 4, limits(32).deadline)
+                .is_ok()
+        );
+        assert!(
+            confined
+                .read_range(
+                    Path::new("dated/file"),
+                    file.identity,
+                    0,
+                    4,
+                    limits(32).deadline
+                )
+                .is_ok()
+        );
+        assert!(
+            confined
+                .read_after_owned_mutation(Path::new("dated/file"), limits(32))
+                .is_err()
+        );
+        // Loss of the only private boundary is caught after actual IO, too.
+        assert!(
+            confined
+                .read_with_hook(Path::new("dated/file"), limits(32), || {
+                    std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                })
+                .is_err()
+        );
+        assert!(ConfinedRoot::open_external_source(&source).is_err());
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(confined.revalidate_stable().is_ok());
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            ConfinedRoot::open_external_source(&source)
+                .unwrap()
+                .read(Path::new("dated/file"), limits(32))
+                .is_ok()
+        );
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(confined.open_regular_file(Path::new("dated/file")).is_err());
+        assert!(
+            confined
+                .list_directory(Some(Path::new("dated")), 4, limits(32).deadline)
+                .is_err()
+        );
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            confined
+                .revalidate_file(Path::new("dated/file"), file.identity)
+                .is_err()
+        );
+        assert!(confined.read(Path::new("dated/file"), limits(32)).is_err());
+        assert!(confined.open_regular_file(Path::new("dated/file")).is_err());
+        assert!(
+            confined
+                .read_range(
+                    Path::new("dated/file"),
+                    file.identity,
+                    0,
+                    4,
+                    limits(32).deadline
+                )
+                .is_err()
+        );
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let fresh = confined.read(Path::new("dated/file"), limits(32)).unwrap();
+        std::fs::rename(&leaf, middle.join("old")).unwrap();
+        std::fs::write(&leaf, b"content").unwrap();
+        assert!(
+            confined
+                .read_range(
+                    Path::new("dated/file"),
+                    fresh.identity,
+                    0,
+                    4,
+                    limits(32).deadline
+                )
+                .is_err()
+        );
+        std::fs::remove_file(&leaf).unwrap();
+        symlink("old", &leaf).unwrap();
+        assert!(confined.read(Path::new("dated/file"), limits(32)).is_err());
+        symlink("dated", source.join("alias")).unwrap();
+        assert!(confined.open_regular_file(Path::new("alias/old")).is_err());
+        std::fs::remove_dir_all(outer).unwrap();
+    }
+
+    #[test]
+    fn external_source_rejects_unprotected_writable_ancestor_above_private_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        let outer = root();
+        let private = outer.join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ConfinedRoot::open_external_source(&private).is_err());
+        // Original recovery entry has not acquired this external-source policy.
+        assert!(ConfinedRoot::open_owned_private(&private).is_ok());
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let confined = ConfinedRoot::open_external_source(&private).unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(confined.revalidate_stable().is_err());
+        std::fs::remove_dir_all(outer).unwrap();
     }
 
     #[test]

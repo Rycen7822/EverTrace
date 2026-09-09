@@ -461,7 +461,7 @@ fn catalog_codex_sessions_after(
         requested_root,
     )
     .map_err(map_root)?;
-    let root = ConfinedRoot::open_owned_private(qualified.path()).map_err(map_read)?;
+    let root = ConfinedRoot::open_external_source(qualified.path()).map_err(map_read)?;
     let mut reader = CatalogReader {
         root: &root,
         repositories,

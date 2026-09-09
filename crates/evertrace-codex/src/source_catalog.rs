@@ -111,7 +111,7 @@ fn validate_root_identity(
         || before.file_type().is_symlink()
         || before.dev() != expected_device
         || before.ino() != expected_inode
-        || before.permissions().mode() & 0o077 != 0
+        || before.permissions().mode() & 0o022 != 0
     {
         return Err(SessionCatalogRootError::UnsafeIdentity);
     }
@@ -131,6 +131,12 @@ fn validate_root_identity(
         || after.dev() != expected_device
         || after.ino() != expected_inode
         || after.file_type().is_symlink()
+        || !pinned.is_dir()
+        || !after.is_dir()
+        || pinned.uid() != owner
+        || after.uid() != owner
+        || pinned.permissions().mode() & 0o022 != 0
+        || after.permissions().mode() & 0o022 != 0
     {
         return Err(SessionCatalogRootError::UnsafeIdentity);
     }

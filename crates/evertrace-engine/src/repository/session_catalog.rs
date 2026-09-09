@@ -122,7 +122,7 @@ fn observe_session_catalog_root_at(
     }
     let transcript = transcript_path.ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
     let (root, relative) = codex_session_path(transcript)?;
-    let confined = ConfinedRoot::open_owned_private(&root)
+    let confined = ConfinedRoot::open_external_source(&root)
         .map_err(|_| SessionCatalogObservationError::UnsafeIdentity)?;
     let observed_identity = match confined.read(
         &relative,
@@ -147,13 +147,13 @@ fn observe_session_catalog_root_at(
     if !root_metadata.file_type().is_dir()
         || root_metadata.file_type().is_symlink()
         || root_metadata.uid() != process_owner
-        || root_metadata.permissions().mode() & 0o077 != 0
+        || root_metadata.permissions().mode() & 0o022 != 0
         || root_metadata.dev() != confined.identity().device
         || root_metadata.ino() != confined.identity().inode
         || !transcript_metadata.file_type().is_file()
         || transcript_metadata.file_type().is_symlink()
         || transcript_metadata.uid() != process_owner
-        || transcript_metadata.permissions().mode() & 0o077 != 0
+        || transcript_metadata.permissions().mode() & 0o022 != 0
         || transcript_metadata.dev() != observed_identity.device
         || transcript_metadata.ino() != observed_identity.inode
         || transcript_metadata.size() != observed_identity.size
@@ -230,7 +230,7 @@ pub fn read_native_repository_trust(
     let Some(adapter_root) = sessions_root.parent() else {
         return unknown();
     };
-    let Ok(confined) = ConfinedRoot::open_owned_private(adapter_root) else {
+    let Ok(confined) = ConfinedRoot::open_external_source(adapter_root) else {
         return unknown();
     };
     let Ok(config) = confined.read(
@@ -253,7 +253,7 @@ pub fn read_native_repository_trust(
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.uid() != process.uid()
-        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.permissions().mode() & 0o022 != 0
         || metadata.dev() != config.identity.device
         || metadata.ino() != config.identity.inode
         || metadata.size() != config.identity.size
@@ -332,7 +332,7 @@ fn read_repository_trust_at(
     let Some(path) = worktree.current_path.as_deref() else {
         return unknown();
     };
-    let Ok(confined) = ConfinedRoot::open_owned_private(adapter_root) else {
+    let Ok(confined) = ConfinedRoot::open_external_source(adapter_root) else {
         return unknown();
     };
     let Ok(config) = confined.read(
@@ -355,7 +355,7 @@ fn read_repository_trust_at(
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.uid() != process.uid()
-        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.permissions().mode() & 0o022 != 0
         || metadata.dev() != config.identity.device
         || metadata.ino() != config.identity.inode
         || metadata.size() != config.identity.size

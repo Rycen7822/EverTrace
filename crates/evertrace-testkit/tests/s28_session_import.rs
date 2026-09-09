@@ -163,7 +163,11 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
         &sessions.join("2026/08"),
         &dated,
     ] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if path == &adapter { 0o700 } else { 0o755 }),
+        )
+        .unwrap();
     }
     let session_id = "019d0000-0000-7000-8000-000000000028";
     let transcript = dated.join(format!("rollout-2026-08-30T00-00-00-{session_id}.jsonl"));
@@ -199,7 +203,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
         .join("\n");
     let base = format!("{header}\n{visible}\n{extra_records}\n");
     fs::write(&transcript, &base).unwrap();
-    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o644)).unwrap();
     let report =
         observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28", None)
             .unwrap();
@@ -248,6 +252,34 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let worker =
         SessionImportWorker::new(handle.clone(), runtime(temp.path()), Arc::clone(&report))
             .unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        worker
+            .process_checkpoint(
+                session_id,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    deadline: Instant::now() + Duration::from_secs(2),
+                }
+            )
+            .await,
+        Err(evertrace_engine::SessionImportError::Unavailable)
+    ));
+    let before_import = handle.project().await.unwrap();
+    assert_eq!(
+        SessionImportCurrentView::from_snapshot(&before_import)
+            .unwrap()
+            .sessions[session_id]
+            .body_state,
+        SessionBodyState::Queued
+    );
+    assert!(
+        !before_import
+            .data_rows()
+            .any(|row| row.object_kind.as_deref() == Some("source_observation"))
+    );
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
     let mut imported = 0;
     for (checkpoint, expected_complete) in [false, false, true].into_iter().enumerate() {
         let progress = worker
