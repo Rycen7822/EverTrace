@@ -281,7 +281,7 @@ fn wiring(data_root: &Path, cli: &Path, config: &Path) -> Result<Vec<u8>, Instal
         "../../../packaging/codex/hooks.v1.template.json"
     ))
     .map_err(|_| InstallError::InvalidType)?;
-    for event in ["PreToolUse", "PostToolUse"] {
+    for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit"] {
         hooks["hooks"][event][0]["hooks"][0]["command"] = command.clone().into();
     }
     mcp.as_table_mut().ok_or(InstallError::InvalidType)?.insert(
@@ -321,13 +321,16 @@ fn merge_wiring(original: &[u8], owned: &[u8], uninstall: bool) -> Result<Vec<u8
             .find(OWNED_END)
             .map(|end| start + end + OWNED_END.len())
             .ok_or(InstallError::InvalidType)?;
-        if &text[start..end] != owned || text[end..].contains(OWNED_BEGIN) {
+        let actual = &text[start..end];
+        if (actual != owned && actual != previous_tool_wiring(owned)?)
+            || text[end..].contains(OWNED_BEGIN)
+        {
             return Err(InstallError::InvalidType);
         }
         if uninstall {
             format!("{}{}", &text[..start], &text[end..])
         } else {
-            text.to_owned()
+            format!("{}{}{}", &text[..start], owned, &text[end..])
         }
     } else {
         if text.contains(OWNED_END)
@@ -356,6 +359,27 @@ fn merge_wiring(original: &[u8], owned: &[u8], uninstall: bool) -> Result<Vec<u8
     }
     toml::from_str::<toml::Value>(&result).map_err(|_| InstallError::InvalidType)?;
     Ok(result.into_bytes())
+}
+
+// Exact predecessor emitted by the same owned template before submission
+// coverage. This is only a write/uninstall compatibility check, not evidence
+// of current installed coverage or tolerance for user edits.
+fn previous_tool_wiring(owned: &str) -> Result<String, InstallError> {
+    let body = owned
+        .strip_prefix(OWNED_BEGIN)
+        .and_then(|value| value.strip_suffix(OWNED_END))
+        .ok_or(InstallError::InvalidType)?;
+    let mut value: toml::Value = toml::from_str(body).map_err(|_| InstallError::InvalidType)?;
+    value
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or(InstallError::InvalidType)?
+        .remove("UserPromptSubmit")
+        .ok_or(InstallError::InvalidType)?;
+    Ok(format!(
+        "{OWNED_BEGIN}{}{OWNED_END}",
+        toml::to_string(&value).map_err(|_| InstallError::InvalidType)?
+    ))
 }
 
 /// Read-only canary preflight uses exactly the installer-owned fragment, not a
@@ -1020,7 +1044,7 @@ pub struct PackageCheckPreflight {
 }
 
 /// Wiring for the caller-owned disposable package probe only.
-pub fn candidate_host_arguments() -> [String; 5] {
+pub fn candidate_host_arguments() -> [String; 6] {
     // Literal definitions remain stable across disposable roots. Environment is
     // routing only; normal Host hook trust and candidate evidence still apply.
     let command =
@@ -1029,6 +1053,7 @@ pub fn candidate_host_arguments() -> [String; 5] {
     [
         format!("hooks.PreToolUse=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         format!("hooks.PostToolUse=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
+        format!("hooks.UserPromptSubmit=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         "mcp_servers.evertrace.command=\"/bin/sh\"".into(),
         "mcp_servers.evertrace.env_vars=[\"EVERTRACE_CANDIDATE_PACKAGE\",\"EVERTRACE_CANDIDATE_CONFIG\"]".into(),
         format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),

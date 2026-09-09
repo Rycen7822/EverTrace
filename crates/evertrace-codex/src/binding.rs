@@ -196,6 +196,70 @@ pub enum NativeToolUseEvent {
     PostToolUse,
 }
 
+/// Fixed external submission envelope. It makes no claim that the Host
+/// accepted the input and carries no tool-call or submission identity.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeInputSubmission {
+    pub cwd: String,
+    pub hook_event_name: NativeSubmissionEvent,
+    pub model: String,
+    pub permission_mode: NativePermissionMode,
+    pub session_id: String,
+    pub turn_id: String,
+    pub transcript_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub enum NativeSubmissionEvent {
+    #[serde(rename = "UserPromptSubmit")]
+    Submitted,
+}
+
+impl NativeInputSubmission {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, BindingError> {
+        let value: Self = serde_json::from_slice(bytes).map_err(|_| BindingError::InvalidCall)?;
+        value.validate_host_fields()?;
+        Ok(value)
+    }
+
+    pub fn validate_host_fields(&self) -> Result<(), BindingError> {
+        validate_native_host_fields(
+            &self.cwd,
+            &self.model,
+            &self.session_id,
+            &self.turn_id,
+            self.transcript_path.as_deref(),
+        )
+    }
+}
+
+fn validate_native_host_fields(
+    cwd: &str,
+    model: &str,
+    session: &str,
+    turn: &str,
+    transcript: Option<&str>,
+) -> Result<(), BindingError> {
+    if !valid_lexical_absolute_path(cwd)
+        || [model, session, turn].into_iter().any(|value| {
+            value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+        })
+        || transcript.is_some_and(|value| {
+            value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control)
+        })
+    {
+        Err(BindingError::InvalidAnchor)
+    } else {
+        Ok(())
+    }
+}
+
 impl<T> NativeToolUse<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -218,22 +282,16 @@ where
     }
 
     pub fn validate_host_fields(&self) -> Result<(), BindingError> {
-        if !valid_lexical_absolute_path(&self.cwd)
-            || self.model.is_empty()
-            || self.session_id.is_empty()
-            || self.tool_use_id.is_empty()
-            || self.transcript_path.as_deref().is_some_and(|value| {
-                value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control)
-            })
-            || self.turn_id.is_empty()
-            || [
-                &self.model,
-                &self.session_id,
-                &self.tool_use_id,
-                &self.turn_id,
-            ]
-            .into_iter()
-            .any(|value| value.len() > 512 || value.chars().any(char::is_control))
+        validate_native_host_fields(
+            &self.cwd,
+            &self.model,
+            &self.session_id,
+            &self.turn_id,
+            self.transcript_path.as_deref(),
+        )?;
+        if self.tool_use_id.is_empty()
+            || self.tool_use_id.len() > 512
+            || self.tool_use_id.chars().any(char::is_control)
         {
             Err(BindingError::InvalidAnchor)
         } else {

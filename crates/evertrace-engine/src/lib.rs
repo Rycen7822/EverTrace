@@ -42,7 +42,7 @@ pub use service::{
     ConfigReloadAudit, ConfigReloadOutcome, ConfigReloadSource, EngineError, EngineService,
     HealthDispatchError, HealthSnapshot, HumanActionOutcome, HumanBackupSummary,
     HumanBackupTableState, HumanBackupValidationResult, HumanCompetingDetail, HumanDegradedReason,
-    HumanExecutionIntegrityDetail, HumanForgetPreview, HumanGovernanceError,
+    HumanEvidenceDetail, HumanExecutionIntegrityDetail, HumanForgetPreview, HumanGovernanceError,
     HumanGovernanceService, HumanItemCategory, HumanJobBudget, HumanJobDetail, HumanJobState,
     HumanJobTerminalReason, HumanNativeHistoryCleanupAvailability, HumanNegativeDecision,
     HumanObjectFamily, HumanPage, HumanProposalDecision, HumanProposalReview, HumanRecoveryDetail,

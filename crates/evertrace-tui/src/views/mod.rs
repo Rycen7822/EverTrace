@@ -137,6 +137,40 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
         format!("audit row: {}", item.stable_key),
         daemon_status,
     ];
+    if let Some(detail) = &item.evidence_detail {
+        use evertrace_domain::evidence::ProtectedPresentation;
+        lines.extend([
+            format!(
+                "source/role: {:?} / {:?}",
+                detail.source_kind, detail.source_role
+            ),
+            format!(
+                "observation/trust: {:?} / {:?}",
+                detail.observation_role, detail.content_trust
+            ),
+            format!(
+                "capture: {:?}; instruction authority: none",
+                detail.capture_completeness
+            ),
+            format!("protected bytes: {}", detail.protected_length),
+            format!("CAS: {}", detail.cas_ref),
+        ]);
+        if detail.observation_role == evertrace_domain::evidence::ObservationRole::Message {
+            lines.push("Observed message; acceptance or task intent not established".into());
+        }
+        lines.push(match &detail.protected_presentation {
+            Some(ProtectedPresentation::Inline { text }) => {
+                format!("protected inline: {}", text.escape_debug())
+            }
+            Some(ProtectedPresentation::Preview { text }) => {
+                format!("protected preview (partial): {}", text.escape_debug())
+            }
+            Some(ProtectedPresentation::Unavailable { reason }) => {
+                format!("protected presentation unavailable: {reason:?}")
+            }
+            None => "protected presentation unavailable".into(),
+        });
+    }
     if let Some(proposal) = &item.proposal {
         lines.extend([
             format!(

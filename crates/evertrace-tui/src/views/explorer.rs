@@ -19,8 +19,13 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
             },
         )
     };
-    f.render_widget(
-        components::table("Explorer", body).scroll((state.detail_scroll, 0)),
-        a,
-    )
+    let mut paragraph = components::table("Explorer", body).scroll((state.detail_scroll, 0));
+    if state
+        .detail
+        .as_ref()
+        .is_some_and(|item| item.evidence_detail.is_some())
+    {
+        paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
+    }
+    f.render_widget(paragraph, a)
 }

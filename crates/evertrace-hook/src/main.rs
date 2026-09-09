@@ -187,7 +187,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
         },
         surface_eligible: matches!(
             input.event_kind,
-            HookEventKind::PreToolUse | HookEventKind::PostToolUse
+            HookEventKind::PreToolUse | HookEventKind::PostToolUse | HookEventKind::InputSubmitted
         ) && input.payload.len()
             <= evertrace_domain::evidence::MAX_EVIDENCE_SURFACE_BYTES,
         adapter_revision: 1,
@@ -398,9 +398,11 @@ impl Drop for InvocationChild {
 fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
     let capture_input = CaptureHookInput::from_json(bytes).ok();
     let native_input = NativeToolUse::from_json(bytes).ok();
-    let (session_id, binding_mode) = match (&capture_input, &native_input) {
-        (Some(input), None) => (input.session_id.as_str(), false),
-        (None, Some(input)) => (
+    let submission = evertrace_codex::binding::NativeInputSubmission::from_json(bytes).ok();
+    let (session_id, binding_mode) = match (&capture_input, &native_input, &submission) {
+        (Some(input), None, None) => (input.session_id.as_str(), false),
+        (None, None, Some(input)) => (input.session_id.as_str(), false),
+        (None, Some(input), None) => (
             input.session_id.as_str(),
             input.hook_event_name == NativeToolUseEvent::PreToolUse && input.targets_evertrace(),
         ),
@@ -435,6 +437,12 @@ fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
     let normalized;
     let bytes = if !binding_mode && let Some(native) = native_input {
         normalized = CaptureHookInput::from_native(native, generation.generation)
+            .map_err(|_| ())?
+            .to_json()
+            .map_err(|_| ())?;
+        normalized.as_slice()
+    } else if let Some(submission) = submission {
+        normalized = CaptureHookInput::from_submission(submission, generation.generation)
             .map_err(|_| ())?
             .to_json()
             .map_err(|_| ())?;
@@ -516,6 +524,7 @@ fn recovery_barrier_budget(
 
 const fn observation_role(kind: HookEventKind) -> ObservationRole {
     match kind {
+        HookEventKind::InputSubmitted => ObservationRole::Message,
         HookEventKind::PreToolUse => ObservationRole::Intent,
         HookEventKind::PostToolUse => ObservationRole::Result,
         HookEventKind::SubagentStart
@@ -530,7 +539,8 @@ const fn observation_role(kind: HookEventKind) -> ObservationRole {
 const fn source_role(kind: HookEventKind) -> SourceRole {
     match kind {
         HookEventKind::PreToolUse | HookEventKind::PostToolUse => SourceRole::Tool,
-        HookEventKind::SubagentStart
+        HookEventKind::InputSubmitted
+        | HookEventKind::SubagentStart
         | HookEventKind::SubagentTerminal
         | HookEventKind::Compact
         | HookEventKind::SourceClose
@@ -540,10 +550,12 @@ const fn source_role(kind: HookEventKind) -> SourceRole {
 }
 
 const fn unsupported_classification(
-    _kind: HookEventKind,
+    kind: HookEventKind,
     payload_length: usize,
 ) -> Option<UnsupportedRecordClassification> {
-    if payload_length > evertrace_domain::evidence::MAX_EVIDENCE_SURFACE_BYTES {
+    if !matches!(kind, HookEventKind::InputSubmitted)
+        && payload_length > evertrace_domain::evidence::MAX_EVIDENCE_SURFACE_BYTES
+    {
         Some(UnsupportedRecordClassification::UnboundedToolOutput)
     } else {
         None

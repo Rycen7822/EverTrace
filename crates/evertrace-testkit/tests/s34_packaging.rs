@@ -1100,6 +1100,258 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
 }
 
 #[tokio::test]
+async fn submitted_inputs_are_weak_independent_and_visible_after_automatic_ingest() {
+    use evertrace_domain::{
+        evidence::{ContentTrust, ObservationRole, SourceRole},
+        ids::RequestId,
+    };
+    use evertrace_protocol::{
+        LocalClient,
+        command::Command as Rpc,
+        dto::{
+            ClientKind, HumanGovernanceRequest, HumanGovernanceResponse, HumanReadRequest,
+            HumanSurface,
+        },
+        response::Response,
+    };
+    use std::time::{Duration, Instant};
+    let (_root, paths, config) = fixture();
+    let mut settings = config.config().clone();
+    settings.llm.enabled = false;
+    settings.capture.inline_payload_bytes = 131_072;
+    fs::write(
+        &paths.config,
+        EffectiveConfig::new(settings).unwrap().to_toml().unwrap(),
+    )
+    .unwrap();
+    install_offline(&paths, false).unwrap();
+    let mut raw = serde_json::json!({"cwd":paths.data_root,"hook_event_name":"UserPromptSubmit",
+        "model":"test","permission_mode":"default","session_id":"submission-session","turn_id":"same-turn",
+        "transcript_path":null,"prompt":"submitted only api_key=secret-canary-value"});
+    // Synthetic deliveries cover same-turn multiplicity and child declarations;
+    // they do not manufacture a source-local namespace or accepted Task intent.
+    let mut malformed = raw.clone();
+    malformed["source_local_evidence"] = serde_json::json!({"namespace":"invented"});
+    assert!(
+        evertrace_codex::binding::NativeInputSubmission::from_json(
+            &serde_json::to_vec(&malformed).unwrap()
+        )
+        .is_err()
+    );
+    malformed = raw.clone();
+    malformed["prompt"] = 7.into();
+    assert!(
+        evertrace_codex::binding::NativeInputSubmission::from_json(
+            &serde_json::to_vec(&malformed).unwrap()
+        )
+        .is_err()
+    );
+    invoke(&paths, &serde_json::to_vec(&raw).unwrap());
+    invoke(&paths, &serde_json::to_vec(&raw).unwrap());
+    raw["agent_id"] = "child-declaration".into();
+    raw["agent_type"] = "worker".into();
+    raw["prompt"] = "different submitted input in the same turn "
+        .repeat(1800)
+        .into();
+    invoke(&paths, &serde_json::to_vec(&raw).unwrap());
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
+    let spool =
+        DurableSpool::open_read_only(&runtime.spool_dir, runtime.spool_limits().unwrap()).unwrap();
+    let frames = spool.read_active().unwrap();
+    assert_eq!(frames.len(), 3);
+    let original = frames[0].record.clone();
+    for frame in frames {
+        let body = evertrace_capture::decode_record_body(&frame.record.record_body).unwrap();
+        assert_eq!(body.observation_role, ObservationRole::Message);
+        assert_eq!(body.source_role, SourceRole::Host);
+        assert_eq!(body.content_trust, ContentTrust::Observed);
+        assert_eq!(body.capture_completeness, CaptureCompleteness::Partial);
+        assert!(
+            body.source_local_evidence.is_none() && body.correlation.native_request_id.is_none()
+        );
+        assert!(body.task_id.is_none() && body.lifecycle.is_none());
+    }
+    drop(spool);
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for replay in [false, true] {
+        if replay {
+            let mut spool =
+                DurableSpool::open_read_only(&runtime.spool_dir, runtime.spool_limits().unwrap())
+                    .unwrap();
+            spool.append(&original).unwrap();
+        }
+        let mut daemon = Daemon(
+            Command::new(&paths.daemon)
+                .arg("--config")
+                .arg(&paths.config)
+                .env_clear()
+                .env("HOME", paths.data_root.parent().unwrap())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if package_health(socket.clone()).await {
+                let connection = evertrace_store::connection::CompatibilityStore::connect_local(
+                    &evertrace_store::connection::native_root(&paths.data_root),
+                )
+                .await
+                .unwrap();
+                let journal = connection
+                    .connection()
+                    .open_table(evertrace_store::JOURNAL_TABLE)
+                    .execute()
+                    .await
+                    .unwrap();
+                let rows = evertrace_store::journal::read_all_journal_rows(&journal)
+                    .await
+                    .unwrap();
+                let payloads = rows
+                    .iter()
+                    .map(|row| row.payload().unwrap())
+                    .collect::<Vec<_>>();
+                let receipts = payloads
+                    .iter()
+                    .filter_map(|payload| match payload {
+                        JournalPayload::SourceReceiptRecorded(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(receipts.len() <= 3);
+                let spool = DurableSpool::open_read_only(
+                    &runtime.spool_dir,
+                    runtime.spool_limits().unwrap(),
+                )
+                .unwrap();
+                if receipts.len() == 3
+                    && spool.read_durable_records(16, 2 << 20).unwrap().is_empty()
+                {
+                    assert_eq!(
+                        receipts
+                            .iter()
+                            .map(|receipt| receipt.source_instance_id.clone())
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len(),
+                        3
+                    );
+                    assert!(!payloads.iter().any(|payload| matches!(
+                        payload,
+                        JournalPayload::OperationDerived(_)
+                            | JournalPayload::TaskRecorded(_)
+                            | JournalPayload::ExecutionLaneRecorded(_)
+                            | JournalPayload::CaptureReceiptRecorded(_)
+                    )));
+                    assert!(
+                        !serde_json::to_string(&receipts)
+                            .unwrap()
+                            .contains("secret-canary-value")
+                    );
+                    let largest = receipts
+                        .iter()
+                        .max_by_key(|receipt| receipt.protected_length)
+                        .unwrap();
+                    assert!(
+                        matches!(&largest.protected_presentation, Some(evertrace_domain::evidence::ProtectedPresentation::Inline { text }) if text.len() > 65_536)
+                    );
+                    let object = format!(
+                        "object:evidence:source_receipt:{}",
+                        largest.source_receipt_id
+                    );
+                    let mut client = LocalClient::connect(
+                        &socket,
+                        "s34-submission",
+                        ClientKind::Cli,
+                        Duration::from_secs(3),
+                    )
+                    .await
+                    .unwrap();
+                    let mut observed = false;
+                    while Instant::now() < deadline {
+                        let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
+                            frontier,
+                            items,
+                            ..
+                        }) = client
+                            .request(
+                                RequestId::new_v7(),
+                                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                                    request: HumanReadRequest::List {
+                                        surface: HumanSurface::Explorer,
+                                        expected_frontier: None,
+                                        after: None,
+                                        limit: 16,
+                                    },
+                                }),
+                            )
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("explorer list");
+                        };
+                        assert!(items.iter().all(|item| item.evidence_detail.is_none()));
+                        let response = client
+                            .request(
+                                RequestId::new_v7(),
+                                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                                    request: HumanReadRequest::Detail {
+                                        surface: HumanSurface::Explorer,
+                                        object_ref: object.clone(),
+                                        expected_frontier: frontier,
+                                        expected_revision_ref: None,
+                                    },
+                                }),
+                            )
+                            .await
+                            .unwrap();
+                        match response {
+                            Response::HumanGovernance(HumanGovernanceResponse::Conflict {
+                                ..
+                            }) => continue,
+                            Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
+                                items,
+                                ..
+                            }) => {
+                                assert_eq!(items.len(), 1);
+                                let detail = items[0].evidence_detail.as_ref().unwrap();
+                                assert_eq!(detail.observation_role, ObservationRole::Message);
+                                assert_eq!(detail.content_trust, ContentTrust::Observed);
+                                assert_eq!(
+                                    detail.capture_completeness,
+                                    CaptureCompleteness::Partial
+                                );
+                                assert!(
+                                    matches!(&detail.protected_presentation, Some(evertrace_domain::evidence::ProtectedPresentation::Preview { text }) if text.len() <= 65_536)
+                                );
+                                assert_eq!(detail.protected_length, largest.protected_length);
+                                let encoded = serde_json::to_string(&items).unwrap();
+                                assert!(!encoded.contains("secret-canary-value"));
+                                observed = true;
+                                break;
+                            }
+                            other => panic!("unexpected detail: {other:?}"),
+                        }
+                    }
+                    assert!(observed);
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn package_check_prepares_native_and_materials_without_publication() {
     use evertrace_engine::maintenance::{check_package_upgrade, upgrade_offline};
     use std::os::unix::fs::MetadataExt;
@@ -1706,6 +1958,53 @@ fn owned_merge_idempotence_uninstall_and_unknown_owner() {
     assert!(install_offline(&paths, false).unwrap().backups.is_empty());
     assert_eq!(fs::read(&paths.host_config).unwrap(), installed);
     fs::write(paths.data_root.join("user-data"), b"keep").unwrap();
+    // Literal output of the pre-edit package's real isolated install, checked
+    // against 5643caa's owned format; not generated by the new compatibility helper.
+    let historical = r#"# BEGIN EverTrace managed wiring v1
+[[hooks.PostToolUse]]
+matcher = ".*"
+
+[[hooks.PostToolUse.hooks]]
+command = "'/experiment/old-home/.local/share/evertrace/hook-v1' --launcher-root '/experiment/old-home/.local/share/evertrace'"
+timeout = 3
+type = "command"
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+command = "'/experiment/old-home/.local/share/evertrace/hook-v1' --launcher-root '/experiment/old-home/.local/share/evertrace'"
+timeout = 3
+type = "command"
+
+[mcp_servers.evertrace]
+args = ["--config", "/experiment/old.toml", "mcp"]
+command = "/package/evertrace"
+enabled_tools = ["evertrace"]
+# END EverTrace managed wiring v1
+"#
+        .replace("/experiment/old-home/.local/share/evertrace", paths.data_root.to_str().unwrap())
+        .replace("/experiment/old.toml", paths.config.to_str().unwrap())
+        .replace("/package/evertrace", paths.cli.to_str().unwrap());
+    fs::write(&paths.host_config, format!("{original}{historical}")).unwrap();
+    assert!(
+        evertrace_codex::install::validate_installed_wiring(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config
+        )
+        .is_err()
+    );
+    install_offline(&paths, false).unwrap();
+    assert_eq!(fs::read(&paths.host_config).unwrap(), installed);
+    let edited_old = format!(
+        "{original}{}",
+        historical.replace("timeout = 3", "timeout = 4")
+    );
+    fs::write(&paths.host_config, &edited_old).unwrap();
+    assert!(install_offline(&paths, false).is_err());
+    assert_eq!(fs::read_to_string(&paths.host_config).unwrap(), edited_old);
+    fs::write(&paths.host_config, format!("{original}{historical}")).unwrap();
     install_offline(&paths, true).unwrap();
     assert_eq!(fs::read_to_string(&paths.host_config).unwrap(), original);
     assert_eq!(

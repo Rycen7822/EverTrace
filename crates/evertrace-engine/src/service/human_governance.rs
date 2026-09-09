@@ -220,6 +220,7 @@ pub enum HumanItemCategory {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanSummary {
+    pub evidence_detail: Option<HumanEvidenceDetail>,
     pub proposal: Option<HumanProposalSummary>,
     pub proposal_review: Option<HumanProposalReview>,
     pub support_detail: Option<HumanSupportDetail>,
@@ -245,6 +246,18 @@ pub struct HumanSummary {
     pub support_state: Option<String>,
     pub scope_ref: Option<String>,
     pub source_event_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanEvidenceDetail {
+    pub source_kind: evertrace_domain::evidence::EvidenceSourceKind,
+    pub observation_role: evertrace_domain::evidence::ObservationRole,
+    pub source_role: evertrace_domain::evidence::SourceRole,
+    pub content_trust: evertrace_domain::evidence::ContentTrust,
+    pub capture_completeness: evertrace_domain::evidence::CaptureCompleteness,
+    pub protected_presentation: Option<evertrace_domain::evidence::ProtectedPresentation>,
+    pub protected_length: u64,
+    pub cas_ref: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3810,6 +3823,11 @@ fn summary(
     surface: HumanSurface,
     include_detail: bool,
 ) -> Result<HumanSummary, HumanGovernanceError> {
+    let evidence_detail = if include_detail && surface == HumanSurface::Explorer {
+        source_evidence_detail(snapshot, row)?
+    } else {
+        None
+    };
     let deletion_admission = include_detail
         .then(|| ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot))
         .transpose()
@@ -4094,6 +4112,7 @@ fn summary(
             (None, None, None, None)
         };
     Ok(HumanSummary {
+        evidence_detail,
         proposal,
         proposal_review,
         support_detail,
@@ -4129,6 +4148,81 @@ fn summary(
             .or_else(|| row.session_id.clone()),
         source_event_seq: row.source_event_seq,
     })
+}
+
+fn source_evidence_detail(
+    snapshot: &ProjectionSnapshot,
+    row: &ObjectRow,
+) -> Result<Option<HumanEvidenceDetail>, HumanGovernanceError> {
+    use evertrace_domain::evidence::ProtectedPresentation;
+    if !matches!(
+        row.object_kind.as_deref(),
+        Some("source_receipt" | "source_observation")
+    ) {
+        return Ok(None);
+    }
+    let decode = |row: &ObjectRow| {
+        serde_json::from_str::<JournalPayload>(
+            row.payload_json
+                .as_deref()
+                .ok_or(HumanGovernanceError::Store)?,
+        )
+        .map_err(|_| HumanGovernanceError::Store)
+    };
+    let (receipt, observation) = match decode(row)? {
+        JournalPayload::SourceReceiptRecorded(receipt) => {
+            let other = snapshot
+                .row(&format!(
+                    "object:evidence:source_observation:{}",
+                    receipt.source_observation_id
+                ))
+                .ok_or(HumanGovernanceError::Store)?;
+            let JournalPayload::SourceObservationRecorded(observation) = decode(other)? else {
+                return Err(HumanGovernanceError::Store);
+            };
+            (receipt, observation)
+        }
+        JournalPayload::SourceObservationRecorded(observation) => {
+            let other = snapshot
+                .row(&format!(
+                    "object:evidence:source_receipt:{}",
+                    observation.source_receipt_ref
+                ))
+                .ok_or(HumanGovernanceError::Store)?;
+            let JournalPayload::SourceReceiptRecorded(receipt) = decode(other)? else {
+                return Err(HumanGovernanceError::Store);
+            };
+            (receipt, observation)
+        }
+        _ => return Err(HumanGovernanceError::Store),
+    };
+    if receipt.source_observation_id != observation.source_observation_id
+        || receipt.source_receipt_id != observation.source_receipt_ref
+    {
+        return Err(HumanGovernanceError::Store);
+    }
+    Ok(Some(HumanEvidenceDetail {
+        source_kind: receipt.source_kind,
+        observation_role: observation.observation_role,
+        source_role: observation.source_role,
+        content_trust: observation.content_trust,
+        capture_completeness: receipt.capture_completeness,
+        protected_presentation: receipt.protected_presentation.map(
+            |presentation| match presentation {
+                ProtectedPresentation::Inline { mut text } if text.len() > 65_536 => {
+                    let mut end = 65_536;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                    ProtectedPresentation::Preview { text }
+                }
+                presentation => presentation,
+            },
+        ),
+        protected_length: receipt.protected_length,
+        cas_ref: receipt.cas_ref,
+    }))
 }
 
 fn forget_target(row: &ObjectRow) -> Result<Option<ObjectDeletionTarget>, HumanGovernanceError> {

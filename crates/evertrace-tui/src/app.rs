@@ -762,12 +762,18 @@ impl App {
         } else {
             frame.render_widget(components::navigation(self.state.route), shell.nav);
             views::render(frame, shell.list, &self.state);
-            frame.render_widget(
-                components::inspector(views::inspector_text(&self.state))
-                    .style(Style::default().fg(palette.muted).bg(palette.surface))
-                    .scroll((self.state.detail_scroll, 0)),
-                shell.inspector,
-            );
+            let mut inspector = components::inspector(views::inspector_text(&self.state))
+                .style(Style::default().fg(palette.muted).bg(palette.surface))
+                .scroll((self.state.detail_scroll, 0));
+            if self
+                .state
+                .detail
+                .as_ref()
+                .is_some_and(|item| item.evidence_detail.is_some())
+            {
+                inspector = inspector.wrap(ratatui::widgets::Wrap { trim: false });
+            }
+            frame.render_widget(inspector, shell.inspector);
         }
         frame.render_widget(components::status_bar(&self.state.shell), shell.status);
         let hints = if self.state.repository_purge_confirmation.is_some() {
@@ -2714,6 +2720,7 @@ mod tests {
         reviewed.fingerprint = reviewed.recompute_fingerprint().unwrap();
         assert!(reviewed.validate().is_ok());
         let item = HumanSnapshotItem {
+            evidence_detail: None,
             item_kind: HumanItemKind::RevisionProposal,
             proposal: Some(HumanProposalMetadata {
                 proposal_id,
@@ -3474,6 +3481,89 @@ mod tests {
         assert!(render_app(&stopping, 100, 30).contains("Daemon stopping; read unavailable"));
     }
 
+    #[test]
+    fn submitted_evidence_detail_is_authority_free_and_control_safe() {
+        use evertrace_domain::evidence::{
+            CaptureCompleteness, ContentTrust, EvidenceSourceKind, ObservationRole,
+            ProtectedPresentation, SourceRole,
+        };
+        let mut app = App::new();
+        app.state.route = crate::Route::Explorer;
+        let mut item = snapshot_item("source_receipt", "receipt-test".into());
+        assert!(
+            !String::from_utf8(evertrace_protocol::frame::canonical_json(&item).unwrap())
+                .unwrap()
+                .contains("evidence_detail")
+        );
+        item.evidence_detail = Some(evertrace_protocol::dto::HumanEvidenceDetail {
+            source_kind: EvidenceSourceKind::CodexHook,
+            observation_role: ObservationRole::Message,
+            source_role: SourceRole::Host,
+            content_trust: ContentTrust::Observed,
+            capture_completeness: CaptureCompleteness::Partial,
+            protected_presentation: Some(ProtectedPresentation::Preview {
+                text: "submitted \u{1b}[31m".into(),
+            }),
+            protected_length: 100,
+            cas_ref: "a".repeat(64),
+        });
+        app.state.detail = Some(item);
+        let rendered = render_app(&app, 140, 40);
+        assert!(rendered.contains("Message / Observed"));
+        assert!(rendered.contains("capture: Partial; instruction authority: none"));
+        assert!(rendered.contains("acceptance or task intent not established"));
+        assert!(rendered.contains("protected preview (partial): submitted"));
+        assert!(!rendered.contains('\u{1b}'));
+        app.state
+            .detail
+            .as_mut()
+            .unwrap()
+            .evidence_detail
+            .as_mut()
+            .unwrap()
+            .protected_presentation = Some(ProtectedPresentation::Preview {
+            text: format!("{} submitted-tail", "prefix ".repeat(30)),
+        });
+        assert!(render_app(&app, 140, 40).contains("submitted-tail"));
+        assert!(render_app(&app, 70, 40).contains("submitted-tail"));
+        let mut item = app.state.detail.take().unwrap();
+        item.evidence_detail
+            .as_mut()
+            .unwrap()
+            .protected_presentation = Some(ProtectedPresentation::Preview {
+            text: "\0".repeat(65_536),
+        });
+        item.evidence_detail.as_mut().unwrap().protected_length = 1_048_576;
+        let response = evertrace_protocol::envelope::ServerEnvelope::Response(
+            evertrace_protocol::response::ResponseEnvelope {
+                request_id: evertrace_domain::ids::RequestId::new_v7(),
+                response: evertrace_protocol::response::Response::HumanGovernance(
+                    evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
+                        frontier: 1,
+                        status: evertrace_protocol::dto::HumanSnapshotStatus::Ready,
+                        degraded_reasons: vec![],
+                        items: vec![item],
+                        next_cursor: None,
+                    },
+                ),
+            },
+        );
+        let mut framed = Vec::new();
+        evertrace_protocol::frame::write_frame_sync(
+            &mut framed,
+            &response,
+            evertrace_protocol::dto::MAX_FRAME_SIZE,
+        )
+        .unwrap();
+        assert!(framed.len() > 6 * 65_536);
+        let mut rejected = Vec::new();
+        assert!(matches!(
+            evertrace_protocol::frame::write_frame_sync(&mut rejected, &response, 65_536),
+            Err(evertrace_protocol::frame::FrameError::Oversize)
+        ));
+        assert!(rejected.is_empty());
+    }
+
     fn snapshot_item(family: &str, object_ref: String) -> HumanSnapshotItem {
         let (category, object_family) = match family {
             "recovery_bundle" => (HumanItemCategory::RecoveryEvidence, HumanObjectFamily::Work),
@@ -3481,6 +3571,7 @@ mod tests {
             _ => (HumanItemCategory::Work, HumanObjectFamily::Work),
         };
         HumanSnapshotItem {
+            evidence_detail: None,
             item_kind: HumanItemKind::Generic,
             proposal: None,
             proposal_review: None,

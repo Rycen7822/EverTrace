@@ -370,6 +370,8 @@ pub struct HumanRepositoryPurgePreview {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanSnapshotItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_detail: Option<HumanEvidenceDetail>,
     pub item_kind: HumanItemKind,
     pub proposal: Option<HumanProposalMetadata>,
     pub proposal_review: Option<HumanProposalReview>,
@@ -398,6 +400,19 @@ pub struct HumanSnapshotItem {
     pub support_state: Option<String>,
     pub scope_ref: Option<String>,
     pub source_event_seq: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanEvidenceDetail {
+    pub source_kind: evertrace_domain::evidence::EvidenceSourceKind,
+    pub observation_role: evertrace_domain::evidence::ObservationRole,
+    pub source_role: evertrace_domain::evidence::SourceRole,
+    pub content_trust: evertrace_domain::evidence::ContentTrust,
+    pub capture_completeness: evertrace_domain::evidence::CaptureCompleteness,
+    pub protected_presentation: Option<evertrace_domain::evidence::ProtectedPresentation>,
+    pub protected_length: u64,
+    pub cas_ref: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -893,6 +908,28 @@ impl HumanGovernanceResponse {
 impl HumanSnapshotItem {
     fn validate(&self) -> bool {
         ((self.item_kind == HumanItemKind::RevisionProposal) == self.proposal.is_some())
+            && self.evidence_detail.as_ref().is_none_or(|detail| {
+                use evertrace_domain::evidence::ProtectedPresentation;
+                matches!(
+                    self.object_kind.as_str(),
+                    "source_receipt" | "source_observation"
+                ) && detail.protected_length > 0
+                    && valid_hex(&detail.cas_ref)
+                    && detail
+                        .protected_presentation
+                        .as_ref()
+                        .is_none_or(|value| match value {
+                            ProtectedPresentation::Inline { text } => {
+                                text.len() <= 1_048_576
+                                    && text.len() as u64 == detail.protected_length
+                            }
+                            ProtectedPresentation::Preview { text } => {
+                                text.len() <= 65_536
+                                    && (text.len() as u64) < detail.protected_length
+                            }
+                            ProtectedPresentation::Unavailable { .. } => true,
+                        })
+            })
             && ((self.category == HumanItemCategory::NegativeReview)
                 == self.negative_review.is_some())
             && self.proposal.as_ref().is_none_or(|proposal| {

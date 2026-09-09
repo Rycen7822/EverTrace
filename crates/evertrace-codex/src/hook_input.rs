@@ -11,6 +11,7 @@ use crate::capability::CanaryStatus;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEventKind {
+    InputSubmitted,
     PreToolUse,
     PostToolUse,
     SubagentStart,
@@ -171,20 +172,71 @@ impl CaptureHookInput {
         input: crate::binding::NativeToolUse<serde_json::Value>,
         generation: u64,
     ) -> Result<Self, HookInputError> {
-        use evertrace_domain::evidence::{
-            CorrelationField, CorrelationFieldClaim, ObservationRole, SourceInstanceId,
-        };
         input
             .validate_host_fields()
             .map_err(|_| HookInputError::Invalid)?;
-        let report = native_generation_report(generation)?;
-        let manifest = report.manifest().adapter_manifest_id.clone();
-        let source = SourceInstanceId::new_v7().as_str().to_owned();
         let event_kind = match input.hook_event_name {
             crate::binding::NativeToolUseEvent::PreToolUse => HookEventKind::PreToolUse,
             crate::binding::NativeToolUseEvent::PostToolUse => HookEventKind::PostToolUse,
         };
         let payload = serde_json::to_string(&input).map_err(|_| HookInputError::Invalid)?;
+        Self::native_delivery(
+            input.session_id,
+            input.turn_id,
+            Some(input.tool_use_id),
+            event_kind,
+            payload,
+            generation,
+        )
+    }
+
+    pub fn from_submission(
+        input: crate::binding::NativeInputSubmission,
+        generation: u64,
+    ) -> Result<Self, HookInputError> {
+        input
+            .validate_host_fields()
+            .map_err(|_| HookInputError::Invalid)?;
+        let payload = serde_json::to_string(&input).map_err(|_| HookInputError::Invalid)?;
+        Self::native_delivery(
+            input.session_id,
+            input.turn_id,
+            None,
+            HookEventKind::InputSubmitted,
+            payload,
+            generation,
+        )
+    }
+
+    fn native_delivery(
+        session_id: String,
+        turn_id: String,
+        request: Option<String>,
+        event_kind: HookEventKind,
+        payload: String,
+        generation: u64,
+    ) -> Result<Self, HookInputError> {
+        use evertrace_domain::evidence::{
+            CorrelationField, CorrelationFieldClaim, ObservationRole, SourceInstanceId,
+        };
+        let report = native_generation_report(generation)?;
+        let manifest = report.manifest().adapter_manifest_id.clone();
+        let source = SourceInstanceId::new_v7().as_str().to_owned();
+        let role = match event_kind {
+            HookEventKind::PreToolUse => ObservationRole::Intent,
+            HookEventKind::PostToolUse => ObservationRole::Result,
+            HookEventKind::InputSubmitted => ObservationRole::Message,
+            _ => return Err(HookInputError::Invalid),
+        };
+        let field_provenance = request
+            .as_ref()
+            .map(|_| CorrelationFieldClaim {
+                field: CorrelationField::NativeRequestId,
+                source_ref: source.clone(),
+                evidence_ref: source.clone(),
+            })
+            .into_iter()
+            .collect();
         let value = Self {
             input_version: CAPTURE_HOOK_INPUT_VERSION,
             spool_record_id: None,
@@ -201,9 +253,9 @@ impl CaptureHookInput {
             source_revision_mode: SourceRevisionMode::Append,
             previous_source_revision: None,
             source_ref: source.clone(),
-            session_id: input.session_id,
-            turn_id: Some(input.turn_id),
-            tool_use_id: Some(input.tool_use_id.clone()),
+            session_id,
+            turn_id: Some(turn_id),
+            tool_use_id: request.clone(),
             event_kind,
             correlation: HostCorrelationEvidence {
                 occurrence_schema_version: 1,
@@ -211,18 +263,10 @@ impl CaptureHookInput {
                 host_trace_lineage_id: None,
                 host_lane_key: None,
                 canonical_event_family: None,
-                native_request_id: Some(input.tool_use_id),
+                native_request_id: request,
                 physical_execution_ordinal: None,
-                pairing_role: if event_kind == HookEventKind::PreToolUse {
-                    ObservationRole::Intent
-                } else {
-                    ObservationRole::Result
-                },
-                field_provenance: vec![CorrelationFieldClaim {
-                    field: CorrelationField::NativeRequestId,
-                    source_ref: source.clone(),
-                    evidence_ref: source,
-                }],
+                pairing_role: role,
+                field_provenance,
                 adapter_manifest_ref: manifest,
                 adapter_revision: 1,
                 strong_gate_receipt_ref: None,

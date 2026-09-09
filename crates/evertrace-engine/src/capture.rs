@@ -1152,6 +1152,17 @@ fn normalize_selected_dirty(
         }
     }
     for id in selected_ids {
+        // Another selected member may already have normalized this occurrence.
+        // Its unchanged payload still supports this target's watermark command.
+        let occurrence = normalized
+            .occurrences
+            .iter()
+            .find(|value| value.source_observation_refs.contains(&id))
+            .ok_or(ReconcileError::Domain)?;
+        if !payloads.iter().any(|payload| matches!(payload,
+            JournalPayload::HostOccurrenceNormalized(value) if value.host_occurrence_id == occurrence.host_occurrence_id)) {
+            payloads.push(JournalPayload::HostOccurrenceNormalized(Box::new(occurrence.clone())));
+        }
         payloads.push(JournalPayload::NormalizationWatermark(
             NormalizationWatermark {
                 source_observation_id: id,

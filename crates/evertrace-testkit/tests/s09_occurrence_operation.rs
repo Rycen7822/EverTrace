@@ -770,6 +770,137 @@ fn evidence_command(
 }
 
 #[tokio::test]
+async fn separately_selected_pair_members_close_watermarks_without_new_objects() {
+    use evertrace_capture::{
+        DurableSpool, RecallCueGateMode, RecoveryGateMode, RecoverySnapshotSettings,
+        RuntimeSnapshot, SpoolLimits,
+    };
+    use evertrace_engine::{
+        capture::{ReconcileInput, reconcile_observations_once},
+        spawn_writer,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("data");
+    let mut writer = JournalWriter::open(&root).await.unwrap();
+    let limits = SpoolLimits {
+        high_watermark_bytes: 1 << 20,
+        low_watermark_bytes: 1 << 19,
+        max_main_files: 16,
+        emergency_slots: 4,
+    };
+    let runtime = RuntimeSnapshot::for_data_dir(
+        &root,
+        1,
+        limits,
+        RecoverySnapshotSettings {
+            gate: RecoveryGateMode::Disabled,
+            preflight_timeout_ms: 250,
+            effective_config_hash: CONFIG_HASH,
+            adapter_manifest_id: None,
+            classifier_revision: 1,
+            max_bundle_bytes: 4 << 20,
+            max_untracked_file_bytes: 1 << 20,
+            max_untracked_total_bytes: 2 << 20,
+            recall_cue_gate: RecallCueGateMode::Disabled,
+            recall_cue_adapter_manifest_id: None,
+        },
+    )
+    .unwrap();
+    drop(DurableSpool::open(&runtime.spool_dir, limits).unwrap());
+    let (receipt, intent) = observation(
+        "selected-intent",
+        ObservationRole::Intent,
+        exact_correlation("hook", CanonicalEventFamily::Mutate),
+        vec![],
+    );
+    let intent_id = intent.source_observation_id;
+    writer
+        .commit(&evidence_command(CommandId::new_v7(), receipt, intent), 1)
+        .await
+        .unwrap();
+    let (receipt, result) = observation(
+        "selected-result",
+        ObservationRole::Result,
+        exact_correlation("session", CanonicalEventFamily::Mutate),
+        vec![],
+    );
+    let result_id = result.source_observation_id;
+    writer
+        .commit(&evidence_command(CommandId::new_v7(), receipt, result), 2)
+        .await
+        .unwrap();
+    let (handle, actor) = spawn_writer(writer, 8).unwrap();
+    let input = ReconcileInput {
+        runtime_snapshot: runtime,
+        adapter_manifests: vec![],
+        liveness: vec![],
+        reconciled_gaps: vec![],
+        reconciled_outages: vec![],
+        independent_source_reconciliations: vec![],
+        effective_config_hash: CONFIG_HASH,
+        algorithm_revision: "selected-normalization-v1".into(),
+        occurred_at_us: 3,
+        max_items: 1,
+    };
+    reconcile_observations_once(input.clone(), &handle, &[intent_id])
+        .await
+        .unwrap();
+    let first = handle.project().await.unwrap();
+    let physical = |snapshot: &evertrace_store::ProjectionSnapshot| {
+        snapshot
+            .data_rows()
+            .filter(|row| {
+                matches!(
+                    row.object_kind.as_deref(),
+                    Some("host_occurrence" | "operation")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let before = physical(&first);
+    assert_eq!(before.len(), 2);
+    assert!(
+        !first
+            .reconciliation_frontier_for_observations(&[result_id])
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    reconcile_observations_once(input.clone(), &handle, &[result_id])
+        .await
+        .unwrap();
+    let second = handle.project().await.unwrap();
+    // Same immutable occurrence payload is co-command support, not a successor.
+    let before_payloads = before
+        .iter()
+        .map(|row| &row.payload_json)
+        .collect::<Vec<_>>();
+    let after = physical(&second);
+    assert_eq!(
+        before_payloads,
+        after
+            .iter()
+            .map(|row| &row.payload_json)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        second
+            .reconciliation_frontier_for_observations(&[intent_id, result_id])
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let repeated = reconcile_observations_once(input, &handle, &[result_id])
+        .await
+        .unwrap();
+    assert!(repeated.no_delta);
+    assert_eq!(handle.project().await.unwrap().frontier, second.frontier);
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn journal_projection_replay_relations_and_no_delta_are_closed() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("store");
