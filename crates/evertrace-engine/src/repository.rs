@@ -14,7 +14,9 @@ mod git_probe;
 mod integration;
 mod resolver;
 mod session_catalog;
-pub(crate) use session_catalog::freeze_native_namespace;
+pub(crate) use session_catalog::{
+    SESSION_ROOT_PROBE_BUDGET, freeze_native_namespace, read_report_repository_trust_before,
+};
 
 pub(crate) use git_probe::with_probe_deadline;
 pub use git_probe::{

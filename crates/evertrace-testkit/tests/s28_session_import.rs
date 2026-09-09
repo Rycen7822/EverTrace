@@ -213,6 +213,35 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let (handle, task) = spawn_writer(writer, 32).unwrap();
     let catalog = SessionCatalogService::new(handle.clone(), CONFIG);
     assert_eq!(catalog.refresh(&report).await.unwrap(), 1);
+    let catalog_snapshot = handle.project().await.unwrap();
+    assert!(evertrace_store::RuntimeSchedulerView::from_snapshot(&catalog_snapshot).is_ok());
+    let mut invalid_current = catalog_snapshot.clone();
+    invalid_current
+        .rows
+        .iter_mut()
+        .find(|row| row.object_kind.as_deref() == Some("session_import_current"))
+        .unwrap()
+        .payload_json = Some("{}".into());
+    assert!(evertrace_store::RuntimeSchedulerView::from_snapshot(&invalid_current).is_err());
+    for snapshot in [&catalog_snapshot, &invalid_current] {
+        let valid = std::ptr::eq(snapshot, &catalog_snapshot);
+        assert_eq!(
+            evertrace_store::projections::RecoveryCurrentView::from_snapshot(snapshot).is_ok(),
+            valid
+        );
+        assert_eq!(
+            evertrace_engine::expired_leases(&snapshot.rows, 10, snapshot.frontier).is_ok(),
+            valid
+        );
+        assert_eq!(
+            evertrace_engine::pending_outbox(&snapshot.rows, snapshot.frontier).is_ok(),
+            valid
+        );
+        assert_eq!(
+            evertrace_engine::pending_dirty(&snapshot.rows, snapshot.frontier).is_ok(),
+            valid
+        );
+    }
     let debug_projection = handle.project().await;
     assert!(
         debug_projection.is_ok(),

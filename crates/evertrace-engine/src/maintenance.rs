@@ -2876,6 +2876,12 @@ fn support_context(
     let mut contracts = Vec::new();
     let mut validations = Vec::new();
     for row in snapshot.data_rows() {
+        if evertrace_store::session_import::restore_current(row)
+            .map_err(|_| BackgroundSchedulerError::Store)?
+            .is_some()
+        {
+            continue;
+        }
         let Some(json) = row.payload_json.as_deref() else {
             return Err(BackgroundSchedulerError::Store);
         };

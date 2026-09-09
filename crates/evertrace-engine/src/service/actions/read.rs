@@ -498,7 +498,7 @@ impl McpActionService {
     }
 }
 
-fn retained_forgotten_source(
+pub(super) fn retained_forgotten_source(
     snapshot: &ProjectionSnapshot,
     row: &ObjectRow,
 ) -> Result<bool, McpServiceError> {
@@ -535,11 +535,20 @@ fn retained_forgotten_source(
     let mut surface = None;
     let mut observation = None;
     let mut receipt = None;
+    let observation_text =
+        serde_json::to_string(&observation_id).map_err(|_| McpServiceError::Store)?;
     for candidate in snapshot.data_rows() {
         if !matches!(
             candidate.object_kind.as_deref(),
             Some("evidence_surface" | "source_observation" | "source_receipt")
         ) {
+            continue;
+        }
+        if candidate
+            .payload_json
+            .as_deref()
+            .is_none_or(|json| !json.contains(&observation_text))
+        {
             continue;
         }
         let payload = match candidate.payload_json.as_deref() {

@@ -150,6 +150,9 @@ impl RuntimeSchedulerView {
             if row.row_class != Some(ObjectRowClass::Runtime) {
                 continue;
             }
+            if crate::session_import::restore_current(row)?.is_some() {
+                continue;
+            }
             let Some(json) = row.payload_json.as_deref() else {
                 return Err(StoreError::StoreCorrupt);
             };

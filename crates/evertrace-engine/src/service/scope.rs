@@ -402,6 +402,7 @@ mod tests {
             workspace,
             anchor: None,
             mechanism,
+            repository_report: None,
         }
     }
 
@@ -641,6 +642,7 @@ mod tests {
             workspace: PublicWorkspace::Active,
             anchor: Some(anchor.clone()),
             mechanism: McpScopeMechanism::ExactClaim,
+            repository_report: None,
         };
         let resolved = resolve_query_anchor(&snapshot, &exact, "/cwd").unwrap();
         assert_eq!(resolved.task_id, Some(task_id));
@@ -654,6 +656,7 @@ mod tests {
                 workspace: PublicWorkspace::Repository(repository_id),
                 anchor: Some(anchor),
                 mechanism: McpScopeMechanism::ExactClaim,
+                repository_report: None,
             },
             "/cwd",
         )
@@ -672,6 +675,7 @@ mod tests {
                 workspace: PublicWorkspace::Active,
                 anchor: Some(anchor),
                 mechanism: McpScopeMechanism::ExactClaim,
+                repository_report: None,
             };
             let mut missing = snapshot.clone();
             missing
@@ -716,6 +720,7 @@ mod tests {
             workspace: PublicWorkspace::Active,
             anchor: Some(anchor),
             mechanism: McpScopeMechanism::ExactClaim,
+            repository_report: None,
         };
         assert!(resolve_query_anchor(&snapshot, &binding(anchor.clone()), "/cwd").is_none());
         anchor.agent_id = Some("agent".into());
@@ -758,6 +763,7 @@ mod tests {
             workspace: PublicWorkspace::Active,
             anchor: Some(anchor),
             mechanism: McpScopeMechanism::ExactClaim,
+            repository_report: None,
         };
         assert!(resolve_query_anchor(&snapshot, &binding, "/cwd").is_none());
     }

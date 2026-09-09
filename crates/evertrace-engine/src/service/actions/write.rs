@@ -1,6 +1,125 @@
 use super::*;
 
 impl McpActionService {
+    pub(super) async fn capture_annotation(
+        &self,
+        request_id: RequestId,
+        binding: &McpResolvedScope,
+        input: String,
+        (task_ref, repository_ref, worktree_ref): (Option<String>, Option<String>, Option<String>),
+    ) -> Result<Option<evertrace_domain::ids::SourceObservationId>, McpServiceError> {
+        let event_time_us = unix_time_us_for_mcp();
+        let sequence = u64::try_from(event_time_us).unwrap_or(u64::MAX);
+        let record_key = request_id.to_string();
+        let source_instance_text = format!("evertrace-mcp-{record_key}");
+        let source_revision_text = format!("mcp-v1-{record_key}");
+        let source_instance =
+            SourceInstanceId::parse(&source_instance_text).map_err(|_| McpServiceError::Store)?;
+        let source_revision =
+            SourceRevision::parse(&source_revision_text).map_err(|_| McpServiceError::Store)?;
+        let source_record_identity =
+            SourceRecordIdentity::parse(&record_key).map_err(|_| McpServiceError::Store)?;
+        let observation_id =
+            source_observation_id(&source_instance, &source_revision, &source_record_identity)
+                .map_err(|_| McpServiceError::Store)?;
+        let (session_ref, turn_ref, tool_ref) = binding.anchor.as_ref().map_or_else(
+            || {
+                (
+                    format!("mcp-unanchored-{record_key}"),
+                    None,
+                    Some(record_key.clone()),
+                )
+            },
+            |anchor| {
+                (
+                    anchor.session_id.clone(),
+                    Some(anchor.turn_id.clone()),
+                    Some(anchor.tool_use_id.clone()),
+                )
+            },
+        );
+        let capture = CaptureRecordInput {
+            source_local_evidence: None,
+            spool_record_id: Some(format!("mcp-{record_key}")),
+            source_observation_id_hint: Some(observation_id.to_string()),
+            source_instance_id: source_instance_text,
+            source_revision: source_revision_text,
+            source_record_identity: Some(record_key.clone()),
+            identity_strength: Some(IdentityStrength::StableNative),
+            source_kind: EvidenceSourceKind::Other,
+            identity_domain: "evertrace-mcp-v1".into(),
+            source_ref: format!("evertrace-mcp-{record_key}"),
+            session_ref,
+            turn_ref,
+            tool_ref,
+            source_sequence: sequence,
+            source_sequence_origin: Some(sequence),
+            task_id: task_ref,
+            repository_instance_id: repository_ref,
+            worktree_instance_id: worktree_ref,
+            source_byte_range: None,
+            source_revision_mode: SourceRevisionMode::Append,
+            previous_source_revision: None,
+            close_watermark: Some(sequence),
+            observation_role: ObservationRole::Result,
+            correlation: HostCorrelationEvidence {
+                occurrence_schema_version: 1,
+                host_instance_id: None,
+                host_trace_lineage_id: None,
+                host_lane_key: None,
+                canonical_event_family: None,
+                native_request_id: None,
+                physical_execution_ordinal: None,
+                pairing_role: ObservationRole::Result,
+                field_provenance: Vec::new(),
+                adapter_manifest_ref: "evertrace-mcp-v1".into(),
+                adapter_revision: 1,
+                strong_gate_receipt_ref: None,
+                admission: CorrelationAdmission::Unavailable,
+                partial_correlation_ref: None,
+                possible_duplicate_group_id: None,
+            },
+            scope_effect_claims: Vec::new(),
+            lifecycle: None,
+            unsupported_record_classification: None,
+            source_role: SourceRole::Assistant,
+            content_trust: ContentTrust::AgentClaim,
+            capture_completeness: CaptureCompleteness::Complete,
+            surface_eligible: input.len() <= evertrace_domain::evidence::MAX_EVIDENCE_SURFACE_BYTES,
+            adapter_revision: 1,
+            adapter_manifest_ref: "evertrace-mcp-v1".into(),
+            eligible_event_manifest_ref: "evertrace-mcp-add-v1".into(),
+            parser_revision: 1,
+            canonicalization_revision: 1,
+            event_time_us: Some(event_time_us),
+            raw_payload: input.into_bytes(),
+        };
+        let mut runtime = CaptureRuntime::open(self.runtime_snapshot.clone())
+            .map_err(|_| McpServiceError::Store)?;
+        let outcome = runtime
+            .capture(capture)
+            .map_err(|_| McpServiceError::Store)?;
+        let CaptureOutcome::Durable { .. } = outcome else {
+            return Ok(None);
+        };
+        drop(runtime);
+        let mut ingestor = EvidenceIngestor::new(
+            self.runtime_snapshot.clone(),
+            self.writer.clone(),
+            self.runtime_snapshot.effective_config_hash,
+            "s20-mcp-v1",
+        )
+        .map_err(|_| McpServiceError::Store)?;
+        if let Some(config) = &self.operation_config {
+            ingestor = ingestor.with_operation_config(std::sync::Arc::clone(config));
+        }
+        ingestor
+            .drain_observations_once(&[observation_id])
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        Ok(Some(observation_id))
+    }
+
     pub(super) async fn add(
         &self,
         request_id: RequestId,
@@ -62,98 +181,19 @@ impl McpActionService {
         if task_rows.next().is_some() || !scope_matches {
             return Ok(unresolved_add(request_id, &scope));
         }
-        let event_time_us = unix_time_us_for_mcp();
-        let sequence = u64::try_from(event_time_us).unwrap_or(u64::MAX);
-        let record_key = request_id.to_string();
-        let source_instance_text = format!("evertrace-mcp-{record_key}");
-        let source_revision_text = format!("mcp-v1-{record_key}");
-        let source_instance =
-            SourceInstanceId::parse(&source_instance_text).map_err(|_| McpServiceError::Store)?;
-        let source_revision =
-            SourceRevision::parse(&source_revision_text).map_err(|_| McpServiceError::Store)?;
-        let source_record_identity =
-            SourceRecordIdentity::parse(&record_key).map_err(|_| McpServiceError::Store)?;
-        let observation_id =
-            source_observation_id(&source_instance, &source_revision, &source_record_identity)
-                .map_err(|_| McpServiceError::Store)?;
-        let (session_ref, turn_ref, tool_ref) = scope.binding.anchor.as_ref().map_or_else(
-            || {
+        let Some(observation_id) = self
+            .capture_annotation(
+                request_id,
+                &scope.binding,
+                input,
                 (
-                    format!("mcp-unanchored-{record_key}"),
-                    None,
-                    Some(record_key.clone()),
-                )
-            },
-            |anchor| {
-                (
-                    anchor.session_id.clone(),
-                    Some(anchor.turn_id.clone()),
-                    Some(anchor.tool_use_id.clone()),
-                )
-            },
-        );
-        let capture = CaptureRecordInput {
-            source_local_evidence: None,
-            spool_record_id: Some(format!("mcp-{record_key}")),
-            source_observation_id_hint: Some(observation_id.to_string()),
-            source_instance_id: source_instance_text,
-            source_revision: source_revision_text,
-            source_record_identity: Some(record_key.clone()),
-            identity_strength: Some(IdentityStrength::StableNative),
-            source_kind: EvidenceSourceKind::Other,
-            identity_domain: "evertrace-mcp-v1".into(),
-            source_ref: format!("evertrace-mcp-{record_key}"),
-            session_ref,
-            turn_ref,
-            tool_ref,
-            source_sequence: sequence,
-            source_sequence_origin: Some(sequence),
-            task_id: Some(task_ref),
-            repository_instance_id: scope.anchor.repository_id.map(|id| id.to_string()),
-            worktree_instance_id: scope.anchor.worktree_id.map(|id| id.to_string()),
-            source_byte_range: None,
-            source_revision_mode: SourceRevisionMode::Append,
-            previous_source_revision: None,
-            close_watermark: Some(sequence),
-            observation_role: ObservationRole::Result,
-            correlation: HostCorrelationEvidence {
-                occurrence_schema_version: 1,
-                host_instance_id: None,
-                host_trace_lineage_id: None,
-                host_lane_key: None,
-                canonical_event_family: None,
-                native_request_id: None,
-                physical_execution_ordinal: None,
-                pairing_role: ObservationRole::Result,
-                field_provenance: Vec::new(),
-                adapter_manifest_ref: "evertrace-mcp-v1".into(),
-                adapter_revision: 1,
-                strong_gate_receipt_ref: None,
-                admission: CorrelationAdmission::Unavailable,
-                partial_correlation_ref: None,
-                possible_duplicate_group_id: None,
-            },
-            scope_effect_claims: Vec::new(),
-            lifecycle: None,
-            unsupported_record_classification: None,
-            source_role: SourceRole::Assistant,
-            content_trust: ContentTrust::AgentClaim,
-            capture_completeness: CaptureCompleteness::Complete,
-            surface_eligible: input.len() <= evertrace_domain::evidence::MAX_EVIDENCE_SURFACE_BYTES,
-            adapter_revision: 1,
-            adapter_manifest_ref: "evertrace-mcp-v1".into(),
-            eligible_event_manifest_ref: "evertrace-mcp-add-v1".into(),
-            parser_revision: 1,
-            canonicalization_revision: 1,
-            event_time_us: Some(event_time_us),
-            raw_payload: input.into_bytes(),
-        };
-        let mut runtime = CaptureRuntime::open(self.runtime_snapshot.clone())
-            .map_err(|_| McpServiceError::Store)?;
-        let outcome = runtime
-            .capture(capture)
-            .map_err(|_| McpServiceError::Store)?;
-        let CaptureOutcome::Durable { .. } = outcome else {
+                    Some(task_ref),
+                    scope.anchor.repository_id.map(|id| id.to_string()),
+                    scope.anchor.worktree_id.map(|id| id.to_string()),
+                ),
+            )
+            .await?
+        else {
             return Ok(empty_result(
                 request_id,
                 McpServiceStatus::Partial,
@@ -162,21 +202,6 @@ impl McpActionService {
                 ["capture_degraded"],
             ));
         };
-        drop(runtime);
-        let mut ingestor = EvidenceIngestor::new(
-            self.runtime_snapshot.clone(),
-            self.writer.clone(),
-            self.runtime_snapshot.effective_config_hash,
-            "s20-mcp-v1",
-        )
-        .map_err(|_| McpServiceError::Store)?;
-        if let Some(config) = &self.operation_config {
-            ingestor = ingestor.with_operation_config(std::sync::Arc::clone(config));
-        }
-        ingestor
-            .drain_observations_once(&[observation_id])
-            .await
-            .map_err(|_| McpServiceError::Store)?;
         let details = serde_json::to_string(&AddResultDetails {
             authorization_status: "unverified",
             proposal_created: false,
@@ -193,7 +218,7 @@ impl McpActionService {
                 kind: "source_observation".into(),
                 object_ref: Some(observation_id.to_string()),
                 object_revision_ref: None,
-                source_revision_ref: Some(source_revision.as_str().to_owned()),
+                source_revision_ref: Some(format!("mcp-v1-{request_id}")),
                 scope: Some(task_id.to_string()),
                 applicability: None,
                 authority: None,

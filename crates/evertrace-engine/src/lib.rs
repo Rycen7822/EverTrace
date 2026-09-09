@@ -48,7 +48,8 @@ pub use service::{
     HumanObjectFamily, HumanPage, HumanProposalDecision, HumanProposalReview, HumanRecoveryDetail,
     HumanRelatedRequest, HumanRelationKind, HumanRepositoryPurgePreview, HumanRowClass,
     HumanSnapshotStatus, HumanSummary, HumanSupportDetail, HumanSurface, HumanSystemDetail,
-    McpActionService, McpBindingAuthority, McpBindingError, McpBindingGrant, McpBindingIssue,
-    McpItemPartition, McpResolvedScope, McpScopeMechanism, McpServiceAction, McpServiceError,
-    McpServiceItem, McpServiceRequest, McpServiceResult, McpServiceStatus, RuntimeMode,
+    HumanWorkDetail, McpActionService, McpBindingAuthority, McpBindingError, McpBindingGrant,
+    McpBindingIssue, McpItemPartition, McpResolvedScope, McpScopeMechanism, McpServiceAction,
+    McpServiceError, McpServiceItem, McpServiceRequest, McpServiceResult, McpServiceStatus,
+    RuntimeMode,
 };

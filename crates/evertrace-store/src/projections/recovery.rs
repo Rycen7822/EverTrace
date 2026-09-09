@@ -59,6 +59,9 @@ impl RecoveryCurrentView {
         let mut attempt_revisions = BTreeMap::new();
         let mut competing_group_revisions = BTreeMap::new();
         for row in snapshot.data_rows() {
+            if crate::session_import::restore_current(row)?.is_some() {
+                continue;
+            }
             let Some(payload_json) = row.payload_json.as_deref() else {
                 continue;
             };

@@ -23,7 +23,7 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
     if state
         .detail
         .as_ref()
-        .is_some_and(|item| item.evidence_detail.is_some())
+        .is_some_and(|item| item.evidence_detail.is_some() || item.work_detail.is_some())
     {
         paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
     }

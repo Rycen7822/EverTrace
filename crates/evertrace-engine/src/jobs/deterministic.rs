@@ -110,6 +110,9 @@ pub fn expired_leases(
     validate_checkpoint(rows, journal_frontier)?;
     let mut actions = Vec::new();
     for row in data_rows_at_frontier(rows, journal_frontier) {
+        if evertrace_store::session_import::restore_current(row)?.is_some() {
+            continue;
+        }
         let Some(payload) = row.payload_json.as_deref() else {
             return Err(StoreError::StoreCorrupt);
         };
@@ -140,6 +143,9 @@ pub fn pending_outbox(
     validate_checkpoint(rows, journal_frontier)?;
     let mut entries = Vec::new();
     for row in data_rows_at_frontier(rows, journal_frontier) {
+        if evertrace_store::session_import::restore_current(row)?.is_some() {
+            continue;
+        }
         let event: JournalPayload = serde_json::from_str(
             row.payload_json
                 .as_deref()
@@ -161,6 +167,9 @@ pub fn pending_dirty(
     validate_checkpoint(rows, journal_frontier)?;
     let mut entries = Vec::new();
     for row in data_rows_at_frontier(rows, journal_frontier) {
+        if evertrace_store::session_import::restore_current(row)?.is_some() {
+            continue;
+        }
         let event: JournalPayload = serde_json::from_str(
             row.payload_json
                 .as_deref()

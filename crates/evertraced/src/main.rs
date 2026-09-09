@@ -458,7 +458,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .ok();
                         let grant = mcp_bindings
-                            .issue(McpBindingIssue {
+                            .issue_with_report(McpBindingIssue {
                                 session_id: issue.session_id,
                                 turn_id: issue.turn_id,
                                 tool_use_id: issue.tool_use_id,
@@ -468,7 +468,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 input: issue.original_input.input,
                                 refs: issue.original_input.refs,
                                 launcher_protocol_revision: issue.launcher_protocol_revision,
-                            })
+                            }, observed.clone().map(Arc::new))
                             .map_err(|_| ErrorCode::Untrusted)?;
                         *session_catalog_report.write().await = observed;
                         let next = (*session_import_wakeup.borrow()).wrapping_add(1);
@@ -1219,6 +1219,11 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             .items
             .into_iter()
             .map(|item| HumanSnapshotItem {
+                work_detail: item.work_detail.map(|detail| evertrace_protocol::dto::HumanWorkDetail {
+                    canonical_goal: detail.canonical_goal, identity_confidence: detail.identity_confidence,
+                    source_refs: detail.source_refs, workstream_goal: detail.workstream_goal,
+                    phase: detail.phase, acceptance: detail.acceptance,
+                }),
                 evidence_detail: item.evidence_detail.map(|detail| evertrace_protocol::dto::HumanEvidenceDetail {
                     source_kind: detail.source_kind, observation_role: detail.observation_role,
                     source_role: detail.source_role, content_trust: detail.content_trust,

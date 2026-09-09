@@ -316,6 +316,279 @@ fn one_tool_schema_and_workspace_forms_are_closed() {
     assert!(PublicWorkspace::parse("@bound:v1:01234567890123456789012345678901").is_err());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_bootstrap_rechecks_claim_trust_and_forgotten_submission() {
+    use evertrace_engine::repository::{
+        HostTrustDecision, ProbeLimits, RepositoryResolveInput, observe_session_catalog_report,
+        probe_repository, resolve_repository,
+    };
+    use evertrace_store::repository::RepositoryCurrentView;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let repository_path = temp.path().join("repository");
+    fs::create_dir(&repository_path).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repository_path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let evidence = probe_repository(
+        &repository_path,
+        HostTrustDecision::Trusted,
+        &["test:work-permissions".into()],
+        1,
+        &ProbeLimits::default(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let resolution = resolve_repository(&RepositoryResolveInput {
+        view: &RepositoryCurrentView::default(),
+        evidence: &evidence,
+        derived_from_hint: None,
+    })
+    .unwrap();
+    let repository_id = resolution.repositories[0].repository_id;
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/09");
+    fs::create_dir_all(&dated).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000020";
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta",
+                "payload":{"id":session,"session_id":session,"cwd":repository_path,
+                "originator":"codex_cli_rs","model_provider":"test","git":null}
+            })
+        ),
+    )
+    .unwrap();
+    let config = adapter.join("config.toml");
+    let trust = |level: &str| {
+        format!(
+            "[projects.{}]\ntrust_level = \"{level}\"\n",
+            serde_json::to_string(repository_path.to_str().unwrap()).unwrap()
+        )
+    };
+    fs::write(&config, trust("trusted")).unwrap();
+    let report = Arc::new(
+        observe_session_catalog_report(transcript.to_str(), session, "tool", None).unwrap(),
+    );
+    let store = temp.path().join("data");
+    let runtime = runtime_snapshot(&store);
+    let (handle, writer_task) = spawn_writer(open_writer(&store).await.unwrap(), 8).unwrap();
+    handle
+        .commit(
+            resolution
+                .journal_command(1, [0x20; 32], "s20-test-v1")
+                .unwrap()
+                .unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    // Synthetic submission through the real protection/spool/ingest path;
+    // no physical completeness or Work authority is claimed by this fixture.
+    let mut input = capture_input("work-permissions", 1, None, Some(repository_id));
+    input.session_ref = session.into();
+    input.source_kind = EvidenceSourceKind::CodexHook;
+    input.observation_role = ObservationRole::Message;
+    input.correlation.pairing_role = ObservationRole::Message;
+    input.source_role = SourceRole::Host;
+    input.content_trust = ContentTrust::Observed;
+    input.capture_completeness = CaptureCompleteness::Partial;
+    DeviceKeyStore::new(&runtime.device_key_dir)
+        .load_or_create()
+        .unwrap();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    capture.capture(input).unwrap();
+    drop(capture);
+    EvidenceIngestor::new(runtime.clone(), handle.clone(), [0x20; 32], "s20-test-v1")
+        .unwrap()
+        .drain_once()
+        .await
+        .unwrap();
+    let reference = source_observation_id(
+        &SourceInstanceId::parse("source-s20").unwrap(),
+        &SourceRevision::parse("revision-s20").unwrap(),
+        &SourceRecordIdentity::parse("work-permissions").unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    let bindings = authority(&runtime.device_key_dir);
+    let service = McpActionService::open(bindings.clone(), &store, handle.clone(), runtime)
+        .await
+        .unwrap();
+    // Each grant carries the same report identity; permission is reread at use.
+    for (index, revoke) in [false, true].into_iter().enumerate() {
+        let original = call("@active", "submission", &[&reference]);
+        let grant = bindings
+            .issue_with_report(issue(&original, session), Some(Arc::clone(&report)))
+            .unwrap();
+        if revoke {
+            fs::write(&config, trust("untrusted")).unwrap();
+        }
+        let before = handle.project().await.unwrap();
+        let result = service
+            .handle(
+                &format!("work-read-{index}"),
+                McpServiceRequest {
+                    request_id: RequestId::new_v7(),
+                    action: McpServiceAction::Search,
+                    workspace: grant.bound_workspace,
+                    input: original.input,
+                    refs: original.refs,
+                    client_cwd: repository_path.to_str().unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .any(|item| item.object_ref.as_deref() == Some(&reference)),
+            !revoke,
+            "{result:?}"
+        );
+        assert_eq!(handle.project().await.unwrap(), before);
+    }
+    fs::write(&config, trust("trusted")).unwrap();
+    let declaration = serde_json::json!({"kind":"work_annotation","choice":"root",
+        "task_id":TaskId::new_v7(),"goal":"new work"})
+    .to_string();
+    let mut original = call("@active", &declaration, &[&reference]);
+    original.action = "add".into();
+    let grant = bindings
+        .issue_with_report(issue(&original, session), Some(Arc::clone(&report)))
+        .unwrap();
+    fs::write(&config, trust("untrusted")).unwrap();
+    let before = handle.project().await.unwrap();
+    let result = service
+        .handle(
+            "work-revoked",
+            McpServiceRequest {
+                request_id: RequestId::new_v7(),
+                action: McpServiceAction::Add,
+                workspace: grant.bound_workspace,
+                input: declaration,
+                refs: original.refs,
+                client_cwd: repository_path.to_str().unwrap().into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, McpServiceStatus::InvalidInput);
+    assert_eq!(
+        handle.project().await.unwrap(),
+        before,
+        "revoked claim wrote Work"
+    );
+    fs::write(&config, trust("trusted")).unwrap();
+    // A real admitted Atom forget establishes the existing source suppression;
+    // the receipt remains present, so this is not merely a missing-ref check.
+    let (atom, _) = atom_command(
+        "work-permissions",
+        "submitted claim",
+        AtomScope::Repository {
+            repository_instance_id: repository_id,
+        },
+        4,
+    );
+    let JournalPayload::AtomRecorded(value) = &atom.events()[0].payload else {
+        panic!()
+    };
+    let target = evertrace_domain::purge::ObjectDeletionTarget::Atom {
+        atom_id: value.atom_id,
+    };
+    handle.commit(atom, 4).await.unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let preview = evertrace_store::object_deletion_preview(&snapshot, target).unwrap();
+    assert!(!preview.default_retrieval_suppression_ref_hashes.is_empty());
+    let forget = evertrace_engine::purge::pending_object_forget_command(
+        RequestId::new_v7(),
+        &preview,
+        &preview.exact_revision_ids,
+        preview.deletion_generation,
+        5,
+        snapshot.frontier,
+        [0x20; 32],
+    )
+    .unwrap();
+    handle.commit(forget, 5).await.unwrap();
+    assert!(
+        handle
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .any(
+                |row| row.object_kind.as_deref() == Some("source_observation")
+                    && row.object_id.as_deref() == Some(&reference)
+            )
+    );
+    for action in [McpServiceAction::Search, McpServiceAction::Add] {
+        let input = if action == McpServiceAction::Add {
+            serde_json::json!({"kind":"work_annotation","choice":"root",
+                "task_id":TaskId::new_v7(),"goal":"new work"})
+            .to_string()
+        } else {
+            "submission".into()
+        };
+        let mut original = call("@active", &input, &[&reference]);
+        original.action = if action == McpServiceAction::Add {
+            "add"
+        } else {
+            "search"
+        }
+        .into();
+        let grant = bindings
+            .issue_with_report(issue(&original, session), Some(Arc::clone(&report)))
+            .unwrap();
+        let before = handle.project().await.unwrap();
+        let result = service
+            .handle(
+                "work-suppressed",
+                McpServiceRequest {
+                    request_id: RequestId::new_v7(),
+                    action,
+                    workspace: grant.bound_workspace,
+                    input,
+                    refs: original.refs,
+                    client_cwd: repository_path.to_str().unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result
+                .items
+                .iter()
+                .any(|item| item.object_ref.as_deref() == Some(&reference))
+        );
+        if action == McpServiceAction::Add {
+            assert_eq!(result.status, McpServiceStatus::InvalidInput);
+        }
+        assert_eq!(
+            handle.project().await.unwrap(),
+            before,
+            "rejected source wrote Work"
+        );
+    }
+    drop(service);
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+}
+
 #[test]
 fn claim_is_atomic_exact_replay_safe_and_leaves_no_connection_authority() {
     let temp = TempDir::new().unwrap();

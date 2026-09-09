@@ -372,6 +372,8 @@ pub struct HumanRepositoryPurgePreview {
 pub struct HumanSnapshotItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_detail: Option<HumanEvidenceDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_detail: Option<HumanWorkDetail>,
     pub item_kind: HumanItemKind,
     pub proposal: Option<HumanProposalMetadata>,
     pub proposal_review: Option<HumanProposalReview>,
@@ -413,6 +415,17 @@ pub struct HumanEvidenceDetail {
     pub protected_presentation: Option<evertrace_domain::evidence::ProtectedPresentation>,
     pub protected_length: u64,
     pub cas_ref: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanWorkDetail {
+    pub canonical_goal: String,
+    pub identity_confidence: evertrace_domain::work::TaskIdentityConfidence,
+    pub source_refs: Vec<String>,
+    pub workstream_goal: Option<String>,
+    pub phase: Option<evertrace_domain::work::PhaseContract>,
+    pub acceptance: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -908,6 +921,28 @@ impl HumanGovernanceResponse {
 impl HumanSnapshotItem {
     fn validate(&self) -> bool {
         ((self.item_kind == HumanItemKind::RevisionProposal) == self.proposal.is_some())
+            && self.work_detail.as_ref().is_none_or(|detail| {
+                matches!(self.object_kind.as_str(), "task" | "workstream")
+                    && !detail.canonical_goal.is_empty()
+                    && detail.canonical_goal.len() <= 4096
+                    && detail.source_refs.len() <= 64
+                    && detail
+                        .source_refs
+                        .iter()
+                        .all(|value| !value.is_empty() && value.len() <= 4096)
+                    && detail
+                        .workstream_goal
+                        .as_ref()
+                        .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
+                    && detail
+                        .acceptance
+                        .as_ref()
+                        .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
+                    && detail
+                        .phase
+                        .as_ref()
+                        .is_none_or(|value| value.validate().is_ok())
+            })
             && self.evidence_detail.as_ref().is_none_or(|detail| {
                 use evertrace_domain::evidence::ProtectedPresentation;
                 matches!(

@@ -49,6 +49,7 @@ use super::{
 };
 
 mod read;
+mod work;
 mod write;
 
 struct McpRequestScope {
@@ -309,7 +310,18 @@ impl McpActionService {
             .project()
             .await
             .map_err(|_| McpServiceError::Store)?;
-        let Some(anchor) = resolve_query_anchor(&snapshot, &binding, &client_cwd) else {
+        if action == McpServiceAction::Add && work::is_work_annotation(&input) {
+            return self
+                .work_annotation(request_id, binding, snapshot, input, refs)
+                .await;
+        }
+        let anchor = resolve_query_anchor(&snapshot, &binding, &client_cwd);
+        if anchor.is_none() || work::has_work_refs(action, &input, &refs) {
+            return self
+                .passive_work_read(request_id, action, binding, snapshot, input, refs)
+                .await;
+        }
+        let Some(anchor) = anchor else {
             return Ok(scope_unresolved(request_id));
         };
         let scope = McpRequestScope {

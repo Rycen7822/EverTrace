@@ -22,7 +22,7 @@ use evertrace_store::repository::RepositoryCurrentView;
 use serde_json::Value;
 use thiserror::Error;
 
-const SESSION_ROOT_PROBE_BUDGET: Duration = Duration::from_millis(50);
+pub(crate) const SESSION_ROOT_PROBE_BUDGET: Duration = Duration::from_millis(50);
 
 pub(crate) fn freeze_native_namespace(
     call: &evertrace_domain::evidence::SourceLocalNativeCall,
@@ -317,6 +317,20 @@ pub fn read_report_repository_trust(
     current: &RepositoryCurrentView,
     worktree_id: WorktreeId,
 ) -> RepositoryTrustResult {
+    read_report_repository_trust_before(
+        report,
+        current,
+        worktree_id,
+        Instant::now() + SESSION_ROOT_PROBE_BUDGET,
+    )
+}
+
+pub(crate) fn read_report_repository_trust_before(
+    report: &HostProbeReport,
+    current: &RepositoryCurrentView,
+    worktree_id: WorktreeId,
+    deadline: Instant,
+) -> RepositoryTrustResult {
     let unknown = || RepositoryTrustResult {
         state: RepositoryTrustState::Unknown,
         canonical_repository_path: None,
@@ -339,12 +353,7 @@ pub fn read_report_repository_trust(
     let Some(adapter_root) = qualified.path().parent() else {
         return unknown();
     };
-    read_repository_trust_at(
-        adapter_root,
-        current,
-        worktree_id,
-        Instant::now() + SESSION_ROOT_PROBE_BUDGET,
-    )
+    read_repository_trust_at(adapter_root, current, worktree_id, deadline)
 }
 
 fn read_repository_trust_at(

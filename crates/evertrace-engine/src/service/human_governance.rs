@@ -221,6 +221,7 @@ pub enum HumanItemCategory {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanSummary {
     pub evidence_detail: Option<HumanEvidenceDetail>,
+    pub work_detail: Option<HumanWorkDetail>,
     pub proposal: Option<HumanProposalSummary>,
     pub proposal_review: Option<HumanProposalReview>,
     pub support_detail: Option<HumanSupportDetail>,
@@ -258,6 +259,16 @@ pub struct HumanEvidenceDetail {
     pub protected_presentation: Option<evertrace_domain::evidence::ProtectedPresentation>,
     pub protected_length: u64,
     pub cas_ref: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct HumanWorkDetail {
+    pub canonical_goal: String,
+    pub identity_confidence: evertrace_domain::work::TaskIdentityConfidence,
+    pub source_refs: Vec<String>,
+    pub workstream_goal: Option<String>,
+    pub phase: Option<evertrace_domain::work::PhaseContract>,
+    pub acceptance: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3828,6 +3839,11 @@ fn summary(
     } else {
         None
     };
+    let work_detail = if include_detail && surface == HumanSurface::Explorer {
+        work_evidence_detail(snapshot, row)?
+    } else {
+        None
+    };
     let deletion_admission = include_detail
         .then(|| ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot))
         .transpose()
@@ -4113,6 +4129,7 @@ fn summary(
         };
     Ok(HumanSummary {
         evidence_detail,
+        work_detail,
         proposal,
         proposal_review,
         support_detail,
@@ -4150,11 +4167,48 @@ fn summary(
     })
 }
 
+pub(crate) fn work_evidence_detail(
+    snapshot: &ProjectionSnapshot,
+    row: &ObjectRow,
+) -> Result<Option<HumanWorkDetail>, HumanGovernanceError> {
+    if !matches!(row.object_kind.as_deref(), Some("task" | "workstream")) {
+        return Ok(None);
+    }
+    let payload: JournalPayload = serde_json::from_str(
+        row.payload_json
+            .as_deref()
+            .ok_or(HumanGovernanceError::Store)?,
+    )
+    .map_err(|_| HumanGovernanceError::Store)?;
+    let (task, stream) = match payload {
+        JournalPayload::TaskRecorded(task) => (*task, None),
+        JournalPayload::WorkstreamRecorded(stream) => {
+            let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(snapshot)
+                .map_err(|_| HumanGovernanceError::Store)?;
+            (
+                view.tasks
+                    .get(&stream.task_id)
+                    .cloned()
+                    .ok_or(HumanGovernanceError::Store)?,
+                Some(*stream),
+            )
+        }
+        _ => return Err(HumanGovernanceError::Store),
+    };
+    Ok(Some(HumanWorkDetail {
+        canonical_goal: task.canonical_goal,
+        identity_confidence: task.identity_confidence,
+        source_refs: task.request_root_refs,
+        workstream_goal: stream.as_ref().map(|value| value.workstream_goal.clone()),
+        phase: stream.as_ref().map(|value| value.phase_contract.clone()),
+        acceptance: stream.map(|value| value.acceptance_boundary),
+    }))
+}
+
 fn source_evidence_detail(
     snapshot: &ProjectionSnapshot,
     row: &ObjectRow,
 ) -> Result<Option<HumanEvidenceDetail>, HumanGovernanceError> {
-    use evertrace_domain::evidence::ProtectedPresentation;
     if !matches!(
         row.object_kind.as_deref(),
         Some("source_receipt" | "source_observation")
@@ -4207,22 +4261,27 @@ fn source_evidence_detail(
         source_role: observation.source_role,
         content_trust: observation.content_trust,
         capture_completeness: receipt.capture_completeness,
-        protected_presentation: receipt.protected_presentation.map(
-            |presentation| match presentation {
-                ProtectedPresentation::Inline { mut text } if text.len() > 65_536 => {
-                    let mut end = 65_536;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                    ProtectedPresentation::Preview { text }
-                }
-                presentation => presentation,
-            },
-        ),
+        protected_presentation: bounded_evidence_presentation(receipt.protected_presentation),
         protected_length: receipt.protected_length,
         cas_ref: receipt.cas_ref,
     }))
+}
+
+pub(crate) fn bounded_evidence_presentation(
+    presentation: Option<evertrace_domain::evidence::ProtectedPresentation>,
+) -> Option<evertrace_domain::evidence::ProtectedPresentation> {
+    use evertrace_domain::evidence::ProtectedPresentation;
+    presentation.map(|presentation| match presentation {
+        ProtectedPresentation::Inline { mut text } if text.len() > 65_536 => {
+            let mut end = 65_536;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            ProtectedPresentation::Preview { text }
+        }
+        presentation => presentation,
+    })
 }
 
 fn forget_target(row: &ObjectRow) -> Result<Option<ObjectDeletionTarget>, HumanGovernanceError> {

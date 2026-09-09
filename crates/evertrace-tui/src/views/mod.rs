@@ -137,6 +137,36 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
         format!("audit row: {}", item.stable_key),
         daemon_status,
     ];
+    if let Some(detail) = &item.work_detail {
+        lines.push(format!(
+            "Work identity: {:?}; instruction authority: none",
+            detail.identity_confidence
+        ));
+        lines.push("Agent-organized plan, not execution or user authorization".into());
+        lines.push(format!("Goal: {}", detail.canonical_goal.escape_debug()));
+        if let Some(goal) = &detail.workstream_goal {
+            lines.push(format!("Workstream goal: {}", goal.escape_debug()));
+        }
+        if let Some(phase) = &detail.phase {
+            lines.push(format!(
+                "Phase: {:?} / {}",
+                phase.phase_kind,
+                phase.phase_label.escape_debug()
+            ));
+            lines.push(format!("Local goal: {}", phase.local_goal.escape_debug()));
+            lines.push(format!(
+                "Expected transition: {}",
+                phase.expected_state_transition.escape_debug()
+            ));
+        }
+        if let Some(acceptance) = &detail.acceptance {
+            lines.push(format!("Acceptance plan: {}", acceptance.escape_debug()));
+        }
+        lines.push(format!(
+            "Sources: {}",
+            detail.source_refs.join(", ").escape_debug()
+        ));
+    }
     if let Some(detail) = &item.evidence_detail {
         use evertrace_domain::evidence::ProtectedPresentation;
         lines.extend([

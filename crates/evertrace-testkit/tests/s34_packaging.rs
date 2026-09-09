@@ -1650,6 +1650,585 @@ fn invoke(paths: &ManagedInstallPaths, bytes: &[u8]) {
 }
 
 #[tokio::test]
+async fn submitted_sources_bootstrap_work_through_managed_mcp() {
+    use evertrace_domain::ids::{RequestId, TaskId, WorkstreamId};
+    use evertrace_protocol::{
+        LocalClient,
+        command::Command as Rpc,
+        dto::{
+            ClientKind, HumanGovernanceRequest, HumanGovernanceResponse, HumanReadRequest,
+            HumanSurface,
+        },
+        response::Response,
+    };
+    use serde_json::{Value, json};
+    use std::time::{Duration, Instant};
+    // Synthetic Host inputs, but actual managed launcher, binding consume,
+    // CLI stdout, ordinary daemon ingest, Store and Explorer consumers.
+    fn call(
+        paths: &ManagedInstallPaths,
+        session: &str,
+        action: &str,
+        input: &str,
+        refs: &[String],
+    ) -> Value {
+        let arguments = json!({"action":action,"workspace":"@active","input":input,"refs":refs});
+        let raw = json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test",
+            "permission_mode":"default","session_id":session,"turn_id":"work-turn",
+            "tool_use_id":RequestId::new_v7().to_string(),"transcript_path":null,
+            "tool_name":evertrace_codex::binding::CODEX_EVERTRACE_TOOL_NAME,"tool_input":arguments});
+        let mut hook = Command::new(paths.data_root.join("hook-v1"))
+            .arg("--launcher-root")
+            .arg(&paths.data_root)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        hook.stdin
+            .take()
+            .unwrap()
+            .write_all(raw.to_string().as_bytes())
+            .unwrap();
+        let output = hook.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stamped: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let arguments = &stamped["hookSpecificOutput"]["updatedInput"];
+        assert!(
+            arguments["workspace"]
+                .as_str()
+                .unwrap()
+                .starts_with("@bound:")
+        );
+        let mut cli = Command::new(&paths.cli)
+            .arg("--config")
+            .arg(&paths.config)
+            .arg("mcp")
+            .current_dir(paths.data_root.parent().unwrap())
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = cli.stdin.take().unwrap();
+        for request in [
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"work-test","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"evertrace","arguments":arguments}}),
+        ] {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        let output = cli.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let messages: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        messages[1]["result"]["structuredContent"].clone()
+    }
+    let (_root, paths, config) = fixture();
+    let mut settings = config.config().clone();
+    settings.llm.enabled = false;
+    fs::write(
+        &paths.config,
+        EffectiveConfig::new(settings).unwrap().to_toml().unwrap(),
+    )
+    .unwrap();
+    install_offline(&paths, false).unwrap();
+    let raw = json!({"cwd":paths.data_root,"hook_event_name":"UserPromptSubmit","model":"test",
+        "permission_mode":"default","session_id":"work-session","turn_id":"work-turn",
+        "transcript_path":null,"prompt":"organize the submitted workneedle api_key=work-secret-canary"});
+    invoke(&paths, &serde_json::to_vec(&raw).unwrap());
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let daemon = Daemon(
+        Command::new(&paths.daemon)
+            .arg("--config")
+            .arg(&paths.config)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let reference = loop {
+        let result = call(&paths, "work-session", "search", "workneedle", &[]);
+        if let Some(reference) = result["items"]["evidence"][0]["object_ref"].as_str() {
+            break reference.to_owned();
+        }
+        assert!(Instant::now() < deadline, "{result}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        call(&paths, "other-session", "search", "workneedle", &[])["items"]["evidence"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let task = TaskId::new_v7();
+    let stream = WorkstreamId::new_v7();
+    let declaration = json!({"kind":"work_annotation","choice":"root","task_id":task,
+        "goal":"inspect api_key=plan-secret-canary","workstream":{"workstream_id":stream,
+        "goal":"inspect the source","target_family":"source","hypothesis_or_failure_family":"unknown defect",
+        "acceptance_boundary":"source inspection recorded","phase_contract":{"local_goal":"inspect source",
+        "phase_kind":"inspect","phase_label":"inspection","primary_targets":["source"],
+        "entry_conditions":["source available"],"acceptance_boundary":"inspection recorded","expected_state_transition":"uninspected to inspected"}}});
+    let mut result = call(
+        &paths,
+        "work-session",
+        "add",
+        &declaration.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    if result["status"] == "conflict" {
+        result = call(
+            &paths,
+            "work-session",
+            "add",
+            &declaration.to_string(),
+            std::slice::from_ref(&reference),
+        );
+    }
+    assert_eq!(result["status"], "partial", "{result}");
+    assert_eq!(
+        result["items"]["evidence"].as_array().unwrap().len(),
+        2,
+        "{result}"
+    );
+    assert!(!result.to_string().contains("plan-secret-canary"));
+    let revision = result["items"]["evidence"][0]["object_revision_ref"].clone();
+    let duplicate = call(
+        &paths,
+        "work-session",
+        "add",
+        &declaration.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(
+        duplicate["items"]["evidence"][0]["object_revision_ref"], revision,
+        "{duplicate}"
+    );
+    let read = call(&paths, "other-session", "get", &task.to_string(), &[]);
+    assert_eq!(read["items"]["evidence"][0]["authority"], "none", "{read}");
+    assert!(read.to_string().contains("provisional"));
+    assert_eq!(
+        call(
+            &paths,
+            "other-session",
+            "add",
+            &declaration.to_string(),
+            std::slice::from_ref(&reference)
+        )["status"],
+        "invalid_input"
+    );
+    let child = WorkstreamId::new_v7();
+    let mut partial = declaration.clone();
+    partial["choice"] = "fork".into();
+    partial["workstream"] =
+        json!({"workstream_id":child,"parent_workstream_id":stream,"goal":"a partial child plan"});
+    let pending = call(
+        &paths,
+        "work-session",
+        "add",
+        &partial.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(
+        pending["items"]["evidence"][0]["object_revision_ref"], revision,
+        "{pending}"
+    );
+    assert!(
+        pending.to_string().contains("annotation_only")
+            && pending.to_string().contains("missing_phase_contract")
+    );
+    partial["expected_task_revision"] = revision.clone();
+    partial["workstream"] = declaration["workstream"].clone();
+    partial["workstream"]["workstream_id"] = json!(child);
+    partial["workstream"]["parent_workstream_id"] = json!(stream);
+    let fork = call(
+        &paths,
+        "work-session",
+        "add",
+        &partial.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(
+        fork["items"]["evidence"][1]["object_ref"],
+        child.to_string(),
+        "{fork}"
+    );
+    let mut changed = declaration.clone();
+    changed["workstream"] = Value::Null;
+    changed["goal"] = "refined protected goal".into();
+    let conflict = call(
+        &paths,
+        "work-session",
+        "add",
+        &changed.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(conflict["status"], "conflict", "{conflict}");
+    assert_eq!(
+        conflict["items"]["evidence"][0]["object_revision_ref"],
+        revision
+    );
+    changed["expected_task_revision"] = revision.clone();
+    let revised = call(
+        &paths,
+        "work-session",
+        "add",
+        &changed.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(revised["status"], "partial", "{revised}");
+    assert_ne!(
+        revised["items"]["evidence"][0]["object_revision_ref"],
+        revision
+    );
+    let mut another = raw.clone();
+    another["session_id"] = "other-session".into();
+    another["prompt"] = "continue worknext".into();
+    invoke(&paths, &serde_json::to_vec(&another).unwrap());
+    let next_reference = loop {
+        let result = call(&paths, "other-session", "search", "worknext", &[]);
+        if let Some(reference) = result["items"]["evidence"][0]["object_ref"].as_str() {
+            break reference.to_owned();
+        }
+        assert!(Instant::now() < deadline, "{result}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    changed["choice"] = "continue".into();
+    let continued = call(
+        &paths,
+        "other-session",
+        "add",
+        &changed.to_string(),
+        &[next_reference],
+    );
+    assert_eq!(
+        continued["items"]["evidence"][0]["object_revision_ref"],
+        revised["items"]["evidence"][0]["object_revision_ref"],
+        "{continued}"
+    );
+    for action in ["add", "organize"] {
+        assert_eq!(
+            call(&paths, "work-session", action, "ordinary input", &[])["status"],
+            "scope_unresolved"
+        );
+    }
+    assert_eq!(
+        call(&paths, "work-session", "search", "@due", &[])["status"],
+        "scope_unresolved"
+    );
+    let second_task = TaskId::new_v7();
+    let separate = json!({"kind":"work_annotation","choice":"root","task_id":second_task,"goal":"a separate plan"});
+    let separate_result = call(
+        &paths,
+        "work-session",
+        "add",
+        &separate.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(
+        separate_result["items"]["evidence"][0]["object_ref"],
+        second_task.to_string(),
+        "{separate_result}"
+    );
+    let mut foreign_stream = separate.clone();
+    foreign_stream["workstream"] = declaration["workstream"].clone();
+    let rejected = call(
+        &paths,
+        "work-session",
+        "add",
+        &foreign_stream.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(rejected["status"], "conflict");
+    assert_eq!(rejected["items"]["evidence"].as_array().unwrap().len(), 1);
+    foreign_stream["expected_task_revision"] =
+        separate_result["items"]["evidence"][0]["object_revision_ref"].clone();
+    assert_eq!(
+        call(
+            &paths,
+            "work-session",
+            "add",
+            &foreign_stream.to_string(),
+            std::slice::from_ref(&reference)
+        )["status"],
+        "invalid_input"
+    );
+    changed["choice"] = "switch".into();
+    let switched = call(
+        &paths,
+        "work-session",
+        "add",
+        &changed.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(
+        switched["items"]["evidence"][0]["object_revision_ref"],
+        revised["items"]["evidence"][0]["object_revision_ref"]
+    );
+    assert_eq!(
+        call(
+            &paths,
+            "work-session",
+            "add",
+            &separate.to_string(),
+            &["src:missing".into()]
+        )["status"],
+        "invalid_input"
+    );
+    let mut client = LocalClient::connect(
+        &socket,
+        "work-test",
+        ClientKind::Cli,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    loop {
+        let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { frontier, .. }) = client
+            .request(
+                RequestId::new_v7(),
+                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                    request: HumanReadRequest::List {
+                        surface: HumanSurface::Explorer,
+                        expected_frontier: None,
+                        after: None,
+                        limit: 16,
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("list");
+        };
+        match client
+            .request(
+                RequestId::new_v7(),
+                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                    request: HumanReadRequest::Detail {
+                        surface: HumanSurface::Explorer,
+                        object_ref: format!("object:work:task:{task}"),
+                        expected_frontier: frontier,
+                        expected_revision_ref: None,
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+        {
+            Response::HumanGovernance(HumanGovernanceResponse::Snapshot { items, .. }) => {
+                assert_eq!(items.len(), 1);
+                let detail = items[0].work_detail.as_ref().unwrap();
+                assert_eq!(
+                    detail.identity_confidence,
+                    evertrace_domain::work::TaskIdentityConfidence::Provisional
+                );
+                assert!(!detail.canonical_goal.contains("plan-secret-canary"));
+                break;
+            }
+            Response::HumanGovernance(HumanGovernanceResponse::Conflict { .. }) => {
+                assert!(Instant::now() < deadline)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    drop(client);
+    drop(daemon);
+    let connection = evertrace_store::connection::CompatibilityStore::connect_local(
+        &evertrace_store::connection::native_root(&paths.data_root),
+    )
+    .await
+    .unwrap();
+    let journal = connection
+        .connection()
+        .open_table(evertrace_store::JOURNAL_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    let rows = evertrace_store::journal::read_all_journal_rows(&journal)
+        .await
+        .unwrap();
+    let payloads = rows
+        .iter()
+        .map(|row| row.payload().unwrap())
+        .collect::<Vec<_>>();
+    let tasks = payloads
+        .iter()
+        .filter_map(|payload| {
+            if let JournalPayload::TaskRecorded(task) = payload {
+                Some(task)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks[0].request_root_refs, tasks[1].request_root_refs);
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(payload, JournalPayload::WorkstreamRecorded(_)))
+            .count(),
+        2
+    );
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        JournalPayload::ExecutionLaneRecorded(_)
+            | JournalPayload::WorkBindingRecorded(_)
+            | JournalPayload::OperationDerived(_)
+            | JournalPayload::AtomRecorded(_)
+    )));
+    // A synthetic, legally committed terminal transition is only the
+    // precondition here; the new continuation still uses the real MCP path.
+    let previous = tasks
+        .iter()
+        .rev()
+        .find(|value| value.task_id == task)
+        .unwrap()
+        .as_ref()
+        .clone();
+    drop(journal);
+    drop(connection);
+    let mut writer = JournalWriter::open(&paths.data_root).await.unwrap();
+    let snapshot = writer.project().await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+    let mut closed = previous.clone();
+    closed.predecessor_revision_id = Some(previous.revision_id);
+    closed.revision_id = evertrace_domain::revision::RevisionId::new_v7();
+    closed.lifecycle = evertrace_domain::work::TaskLifecycle::Completed;
+    closed.closed_at_us = Some(now);
+    closed.source_watermark = snapshot.frontier;
+    writer
+        .commit(
+            &evertrace_engine::work::task::revise_task(
+                evertrace_engine::work::WorkCommandContext {
+                    command_id: evertrace_domain::ids::CommandId::new_v7(),
+                    occurred_at_us: now,
+                    effective_config_hash: config.hash(),
+                    algorithm_revision: "work-test-terminal-v1",
+                },
+                &previous,
+                closed.clone(),
+                evertrace_engine::work::TypedTaskChange::Lifecycle,
+                std::slice::from_ref(&reference),
+            )
+            .unwrap(),
+            now,
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    let daemon = Daemon(
+        Command::new(&paths.daemon)
+            .arg("--config")
+            .arg(&paths.config)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let continuation = TaskId::new_v7();
+    let mut next = json!({"kind":"work_annotation","choice":"continue","task_id":continuation,
+        "from_task_id":task,"goal":"different goal"});
+    assert_eq!(
+        call(
+            &paths,
+            "work-session",
+            "add",
+            &next.to_string(),
+            std::slice::from_ref(&reference)
+        )["status"],
+        "invalid_input"
+    );
+    next["goal"] = closed.canonical_goal.clone().into();
+    let result = loop {
+        let result = call(
+            &paths,
+            "work-session",
+            "add",
+            &next.to_string(),
+            std::slice::from_ref(&reference),
+        );
+        if result["items"]["evidence"][0]["object_ref"].is_string() {
+            break result;
+        }
+        assert!(Instant::now() < deadline, "{result}");
+        assert!(
+            result["status"] == "conflict" || result["status"] == "partial",
+            "{result}"
+        );
+    };
+    assert_eq!(
+        result["items"]["evidence"][0]["object_ref"],
+        continuation.to_string()
+    );
+    let repeated = call(
+        &paths,
+        "work-session",
+        "add",
+        &next.to_string(),
+        std::slice::from_ref(&reference),
+    );
+    assert_eq!(
+        repeated["items"]["evidence"][0]["object_revision_ref"],
+        result["items"]["evidence"][0]["object_revision_ref"]
+    );
+    drop(daemon);
+    let writer = JournalWriter::open(&paths.data_root).await.unwrap();
+    let snapshot = writer.project().await.unwrap();
+    let view = evertrace_store::WorkIdentityCurrentView::from_snapshot(&snapshot).unwrap();
+    let created = view.tasks.get(&continuation).unwrap();
+    assert_eq!(created.continuation_of_task_id, Some(task));
+    assert_eq!(
+        created.identity_confidence,
+        evertrace_domain::work::TaskIdentityConfidence::Provisional
+    );
+    assert!(created.scope_memberships.is_empty());
+    assert_eq!(
+        view.tasks.get(&task).unwrap().revision_id,
+        closed.revision_id
+    );
+}
+
+#[tokio::test]
 async fn installed_native_capture_is_weak_durable_and_replay_safe() {
     let (root, paths, config) = fixture();
     fs::create_dir(&paths.data_root).unwrap();

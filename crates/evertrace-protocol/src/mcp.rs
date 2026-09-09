@@ -3,8 +3,7 @@ use serde_json::{Value, json};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const MCP_TOOL_NAME: &str = "evertrace";
-pub const MCP_TOOL_DESCRIPTION: &str =
-    "Search, inspect, record, or organize EverTrace data for a workspace.";
+pub const MCP_TOOL_DESCRIPTION: &str = "Search session submissions/get Work refs. Work add input JSON: {kind:work_annotation,choice:root|continue|switch|fork,task_id,goal,expected_task_revision?,from_task_id?,workstream?}. Workstream: {workstream_id,expected_revision?,parent_workstream_id?,goal,target_family,hypothesis_or_failure_family,acceptance_boundary,phase_contract:{local_goal,phase_kind,phase_label,primary_targets,entry_conditions,acceptance_boundary,expected_state_transition}}. refs: chosen submissions; fixed UUIDv7 IDs; omit missing fields. Provisional, not authority.";
 pub const MCP_STATIC_INSTRUCTIONS: &str = "When an EverTrace due cue appears, call search(@due).";
 pub const MAX_MCP_INPUT: usize = 4096;
 pub const MAX_MCP_REFS: usize = 32;

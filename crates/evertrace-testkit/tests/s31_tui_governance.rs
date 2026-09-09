@@ -701,6 +701,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     };
     let proposal_item = HumanSnapshotItem {
         evidence_detail: None,
+        work_detail: None,
         item_kind: HumanItemKind::RevisionProposal,
         proposal: Some(proposal),
         proposal_review: None,

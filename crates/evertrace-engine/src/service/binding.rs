@@ -40,6 +40,7 @@ pub struct McpResolvedScope {
     pub workspace: PublicWorkspace,
     pub anchor: Option<BindingAnchor>,
     pub mechanism: McpScopeMechanism,
+    pub(crate) repository_report: Option<Arc<evertrace_codex::probe::HostProbeReport>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +83,7 @@ struct McpClaim {
     workspace: PublicWorkspace,
     canonical_call_auth_tag: [u8; 32],
     expires_at: Instant,
+    repository_report: Option<Arc<evertrace_codex::probe::HostProbeReport>>,
 }
 
 struct McpPinnedCwd {
@@ -145,6 +147,14 @@ impl McpBindingAuthority {
     }
 
     pub fn issue(&self, issue: McpBindingIssue) -> Result<McpBindingGrant, McpBindingError> {
+        self.issue_with_report(issue, None)
+    }
+
+    pub fn issue_with_report(
+        &self,
+        issue: McpBindingIssue,
+        repository_report: Option<Arc<evertrace_codex::probe::HostProbeReport>>,
+    ) -> Result<McpBindingGrant, McpBindingError> {
         let anchor = BindingAnchor {
             session_id: issue.session_id,
             turn_id: issue.turn_id,
@@ -189,6 +199,7 @@ impl McpBindingAuthority {
                 workspace,
                 canonical_call_auth_tag,
                 expires_at: now + MCP_CLAIM_TTL,
+                repository_report,
             },
         );
         Ok(McpBindingGrant {
@@ -292,6 +303,7 @@ impl McpBindingAuthority {
                     workspace: claim.workspace,
                     anchor: Some(claim.anchor),
                     mechanism: McpScopeMechanism::ExactClaim,
+                    repository_report: claim.repository_report,
                 })
             }
             TransportWorkspace::Public(workspace) => {
@@ -300,12 +312,14 @@ impl McpBindingAuthority {
                         workspace,
                         anchor: None,
                         mechanism: McpScopeMechanism::CwdOnly,
+                        repository_report: None,
                     })
                 } else {
                     Ok(McpResolvedScope {
                         workspace,
                         anchor: None,
                         mechanism: McpScopeMechanism::Explicit,
+                        repository_report: None,
                     })
                 }
             }
@@ -385,6 +399,43 @@ mod tests {
                 .unwrap()
                 .mechanism,
             McpScopeMechanism::CwdOnly
+        );
+        let report = Arc::new(
+            evertrace_codex::HostProbeReport::evaluate(
+                &evertrace_codex::ProbeContext::unobserved_codex(),
+                &evertrace_codex::ProbeEvidence::empty(),
+            )
+            .unwrap(),
+        );
+        let grant = authority
+            .issue_with_report(issue_for(&original), Some(Arc::clone(&report)))
+            .unwrap();
+        let other = authority.issue(issue_for(&original)).unwrap();
+        assert!(
+            authority
+                .resolve(&call(&other.bound_workspace, "needle"))
+                .unwrap()
+                .repository_report
+                .is_none()
+        );
+        let resolved = authority
+            .resolve(&call(&grant.bound_workspace, "needle"))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            resolved.repository_report.as_ref().unwrap(),
+            &report
+        ));
+        assert!(
+            authority
+                .resolve(&call(&grant.bound_workspace, "needle"))
+                .is_err()
+        );
+        assert!(
+            authority
+                .resolve(&call("@active", "needle"))
+                .unwrap()
+                .repository_report
+                .is_none()
         );
     }
 
