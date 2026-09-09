@@ -454,6 +454,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             issue.transcript_path.as_deref(),
                             &issue.session_id,
                             &issue.tool_use_id,
+                            issue.agent_id.as_deref(),
                         )
                         .ok();
                         let grant = mcp_bindings

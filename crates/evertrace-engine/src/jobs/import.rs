@@ -34,11 +34,10 @@ use tokio::sync::{Mutex, RwLock};
 use crate::{
     EvidenceIngestor, WriterHandle,
     repository::read_report_repository_trust,
-    session_import::{active_import_job, session_source_fingerprint},
+    session_import::{MAX_RECORD_BYTES, active_import_job, session_source_fingerprint},
 };
 
 const CHUNK_BYTES: usize = 16 * 1024;
-const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 16;
 const PREFIX_TAG: &str = "session_import_confirmed_prefix";
 

@@ -172,6 +172,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
         "type": "session_meta",
         "payload": {
             "id": session_id,
+            "session_id": session_id,
             "cwd": "/not-a-repository",
             "originator": "codex_cli_rs",
             "model_provider": "openai",
@@ -198,7 +199,8 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     fs::write(&transcript, &base).unwrap();
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
     let report =
-        observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28").unwrap();
+        observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28", None)
+            .unwrap();
 
     let data_dir = temp.path().join("data");
     let writer = open_writer(&data_dir).await.unwrap();
@@ -293,9 +295,13 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     });
     fs::write(&transcript, format!("{base}{appended}\n")).unwrap();
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
-    let append_report =
-        observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28-append")
-            .unwrap();
+    let append_report = observe_session_catalog_report(
+        transcript.to_str(),
+        session_id,
+        "tool-use-s28-append",
+        None,
+    )
+    .unwrap();
     *report.write().await = Some(append_report.clone());
     assert_eq!(catalog.refresh(&append_report).await.unwrap(), 1);
     assert_eq!(
@@ -341,6 +347,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
         transcript.to_str(),
         session_id,
         "tool-use-s28-rewrite-grow",
+        None,
     )
     .unwrap();
     *report.write().await = Some(rewrite_grow_report.clone());
@@ -394,9 +401,13 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
 
     fs::write(&transcript, format!("{header}\n{visible}\n")).unwrap();
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
-    let rewrite_report =
-        observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28-rewrite")
-            .unwrap();
+    let rewrite_report = observe_session_catalog_report(
+        transcript.to_str(),
+        session_id,
+        "tool-use-s28-rewrite",
+        None,
+    )
+    .unwrap();
     *report.write().await = Some(rewrite_report.clone());
     assert_eq!(catalog.refresh(&rewrite_report).await.unwrap(), 1);
     assert_eq!(
@@ -444,9 +455,13 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let invalid = "not-json";
     fs::write(&transcript, format!("{header}\n{visible}\n{invalid}\n")).unwrap();
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
-    let appended_report =
-        observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28-invalid")
-            .unwrap();
+    let appended_report = observe_session_catalog_report(
+        transcript.to_str(),
+        session_id,
+        "tool-use-s28-invalid",
+        None,
+    )
+    .unwrap();
     *report.write().await = Some(appended_report.clone());
     assert_eq!(catalog.refresh(&appended_report).await.unwrap(), 1);
     let changed_visible = serde_json::json!({
@@ -464,6 +479,7 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
         transcript.to_str(),
         session_id,
         "tool-use-s28-active-replacement",
+        None,
     )
     .unwrap();
     *report.write().await = Some(replaced_report.clone());

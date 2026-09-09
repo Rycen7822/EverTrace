@@ -36,8 +36,8 @@ pub enum SessionCatalogObservationError {
 
 /// Derives transient session-root evidence from the host-authored native hook
 /// envelope. The transcript is opened through the capture crate's confined,
-/// no-follow reader with a zero-byte budget, so this canary observes file
-/// identity without reading session body bytes.
+/// no-follow reader. Only its bounded first metadata record is decoded;
+/// session body records do not become root authority.
 pub fn observe_native_session_catalog_root(
     native_input: &[u8],
 ) -> Result<SessionCatalogRootEvidence, SessionCatalogObservationError> {
@@ -58,6 +58,7 @@ fn observe_native_session_catalog_root_at(
         input.transcript_path.as_deref(),
         &input.session_id,
         &input.tool_use_id,
+        input.agent_id.as_deref(),
         deadline,
     )
 }
@@ -69,11 +70,13 @@ pub fn observe_session_catalog_root(
     transcript_path: Option<&str>,
     session_id: &str,
     tool_use_id: &str,
+    agent_id: Option<&str>,
 ) -> Result<SessionCatalogRootEvidence, SessionCatalogObservationError> {
     observe_session_catalog_root_at(
         transcript_path,
         session_id,
         tool_use_id,
+        agent_id,
         Instant::now() + SESSION_ROOT_PROBE_BUDGET,
     )
     .map(|(evidence, _)| evidence)
@@ -85,8 +88,9 @@ pub fn observe_session_catalog_report(
     transcript_path: Option<&str>,
     session_id: &str,
     tool_use_id: &str,
+    agent_id: Option<&str>,
 ) -> Result<HostProbeReport, SessionCatalogObservationError> {
-    let root = observe_session_catalog_root(transcript_path, session_id, tool_use_id)?;
+    let root = observe_session_catalog_root(transcript_path, session_id, tool_use_id, agent_id)?;
     let context = ProbeContext {
         adapter_kind: AdapterKind::CodexHook,
         adapter_revision: "codex-native-binding-v1".into(),
@@ -104,6 +108,7 @@ fn observe_session_catalog_root_at(
     transcript_path: Option<&str>,
     session_id: &str,
     tool_use_id: &str,
+    agent_id: Option<&str>,
     deadline: Instant,
 ) -> Result<(SessionCatalogRootEvidence, PathBuf), SessionCatalogObservationError> {
     if session_id.is_empty()
@@ -116,7 +121,7 @@ fn observe_session_catalog_root_at(
         return Err(SessionCatalogObservationError::InvalidNativeInput);
     }
     let transcript = transcript_path.ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
-    let (root, relative) = codex_session_path(transcript, session_id)?;
+    let (root, relative) = codex_session_path(transcript)?;
     let confined = ConfinedRoot::open_owned_private(&root)
         .map_err(|_| SessionCatalogObservationError::UnsafeIdentity)?;
     let observed_identity = match confined.read(
@@ -158,6 +163,20 @@ fn observe_session_catalog_root_at(
         || transcript_metadata.ctime_nsec() as u64 != observed_identity.ctime_nanoseconds
     {
         return Err(SessionCatalogObservationError::UnsafeIdentity);
+    }
+    let mut remaining = crate::session_import::MAX_RECORD_BYTES + 1;
+    let header = crate::session_import::read_session_header(
+        &confined,
+        &relative,
+        observed_identity,
+        &mut remaining,
+        deadline,
+    )
+    .map_err(|_| SessionCatalogObservationError::UnsupportedLayout)?;
+    if header.payload.session_id.as_deref() != Some(session_id)
+        || agent_id.is_some_and(|agent| agent != header.payload.id)
+    {
+        return Err(SessionCatalogObservationError::InvalidNativeInput);
     }
     confined
         .revalidate()
@@ -359,7 +378,6 @@ fn read_repository_trust_at(
 
 fn codex_session_path(
     transcript: &str,
-    session_id: &str,
 ) -> Result<(PathBuf, PathBuf), SessionCatalogObservationError> {
     let path = Path::new(transcript);
     if !path.is_absolute()
@@ -373,7 +391,7 @@ fn codex_session_path(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(SessionCatalogObservationError::UnsupportedLayout)?;
-    if !file_name.starts_with("rollout-") || !file_name.ends_with(&format!("-{session_id}.jsonl")) {
+    if crate::session_import::session_id_from_name(file_name).is_err() {
         return Err(SessionCatalogObservationError::UnsupportedLayout);
     }
     let day = path

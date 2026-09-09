@@ -39,7 +39,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{WriterActorError, WriterHandle, repository::read_report_repository_trust};
 
-const HEADER_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_RECORD_BYTES: usize = 64 * 1024;
+const HEADER_CHUNK_BYTES: usize = 4 * 1024;
 const SOURCE_FORMAT: &str = "codex_rollout_jsonl_v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -602,38 +603,21 @@ impl CatalogReader<'_> {
                 .and_then(|name| name.to_str())
                 .ok_or(SessionCatalogError::Unsupported)?,
         )?;
-        let remaining = self
+        let mut remaining = self
             .budget
             .max_metadata_bytes
             .checked_sub(self.read_bytes)
             .filter(|value| *value != 0)
             .ok_or(SessionCatalogError::Budget)?;
-        let limit = HEADER_BYTES.min(remaining);
-        let header = self
-            .root
-            .read_range(&relative, identity, 0, limit, self.budget.deadline)
-            .map_err(map_read)?;
-        let header_bytes = header.bytes;
-        self.read_bytes = self
-            .read_bytes
-            .checked_add(header_bytes.len())
-            .ok_or(SessionCatalogError::Budget)?;
-        let newline = header_bytes
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .ok_or(SessionCatalogError::Unsupported)?;
-        let header: SessionMetaRecord = serde_json::from_slice(&header_bytes[..newline])
-            .map_err(|_| SessionCatalogError::Unsupported)?;
-        if header.record_type != "session_meta"
-            || header.payload.id != session_id
-            || header
-                .payload
-                ._session_id
-                .as_deref()
-                .is_some_and(|value| value != header.payload.id)
-        {
-            return Err(SessionCatalogError::Unsupported);
-        }
+        let result = read_session_header(
+            self.root,
+            &relative,
+            identity,
+            &mut remaining,
+            self.budget.deadline,
+        );
+        self.read_bytes = self.budget.max_metadata_bytes - remaining;
+        let header = result?;
         let workspace = header.payload.cwd.as_deref();
         let (resolution, repository_id, worktree_id) =
             resolve_workspace(workspace, &header.payload.git, self.repositories)?;
@@ -675,26 +659,26 @@ impl CatalogReader<'_> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SessionMetaRecord {
+pub(crate) struct SessionMetaRecord {
     #[serde(rename = "timestamp")]
     _timestamp: String,
     #[serde(rename = "type")]
     record_type: String,
-    payload: SessionMetaPayload,
+    pub(crate) payload: SessionMetaPayload,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SessionMetaPayload {
-    id: String,
+pub(crate) struct SessionMetaPayload {
+    pub(crate) id: String,
     #[serde(rename = "session_id")]
-    _session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     cwd: Option<String>,
     originator: Option<String>,
     #[serde(rename = "cli_version")]
     _cli_version: Option<String>,
     #[serde(rename = "source")]
-    _source: Option<String>,
+    _source: Option<serde::de::IgnoredAny>,
     model_provider: Option<String>,
     #[serde(rename = "timestamp")]
     _payload_timestamp: Option<String>,
@@ -716,6 +700,22 @@ struct SessionMetaPayload {
     _base_instructions: Option<serde::de::IgnoredAny>,
     #[serde(rename = "instructions")]
     _instructions: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "forked_from_id")]
+    _forked_from_id: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "forked_from_ordinal_exclusive")]
+    _forked_from_ordinal_exclusive: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "agent_role", alias = "agent_type")]
+    _agent_role: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "dynamic_tools")]
+    _dynamic_tools: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "selected_capability_roots")]
+    _selected_capability_roots: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "memory_mode")]
+    _memory_mode: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "history_base")]
+    _history_base: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "subagent_history_start_ordinal")]
+    _subagent_history_start_ordinal: Option<serde::de::IgnoredAny>,
     #[serde(default, deserialize_with = "deserialize_session_git")]
     git: SessionGit,
 }
@@ -788,29 +788,117 @@ fn resolve_workspace(
     ))
 }
 
-fn session_id_from_name(name: &str) -> Result<String, SessionCatalogError> {
-    if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-        return Err(SessionCatalogError::Unsupported);
-    }
-    let stem = name
-        .strip_suffix(".jsonl")
-        .ok_or(SessionCatalogError::Unsupported)?;
-    let rest = stem
+// Fixed rust-v0.153.4 rollout basename. The catalog key remains the thread,
+// not the optional distinct rollout suffix and not the shared Hook session.
+pub(crate) fn session_id_from_name(name: &str) -> Result<String, SessionCatalogError> {
+    let core = name
         .strip_prefix("rollout-")
+        .and_then(|value| value.strip_suffix(".jsonl"))
         .ok_or(SessionCatalogError::Unsupported)?;
-    if rest.len() <= 20 || rest.as_bytes().get(19) != Some(&b'-') {
+    let timestamp = core.get(..19).ok_or(SessionCatalogError::Unsupported)?;
+    if !valid_rollout_timestamp(timestamp) || core.get(19..20) != Some("-") {
         return Err(SessionCatalogError::Unsupported);
     }
-    let id = &rest[20..];
-    if id.len() < 16
-        || id.len() > 128
-        || id
-            .chars()
-            .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-')
+    let ids = core.get(20..).ok_or(SessionCatalogError::Unsupported)?;
+    let (thread, rollout) = ids.split_once('_').unwrap_or((ids, ids));
+    if !native_uuid(thread) || !native_uuid(rollout) {
+        return Err(SessionCatalogError::Unsupported);
+    }
+    Ok(thread.to_owned())
+}
+
+fn native_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
+fn valid_rollout_timestamp(value: &str) -> bool {
+    if value.len() != 19
+        || !value.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 | 13 | 16 => byte == b'-',
+            10 => byte == b'T',
+            _ => byte.is_ascii_digit(),
+        })
     {
-        return Err(SessionCatalogError::Unsupported);
+        return false;
     }
-    Ok(id.to_owned())
+    let number = |range: std::ops::Range<usize>| value[range].parse::<u32>().unwrap_or(u32::MAX);
+    let year = number(0..4);
+    let month = number(5..7);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&number(8..10))
+        && number(11..13) < 24
+        && number(14..16) < 60
+        && number(17..19) < 60
+}
+
+pub(crate) fn read_session_header(
+    root: &ConfinedRoot,
+    relative: &Path,
+    identity: ConfinedFileIdentity,
+    remaining: &mut usize,
+    deadline: Instant,
+) -> Result<SessionMetaRecord, SessionCatalogError> {
+    let thread = session_id_from_name(
+        relative
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(SessionCatalogError::Unsupported)?,
+    )?;
+    let mut bytes = Vec::new();
+    loop {
+        let limit = HEADER_CHUNK_BYTES
+            .min(*remaining)
+            // The record bound excludes its required newline; read budget does not.
+            .min(MAX_RECORD_BYTES + 1 - bytes.len());
+        if limit == 0 {
+            return Err(SessionCatalogError::Budget);
+        }
+        let chunk = root
+            .read_range(relative, identity, bytes.len() as u64, limit, deadline)
+            .map_err(map_read)?;
+        *remaining -= chunk.bytes.len();
+        if let Some(newline) = chunk.bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.extend_from_slice(&chunk.bytes[..newline]);
+            let header: SessionMetaRecord =
+                serde_json::from_slice(&bytes).map_err(|_| SessionCatalogError::Unsupported)?;
+            if Instant::now() >= deadline {
+                return Err(SessionCatalogError::Budget);
+            }
+            if header.record_type != "session_meta"
+                || header.payload.id != thread
+                || header
+                    .payload
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| !native_uuid(id))
+            {
+                return Err(SessionCatalogError::Unsupported);
+            }
+            return Ok(header);
+        }
+        if bytes.len() + chunk.bytes.len() > MAX_RECORD_BYTES {
+            return Err(SessionCatalogError::Budget);
+        }
+        if chunk.eof {
+            return Err(SessionCatalogError::Unsupported);
+        }
+        bytes.extend_from_slice(&chunk.bytes);
+    }
 }
 
 fn require_directory_component(
@@ -1258,7 +1346,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
         let report =
-            observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28")
+            observe_session_catalog_report(transcript.to_str(), session_id, "tool-use-s28", None)
                 .unwrap();
         let catalog = catalog_codex_sessions(
             &report,
@@ -1283,10 +1371,161 @@ mod tests {
     }
 
     #[test]
+    fn native_header_binds_child_and_current_rollout_with_bounded_metadata() {
+        let adapter = temp_root();
+        let sessions = adapter.join("sessions");
+        let dated = sessions.join("2026/09/09");
+        fs::create_dir_all(&dated).unwrap();
+        for path in [
+            &adapter,
+            &sessions,
+            &sessions.join("2026"),
+            &sessions.join("2026/09"),
+            &dated,
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let session = "019d0000-0000-7000-8000-000000000001";
+        let thread = "019d0000-0000-7000-8000-000000000002";
+        let rollout = "019d0000-0000-7000-8000-000000000003";
+        let transcript = dated.join(format!(
+            "rollout-2026-09-09T12-00-00-{thread}_{rollout}.jsonl"
+        ));
+        // Synthetic fixed-format metadata: object source and instructions are ignored.
+        let mut header = serde_json::json!({"timestamp":"2026-09-09T12:00:00Z", "type":"session_meta",
+            "payload":{"id":thread, "session_id":session, "source":{"subagent":{"thread_spawn":{"parent_thread_id":session}}},
+                "base_instructions":{"text":"PRIVATE_INSTRUCTIONS".repeat(1200)},
+                "history_base":{"thread_id":session,"ordinal":4}, "agent_role":"worker"}});
+        let encoded = format!("{header}\nBODY_NOT_METADATA\n");
+        assert!(encoded.len() > 16 * 1024 && encoded.len() < MAX_RECORD_BYTES);
+        fs::write(&transcript, &encoded).unwrap();
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+        let report =
+            observe_session_catalog_report(transcript.to_str(), session, "child", Some(thread))
+                .unwrap();
+        assert!(
+            observe_session_catalog_report(transcript.to_str(), session, "child", None).is_ok()
+        );
+        assert!(
+            observe_session_catalog_report(
+                transcript.to_str(),
+                thread,
+                "wrong-session",
+                Some(thread)
+            )
+            .is_err()
+        );
+        assert!(
+            observe_session_catalog_report(
+                transcript.to_str(),
+                session,
+                "wrong-agent",
+                Some(session)
+            )
+            .is_err()
+        );
+        let budget = |bytes| SessionCatalogBudget {
+            max_entries: 32,
+            max_metadata_bytes: bytes,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        let catalog = catalog_codex_sessions(
+            &report,
+            &sessions,
+            &RepositoryCurrentView::default(),
+            budget(MAX_RECORD_BYTES),
+        )
+        .unwrap();
+        assert_eq!(catalog[0].session_id, thread);
+        assert!(
+            !serde_json::to_string(&catalog[0].metadata)
+                .unwrap()
+                .contains("PRIVATE_INSTRUCTIONS")
+        );
+        assert!(matches!(
+            catalog_codex_sessions(
+                &report,
+                &sessions,
+                &RepositoryCurrentView::default(),
+                budget(16 * 1024)
+            ),
+            Err(SessionCatalogError::Budget)
+        ));
+        let original = dated.join(format!("rollout-2026-09-09T12-00-00-{thread}.jsonl"));
+        fs::write(&original, &encoded).unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            catalog_codex_sessions(
+                &report,
+                &sessions,
+                &RepositoryCurrentView::default(),
+                budget(2 * MAX_RECORD_BYTES)
+            ),
+            Err(SessionCatalogError::Unsupported)
+        ));
+        fs::remove_file(&original).unwrap();
+        header["payload"]["id"] = session.into();
+        fs::write(&transcript, format!("{header}\n")).unwrap();
+        assert!(
+            observe_session_catalog_report(transcript.to_str(), session, "wrong-thread", None)
+                .is_err()
+        );
+        header["payload"]["id"] = thread.into();
+        let mut boundary = header.to_string().into_bytes();
+        boundary.resize(MAX_RECORD_BYTES, b' ');
+        boundary.push(b'\n');
+        fs::write(&transcript, &boundary).unwrap();
+        assert!(
+            observe_session_catalog_report(transcript.to_str(), session, "record-boundary", None)
+                .is_ok()
+        );
+        boundary.insert(MAX_RECORD_BYTES, b' ');
+        fs::write(&transcript, &boundary).unwrap();
+        assert!(
+            observe_session_catalog_report(
+                transcript.to_str(),
+                session,
+                "record-over-boundary",
+                None
+            )
+            .is_err()
+        );
+        fs::write(&transcript, header.to_string()).unwrap();
+        assert!(
+            observe_session_catalog_report(transcript.to_str(), session, "truncated", None)
+                .is_err()
+        );
+        header["payload"]["base_instructions"] =
+            serde_json::json!({"text":"x".repeat(MAX_RECORD_BYTES)});
+        fs::write(&transcript, format!("{header}\n")).unwrap();
+        assert!(
+            observe_session_catalog_report(transcript.to_str(), session, "oversized", None)
+                .is_err()
+        );
+        fs::remove_file(&transcript).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &transcript).unwrap();
+        assert!(
+            observe_session_catalog_report(transcript.to_str(), session, "symlink", None).is_err()
+        );
+        assert!(
+            session_id_from_name(&format!("rollout-2026-02-30T12-00-00-{thread}.jsonl")).is_err()
+        );
+        fs::remove_dir_all(adapter).unwrap();
+    }
+
+    #[test]
     fn repository_candidate_does_not_fall_back_to_non_repository() {
         let payload = SessionMetaPayload {
             id: "session".into(),
-            _session_id: None,
+            session_id: None,
+            _forked_from_id: None,
+            _forked_from_ordinal_exclusive: None,
+            _agent_role: None,
+            _dynamic_tools: None,
+            _selected_capability_roots: None,
+            _memory_mode: None,
+            _history_base: None,
+            _subagent_history_start_ordinal: None,
             cwd: Some("/unmatched".into()),
             originator: None,
             _cli_version: None,
@@ -1348,7 +1587,7 @@ mod tests {
             let header = serde_json::json!({
                 "timestamp": "2026-08-30T00:00:00Z",
                 "type": "session_meta",
-                "payload": { "id": session_id, "cwd": "/nonrepo", "git": null }
+                "payload": { "id": session_id, "session_id": session_id, "cwd": "/nonrepo", "git": null }
             });
             fs::write(&path, format!("{header}\n")).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1359,6 +1598,7 @@ mod tests {
             transcript.as_ref().unwrap().to_str(),
             first_id,
             "tool-use-page",
+            None,
         )
         .unwrap();
         let mut cursor = None;
@@ -1401,7 +1641,7 @@ mod tests {
             let header = serde_json::json!({
                 "timestamp": "2026-08-30T00:00:00Z",
                 "type": "session_meta",
-                "payload": { "id": session_id, "cwd": "/nonrepo", "git": null }
+                "payload": { "id": session_id, "session_id": session_id, "cwd": "/nonrepo", "git": null }
             });
             fs::write(&path, format!("{header}\n")).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1419,9 +1659,13 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let (transcript, session_id) = transcript.unwrap();
-        let report =
-            observe_session_catalog_report(transcript.to_str(), &session_id, "tool-use-cross-day")
-                .unwrap();
+        let report = observe_session_catalog_report(
+            transcript.to_str(),
+            &session_id,
+            "tool-use-cross-day",
+            None,
+        )
+        .unwrap();
         let mut cursor = None;
         let mut visited = 0;
         let mut page_index = 0;

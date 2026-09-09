@@ -173,7 +173,13 @@ fn session_root_requires_current_observed_canary_and_pinned_filesystem_identity(
     let dated = root.join("2026/08/30");
     fs::create_dir_all(&dated).unwrap();
     let transcript = dated.join(format!("rollout-2026-08-30T10-00-00-{session_id}.jsonl"));
-    fs::write(&transcript, b"BODY_CANARY_MUST_NOT_BE_READ\n").unwrap();
+    let header = serde_json::json!({"timestamp":"2026-08-30T10:00:00Z", "type":"session_meta",
+        "payload":{"id":session_id,"session_id":session_id}});
+    fs::write(
+        &transcript,
+        format!("{header}\nBODY_CANARY_MUST_NOT_BE_READ\n"),
+    )
+    .unwrap();
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
     let native = serde_json::json!({
         "cwd": temp.path().to_string_lossy(),
