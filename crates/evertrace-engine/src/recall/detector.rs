@@ -233,7 +233,7 @@ pub fn spawn_recall_worker(
     runtime: evertrace_capture::RuntimeSnapshot,
     data_dir: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_recall_worker_with_config(writer, runtime, data_dir, None)
+    spawn_recall_worker_with_config(writer, runtime, data_dir, None, None)
 }
 
 pub fn spawn_recall_worker_with_config(
@@ -241,14 +241,21 @@ pub fn spawn_recall_worker_with_config(
     mut runtime: evertrace_capture::RuntimeSnapshot,
     data_dir: std::path::PathBuf,
     config: Option<std::sync::Arc<crate::ConfigReloadService>>,
+    report: Option<std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
 ) -> tokio::task::JoinHandle<()> {
     let mut frontier = writer.subscribe_recall_frontier();
     tokio::spawn(async move {
         let mut startup = true;
         loop {
-            let first =
-                process_recall_batch(&writer, &mut runtime, &data_dir, startup, config.as_deref())
-                    .await;
+            let first = process_recall_batch(
+                &writer,
+                &mut runtime,
+                &data_dir,
+                startup,
+                config.as_deref(),
+                report.as_deref(),
+            )
+            .await;
             if first.is_err()
                 && process_recall_batch(
                     &writer,
@@ -256,6 +263,7 @@ pub fn spawn_recall_worker_with_config(
                     &data_dir,
                     startup,
                     config.as_deref(),
+                    report.as_deref(),
                 )
                 .await
                 .is_err()
@@ -276,6 +284,7 @@ async fn process_recall_batch(
     data_dir: &std::path::Path,
     abandon_claims: bool,
     config: Option<&crate::ConfigReloadService>,
+    report: Option<&tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
 ) -> Result<(), crate::WriterActorError> {
     if let Some(config) = config {
         runtime.effective_config_hash = config
@@ -297,9 +306,30 @@ async fn process_recall_batch(
         }
         let index = RecallTriggerIndex::from_current_contexts(frontier, &contexts)
             .map_err(|_| crate::WriterActorError::StoreCorrupt)?;
+        let observed = match report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        let blocked = crate::repository::blocked_repositories(
+            writer,
+            contexts
+                .iter()
+                .filter_map(|context| context.episode.repository_instance_id)
+                .collect(),
+            observed.as_ref(),
+            runtime.effective_config_hash,
+        )
+        .await?;
         let occurred_at_us = current_time_us()?;
         let mut ledger_events = Vec::new();
         for context in &contexts {
+            if context
+                .episode
+                .repository_instance_id
+                .is_some_and(|id| blocked.contains(&id))
+            {
+                continue;
+            }
             let mut terminalized = false;
             for need in &context.needs {
                 match current_need_validity(context, need, &index, occurred_at_us)
@@ -392,7 +422,7 @@ async fn process_recall_batch(
                 Err(error) => return Err(error),
             }
         }
-        publish_cues(writer, runtime, data_dir, occurred_at_us, config).await?;
+        publish_cues(writer, runtime, data_dir, occurred_at_us, config, report).await?;
         return Ok(());
     }
 }
@@ -409,8 +439,23 @@ async fn publish_cues(
     data_dir: &std::path::Path,
     occurred_at_us: i64,
     config: Option<&crate::ConfigReloadService>,
+    report: Option<&tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
 ) -> Result<(), crate::WriterActorError> {
     let contexts = writer.recall_current_contexts(32).await?;
+    let observed = match report {
+        Some(report) => report.read().await.clone(),
+        None => None,
+    };
+    let blocked = crate::repository::blocked_repositories(
+        writer,
+        contexts
+            .iter()
+            .filter_map(|context| context.episode.repository_instance_id)
+            .collect(),
+        observed.as_ref(),
+        runtime.effective_config_hash,
+    )
+    .await?;
     let mut cues = Vec::new();
     if runtime.recall_cue_gate == evertrace_capture::RecallCueGateMode::Active {
         let manifest = runtime
@@ -418,6 +463,13 @@ async fn publish_cues(
             .clone()
             .ok_or(crate::WriterActorError::StoreCorrupt)?;
         for context in &contexts {
+            if context
+                .episode
+                .repository_instance_id
+                .is_some_and(|id| blocked.contains(&id))
+            {
+                continue;
+            }
             if !context
                 .execution_lane
                 .adapter_manifest_ids

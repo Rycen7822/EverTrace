@@ -149,11 +149,23 @@ pub struct McpActionService {
     writer: WriterHandle,
     runtime_snapshot: RuntimeSnapshot,
     operation_config: Option<std::sync::Arc<evertrace_domain::config::EffectiveConfig>>,
+    native_peer: Option<(crate::repository::NativeHostPeer, std::sync::Weak<()>)>,
     session_report:
         Option<std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
 }
 
 impl McpActionService {
+    /// Server-only kernel carrier; no request field or caller identity assertion.
+    pub fn for_native_peer(
+        &self,
+        peer: Option<crate::repository::NativeHostPeer>,
+        connection: std::sync::Weak<()>,
+    ) -> Self {
+        let mut operation = self.clone();
+        operation.native_peer = peer.map(|peer| (peer, connection));
+        operation
+    }
+
     pub fn with_session_report(
         mut self,
         report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
@@ -272,6 +284,7 @@ impl McpActionService {
             writer,
             runtime_snapshot,
             operation_config: None,
+            native_peer: None,
             session_report: None,
         }
     }
@@ -311,10 +324,40 @@ impl McpActionService {
         {
             return Ok(scope_unresolved(request_id));
         }
-        let binding = match self.bindings.resolve(&call) {
+        let mut binding = match self.bindings.resolve(&call) {
             Ok(scope) => scope,
             Err(McpBindingError::ScopeUnresolved) => return Ok(scope_unresolved(request_id)),
         };
+        if binding.mechanism == McpScopeMechanism::ExactClaim
+            && let Some((peer, connection)) = &self.native_peer
+            && let Ok(data_root) = self.runtime_snapshot.data_dir()
+        {
+            binding.inventory_host = self.bindings.observe_inventory_host(
+                connection_id,
+                *peer,
+                connection.clone(),
+                data_root,
+            );
+            if let Some(host) = binding
+                .inventory_host
+                .as_ref()
+                .filter(|host| host.cwd == std::path::Path::new(&client_cwd))
+                && let Some(report) = binding.repository_report.as_ref()
+            {
+                let observation = evertrace_codex::inventory::InventoryHostObservation {
+                    home: host.home.clone(),
+                    config_root: host.config_root.clone(),
+                    cwd: host.cwd.clone(),
+                    profile: host.profile.clone(),
+                    selections_observed: host.selections_observed,
+                };
+                if let Ok(report) = report.as_ref().clone().with_inventory_host(observation) {
+                    binding.repository_report = Some(std::sync::Arc::new(report));
+                }
+            }
+            self.bindings
+                .retain_inventory_report(connection_id, &binding);
+        }
         let snapshot = self
             .writer
             .project()

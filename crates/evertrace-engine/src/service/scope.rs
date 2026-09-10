@@ -322,6 +322,8 @@ mod tests {
 
     fn repository(id: RepositoryId, path: &str) -> RepositoryInstance {
         RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
             repository_id: id,
             repository_revision: 1,
             predecessor_revision: None,
@@ -403,6 +405,7 @@ mod tests {
             anchor: None,
             mechanism,
             repository_report: None,
+            inventory_host: None,
         }
     }
 
@@ -572,6 +575,19 @@ mod tests {
         assert_eq!(cwd.repository_id, Some(repository_id));
         assert_eq!(cwd.worktree_id, Some(worktree_id));
         assert!(cwd.task_id.is_none());
+        let mut typed = snapshot.clone();
+        typed.rows[1].object_id = Some(worktree_id.to_string());
+        let mut scoped_asset = typed.rows[1].clone();
+        scoped_asset.row_id = "scoped-asset".into();
+        scoped_asset.repository_id = None;
+        scoped_asset.worktree_id = Some(worktree_id.to_string());
+        let access = crate::repository::row_repository_contexts(&typed, &[&scoped_asset]).unwrap();
+        assert_eq!(
+            access["scoped-asset"],
+            [repository_id].into_iter().collect()
+        );
+        typed.rows.pop();
+        assert!(crate::repository::row_repository_contexts(&typed, &[&scoped_asset]).is_err());
         assert!(
             resolve_query_anchor(
                 &snapshot,
@@ -643,6 +659,7 @@ mod tests {
             anchor: Some(anchor.clone()),
             mechanism: McpScopeMechanism::ExactClaim,
             repository_report: None,
+            inventory_host: None,
         };
         let resolved = resolve_query_anchor(&snapshot, &exact, "/cwd").unwrap();
         assert_eq!(resolved.task_id, Some(task_id));
@@ -657,6 +674,7 @@ mod tests {
                 anchor: Some(anchor),
                 mechanism: McpScopeMechanism::ExactClaim,
                 repository_report: None,
+                inventory_host: None,
             },
             "/cwd",
         )
@@ -676,6 +694,7 @@ mod tests {
                 anchor: Some(anchor),
                 mechanism: McpScopeMechanism::ExactClaim,
                 repository_report: None,
+                inventory_host: None,
             };
             let mut missing = snapshot.clone();
             missing
@@ -721,6 +740,7 @@ mod tests {
             anchor: Some(anchor),
             mechanism: McpScopeMechanism::ExactClaim,
             repository_report: None,
+            inventory_host: None,
         };
         assert!(resolve_query_anchor(&snapshot, &binding(anchor.clone()), "/cwd").is_none());
         anchor.agent_id = Some("agent".into());
@@ -764,6 +784,7 @@ mod tests {
             anchor: Some(anchor),
             mechanism: McpScopeMechanism::ExactClaim,
             repository_report: None,
+            inventory_host: None,
         };
         assert!(resolve_query_anchor(&snapshot, &binding, "/cwd").is_none());
     }

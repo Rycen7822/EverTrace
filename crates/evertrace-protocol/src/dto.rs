@@ -54,11 +54,22 @@ pub enum ClientKind {
 pub struct ConnectionContext {
     pub connection_id: String,
     pub client_kind: ClientKind,
+    /// Kernel observations, never supplied by the handshake or serialized.
+    pub peer_credentials: Option<PeerCredentials>,
+    /// Its weak form lets an in-flight observer detect connection termination.
+    pub connection_lifetime: std::sync::Arc<()>,
     /// Server-only association from a successfully sent, budgeted response.
     pub mcp_returned: Option<(
         evertrace_domain::ids::RequestId,
         Vec<evertrace_domain::revision::RevisionId>,
     )>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerCredentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -143,6 +154,14 @@ pub enum HumanUnavailableAction {
     BackupRestoreOrGc,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryAccessAction {
+    Disable,
+    Enable,
+    Rescan,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanActionRequest {
@@ -184,6 +203,13 @@ pub enum HumanActionRequest {
         repository_confirmation: String,
         expected_repository_revision: u32,
         expected_deletion_generation: u64,
+    },
+    RepositoryAccess {
+        repository_id: evertrace_domain::ids::RepositoryId,
+        expected_repository_revision: u32,
+        action: RepositoryAccessAction,
+        worktree_id: Option<evertrace_domain::ids::WorktreeId>,
+        inventory_ref: Option<JobId>,
     },
     CreateBackup,
     CollectGarbage,
@@ -298,6 +324,8 @@ pub struct HumanProposalReview {
     pub merge_and_accept_eligible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reauthorization: Option<ObjectReauthorizationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_coverage: Option<evertrace_domain::inventory::CapabilityCoverageSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -626,6 +654,27 @@ pub struct HumanConservativePruneResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanSystemDetail {
+    Repository {
+        repository_id: RepositoryId,
+        repository_revision: u32,
+        user_disabled: bool,
+        trust_revoked: bool,
+        revalidated_inventory_ref: Option<JobId>,
+        worktree_id: Option<WorktreeId>,
+    },
+    CapabilityInventory {
+        job_id: JobId,
+        repository_id: RepositoryId,
+        repository_revision: u32,
+        worktree_id: WorktreeId,
+        cwd: String,
+        state: String,
+        source_count: Option<u32>,
+        signature_count: Option<u32>,
+        unobserved_source_count: Option<u32>,
+        unknown_contract_count: Option<u32>,
+        asset_names: Vec<String>,
+    },
     SessionImport {
         session_id: String,
         source_instance_id: String,
@@ -894,6 +943,23 @@ impl HumanActionRequest {
                     && *expected_deletion_generation > 0
             }
             Self::CreateBackup | Self::VerifyBackup { .. } | Self::CollectGarbage => true,
+            Self::RepositoryAccess {
+                expected_repository_revision,
+                action,
+                worktree_id,
+                inventory_ref,
+                ..
+            } => {
+                *expected_repository_revision > 0
+                    && match action {
+                        RepositoryAccessAction::Disable => {
+                            worktree_id.is_none() && inventory_ref.is_none()
+                        }
+                        RepositoryAccessAction::Enable | RepositoryAccessAction::Rescan => {
+                            worktree_id.is_some()
+                        }
+                    }
+            }
             Self::Unavailable { .. } => true,
         }
     }
@@ -1035,6 +1101,15 @@ impl HumanGovernanceResponse {
 impl HumanSnapshotItem {
     fn validate(&self) -> bool {
         ((self.item_kind == HumanItemKind::RevisionProposal) == self.proposal.is_some())
+            && self.proposal_review.as_ref().is_none_or(|review| {
+                review.capability_coverage.as_ref().is_none_or(|coverage| {
+                    coverage.validate()
+                        && matches!(
+                            review.proposal.payload,
+                            evertrace_domain::semantic::ProposalPayload::Procedure(_)
+                        )
+                })
+            })
             && self.work_detail.as_ref().is_none_or(|detail| {
                 matches!(self.object_kind.as_str(), "task" | "workstream")
                     && !detail.canonical_goal.is_empty()
@@ -1420,16 +1495,64 @@ impl HumanExecutionIntegrityDetail {
 
 impl HumanSystemDetail {
     fn validate(&self, item: &HumanSnapshotItem) -> bool {
-        if item.row_class != HumanRowClass::Runtime
-            || item.family != HumanObjectFamily::Runtime
-            || item.category != HumanItemCategory::Runtime
-            || item.object_kind != "runtime_event"
-            || item.object_ref.is_some()
-            || item.revision_ref.is_some()
+        if matches!(self, Self::Job { .. } | Self::Config { .. })
+            && (item.row_class != HumanRowClass::Runtime
+                || item.family != HumanObjectFamily::Runtime
+                || item.category != HumanItemCategory::Runtime
+                || item.object_kind != "runtime_event"
+                || item.object_ref.is_some()
+                || item.revision_ref.is_some())
         {
             return false;
         }
         match self {
+            Self::Repository {
+                repository_id,
+                repository_revision,
+                ..
+            } => {
+                item.object_kind == "repository"
+                    && *repository_revision > 0
+                    && item.object_ref.as_deref() == Some(repository_id.to_string().as_str())
+            }
+            Self::CapabilityInventory {
+                job_id,
+                repository_id: _,
+                repository_revision,
+                worktree_id: _,
+                cwd,
+                state,
+                source_count,
+                signature_count,
+                unobserved_source_count,
+                unknown_contract_count,
+                asset_names,
+            } => {
+                item.object_kind == "capability_inventory"
+                    && *repository_revision > 0
+                    && item.object_ref.as_deref() == Some(job_id.to_string().as_str())
+                    && cwd.starts_with('/')
+                    && cwd.len() <= 4096
+                    && !cwd.chars().any(char::is_control)
+                    && matches!(
+                        state.as_str(),
+                        "recorded"
+                            | "ready"
+                            | "stale"
+                            | "disabled"
+                            | "revoked"
+                            | "purged"
+                            | "unobserved"
+                    )
+                    && asset_names.len() <= 16
+                    && asset_names.iter().all(|name| valid_short(name))
+                    && (state == "ready"
+                        || source_count.is_none()
+                            && signature_count.is_none()
+                            && unobserved_source_count.is_none()
+                            && unknown_contract_count.is_none()
+                            && asset_names.is_empty())
+            }
             Self::Job { detail } => {
                 let HumanJobDetail {
                     job_id,

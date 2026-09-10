@@ -41,6 +41,7 @@ pub struct McpResolvedScope {
     pub anchor: Option<BindingAnchor>,
     pub mechanism: McpScopeMechanism,
     pub(crate) repository_report: Option<Arc<evertrace_codex::probe::HostProbeReport>>,
+    pub(crate) inventory_host: Option<Arc<crate::repository::NativeHostContext>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +102,20 @@ struct McpClaim {
 struct McpPinnedCwd {
     path: String,
     expires_at: Instant,
+    inventory_host: Option<Arc<crate::repository::NativeHostContext>>,
+    inventory_report: Option<Arc<evertrace_codex::HostProbeReport>>,
+    inventory_session: Option<String>,
+    inventory_pending: bool,
+    inventory_wakeup: bool,
+}
+
+impl McpPinnedCwd {
+    fn request_inventory_rescan(&mut self) {
+        if !self.inventory_pending {
+            self.inventory_pending = true;
+            self.inventory_wakeup = true;
+        }
+    }
 }
 
 impl McpBindingAuthority {
@@ -257,9 +272,192 @@ impl McpBindingAuthority {
             McpPinnedCwd {
                 path: client_cwd.into(),
                 expires_at: now + MCP_CWD_TTL,
+                inventory_host: None,
+                inventory_report: None,
+                inventory_session: None,
+                inventory_pending: false,
+                inventory_wakeup: false,
             },
         );
         Ok(())
+    }
+
+    /// Only called after the exact claim has been successfully consumed.
+    pub(crate) fn observe_inventory_host(
+        &self,
+        connection_id: &str,
+        peer: crate::repository::NativeHostPeer,
+        lifetime: std::sync::Weak<()>,
+        data_root: &std::path::Path,
+    ) -> Option<Arc<crate::repository::NativeHostContext>> {
+        let cached = self
+            .state
+            .lock()
+            .ok()?
+            .client_cwds
+            .get(connection_id)?
+            .inventory_host
+            .clone();
+        let observed = cached
+            .as_ref()
+            .filter(|value| value.current())
+            .cloned()
+            .or_else(|| {
+                crate::repository::NativeHostContext::observe(peer, lifetime, data_root)
+                    .map(Arc::new)
+            });
+        let mut state = self.state.lock().ok()?;
+        let entry = state.client_cwds.get_mut(connection_id)?;
+        if cached != observed {
+            entry.inventory_pending = observed.is_some();
+            entry.inventory_wakeup = observed.is_some();
+        }
+        entry.inventory_host = observed.clone();
+        observed
+    }
+
+    pub(crate) fn retain_inventory_report(&self, connection: &str, scope: &McpResolvedScope) {
+        if scope.mechanism != McpScopeMechanism::ExactClaim {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock()
+            && let Some(entry) = state.client_cwds.get_mut(connection)
+        {
+            let session = scope
+                .anchor
+                .as_ref()
+                .map(|anchor| anchor.session_id.clone());
+            if entry.inventory_session != session
+                || entry
+                    .inventory_report
+                    .as_ref()
+                    .and_then(|report| report.inventory_host())
+                    != scope
+                        .repository_report
+                        .as_ref()
+                        .and_then(|report| report.inventory_host())
+            {
+                entry.inventory_pending = true;
+                entry.inventory_wakeup = true;
+            }
+            entry.inventory_session = session;
+            entry.inventory_report = scope
+                .repository_report
+                .as_ref()
+                .filter(|report| report.inventory_host().is_some())
+                .cloned();
+        }
+    }
+
+    pub(crate) fn pending_inventory_contexts(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Vec<(
+        String,
+        Arc<crate::repository::NativeHostContext>,
+        Arc<evertrace_codex::HostProbeReport>,
+    )> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let bounds = (after.map_or(Unbounded, Excluded), Unbounded);
+        state
+            .client_cwds
+            .range::<str, _>(bounds)
+            .filter(|(_, entry)| entry.inventory_pending)
+            .filter_map(|(id, entry)| {
+                Some((
+                    id.clone(),
+                    entry.inventory_host.clone()?,
+                    entry.inventory_report.clone()?,
+                ))
+            })
+            .take(limit)
+            .collect()
+    }
+
+    pub(crate) fn inventory_context_admitted(&self, connection: &str) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(entry) = state.client_cwds.get_mut(connection)
+        {
+            entry.inventory_pending = false;
+            entry.inventory_wakeup = false;
+        }
+    }
+
+    /// A read can discover a stale finite inventory without a journal write.
+    /// Consume each new request once for the existing scheduler wake channel.
+    /// Repeated pages cannot re-probe an unresolved pending context, and a
+    /// missing Host/report supplies no independently runnable work.
+    pub fn take_inventory_wakeup(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let mut wake = false;
+        for entry in state.client_cwds.values_mut() {
+            wake |= std::mem::take(&mut entry.inventory_wakeup)
+                && entry.inventory_pending
+                && entry.inventory_host.is_some()
+                && entry.inventory_report.is_some();
+        }
+        wake
+    }
+
+    pub(crate) fn inventory_context_stale(
+        &self,
+        context: &evertrace_domain::inventory::InventoryContext,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            for entry in state.client_cwds.values_mut() {
+                if entry.inventory_host.as_ref().is_some_and(|host| {
+                    host.cwd.to_str() == Some(context.cwd.as_str())
+                        && host.home.to_str() == Some(context.host_home.as_str())
+                        && host.config_root.to_str() == Some(context.host_config_root.as_str())
+                        && host.profile == context.host_profile
+                }) {
+                    entry.request_inventory_rescan();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn active_inventory_contexts(
+        &self,
+    ) -> Vec<(
+        Arc<crate::repository::NativeHostContext>,
+        Arc<evertrace_codex::HostProbeReport>,
+    )> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state
+            .client_cwds
+            .values()
+            .filter_map(|entry| {
+                Some((
+                    entry.inventory_host.clone()?,
+                    entry.inventory_report.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn inventory_session_ref(
+        &self,
+        host: &crate::repository::NativeHostContext,
+    ) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        let mut sessions = state.client_cwds.values().filter_map(|entry| {
+            (entry.inventory_host.as_deref() == Some(host))
+                .then_some(entry.inventory_session.as_deref())
+                .flatten()
+        });
+        let session = sessions.next()?;
+        sessions
+            .all(|other| other == session)
+            .then(|| format!("session:{session}"))
     }
 
     pub fn resolve(
@@ -326,6 +524,7 @@ impl McpBindingAuthority {
                     anchor: Some(claim.anchor),
                     mechanism: McpScopeMechanism::ExactClaim,
                     repository_report: claim.repository_report,
+                    inventory_host: None,
                 })
             }
             TransportWorkspace::Public(workspace) => {
@@ -335,6 +534,7 @@ impl McpBindingAuthority {
                         anchor: None,
                         mechanism: McpScopeMechanism::CwdOnly,
                         repository_report: None,
+                        inventory_host: None,
                     })
                 } else {
                     Ok(McpResolvedScope {
@@ -342,6 +542,7 @@ impl McpBindingAuthority {
                         anchor: None,
                         mechanism: McpScopeMechanism::Explicit,
                         repository_report: None,
+                        inventory_host: None,
                     })
                 }
             }
@@ -401,6 +602,36 @@ mod tests {
 
     fn new_authority() -> McpBindingAuthority {
         McpBindingAuthority::new(new_device_key())
+    }
+
+    #[test]
+    fn inventory_read_pending_reuses_wakeup_without_granting_authority() {
+        let authority = new_authority();
+        authority.pin_client_cwd("reader", "/workspace").unwrap();
+        assert!(!authority.take_inventory_wakeup());
+        // Only the scheduler notification state is exercised here. No Host
+        // observation, report, claim or inventory is fabricated by this test.
+        {
+            let mut state = authority.state.lock().unwrap();
+            let entry = state.client_cwds.get_mut("reader").unwrap();
+            entry.request_inventory_rescan();
+            assert!(entry.inventory_pending && entry.inventory_wakeup);
+            entry.request_inventory_rescan();
+            assert!(entry.inventory_wakeup);
+        }
+        assert!(!authority.take_inventory_wakeup());
+        assert!(authority.pending_inventory_contexts(None, 1).is_empty());
+        {
+            let mut state = authority.state.lock().unwrap();
+            let entry = state.client_cwds.get_mut("reader").unwrap();
+            entry.request_inventory_rescan();
+            assert!(
+                !entry.inventory_wakeup,
+                "the same pending read is coalesced"
+            );
+        }
+        authority.inventory_context_admitted("reader");
+        assert!(!authority.take_inventory_wakeup());
     }
 
     #[test]

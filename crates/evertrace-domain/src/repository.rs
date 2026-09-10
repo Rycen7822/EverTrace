@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ids::{
-    AttemptId, IntegrationEventId, RepositoryId, WorktreeId, WorktreeSnapshotId,
+    AttemptId, IntegrationEventId, JobId, RepositoryId, WorktreeId, WorktreeSnapshotId,
     WorktreeTransitionId,
 };
 
@@ -242,6 +242,19 @@ pub struct RepositoryInstance {
     pub derived_from: Option<RepositoryId>,
     pub identity_evidence_refs: Vec<String>,
     pub recorded_at_us: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_state: Option<RepositoryCapabilityState>,
+}
+
+/// Orthogonal to Git identity and lifecycle. A successful inventory command is
+/// the only operation allowed to clear a sticky revocation or move this boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryCapabilityState {
+    pub trust_revoked: bool,
+    pub revalidated_inventory_ref: Option<JobId>,
 }
 
 impl RepositoryInstance {
@@ -719,6 +732,8 @@ mod tests {
 
     fn repository() -> RepositoryInstance {
         RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
             repository_id: RepositoryId::from_str("repo:01890f47-6a4a-7cc1-98b9-01890f476a01")
                 .unwrap(),
             repository_revision: 1,

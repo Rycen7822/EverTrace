@@ -245,6 +245,30 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
             format!("review payload:\n{:#?}", review.proposal.payload),
         ]);
         lines.push("edit-and-accept: unavailable".into());
+        if let Some(coverage) = &review.capability_coverage {
+            lines.extend([
+                format!("capability inventory: {:?}", coverage.inventory_refs),
+                format!(
+                    "present assets: {}; unobserved sources: {}; unknown contracts: {}",
+                    coverage.present_assets,
+                    coverage.unobserved_sources,
+                    coverage.unknown_contracts
+                ),
+                format!(
+                    "equivalent capability evidence: {:?}",
+                    coverage.equivalent_assets
+                ),
+                format!(
+                    "incremental boundary base: {:?}",
+                    coverage.incremental_base_revision
+                ),
+                format!(
+                    "coverage omissions: {:?}; likely redundant: {}",
+                    coverage.omissions, coverage.likely_redundant
+                ),
+                "Unknown coverage blocks automatic acceptance, not manual review.".into(),
+            ]);
+        }
         if let Some(reference) = &review.reauthorization {
             lines.extend([
                 "re-authorize forgotten object: available".into(),
@@ -701,6 +725,42 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
                         ),
                     ]);
                 }
+            }
+            HumanSystemDetail::Repository {
+                repository_id,
+                repository_revision,
+                user_disabled,
+                trust_revoked,
+                revalidated_inventory_ref,
+                worktree_id,
+            } => {
+                lines.extend([
+                    format!("repository: {repository_id} revision {repository_revision}"),
+                    format!("disabled: {user_disabled}; sticky trust revoked: {trust_revoked}"),
+                    format!("restoration boundary: {revalidated_inventory_ref:?}"),
+                    format!("worktree: {worktree_id:?}"),
+                    "D disable; E verify and enable; R rescan (exact selected context)".into(),
+                ]);
+            }
+            HumanSystemDetail::CapabilityInventory {
+                job_id,
+                repository_id,
+                repository_revision,
+                worktree_id,
+                cwd,
+                state,
+                source_count,
+                signature_count,
+                unobserved_source_count,
+                unknown_contract_count,
+                asset_names,
+            } => {
+                lines.extend([format!("inventory: {job_id}"),
+                    format!("repository: {repository_id} revision {repository_revision}; worktree: {worktree_id}"),
+                    format!("cwd: {cwd}"), format!("state: {state}; sources: {source_count:?}; signatures: {signature_count:?}"),
+                    format!("unobserved sources: {unobserved_source_count:?}; unknown contracts: {unknown_contract_count:?}"),
+                    "Presence is not routing, adoption, or automatic Procedure coverage.".into()]);
+                lines.extend(asset_names.iter().map(|name| format!("asset: {name}")));
             }
             HumanSystemDetail::SessionImport {
                 session_id,

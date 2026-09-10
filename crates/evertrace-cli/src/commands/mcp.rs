@@ -30,7 +30,13 @@ enum Lifecycle {
     Ready,
 }
 
-pub async fn run(config_path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+pub async fn run(
+    config_path: Option<PathBuf>,
+    _host_locator: Option<(PathBuf, PathBuf)>,
+) -> Result<(), Box<dyn Error>> {
+    // Locators deliberately stay in the real process argv. The daemon obtains
+    // them from the kernel peer and independently verifies owned wiring and the
+    // direct Host parent; they never become caller-supplied wire authority.
     let effective = config::load(config_path)?;
     let home = env::var_os("HOME").map(PathBuf::from);
     let data_dir = resolve_data_dir(

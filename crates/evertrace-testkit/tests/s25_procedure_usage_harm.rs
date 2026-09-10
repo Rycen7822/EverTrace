@@ -289,6 +289,8 @@ fn source_payloads(receipt: SourceReceipt, observation: SourceObservation) -> Ve
 
 fn repository(repository_id: RepositoryId) -> RepositoryInstance {
     RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,

@@ -1602,16 +1602,60 @@ async fn mark_new_attempt_creates_one_unknown_child_and_replays_after_reopen() {
 }
 
 async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() {
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
     let root = TempDir::new().unwrap();
     let runtime = runtime_snapshot(root.path());
     DeviceKeyStore::new(runtime.device_key_dir.clone())
         .load_or_create()
         .unwrap();
-    drop(evertrace_capture::CaptureRuntime::open(runtime.clone()).unwrap());
+    let cold_runtime = runtime.clone();
+    // Keep cold Capture/Lance initialization off this existing large scenario's
+    // polling stack; all initialization and subsequent writes remain serial.
+    tokio::task::spawn_blocking(move || {
+        drop(evertrace_capture::CaptureRuntime::open(cold_runtime).unwrap());
+    })
+    .await
+    .unwrap();
     let repository_id = RepositoryId::new_v7();
     let worktree_id = WorktreeId::new_v7();
     let task_id = TaskId::new_v7();
     let repository_path = root.path().join("repo").display().to_string();
+    std::fs::create_dir(&repository_path).unwrap();
+    let adapter = root.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/09");
+    std::fs::create_dir_all(&dated).unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000031";
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta",
+                "payload":{"id":session,"session_id":session,"cwd":repository_path,
+                "originator":"codex_cli_rs","model_provider":"test","git":null}
+            })
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(&repository_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let report = Arc::new(tokio::sync::RwLock::new(Some(
+        evertrace_engine::repository::observe_session_catalog_report(
+            transcript.to_str(),
+            session,
+            "tool",
+            None,
+        )
+        .unwrap(),
+    )));
     let path_observation = PathObservation {
         path: repository_path.clone(),
         first_observed_at_us: 1,
@@ -1619,6 +1663,8 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         evidence_refs: vec!["path:s31".into()],
     };
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,
@@ -1711,7 +1757,10 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
     )
     .unwrap();
     let store = root.path().join("store");
-    let writer = open_writer(&store).await.unwrap();
+    let cold_store = store.clone();
+    let writer = tokio::spawn(async move { open_writer(&cold_store).await.unwrap() })
+        .await
+        .unwrap();
     let (handle, writer_task) = spawn_writer(writer, 8).unwrap();
     handle.commit(initial, 1).await.unwrap();
     let proposals = RevisionProposalService;
@@ -1752,7 +1801,8 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             procedure: PromotionLevel::Manual,
             core_membership: PromotionLevel::Manual,
         },
-    );
+    )
+    .with_session_report(report.clone());
     assert!(matches!(
         service
             .resolve_competing_selected(
@@ -3053,7 +3103,10 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
     drop(restored_edit);
     handle.shutdown().await.unwrap();
     writer_task.await.unwrap().unwrap();
-    let writer = open_writer(&store).await.unwrap();
+    let cold_store = store.clone();
+    let writer = tokio::spawn(async move { open_writer(&cold_store).await.unwrap() })
+        .await
+        .unwrap();
     let (handle, writer_task) = spawn_writer(writer, 8).unwrap();
     let service = HumanGovernanceService::with_acceptance(
         handle.clone(),
@@ -3064,7 +3117,8 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             procedure: PromotionLevel::Manual,
             core_membership: PromotionLevel::Manual,
         },
-    );
+    )
+    .with_session_report(report.clone());
     Box::pin(async {
         let before_deprecate_submit_retry = handle.project().await.unwrap();
         let evertrace_engine::HumanActionOutcome::Applied {
@@ -4357,7 +4411,10 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
     }));
     handle.shutdown().await.unwrap();
     writer_task.await.unwrap().unwrap();
-    let reopened = open_writer(&store).await.unwrap();
+    let cold_store = store.clone();
+    let reopened = tokio::spawn(async move { open_writer(&cold_store).await.unwrap() })
+        .await
+        .unwrap();
     let (reopened_handle, reopened_task) = spawn_writer(reopened, 8).unwrap();
     let before_reconcile = reopened_handle.project().await.unwrap();
     let reopened_service = HumanGovernanceService::with_acceptance(
@@ -4369,7 +4426,8 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             procedure: PromotionLevel::Manual,
             core_membership: PromotionLevel::Manual,
         },
-    );
+    )
+    .with_session_report(report);
     reopened_service.reconcile_reserved_once().await.unwrap();
     let rebuilt = reopened_handle.project().await.unwrap();
     assert_eq!(rebuilt.frontier, before_reconcile.frontier);

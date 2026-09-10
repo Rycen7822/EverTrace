@@ -125,6 +125,7 @@ pub struct SynthesisPlanner {
     provider: Option<OpenAiCompatibleProvider>,
     prompt_hash: [u8; 32],
     concurrency: std::sync::Arc<crate::provider::ProviderConcurrency>,
+    inventory: Option<super::InventoryWorker>,
 }
 
 impl SynthesisPlanner {
@@ -138,7 +139,13 @@ impl SynthesisPlanner {
             provider,
             prompt_hash: canonical_prompt_hash(),
             concurrency,
+            inventory: None,
         }
+    }
+
+    pub fn with_inventory(mut self, inventory: Option<super::InventoryWorker>) -> Self {
+        self.inventory = inventory;
+        self
     }
 
     pub(crate) fn reconfigured(
@@ -158,6 +165,7 @@ impl SynthesisPlanner {
             provider,
             prompt_hash: self.prompt_hash,
             concurrency: std::sync::Arc::clone(&self.concurrency),
+            inventory: self.inventory.clone(),
         })
     }
 
@@ -620,7 +628,7 @@ impl SynthesisPlanner {
             .filter(|reference| ref_index.proposal_evidence(reference))
             .cloned()
             .collect::<Vec<_>>();
-        let application = match materialize_application(
+        let mut application = match materialize_application(
             derived.application,
             &episode,
             &evidence_refs,
@@ -659,6 +667,20 @@ impl SynthesisPlanner {
                 },
             );
         }
+        // The closed provider result permits at most one candidate. Resolve
+        // its cohort's assets once, after schema/protection, not per record.
+        let coverage = match (application.candidates.first(), &self.inventory) {
+            (Some(SemanticCandidate::ProcedureProposal { payload, .. }), Some(inventory)) => Some(
+                inventory
+                    .procedure_coverage(request.snapshot, payload.draft(), &evidence_refs)
+                    .await?,
+            ),
+            _ => None,
+        };
+        if let (Some(coverage), Some(candidate)) = (&coverage, application.candidates.first_mut()) {
+            coverage.apply_incremental_boundary(candidate);
+        }
+        validate_candidates(&application.candidates, &episode, request.snapshot)?;
         let digest_id = SemanticDigestId::new_v7();
         let digest = SemanticDigest {
             semantic_digest_id: digest_id,
@@ -725,7 +747,13 @@ impl SynthesisPlanner {
         episode
             .validate_successor(&successor)
             .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
-        let mut payloads = proposal_payloads(&digest, request.snapshot, &request, &evidence_refs)?;
+        let mut payloads = proposal_payloads(
+            &digest,
+            request.snapshot,
+            &request,
+            &evidence_refs,
+            coverage.as_ref(),
+        )?;
         payloads.extend([
             JournalPayload::SemanticDigestRecorded(Box::new(digest.clone())),
             JournalPayload::SemanticDerivationRunRecorded(Box::new(run.clone())),
@@ -1285,12 +1313,19 @@ fn proposal_payloads(
     snapshot: &ProjectionSnapshot,
     request: &SynthesisRequest<'_>,
     evidence_refs: &[String],
+    coverage: Option<&crate::procedure::VerifiedProcedureCoverage>,
 ) -> Result<Vec<JournalPayload>, crate::semantic::SemanticServiceError> {
     let view = SemanticCurrentView::from_snapshot(snapshot)?;
     let deletion_admission = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
     let service = RevisionProposalService;
     let mut payloads = Vec::new();
     for candidate in &digest.application.candidates {
+        if matches!(candidate, SemanticCandidate::ProcedureProposal { payload, .. }
+            if payload.operation() == evertrace_domain::semantic::ProposalOperation::Create)
+            && coverage.is_some_and(|coverage| coverage.suppresses_duplicate_create())
+        {
+            continue;
+        }
         let submit = match candidate {
             SemanticCandidate::ScenarioPatch { .. } => continue,
             SemanticCandidate::AtomProposal {

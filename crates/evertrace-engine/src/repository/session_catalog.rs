@@ -360,6 +360,9 @@ pub(crate) fn read_report_path_trust_before(
     repository_path: Option<&str>,
     deadline: Instant,
 ) -> RepositoryTrustResult {
+    if let Some(host) = report.inventory_host() {
+        return read_repository_trust_at(&host.config_root, repository_path, deadline);
+    }
     let unknown = || RepositoryTrustResult {
         state: RepositoryTrustState::Unknown,
         canonical_repository_path: None,

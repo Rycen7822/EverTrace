@@ -30,7 +30,396 @@ const MAX_CANDIDATES: usize = 64;
 #[derive(Clone, Debug)]
 pub enum ProcedureAcceptanceContext {
     Manual(AtomAcceptanceContext),
-    AutoFull(ProcedureEligibilityEvidence),
+    AutoFull {
+        evidence: ProcedureEligibilityEvidence,
+        coverage: Option<Box<VerifiedProcedureCoverage>>,
+    },
+}
+
+/// Only the current, protected inventory reader can construct this value. The
+/// display summary is deliberately not accepted as an authorization token.
+#[derive(Clone, Debug)]
+pub struct VerifiedProcedureCoverage {
+    summary: evertrace_domain::inventory::CapabilityCoverageSummary,
+    frontier: u64,
+    draft: evertrace_domain::procedure::ProcedureDraft,
+    source_refs: Vec<String>,
+    incremental_target: Option<(ProcedureId, RevisionId)>,
+}
+
+impl VerifiedProcedureCoverage {
+    pub fn summary(&self) -> &evertrace_domain::inventory::CapabilityCoverageSummary {
+        &self.summary
+    }
+
+    pub(crate) fn suppresses_duplicate_create(&self) -> bool {
+        self.summary.equivalent_assets.iter().any(|value| {
+            value.level == evertrace_domain::inventory::CapabilityEvidenceLevel::OutcomeSupported
+        })
+    }
+
+    pub(crate) fn apply_incremental_boundary(
+        &self,
+        candidate: &mut evertrace_domain::semantic::SemanticCandidate,
+    ) {
+        let Some((id, revision)) = self.incremental_target else {
+            return;
+        };
+        let evertrace_domain::semantic::SemanticCandidate::ProcedureProposal {
+            target_id,
+            base_revision_id,
+            payload,
+        } = candidate
+        else {
+            return;
+        };
+        if target_id.is_none()
+            && base_revision_id.is_none()
+            && matches!(payload.as_ref(), ProcedureProposalPayload::Create { draft } if draft == &self.draft)
+        {
+            *target_id = Some(id);
+            *base_revision_id = Some(revision);
+            **payload = ProcedureProposalPayload::Replace {
+                draft: self.draft.clone(),
+            };
+        }
+    }
+
+    fn permits_auto_full(&self, view: &SemanticCurrentView, proposal: &RevisionProposal) -> bool {
+        let ProposalPayload::Procedure(payload) = &proposal.payload else {
+            return false;
+        };
+        self.frontier == view.frontier
+            && &self.draft == payload.draft()
+            && self.source_refs == proposal.source_cohort_refs
+            && !self.summary.inventory_refs.is_empty()
+            && self.summary.omissions.is_empty()
+            && self.summary.equivalent_assets.is_empty()
+            && self.incremental_target.is_none()
+            && !self.summary.likely_redundant
+    }
+}
+
+/// The proposal's real source cohort selects its session. A recent inventory
+/// from another session or cwd is never a fallback, nor is an old installation
+/// backfilled into a session that did not observe it.
+pub async fn resolve_procedure_coverage(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    snapshot: &ProjectionSnapshot,
+    draft: &evertrace_domain::procedure::ProcedureDraft,
+    source_refs: &[String],
+) -> Result<VerifiedProcedureCoverage, SemanticServiceError> {
+    use evertrace_domain::inventory::{
+        CapabilityCoverageMatch, CapabilityCoverageOmission as Omission, CapabilityCoverageSummary,
+        CapabilityEvidenceLevel,
+    };
+    use std::collections::BTreeSet;
+    // Existing stage/usage facts do not identify natural execution of the
+    // same actions across independent tasks or account for exploration cost.
+    // False must not stand in for an observed non-redundancy determination.
+    let mut coverage = CapabilityCoverageSummary {
+        omissions: vec![Omission::NaturalExecutionUnobserved],
+        ..CapabilityCoverageSummary::default()
+    };
+    let refs = source_refs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut sessions = BTreeSet::new();
+    let mut complete_capture = !refs.is_empty();
+    let mut source_boundary = None::<(u64, i64)>;
+    let mut receipts = BTreeSet::new();
+    let mut resolved_refs = BTreeSet::new();
+    for row in snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
+    {
+        if row.object_id.as_deref().is_none_or(|id| !refs.contains(id)) {
+            continue;
+        }
+        let JournalPayload::SourceObservationRecorded(value) = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(SemanticServiceError::InvalidInput)?,
+        )
+        .map_err(|_| SemanticServiceError::InvalidInput)?
+        else {
+            return Err(SemanticServiceError::InvalidInput);
+        };
+        receipts.insert(value.source_receipt_ref.to_string());
+        resolved_refs.insert(value.source_observation_id.to_string());
+    }
+    for row in snapshot
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+    {
+        if row
+            .object_id
+            .as_deref()
+            .is_none_or(|id| !refs.contains(id) && !receipts.contains(id))
+        {
+            continue;
+        }
+        let JournalPayload::SourceReceiptRecorded(value) = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(SemanticServiceError::InvalidInput)?,
+        )
+        .map_err(|_| SemanticServiceError::InvalidInput)?
+        else {
+            return Err(SemanticServiceError::InvalidInput);
+        };
+        sessions.insert(format!("session:{}", value.source_session_ref));
+        let boundary = (row.source_event_seq, value.recorded_at_us);
+        source_boundary = Some(source_boundary.map_or(boundary, |old| {
+            (old.0.min(boundary.0), old.1.min(boundary.1))
+        }));
+        resolved_refs.insert(value.source_receipt_id.to_string());
+        receipts.remove(&value.source_receipt_id.to_string());
+        complete_capture &= value.capture_completeness
+            == evertrace_domain::evidence::CaptureCompleteness::Complete
+            && value.close_watermark.is_some();
+    }
+    if sessions.len() != 1 {
+        coverage.omissions.push(Omission::SessionUnobserved);
+    }
+    if sessions.is_empty()
+        || !complete_capture
+        || !receipts.is_empty()
+        || refs
+            .iter()
+            .any(|reference| !resolved_refs.contains(*reference))
+    {
+        coverage
+            .omissions
+            .push(Omission::HistoricalCaptureUnobserved);
+    }
+    let active = bindings.active_inventory_contexts();
+    let mut candidates = std::collections::BTreeMap::new();
+    let mut historical = std::collections::BTreeMap::new();
+    let mut incremental_targets = Vec::new();
+    if sessions.len() == 1 {
+        for row in snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("capability_inventory"))
+        {
+            let JournalPayload::CapabilityInventoryRecorded(value) = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(SemanticServiceError::InvalidInput)?,
+            )
+            .map_err(|_| SemanticServiceError::InvalidInput)?
+            else {
+                return Err(SemanticServiceError::InvalidInput);
+            };
+            let scope = ProcedureScope::Worktree {
+                repository_id: value.context.repository_id,
+                worktree_id: value.context.worktree_id,
+            };
+            if draft.scope.contains(&scope)
+                && active.iter().any(|(host, report)| {
+                    host.cwd.to_str() == Some(value.context.cwd.as_str())
+                        && host.home.to_str() == Some(value.context.host_home.as_str())
+                        && host.config_root.to_str()
+                            == Some(value.context.host_config_root.as_str())
+                        && host.profile == value.context.host_profile
+                        && report.manifest().adapter_manifest_id
+                            == value.context.adapter_manifest_id
+                        && bindings
+                            .inventory_session_ref(host)
+                            .is_some_and(|reference| sessions.contains(&reference))
+                })
+            {
+                if source_boundary.is_some_and(|(seq, time)| {
+                    row.source_event_seq <= seq && value.recorded_at_us <= time
+                }) && value
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| sessions.contains(reference))
+                {
+                    let entry = historical
+                        .entry(value.context.clone())
+                        .or_insert((row.source_event_seq, value.snapshot_cas_ref.clone()));
+                    if row.source_event_seq > entry.0 {
+                        *entry = (row.source_event_seq, value.snapshot_cas_ref.clone());
+                    }
+                }
+                let entry = candidates
+                    .entry(value.context.clone())
+                    .or_insert((row.source_event_seq, value.clone()));
+                if row.source_event_seq > entry.0 {
+                    *entry = (row.source_event_seq, value);
+                }
+                if candidates.len() > 1 {
+                    break;
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        coverage.omissions.push(Omission::InventoryMissing);
+    }
+    // Different active cwd/profile observations for one source cohort are not
+    // interchangeable. Do not choose an arbitrary recent Host observation.
+    if candidates.len() > 1 {
+        coverage.omissions.push(Omission::SessionUnobserved);
+        candidates.clear();
+    }
+    for (_, (_, fact)) in candidates {
+        // Current presence is useful to the reviewer, but an inventory that
+        // completed after the source cannot prove that source's historical
+        // capability coverage, including when the same session resumes.
+        if historical
+            .get(&fact.context)
+            .is_none_or(|(_, cas_ref)| *cas_ref != fact.snapshot_cas_ref)
+        {
+            coverage
+                .omissions
+                .push(Omission::HistoricalCaptureUnobserved);
+        }
+        let Some(inventory) = crate::repository::read_inventory(writer, bindings, runtime, &fact)
+            .await
+            .map_err(|_| SemanticServiceError::InvalidInput)?
+        else {
+            coverage.omissions.push(Omission::InventoryStale);
+            continue;
+        };
+        coverage.inventory_refs.push(fact.job_id);
+        coverage.present_assets = inventory.signatures.len() as u32;
+        coverage.unobserved_sources = inventory
+            .sources
+            .iter()
+            .filter(|source| !source.observed)
+            .count() as u32;
+        if coverage.unobserved_sources != 0 {
+            coverage.omissions.push(Omission::SourceUnobserved);
+        }
+        for signature in &inventory.signatures {
+            let (
+                Some(triggers),
+                Some(preconditions),
+                Some(actions),
+                Some(outputs),
+                Some(validation),
+                Some(boundaries),
+            ) = (
+                &signature.triggers,
+                &signature.preconditions,
+                &signature.key_actions,
+                &signature.outputs,
+                &signature.validation,
+                &signature.failure_boundaries,
+            )
+            else {
+                coverage.unknown_contracts += 1;
+                continue;
+            };
+            if triggers == &draft.when.goals
+                && preconditions == &draft.when.requires
+                && actions == &draft.actions.stages
+                && outputs == &draft.done.success
+                && validation == &draft.done.verify
+                && boundaries == &draft.pitfalls
+            {
+                coverage.equivalent_assets.push(CapabilityCoverageMatch {
+                    revision_ref: signature.content_cas_ref.clone(),
+                    level: CapabilityEvidenceLevel::Present,
+                });
+            }
+        }
+        if coverage.unknown_contracts != 0 {
+            coverage.omissions.push(Omission::ContractUnknown);
+        }
+        let usage = usage::ProcedureUsageCurrentView::from_snapshot(snapshot)?;
+        for (index, (procedure, level)) in usage
+            .coverage_procedures(
+                draft.scope,
+                fact.context.repository_id,
+                fact.context.worktree_id,
+            )
+            .enumerate()
+        {
+            if index == MAX_CANDIDATES {
+                coverage.omissions.push(Omission::CandidateLimit);
+                break;
+            }
+            if equivalent_procedure_contract(&procedure.draft, draft) {
+                coverage.equivalent_assets.push(CapabilityCoverageMatch {
+                    revision_ref: procedure.revision_id.to_string(),
+                    level,
+                });
+            } else if level == CapabilityEvidenceLevel::OutcomeSupported
+                && procedure.draft.scope == draft.scope
+                && extends_procedure_boundaries(&procedure.draft, draft)
+            {
+                incremental_targets.push((procedure.procedure_id, procedure.revision_id));
+            }
+        }
+    }
+    coverage.inventory_refs.sort();
+    coverage.inventory_refs.dedup();
+    coverage
+        .equivalent_assets
+        .sort_by(|left, right| left.revision_ref.cmp(&right.revision_ref));
+    coverage
+        .equivalent_assets
+        .dedup_by(|left, right| left.revision_ref == right.revision_ref);
+    if coverage.equivalent_assets.len() > MAX_CANDIDATES {
+        coverage.equivalent_assets.truncate(MAX_CANDIDATES);
+        coverage.omissions.push(Omission::CandidateLimit);
+    }
+    coverage.omissions.sort();
+    coverage.omissions.dedup();
+    let incremental_target = (incremental_targets.len() == 1).then(|| incremental_targets[0]);
+    coverage.incremental_base_revision = incremental_target.map(|(_, revision)| revision);
+    if !coverage.validate() {
+        return Err(SemanticServiceError::InvalidInput);
+    }
+    Ok(VerifiedProcedureCoverage {
+        summary: coverage,
+        frontier: snapshot.frontier,
+        draft: draft.clone(),
+        source_refs: source_refs.to_vec(),
+        incremental_target,
+    })
+}
+
+fn extends_procedure_boundaries(
+    left: &evertrace_domain::procedure::ProcedureDraft,
+    right: &evertrace_domain::procedure::ProcedureDraft,
+) -> bool {
+    // Only an authored, strict extension of the same proven contract. Changing
+    // actions, conditions or verification is not a deterministic equivalence.
+    if right.pitfalls.len() <= left.pitfalls.len()
+        || !left
+            .pitfalls
+            .iter()
+            .all(|boundary| right.pitfalls.contains(boundary))
+    {
+        return false;
+    }
+    let mut comparable = right.clone();
+    comparable.pitfalls.clone_from(&left.pitfalls);
+    equivalent_procedure_contract(left, &comparable)
+}
+
+fn equivalent_procedure_contract(
+    left: &evertrace_domain::procedure::ProcedureDraft,
+    right: &evertrace_domain::procedure::ProcedureDraft,
+) -> bool {
+    left.scope.contains(&right.scope)
+        && left.kind == right.kind
+        && left.when == right.when
+        && left.condition_ir_version == right.condition_ir_version
+        && left.applicability_expr == right.applicability_expr
+        && left.avoid_expr == right.avoid_expr
+        && left.completion_expr == right.completion_expr
+        && left.stage_alignment == right.stage_alignment
+        && left.actions == right.actions
+        && left.done == right.done
+        && left.pitfalls == right.pitfalls
 }
 
 pub(crate) struct EditedProcedureAcceptance<'a> {
@@ -280,7 +669,16 @@ fn accept_procedure_inner(
                 )?
             }
         }
-        ProcedureAcceptanceContext::AutoFull(evidence) => {
+        ProcedureAcceptanceContext::AutoFull {
+            mut evidence,
+            coverage,
+        } => {
+            let coverage = coverage
+                .filter(|coverage| coverage.permits_auto_full(view, proposal))
+                .ok_or(SemanticServiceError::InvalidInput)?;
+            // Never trust the caller/LLM's redundancy flag. All other existing
+            // objective verifier and independent-success gates remain intact.
+            evidence.redundancy_check_passed = true;
             let global = matches!(draft.scope, ProcedureScope::Global);
             if proposal.eligibility != ProposalEligibility::AutoEligibleFull
                 || global && global_config.procedure != PromotionLevel::FullAuto
@@ -304,6 +702,7 @@ fn accept_procedure_inner(
                         eligibility: evidence,
                         procedure_promotion_level: global_config.procedure,
                         eligible: true,
+                        capability_inventory_refs: Some(coverage.summary.inventory_refs),
                     })),
                 },
                 ProposalAcceptanceAudit {

@@ -738,6 +738,7 @@ fn recovery_manifest() -> Result<AdapterCapabilityManifest, RecoveryError> {
         trust_readback: TrustReadback::Unavailable,
         project_policy_surfaces: vec![],
         session_catalog_root_contracts: vec![],
+        capability_inventory_profile: None,
         admission_failure_observability: ManifestObservability::Complete,
         mcp_session_binding: McpSessionBinding::Unavailable,
         mcp_binding_mechanism: McpBindingMechanism::None,

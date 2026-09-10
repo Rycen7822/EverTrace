@@ -1215,6 +1215,8 @@ fn scheduler(
 
 fn repository(id: RepositoryId, path: &str, at: i64) -> RepositoryInstance {
     RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id: id,
         repository_revision: 1,
         predecessor_revision: None,

@@ -439,6 +439,27 @@ pub struct HumanJobDetail {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HumanSystemDetail {
+    Repository {
+        repository_id: RepositoryId,
+        repository_revision: u32,
+        user_disabled: bool,
+        trust_revoked: bool,
+        revalidated_inventory_ref: Option<JobId>,
+        worktree_id: Option<WorktreeId>,
+    },
+    CapabilityInventory {
+        job_id: JobId,
+        repository_id: RepositoryId,
+        repository_revision: u32,
+        worktree_id: WorktreeId,
+        cwd: String,
+        state: String,
+        source_count: Option<u32>,
+        signature_count: Option<u32>,
+        unobserved_source_count: Option<u32>,
+        unknown_contract_count: Option<u32>,
+        asset_names: Vec<String>,
+    },
     SessionImport {
         session_id: String,
         source_instance_id: String,
@@ -547,6 +568,7 @@ pub struct HumanProposalReview {
     pub plain_accept_eligible: bool,
     pub merge_and_accept_eligible: bool,
     pub reauthorization: Option<ObjectReauthorizationRef>,
+    pub capability_coverage: Option<evertrace_domain::inventory::CapabilityCoverageSummary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -667,6 +689,22 @@ pub enum HumanActionOutcome {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HumanRepositoryAccessAction {
+    Disable,
+    Enable,
+    Rescan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanRepositoryAccess {
+    pub repository_id: RepositoryId,
+    pub expected_repository_revision: u32,
+    pub action: HumanRepositoryAccessAction,
+    pub worktree_id: Option<WorktreeId>,
+    pub inventory_ref: Option<JobId>,
+}
+
 #[derive(Debug, Error)]
 pub enum HumanGovernanceError {
     #[error("invalid human governance request")]
@@ -683,9 +721,181 @@ pub struct HumanGovernanceService {
     global_promotion: GlobalPromotionConfig,
     session_report:
         Option<std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
+    inventory_bindings: Option<crate::McpBindingAuthority>,
 }
 
 impl HumanGovernanceService {
+    pub fn with_inventory_bindings(mut self, bindings: crate::McpBindingAuthority) -> Self {
+        self.inventory_bindings = Some(bindings);
+        self
+    }
+
+    async fn inventory_detail(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        items: &mut [HumanSummary],
+    ) -> Result<(), HumanGovernanceError> {
+        for item in items {
+            if let Some(review) = item.proposal_review.as_mut()
+                && let ProposalPayload::Procedure(payload) = &review.proposal.payload
+                && let (Some(runtime), Some(bindings)) =
+                    (&self.runtime_snapshot, &self.inventory_bindings)
+            {
+                review.capability_coverage = Some(
+                    crate::procedure::resolve_procedure_coverage(
+                        &self.writer,
+                        bindings,
+                        runtime,
+                        snapshot,
+                        payload.draft(),
+                        &review.proposal.source_cohort_refs,
+                    )
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?
+                    .summary()
+                    .clone(),
+                );
+            }
+            if let Some(HumanSystemDetail::Repository {
+                repository_id,
+                worktree_id,
+                ..
+            }) = item.system_detail.as_mut()
+            {
+                let mut matches = snapshot
+                    .data_rows()
+                    .filter(|row| row.object_kind.as_deref() == Some("worktree"))
+                    .filter_map(|row| row.payload_json.as_deref())
+                    .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+                    .filter_map(|payload| match payload {
+                        JournalPayload::WorktreeInstanceRecorded(value)
+                            if value.repository_instance_id == *repository_id
+                                && !value.lifecycle.is_terminal()
+                                && value.current_path.is_some() =>
+                        {
+                            Some(value.worktree_instance_id)
+                        }
+                        _ => None,
+                    });
+                let first = matches.next();
+                if matches.next().is_none() {
+                    *worktree_id = first;
+                }
+            }
+            let Some(HumanSystemDetail::CapabilityInventory {
+                job_id,
+                repository_revision,
+                state,
+                source_count,
+                signature_count,
+                unobserved_source_count,
+                unknown_contract_count,
+                asset_names,
+                ..
+            }) = item.system_detail.as_mut()
+            else {
+                continue;
+            };
+            let fact = snapshot
+                .data_rows()
+                .find(|row| row.row_id == item.stable_key)
+                .and_then(|row| row.payload_json.as_deref())
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok());
+            let Some(JournalPayload::CapabilityInventoryRecorded(fact)) = fact else {
+                return Err(HumanGovernanceError::Store);
+            };
+            if fact.job_id != *job_id {
+                return Err(HumanGovernanceError::Store);
+            }
+            let current = self
+                .writer
+                .inventory_context(&fact.context, None)
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            let Some(repository) = current.repository else {
+                *state = "unobserved".into();
+                continue;
+            };
+            *repository_revision = repository.repository_revision;
+            *state = if current.purge_pending_or_purged {
+                "purged"
+            } else if repository.user_disabled {
+                "disabled"
+            } else if repository
+                .capability_state
+                .as_ref()
+                .is_some_and(|state| state.trust_revoked)
+            {
+                "revoked"
+            } else {
+                "stale"
+            }
+            .into();
+            if matches!(state.as_str(), "purged" | "disabled" | "revoked") {
+                continue;
+            }
+            let (Some(runtime), Some(bindings)) =
+                (&self.runtime_snapshot, &self.inventory_bindings)
+            else {
+                continue;
+            };
+            if let Some(body) =
+                crate::repository::read_inventory(&self.writer, bindings, runtime, &fact)
+                    .await
+                    .map_err(|_| HumanGovernanceError::Store)?
+            {
+                *state = "ready".into();
+                *source_count = Some(
+                    body.sources
+                        .len()
+                        .try_into()
+                        .map_err(|_| HumanGovernanceError::Store)?,
+                );
+                *signature_count = Some(
+                    body.signatures
+                        .len()
+                        .try_into()
+                        .map_err(|_| HumanGovernanceError::Store)?,
+                );
+                *unobserved_source_count = Some(
+                    body.sources
+                        .iter()
+                        .filter(|source| !source.observed)
+                        .count() as u32,
+                );
+                *unknown_contract_count = Some(
+                    body.signatures
+                        .iter()
+                        .filter(|signature| {
+                            signature.triggers.is_none()
+                                || signature.preconditions.is_none()
+                                || signature.key_actions.is_none()
+                                || signature.outputs.is_none()
+                                || signature.validation.is_none()
+                                || signature.failure_boundaries.is_none()
+                        })
+                        .count() as u32,
+                );
+                *asset_names = body
+                    .signatures
+                    .iter()
+                    .take(16)
+                    .map(|signature| {
+                        signature
+                            .authored_name
+                            .as_deref()
+                            .unwrap_or("authored name unknown")
+                            .chars()
+                            .filter(|character| !character.is_control())
+                            .take(128)
+                            .collect()
+                    })
+                    .collect();
+            }
+        }
+        Ok(())
+    }
+
     pub fn with_session_report(
         mut self,
         report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
@@ -711,17 +921,39 @@ impl HumanGovernanceService {
             Some(report) => report.read().await.clone(),
             None => None,
         };
-        let blocked = crate::session_import::blocked_source_rows(
+        let mut blocked = crate::session_import::blocked_source_rows(
             &self.writer,
             report.as_ref(),
             snapshot,
             &rows,
+            self.effective_config_hash,
         )
         .await
         .map_err(|_| HumanGovernanceError::Store)?;
+        let scopes = crate::repository::row_repository_contexts(snapshot, &rows)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let ids = scopes.values().flatten().copied().collect();
+        let repositories = crate::repository::blocked_repositories(
+            &self.writer,
+            ids,
+            report.as_ref(),
+            self.effective_config_hash,
+        )
+        .await
+        .map_err(|_| HumanGovernanceError::Store)?;
+        blocked.extend(
+            scopes
+                .into_iter()
+                .filter(|(_, ids)| !ids.is_disjoint(&repositories))
+                .map(|(row, _)| row.to_owned()),
+        );
         for item in items {
             if blocked.contains(&item.stable_key) {
                 item.evidence_detail = None;
+                item.work_detail = None;
+                item.proposal_review = None;
+                item.support_detail = None;
+                item.recovery_detail = None;
             }
         }
         Ok(())
@@ -748,6 +980,7 @@ impl HumanGovernanceService {
             runtime_snapshot: None,
             global_promotion: GlobalPromotionConfig::default(),
             session_report: None,
+            inventory_bindings: None,
         }
     }
 
@@ -763,6 +996,7 @@ impl HumanGovernanceService {
             runtime_snapshot: Some(runtime_snapshot),
             global_promotion,
             session_report: None,
+            inventory_bindings: None,
         }
     }
 
@@ -1094,6 +1328,7 @@ impl HumanGovernanceService {
         if surface == HumanSurface::Explorer {
             self.restrict_import_evidence(&snapshot, &mut items).await?;
         }
+        self.inventory_detail(&snapshot, &mut items).await?;
         if let Some((index, backup_job_id, validation_result)) =
             items.iter().enumerate().find_map(|(index, item)| {
                 let HumanSystemDetail::Job { detail } = item.system_detail.as_ref()? else {
@@ -2920,6 +3155,269 @@ impl HumanGovernanceService {
         })
     }
 
+    pub async fn repository_access(
+        &self,
+        request_id: RequestId,
+        expected_frontier: u64,
+        request: HumanRepositoryAccess,
+    ) -> Result<HumanActionOutcome, HumanGovernanceError> {
+        use evertrace_store::projections::{
+            INVENTORY_JOB_KIND, inventory_job_context_ref, inventory_job_worktree,
+            inventory_repository_target,
+        };
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let job_id = JobId::from_uuid(request_id.as_uuid())
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let target = inventory_repository_target(
+            request.repository_id,
+            request.expected_repository_revision,
+        );
+        let enable = request.action == HumanRepositoryAccessAction::Enable;
+        let context_ref = request
+            .inventory_ref
+            .map_or_else(|| "root".into(), |id| id.to_string());
+        if request.expected_repository_revision == 0
+            || (request.action == HumanRepositoryAccessAction::Disable)
+                != request.worktree_id.is_none()
+            || request.action == HumanRepositoryAccessAction::Disable
+                && request.inventory_ref.is_some()
+        {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
+        if let Some(committed) = self
+            .writer
+            .committed_command(command_id)
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?
+        {
+            let matched = committed
+                .payloads
+                .iter()
+                .enumerate()
+                .find_map(|(ordinal, payload)| match payload {
+                    JournalPayload::RepositoryInstanceRecorded(repository)
+                        if request.action == HumanRepositoryAccessAction::Disable
+                            && repository.repository_id == request.repository_id
+                            && repository.user_disabled
+                            && repository.predecessor_revision
+                                == Some(request.expected_repository_revision) =>
+                    {
+                        Some((
+                            ordinal,
+                            format!(
+                                "{}@{}",
+                                repository.repository_id, repository.repository_revision
+                            ),
+                        ))
+                    }
+                    JournalPayload::JobState(job)
+                        if request.action != HumanRepositoryAccessAction::Disable
+                            && job.job_id == job_id
+                            && job.target_revision == target
+                            && job.kind == INVENTORY_JOB_KIND
+                            && inventory_job_worktree(job) == request.worktree_id
+                            && inventory_job_context_ref(job) == Some(context_ref.as_str())
+                            && job.idempotency_key.starts_with(if enable {
+                                "capability_inventory:enable:"
+                            } else {
+                                "capability_inventory:scan:"
+                            }) =>
+                    {
+                        Some((ordinal, job.job_id.to_string()))
+                    }
+                    _ => None,
+                })
+                .ok_or(HumanGovernanceError::Store)?;
+            return Ok(HumanActionOutcome::Applied {
+                current_revision_ref: matched.1,
+                audit_event_ref: committed
+                    .event_ids
+                    .get(matched.0)
+                    .cloned()
+                    .ok_or(HumanGovernanceError::Store)?,
+            });
+        }
+        let snapshot = self
+            .writer
+            .project()
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let repositories =
+            evertrace_store::repository::RepositoryCurrentView::from_snapshot(&snapshot)
+                .map_err(|_| HumanGovernanceError::Store)?;
+        let Some(repository) = repositories.repositories.get(&request.repository_id) else {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "repository_missing",
+            });
+        };
+        if snapshot.frontier != expected_frontier
+            || repository.repository_revision != request.expected_repository_revision
+        {
+            return Ok(HumanActionOutcome::Conflict {
+                current_revision_ref: Some(format!(
+                    "{}@{}",
+                    repository.repository_id, repository.repository_revision
+                )),
+            });
+        }
+        if evertrace_store::ScopePurgeCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?
+            .events
+            .contains_key(&request.repository_id)
+        {
+            return Ok(HumanActionOutcome::Unavailable {
+                reason: "repository_purged",
+            });
+        }
+        let jobs = RuntimeSchedulerView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
+        let active = jobs
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.kind == INVENTORY_JOB_KIND
+                    && matches!(job.state, JobStatus::Queued | JobStatus::Leased)
+                    && job
+                        .target_revision
+                        .starts_with(&format!("{}@", request.repository_id))
+            })
+            .collect::<Vec<_>>();
+        let now = now_us()?;
+        let mut payloads = Vec::new();
+        let revision_ref;
+        if request.action == HumanRepositoryAccessAction::Disable {
+            if repository.user_disabled && active.is_empty() {
+                return Ok(HumanActionOutcome::NoDelta {
+                    current_revision_ref: format!(
+                        "{}@{}",
+                        repository.repository_id, repository.repository_revision
+                    ),
+                });
+            }
+            let mut next = repository.clone();
+            next.repository_revision = next
+                .repository_revision
+                .checked_add(1)
+                .ok_or(HumanGovernanceError::Store)?;
+            next.predecessor_revision = Some(repository.repository_revision);
+            next.recorded_at_us = now;
+            next.user_disabled = true;
+            revision_ref = format!("{}@{}", next.repository_id, next.repository_revision);
+            payloads.push(JournalPayload::RepositoryInstanceRecorded(Box::new(next)));
+            // The Repository revision fences every older target, including
+            // jobs beyond this bounded immediate cancellation batch.
+            for job in active.into_iter().take(crate::maintenance::PER_LANE_LIMIT) {
+                let mut cancelled = job.clone();
+                cancelled.state = JobStatus::Failed;
+                cancelled.lease_until_us = None;
+                cancelled.terminal = Some(Box::new(evertrace_store::JobTerminalAudit {
+                    outcome: evertrace_store::JobTerminalOutcome::Failed,
+                    reason: JobTerminalReason::Revoked,
+                    result_ref: None,
+                }));
+                payloads.push(JournalPayload::JobState(cancelled));
+            }
+        } else {
+            let worktree_id = request
+                .worktree_id
+                .ok_or(HumanGovernanceError::InvalidInput)?;
+            let Some(worktree) = repositories.worktrees.get(&worktree_id).filter(|worktree| {
+                worktree.repository_instance_id == repository.repository_id
+                    && !worktree.lifecycle.is_terminal()
+                    && worktree.current_path.is_some()
+            }) else {
+                return Ok(HumanActionOutcome::Unavailable {
+                    reason: "worktree_missing",
+                });
+            };
+            if let Some(reference) = request.inventory_ref {
+                let exists = snapshot.data_rows().filter(|row| row.object_kind.as_deref() == Some("capability_inventory")).any(|row| {
+                    matches!(row.payload_json.as_deref().and_then(|json| serde_json::from_str::<JournalPayload>(json).ok()), Some(JournalPayload::CapabilityInventoryRecorded(fact))
+                        if fact.job_id == reference && fact.context.repository_id == repository.repository_id && fact.context.worktree_id == worktree.worktree_instance_id)
+                });
+                if !exists {
+                    return Err(HumanGovernanceError::InvalidInput);
+                }
+            }
+            if !enable && !crate::repository::repository_read_gate(repository, false) {
+                return Ok(HumanActionOutcome::Unavailable {
+                    reason: "repository_disabled_or_revoked",
+                });
+            }
+            let prefix = if enable {
+                "capability_inventory:enable:"
+            } else {
+                "capability_inventory:scan:"
+            };
+            if let Some(job) = active.iter().find(|job| {
+                job.target_revision == target
+                    && job.idempotency_key.starts_with(prefix)
+                    && inventory_job_worktree(job) == Some(worktree_id)
+                    && inventory_job_context_ref(job) == Some(context_ref.as_str())
+            }) {
+                return Ok(HumanActionOutcome::NoDelta {
+                    current_revision_ref: job.job_id.to_string(),
+                });
+            }
+            revision_ref = job_id.to_string();
+            payloads.push(JournalPayload::JobState(DurableJob {
+                job_id,
+                idempotency_key: format!("{prefix}{job_id}|{worktree_id}|{context_ref}"),
+                target_revision: target,
+                target_watermark: expected_frontier,
+                target_generation: u64::from(repository.repository_revision),
+                kind: INVENTORY_JOB_KIND.into(),
+                algorithm_revision: INVENTORY_JOB_KIND.into(),
+                model_id: None,
+                priority: 0,
+                state: JobStatus::Queued,
+                attempt: 1,
+                backoff_until_us: None,
+                config_hash: self.effective_config_hash,
+                budget: crate::jobs::inventory_budget(),
+                terminal: None,
+                lease_until_us: None,
+            }));
+        }
+        let events = payloads
+            .into_iter()
+            .map(|payload| {
+                let mut event = evertrace_store::JournalEventDraft::runtime(
+                    now,
+                    self.effective_config_hash,
+                    INVENTORY_JOB_KIND,
+                    payload,
+                );
+                event.source_kind = evertrace_store::SourceKind::Manual;
+                event
+            })
+            .collect();
+        let command = JournalCommand::new(command_id, events)
+            .map_err(|_| HumanGovernanceError::InvalidInput)?;
+        let outcome = match self
+            .writer
+            .commit_if_frontier(command, now, snapshot.frontier)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(crate::WriterActorError::StaleFrontier) => {
+                return Ok(HumanActionOutcome::Conflict {
+                    current_revision_ref: None,
+                });
+            }
+            Err(_) => return Err(HumanGovernanceError::Store),
+        };
+        Ok(HumanActionOutcome::Applied {
+            current_revision_ref: revision_ref,
+            audit_event_ref: outcome
+                .event_ids
+                .first()
+                .cloned()
+                .ok_or(HumanGovernanceError::Store)?,
+        })
+    }
+
     pub async fn purge_repository(
         &self,
         request_id: RequestId,
@@ -3509,7 +4007,13 @@ fn surface_matches(surface: HumanSurface, row: &ObjectRow) -> bool {
         HumanSurface::Explorer => row.row_class != Some(ObjectRowClass::Runtime),
         HumanSurface::System => {
             row.row_class == Some(ObjectRowClass::Runtime)
-                || matches!(kind, "session_import_current" | "semantic_derivation_run")
+                || matches!(
+                    kind,
+                    "session_import_current"
+                        | "semantic_derivation_run"
+                        | "repository"
+                        | "capability_inventory"
+                )
         }
     }
 }
@@ -4025,6 +4529,7 @@ fn summary(
                     plain_accept_eligible: plain_accept_eligible && reauthorization.is_none(),
                     merge_and_accept_eligible,
                     reauthorization,
+                    capability_coverage: None,
                 })
             })
             .transpose()?
@@ -4535,6 +5040,8 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
             | "execution_lane"
             | "capture_receipt"
             | "runtime_event"
+            | "repository"
+            | "capability_inventory"
     ) {
         return Ok((None, None, None, None));
     }
@@ -4545,6 +5052,43 @@ fn typed_current_detail(row: &ObjectRow) -> Result<HumanTypedDetails, HumanGover
     )
     .map_err(|_| HumanGovernanceError::Store)?;
     match (kind, payload) {
+        ("repository", JournalPayload::RepositoryInstanceRecorded(value)) => Ok((
+            None,
+            None,
+            None,
+            Some(HumanSystemDetail::Repository {
+                repository_id: value.repository_id,
+                repository_revision: value.repository_revision,
+                user_disabled: value.user_disabled,
+                trust_revoked: value
+                    .capability_state
+                    .as_ref()
+                    .is_some_and(|state| state.trust_revoked),
+                revalidated_inventory_ref: value
+                    .capability_state
+                    .as_ref()
+                    .and_then(|state| state.revalidated_inventory_ref),
+                worktree_id: None,
+            }),
+        )),
+        ("capability_inventory", JournalPayload::CapabilityInventoryRecorded(value)) => Ok((
+            None,
+            None,
+            None,
+            Some(HumanSystemDetail::CapabilityInventory {
+                job_id: value.job_id,
+                repository_id: value.context.repository_id,
+                repository_revision: value.repository_revision,
+                worktree_id: value.context.worktree_id,
+                cwd: value.context.cwd,
+                state: "recorded".into(),
+                source_count: None,
+                signature_count: None,
+                unobserved_source_count: None,
+                unknown_contract_count: None,
+                asset_names: Vec::new(),
+            }),
+        )),
         (
             "recovery_capture_request_revision",
             JournalPayload::RecoveryCaptureRequestRecorded(value),

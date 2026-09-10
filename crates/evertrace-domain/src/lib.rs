@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod evidence;
 pub mod ids;
+pub mod inventory;
 pub mod procedure;
 pub mod purge;
 pub mod query;

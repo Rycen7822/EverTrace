@@ -545,6 +545,64 @@ impl ProcedureUsageCurrentView {
             .then_some(procedure)
     }
 
+    pub(crate) fn coverage_procedures(
+        &self,
+        scope: evertrace_domain::procedure::ProcedureScope,
+        repository_id: evertrace_domain::ids::RepositoryId,
+        worktree_id: evertrace_domain::ids::WorktreeId,
+    ) -> impl Iterator<
+        Item = (
+            &ProcedureRevision,
+            evertrace_domain::inventory::CapabilityEvidenceLevel,
+        ),
+    > {
+        use evertrace_domain::inventory::CapabilityEvidenceLevel as Level;
+        use evertrace_domain::procedure::{
+            ProcedureCorrelationState, ProcedureTruth, ProcedureUsageStage,
+        };
+        self.current_procedures.values().filter_map(move |id| {
+            let procedure = self.current_procedure_by_revision(*id)?;
+            if !procedure.draft.scope.contains(&scope)
+                || !self.publications.get(id).is_some_and(|(event, _)| {
+                    matches!(
+                        event.to_state,
+                        ProcedurePublicationState::ActiveStable
+                            | ProcedurePublicationState::ActiveProbationary
+                    )
+                })
+            {
+                return None;
+            }
+            let level = self
+                .usages
+                .values()
+                .filter(|usage| {
+                    usage.procedure_revision_id == *id
+                        && usage.local_context.repository_id == Some(repository_id)
+                        && usage.local_context.worktree_id == Some(worktree_id)
+                        && usage.correlation_state == ProcedureCorrelationState::Resolved
+                        && usage.eligible == ProcedureTruth::True
+                })
+                .map(|usage| {
+                    if usage.action_aligned == ProcedureTruth::True
+                        && usage.verifier_aligned == ProcedureTruth::True
+                        && usage.outcome_supported == ProcedureTruth::True
+                    {
+                        Level::OutcomeSupported
+                    } else if usage.action_aligned == ProcedureTruth::True {
+                        Level::ActionAligned
+                    } else if usage.stage >= ProcedureUsageStage::Routed {
+                        Level::Routed
+                    } else {
+                        Level::Present
+                    }
+                })
+                .max()
+                .unwrap_or(Level::Present);
+            Some((procedure, level))
+        })
+    }
+
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, SemanticServiceError> {
         let mut view = Self {
             frontier: snapshot.frontier,

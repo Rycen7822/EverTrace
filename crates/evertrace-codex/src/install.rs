@@ -273,7 +273,17 @@ fn shell_path(path: &Path) -> Result<String, InstallError> {
     Ok(format!("'{}'", text.replace('\'', "'\\''")))
 }
 
+#[cfg(test)]
 fn wiring(data_root: &Path, cli: &Path, config: &Path) -> Result<Vec<u8>, InstallError> {
+    wiring_with_host(data_root, cli, config, None)
+}
+
+fn wiring_with_host(
+    data_root: &Path,
+    cli: &Path,
+    config: &Path,
+    host: Option<(&Path, &Path)>,
+) -> Result<Vec<u8>, InstallError> {
     let command = format!(
         "{} --launcher-root {}",
         shell_path(&data_root.join("hook-v1"))?,
@@ -287,6 +297,22 @@ fn wiring(data_root: &Path, cli: &Path, config: &Path) -> Result<Vec<u8>, Instal
         toml::Value::String(cli.to_str().ok_or(InstallError::InvalidType)?.into());
     mcp["mcp_servers"]["evertrace"]["args"][1] =
         toml::Value::String(config.to_str().ok_or(InstallError::InvalidType)?.into());
+    if let Some((executable, host_config)) = host {
+        if !executable.is_absolute() || !host_config.is_absolute() {
+            return Err(InstallError::InvalidType);
+        }
+        let args = mcp["mcp_servers"]["evertrace"]["args"]
+            .as_array_mut()
+            .ok_or(InstallError::InvalidType)?;
+        for value in [
+            "--host-executable",
+            executable.to_str().ok_or(InstallError::InvalidType)?,
+            "--host-config",
+            host_config.to_str().ok_or(InstallError::InvalidType)?,
+        ] {
+            args.push(toml::Value::String(value.into()));
+        }
+    }
     let mut hooks: serde_json::Value = serde_json::from_str(include_str!(
         "../../../packaging/codex/hooks.v1.template.json"
     ))
@@ -660,6 +686,20 @@ pub fn validate_installed_wiring(
     validated_installed_wiring(data_root, config, host_config).map(|(cli, _)| cli)
 }
 
+/// Returns locators only after the existing exact owned-wiring verification.
+/// The native observer must independently compare opened executable identities.
+pub fn inventory_wiring_locators(
+    data_root: &Path,
+    config: &Path,
+    host_config: &Path,
+) -> Result<(PathBuf, PathBuf), InstallError> {
+    let (cli, file) = validated_installed_wiring(data_root, config, host_config)?;
+    let (_, bytes) = file.original.as_ref().ok_or(InstallError::InvalidType)?;
+    let (host, _) = wiring_host_locator(bytes)?.ok_or(InstallError::InvalidType)?;
+    package_metadata(&host)?;
+    Ok((cli, host))
+}
+
 /// Digest only normalized verified declarations, never Host state or user TOML.
 pub fn installed_wiring_hash(
     data_root: &Path,
@@ -692,11 +732,63 @@ fn validated_installed_wiring(
         .map(PathBuf::from)
         .ok_or(InstallError::InvalidType)?;
     package_metadata(&cli)?;
-    if merge_wiring(bytes, &wiring(data_root, &cli, config)?, false)? != *bytes {
+    let locator = wiring_host_locator(bytes)?;
+    if locator
+        .as_ref()
+        .is_some_and(|(_, path)| path != host_config)
+        || merge_wiring(
+            bytes,
+            &wiring_with_host(
+                data_root,
+                &cli,
+                config,
+                locator
+                    .as_ref()
+                    .map(|(exe, path)| (exe.as_path(), path.as_path())),
+            )?,
+            false,
+        )? != *bytes
+    {
         return Err(InstallError::InvalidType);
     }
     file.revalidate(file.original.as_ref().map(|(identity, _)| identity))?;
     Ok((cli, file))
+}
+
+/// Parses only the two exact managed argv shapes. Values are locators, never
+/// executable or environment authority; the observer still opens both peers.
+fn wiring_host_locator(bytes: &[u8]) -> Result<Option<(PathBuf, PathBuf)>, InstallError> {
+    let source = std::str::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?;
+    if !source.contains(OWNED_BEGIN) {
+        return Ok(None);
+    }
+    let value: toml::Value = toml::from_str(source).map_err(|_| InstallError::InvalidType)?;
+    let args = value
+        .get("mcp_servers")
+        .and_then(|value| value.get("evertrace"))
+        .and_then(|value| value.get("args"))
+        .and_then(toml::Value::as_array)
+        .ok_or(InstallError::InvalidType)?;
+    let args = args
+        .iter()
+        .map(toml::Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(InstallError::InvalidType)?;
+    match args.as_slice() {
+        ["--config", _, "mcp"] => Ok(None),
+        [
+            "--config",
+            _,
+            "mcp",
+            "--host-executable",
+            executable,
+            "--host-config",
+            config,
+        ] if Path::new(executable).is_absolute() && Path::new(config).is_absolute() => {
+            Ok(Some((PathBuf::from(executable), PathBuf::from(config))))
+        }
+        _ => Err(InstallError::InvalidType),
+    }
 }
 
 fn ensure_install_parent(path: &Path) -> Result<(), InstallError> {
@@ -795,6 +887,20 @@ pub(crate) fn bounded_install_command(
     arguments: &[&str],
     host_home: Option<&Path>,
 ) -> Result<(i32, String), InstallError> {
+    bounded_install_command_before(
+        executable,
+        arguments,
+        host_home,
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+    )
+}
+
+pub(crate) fn bounded_install_command_before(
+    executable: &Path,
+    arguments: &[&str],
+    host_home: Option<&Path>,
+    deadline: std::time::Instant,
+) -> Result<(i32, String), InstallError> {
     use std::{
         os::fd::OwnedFd,
         os::unix::net::UnixStream,
@@ -802,6 +908,9 @@ pub(crate) fn bounded_install_command(
         time::{Duration, Instant},
     };
     let (mut reader, output) = UnixStream::pair().map_err(map_io)?;
+    if Instant::now() >= deadline {
+        return Err(InstallError::ResourceExhausted);
+    }
     reader.set_nonblocking(true).map_err(map_io)?;
     let descriptor: OwnedFd = output.into();
     let mut command = Command::new(executable);
@@ -814,7 +923,6 @@ pub(crate) fn bounded_install_command(
         command.env("CODEX_HOME", home);
     }
     let mut child = command.spawn().map_err(map_io)?;
-    let deadline = Instant::now() + Duration::from_secs(3);
     let mut bytes = Vec::new();
     loop {
         let mut buffer = [0; 1024];
@@ -910,11 +1018,26 @@ pub fn managed_install(
             .original
             .as_ref()
             .map_or(&[][..], |(_, bytes)| bytes.as_slice());
-        let merged = merge_wiring(
-            original_host,
-            &wiring(&paths.data_root, &paths.cli, &paths.config)?,
-            uninstall,
+        let previous_locator = wiring_host_locator(original_host)?;
+        let expected = wiring_with_host(
+            &paths.data_root,
+            &paths.cli,
+            &paths.config,
+            previous_locator
+                .as_ref()
+                .map(|(exe, path)| (exe.as_path(), path.as_path())),
         )?;
+        let replacement = if uninstall {
+            None
+        } else {
+            Some(wiring_with_host(
+                &paths.data_root,
+                &paths.cli,
+                &paths.config,
+                Some((&paths.host_executable, &paths.host_config)),
+            )?)
+        };
+        let merged = replace_wiring(original_host, &expected, replacement.as_deref())?;
         host.desired = if host.original.is_none() && uninstall {
             None
         } else {
@@ -1615,6 +1738,45 @@ pub struct PackageCheckPreflight {
 }
 
 impl PackageCheckPreflight {
+    /// Updates only the already validated desired owned declaration. The
+    /// original file identity and publication/rollback transaction stay intact.
+    pub fn bind_inventory_host(&mut self, executable: &Path) -> Result<(), InstallError> {
+        self.revalidate_original()?;
+        package_metadata(executable)?;
+        let desired = self
+            .host
+            .desired
+            .as_deref()
+            .ok_or(InstallError::InvalidType)?;
+        wiring_host_locator(desired)?;
+        let owned = owned_wiring(desired)?;
+        let mut value: toml::Value =
+            toml::from_str(std::str::from_utf8(&owned).map_err(|_| InstallError::InvalidType)?)
+                .map_err(|_| InstallError::InvalidType)?;
+        let args = value["mcp_servers"]["evertrace"]["args"]
+            .as_array_mut()
+            .ok_or(InstallError::InvalidType)?;
+        args.truncate(3);
+        for argument in [
+            "--host-executable",
+            executable.to_str().ok_or(InstallError::InvalidType)?,
+            "--host-config",
+            self.host.path.to_str().ok_or(InstallError::InvalidType)?,
+        ] {
+            args.push(toml::Value::String(argument.into()));
+        }
+        let replacement = format!(
+            "{OWNED_BEGIN}{}{OWNED_END}",
+            toml::to_string(&value).map_err(|_| InstallError::InvalidType)?
+        );
+        self.host.desired = Some(replace_wiring(
+            desired,
+            &owned,
+            Some(replacement.as_bytes()),
+        )?);
+        Ok(())
+    }
+
     pub fn revalidate_original(&self) -> Result<(), InstallError> {
         for file in [&self.host, &self.service]
             .into_iter()
@@ -1845,10 +2007,19 @@ pub fn preflight_package_check(
     }
     let mut host = InstallFile::read(host_config)?;
     let old_host = &host.original.as_ref().ok_or(InstallError::InvalidType)?.1;
+    let host_locator = wiring_host_locator(old_host)?;
+    let host_locator = host_locator
+        .as_ref()
+        .map(|(exe, config)| (exe.as_path(), config.as_path()));
     let proposed = replace_wiring(
         old_host,
-        &wiring(data, &old_cli, config)?,
-        Some(&wiring(data, &package.join("evertrace"), config)?),
+        &wiring_with_host(data, &old_cli, config, host_locator)?,
+        Some(&wiring_with_host(
+            data,
+            &package.join("evertrace"),
+            config,
+            host_locator,
+        )?),
     )?;
     let mut service = InstallFile::read(unit)?;
     let expected_unit = unit_bytes(&old_package.join("evertraced"), config)?;

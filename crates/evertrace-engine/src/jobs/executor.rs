@@ -54,6 +54,15 @@ enum WriterRequest {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<RecallCurrentContext>, WriterActorError>>,
     },
+    RepositoryReadContext {
+        ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+        reply: oneshot::Sender<Result<evertrace_store::RepositoryReadContext, WriterActorError>>,
+    },
+    InventoryContext {
+        context: evertrace_domain::inventory::InventoryContext,
+        job_id: Option<evertrace_domain::ids::JobId>,
+        reply: oneshot::Sender<Result<evertrace_store::InventoryCurrentContext, WriterActorError>>,
+    },
     SessionImportContext {
         source: String,
         repository_locator: Option<(evertrace_domain::repository::FilesystemIdentity, String)>,
@@ -183,6 +192,35 @@ impl WriterHandle {
             .send(WriterRequest::SessionImportContext {
                 source: source.to_owned(),
                 repository_locator: None,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn repository_read_context(
+        &self,
+        ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+    ) -> Result<evertrace_store::RepositoryReadContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::RepositoryReadContext { ids, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn inventory_context(
+        &self,
+        context: &evertrace_domain::inventory::InventoryContext,
+        job_id: Option<evertrace_domain::ids::JobId>,
+    ) -> Result<evertrace_store::InventoryCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::InventoryContext {
+                context: context.clone(),
+                job_id,
                 reply,
             })
             .await
@@ -585,6 +623,26 @@ async fn run_writer(
                     None => writer.session_import_context(&source),
                 }
                 .map_err(map_store_error);
+                let _ = reply.send(result);
+            }
+            WriterRequest::RepositoryReadContext { ids, reply } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .repository_read_context(&ids)
+                    .map_err(map_store_error);
+                let _ = reply.send(result);
+            }
+            WriterRequest::InventoryContext {
+                context,
+                job_id,
+                reply,
+            } => {
+                let result = writer
+                    .as_ref()
+                    .ok_or(WriterActorError::Stopped)?
+                    .inventory_context(&context, job_id)
+                    .map_err(map_store_error);
                 let _ = reply.send(result);
             }
             WriterRequest::SessionImportContexts {
@@ -1132,6 +1190,8 @@ fn recall_relevant(command: &JournalCommand) -> bool {
                 | evertrace_store::JournalPayload::WorkCheckpointRecorded(_)
                 | evertrace_store::JournalPayload::AtomRecorded(_)
                 | evertrace_store::JournalPayload::RecallLedgerRecorded(_)
+                | evertrace_store::JournalPayload::RepositoryInstanceRecorded(_)
+                | evertrace_store::JournalPayload::ScopePurgeProgressRecorded(_)
         )
     })
 }

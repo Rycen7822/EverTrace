@@ -530,13 +530,26 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
         .unwrap()
         .unwrap();
     assert_eq!(before.current.body_state, SessionBodyState::Queued);
+    let revoked = worker.process_checkpoint(&source, budget).await.unwrap();
+    assert_eq!(
+        (revoked.records, revoked.bytes, revoked.completed),
+        (0, 0, false)
+    );
     assert!(worker.process_checkpoint(&source, budget).await.is_err());
     let after = writer
         .session_import_context(&source)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(before, after);
+    assert_eq!(before.current, after.current);
+    assert_eq!(before.watermark, after.watermark);
+    assert!(after.read_repositories.iter().any(|value| {
+        value.repository_id == repository
+            && value
+                .capability_state
+                .as_ref()
+                .is_some_and(|state| state.trust_revoked)
+    }));
     let snapshot = writer.project().await.unwrap();
     let detail = human
         .detail(
@@ -550,7 +563,7 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
         .unwrap();
     assert!(detail.items[0].evidence_detail.is_none());
     read(true).await;
-    let repository_revision = before
+    let repository_revision = after
         .read_repositories
         .iter()
         .find(|value| value.repository_id == repository)
@@ -829,6 +842,14 @@ async fn nearest_git_restricts_nested_source_and_external_linked_worktree_conver
     assert_eq!(restrictions.len(), 2);
     assert!(restrictions.contains(&repository_a));
     assert_eq!(restricted.watermark, old_context.watermark);
+    let revoked = worker
+        .process_checkpoint(&sources[1], budget)
+        .await
+        .unwrap();
+    assert_eq!(
+        (revoked.records, revoked.bytes, revoked.completed),
+        (0, 0, false)
+    );
     assert!(
         worker
             .process_checkpoint(&sources[1], budget)
@@ -1639,18 +1660,32 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
             .unwrap(),
         before_moved_prefix
     );
-    let complete = worker
-        .process_checkpoint(
-            &source_b,
-            SessionImportBudget {
-                max_bytes: 64 * 1024,
-                max_records: 16,
-                max_work_time: Duration::from_millis(250),
-            },
-        )
-        .await
-        .unwrap();
-    assert!(complete.completed);
+    // A read quantum may yield after either remaining record. Keep the real
+    // 250 ms bound and require progress, rather than assume fixed throughput.
+    let mut moved_records = 0;
+    let mut moved_completed = false;
+    for _ in 0..3 {
+        let complete = worker
+            .process_checkpoint(
+                &source_b,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: (2_usize - moved_records).max(1),
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(complete.records > 0 || complete.completed);
+        moved_records += complete.records;
+        assert!(moved_records <= 2);
+        if complete.completed {
+            moved_completed = true;
+            break;
+        }
+    }
+    assert!(moved_completed);
+    assert_eq!(moved_records, 2);
     let sources =
         SessionImportCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
     assert_eq!(

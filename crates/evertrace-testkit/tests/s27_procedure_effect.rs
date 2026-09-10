@@ -476,6 +476,143 @@ mod controlled_projection_proof {
         task.await.unwrap().unwrap();
     }
 
+    // Explicit synthetic human acceptance keeps the controlled-run fixture's
+    // publication setup separate from S34's verified native inventory gate.
+    // The existing controlled execution surfaces below still use real capture.
+    async fn manual_procedure_context(
+        writer: &mut JournalWriter,
+        runtime: &RuntimeSnapshot,
+        proposal: &evertrace_domain::semantic::RevisionProposal,
+        template_id: SourceReceiptId,
+        at: i64,
+    ) -> evertrace_engine::semantic::AtomAcceptanceContext {
+        let snapshot = writer.project().await.unwrap();
+        let mut receipt = snapshot
+            .data_rows()
+            .find_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::SourceReceiptRecorded(value)
+                        if value.source_receipt_id == template_id =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap();
+        let mut observation = snapshot
+            .data_rows()
+            .find_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::SourceObservationRecorded(value)
+                        if value.source_receipt_ref == template_id =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap();
+        let payload = evertrace_domain::semantic::tui_acceptance_event_payload(
+            proposal.proposal_id,
+            proposal.proposal_revision_id,
+            &proposal.fingerprint,
+        );
+        let key = DeviceKeyStore::new(runtime.device_key_dir.clone())
+            .load()
+            .unwrap();
+        let protected = evertrace_capture::protect(payload.as_bytes(), &key).unwrap();
+        assert!(protected.spans().is_empty());
+        let cas_ref = evertrace_capture::CasStore::open_existing(&runtime.cas_dir)
+            .unwrap()
+            .put(&protected)
+            .unwrap()
+            .to_string();
+        let instance =
+            SourceInstanceId::parse(format!("s27-human-{}", proposal.proposal_revision_id))
+                .unwrap();
+        let record = SourceRecordIdentity::parse("acceptance").unwrap();
+        let observation_id =
+            source_observation_id(&instance, &receipt.source_revision, &record).unwrap();
+        let receipt_id = source_receipt_id(&instance, &receipt.source_revision, &record).unwrap();
+        receipt.source_instance_id = instance.clone();
+        receipt.source_record_identity = record.clone();
+        receipt.source_receipt_id = receipt_id;
+        receipt.source_observation_id = observation_id;
+        receipt.source_ref = format!("human:{}", proposal.proposal_revision_id);
+        receipt.source_sequence = 1;
+        receipt.source_sequence_origin = Some(1);
+        receipt.close_watermark = Some(1);
+        receipt.observation_role = ObservationRole::Message;
+        receipt.cas_ref = cas_ref;
+        receipt.protected_presentation = None;
+        receipt.protected_length = payload.len() as u64;
+        receipt.original_length = payload.len() as u64;
+        receipt.protected_secret_digest = None;
+        receipt.redaction_spans.clear();
+        receipt.eligible_event_manifest_ref =
+            evertrace_domain::semantic::TUI_ACCEPTANCE_EVENT_MANIFEST_REF.into();
+        receipt.event_time_us = at;
+        receipt.recorded_at_us = at;
+        observation.source_instance_id = instance;
+        observation.source_record_identity = record;
+        observation.source_observation_id = observation_id;
+        observation.source_receipt_ref = receipt_id;
+        observation.observation_role = ObservationRole::Message;
+        observation.source_role = SourceRole::User;
+        observation.content_trust = ContentTrust::UserStatement;
+        observation.payload_fingerprint = evertrace_domain::evidence::hex(
+            &evertrace_domain::evidence::payload_fingerprint(
+                observation.canonicalization_revision,
+                payload.as_bytes(),
+                None,
+            )
+            .unwrap(),
+        );
+        observation.correlation.pairing_role = ObservationRole::Message;
+        observation.correlation.admission = CorrelationAdmission::Unavailable;
+        observation.correlation.strong_gate_receipt_ref = None;
+        receipt.validate().unwrap();
+        observation.validate().unwrap();
+        writer
+            .commit(
+                &journal_command(
+                    at,
+                    vec![
+                        JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                        JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                        JournalPayload::SourceIngestWatermark(
+                            evertrace_store::SourceIngestWatermark {
+                                source_instance_id: receipt.source_instance_id.clone(),
+                                source_revision: receipt.source_revision.clone(),
+                                source_sequence: 1,
+                                confirmed_prefix_digest: None,
+                            },
+                        ),
+                        JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
+                            target_kind: evertrace_store::DirtyTargetKind::EvidenceSurface,
+                            target_id: observation_id.to_string(),
+                            algorithm_revision: "s27-controlled-v1".into(),
+                            source_watermark: 1,
+                        }),
+                        JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
+                            target_kind: evertrace_store::DirtyTargetKind::PhysicalNormalization,
+                            target_id: observation_id.to_string(),
+                            algorithm_revision: "s27-controlled-v1".into(),
+                            source_watermark: 1,
+                        }),
+                    ],
+                ),
+                at,
+            )
+            .await
+            .unwrap();
+        evertrace_engine::semantic::AtomAcceptanceContext::GlobalTui {
+            observation: Box::new(observation),
+            receipt: Box::new(receipt),
+        }
+    }
+
     async fn capture_operation(
         snapshot: &RuntimeSnapshot,
         store_root: &Path,
@@ -483,39 +620,50 @@ mod controlled_projection_proof {
         observation_ids: &[evertrace_domain::ids::SourceObservationId],
         at: i64,
     ) -> evertrace_domain::evidence::Operation {
-        capture_and_ingest(snapshot, store_root, inputs).await;
-        let mut writer = JournalWriter::open(store_root).await.unwrap();
-        let projected = writer.project().await.unwrap();
-        let observations = projected
-            .data_rows()
-            .filter_map(|row| {
-                let payload =
-                    serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()?;
-                match payload {
-                    JournalPayload::SourceObservationRecorded(value)
-                        if observation_ids.contains(&value.source_observation_id) =>
-                    {
-                        Some(*value)
+        // Each real capture/normalization is still strictly serial. Give the
+        // worker its own poll stack, instead of nesting journal replay under
+        // the large controlled-run test's async frame.
+        let snapshot = snapshot.clone();
+        let store_root = store_root.to_owned();
+        let observation_ids = observation_ids.to_vec();
+        tokio::spawn(async move {
+            capture_and_ingest(&snapshot, &store_root, inputs).await;
+            let mut writer = JournalWriter::open(&store_root).await.unwrap();
+            let projected = writer.project().await.unwrap();
+            let observations = projected
+                .data_rows()
+                .filter_map(|row| {
+                    let payload =
+                        serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?)
+                            .ok()?;
+                    match payload {
+                        JournalPayload::SourceObservationRecorded(value)
+                            if observation_ids.contains(&value.source_observation_id) =>
+                        {
+                            Some(*value)
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        let physical = PhysicalNormalizer::new(1)
-            .unwrap()
-            .normalize(&observations, None)
-            .unwrap();
-        assert_eq!(physical.operations.len(), 1);
-        writer
-            .commit(
-                &physical
-                    .journal_command(CommandId::new_v7(), at, [27; 32], "s27-controlled-v1")
-                    .unwrap(),
-                at,
-            )
-            .await
-            .unwrap();
-        physical.operations[0].clone()
+                })
+                .collect::<Vec<_>>();
+            let physical = PhysicalNormalizer::new(1)
+                .unwrap()
+                .normalize(&observations, None)
+                .unwrap();
+            assert_eq!(physical.operations.len(), 1);
+            writer
+                .commit(
+                    &physical
+                        .journal_command(CommandId::new_v7(), at, [27; 32], "s27-controlled-v1")
+                        .unwrap(),
+                    at,
+                )
+                .await
+                .unwrap();
+            physical.operations[0].clone()
+        })
+        .await
+        .unwrap()
     }
 
     fn journal_command(at: i64, payloads: Vec<JournalPayload>) -> JournalCommand {
@@ -1124,6 +1272,8 @@ mod controlled_projection_proof {
         };
         assert!(usage.validate());
         let repository = RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
             repository_id,
             repository_revision: 1,
             predecessor_revision: None,
@@ -1645,6 +1795,8 @@ mod controlled_projection_proof {
         let worktree_id = WorktreeId::new_v7();
         let snapshot_id = WorktreeSnapshotId::new_v7();
         let repository = RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
             repository_id,
             repository_revision: 1,
             predecessor_revision: None,
@@ -1770,6 +1922,30 @@ mod controlled_projection_proof {
             procedure: PromotionLevel::FullAuto,
             core_membership: PromotionLevel::Manual,
         };
+        assert!(
+            accept_procedure(
+                &view,
+                proposal_context(4),
+                proposal.proposal_id,
+                ProcedureAcceptanceContext::AutoFull {
+                    evidence: eligibility(evidence_observation_id),
+                    coverage: None
+                },
+                None,
+                None,
+                &config
+            )
+            .is_err()
+        );
+        let manual = Box::pin(manual_procedure_context(
+            &mut writer,
+            &runtime,
+            &proposal,
+            evidence_receipt_id,
+            4,
+        ))
+        .await;
+        let view = SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
         let ProcedureAcceptanceResolution::Command {
             procedure,
             command: accepted,
@@ -1778,7 +1954,7 @@ mod controlled_projection_proof {
             &view,
             proposal_context(4),
             proposal.proposal_id,
-            ProcedureAcceptanceContext::AutoFull(eligibility(evidence_observation_id)),
+            ProcedureAcceptanceContext::Manual(manual),
             None,
             None,
             &config,
@@ -2251,6 +2427,14 @@ mod controlled_projection_proof {
             panic!("replacement proposal must persist")
         };
         writer.commit(&replacement_submitted, 130).await.unwrap();
+        let manual = Box::pin(manual_procedure_context(
+            &mut writer,
+            &runtime,
+            &replacement_proposal,
+            evidence_receipt_id,
+            131,
+        ))
+        .await;
         let semantic_view =
             SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
         let ProcedureAcceptanceResolution::Command {
@@ -2261,7 +2445,7 @@ mod controlled_projection_proof {
             &semantic_view,
             proposal_context(131),
             replacement_proposal.proposal_id,
-            ProcedureAcceptanceContext::AutoFull(eligibility(evidence_observation_id)),
+            ProcedureAcceptanceContext::Manual(manual),
             Some(&procedure),
             Some(ProcedurePublicationState::ActiveProbationary),
             &config,

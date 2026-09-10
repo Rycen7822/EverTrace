@@ -113,6 +113,8 @@ fn runtime_snapshot(root: &Path) -> RuntimeSnapshot {
 
 fn repository(id: RepositoryId, path: &str) -> RepositoryInstance {
     RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id: id,
         repository_revision: 1,
         predecessor_revision: None,
@@ -707,7 +709,47 @@ async fn hook_sync_issue_uses_existing_uds_handshake_and_hook_client_kind() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries() {
+    use std::os::unix::fs::PermissionsExt;
     let temp = TempDir::new().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let repository_path = temp.path().join("repository").display().to_string();
+    let other_path = temp.path().join("other").display().to_string();
+    std::fs::create_dir(&repository_path).unwrap();
+    std::fs::create_dir(&other_path).unwrap();
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/09");
+    std::fs::create_dir_all(&dated).unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000021";
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta",
+                "payload":{"id":session,"session_id":session,"cwd":repository_path,
+                "originator":"codex_cli_rs","model_provider":"test","git":null}
+            })
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(&repository_path).unwrap(),
+            serde_json::to_string(&other_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let report = evertrace_engine::repository::observe_session_catalog_report(
+        transcript.to_str(),
+        session,
+        "tool",
+        None,
+    )
+    .unwrap();
     let runtime = runtime_snapshot(temp.path());
     let store = temp.path().join("store");
     let writer = open_writer(&store).await.unwrap();
@@ -721,14 +763,14 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
             1,
             JournalPayload::RepositoryInstanceRecorded(Box::new(repository(
                 repository_id,
-                "/s20/repository",
+                &repository_path,
             ))),
         ),
         (
             2,
             JournalPayload::RepositoryInstanceRecorded(Box::new(repository(
                 other_repository,
-                "/s20/other",
+                &other_path,
             ))),
         ),
     ] {
@@ -935,7 +977,8 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
         runtime.clone(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_session_report(Arc::new(tokio::sync::RwLock::new(Some(report))));
     let workspace = repository_id.to_string();
     for (case, action, case_workspace, input, refs) in [
         (
@@ -991,7 +1034,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                     workspace: case_workspace,
                     input,
                     refs,
-                    client_cwd: "/s20/repository".into(),
+                    client_cwd: repository_path.clone(),
                 },
             )
             .await
@@ -1016,7 +1059,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: "x".repeat(4_097),
                 refs: Vec::new(),
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1031,7 +1074,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: "needle".into(),
                 refs: Vec::new(),
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1094,7 +1137,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: repo_revision.to_string(),
                 refs: Vec::new(),
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1126,7 +1169,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: repo_atom_id.to_string(),
                 refs: Vec::new(),
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1160,7 +1203,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: "agent annotation only".into(),
                 refs: vec![task_id.to_string()],
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1220,7 +1263,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: observation_ref.clone(),
                 refs: Vec::new(),
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1256,7 +1299,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                     "{{\"v\":1,\"op\":\"deprecate\",\"target\":\"{repo_atom_id}\",\"expected_revision\":\"{successor_revision}\",\"patch\":{{\"nested\":{{\"authority\":\"user_explicit\"}}}},\"reason\":\"malicious\"}}"
                 ),
                 refs: vec![observation_ref.clone()],
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1273,7 +1316,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: organize_input.clone(),
                 refs: vec![observation_ref.clone()],
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1307,7 +1350,7 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
                 workspace: workspace.clone(),
                 input: organize_input,
                 refs: vec![observation_ref.clone()],
-                client_cwd: "/s20/repository".into(),
+                client_cwd: repository_path.clone(),
             },
         )
         .await
@@ -1336,6 +1379,52 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
             .count(),
         atom_count
     );
+
+    let mut disabled = repository(repository_id, &repository_path);
+    disabled.repository_revision = 2;
+    disabled.predecessor_revision = Some(1);
+    disabled.recorded_at_us = 9;
+    disabled.user_disabled = true;
+    let mut event = JournalEventDraft::runtime(
+        9,
+        [0x20; 32],
+        "s20-test-v1",
+        JournalPayload::RepositoryInstanceRecorded(Box::new(disabled)),
+    );
+    event.source_kind = evertrace_store::command::SourceKind::Manual;
+    handle
+        .commit(
+            JournalCommand::new(CommandId::new_v7(), vec![event]).unwrap(),
+            9,
+        )
+        .await
+        .unwrap();
+    let closed = handle.project().await.unwrap().frontier;
+    for (action, input) in [
+        (McpServiceAction::Search, "needle".into()),
+        (McpServiceAction::Get, task_revision.to_string()),
+        (McpServiceAction::Get, repo_revision.to_string()),
+    ] {
+        let denied = service
+            .handle(
+                "connection-actions",
+                McpServiceRequest {
+                    request_id: RequestId::new_v7(),
+                    action,
+                    workspace: workspace.clone(),
+                    input,
+                    refs: Vec::new(),
+                    client_cwd: repository_path.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            denied.items.is_empty(),
+            "disabled context exposed a scoped asset: {denied:?}"
+        );
+        assert_eq!(handle.project().await.unwrap().frontier, closed);
+    }
 
     handle.shutdown().await.unwrap();
     writer_task.await.unwrap().unwrap();

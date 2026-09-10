@@ -661,6 +661,59 @@ async fn legacy_request_rejects_notification_before_response() {
 }
 
 #[tokio::test]
+async fn mcp_connection_keeps_idle_observation_but_bounds_started_frames() {
+    let temp = TempDir::new().unwrap();
+    let server = LocalServer::bind(&data_dir(&temp), options()).unwrap();
+    let socket = server.socket_path().to_owned();
+    let observed = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
+    let captured = Arc::clone(&observed);
+    let (shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(
+        server.run_dispatch_with_context(receiver, move |context, _, _| {
+            assert!(context.peer_credentials.is_some());
+            *captured.lock().unwrap() = Arc::downgrade(&context.connection_lifetime);
+            std::future::ready(Ok(Response::Health(health(HealthMode::Normal))))
+        }),
+    );
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    let mut hello = handshake(PROTOCOL_VERSION);
+    let ClientEnvelope::Handshake(value) = &mut hello else {
+        unreachable!()
+    };
+    value.client_kind = ClientKind::Mcp;
+    write_frame(&mut stream, &hello, MAX_FRAME_SIZE, WAIT)
+        .await
+        .unwrap();
+    let _: ServerEnvelope = read_frame(&mut stream, MAX_FRAME_SIZE, WAIT).await.unwrap();
+    write_frame(&mut stream, &command(), MAX_FRAME_SIZE, WAIT)
+        .await
+        .unwrap();
+    let _: ServerEnvelope = read_frame(&mut stream, MAX_FRAME_SIZE, WAIT).await.unwrap();
+    sleep(Duration::from_millis(180)).await;
+    assert!(
+        observed.lock().unwrap().upgrade().is_some(),
+        "idle is not a disconnected Host"
+    );
+    write_frame(&mut stream, &command(), MAX_FRAME_SIZE, WAIT)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_frame::<ServerEnvelope>(&mut stream, MAX_FRAME_SIZE, WAIT)
+            .await
+            .unwrap(),
+        ServerEnvelope::Response(_)
+    ));
+    stream.write_all(&[0]).await.unwrap();
+    sleep(Duration::from_millis(180)).await;
+    assert!(
+        observed.lock().unwrap().upgrade().is_none(),
+        "a partial frame still expires"
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn split_receiver_stays_idle_then_receives_server_stopping() {
     let temp = TempDir::new().unwrap();
     let socket = temp.path().join("idle-notification.sock");

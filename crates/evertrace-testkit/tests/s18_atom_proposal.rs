@@ -77,6 +77,8 @@ fn scope_fixture(root: &std::path::Path) -> ScopeFixture {
         evidence_refs: vec!["path:s18".into()],
     };
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,

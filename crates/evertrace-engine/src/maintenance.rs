@@ -282,6 +282,11 @@ where
         package,
     )
     .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+    if let Some(host) = &live_host {
+        preflight
+            .bind_inventory_host(Path::new(&host.host_executable))
+            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+    }
     preflight
         .bind_runtime_source(&RuntimeSnapshot::snapshot_path(data_dir))
         .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
@@ -1324,6 +1329,7 @@ pub struct BackgroundScheduler {
     writer: WriterHandle,
     catalog: SessionCatalogService,
     import: SessionImportWorker,
+    inventory: Option<crate::jobs::InventoryWorker>,
     report: Arc<RwLock<Option<HostProbeReport>>>,
     runtime: RuntimeSnapshot,
     synthesis: SynthesisPlanner,
@@ -1351,6 +1357,7 @@ impl BackgroundScheduler {
             writer,
             catalog,
             import,
+            inventory: None,
             report,
             runtime,
             synthesis,
@@ -1363,6 +1370,12 @@ impl BackgroundScheduler {
             config: None,
             import_settings: evertrace_domain::config::SessionImportConfig::default(),
         }
+    }
+
+    pub fn with_inventory(mut self, inventory: crate::jobs::InventoryWorker) -> Self {
+        self.synthesis = self.synthesis.with_inventory(Some(inventory.clone()));
+        self.inventory = Some(inventory);
+        self
     }
 
     pub fn with_backup_requests(mut self, requests: mpsc::Sender<QuiescedBackupRequest>) -> Self {
@@ -1395,6 +1408,12 @@ impl BackgroundScheduler {
                 .for_config(Arc::clone(&config.effective))
                 .map_err(|_| BackgroundSchedulerError::Store)?;
         }
+        operation.inventory = operation
+            .inventory
+            .map(|worker| worker.for_runtime(operation.runtime.clone()));
+        operation.synthesis = operation
+            .synthesis
+            .with_inventory(operation.inventory.clone());
         operation.run_once_inner().await
     }
 
@@ -1442,6 +1461,16 @@ impl BackgroundScheduler {
         }
 
         let mut snapshot = self.writer.project().await.map_err(map_writer)?;
+        if optional_allowed && let Some(inventory) = &self.inventory {
+            match inventory.enqueue_observed(&snapshot).await {
+                Ok(true) => snapshot = self.writer.project().await.map_err(map_writer)?,
+                Ok(false) => {}
+                Err(crate::jobs::InventoryWorkerError::StaleFrontier) => retryable = true,
+                Err(crate::jobs::InventoryWorkerError::Store) => {
+                    return Err(BackgroundSchedulerError::Store);
+                }
+            }
+        }
         let recovery_now_us = now_us()?;
         let recovery = expired_leases(&snapshot.rows, recovery_now_us, snapshot.frontier)
             .map_err(|_| BackgroundSchedulerError::Store)?;
@@ -1985,7 +2014,20 @@ impl BackgroundScheduler {
             .iter()
             .find(|selected| selected.lane == BackgroundLane::Maintenance)
         {
-            if let Some(claimed) = self.claim_job(&selected_job.job).await? {
+            if selected_job.job.kind == evertrace_store::projections::INVENTORY_JOB_KIND {
+                if let Some(inventory) = &self.inventory {
+                    match inventory.run_job(&selected_job.job).await {
+                        Ok(progress) => {
+                            completed += usize::from(progress.completed);
+                            retryable |= progress.retryable;
+                        }
+                        Err(crate::jobs::InventoryWorkerError::StaleFrontier) => retryable = true,
+                        Err(crate::jobs::InventoryWorkerError::Store) => {
+                            return Err(BackgroundSchedulerError::Store);
+                        }
+                    }
+                }
+            } else if let Some(claimed) = self.claim_job(&selected_job.job).await? {
                 if claimed.job.kind == QUIESCED_BACKUP_CREATE_JOB_KIND {
                     let progress = self.run_backup_create(claimed).await?;
                     completed += progress.completed;
@@ -2080,6 +2122,15 @@ impl BackgroundScheduler {
                     continue;
                 };
                 let job_wall_time = Duration::from_millis(claimed.job.budget.max_wall_time_ms);
+                if !self
+                    .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
+                    .await?
+                {
+                    self.fail_stale(&claimed.job, claimed.snapshot.frontier)
+                        .await?;
+                    completed += 1;
+                    continue;
+                }
                 let occurred_at_us = now_us()?;
                 let daily_wall_time = self
                     .synthesis
@@ -2106,15 +2157,26 @@ impl BackgroundScheduler {
                         retryable = true;
                         break;
                     }
-                    Ok(Ok(command)) => match self
-                        .writer
-                        .commit_if_frontier(command, now_us()?, claimed.snapshot.frontier)
-                        .await
-                    {
-                        Ok(outcome) => completed += usize::from(!outcome.replayed),
-                        Err(WriterActorError::StaleFrontier) => retryable = true,
-                        Err(error) => return Err(map_writer(error)),
-                    },
+                    Ok(Ok(command)) => {
+                        if !self
+                            .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
+                            .await?
+                        {
+                            self.fail_stale(&claimed.job, claimed.snapshot.frontier)
+                                .await?;
+                            completed += 1;
+                            continue;
+                        }
+                        match self
+                            .writer
+                            .commit_if_frontier(command, now_us()?, claimed.snapshot.frontier)
+                            .await
+                        {
+                            Ok(outcome) => completed += usize::from(!outcome.replayed),
+                            Err(WriterActorError::StaleFrontier) => retryable = true,
+                            Err(error) => return Err(map_writer(error)),
+                        }
+                    }
                     Ok(Err(_)) => {
                         self.fail_stale(&claimed.job, claimed.snapshot.frontier)
                             .await?;
@@ -2127,6 +2189,33 @@ impl BackgroundScheduler {
             completed,
             retryable,
         })
+    }
+
+    async fn synthesis_repository_allowed(
+        &self,
+        snapshot: &evertrace_store::ProjectionSnapshot,
+        job: &DurableJob,
+    ) -> Result<bool, BackgroundSchedulerError> {
+        let ids = snapshot
+            .data_rows()
+            .filter(|row| {
+                row.object_kind.as_deref() == Some("work_episode")
+                    && row.current_revision_id.as_deref() == Some(job.target_revision.as_str())
+            })
+            .filter_map(|row| row.repository_id.as_deref())
+            .map(str::parse)
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let report = self.report.read().await.clone();
+        crate::repository::blocked_repositories(
+            &self.writer,
+            ids,
+            report.as_ref(),
+            self.runtime.effective_config_hash,
+        )
+        .await
+        .map(|blocked| blocked.is_empty())
+        .map_err(map_writer)
     }
 
     async fn run_gc_round(&self) -> Result<usize, BackgroundSchedulerError> {
@@ -3111,6 +3200,7 @@ fn executable_job(job: &DurableJob) -> bool {
             | "physical_normalization"
             | "capture_reconciliation"
             | "session_import_v1"
+            | "capability_inventory_v1"
             | "semantic_synthesis_v1"
             | QUIESCED_BACKUP_CREATE_JOB_KIND
             | QUIESCED_BACKUP_VERIFY_JOB_KIND

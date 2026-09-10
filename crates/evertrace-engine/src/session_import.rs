@@ -1375,13 +1375,21 @@ pub(crate) fn source_read_allowed(
     context: &evertrace_store::SessionImportContext,
     deadline: Instant,
 ) -> bool {
+    source_read_decision(report, context, deadline).0
+}
+
+fn source_read_decision(
+    report: &HostProbeReport,
+    context: &evertrace_store::SessionImportContext,
+    deadline: Instant,
+) -> (bool, Vec<evertrace_domain::repository::RepositoryInstance>) {
     let current = &context.current;
     let restrictions = current
         .metadata
         .read_restrictions()
         .collect::<std::collections::BTreeSet<_>>();
     let Ok(location) = workspace_location(&current.metadata, deadline) else {
-        return false;
+        return (false, Vec::new());
     };
     let owner = location.as_ref().and_then(|location| {
         let mut matches = context.read_repositories.iter().filter(|repository| {
@@ -1390,46 +1398,48 @@ pub(crate) fn source_read_allowed(
         let owner = matches.next()?;
         matches.next().is_none().then_some(owner.repository_id)
     });
-    if location.is_some() && owner.is_none() {
-        return false;
+    let mut allowed = !(location.is_some() && owner.is_none())
+        && !context.repository_purged
+        && current.access_decision != Some(SessionAccessDecision::Revoked);
+    let mut revoked = Vec::new();
+    for repository in context.read_repositories.iter().filter(|repository| {
+        restrictions.contains(&repository.repository_id)
+            || repository_candidate_at(&current.metadata, repository, location.as_ref())
+            || (location.is_none()
+                && context.read_worktrees.iter().any(|worktree| {
+                    worktree.repository_instance_id == repository.repository_id
+                        && worktree
+                            .path_history
+                            .iter()
+                            .any(|path| current.metadata.workspace_matches_path(&path.path))
+                }))
+    }) {
+        let trust_path = repository_trust_path(
+            &current.metadata,
+            repository,
+            location.as_ref(),
+            context.read_worktrees.iter(),
+        );
+        let trust =
+            crate::repository::read_report_path_trust_before(report, Some(trust_path), deadline)
+                .state;
+        if trust == RepositoryTrustState::Untrusted
+            && !context.repository_purged
+            && !repository
+                .capability_state
+                .as_ref()
+                .is_some_and(|state| state.trust_revoked)
+        {
+            revoked.push(repository.clone());
+        }
+        if !restrictions.contains(&repository.repository_id)
+            || !crate::repository::repository_read_gate(repository, context.repository_purged)
+            || trust != RepositoryTrustState::Trusted
+        {
+            allowed = false;
+        }
     }
-    if context.repository_purged
-        || current.access_decision == Some(SessionAccessDecision::Revoked)
-        || context
-            .read_repositories
-            .iter()
-            .filter(|repository| {
-                restrictions.contains(&repository.repository_id)
-                    || repository_candidate_at(&current.metadata, repository, location.as_ref())
-                    || (location.is_none()
-                        && context.read_worktrees.iter().any(|worktree| {
-                            worktree.repository_instance_id == repository.repository_id
-                                && worktree
-                                    .path_history
-                                    .iter()
-                                    .any(|path| current.metadata.workspace_matches_path(&path.path))
-                        }))
-            })
-            .any(|repository| {
-                let trust_path = repository_trust_path(
-                    &current.metadata,
-                    repository,
-                    location.as_ref(),
-                    context.read_worktrees.iter(),
-                );
-                !restrictions.contains(&repository.repository_id)
-                    || crate::repository::read_report_path_trust_before(
-                        report,
-                        Some(trust_path),
-                        deadline,
-                    )
-                    .state
-                        != RepositoryTrustState::Trusted
-            })
-    {
-        return false;
-    }
-    Instant::now() < deadline
+    (allowed && Instant::now() < deadline, revoked)
 }
 
 pub(crate) fn source_ingest_read_allowed(
@@ -1533,6 +1543,17 @@ pub(crate) async fn preflight_import_context(
     };
     let context = located_context.as_ref().unwrap_or(context);
     let current = &context.current;
+    let (_, revoked) = source_read_decision(
+        report,
+        context,
+        Instant::now() + allowance.saturating_sub(preparation_time),
+    );
+    if crate::repository::record_trust_revocations(writer, revoked, config_hash)
+        .await
+        .map_err(map_writer)?
+    {
+        return Ok(true);
+    }
     if context.repository_purged || current.access_decision == Some(SessionAccessDecision::Revoked)
     {
         return Ok(false);
@@ -1651,6 +1672,7 @@ pub(crate) async fn blocked_source_rows(
     report: Option<&HostProbeReport>,
     snapshot: &evertrace_store::ProjectionSnapshot,
     rows: &[&evertrace_store::ObjectRow],
+    config_hash: [u8; 32],
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
     if rows.len() > 64 {
         return Err(SessionImportServiceError::Unavailable);
@@ -1741,6 +1763,7 @@ pub(crate) async fn blocked_source_rows(
     // All sources share one bounded read quantum after their current contexts
     // have been obtained; no per-source deadline renewal.
     let deadline = Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET;
+    let mut revoked = Vec::new();
     let permissions = contexts
         .into_iter()
         .map(|(source, context)| {
@@ -1748,12 +1771,19 @@ pub(crate) async fn blocked_source_rows(
                 .as_ref()
                 .zip(report)
                 .is_some_and(|(context, report)| {
-                    context.current.source_instance() == source
-                        && source_read_allowed(report, context, deadline)
+                    if context.current.source_instance() != source {
+                        return false;
+                    }
+                    let (allowed, observations) = source_read_decision(report, context, deadline);
+                    revoked.extend(observations);
+                    allowed
                 });
             (source, allowed)
         })
         .collect::<BTreeMap<_, _>>();
+    crate::repository::record_trust_revocations(writer, revoked, config_hash)
+        .await
+        .map_err(map_writer)?;
     Ok(sources
         .into_iter()
         .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row))

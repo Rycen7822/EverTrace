@@ -69,6 +69,7 @@ use crate::{
 };
 
 mod autoresearch;
+mod inventory;
 mod procedure;
 mod procedure_effect;
 mod procedure_validation;
@@ -82,6 +83,10 @@ mod semantic;
 pub(crate) mod synthesis;
 pub use autoresearch::AutoresearchCurrentView;
 use autoresearch::{record_artifact, record_result, record_run};
+pub use inventory::{
+    INVENTORY_JOB_KIND, INVENTORY_OBJECT_KIND, InventoryCurrentContext, RepositoryReadContext,
+    inventory_job_context_ref, inventory_job_worktree, inventory_repository_target,
+};
 pub use recovery::{RecoveryCurrentState, RecoveryCurrentView};
 pub use segmentation::{
     EpisodeCurrentView, OperationBurstCurrentView, SegmentationCurrentState,
@@ -353,6 +358,12 @@ impl ProjectionSnapshot {
             payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
             match payload {
                 JournalPayload::SourceReceiptRecorded(value) => retain(value.cas_ref),
+                JournalPayload::CapabilityInventoryRecorded(value) => {
+                    retain(value.snapshot_cas_ref);
+                    for reference in value.dependency_cas_refs {
+                        retain(reference);
+                    }
+                }
                 JournalPayload::WorkArtifactRecorded(value) => {
                     if let Some(value) = value.revision.content_blob_ref {
                         retain(cas_ref_string(value));
@@ -2188,6 +2199,7 @@ fn json_field_fragment<T: serde::Serialize + ?Sized>(
 
 #[derive(Clone, Default)]
 struct ReducerState {
+    inventory: inventory::InventoryState,
     session_imports: BTreeMap<String, crate::session_import::SessionImportCurrent>,
     migrations: BTreeMap<String, (JournalPayload, u64)>,
     dirty: BTreeMap<String, (DirtyTarget, u64)>,
@@ -2315,6 +2327,7 @@ impl KnownSourceRange {
 
 #[derive(Clone, Default)]
 pub(crate) struct JournalAdmissionState {
+    inventory: inventory::InventoryState,
     repository_closures: BTreeMap<RepositoryId, RepositoryClosureKeys>,
     session_imports: BTreeMap<String, crate::session_import::SessionImportCurrent>,
     import_jobs: BTreeMap<String, BTreeSet<JobId>>,
@@ -2734,6 +2747,7 @@ struct ObjectDeletionPreviewInputs<'a> {
 }
 
 struct RepositoryScopePreviewInputs<'a> {
+    inventory: &'a inventory::InventoryState,
     session_imports: &'a BTreeMap<String, crate::session_import::SessionImportCurrent>,
     jobs: Vec<&'a DurableJob>,
     host_occurrences: &'a BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
@@ -3268,6 +3282,7 @@ impl ReducerState {
 
     fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_> {
         RepositoryScopePreviewInputs {
+            inventory: &self.inventory,
             session_imports: &self.session_imports,
             jobs: self.jobs.values().map(|(job, _)| job).collect(),
             host_occurrences: &self.host_occurrences,
@@ -3639,6 +3654,7 @@ impl JournalAdmissionState {
 
     fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_> {
         RepositoryScopePreviewInputs {
+            inventory: &self.inventory,
             session_imports: &self.session_imports,
             jobs: self.jobs.values().collect(),
             host_occurrences: &self.host_occurrences,
@@ -4106,6 +4122,7 @@ fn derive_repository_scope_purge_preview(
             matches!(job.state, JobStatus::Queued | JobStatus::Leased)
                 && job_targets_repository(
                     job,
+                    repository_id,
                     &target_session_ids,
                     &target_episode_revision_ids,
                     &target_observations,
@@ -4306,17 +4323,21 @@ fn derive_repository_scope_purge_preview(
     let mut target_proposal_revision_ids = BTreeSet::new();
     let mut global_target_proposal_ids = BTreeSet::new();
     for (proposal, _) in inputs.proposal_revisions.values() {
-        if proposal_references_repository_closure(
-            proposal,
-            repository_id,
-            &target_task_ids,
-            &target_observations,
-            &target_receipt_ids,
-            &target_revision_ids,
-            &target_atom_ids,
-            &target_procedure_ids,
-            &membership_ids,
-        ) {
+        if inputs
+            .inventory
+            .proposal_depends_on_repository(proposal, repository_id)
+            || proposal_references_repository_closure(
+                proposal,
+                repository_id,
+                &target_task_ids,
+                &target_observations,
+                &target_receipt_ids,
+                &target_revision_ids,
+                &target_atom_ids,
+                &target_procedure_ids,
+                &membership_ids,
+            )
+        {
             target_proposal_ids.insert(proposal.proposal_id);
             target_proposal_revision_ids.insert(proposal.proposal_revision_id);
             if proposal_targets_outside_repository(
@@ -4402,6 +4423,7 @@ fn derive_repository_scope_purge_preview(
             .copied()
             .map(cas_ref_string)
     }));
+    target_cas.extend(inputs.inventory.cas_refs(repository_id, true).cloned());
     let mut shared_cas = inputs
         .source_receipts
         .values()
@@ -4411,6 +4433,15 @@ fn derive_repository_scope_purge_preview(
             .then_some(receipt.cas_ref.clone())
         })
         .collect::<BTreeSet<_>>();
+    // Inventory sources may be shared with another repository or with a normal
+    // capture. Retain them until every existing live reference has gone away.
+    shared_cas.extend(
+        inputs
+            .inventory
+            .cas_refs(repository_id, false)
+            .filter(|reference| target_cas.contains(*reference))
+            .cloned(),
+    );
     shared_cas.extend(
         inputs
             .artifact_revisions
@@ -4470,6 +4501,12 @@ fn derive_repository_scope_purge_preview(
         .deletion_procedure_impacts(&target_revision_ids);
     let affected_session_count = bounded_aggregate_count(&[target_session_ids.len()])?;
     let affected_evidence_receipt_capture_count = bounded_aggregate_count(&[
+        inputs
+            .inventory
+            .completed
+            .values()
+            .filter(|(fact, _)| fact.context.repository_id == repository_id)
+            .count(),
         target_observations.len(),
         target_receipt_ids.len(),
         inputs
@@ -5006,11 +5043,13 @@ fn proposal_targets_outside_repository(
 
 fn job_targets_repository(
     job: &DurableJob,
+    repository_id: RepositoryId,
     session_ids: &BTreeSet<String>,
     episode_revision_ids: &BTreeSet<RevisionId>,
     observation_ids: &BTreeSet<SourceObservationId>,
 ) -> bool {
     match job.kind.as_str() {
+        INVENTORY_JOB_KIND => inventory::job_repository(job) == Some(repository_id),
         "session_import_v1" => job
             .idempotency_key
             .strip_prefix("session_import:")
@@ -5111,6 +5150,7 @@ impl RepositoryClosureKeys {
                 self.target_repository_job_ids.contains(&job.job_id)
                     || job_targets_repository(
                         job,
+                        repository_id,
                         &self.session_ids,
                         &self.episode_revision_ids,
                         &self.source_observation_ids,
@@ -5240,6 +5280,9 @@ impl RepositoryClosureKeys {
             }
             JournalPayload::RepositoryInstanceRecorded(value) => {
                 value.repository_id == repository_id
+            }
+            JournalPayload::CapabilityInventoryRecorded(value) => {
+                value.context.repository_id == repository_id
             }
             JournalPayload::WorktreeInstanceRecorded(value) => {
                 self.worktree_ids.contains(&value.worktree_instance_id)
@@ -6102,11 +6145,93 @@ impl JournalAdmissionState {
         Ok(state)
     }
 
+    fn inventory_admission(&self) -> inventory::InventoryAdmission<'_> {
+        inventory::InventoryAdmission {
+            inventory: &self.inventory,
+            repositories: &self.repositories,
+            worktrees: &self.worktrees,
+            jobs: &self.jobs,
+            purges: &self.scope_purges,
+        }
+    }
+
+    pub(crate) fn repository_read_context(
+        &self,
+        ids: &BTreeSet<RepositoryId>,
+    ) -> Result<RepositoryReadContext, StoreError> {
+        if ids.len() > 64 {
+            return Err(StoreError::InvalidInput);
+        }
+        Ok(RepositoryReadContext {
+            frontier: self.frontier,
+            repositories: ids
+                .iter()
+                .filter_map(|id| {
+                    self.repositories
+                        .get(id)
+                        .map(|(repository, _)| (*id, repository.clone()))
+                })
+                .collect(),
+            purged: ids
+                .iter()
+                .filter(|id| self.scope_purges.current(**id).is_some())
+                .copied()
+                .collect(),
+        })
+    }
+
+    pub(crate) fn inventory_context(
+        &self,
+        context: &evertrace_domain::inventory::InventoryContext,
+        job_id: Option<JobId>,
+    ) -> Result<InventoryCurrentContext, StoreError> {
+        context.validate().map_err(|_| StoreError::InvalidInput)?;
+        let repository = self
+            .repositories
+            .get(&context.repository_id)
+            .map(|(value, _)| value.clone());
+        let worktree = self
+            .worktrees
+            .get(&context.worktree_id)
+            .filter(|(value, _)| value.repository_instance_id == context.repository_id)
+            .map(|(value, _)| value.clone());
+        let restoration_boundary = repository
+            .as_ref()
+            .and_then(|repository| repository.capability_state.as_ref())
+            .and_then(|state| state.revalidated_inventory_ref)
+            .and_then(|id| self.inventory.completed.get(&id))
+            .map(|(fact, _)| fact.clone());
+        Ok(InventoryCurrentContext {
+            frontier: self.frontier,
+            repository,
+            worktree,
+            latest_completion: self.inventory.latest(context).cloned(),
+            restoration_boundary,
+            job: job_id
+                .and_then(|id| self.jobs.get(&id))
+                .filter(|job| inventory::job_repository(job) == Some(context.repository_id))
+                .cloned(),
+            purge_pending_or_purged: self.scope_purges.current(context.repository_id).is_some(),
+        })
+    }
+
     pub(crate) fn apply_command(
         &self,
         command: &JournalCommand,
         first_seq: u64,
     ) -> Result<Self, StoreError> {
+        self.inventory_admission().validate_procedure_coverage(
+            command.events().iter().map(|event| &event.payload),
+            true,
+            StoreError::InvalidInput,
+        )?;
+        self.inventory_admission().validate(
+            command
+                .events()
+                .iter()
+                .map(|event| (&event.payload, event.source_kind, event.occurred_at_us)),
+            StoreError::InvalidInput,
+        )?;
         self.validate_job_command(
             command
                 .events()
@@ -6316,6 +6441,17 @@ impl JournalAdmissionState {
                 Ok((payload, row.seq, row.occurred_at_us))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
+        self.inventory_admission().validate_procedure_coverage(
+            parsed.iter().map(|(payload, _, _)| payload),
+            false,
+            StoreError::StoreCorrupt,
+        )?;
+        self.inventory_admission().validate(
+            rows.iter()
+                .zip(&parsed)
+                .map(|(row, (payload, _, at))| (payload, row.source_kind, *at)),
+            StoreError::StoreCorrupt,
+        )?;
         self.validate_job_command(
             parsed
                 .iter()
@@ -7387,6 +7523,9 @@ impl JournalAdmissionState {
             JournalPayload::RepositoryInstanceRecorded(value) => {
                 crate::repository::replace_repository(&mut self.repositories, *value, seq)?;
             }
+            JournalPayload::CapabilityInventoryRecorded(value) => {
+                self.inventory.record(*value, seq)?;
+            }
             JournalPayload::WorktreeInstanceRecorded(value) => {
                 crate::repository::replace_worktree(&mut self.worktrees, *value, seq)?;
             }
@@ -7539,6 +7678,10 @@ impl JournalAdmissionState {
     }
 
     fn validate_relations(&self) -> Result<(), StoreError> {
+        self.inventory
+            .validate_relations(&self.repositories, &self.worktrees)?;
+        self.inventory
+            .validate_procedure_refs(self.proposal_revisions.values().map(|(value, _)| value))?;
         validate_source_local_relations(
             &self.source_observations,
             &self.source_receipts,
@@ -8357,6 +8500,9 @@ fn apply_event(
         }
         JournalPayload::RepositoryInstanceRecorded(value) => {
             crate::repository::replace_repository(&mut state.repositories, *value, row.seq)?;
+        }
+        JournalPayload::CapabilityInventoryRecorded(value) => {
+            state.inventory.record(*value, row.seq)?;
         }
         JournalPayload::WorktreeInstanceRecorded(value) => {
             crate::repository::replace_worktree(&mut state.worktrees, *value, row.seq)?;
@@ -10416,6 +10562,10 @@ impl ReducerState {
                     .insert(value.repository_id, (value, row.source_event_seq))
                     .is_some()
             }
+            JournalPayload::CapabilityInventoryRecorded(value) => {
+                self.inventory.restore(*value, row)?;
+                false
+            }
             JournalPayload::WorktreeInstanceRecorded(value) => {
                 let value = *value;
                 require_physical_row(
@@ -10931,6 +11081,7 @@ impl ReducerState {
                 seq,
             )?);
         }
+        rows.extend(self.inventory.rows()?);
         for (id, (value, seq)) in self.worktrees {
             rows.push(physical_object_row(
                 ObjectFamily::Work,
@@ -11296,6 +11447,10 @@ impl ReducerState {
     }
 
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
+        self.inventory
+            .validate_relations(&self.repositories, &self.worktrees)?;
+        self.inventory
+            .validate_procedure_refs(self.proposal_revisions.values().map(|(value, _)| value))?;
         validate_source_local_relations(
             &self.source_observations,
             &self.source_receipts,
@@ -11539,6 +11694,7 @@ impl ReducerState {
             capture_outages: self.capture_outages.clone(),
             source_close_reconciliations: self.source_close_reconciliations.clone(),
             repositories: self.repositories.clone(),
+            inventory: self.inventory.clone(),
             worktrees: self.worktrees.clone(),
             worktree_snapshots: self.worktree_snapshots.clone(),
             worktree_transitions: self.worktree_transitions.clone(),

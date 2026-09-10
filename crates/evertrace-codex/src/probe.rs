@@ -89,6 +89,21 @@ pub struct InstallHostProbe {
     pub hooks_enabled: bool,
 }
 
+/// The same closed executable runner, limited to a version query. No app-server,
+/// config interpretation, feature mutation, authentication or model request.
+pub fn inventory_profile_version(
+    pinned_executable: &std::path::Path,
+    deadline: std::time::Instant,
+) -> bool {
+    crate::install::bounded_install_command_before(
+        pinned_executable,
+        &["--version"],
+        None,
+        deadline,
+    )
+    .is_ok_and(|(status, value)| status == 0 && value.trim() == "codex-cli 0.153.4")
+}
+
 /// Read-only executable probe. This permits wiring the documented shape, not
 /// trusting the hook or granting any canary-backed capability.
 pub fn probe_install_host(
@@ -365,6 +380,8 @@ pub struct HostProbeReport {
     strong_normalization: GateReceipt,
     project_policy: GateReceipt,
     session_catalog_roots: Vec<SessionCatalogRootResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory_host: Option<crate::inventory::InventoryHostObservation>,
 }
 
 /// Read-only projection of an evaluated report. This is not probe input and
@@ -390,6 +407,24 @@ pub struct GateQualification {
 }
 
 impl HostProbeReport {
+    pub fn with_inventory_host(
+        mut self,
+        observation: crate::inventory::InventoryHostObservation,
+    ) -> Result<Self, ProbeError> {
+        observation
+            .validate()
+            .map_err(|_| ProbeError::InvalidEvidence)?;
+        if self.manifest.capability_inventory_profile.is_none() {
+            return Err(ProbeError::InvalidEvidence);
+        }
+        self.inventory_host = Some(observation);
+        Ok(self)
+    }
+
+    pub fn inventory_host(&self) -> Option<&crate::inventory::InventoryHostObservation> {
+        self.inventory_host.as_ref()
+    }
+
     pub fn qualification(&self) -> HostProbeQualification {
         let gate = |value: &GateReceipt| GateQualification {
             result: value.result,
@@ -528,6 +563,7 @@ impl HostProbeReport {
                 &manifest,
                 &evidence.session_catalog_roots,
             ),
+            inventory_host: None,
         })
     }
 }
@@ -711,6 +747,10 @@ fn compile_manifest(
         })
         .into_iter()
         .collect(),
+        capability_inventory_profile: matches!(context.adapter_kind, AdapterKind::CodexHook)
+            .then_some(
+                evertrace_domain::inventory::CapabilityInventoryProfile::NativeFiniteAssetsV1,
+            ),
         admission_failure_observability,
         mcp_session_binding: mcp.binding,
         mcp_binding_mechanism: mcp.mechanism,

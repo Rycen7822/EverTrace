@@ -8,6 +8,7 @@ use evertrace_domain::{
         SourceRevisionMode,
     },
     ids::{CaptureOutageIntervalId, CommandId, ExecutionLaneId, JobId, SourceObservationId},
+    inventory::CapabilityInventoryRecorded,
     procedure::{
         ProcedureNegativeEvidence, ProcedureNegativeReviewEvent, ProcedureRevision,
         ProcedureStateEvent, ProcedureUsageRevision,
@@ -592,6 +593,7 @@ pub enum JournalPayload {
     CaptureOutageIntervalRecorded(Box<CaptureOutageInterval>),
     SourceCloseReconciliation(SourceCloseReconciliation),
     RepositoryInstanceRecorded(Box<RepositoryInstance>),
+    CapabilityInventoryRecorded(Box<CapabilityInventoryRecorded>),
     WorktreeInstanceRecorded(Box<WorktreeInstance>),
     WorktreeSnapshotRecorded(Box<WorktreeSnapshot>),
     WorktreeTransitionRecorded(Box<WorktreeTransition>),
@@ -656,6 +658,7 @@ impl JournalPayload {
             Self::CaptureOutageIntervalRecorded(_) => "capture_outage_interval_recorded_v1",
             Self::SourceCloseReconciliation(_) => "source_close_reconciliation_v1",
             Self::RepositoryInstanceRecorded(_) => "repository_instance_recorded_v1",
+            Self::CapabilityInventoryRecorded(_) => "capability_inventory_recorded_v1",
             Self::WorktreeInstanceRecorded(_) => "worktree_instance_recorded_v1",
             Self::WorktreeSnapshotRecorded(_) => "worktree_snapshot_recorded_v1",
             Self::WorktreeTransitionRecorded(_) => "worktree_transition_recorded_v1",
@@ -711,6 +714,7 @@ impl JournalPayload {
             | Self::CaptureGapMarkerRecorded(_)
             | Self::CaptureOutageIntervalRecorded(_)
             | Self::RepositoryInstanceRecorded(_)
+            | Self::CapabilityInventoryRecorded(_)
             | Self::WorktreeInstanceRecorded(_)
             | Self::WorktreeSnapshotRecorded(_)
             | Self::WorktreeTransitionRecorded(_)
@@ -855,6 +859,9 @@ impl JournalPayload {
             }
             Self::SourceCloseReconciliation(value) => value.validate(),
             Self::RepositoryInstanceRecorded(value) => {
+                value.validate().map_err(|_| StoreError::InvalidInput)
+            }
+            Self::CapabilityInventoryRecorded(value) => {
                 value.validate().map_err(|_| StoreError::InvalidInput)
             }
             Self::WorktreeInstanceRecorded(value) => {
@@ -1127,6 +1134,9 @@ impl JournalPayload {
             }
             Self::RepositoryInstanceRecorded(value) => {
                 tagged_json("repository_instance_recorded", value)
+            }
+            Self::CapabilityInventoryRecorded(value) => {
+                tagged_json("capability_inventory_recorded", value)
             }
             Self::WorktreeInstanceRecorded(value) => {
                 tagged_json("worktree_instance_recorded", value)

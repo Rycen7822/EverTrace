@@ -56,6 +56,8 @@ fn scope_fixture(root: &std::path::Path) -> ScopeFixture {
     };
     ScopeFixture {
         repository: RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
             repository_id,
             repository_revision: 1,
             predecessor_revision: None,

@@ -605,6 +605,8 @@ mod replacement_proof {
             evidence_refs: vec![evidence.into()],
         };
         let repository = RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
             repository_id,
             repository_revision: 1,
             predecessor_revision: None,

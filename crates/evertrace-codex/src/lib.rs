@@ -9,6 +9,7 @@ pub mod capability;
 pub mod frozen_memory_export;
 pub mod hook_input;
 pub mod install;
+pub mod inventory;
 pub mod policy;
 pub mod probe;
 pub mod recovery;

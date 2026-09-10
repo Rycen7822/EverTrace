@@ -10,10 +10,18 @@
 //! construction time; idempotent replay works because the caller re-submits
 //! the already-constructed command and the writer deduplicates by command ID.
 
+mod access;
 mod git_probe;
+mod host_context;
 mod integration;
 mod resolver;
 mod session_catalog;
+pub(crate) use access::{
+    blocked_repositories, read_inventory, record_trust_revocations, repository_read_gate,
+    row_repository_contexts,
+};
+pub(crate) use host_context::NativeHostContext;
+pub use host_context::NativeHostPeer;
 pub(crate) use session_catalog::{
     SESSION_ROOT_PROBE_BUDGET, freeze_native_namespace, read_report_path_trust_before,
     read_report_repository_trust_before,

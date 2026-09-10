@@ -24,6 +24,7 @@ pub enum UiCommand {
     PrepareMarkNewAttempt,
     PrepareForgetObject,
     PrepareRepositoryPurge,
+    PrepareRepositoryAccess(evertrace_protocol::dto::RepositoryAccessAction),
     PrepareCreateBackup,
     PrepareCollectGarbage,
     PrepareVerifyBackup,

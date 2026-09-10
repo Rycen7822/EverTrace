@@ -410,6 +410,8 @@ pub struct ProcedureAutoFullAudit {
     pub eligibility: ProcedureEligibilityEvidence,
     pub procedure_promotion_level: PromotionLevel,
     pub eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_inventory_refs: Option<Vec<crate::ids::JobId>>,
 }
 
 impl ProcedureAutoFullAudit {
@@ -422,6 +424,9 @@ impl ProcedureAutoFullAudit {
         if self.validator_revision != PROCEDURE_ELIGIBILITY_VALIDATOR_REVISION
             || self.eligible != expected
             || !self.eligible
+            || self.capability_inventory_refs.as_ref().is_some_and(|refs| {
+                refs.is_empty() || refs.len() > 8 || refs.windows(2).any(|pair| pair[0] >= pair[1])
+            })
         {
             return Err(SemanticError::InvalidProposal);
         }

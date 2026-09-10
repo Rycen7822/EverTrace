@@ -83,6 +83,7 @@ pub struct RecoveryActionService {
     writer: WriterHandle,
     fence: RecoveryMutationFence,
     custody: Arc<ActionCustody>,
+    report: Option<Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
     #[cfg(test)]
     faults: Arc<TestFaultState>,
 }
@@ -237,9 +238,37 @@ impl RecoveryActionService {
             writer,
             fence,
             custody: Arc::new(ActionCustody::default()),
+            report: None,
             #[cfg(test)]
             faults: Arc::new(TestFaultState::default()),
         }
+    }
+
+    pub fn with_session_report(
+        mut self,
+        report: Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Self {
+        self.report = Some(report);
+        self
+    }
+
+    async fn repository_allowed(
+        &self,
+        repository_id: evertrace_domain::ids::RepositoryId,
+    ) -> Result<bool, RecoveryError> {
+        let report = match &self.report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        crate::repository::blocked_repositories(
+            &self.writer,
+            [repository_id].into_iter().collect(),
+            report.as_ref(),
+            self.snapshot.effective_config_hash,
+        )
+        .await
+        .map(|blocked| blocked.is_empty())
+        .map_err(|_| RecoveryError::Store)
     }
 
     #[cfg(test)]
@@ -537,15 +566,16 @@ impl RecoveryActionService {
                 replayed: false,
             });
         }
-        if self
-            .affected_git_proof(
-                &prepared.pinned_root,
-                &prepared.affected_relative_path,
-                deadline,
-            )
-            .await?
-            .as_ref()
-            != Some(&prepared.affected_git_prestate)
+        if !self.repository_allowed(prepared.repository_id).await?
+            || self
+                .affected_git_proof(
+                    &prepared.pinned_root,
+                    &prepared.affected_relative_path,
+                    deadline,
+                )
+                .await?
+                .as_ref()
+                != Some(&prepared.affected_git_prestate)
             || prepared.pinned_root.revalidate().is_err()
             || read_affected_file(
                 &prepared.pinned_root,
@@ -768,6 +798,12 @@ impl RecoveryActionService {
         };
         if target.lifecycle != WorktreeLifecycle::Active
             || target.repository_instance_id != source.repository_instance_id
+        {
+            return Ok(Err(RecoveryUnsupportedReason::TargetUnavailable));
+        }
+        if !self
+            .repository_allowed(target.repository_instance_id)
+            .await?
         {
             return Ok(Err(RecoveryUnsupportedReason::TargetUnavailable));
         }
@@ -1295,6 +1331,12 @@ impl RecoveryActionService {
         }
         let digest = CasDigest::from_str(&selected.payload.cas_ref)
             .map_err(|_| RecoveryError::InvalidSuccessor)?;
+        if !self
+            .repository_allowed(target.repository_instance_id)
+            .await?
+        {
+            return Ok(None);
+        }
         let cas = CasStore::open(self.snapshot.cas_dir.clone()).map_err(|_| RecoveryError::Cas)?;
         let patch = cas.read(&digest).map_err(|_| RecoveryError::Cas)?;
         let Some(affected_relative_path) = strict_patch_target(&patch) else {
@@ -1902,6 +1944,41 @@ mod tests {
         let git_dir = canonical.join(".git");
         let git_metadata = std::fs::metadata(&git_dir).unwrap();
         let path = canonical.to_string_lossy().into_owned();
+        let adapter = root.join("adapter");
+        let dated = adapter.join("sessions/2026/09/09");
+        std::fs::create_dir_all(&dated).unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = "019d0000-0000-7000-8000-000000000016";
+        let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta",
+                    "payload":{"id":session,"session_id":session,"cwd":path,
+                    "originator":"codex_cli_rs","model_provider":"test","git":null}
+                })
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            adapter.join("config.toml"),
+            format!(
+                "[projects.{}]\ntrust_level = \"trusted\"\n",
+                serde_json::to_string(&path).unwrap()
+            ),
+        )
+        .unwrap();
+        let report = Arc::new(tokio::sync::RwLock::new(Some(
+            crate::repository::observe_session_catalog_report(
+                transcript.to_str(),
+                session,
+                "tool",
+                None,
+            )
+            .unwrap(),
+        )));
         let path_observation = PathObservation {
             path: path.clone(),
             first_observed_at_us: 1,
@@ -1909,6 +1986,8 @@ mod tests {
             evidence_refs: vec!["action-path".into()],
         };
         let repository = RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
             repository_id,
             repository_revision: 1,
             predecessor_revision: None,
@@ -2080,7 +2159,8 @@ mod tests {
             runtime.clone(),
             handle.clone(),
             RecoveryMutationFence::default(),
-        );
+        )
+        .with_session_report(report);
         ActionHarness {
             root,
             worktree,
@@ -2142,6 +2222,35 @@ mod tests {
         assert!(current_application(&harness).await.is_none());
         let spool = harness.runtime.spool_dir.join("main");
         assert!(!spool.exists() || std::fs::read_dir(spool).unwrap().next().is_none());
+        *harness.service.faults.fault.lock().unwrap() = None;
+        let config = harness.root.join("adapter/config.toml");
+        let trusted = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, trusted.replace("\"trusted\"", "\"untrusted\"")).unwrap();
+        assert!(matches!(
+            harness.service.handle(harness.request).await.unwrap(),
+            RecoveryActionOutcome::Unsupported(RecoveryUnsupportedReason::TargetUnavailable)
+        ));
+        let revoked = harness.handle.project().await.unwrap();
+        assert!(revoked.data_rows().any(|row| row.object_kind.as_deref() == Some("repository")
+            && matches!(row.payload_json.as_deref().and_then(|json| serde_json::from_str::<JournalPayload>(json).ok()),
+                Some(JournalPayload::RepositoryInstanceRecorded(value)) if value.capability_state.as_ref().is_some_and(|state| state.trust_revoked))));
+        std::fs::write(config, trusted).unwrap();
+        assert!(matches!(
+            harness.service.handle(harness.request).await.unwrap(),
+            RecoveryActionOutcome::Unsupported(RecoveryUnsupportedReason::TargetUnavailable)
+        ));
+        assert_eq!(
+            harness.handle.project().await.unwrap().frontier,
+            revoked.frontier
+        );
+        assert_eq!(
+            harness.service.faults.spawn_count.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            std::fs::read(harness.worktree.join("tracked.txt")).unwrap(),
+            b"before\n"
+        );
         harness.close().await;
     }
 
@@ -2240,7 +2349,8 @@ mod tests {
             harness.runtime.clone(),
             handle.clone(),
             RecoveryMutationFence::default(),
-        );
+        )
+        .with_session_report(harness.service.report.as_ref().unwrap().clone());
         service.reconcile_pending_on_startup().await.unwrap();
         let restored =
             RecoveryCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();

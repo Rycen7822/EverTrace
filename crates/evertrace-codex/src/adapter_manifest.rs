@@ -157,6 +157,9 @@ pub struct AdapterCapabilityManifest {
     pub project_policy_surfaces: Vec<ProjectPolicySurface>,
     #[serde(default)]
     pub session_catalog_root_contracts: Vec<SessionCatalogRootContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_inventory_profile:
+        Option<evertrace_domain::inventory::CapabilityInventoryProfile>,
     pub admission_failure_observability: AdmissionFailureObservability,
     pub mcp_session_binding: crate::capability::McpSessionBinding,
     pub mcp_binding_mechanism: crate::capability::McpBindingMechanism,
@@ -319,6 +322,9 @@ impl AdapterCapabilityManifest {
             subagent_trace: SubagentTrace,
             trust_readback: TrustReadback,
             project_policy_surfaces: &'a [ProjectPolicySurface],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            capability_inventory_profile:
+                Option<evertrace_domain::inventory::CapabilityInventoryProfile>,
             admission_failure_observability: AdmissionFailureObservability,
             mcp_session_binding: crate::capability::McpSessionBinding,
             mcp_binding_mechanism: crate::capability::McpBindingMechanism,
@@ -339,6 +345,7 @@ impl AdapterCapabilityManifest {
             subagent_trace: self.subagent_trace,
             trust_readback: self.trust_readback,
             project_policy_surfaces: &self.project_policy_surfaces,
+            capability_inventory_profile: self.capability_inventory_profile,
             admission_failure_observability: self.admission_failure_observability,
             mcp_session_binding: self.mcp_session_binding,
             mcp_binding_mechanism: self.mcp_binding_mechanism,

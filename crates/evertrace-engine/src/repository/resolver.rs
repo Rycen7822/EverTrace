@@ -631,6 +631,8 @@ fn create_repository(
         .ok_or(RepositoryResolveError::InvalidEvidence)?;
     let repository_id = new_repository_id();
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,

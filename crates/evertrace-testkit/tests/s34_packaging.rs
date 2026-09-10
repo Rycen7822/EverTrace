@@ -479,6 +479,8 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
     actor.await.unwrap().unwrap();
     let path = paths.data_root.to_string_lossy().into_owned();
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,

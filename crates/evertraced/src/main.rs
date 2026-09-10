@@ -211,11 +211,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     let runtime_snapshot = config_reload.initialize_runtime().await?;
     evertrace_engine::initialize_runtime_spool(&runtime_snapshot)?;
+    let current_session_catalog_report = Arc::new(RwLock::new(None));
     let mut recall_worker = spawn_recall_worker_with_config(
         writer_handle.clone(),
         runtime_snapshot.clone(),
         data_dir.clone(),
         Some(Arc::clone(&config_reload)),
+        Some(Arc::clone(&current_session_catalog_report)),
     );
     let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
     let mut host_canary = evertrace_engine::HostCanaryService::new(
@@ -236,7 +238,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .to_owned(),
         )?;
     }
-    let current_session_catalog_report = Arc::new(RwLock::new(None));
     let session_import_admin = SessionImportAdminService::new(
         writer_handle.clone(),
         Arc::clone(&current_session_catalog_report),
@@ -257,7 +258,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_snapshot.clone(),
         engine.effective_config().config().global_promotion.clone(),
     )
-    .with_session_report(Arc::clone(&current_session_catalog_report));
+    .with_session_report(Arc::clone(&current_session_catalog_report))
+    .with_inventory_bindings(mcp_bindings.clone());
     human_governance.reconcile_reserved_once().await?;
     let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
     let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
@@ -272,6 +274,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         engine.effective_config().config().dreaming.clone(),
     )
     .with_backup_requests(backup_request_tx)
+    .with_inventory(evertrace_engine::jobs::InventoryWorker::new(
+        writer_handle.clone(),
+        runtime_snapshot.clone(),
+        mcp_bindings.clone(),
+    ))
     .with_config(Arc::clone(&config_reload));
     let mut background_scheduler_task =
         tokio::spawn(scheduler.run(session_import_wakeup_rx, session_import_shutdown_rx));
@@ -292,12 +299,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_snapshot.generation,
         runtime_snapshot.effective_config_hash,
         &data_dir,
-    );
+    )
+    .with_session_report(Arc::clone(&current_session_catalog_report));
     let recovery_action_service = RecoveryActionService::new(
         runtime_snapshot.clone(),
         writer_handle.clone(),
         recovery_service.mutation_fence(),
-    );
+    )
+    .with_session_report(Arc::clone(&current_session_catalog_report));
     recovery_service.reconcile_pending_on_startup().await?;
     recovery_action_service
         .reconcile_pending_on_startup()
@@ -532,6 +541,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                         let result = mcp_service
+                            .for_native_peer(
+                                context.peer_credentials.map(|peer| evertrace_engine::repository::NativeHostPeer {
+                                    pid: peer.pid, uid: peer.uid, gid: peer.gid,
+                                }),
+                                std::sync::Arc::downgrade(&context.connection_lifetime),
+                            )
                             .handle(
                                 &context.connection_id,
                                 McpServiceRequest {
@@ -545,6 +560,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await
                             .map_err(|_| ErrorCode::Internal)?;
+                        let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                        session_import_wakeup.send_replace(next);
                         let target_bytes = match output_action {
                             evertrace_protocol::mcp::McpAction::Search => {
                                 config_snapshot.config().search.search_token_budget as usize * 4
@@ -860,6 +877,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             )
                                             .await
                                     }
+                                    HumanActionRequest::RepositoryAccess { repository_id, expected_repository_revision, action, worktree_id, inventory_ref } => {
+                                        human_governance.repository_access(request_id, expected_frontier,
+                                            evertrace_engine::HumanRepositoryAccess {
+                                                repository_id, expected_repository_revision, worktree_id, inventory_ref,
+                                                action: match action {
+                                                    evertrace_protocol::dto::RepositoryAccessAction::Disable => evertrace_engine::HumanRepositoryAccessAction::Disable,
+                                                    evertrace_protocol::dto::RepositoryAccessAction::Enable => evertrace_engine::HumanRepositoryAccessAction::Enable,
+                                                    evertrace_protocol::dto::RepositoryAccessAction::Rescan => evertrace_engine::HumanRepositoryAccessAction::Rescan,
+                                                },
+                                            }).await
+                                    }
                                     HumanActionRequest::CreateBackup => {
                                         human_governance
                                             .create_backup(request_id, expected_frontier)
@@ -898,6 +926,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         };
+                        if mcp_bindings.take_inventory_wakeup() {
+                            let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                            session_import_wakeup.send_replace(next);
+                        }
                         Ok(Response::HumanGovernance(response))
                     }
                     ProtocolCommand::RecallCue(command) => {
@@ -1076,6 +1108,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     runtime_snapshot.clone(),
                     data_dir.clone(),
                     Some(Arc::clone(&config_reload)),
+                    Some(Arc::clone(&current_session_catalog_report)),
                 );
                 if !recovery_action_service.resume_after_quiesce() {
                     maintenance_active.store(false, Ordering::Release);
@@ -1270,6 +1303,7 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                     plain_accept_eligible: review.plain_accept_eligible,
                     merge_and_accept_eligible: review.merge_and_accept_eligible,
                     reauthorization: review.reauthorization,
+                    capability_coverage: review.capability_coverage,
                 }),
                 support_detail: item.support_detail.map(
                     |EngineHumanSupportDetail {
@@ -1612,6 +1646,8 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
                     }
                 }),
                 system_detail: item.system_detail.map(|detail| match detail {
+                    EngineHumanSystemDetail::Repository { repository_id, repository_revision, user_disabled, trust_revoked, revalidated_inventory_ref, worktree_id } => HumanSystemDetail::Repository { repository_id, repository_revision, user_disabled, trust_revoked, revalidated_inventory_ref, worktree_id },
+                    EngineHumanSystemDetail::CapabilityInventory { job_id, repository_id, repository_revision, worktree_id, cwd, state, source_count, signature_count, unobserved_source_count, unknown_contract_count, asset_names } => HumanSystemDetail::CapabilityInventory { job_id, repository_id, repository_revision, worktree_id, cwd, state, source_count, signature_count, unobserved_source_count, unknown_contract_count, asset_names },
                     EngineHumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions } => HumanSystemDetail::SessionImport { session_id, source_instance_id, body_state, access, workspace, repository_read_restrictions },
                     EngineHumanSystemDetail::Job { detail } => {
                         let EngineHumanJobDetail {

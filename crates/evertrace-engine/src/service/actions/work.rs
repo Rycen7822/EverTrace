@@ -898,14 +898,15 @@ impl McpActionService {
                 }
             }
             let selected = recent.values().copied().collect::<Vec<_>>();
-            let blocked = crate::session_import::blocked_source_rows(
-                &self.writer,
-                report.as_ref(),
-                &snapshot,
-                &selected,
-            )
-            .await
-            .map_err(|_| McpServiceError::Store)?;
+            let blocked = self
+                .blocked_read_rows(
+                    binding.repository_report.as_deref().or(report.as_ref()),
+                    &snapshot,
+                    &selected,
+                    None,
+                )
+                .await
+                .map_err(|_| McpServiceError::Store)?;
             let mut remaining = 8 * 1024 * 1024usize;
             for (_, row) in recent.into_iter().rev() {
                 if blocked.contains(&row.row_id) {
@@ -963,14 +964,15 @@ impl McpActionService {
                         .map(|(row, _)| row)
                 })
                 .collect::<Vec<_>>();
-            let blocked = crate::session_import::blocked_source_rows(
-                &self.writer,
-                report.as_ref(),
-                &snapshot,
-                &selected,
-            )
-            .await
-            .map_err(|_| McpServiceError::Store)?;
+            let blocked = self
+                .blocked_read_rows(
+                    binding.repository_report.as_deref().or(report.as_ref()),
+                    &snapshot,
+                    &selected,
+                    None,
+                )
+                .await
+                .map_err(|_| McpServiceError::Store)?;
             for reference in requested.iter().take(3) {
                 let Some((row, true)) = select_object_row(&snapshot, reference).ok().flatten()
                 else {

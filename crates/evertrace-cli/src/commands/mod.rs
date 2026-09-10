@@ -27,10 +27,27 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         } => install::run(args.config, Some(host_executable), live_canary).await,
         Command::Uninstall => install::run(args.config, None, false).await,
         Command::Restore { backup } => restore::run(args.config, backup).await,
-        Command::Mcp => mcp::run(args.config).await,
+        Command::Mcp { host_locator } => mcp::run(args.config, host_locator).await,
         Command::Tui => tui::run(args.config).await,
         Command::AdminSession { action, session_id } => {
             admin::run(args.config, action, session_id).await
+        }
+        Command::AdminRepository {
+            action,
+            repository_id,
+            expected_revision,
+            worktree_id,
+            inventory_ref,
+        } => {
+            admin::repository(
+                args.config,
+                action,
+                repository_id,
+                expected_revision,
+                worktree_id,
+                inventory_ref,
+            )
+            .await
         }
     }
 }

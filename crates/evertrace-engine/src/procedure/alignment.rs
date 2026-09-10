@@ -608,6 +608,62 @@ mod tests {
             completed: eq(completed),
         }
     }
+    #[test]
+    fn inventory_coverage_distinguishes_duplicate_from_incremental_boundary() {
+        use crate::procedure::{
+            VerifiedProcedureCoverage, equivalent_procedure_contract, extends_procedure_boundaries,
+        };
+        use evertrace_domain::{
+            inventory::{
+                CapabilityCoverageMatch, CapabilityCoverageSummary, CapabilityEvidenceLevel,
+            },
+            semantic::{ProcedureProposalPayload, SemanticCandidate},
+        };
+        let original = draft();
+        let mut candidate = original.clone();
+        candidate.title = "different authored title".into();
+        assert!(equivalent_procedure_contract(&original, &candidate));
+        candidate
+            .pitfalls
+            .push("preserve the repository-specific rollback marker".into());
+        assert!(!equivalent_procedure_contract(&original, &candidate));
+        assert!(extends_procedure_boundaries(&original, &candidate));
+        let id = evertrace_domain::ids::ProcedureId::new_v7();
+        let revision = evertrace_domain::revision::RevisionId::new_v7();
+        let mut proof = VerifiedProcedureCoverage {
+            summary: CapabilityCoverageSummary::default(),
+            frontier: 1,
+            draft: candidate.clone(),
+            source_refs: vec!["source".into()],
+            incremental_target: Some((id, revision)),
+        };
+        let mut proposal = SemanticCandidate::ProcedureProposal {
+            target_id: None,
+            base_revision_id: None,
+            payload: Box::new(ProcedureProposalPayload::Create {
+                draft: candidate.clone(),
+            }),
+        };
+        proof.apply_incremental_boundary(&mut proposal);
+        assert!(matches!(proposal, SemanticCandidate::ProcedureProposal {
+            target_id: Some(target), base_revision_id: Some(base), payload,
+        } if target == id && base == revision && matches!(payload.as_ref(), ProcedureProposalPayload::Replace { draft } if draft == &candidate)));
+        candidate.completion_expr = eq("unproven verifier");
+        assert!(!extends_procedure_boundaries(&original, &candidate));
+        for (level, suppressed) in [
+            (CapabilityEvidenceLevel::Present, false),
+            (CapabilityEvidenceLevel::Routed, false),
+            (CapabilityEvidenceLevel::ActionAligned, false),
+            (CapabilityEvidenceLevel::OutcomeSupported, true),
+        ] {
+            proof.summary.equivalent_assets = vec![CapabilityCoverageMatch {
+                revision_ref: revision.to_string(),
+                level,
+            }];
+            assert_eq!(proof.suppresses_duplicate_create(), suppressed);
+        }
+    }
+
     fn draft() -> ProcedureDraft {
         ProcedureDraft {
             scope: ProcedureScope::Repository {

@@ -37,9 +37,17 @@ pub struct RecallCueService {
     runtime_generation: u64,
     effective_config_hash: [u8; 32],
     runtime_snapshot_path: std::path::PathBuf,
+    report: Option<std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>>,
 }
 
 impl RecallCueService {
+    pub fn with_session_report(
+        mut self,
+        report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    ) -> Self {
+        self.report = Some(report);
+        self
+    }
     pub fn for_config(&self, config: &evertrace_domain::config::EffectiveConfig) -> Self {
         let mut operation = self.clone();
         operation.effective_config_hash = config.hash();
@@ -61,6 +69,7 @@ impl RecallCueService {
             runtime_generation,
             effective_config_hash,
             runtime_snapshot_path: evertrace_capture::RuntimeSnapshot::snapshot_path(data_dir),
+            report: None,
         }
     }
 
@@ -83,6 +92,22 @@ impl RecallCueService {
             let index = RecallTriggerIndex::from_current_contexts(frontier(&contexts)?, &contexts)
                 .map_err(|_| RecallCueError::Store)?;
             let (context, need) = select_need(&contexts, claim, false)?;
+            let report = match &self.report {
+                Some(report) => report.read().await.clone(),
+                None => None,
+            };
+            if !crate::repository::blocked_repositories(
+                &self.writer,
+                context.episode.repository_instance_id.into_iter().collect(),
+                report.as_ref(),
+                self.effective_config_hash,
+            )
+            .await
+            .map_err(|_| RecallCueError::Store)?
+            .is_empty()
+            {
+                return Err(RecallCueError::InvalidInput);
+            }
             if !latest_valid(context, need, &index, now, &claim.adapter_manifest_id) {
                 return Err(RecallCueError::Store);
             }

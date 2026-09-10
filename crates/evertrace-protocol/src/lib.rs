@@ -332,7 +332,15 @@ where
     let connection_context = dto::ConnectionContext {
         connection_id,
         client_kind: handshake.client_kind,
+        peer_credentials: stream.peer_cred().ok().and_then(|peer| {
+            Some(dto::PeerCredentials {
+                pid: u32::try_from(peer.pid()?).ok()?,
+                uid: peer.uid(),
+                gid: peer.gid(),
+            })
+        }),
         mcp_returned: None,
+        connection_lifetime: std::sync::Arc::new(()),
     };
     let ack = ServerEnvelope::HandshakeAck(HandshakeAck {
         protocol_version: PROTOCOL_VERSION,
@@ -360,7 +368,17 @@ where
     let mut pending_mcp_return = None;
     loop {
         let message = tokio::select! {
-            result = read_frame::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout) => {
+            result = async {
+                // Managed MCP is a long-lived connection, including between
+                // tool calls. Idle transport is not a disconnected Host. Once
+                // a frame starts, the existing prefix/payload limits still
+                // apply; this grants no binding or repository authority.
+                if connection_context.client_kind == dto::ClientKind::Mcp {
+                    read_frame_after_idle::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout).await
+                } else {
+                    read_frame::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout).await
+                }
+            } => {
                 match result {
                     Ok(value) => value,
                     Err(FrameError::Closed) => return Ok(()),

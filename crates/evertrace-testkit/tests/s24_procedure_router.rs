@@ -248,11 +248,30 @@ fn full_evidence(
 }
 
 #[tokio::test]
-async fn auto_full_acceptance_is_atomic_probationary_rebuildable_and_fts_visible() {
+async fn missing_inventory_blocks_auto_full_but_manual_acceptance_is_atomic_and_rebuildable() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("procedure-store");
     let mut writer = JournalWriter::open(&root).await.unwrap();
     let (mut receipt, mut observation) = source("evidence", "objective procedure evidence", 1);
+    let old_audit = evertrace_domain::procedure::ProcedureAutoFullAudit {
+        validator_revision: evertrace_domain::procedure::PROCEDURE_ELIGIBILITY_VALIDATOR_REVISION
+            .into(),
+        eligibility: full_evidence(observation.source_observation_id),
+        procedure_promotion_level: PromotionLevel::FullAuto,
+        eligible: true,
+        capability_inventory_refs: None,
+    };
+    assert!(old_audit.validate(true).is_ok());
+    let old_json = serde_json::to_string(&old_audit).unwrap();
+    assert!(!old_json.contains("capability_inventory_refs"));
+    assert_eq!(
+        serde_json::to_string(
+            &serde_json::from_str::<evertrace_domain::procedure::ProcedureAutoFullAudit>(&old_json)
+                .unwrap()
+        )
+        .unwrap(),
+        old_json
+    );
     receipt.observation_role = ObservationRole::Result;
     observation.observation_role = ObservationRole::Result;
     observation.source_role = SourceRole::Tool;
@@ -369,6 +388,39 @@ async fn auto_full_acceptance_is_atomic_probationary_rebuildable_and_fts_visible
         procedure: PromotionLevel::FullAuto,
         core_membership: PromotionLevel::Manual,
     };
+    assert!(
+        accept_procedure(
+            &view,
+            proposal_context(4),
+            proposal.proposal_id,
+            ProcedureAcceptanceContext::AutoFull {
+                evidence: full_evidence(observation.source_observation_id),
+                coverage: None
+            },
+            None,
+            None,
+            &config
+        )
+        .is_err()
+    );
+    let acceptance_payload = tui_acceptance_event_payload(
+        proposal.proposal_id,
+        proposal.proposal_revision_id,
+        &proposal.fingerprint,
+    );
+    let (acceptance_receipt, acceptance_observation) =
+        source("initial-manual-acceptance", &acceptance_payload, 3);
+    writer
+        .commit(
+            &command(
+                3,
+                source_payloads(acceptance_receipt.clone(), acceptance_observation.clone()),
+            ),
+            3,
+        )
+        .await
+        .unwrap();
+    let view = SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
     let ProcedureAcceptanceResolution::Command {
         procedure,
         command: accepted,
@@ -377,7 +429,10 @@ async fn auto_full_acceptance_is_atomic_probationary_rebuildable_and_fts_visible
         &view,
         proposal_context(4),
         proposal.proposal_id,
-        ProcedureAcceptanceContext::AutoFull(full_evidence(observation.source_observation_id)),
+        ProcedureAcceptanceContext::Manual(AtomAcceptanceContext::GlobalTui {
+            observation: Box::new(acceptance_observation),
+            receipt: Box::new(acceptance_receipt),
+        }),
         None,
         None,
         &config,
@@ -399,25 +454,33 @@ async fn auto_full_acceptance_is_atomic_probationary_rebuildable_and_fts_visible
         &event.payload,
         JournalPayload::RevisionProposalRecorded(value)
             if value.status == evertrace_domain::semantic::ProposalStatus::Accepted
-                && value.review_reason.as_deref() == Some("automatic_acceptance")
+                && value.review_reason.as_deref() == Some("manual_acceptance")
                 && matches!(value.acceptance.as_ref().map(|acceptance| &acceptance.accepted_target),
                     Some(evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
-                        auto_full_audit: Some(audit), ..
-                    }) if audit.eligible
-                        && audit.eligibility == full_evidence(observation.source_observation_id))
+                        auto_full_audit: None, ..
+                    }))
     )));
     let mut tampered_audit_events = accepted.events().to_vec();
     for event in &mut tampered_audit_events {
         if let JournalPayload::RevisionProposalRecorded(value) = &mut event.payload
             && let Some(evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
-                auto_full_audit: Some(audit),
+                auto_full_audit,
                 ..
             }) = value
                 .acceptance
                 .as_mut()
                 .map(|acceptance| &mut acceptance.accepted_target)
         {
-            audit.eligible = false;
+            *auto_full_audit = Some(Box::new(
+                evertrace_domain::procedure::ProcedureAutoFullAudit {
+                    validator_revision:
+                        evertrace_domain::procedure::PROCEDURE_ELIGIBILITY_VALIDATOR_REVISION.into(),
+                    eligibility: full_evidence(observation.source_observation_id),
+                    procedure_promotion_level: PromotionLevel::FullAuto,
+                    eligible: true,
+                    capability_inventory_refs: None,
+                },
+            ));
         }
     }
     let tampered_audit = JournalCommand::new(CommandId::new_v7(), tampered_audit_events).unwrap();
@@ -895,12 +958,15 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
         let mut view = SemanticCurrentView::default();
         view.proposals
             .insert(proposal.proposal_id, (*proposal).clone());
-        assert!(matches!(
+        assert!(
             accept_procedure(
                 &view,
                 proposal_context(4),
                 proposal.proposal_id,
-                ProcedureAcceptanceContext::AutoFull(full.clone()),
+                ProcedureAcceptanceContext::AutoFull {
+                    evidence: full.clone(),
+                    coverage: None
+                },
                 None,
                 None,
                 &GlobalPromotionConfig {
@@ -908,21 +974,9 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
                     procedure: PromotionLevel::SemiAuto,
                     core_membership: PromotionLevel::Manual,
                 },
-            ),
-            Ok(ProcedureAcceptanceResolution::Command { ref command, .. })
-                if !command.events().iter().any(|event| matches!(
-                    event.payload,
-                    JournalPayload::GlobalSupportContractRecorded(_)
-                )) && command.events().iter().any(|event| matches!(
-                    &event.payload,
-                    JournalPayload::RevisionProposalRecorded(value)
-                        if matches!(value.acceptance.as_ref().map(|acceptance| &acceptance.accepted_target),
-                            Some(evertrace_domain::semantic::AcceptedProposalTarget::Procedure {
-                                auto_full_audit: Some(audit), ..
-                            }) if audit.procedure_promotion_level == PromotionLevel::SemiAuto
-                                && audit.validate(false).is_ok())
-                ))
-        ));
+            )
+            .is_err()
+        );
     }
     let ProposalResolution::Revision {
         value: global_proposal,
@@ -958,7 +1012,10 @@ fn eligibility_publication_and_router_gates_are_closed_and_bounded() {
             &global_view,
             proposal_context(4),
             global_proposal.proposal_id,
-            ProcedureAcceptanceContext::AutoFull(full.clone()),
+            ProcedureAcceptanceContext::AutoFull {
+                evidence: full.clone(),
+                coverage: None
+            },
             None,
             None,
             &GlobalPromotionConfig {

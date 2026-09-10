@@ -239,6 +239,21 @@ impl JournalWriter {
             .session_import_context(self.frontier(), source)
     }
 
+    pub fn repository_read_context(
+        &self,
+        ids: &std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+    ) -> Result<crate::projections::RepositoryReadContext, StoreError> {
+        self.admission_state.repository_read_context(ids)
+    }
+
+    pub fn inventory_context(
+        &self,
+        context: &evertrace_domain::inventory::InventoryContext,
+        job_id: Option<evertrace_domain::ids::JobId>,
+    ) -> Result<crate::projections::InventoryCurrentContext, StoreError> {
+        self.admission_state.inventory_context(context, job_id)
+    }
+
     pub fn session_import_contexts(
         &self,
         after: Option<&str>,

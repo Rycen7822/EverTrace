@@ -29,11 +29,20 @@ pub enum Command {
     Restore {
         backup: PathBuf,
     },
-    Mcp,
+    Mcp {
+        host_locator: Option<(PathBuf, PathBuf)>,
+    },
     Tui,
     AdminSession {
         action: AdminSessionAction,
         session_id: String,
+    },
+    AdminRepository {
+        action: evertrace_protocol::dto::RepositoryAccessAction,
+        repository_id: evertrace_domain::ids::RepositoryId,
+        expected_revision: u32,
+        worktree_id: Option<evertrace_domain::ids::WorktreeId>,
+        inventory_ref: Option<evertrace_domain::ids::JobId>,
     },
 }
 
@@ -116,30 +125,93 @@ impl Args {
                 },
             }
         } else if command == "mcp" {
-            Command::Mcp
+            let host_locator = match values.next() {
+                None => None,
+                Some(flag) if flag == "--host-executable" => {
+                    let executable = PathBuf::from(values.next().ok_or(usage())?);
+                    if values.next().as_deref() != Some(std::ffi::OsStr::new("--host-config")) {
+                        return Err(usage());
+                    }
+                    let config = PathBuf::from(values.next().ok_or(usage())?);
+                    if !executable.is_absolute() || !config.is_absolute() {
+                        return Err(usage());
+                    }
+                    Some((executable, config))
+                }
+                _ => return Err(usage()),
+            };
+            Command::Mcp { host_locator }
         } else if command == "tui" {
             Command::Tui
         } else if command == "admin" {
-            if values.next().as_deref() != Some(std::ffi::OsStr::new("session")) {
+            let subject = values.next().ok_or(usage())?;
+            if subject == "repository" {
+                let action = match values.next().as_deref().and_then(|value| value.to_str()) {
+                    Some("disable") => evertrace_protocol::dto::RepositoryAccessAction::Disable,
+                    Some("enable") => evertrace_protocol::dto::RepositoryAccessAction::Enable,
+                    Some("rescan") => evertrace_protocol::dto::RepositoryAccessAction::Rescan,
+                    _ => return Err(usage()),
+                };
+                let repository_id = values
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .and_then(|value| value.parse().ok())
+                    .ok_or(usage())?;
+                let expected_revision = values
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 0)
+                    .ok_or(usage())?;
+                let (worktree_id, inventory_ref) =
+                    if action == evertrace_protocol::dto::RepositoryAccessAction::Disable {
+                        (None, None)
+                    } else {
+                        let worktree = values
+                            .next()
+                            .and_then(|value| value.into_string().ok())
+                            .and_then(|value| value.parse().ok())
+                            .ok_or(usage())?;
+                        let inventory = values
+                            .next()
+                            .map(|value| {
+                                value
+                                    .into_string()
+                                    .ok()
+                                    .and_then(|value| value.parse().ok())
+                                    .ok_or(usage())
+                            })
+                            .transpose()?;
+                        (Some(worktree), inventory)
+                    };
+                Command::AdminRepository {
+                    action,
+                    repository_id,
+                    expected_revision,
+                    worktree_id,
+                    inventory_ref,
+                }
+            } else if subject == "session" {
+                let action = match values.next().as_deref().and_then(|value| value.to_str()) {
+                    Some("queue") => AdminSessionAction::Queue,
+                    Some("revoke") => AdminSessionAction::Revoke,
+                    _ => return Err(usage()),
+                };
+                let session_id = values
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 256
+                            && value.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+                            })
+                    })
+                    .ok_or(usage())?;
+                Command::AdminSession { action, session_id }
+            } else {
                 return Err(usage());
             }
-            let action = match values.next().as_deref().and_then(|value| value.to_str()) {
-                Some("queue") => AdminSessionAction::Queue,
-                Some("revoke") => AdminSessionAction::Revoke,
-                _ => return Err(usage()),
-            };
-            let session_id = values
-                .next()
-                .and_then(|value| value.into_string().ok())
-                .filter(|value| {
-                    !value.is_empty()
-                        && value.len() <= 256
-                        && value.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
-                        })
-                })
-                .ok_or(usage())?;
-            Command::AdminSession { action, session_id }
         } else if command == "config" {
             match values.next().as_deref().and_then(|value| value.to_str()) {
                 Some("check") => Command::ConfigCheck,
@@ -175,7 +247,7 @@ impl Args {
 }
 
 const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]|upgrade PACKAGE_DIRECTORY --live-host CODEX_EXECUTABLE|install CODEX_EXECUTABLE [--live-canary]|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID"
+    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]|upgrade PACKAGE_DIRECTORY --live-host CODEX_EXECUTABLE|install CODEX_EXECUTABLE [--live-canary]|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID|admin repository disable REPOSITORY_ID REVISION|admin repository enable|rescan REPOSITORY_ID REVISION WORKTREE_ID [INVENTORY_JOB_ID]"
 }
 
 #[cfg(test)]

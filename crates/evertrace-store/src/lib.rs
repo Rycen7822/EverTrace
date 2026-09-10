@@ -35,13 +35,14 @@ pub use objects::{
 };
 pub use projections::{
     AttemptCurrentView, AutoresearchCurrentView, CompetingResolutionEvidenceView,
-    EpisodeCurrentView, NamedCurrentDependency, ObjectDeletionCandidateAdmissionView,
-    OperationBurstCurrentView, ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom,
-    RecallCurrentContext, ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
-    ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
-    ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
-    RuntimeSchedulerView, SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView,
-    WorkBindingCurrentView, WorkIdentityCurrentView, object_deletion_preview, reduce_journal,
+    EpisodeCurrentView, InventoryCurrentContext, NamedCurrentDependency,
+    ObjectDeletionCandidateAdmissionView, OperationBurstCurrentView, ProjectionSnapshot,
+    ProjectionWorker, RecallCurrentAtom, RecallCurrentContext, ReconciliationArtifactContext,
+    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
+    ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
+    RecoveryEvidenceCurrentView, RepositoryReadContext, RuntimeSchedulerView,
+    SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView,
+    WorkIdentityCurrentView, object_deletion_preview, reduce_journal,
     repository_scope_purge_preview,
 };
 pub use purge::{

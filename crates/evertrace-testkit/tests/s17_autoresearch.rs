@@ -605,6 +605,8 @@ fn topology(root: &std::path::Path) -> Topology {
         evidence_refs: vec!["path-observed".into()],
     };
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,
@@ -1396,6 +1398,8 @@ async fn supervised_patch_is_real_at_most_once_and_unsupported_is_zero_delta() {
         evidence_refs: vec!["s17-recovery-path".into()],
     };
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,

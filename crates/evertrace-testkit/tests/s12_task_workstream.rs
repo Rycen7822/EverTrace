@@ -118,6 +118,8 @@ fn workstream(task_id: TaskId, goal: &str, watermark: u64) -> Workstream {
 fn repository(id: RepositoryId, ordinal: u64) -> RepositoryInstance {
     let path = format!("/tmp/s12-repository-{ordinal}");
     RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id: id,
         repository_revision: 1,
         predecessor_revision: None,

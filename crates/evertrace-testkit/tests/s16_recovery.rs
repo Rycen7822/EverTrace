@@ -171,6 +171,8 @@ fn repository_seed_command(request: &RecoveryCaptureRequest, path: &Path) -> Jou
         evidence_refs: vec![evidence.into()],
     };
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id: request.repository_instance_id,
         repository_revision: 1,
         predecessor_revision: None,
@@ -1257,11 +1259,48 @@ async fn active_attempt_anchor_is_produced_only_from_a_real_single_path_patch_ca
     let mut impossible_identity = claim.clone();
     impossible_identity.source_file_identity.device = 0;
     assert!(impossible_identity.validate().is_err());
+    let adapter = root.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/09");
+    std::fs::create_dir_all(&dated).unwrap();
+    std::fs::set_permissions(&adapter, PermissionsExt::from_mode(0o700)).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000116";
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta",
+                "payload":{"id":session,"session_id":session,"cwd":target_root,
+                "originator":"codex_cli_rs","model_provider":"test","git":null}
+            })
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(worktree.to_str().unwrap()).unwrap(),
+            serde_json::to_string(target_root.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let report = std::sync::Arc::new(tokio::sync::RwLock::new(Some(
+        evertrace_engine::repository::observe_session_catalog_report(
+            transcript.to_str(),
+            session,
+            "tool",
+            None,
+        )
+        .unwrap(),
+    )));
     let action = evertrace_engine::RecoveryActionService::new(
         snapshot.clone(),
         handle.clone(),
         barrier.mutation_fence(),
-    );
+    )
+    .with_session_report(report.clone());
     let action_request = evertrace_engine::RecoveryRequest {
         request_id: evertrace_domain::ids::RequestId::new_v7(),
         recovery_bundle_id: bundle.recovery_bundle_id,
@@ -1585,7 +1624,8 @@ async fn active_attempt_anchor_is_produced_only_from_a_real_single_path_patch_ca
         snapshot,
         restart_handle.clone(),
         barrier.mutation_fence(),
-    );
+    )
+    .with_session_report(report);
     assert!(
         restart_action
             .supports_compatible_lineage_transfer(recovery_application_id)

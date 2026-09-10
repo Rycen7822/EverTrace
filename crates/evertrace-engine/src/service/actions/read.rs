@@ -1,6 +1,47 @@
 use super::*;
 
 impl McpActionService {
+    pub(super) async fn blocked_read_rows(
+        &self,
+        report: Option<&evertrace_codex::HostProbeReport>,
+        snapshot: &ProjectionSnapshot,
+        rows: &[&ObjectRow],
+        repository_context: Option<evertrace_domain::ids::RepositoryId>,
+    ) -> Result<BTreeSet<String>, McpServiceError> {
+        let mut blocked = crate::session_import::blocked_source_rows(
+            &self.writer,
+            report,
+            snapshot,
+            rows,
+            self.runtime_snapshot.effective_config_hash,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
+        let scopes = crate::repository::row_repository_contexts(snapshot, rows)
+            .map_err(|_| McpServiceError::Store)?;
+        let mut ids = scopes.values().flatten().copied().collect::<BTreeSet<_>>();
+        ids.extend(repository_context);
+        let repositories = crate::repository::blocked_repositories(
+            &self.writer,
+            ids,
+            report,
+            self.runtime_snapshot.effective_config_hash,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
+        if repository_context.is_some_and(|id| repositories.contains(&id)) {
+            blocked.extend(rows.iter().map(|row| row.row_id.clone()));
+            return Ok(blocked);
+        }
+        blocked.extend(
+            scopes
+                .into_iter()
+                .filter(|(_, ids)| !ids.is_disjoint(&repositories))
+                .map(|(row, _)| row.to_owned()),
+        );
+        Ok(blocked)
+    }
+
     pub(super) async fn search(
         &self,
         request_id: RequestId,
@@ -97,14 +138,19 @@ impl McpActionService {
             Some(report) => report.read().await.clone(),
             None => None,
         };
-        let blocked = crate::session_import::blocked_source_rows(
-            &self.writer,
-            report.as_ref(),
-            &scope.snapshot,
-            &selected,
-        )
-        .await
-        .map_err(|_| McpServiceError::Store)?;
+        let blocked = self
+            .blocked_read_rows(
+                scope
+                    .binding
+                    .repository_report
+                    .as_deref()
+                    .or(report.as_ref()),
+                &scope.snapshot,
+                &selected,
+                scope.anchor.repository_id,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?;
         let blocked_candidates = selected
             .iter()
             .filter(|row| blocked.contains(&row.row_id))
@@ -270,6 +316,23 @@ impl McpActionService {
                 &scope_label(&scope),
                 "unknown",
                 ["scope_unresolved"],
+            ));
+        }
+        let blocked = crate::repository::blocked_repositories(
+            &self.writer,
+            scope.anchor.repository_id.into_iter().collect(),
+            scope.binding.repository_report.as_deref(),
+            self.runtime_snapshot.effective_config_hash,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
+        if !blocked.is_empty() {
+            return Ok(empty_result(
+                request_id,
+                McpServiceStatus::NoMatch,
+                &scope_label(&scope),
+                "current",
+                ["repository_read_restricted"],
             ));
         }
         let now = unix_time_us_for_mcp();
@@ -500,15 +563,20 @@ impl McpActionService {
             Some(report) => report.read().await.clone(),
             None => None,
         };
-        if !crate::session_import::blocked_source_rows(
-            &self.writer,
-            report.as_ref(),
-            &scope.snapshot,
-            &[row],
-        )
-        .await
-        .map_err(|_| McpServiceError::Store)?
-        .is_empty()
+        if !self
+            .blocked_read_rows(
+                scope
+                    .binding
+                    .repository_report
+                    .as_deref()
+                    .or(report.as_ref()),
+                &scope.snapshot,
+                &[row],
+                scope.anchor.repository_id,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?
+            .is_empty()
         {
             return Ok(empty_result(
                 request_id,

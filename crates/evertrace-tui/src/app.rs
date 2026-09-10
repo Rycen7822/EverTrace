@@ -421,6 +421,23 @@ impl App {
     }
 
     pub fn dispatch(&mut self, command: UiCommand) -> UiCommand {
+        let command = if self.state.route == crate::Route::System {
+            use evertrace_protocol::dto::RepositoryAccessAction;
+            match command {
+                UiCommand::OpenSupportDeprecateEditor => {
+                    UiCommand::PrepareRepositoryAccess(RepositoryAccessAction::Disable)
+                }
+                UiCommand::OpenProposalEditor => {
+                    UiCommand::PrepareRepositoryAccess(RepositoryAccessAction::Enable)
+                }
+                UiCommand::PrepareProposal(
+                    evertrace_protocol::dto::ProposalHumanDecision::Reauthorize,
+                ) => UiCommand::PrepareRepositoryAccess(RepositoryAccessAction::Rescan),
+                _ => command,
+            }
+        } else {
+            command
+        };
         if self.state.future_operation_shell.is_some()
             && !matches!(
                 command,
@@ -655,6 +672,17 @@ impl App {
                 if self.state.repository_purge_confirmation.is_none() {
                     self.state.last_action =
                         Some(local_unavailable("repository_purge_unavailable"));
+                }
+            }
+            UiCommand::PrepareRepositoryAccess(action) => {
+                if self.state.write_queued {
+                    self.state.last_action = Some(local_transport_error());
+                    return command;
+                }
+                self.state.proposal_confirmation = repository_access_action(&self.state, action);
+                if self.state.proposal_confirmation.is_none() {
+                    self.state.last_action =
+                        Some(local_unavailable("select_repository_or_inventory_detail"));
                 }
             }
             UiCommand::PrepareCreateBackup => {
@@ -1917,6 +1945,66 @@ fn create_backup_action(
     ))
 }
 
+fn repository_access_action(
+    state: &AppState,
+    action: evertrace_protocol::dto::RepositoryAccessAction,
+) -> Option<(
+    u64,
+    evertrace_protocol::dto::HumanActionRequest,
+    Option<evertrace_protocol::dto::HumanProposalReview>,
+)> {
+    use evertrace_protocol::dto::{
+        HumanActionRequest, HumanGovernanceResponse, HumanSystemDetail, RepositoryAccessAction,
+    };
+    if state.route != crate::Route::System {
+        return None;
+    }
+    let HumanGovernanceResponse::Snapshot { frontier, .. } = state.human.as_ref()? else {
+        return None;
+    };
+    let detail = current_detail(state)
+        .or_else(|| selected_item(state))?
+        .system_detail
+        .as_ref()?;
+    let (repository_id, expected_repository_revision, worktree_id, inventory_ref) = match detail {
+        HumanSystemDetail::Repository {
+            repository_id,
+            repository_revision,
+            worktree_id,
+            ..
+        } => (*repository_id, *repository_revision, *worktree_id, None),
+        HumanSystemDetail::CapabilityInventory {
+            job_id,
+            repository_id,
+            repository_revision,
+            worktree_id,
+            ..
+        } => (
+            *repository_id,
+            *repository_revision,
+            Some(*worktree_id),
+            Some(*job_id),
+        ),
+        _ => return None,
+    };
+    let (worktree_id, inventory_ref) = if action == RepositoryAccessAction::Disable {
+        (None, None)
+    } else {
+        (Some(worktree_id?), inventory_ref)
+    };
+    Some((
+        *frontier,
+        HumanActionRequest::RepositoryAccess {
+            repository_id,
+            expected_repository_revision,
+            action,
+            worktree_id,
+            inventory_ref,
+        },
+        None,
+    ))
+}
+
 fn verify_backup_action(
     state: &AppState,
 ) -> Option<(
@@ -1982,6 +2070,15 @@ fn human_action_label(action: &evertrace_protocol::dto::HumanActionRequest) -> &
         HumanActionRequest::MarkNewAttempt { .. } => "mark new attempt",
         HumanActionRequest::ForgetObject { .. } => "forget object",
         HumanActionRequest::PurgeRepository { .. } => "purge repository",
+        HumanActionRequest::RepositoryAccess { action, .. } => match action {
+            evertrace_protocol::dto::RepositoryAccessAction::Disable => "disable repository",
+            evertrace_protocol::dto::RepositoryAccessAction::Enable => {
+                "verify and enable repository"
+            }
+            evertrace_protocol::dto::RepositoryAccessAction::Rescan => {
+                "rescan repository capabilities"
+            }
+        },
         HumanActionRequest::CreateBackup => "create quiesced backup",
         HumanActionRequest::CollectGarbage => {
             "collect orphan CAS (24 h grace) and prune versions older than 30 d"
@@ -2836,6 +2933,7 @@ mod tests {
             plain_accept_eligible: true,
             merge_and_accept_eligible: false,
             reauthorization: None,
+            capability_coverage: None,
         });
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
@@ -3158,6 +3256,7 @@ mod tests {
             plain_accept_eligible: false,
             merge_and_accept_eligible: true,
             reauthorization: None,
+            capability_coverage: None,
         });
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
             diagnostics: None,

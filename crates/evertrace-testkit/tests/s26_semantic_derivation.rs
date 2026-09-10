@@ -252,6 +252,8 @@ fn task_and_stream(
         evidence_refs: vec!["path:s26".into()],
     };
     let repository = RepositoryInstance {
+        user_disabled: false,
+        capability_state: None,
         repository_id,
         repository_revision: 1,
         predecessor_revision: None,
@@ -1430,7 +1432,44 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         response(serde_json::to_value(provider_application).unwrap()),
     )
     .await;
-    let planner = SynthesisPlanner::new(config(&stub.base_url));
+    // This is the existing legal Episode/provider fixture, not a native Work
+    // bootstrap. The real inventory resolver is attached with no observed Host:
+    // unknown coverage must preserve a manual proposal, never mint authority.
+    let runtime = evertrace_capture::RuntimeSnapshot {
+        snapshot_version: evertrace_capture::RUNTIME_SNAPSHOT_VERSION,
+        generation: 1,
+        device_key_dir: temp.path().join("keys"),
+        cas_dir: temp.path().join("cas"),
+        spool_dir: temp.path().join("spool"),
+        main_high_watermark_bytes: 2 * 1024 * 1024,
+        main_low_watermark_bytes: 64 * 1024,
+        max_main_files: 16,
+        emergency_slots: 2,
+        recovery_gate: evertrace_capture::RecoveryGateMode::Disabled,
+        recovery_socket_path: temp.path().join("runtime/evertraced-v1.sock"),
+        recovery_preflight_timeout_ms: 250,
+        effective_config_hash: CONFIG,
+        recovery_adapter_manifest_id: None,
+        recovery_classifier_revision: 1,
+        recovery_max_bundle_bytes: 4 << 20,
+        recovery_max_untracked_file_bytes: 1 << 20,
+        recovery_max_untracked_total_bytes: 2 << 20,
+        recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+        recall_cue_adapter_manifest_id: None,
+        recall_cues: vec![],
+    };
+    runtime.validate().unwrap();
+    let key = evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let bindings = evertrace_engine::McpBindingAuthority::new(key);
+    let (handle, actor) = evertrace_engine::spawn_writer(seed.writer, 8).unwrap();
+    let inventory = evertrace_engine::jobs::InventoryWorker::new(
+        handle.clone(),
+        runtime.clone(),
+        bindings.clone(),
+    );
+    let planner = SynthesisPlanner::new(config(&stub.base_url)).with_inventory(Some(inventory));
     let resolution = planner
         .execute(SynthesisRequest {
             snapshot: &seed.snapshot,
@@ -1475,6 +1514,33 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         panic!("one procedure proposal is required")
     };
     let draft = payload.draft();
+    let coverage = evertrace_engine::procedure::resolve_procedure_coverage(
+        &handle,
+        &bindings,
+        &runtime,
+        &seed.snapshot,
+        draft,
+        &direct_refs,
+    )
+    .await
+    .unwrap();
+    assert!(coverage.summary().inventory_refs.is_empty());
+    assert!(coverage.summary().omissions.contains(
+        &evertrace_domain::inventory::CapabilityCoverageOmission::NaturalExecutionUnobserved
+    ));
+    assert!(
+        coverage
+            .summary()
+            .omissions
+            .contains(&evertrace_domain::inventory::CapabilityCoverageOmission::InventoryMissing)
+    );
+    assert!(procedure_command.events().iter().any(|event| matches!(&event.payload,
+        JournalPayload::RevisionProposalRecorded(proposal) if proposal.eligibility == ProposalEligibility::ManualRequired && proposal.status == ProposalStatus::Pending)));
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+    seed.writer = JournalWriter::open(&temp.path().join("store"))
+        .await
+        .unwrap();
     assert_eq!(
         draft.scope,
         evertrace_domain::procedure::ProcedureScope::Worktree {

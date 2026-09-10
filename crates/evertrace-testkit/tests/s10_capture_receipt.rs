@@ -479,6 +479,7 @@ fn manifest() -> AdapterCapabilityManifest {
         trust_readback: TrustReadback::Unavailable,
         project_policy_surfaces: Vec::new(),
         session_catalog_root_contracts: Vec::new(),
+        capability_inventory_profile: None,
         admission_failure_observability: ManifestObservability::Complete,
         mcp_session_binding: McpSessionBinding::Unavailable,
         mcp_binding_mechanism: McpBindingMechanism::None,
