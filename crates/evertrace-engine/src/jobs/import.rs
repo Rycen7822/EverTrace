@@ -1106,6 +1106,7 @@ mod tests {
         use crate::session_import::{
             SessionCatalogService, SessionImportAdminAction, SessionImportAdminService,
         };
+        use evertrace_capture::CasStore;
         use std::{fs, os::unix::fs::PermissionsExt};
         let temp =
             std::env::temp_dir().join(format!("evertrace-import-work-{}", RequestId::new_v7()));
@@ -1124,7 +1125,7 @@ mod tests {
             "rollout-2026-08-30T00-00-00-{session}_{second}.jsonl"
         ));
         let header = serde_json::json!({"timestamp":"2026-08-30T00:00:00Z", "type":"session_meta", "payload":{"id":session,"session_id":session,"originator":"codex_cli_rs","model_provider":"openai","cwd":"/non-repository","git":null}});
-        let line = serde_json::json!({"type":"event_msg", "payload":{"type":"user_message","message":"read quantum"}});
+        let line = serde_json::json!({"type":"event_msg", "payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"UserMessage","id":"message","content":[{"type":"text","text":"read quantum"}]}}});
         let content = format!("{header}\n{}", format!("{line}\n").repeat(6));
         fs::write(&first, &content).unwrap();
         fs::write(&other, &content).unwrap();
@@ -1155,6 +1156,54 @@ mod tests {
         DeviceKeyStore::new(temp.join("keys"))
             .load_or_create()
             .unwrap();
+        // A prior importer has already made the first display record durable
+        // as Other, but has not ingested/ACKed it. Reopen must use that frame,
+        // not recapture the same identity with the new Message classification.
+        let current = writer
+            .session_import_context(&sources[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .current;
+        let header = header.to_string();
+        let line = line.to_string();
+        let old_end = (header.len() + line.len() + 2) as u64;
+        {
+            let mut capture = CaptureRuntime::open(test_runtime(&temp)).unwrap();
+            capture
+                .capture(capture_input(
+                    &current,
+                    header.as_bytes(),
+                    0,
+                    header.len() as u64 + 1,
+                    SourceRevisionMode::Append,
+                    None,
+                    classify_record(header.as_bytes()).unwrap(),
+                ))
+                .unwrap();
+            let mut old = capture_input(
+                &current,
+                line.as_bytes(),
+                header.len() as u64 + 1,
+                old_end,
+                SourceRevisionMode::Append,
+                None,
+                RecordVisibility {
+                    role: ObservationRole::Other,
+                    unsupported: Some(UnsupportedRecordClassification::UnknownRecordType),
+                    surface_eligible: false,
+                },
+            );
+            old.capture_completeness = evertrace_domain::evidence::CaptureCompleteness::Complete;
+            capture.capture(old).unwrap();
+            capture.seal_active().unwrap();
+        }
+        drop(admin);
+        writer.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+        let (writer, task) =
+            crate::spawn_writer(crate::open_writer(&temp.join("data")).await.unwrap(), 16).unwrap();
+        let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), [28; 32]);
         let mut worker =
             SessionImportWorker::new(writer.clone(), test_runtime(&temp), Arc::clone(&report))
                 .unwrap();
@@ -1191,6 +1240,32 @@ mod tests {
             }
             assert_eq!(prepared_records, 5);
         }
+        let snapshot = writer.project().await.unwrap();
+        let recovered = snapshot
+            .data_rows()
+            .find_map(|row| {
+                let JournalPayload::SourceReceiptRecorded(receipt) =
+                    serde_json::from_str(row.payload_json.as_deref()?).ok()?
+                else {
+                    return None;
+                };
+                (receipt.source_instance_id.as_str() == sources[0]
+                    && receipt.source_sequence == old_end)
+                    .then_some(receipt)
+            })
+            .unwrap();
+        assert_eq!(recovered.observation_role, ObservationRole::Other);
+        assert_eq!(
+            recovered.unsupported_record_classification,
+            Some(UnsupportedRecordClassification::UnknownRecordType)
+        );
+        assert_eq!(
+            CasStore::open(test_runtime(&temp).cas_dir)
+                .unwrap()
+                .read(&CasStore::parse_digest(&recovered.cas_ref).unwrap())
+                .unwrap(),
+            line.as_bytes()
+        );
         let worker =
             SessionImportWorker::new(writer.clone(), test_runtime(&temp), Arc::clone(&report))
                 .unwrap();
@@ -1459,6 +1534,92 @@ mod tests {
         record["ordinal"] = "1".into();
         assert!(super::classify_record(&serde_json::to_vec(&record).unwrap()).is_err());
     }
+
+    #[test]
+    fn response_metadata_is_closed_typed_and_never_a_message() {
+        let mut record = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}});
+        for metadata in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"client_authored":true,"fallback_token_limit_override":4096}),
+        ] {
+            record["metadata"] = metadata;
+            let visibility = classify_record(&serde_json::to_vec(&record).unwrap()).unwrap();
+            assert_eq!(visibility.role, ObservationRole::Other);
+            assert!(visibility.surface_eligible && visibility.unsupported.is_none());
+        }
+        for metadata in [
+            serde_json::json!({"client_authored":"true"}),
+            serde_json::json!({"fallback_token_limit_override":-1}),
+            serde_json::json!({"fallback_token_limit_override":"4096"}),
+            serde_json::json!({"unknown":true}),
+            serde_json::json!([]),
+        ] {
+            record["metadata"] = metadata;
+            assert!(classify_record(&serde_json::to_vec(&record).unwrap()).is_err());
+        }
+        record["metadata"] = serde_json::Value::Null;
+        record["unknown_outer"] = true.into();
+        assert!(classify_record(&serde_json::to_vec(&record).unwrap()).is_err());
+    }
+
+    #[test]
+    fn completed_display_messages_require_exact_text_variants() {
+        let mut record = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"019d0000-0000-7000-8000-000000000028","turn_id":"turn","item":null}});
+        for item in [
+            serde_json::json!({"type":"UserMessage","id":"u","client_id":"client","content":[{"type":"text","text":"text","text_elements":[{"byte_range":{"start":0,"end":4},"placeholder":null}]}]}),
+            serde_json::json!({"type":"AgentMessage","id":"a","phase":"commentary","content":[{"type":"Text","text":"text"}]}),
+            serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text"}],"memory_citation":null,"delivery":null,"questions":null}),
+            serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text"}],"memory_citation":{"entries":[{"path":"notes.md","lineStart":1,"lineEnd":2,"note":"source claim"}],"rolloutIds":["prior-rollout"]},"delivery":"async","questions":[{"title":"Choose","options":["one","two"]},{"title":"Explain","options":null},{"title":"Continue"}]}),
+        ] {
+            record["payload"]["item"] = item;
+            let visibility = classify_record(&serde_json::to_vec(&record).unwrap()).unwrap();
+            assert_eq!(visibility.role, ObservationRole::Message);
+            assert!(visibility.surface_eligible && visibility.unsupported.is_none());
+        }
+        for item in [
+            serde_json::json!({"type":"agent_message","id":"a","content":[{"type":"Text","text":"text"}]}),
+            serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"text","text":"text"}]}),
+            serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":7}]}),
+            serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text","encrypted_content":"opaque"}]}),
+            serde_json::json!({"type":"UserMessage","id":"u","content":[{"type":"text","text":"text"},{"type":"image","image_url":"data:image/png;base64,AA=="}]}),
+            serde_json::json!({"type":"UserMessage","id":"u","content":[{"type":"text","text":"text","text_elements":"invalid"}]}),
+            serde_json::json!({"type":"AgentMessage","id":"a","content":[]}),
+            serde_json::json!({"type":"Reasoning","id":"r","summary_text":[],"raw_content":["not visible"]}),
+            serde_json::json!({"type":"FunctionCallOutput","id":"f","name":"tool","output":"not a message"}),
+        ] {
+            record["payload"]["item"] = item;
+            let visibility = classify_record(&serde_json::to_vec(&record).unwrap()).unwrap();
+            assert_eq!(visibility.role, ObservationRole::Other);
+            assert!(!visibility.surface_eligible && visibility.unsupported.is_some());
+        }
+        for fields in [
+            serde_json::json!({"memory_citation":"opaque"}),
+            serde_json::json!({"memory_citation":{"entries":[{"path":"notes.md","lineStart":-1,"lineEnd":2,"note":"claim"}],"rolloutIds":[]}}),
+            serde_json::json!({"memory_citation":{"entries":[],"rolloutIds":[7]}}),
+            serde_json::json!({"memory_citation":{"entries":[],"rolloutIds":[],"authority":"accepted"}}),
+            serde_json::json!({"delivery":"Async"}),
+            serde_json::json!({"questions":true}),
+            serde_json::json!({"questions":[{"title":7}]}),
+            serde_json::json!({"questions":[{"title":"Choose","options":[7]}]}),
+            serde_json::json!({"questions":[{"title":"Choose","authority":"accepted"}]}),
+            serde_json::json!({"unknown_field":true}),
+        ] {
+            let mut item = serde_json::json!({"type":"AgentMessage","id":"a","content":[{"type":"Text","text":"text"}]});
+            item.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            record["payload"]["item"] = item;
+            let visibility = classify_record(&serde_json::to_vec(&record).unwrap()).unwrap();
+            assert_eq!(visibility.role, ObservationRole::Other, "{fields}");
+            assert!(!visibility.surface_eligible);
+            assert_eq!(
+                visibility.unsupported,
+                Some(UnsupportedRecordClassification::UnknownRecordType),
+                "{fields}"
+            );
+        }
+    }
 }
 
 fn extend_prefix_digest(
@@ -1508,12 +1669,180 @@ struct RecordKind {
     record_type: String,
     payload: serde_json::Value,
     timestamp: Option<String>,
+    metadata: Option<ResponseMetadata>,
+}
+
+// Fixed history wire at 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a:
+// history/src/{lib,rollout_payload}.rs. These fields are archive metadata only;
+// response items remain Other and cannot enter Message-only synthesis.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponseMetadata {
+    #[serde(default, rename = "client_authored")]
+    _client_authored: bool,
+    #[serde(rename = "fallback_token_limit_override")]
+    _fallback_token_limit_override: Option<usize>,
+}
+
+// The supported display-message subset of protocol/src/{protocol,items,user_input}.rs
+// at the same fixed source. Unknown/complex content remains an archived Other;
+// no raw ResponseItem or other TurnItem becomes a message by resemblance.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedMessageEvent {
+    #[serde(rename = "type")]
+    _event_type: String,
+    #[serde(rename = "thread_id")]
+    _thread_id: String,
+    #[serde(rename = "turn_id")]
+    _turn_id: String,
+    item: CompletedMessage,
+    #[serde(rename = "started_at_ms")]
+    _started_at_ms: Option<i64>,
+    #[serde(default, rename = "completed_at_ms")]
+    _completed_at_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum CompletedMessage {
+    UserMessage {
+        #[serde(rename = "id")]
+        _id: String,
+        #[serde(rename = "client_id")]
+        _client_id: Option<String>,
+        content: Vec<UserText>,
+    },
+    AgentMessage {
+        #[serde(rename = "id")]
+        _id: String,
+        content: Vec<AgentText>,
+        #[serde(rename = "phase")]
+        _phase: Option<MessagePhase>,
+        #[serde(rename = "memory_citation")]
+        _memory_citation: Option<MessageCitation>,
+        #[serde(rename = "delivery")]
+        _delivery: Option<MessageDelivery>,
+        #[serde(rename = "questions")]
+        _questions: Option<Vec<MessageQuestion>>,
+    },
+}
+
+// Optional display fields are source content, never authority or adoption proof.
+// Shapes follow the same fixed protocol/src/{items,memory_citation}.rs wire.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageCitation {
+    #[serde(rename = "entries")]
+    _entries: Vec<MessageCitationEntry>,
+    #[serde(rename = "rolloutIds")]
+    _rollout_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageCitationEntry {
+    #[serde(rename = "path")]
+    _path: String,
+    #[serde(rename = "lineStart")]
+    _line_start: u32,
+    #[serde(rename = "lineEnd")]
+    _line_end: u32,
+    #[serde(rename = "note")]
+    _note: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MessageDelivery {
+    Async,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageQuestion {
+    #[serde(rename = "title")]
+    _title: String,
+    #[serde(rename = "options")]
+    _options: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum UserText {
+    Text {
+        text: String,
+        #[serde(default, rename = "text_elements")]
+        _text_elements: Vec<TextElement>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextElement {
+    #[serde(rename = "byte_range")]
+    _byte_range: TextByteRange,
+    #[serde(rename = "placeholder")]
+    _placeholder: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextByteRange {
+    #[serde(rename = "start")]
+    _start: usize,
+    #[serde(rename = "end")]
+    _end: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum AgentText {
+    Text { text: String },
+}
+
+fn completed_message_visibility(payload: &serde_json::Value) -> RecordVisibility {
+    let message = CompletedMessageEvent::deserialize(payload)
+        .ok()
+        .is_some_and(|event| match event.item {
+            CompletedMessage::UserMessage { content, .. } => content
+                .iter()
+                .any(|UserText::Text { text, .. }| !text.trim().is_empty()),
+            CompletedMessage::AgentMessage { content, .. } => content
+                .iter()
+                .any(|AgentText::Text { text }| !text.trim().is_empty()),
+        });
+    RecordVisibility {
+        role: if message {
+            ObservationRole::Message
+        } else {
+            ObservationRole::Other
+        },
+        unsupported: (!message).then_some(
+            if payload["item"]["type"].as_str() == Some("Reasoning") {
+                UnsupportedRecordClassification::Reasoning
+            } else {
+                UnsupportedRecordClassification::UnknownRecordType
+            },
+        ),
+        surface_eligible: message,
+    }
 }
 
 fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError> {
     let record: RecordKind =
         serde_json::from_slice(bytes).map_err(|_| SessionImportError::Unsupported)?;
     let _ = &record.timestamp;
+    if record.metadata.is_some() && record.record_type != "response_item" {
+        return Err(SessionImportError::Unsupported);
+    }
     Ok(match record.record_type.as_str() {
         "session_meta" | "turn_context" => RecordVisibility {
             role: ObservationRole::StateProbe,
@@ -1531,6 +1860,9 @@ fn classify_record(bytes: &[u8]) -> Result<RecordVisibility, SessionImportError>
                 unsupported: None,
                 surface_eligible: true,
             }
+        }
+        "event_msg" if record.payload["type"].as_str() == Some("item_completed") => {
+            completed_message_visibility(&record.payload)
         }
         "event_msg" => RecordVisibility {
             role: ObservationRole::Other,

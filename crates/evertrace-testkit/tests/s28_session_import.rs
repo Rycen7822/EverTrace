@@ -170,8 +170,16 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
     let source = format!("session-rollout:{session}:{session}");
     let transcript = dated.join(format!("rollout-2026-09-10T00-00-00-{session}.jsonl"));
     let header = serde_json::json!({"timestamp":timestamp,"type":"session_meta","payload":{"id":session,"session_id":session,"cwd":workspace,"git":{"commit_hash":head}}});
-    let message = serde_json::json!({"timestamp":"2026-09-10T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":format!("marigold descriptive source memory {}", "bounded context ".repeat(300))}});
-    fs::write(&transcript, format!("{header}\n{message}\n")).unwrap();
+    // Fixed source 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a:
+    // rollout/src/policy.rs persists ItemCompleted for Paginated history;
+    // history/src/rollout_payload.rs retains the separate raw response envelope.
+    let message_text = format!(
+        "marigold descriptive source memory {}",
+        "bounded context ".repeat(300)
+    );
+    let raw_message = serde_json::json!({"type":"response_item","metadata":{"client_authored":false,"fallback_token_limit_override":8192},"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":message_text}]}});
+    let message = serde_json::json!({"timestamp":"2026-09-10T00:00:01Z","type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":message_text,"text_elements":[]}]},"completed_at_ms":1788998401000i64}});
+    fs::write(&transcript, format!("{header}\n{raw_message}\n{message}\n")).unwrap();
     let report_value =
         observe_session_catalog_report(transcript.to_str(), session, "source-summary", None)
             .unwrap();
@@ -264,8 +272,26 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
             break;
         }
     }
-    assert_eq!(imported, 2);
+    assert_eq!(imported, 3);
     let snapshot = writer.project().await.unwrap();
+    {
+        let cas = evertrace_capture::CasStore::open_existing(temp.path().join("cas")).unwrap();
+        assert!(snapshot.data_rows().any(|row| {
+            let Some(json) = row.payload_json.as_deref() else {
+                return false;
+            };
+            let Ok(JournalPayload::SourceReceiptRecorded(receipt)) = serde_json::from_str(json)
+            else {
+                return false;
+            };
+            receipt.observation_role == ObservationRole::Other
+                && receipt.unsupported_record_classification.is_none()
+                && cas
+                    .read(&evertrace_capture::CasStore::parse_digest(&receipt.cas_ref).unwrap())
+                    .unwrap()
+                    == raw_message.to_string().as_bytes()
+        }));
+    }
     let receipt = snapshot
         .data_rows()
         .filter_map(|row| {
@@ -411,6 +437,12 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
         serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert!(input.get("episode_id").is_none() && input.get("stage_trace").is_none());
     assert_eq!(
+        input["source_refs"],
+        serde_json::json!([receipt.source_observation_id.to_string()])
+    );
+    assert!(!input.to_string().contains("client_authored"));
+    assert!(!input.to_string().contains("fallback_token_limit_override"));
+    assert_eq!(
         input["source_target"]["source_revision"],
         receipt.source_revision.as_str()
     );
@@ -507,8 +539,9 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
     // Normal append keeps the logical revision and advances only the new
     // imported message interval. Disabling the LLM does not hide old memory.
     let body = fs::read_to_string(&transcript).unwrap();
-    let delta = serde_json::json!({"type":"event_msg","payload":{"type":"agent_message","message":"marigold appended claim"}});
-    fs::write(&transcript, format!("{body}{delta}\n")).unwrap();
+    let raw_delta = serde_json::json!({"type":"response_item","metadata":{},"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"marigold appended claim"}],"phase":"final_answer"}});
+    let delta = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"AgentMessage","id":"agent-1","content":[{"type":"Text","text":"marigold appended claim"}],"phase":"final_answer","memory_citation":{"entries":[{"path":"notes.md","lineStart":1,"lineEnd":2,"note":"source claim"}],"rolloutIds":["prior-rollout"]},"delivery":"async","questions":[{"title":"Continue?","options":["yes","no"]}]},"started_at_ms":1788998401000i64,"completed_at_ms":1788998402000i64}});
+    fs::write(&transcript, format!("{body}{raw_delta}\n{delta}\n")).unwrap();
     catalog.refresh(&report_value).await.unwrap();
     let mut imported_delta = 0;
     for _ in 0..3 {
@@ -528,7 +561,7 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
             break;
         }
     }
-    assert_eq!(imported_delta, 1);
+    assert_eq!(imported_delta, 2);
     let appended = writer.project().await.unwrap();
     let second = appended
         .data_rows()
@@ -612,8 +645,27 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
     // Append while the provider owns a frozen interval; this non-message is
     // not another LLM trigger and does not invalidate archived input.
     let body = fs::read_to_string(&transcript).unwrap();
-    let tool = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":null}});
-    fs::write(&transcript, format!("{body}{tool}\n")).unwrap();
+    let non_messages = [
+        serde_json::json!({"type":"response_item","metadata":null,"payload":{"type":"function_call","name":"example","arguments":"{}","call_id":"call-1"}}),
+        serde_json::json!({"type":"response_item","metadata":{"client_authored":false},"payload":{"type":"function_call_output","call_id":"call-1","output":"archived tool output"}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"opaque"}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"agent_message","author":"agent-a","recipient":"agent-b","content":[{"type":"input_text","text":"separate cross-agent representation"}]}}),
+        serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"Reasoning","id":"reasoning-1","summary_text":[],"raw_content":["not visible reasoning"]},"completed_at_ms":1788998403000i64}}),
+        serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"Plan","id":"plan-1","text":"not a message trigger"},"completed_at_ms":1788998403000i64}}),
+        serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"UserMessage","id":"image-1","content":[{"type":"image","image_url":"data:image/png;base64,AA=="}]},"completed_at_ms":1788998403000i64}}),
+    ];
+    fs::write(
+        &transcript,
+        format!(
+            "{body}{}\n",
+            non_messages
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .unwrap();
     catalog.refresh(&report_value).await.unwrap();
     for _ in 0..3 {
         if worker
@@ -631,6 +683,29 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
         {
             break;
         }
+    }
+    {
+        let snapshot = writer.project().await.unwrap();
+        let cas = evertrace_capture::CasStore::open_existing(temp.path().join("cas")).unwrap();
+        let archived = snapshot
+            .data_rows()
+            .filter_map(|row| {
+                let JournalPayload::SourceReceiptRecorded(receipt) =
+                    serde_json::from_str(row.payload_json.as_deref()?).ok()?
+                else {
+                    return None;
+                };
+                (receipt.observation_role == ObservationRole::Other).then(|| {
+                    cas.read(&evertrace_capture::CasStore::parse_digest(&receipt.cas_ref).unwrap())
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            non_messages
+                .iter()
+                .all(|record| archived.contains(&record.to_string().into_bytes()))
+        );
     }
     release.send(()).unwrap();
     running.await.unwrap().unwrap();
