@@ -1,5 +1,8 @@
 //! Single bounded owner for durable background work.
 
+mod capture_recovery;
+use capture_recovery::CAPTURE_ARTIFACT_JOB_KIND;
+
 /// Offline installation keeps runtime interpretation in Engine/Capture. The
 /// adapter never manufactures snapshot JSON or alters a pinned runtime.
 pub fn install_offline(
@@ -1156,6 +1159,7 @@ fn job_target_is_current(
         return Ok(false);
     }
     Ok(match job.kind.as_str() {
+        CAPTURE_ARTIFACT_JOB_KIND => capture_recovery::job_is_current(job, config_hash),
         evertrace_store::optimize::GC_ALGORITHM_REVISION => {
             job.target_revision == job.job_id.to_string()
                 && job.algorithm_revision == evertrace_store::optimize::GC_ALGORITHM_REVISION
@@ -1372,6 +1376,8 @@ pub struct BackgroundScheduler {
     synthesis: SynthesisPlanner,
     dreaming: DreamingConfig,
     capture_cursor: Arc<AtomicUsize>,
+    artifact_scan: Arc<tokio::sync::Mutex<(tokio::time::Instant, u64, bool)>>,
+    dispatch: Option<Arc<RwLock<()>>>,
     repository_purge_plans: Arc<std::sync::Mutex<BTreeMap<JobId, Vec<String>>>>,
     backup_requests: Option<mpsc::Sender<QuiescedBackupRequest>>,
     gc_rounds: Arc<tokio::sync::Mutex<BTreeMap<JobId, evertrace_store::optimize::GcRound>>>,
@@ -1401,6 +1407,12 @@ impl BackgroundScheduler {
             synthesis,
             dreaming,
             capture_cursor: Arc::new(AtomicUsize::new(0)),
+            artifact_scan: Arc::new(tokio::sync::Mutex::new((
+                tokio::time::Instant::now(),
+                0,
+                false,
+            ))),
+            dispatch: None,
             repository_purge_plans: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             backup_requests: None,
             gc_rounds: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -1415,6 +1427,11 @@ impl BackgroundScheduler {
     pub fn with_inventory(mut self, inventory: crate::jobs::InventoryWorker) -> Self {
         self.synthesis = self.synthesis.with_inventory(Some(inventory.clone()));
         self.inventory = Some(inventory);
+        self
+    }
+
+    pub fn with_dispatch(mut self, dispatch: Arc<RwLock<()>>) -> Self {
+        self.dispatch = Some(dispatch);
         self
     }
 
@@ -1463,7 +1480,7 @@ impl BackgroundScheduler {
     }
 
     async fn run_once_inner(&self) -> Result<BackgroundProgress, BackgroundSchedulerError> {
-        let capture_state = self
+        let (capture_state, ordinary_pending) = self
             .runtime
             .spool_limits()
             .ok()
@@ -1479,7 +1496,7 @@ impl BackgroundScheduler {
                     .transpose()
                     .ok()?
                     .is_some();
-                Some(
+                Some((
                     if spool.below_low_watermark().ok()?
                         && spool.pending_gap_markers().ok()?.is_empty()
                         && !quarantine
@@ -1488,10 +1505,11 @@ impl BackgroundScheduler {
                     } else {
                         CaptureAdmissionState::Recovering
                     },
-                )
+                    spool.has_ordinary_backlog().ok()?,
+                ))
             })
-            .unwrap_or(CaptureAdmissionState::Unavailable);
-        let optional_allowed = capture_state == CaptureAdmissionState::Normal;
+            .unwrap_or((CaptureAdmissionState::Unavailable, true));
+        let optional_allowed = capture_state == CaptureAdmissionState::Normal && !ordinary_pending;
         let mut completed = 0;
         completed += self.run_gc_round().await?;
         let mut retryable = false;
@@ -1575,6 +1593,11 @@ impl BackgroundScheduler {
 
         let mut view = RuntimeSchedulerView::from_snapshot(&snapshot)
             .map_err(|_| BackgroundSchedulerError::Store)?;
+        if self.seed_capture_artifacts(&snapshot, &view).await? {
+            snapshot = self.writer.project().await.map_err(map_writer)?;
+            view = RuntimeSchedulerView::from_snapshot(&snapshot)
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+        }
         let max_synthesis_wall_time = Duration::from_secs(self.dreaming.max_wall_time.seconds());
         let synthesis_budget = self
             .synthesis
@@ -2100,6 +2123,7 @@ impl BackgroundScheduler {
             &snapshot,
             &view,
             capture_state,
+            ordinary_pending,
             &self.dreaming,
             selection_time,
         )?;
@@ -2129,6 +2153,11 @@ impl BackgroundScheduler {
                     }
                     "capture_reconciliation" => {
                         let progress = self.run_capture_reconciliation(claimed).await?;
+                        completed += progress.completed;
+                        retryable |= progress.retryable;
+                    }
+                    CAPTURE_ARTIFACT_JOB_KIND => {
+                        let progress = self.run_capture_artifact(claimed).await?;
                         completed += progress.completed;
                         retryable |= progress.retryable;
                     }
@@ -2813,6 +2842,15 @@ impl BackgroundScheduler {
             self.dreaming.clone()
         };
         let mut delay = Duration::from_secs(dreaming.integrity_sweep_interval.seconds());
+        {
+            let scan = self.artifact_scan.lock().await;
+            if scan.2 {
+                delay = delay.min(
+                    scan.0
+                        .saturating_duration_since(tokio::time::Instant::now()),
+                );
+            }
+        }
         let mut idle = SynthesisIdle::default();
         idle.refresh(&snapshot)?;
         if let Some(idle_delay) = idle
@@ -3062,7 +3100,8 @@ impl BackgroundScheduler {
                     | ReconcileError::Manifest
                     | ReconcileError::Domain
                     | ReconcileError::Commit
-                    | ReconcileError::Acknowledgement,
+                    | ReconcileError::Acknowledgement
+                    | ReconcileError::Busy,
                 ) => (
                     JobTerminalOutcome::Failed,
                     JobTerminalReason::IntegrityFailure,
@@ -3651,6 +3690,7 @@ fn executable_job(job: &DurableJob) -> bool {
             | "objects_projection"
             | "physical_normalization"
             | "capture_reconciliation"
+            | CAPTURE_ARTIFACT_JOB_KIND
             | "session_import_v1"
             | "capability_inventory_v1"
             | "semantic_synthesis_v1"
@@ -3663,7 +3703,9 @@ fn executable_job(job: &DurableJob) -> bool {
 
 fn job_lane(job: &DurableJob) -> BackgroundLane {
     match job.kind.as_str() {
-        "support_closure" | "capture_reconciliation" => BackgroundLane::Critical,
+        "support_closure" | "capture_reconciliation" | CAPTURE_ARTIFACT_JOB_KIND => {
+            BackgroundLane::Critical
+        }
         "objects_projection" | "physical_normalization" | PROCEDURE_PROMOTION_JOB_KIND => {
             BackgroundLane::Deterministic
         }
@@ -4052,12 +4094,27 @@ impl SynthesisIdle {
         snapshot: &evertrace_store::ProjectionSnapshot,
         view: &RuntimeSchedulerView,
         capture: CaptureAdmissionState,
+        ordinary_pending: bool,
         config: &evertrace_domain::config::DreamingConfig,
         now: i64,
     ) -> Result<Vec<ScheduledJob>, BackgroundSchedulerError> {
         let mut selectable = view.clone();
         selectable.jobs.clear();
         for job in &view.jobs {
+            // Requested backups validate pending frames at their own exclusive
+            // boundary and retain the original admission gate. Other optional
+            // work waits for ingress; filter before consuming any lane slots.
+            if ordinary_pending
+                && job_lane(job) != BackgroundLane::Critical
+                && !matches!(
+                    job.kind.as_str(),
+                    "objects_projection"
+                        | QUIESCED_BACKUP_CREATE_JOB_KIND
+                        | QUIESCED_BACKUP_VERIFY_JOB_KIND
+                )
+            {
+                continue;
+            }
             let target_present = self.episodes.values().any(|episode| {
                 episode.revision_id.to_string() == job.target_revision
                     && episode.revision_generation == job.target_generation
@@ -4207,6 +4264,7 @@ mod idle_tests {
                 },
                 &view,
                 CaptureAdmissionState::Normal,
+                false,
                 &config,
                 now
             )
@@ -4228,6 +4286,7 @@ mod idle_tests {
                 },
                 &stale_view,
                 CaptureAdmissionState::Normal,
+                false,
                 &config,
                 now,
             )

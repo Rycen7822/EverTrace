@@ -1023,6 +1023,262 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
 }
 
 #[tokio::test]
+async fn scheduler_reconciles_owned_artifact_and_replays_retained_carrier_without_new_semantics() {
+    use evertrace_capture::{CaptureGapMarker, DurableSpool, GapReason};
+
+    // Compress only runtime retry history through the existing writer seam.
+    // Capture evidence, the real lock and the scheduler execution stay real.
+    async fn make_retry_due(handle: &WriterHandle, failed: &DurableJob, attempt: u32) {
+        let occurred_at_us = failed.backoff_until_us.unwrap();
+        let mut queued = failed.clone();
+        queued.state = JobStatus::Queued;
+        queued.attempt = attempt - 1;
+        queued.backoff_until_us = None;
+        queued.terminal = None;
+        let mut expired = failed.clone();
+        expired.attempt = attempt;
+        expired.backoff_until_us = Some(1);
+        let payloads = [
+            JournalPayload::JobState(queued),
+            JournalPayload::JobLease(JobLease {
+                job_id: failed.job_id,
+                target_generation: failed.target_generation,
+                attempt,
+                lease_until_us: occurred_at_us + 250_000,
+            }),
+            JournalPayload::JobState(expired),
+        ];
+        handle
+            .commit(
+                JournalCommand::new(
+                    CommandId::new_v7(),
+                    payloads
+                        .into_iter()
+                        .map(|payload| {
+                            JournalEventDraft::runtime(
+                                occurred_at_us,
+                                failed.config_hash,
+                                failed.algorithm_revision.clone(),
+                                payload,
+                            )
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+                occurred_at_us,
+            )
+            .await
+            .unwrap();
+    }
+
+    let temp = TempDir::new().unwrap();
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let runtime = runtime(temp.path());
+    let report = synthetic_report();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    capture.capture(capture_input(&report)).unwrap();
+    capture.seal_active().unwrap();
+    let store = temp.path().join("store");
+    let (handle, writer_task) = spawn_writer(open_writer(&store).await.unwrap(), 16).unwrap();
+    let ingestor =
+        EvidenceIngestor::new(runtime.clone(), handle.clone(), CONFIG, "s29-ingest").unwrap();
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 1);
+    let marker = CaptureGapMarker {
+        marker_id: "gap:scheduler-artifact".into(),
+        source_ref: "source:s29-capture".into(),
+        session_ref: "session-s29".into(),
+        turn_ref: None,
+        tool_ref: None,
+        failure_reason: GapReason::MainUnavailable,
+        redacted_fingerprint: "ab".repeat(32),
+        attempted_bytes: 7,
+        last_durable_watermark: 1,
+    };
+    let spool =
+        DurableSpool::open_read_only(runtime.spool_dir.clone(), runtime.spool_limits().unwrap())
+            .unwrap();
+    spool.write_gap_marker(&marker).unwrap();
+    spool.write_gap_marker(&marker).unwrap();
+    let reports = Arc::new(RwLock::new(Some(report.clone())));
+    let scheduler = make_scheduler(handle.clone(), runtime.clone(), Arc::clone(&reports));
+    let emergency_lock = std::fs::File::open(runtime.spool_dir.join("emergency")).unwrap();
+    emergency_lock.lock_shared().unwrap();
+    scheduler.run_once().await.unwrap();
+    assert_eq!(
+        spool.pending_gap_markers().unwrap(),
+        vec![marker.clone(), marker.clone()]
+    );
+    let first = handle.project().await.unwrap();
+    let sources = first
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+        .map(|row| row.payload_json.clone())
+        .collect::<Vec<_>>();
+    let gaps = first
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("capture_gap_marker"))
+        .map(|row| row.payload_json.clone())
+        .collect::<Vec<_>>();
+    let receipts = first
+        .data_rows()
+        .filter(|row| row.object_kind.as_deref() == Some("capture_receipt"))
+        .map(|row| row.payload_json.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(gaps.len(), 1);
+    assert!(!receipts.is_empty());
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt.as_ref().unwrap().contains("gap:scheduler-artifact"))
+    );
+    assert!(!spool.below_low_watermark().unwrap());
+    let artifact = RuntimeSchedulerView::from_snapshot(&first)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.kind == "capture_artifact_reconciliation_v1")
+        .unwrap();
+    assert_eq!(artifact.state, JobStatus::Failed);
+    assert!(artifact.backoff_until_us.is_some());
+    scheduler.run_once().await.unwrap();
+    assert_eq!(handle.project().await.unwrap().frontier, first.frontier);
+    drop(ingestor);
+    drop(scheduler);
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+    let (handle, writer_task) = spawn_writer(open_writer(&store).await.unwrap(), 16).unwrap();
+    let scheduler = make_scheduler(handle.clone(), runtime.clone(), Arc::clone(&reports));
+    scheduler.run_once().await.unwrap();
+    assert_eq!(
+        spool.pending_gap_markers().unwrap().len(),
+        2,
+        "reopen does not waive backoff"
+    );
+    drop(scheduler);
+    make_retry_due(&handle, &artifact, 6).await;
+    let scheduler = make_scheduler(handle.clone(), runtime.clone(), Arc::clone(&reports));
+    scheduler.run_once().await.unwrap();
+    let busy = handle.project().await.unwrap();
+    let retried = RuntimeSchedulerView::from_snapshot(&busy)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.job_id == artifact.job_id)
+        .unwrap();
+    assert_eq!((retried.state, retried.attempt), (JobStatus::Failed, 8));
+    assert_eq!(
+        retried.terminal.as_ref().unwrap().reason,
+        JobTerminalReason::SourceUnavailable
+    );
+    assert!(retried.backoff_until_us.unwrap() > artifact.backoff_until_us.unwrap());
+    assert_eq!(spool.pending_gap_markers().unwrap().len(), 2);
+    scheduler.run_once().await.unwrap();
+    assert_eq!(handle.project().await.unwrap().frontier, busy.frontier);
+    make_retry_due(&handle, &retried, 10).await;
+    drop(emergency_lock);
+    drop(scheduler);
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+    let (handle, writer_task) = spawn_writer(open_writer(&store).await.unwrap(), 16).unwrap();
+    let scheduler = make_scheduler(handle.clone(), runtime.clone(), Arc::clone(&reports));
+    scheduler.run_once().await.unwrap();
+    assert!(spool.pending_gap_markers().unwrap().is_empty());
+    let resumed = handle.project().await.unwrap();
+    for (kind, expected) in [("source_receipt", &sources), ("capture_gap_marker", &gaps)] {
+        assert_eq!(
+            &resumed
+                .data_rows()
+                .filter(|row| row.object_kind.as_deref() == Some(kind))
+                .map(|row| row.payload_json.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    assert_eq!(
+        resumed
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("capture_receipt"))
+            .map(|row| row.payload_json.clone())
+            .collect::<Vec<_>>(),
+        receipts
+    );
+    let resumed_jobs = RuntimeSchedulerView::from_snapshot(&resumed)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .filter(|job| job.kind == "capture_artifact_reconciliation_v1")
+        .collect::<Vec<_>>();
+    assert_eq!(resumed_jobs.len(), 1);
+    let resumed_job = &resumed_jobs[0];
+    assert_eq!(resumed_job.job_id, artifact.job_id);
+    assert_eq!(resumed_job.config_hash, artifact.config_hash);
+    assert_eq!(resumed_job.target_watermark, artifact.target_watermark);
+    assert_eq!(
+        (resumed_job.state, resumed_job.attempt),
+        (JobStatus::Succeeded, 12)
+    );
+    assert!(spool.below_low_watermark().unwrap());
+    let ingestor =
+        EvidenceIngestor::new(runtime.clone(), handle.clone(), CONFIG, "s29-ingest").unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let dispatch = Arc::new(RwLock::new(()));
+    let ingest_task = tokio::spawn(ingestor.run(Arc::clone(&dispatch), stop_rx));
+    let mut next = capture_input(&report);
+    next.spool_record_id = Some("s29-capture-next".into());
+    next.source_record_identity = Some("record-2".into());
+    next.source_sequence = 2;
+    capture.capture(next).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if handle
+                .project()
+                .await
+                .unwrap()
+                .data_rows()
+                .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+                .count()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Dispatch can quiesce without waiting for a continuously appended backlog.
+    let guard = dispatch.write().await;
+    stop_tx.send(true).unwrap();
+    drop(guard);
+    ingest_task.await.unwrap().unwrap();
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+    drop(scheduler);
+
+    // The same durable carrier surviving an ACK boundary is replayed against
+    // committed Gap/Receipt facts; reopening must not duplicate either fact.
+    spool.write_gap_marker(&marker).unwrap();
+    let (handle, writer_task) = spawn_writer(open_writer(&store).await.unwrap(), 16).unwrap();
+    let scheduler = make_scheduler(handle.clone(), runtime, reports);
+    scheduler.run_once().await.unwrap();
+    assert!(spool.pending_gap_markers().unwrap().is_empty());
+    let after = handle.project().await.unwrap();
+    assert_eq!(
+        after
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("capture_gap_marker"))
+            .map(|row| row.payload_json.clone())
+            .collect::<Vec<_>>(),
+        gaps
+    );
+    scheduler.run_once().await.unwrap();
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() {
     let temp = TempDir::new().unwrap();
     DeviceKeyStore::new(temp.path().join("keys"))

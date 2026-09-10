@@ -464,13 +464,15 @@ pub enum ReconcileError {
     StaleFrontier,
     #[error("capture reconciliation acknowledgement failed")]
     Acknowledgement,
+    #[error("capture artifact acknowledgement is busy; carrier retained")]
+    Busy,
 }
 
 pub async fn reconcile_once(
     input: ReconcileInput,
     writer: &WriterHandle,
 ) -> Result<ReconcileProgress, ReconcileError> {
-    reconcile_selected(input, writer, None).await
+    reconcile_selected(input, writer, None, None).await
 }
 
 pub async fn reconcile_observations_once(
@@ -489,13 +491,140 @@ pub async fn reconcile_observations_once(
     {
         return Err(ReconcileError::InvalidInput);
     }
-    reconcile_selected(input, writer, Some(observation_ids)).await
+    reconcile_selected(input, writer, Some(observation_ids), None).await
+}
+
+pub(crate) fn pending_capture_artifacts(
+    runtime: &RuntimeSnapshot,
+    start: u64,
+) -> Result<Vec<ReconciliationArtifactDescriptor>, ReconcileError> {
+    let spool = DurableSpool::open_read_only(
+        runtime.spool_dir.clone(),
+        runtime
+            .spool_limits()
+            .map_err(|_| ReconcileError::InvalidInput)?,
+    )
+    .map_err(|_| ReconcileError::Spool)?;
+    filesystem_artifact_descriptors(
+        &spool
+            .pending_gap_marker_handles(runtime.emergency_slots as usize)
+            .map_err(|_| ReconcileError::Spool)?,
+        &spool
+            .pending_quarantine_from(1, start)
+            .map_err(|_| ReconcileError::Spool)?,
+    )
+}
+
+pub(crate) async fn reconcile_artifact_once(
+    input: ReconcileInput,
+    writer: &WriterHandle,
+    artifact: &ReconciliationArtifactDescriptor,
+) -> Result<ReconcileProgress, ReconcileError> {
+    reconcile_selected(input, writer, None, Some(artifact)).await
+}
+
+pub(crate) fn capture_artifact_descriptor(
+    runtime: &RuntimeSnapshot,
+    target: &str,
+) -> Result<Option<ReconciliationArtifactDescriptor>, ReconcileError> {
+    let spool = DurableSpool::open_read_only(
+        runtime.spool_dir.clone(),
+        runtime
+            .spool_limits()
+            .map_err(|_| ReconcileError::InvalidInput)?,
+    )
+    .map_err(|_| ReconcileError::Spool)?;
+    let markers = spool
+        .pending_gap_marker_handles(runtime.emergency_slots as usize)
+        .map_err(|_| ReconcileError::Spool)?;
+    let quarantines = if target.starts_with("marker:") {
+        Vec::new()
+    } else {
+        quarantine_for_target(&spool, target)?
+    };
+    Ok(filesystem_artifact_descriptors(&markers, &quarantines)?
+        .into_iter()
+        .find(|descriptor| capture_artifact_target(descriptor).as_deref() == Some(target)))
+}
+
+pub(crate) fn capture_artifact_target(
+    descriptor: &ReconciliationArtifactDescriptor,
+) -> Option<String> {
+    match descriptor.kind {
+        ReconciliationArtifactKind::GapMarker => descriptor
+            .marker_id
+            .as_ref()
+            .map(|id| format!("marker:{id}")),
+        ReconciliationArtifactKind::Quarantine => Some(descriptor.artifact_id.clone()),
+        ReconciliationArtifactKind::Outage => None,
+    }
+}
+
+pub(crate) async fn absent_capture_artifact_was_propagated(
+    writer: &WriterHandle,
+    target: &str,
+) -> Result<bool, ReconcileError> {
+    let (kind, marker_id) = if let Some(id) = target.strip_prefix("marker:") {
+        (ReconciliationArtifactKind::GapMarker, id)
+    } else if target.starts_with("quarantine:") {
+        (ReconciliationArtifactKind::Quarantine, target)
+    } else {
+        return Err(ReconcileError::InvalidInput);
+    };
+    let context = writer
+        .reconciliation_artifact_context(
+            vec![ReconciliationArtifactDescriptor {
+                kind,
+                artifact_id: target.into(),
+                marker_id: Some(marker_id.into()),
+                redacted_fingerprint: None,
+                source_ref: None,
+                session_ref: None,
+            }],
+            1,
+        )
+        .await
+        .map_err(map_reconcile_writer)?;
+    if context
+        .contexts
+        .iter()
+        .any(|context| context.ownership == ReconciliationArtifactOwnership::Conflict)
+    {
+        return Err(ReconcileError::Projection);
+    }
+    let state = CurrentCaptureState::from_dependencies(
+        context
+            .contexts
+            .into_iter()
+            .flat_map(|context| context.dependencies),
+    )?;
+    Ok(gap_was_propagated(&state, marker_id))
+}
+
+fn quarantine_for_target(
+    spool: &DurableSpool,
+    target: &str,
+) -> Result<Vec<PendingQuarantine>, ReconcileError> {
+    let parts = target.split(':').collect::<Vec<_>>();
+    let ["quarantine", device, inode, length] = parts.as_slice() else {
+        return Ok(Vec::new());
+    };
+    Ok(spool
+        .quarantine_by_identity(
+            device.parse().map_err(|_| ReconcileError::InvalidInput)?,
+            inode.parse().map_err(|_| ReconcileError::InvalidInput)?,
+            length.parse().map_err(|_| ReconcileError::InvalidInput)?,
+        )
+        .map_err(|_| ReconcileError::Spool)?
+        .into_iter()
+        .collect())
 }
 
 async fn reconcile_selected(
     input: ReconcileInput,
     writer: &WriterHandle,
     observation_ids: Option<&[SourceObservationId]>,
+    artifact: Option<&ReconciliationArtifactDescriptor>,
 ) -> Result<ReconcileProgress, ReconcileError> {
     validate_reconcile_input(&input)?;
     let targeted = observation_ids.is_some();
@@ -510,7 +639,7 @@ async fn reconcile_selected(
         .runtime_snapshot
         .spool_limits()
         .map_err(|_| ReconcileError::InvalidInput)?;
-    let spool = if targeted {
+    let spool = if targeted || artifact.is_some() {
         DurableSpool::open_read_only(input.runtime_snapshot.spool_dir.clone(), limits)
             .map_err(|_| ReconcileError::Spool)?
     } else {
@@ -518,14 +647,33 @@ async fn reconcile_selected(
             .map_err(|_| ReconcileError::Spool)?
             .0
     };
-    let marker_handles = if targeted {
+    let mut marker_handles = if targeted {
         Vec::new()
     } else {
         spool
             .pending_gap_marker_handles(input.runtime_snapshot.emergency_slots as usize)
             .map_err(|_| ReconcileError::Spool)?
     };
-    let dirty_frontier = if let Some(observation_ids) = observation_ids {
+    if let Some(artifact) = artifact {
+        marker_handles
+            .retain(|handle| artifact.marker_id.as_deref() == Some(&handle.marker().marker_id));
+    }
+    let selected_artifact_context = if let Some(artifact) = artifact {
+        Some(
+            writer
+                .reconciliation_artifact_context(vec![artifact.clone()], 1)
+                .await
+                .map_err(map_reconcile_writer)?,
+        )
+    } else {
+        None
+    };
+    let dirty_frontier = if let Some(context) = &selected_artifact_context {
+        evertrace_store::ReconciliationFrontier {
+            frontier: context.frontier,
+            items: Vec::new(),
+        }
+    } else if let Some(observation_ids) = observation_ids {
         writer
             .project()
             .await
@@ -541,7 +689,13 @@ async fn reconcile_selected(
     let quarantine_start = dirty_frontier.frontier.wrapping_add(
         u64::try_from(input.occurred_at_us).map_err(|_| ReconcileError::InvalidInput)?,
     );
-    let quarantine_handles = if targeted {
+    let quarantine_handles = if let Some(artifact) = artifact {
+        if artifact.kind == ReconciliationArtifactKind::Quarantine {
+            quarantine_for_target(&spool, &artifact.artifact_id)?
+        } else {
+            Vec::new()
+        }
+    } else if targeted {
         Vec::new()
     } else {
         spool
@@ -550,6 +704,19 @@ async fn reconcile_selected(
     };
     let filesystem_descriptors =
         filesystem_artifact_descriptors(&marker_handles, &quarantine_handles)?;
+    if let Some(artifact) = artifact
+        && filesystem_descriptors.iter().any(|current| {
+            current != artifact
+                && !(current.kind == ReconciliationArtifactKind::GapMarker
+                    && artifact.kind == current.kind
+                    && artifact.marker_id == current.marker_id
+                    && artifact.redacted_fingerprint == current.redacted_fingerprint
+                    && artifact.source_ref == current.source_ref
+                    && artifact.session_ref == current.session_ref)
+        })
+    {
+        return Err(ReconcileError::Spool);
+    }
     let mut lookup_descriptors = filesystem_descriptors.clone();
     let mut reconciled_gaps = input.reconciled_gaps.iter().collect::<Vec<_>>();
     reconciled_gaps.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
@@ -584,7 +751,9 @@ async fn reconcile_selected(
                 source_ref: None,
             }),
     );
-    let artifact_frontier = if lookup_descriptors.is_empty() {
+    let artifact_frontier = if selected_artifact_context.is_some() {
+        selected_artifact_context
+    } else if lookup_descriptors.is_empty() {
         None
     } else {
         Some(
@@ -680,6 +849,7 @@ async fn reconcile_selected(
             explicit_targets: &explicit_targets,
             pending_marker_ids: &pending_marker_ids,
             pending_quarantine_ids: &pending_quarantine_ids,
+            retain_unobserved: artifact.is_some(),
         },
         &mut state,
         &mut payloads,
@@ -697,7 +867,12 @@ async fn reconcile_selected(
                 .map_err(map_reconcile_writer)?,
         )
     };
-    let after_dirty = if let Some(observation_ids) = observation_ids {
+    let after_dirty = if artifact.is_some() {
+        evertrace_store::ReconciliationFrontier {
+            frontier: dirty_frontier.frontier,
+            items: Vec::new(),
+        }
+    } else if let Some(observation_ids) = observation_ids {
         writer
             .project()
             .await
@@ -734,12 +909,32 @@ async fn reconcile_selected(
             .flat_map(|frontier| &frontier.contexts)
             .flat_map(|context| context.dependencies.clone()),
     )?;
+    if artifact.is_some()
+        && marker_handles
+            .iter()
+            .any(|handle| gap_was_propagated(&projected_state, &handle.marker().marker_id))
+    {
+        // Probe while the marker still holds admission in Recovering. A failed
+        // write/fsync cannot expose an apparently healthy marker-free window.
+        spool
+            .probe_recovery_write()
+            .map_err(|_| ReconcileError::Spool)?;
+    }
     for handle in marker_handles {
         let marker_id = handle.marker().marker_id.clone();
         if gap_was_propagated(&projected_state, &marker_id) {
-            spool
-                .acknowledge_gap_marker_handle(handle)
-                .map_err(|_| ReconcileError::Acknowledgement)?;
+            if artifact.is_some() {
+                spool.try_acknowledge_gap_marker_handle(handle)
+            } else {
+                spool.acknowledge_gap_marker_handle(handle)
+            }
+            .map_err(|error| {
+                if artifact.is_some() && error == evertrace_capture::SpoolError::Busy {
+                    ReconcileError::Busy
+                } else {
+                    ReconcileError::Acknowledgement
+                }
+            })?;
             progress.markers_acknowledged += 1;
         }
     }
@@ -2077,6 +2272,7 @@ fn operation_lane_successors_typed(
 }
 
 struct LaneReconcileContext<'a> {
+    retain_unobserved: bool,
     input: &'a ReconcileInput,
     manifests: &'a BTreeMap<String, &'a AdapterCapabilityManifest>,
     groups: &'a BTreeMap<LaneIncarnationKey, Vec<SourceReceipt>>,
@@ -2103,6 +2299,7 @@ fn reconcile_lane_groups(
         explicit_targets,
         pending_marker_ids,
         pending_quarantine_ids,
+        retain_unobserved,
     } = context;
     let group_frontier = |key: &LaneIncarnationKey| {
         groups
@@ -2232,6 +2429,15 @@ fn reconcile_lane_groups(
                 .entry(key.clone())
                 .or_insert_with(|| group_frontier(&key));
         }
+    }
+    if retain_unobserved {
+        targets.retain(|key, _| {
+            groups.get(key).is_some_and(|receipts| {
+                receipts
+                    .iter()
+                    .all(|receipt| manifests.contains_key(&receipt.adapter_manifest_ref))
+            })
+        });
     }
     progress.lanes_considered = targets.len();
     let target_keys = targets.keys().cloned().collect::<BTreeSet<_>>();

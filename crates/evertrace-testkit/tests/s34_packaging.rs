@@ -759,6 +759,236 @@ async fn candidate_native_binary_validates_without_starting_or_repairing() {
 }
 
 #[tokio::test]
+async fn ordinary_daemon_keeps_explorer_and_doctor_readable_with_unowned_spool_faults() {
+    use evertrace_capture::{CaptureGapMarker, GapReason};
+    use evertrace_domain::ids::RequestId;
+    use evertrace_protocol::{
+        LocalClient,
+        command::Command as Rpc,
+        dto::{
+            ClientKind, HumanGovernanceRequest, HumanGovernanceResponse, HumanReadRequest,
+            HumanSurface,
+        },
+        response::Response,
+    };
+    use std::time::{Duration, Instant};
+    let (_root, paths, initial) = fixture();
+    let mut config = initial.config().clone();
+    config.llm.enabled = false;
+    fs::write(
+        &paths.config,
+        EffectiveConfig::new(config).unwrap().to_toml().unwrap(),
+    )
+    .unwrap();
+    install_offline(&paths, false).unwrap();
+    let mut native = serde_json::json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"ordinary-fault","tool_input":{"command":"echo preserved memory"},"tool_name":"Bash","tool_use_id":"one","transcript_path":null,"turn_id":"one"});
+    invoke(&paths, &serde_json::to_vec(&native).unwrap());
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        Daemon(
+            Command::new(&paths.daemon)
+                .arg("--config")
+                .arg(&paths.config)
+                .env_clear()
+                .env("HOME", paths.data_root.parent().unwrap())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut daemon = spawn();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut client = LocalClient::connect(
+        &socket,
+        "s34-spool",
+        ClientKind::Cli,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let saved = loop {
+        let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { items, .. }) = client
+            .request(
+                RequestId::new_v7(),
+                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                    request: HumanReadRequest::List {
+                        surface: HumanSurface::Explorer,
+                        expected_frontier: None,
+                        after: None,
+                        limit: 32,
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Explorer unavailable");
+        };
+        if let Some(item) = items
+            .into_iter()
+            .find(|item| item.object_kind == "source_receipt")
+        {
+            break item.object_ref.unwrap();
+        }
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    drop(client);
+    drop(daemon);
+    // Offline valid frame followed by a torn frame. Startup must not invoke
+    // truncating recovery before the carrier can be retained and accounted.
+    native["tool_use_id"] = "two".into();
+    invoke(&paths, &serde_json::to_vec(&native).unwrap());
+    let active = runtime.spool_dir.join("main/active.open");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&active)
+        .unwrap()
+        .write_all(b"EV")
+        .unwrap();
+    let original = fs::read(&active).unwrap();
+    for reopen in [false, true] {
+        let mut daemon = spawn();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while !package_health(socket.clone()).await {
+            assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let spool =
+            DurableSpool::open_read_only(&runtime.spool_dir, runtime.spool_limits().unwrap())
+                .unwrap();
+        loop {
+            let quarantines = spool.pending_quarantine(1).unwrap();
+            if let Some(carrier) = quarantines.first() {
+                assert_eq!(fs::read(carrier.path()).unwrap(), original);
+                break;
+            }
+            assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !reopen {
+            spool
+                .write_gap_marker(&CaptureGapMarker {
+                    marker_id: "gap:weak-unowned".into(),
+                    source_ref: "unknown-native-source".into(),
+                    session_ref: "ordinary-fault".into(),
+                    turn_ref: None,
+                    tool_ref: None,
+                    failure_reason: GapReason::MainUnavailable,
+                    redacted_fingerprint: "cd".repeat(32),
+                    attempted_bytes: 2,
+                    last_durable_watermark: 0,
+                })
+                .unwrap();
+        }
+        let mut client = LocalClient::connect(
+            &socket,
+            "s34-spool",
+            ClientKind::Cli,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        loop {
+            let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
+                frontier,
+                items,
+                ..
+            }) = client
+                .request(
+                    RequestId::new_v7(),
+                    Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                        request: HumanReadRequest::List {
+                            surface: HumanSurface::Explorer,
+                            expected_frontier: None,
+                            after: None,
+                            limit: 64,
+                        },
+                    }),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("Explorer unavailable during recovery");
+            };
+            assert!(!items.iter().any(|item| matches!(
+                item.object_kind.as_str(),
+                "execution_lane" | "capture_receipt"
+            )));
+            if items
+                .iter()
+                .filter(|item| item.object_kind == "capture_gap_marker")
+                .count()
+                == 2
+            {
+                let result = client
+                    .request(
+                        RequestId::new_v7(),
+                        Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                            request: HumanReadRequest::Detail {
+                                surface: HumanSurface::Explorer,
+                                object_ref: saved.clone(),
+                                expected_frontier: frontier,
+                                expected_revision_ref: None,
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                if let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
+                    items, ..
+                }) = result
+                {
+                    assert!(
+                        items
+                            .iter()
+                            .any(|item| item.evidence_detail.as_ref().is_some_and(|detail| {
+                                serde_json::to_string(detail)
+                                    .unwrap()
+                                    .contains("preserved memory")
+                            }))
+                    );
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(spool.pending_gap_markers().unwrap().len(), 1);
+        assert!(!spool.below_low_watermark().unwrap());
+        let doctor = Command::new(&paths.cli)
+            .arg("--config")
+            .arg(&paths.config)
+            .arg("doctor")
+            .env_clear()
+            .env("HOME", paths.data_root.parent().unwrap())
+            .output()
+            .unwrap();
+        assert!(doctor.status.success());
+        let text = String::from_utf8(doctor.stdout).unwrap();
+        assert!(text.contains("spool_metadata=Inconsistent"), "{text}");
+        assert!(text.contains("spool_frames=NotChecked"));
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        drop(client);
+        drop(daemon);
+    }
+}
+
+#[tokio::test]
 async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_cas() {
     use std::time::Duration;
     let (_root, paths, initial) = fixture();
@@ -1076,29 +1306,8 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
     );
     drop(segments);
     fs::write(&blob, valid_cas).unwrap();
-    let broken = evertrace_capture::encode_frame(&original).unwrap()[..30].to_vec();
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(spool.active_path())
-        .unwrap();
-    file.write_all(&broken).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    for _ in 0..2 {
-        let mut daemon = spawn();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = daemon.0.try_wait().unwrap() {
-                assert!(!status.success());
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert_eq!(fs::read(spool.active_path()).unwrap(), broken);
-    }
+    // Recoverable frame corruption now has its own ordinary online/reopen
+    // consumer regression above; a bad CAS remains a fatal integrity error.
 }
 
 #[tokio::test]

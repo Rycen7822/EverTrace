@@ -759,11 +759,31 @@ impl DurableSpool {
         self.claimed_segments(1, false, Some(cursor))
     }
 
+    /// Ordinary ingress preserves an invalid frame's entire carrier before
+    /// yielding to reconciliation. Unlike `recover`, this never truncates a
+    /// tail (including any complete frames preceding it).
+    pub fn ingest_page(
+        &self,
+        cursor: Option<&SpoolReadCursor>,
+    ) -> Result<Vec<SealedSegment>, SpoolError> {
+        self.claimed_segments_inner(1, false, Some(cursor), true)
+    }
+
     fn claimed_segments(
         &self,
         limit: usize,
         isolated: bool,
         page: Option<Option<&SpoolReadCursor>>,
+    ) -> Result<Vec<SealedSegment>, SpoolError> {
+        self.claimed_segments_inner(limit, isolated, page, false)
+    }
+
+    fn claimed_segments_inner(
+        &self,
+        limit: usize,
+        isolated: bool,
+        page: Option<Option<&SpoolReadCursor>>,
+        preserve_corruption: bool,
     ) -> Result<Vec<SealedSegment>, SpoolError> {
         let configured_limit = usize::try_from(self.limits.max_main_files)
             .map_err(|_| SpoolError::InvalidConfiguration)?;
@@ -847,7 +867,30 @@ impl DurableSpool {
                 .take(read_length)
                 .read_to_end(&mut bytes)
                 .map_err(map_io)?;
-            let scan = scan_frames(&bytes)?;
+            let scan = scan_frames(&bytes);
+            let invalid = match &scan {
+                Ok(scan) => {
+                    (read_length == available && scan.incomplete_tail) || scan.frames.is_empty()
+                }
+                Err(_) => true,
+            };
+            if preserve_corruption && invalid {
+                // The segment claim remains held. Hook never writes sealed
+                // files; recheck identity under the directory lock before the
+                // recoverable rename. Crashes on either side retain all bytes.
+                let directory = File::open(&self.main_dir).map_err(map_io)?;
+                FileExt::try_lock_exclusive(&directory).map_err(map_busy)?;
+                validate_owned_file(&path, &file)?;
+                if segment_identity(&file.metadata().map_err(map_io)?) != segment_identity(&opened)
+                    || segment_identity(&fs::symlink_metadata(&path).map_err(map_io)?)
+                        != segment_identity(&opened)
+                {
+                    return Err(SpoolError::IdentityChanged);
+                }
+                self.quarantine(&path)?;
+                return Err(SpoolError::RecoveryRequired);
+            }
+            let scan = scan?;
             if (read_length == available && scan.incomplete_tail) || scan.frames.is_empty() {
                 return Err(SpoolError::Corrupt);
             }
@@ -1108,10 +1151,29 @@ impl DurableSpool {
 
     pub fn acknowledge_gap_marker_handle(
         &self,
+        handle: PendingGapMarker,
+    ) -> Result<(), SpoolError> {
+        self.acknowledge_gap_marker_inner(handle, false)
+    }
+
+    pub fn try_acknowledge_gap_marker_handle(
+        &self,
+        handle: PendingGapMarker,
+    ) -> Result<(), SpoolError> {
+        self.acknowledge_gap_marker_inner(handle, true)
+    }
+
+    fn acknowledge_gap_marker_inner(
+        &self,
         mut handle: PendingGapMarker,
+        nonblocking: bool,
     ) -> Result<(), SpoolError> {
         let directory_lock = File::open(&self.emergency_dir).map_err(map_io)?;
-        FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
+        if nonblocking {
+            FileExt::try_lock_exclusive(&directory_lock).map_err(map_busy)?;
+        } else {
+            FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
+        }
         validate_ack_identity(
             &handle.path,
             &handle.file,
@@ -1198,16 +1260,16 @@ impl DurableSpool {
             paths.rotate_left(start);
         }
         paths.truncate(limit);
+        drop(directory_lock);
         let mut handles = Vec::new();
         for path in paths {
             if path.extension().is_none_or(|value| value != "spool") {
                 return Err(SpoolError::Corrupt);
             }
-            let mut file = File::open(&path).map_err(map_io)?;
+            let file = File::open(&path).map_err(map_io)?;
             validate_owned_file(&path, &file)?;
             let metadata = file.metadata().map_err(map_io)?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(map_io)?;
+            let bytes = read_owned_file_exact(&path, &metadata, self.limits.high_watermark_bytes)?;
             let fingerprint = hex_digest(&bytes);
             handles.push(PendingQuarantine {
                 path,
@@ -1219,6 +1281,57 @@ impl DurableSpool {
             });
         }
         Ok(handles)
+    }
+
+    /// Locate only the claimed artifact; unrelated quarantine bodies are not
+    /// read or hashed during claim/replay.
+    pub fn quarantine_by_identity(
+        &self,
+        device: u64,
+        inode: u64,
+        length: u64,
+    ) -> Result<Option<PendingQuarantine>, SpoolError> {
+        self.validate_directories()?;
+        let directory = File::open(&self.quarantine_dir).map_err(map_io)?;
+        FileExt::try_lock_shared(&directory).map_err(map_busy)?;
+        for entry in fs::read_dir(&self.quarantine_dir).map_err(map_io)? {
+            let path = entry.map_err(map_io)?.path();
+            let metadata = fs::symlink_metadata(&path).map_err(map_io)?;
+            validate_owned_file_metadata(&metadata)?;
+            if (metadata.dev(), metadata.ino(), metadata.len()) != (device, inode, length) {
+                continue;
+            }
+            let mut file = File::open(&path).map_err(map_io)?;
+            validate_owned_file(&path, &file)?;
+            drop(directory);
+            let bytes = read_owned_file_exact(&path, &metadata, self.limits.high_watermark_bytes)?;
+            file.seek(SeekFrom::Start(0)).map_err(map_io)?;
+            return Ok(Some(PendingQuarantine {
+                path,
+                file,
+                device,
+                inode,
+                length,
+                fingerprint: hex_digest(&bytes),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Anonymous write/fsync probe: no named control file or crash residue.
+    pub fn probe_recovery_write(&self) -> Result<(), SpoolError> {
+        self.validate_directories()?;
+        let directory = File::open(&self.main_dir).map_err(map_io)?;
+        let fd = rustix::fs::openat(
+            &directory,
+            ".",
+            rustix::fs::OFlags::TMPFILE | rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| map_io(error.into()))?;
+        let mut file = File::from(fd);
+        file.write_all(&[0]).map_err(map_write_error)?;
+        file.sync_all().map_err(map_write_error)
     }
 
     pub fn acknowledge_quarantine(&self, mut handle: PendingQuarantine) -> Result<(), SpoolError> {
@@ -1265,13 +1378,34 @@ impl DurableSpool {
             && self.quarantine_evidence()?.is_empty())
     }
 
+    /// Metadata-only optional-work gate. Until ingress validates a pending
+    /// ordinary carrier, its frame health is unknown. Reserved work is separate.
+    pub fn has_ordinary_backlog(&self) -> Result<bool, SpoolError> {
+        self.validate_directories()?;
+        for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
+            let entry = entry.map_err(map_io)?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(map_io)?;
+            validate_owned_file_metadata(&metadata)?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(ISOLATED_PREFIX)
+                && metadata.len() != 0
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn quarantine(&self, source: &Path) -> Result<PathBuf, SpoolError> {
         let destination = unique_path(&self.quarantine_dir, "corrupt", ".spool")?;
         fs::rename(source, &destination).map_err(map_io)?;
-        File::open(&self.main_dir)
+        // Persist the recovery carrier's destination before its old directory.
+        File::open(&self.quarantine_dir)
             .and_then(|dir| dir.sync_all())
             .map_err(map_io)?;
-        File::open(&self.quarantine_dir)
+        File::open(&self.main_dir)
             .and_then(|dir| dir.sync_all())
             .map_err(map_io)?;
         Ok(destination)
@@ -1406,6 +1540,8 @@ struct Usage {
 pub enum SpoolError {
     #[error("spool is busy")]
     Busy,
+    #[error("spool carrier was preserved for capture reconciliation")]
+    RecoveryRequired,
     #[error("spool configuration is invalid")]
     InvalidConfiguration,
     #[error("spool frame failed validation")]

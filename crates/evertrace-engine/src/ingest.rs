@@ -41,9 +41,14 @@ pub struct EvidenceIngestor {
     algorithm_revision: String,
     config: Option<std::sync::Arc<crate::ConfigReloadService>>,
     operation_config: Option<std::sync::Arc<evertrace_domain::config::EffectiveConfig>>,
+    recovery_wakeup: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl EvidenceIngestor {
+    pub fn with_recovery_wakeup(mut self, wakeup: tokio::sync::watch::Sender<u64>) -> Self {
+        self.recovery_wakeup = Some(wakeup);
+        self
+    }
     pub fn with_operation_config(
         mut self,
         config: std::sync::Arc<evertrace_domain::config::EffectiveConfig>,
@@ -72,22 +77,13 @@ impl EvidenceIngestor {
                 .spool_limits()
                 .map_err(|_| IngestError::Snapshot)?,
         )
-        .map_err(map_spool)?
-        .validate_active_without_repair()
-        .map_err(|_| IngestError::Recovering)?;
-        let (_, recovery) = DurableSpool::open(
-            self.snapshot.spool_dir.clone(),
-            self.snapshot
-                .spool_limits()
-                .map_err(|_| IngestError::Snapshot)?,
-        )
         .map_err(map_spool)?;
-        if recovery.repaired_tail_bytes != 0 || !recovery.gaps.is_empty() {
-            return Err(IngestError::Recovering);
-        }
+        // Recovery never truncates an unaccounted tail. The paged reader
+        // preserves a bad carrier and the Critical lane handles its evidence.
         CasStore::open(self.snapshot.cas_dir.clone()).map_err(|_| IngestError::Cas)?;
         drop(startup_guard);
         let mut cursor = None;
+        let mut recovering = false;
         loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -102,11 +98,18 @@ impl EvidenceIngestor {
             let result = self.drain_page(&mut cursor).await;
             drop(guard);
             match result {
-                Ok(_) | Err(IngestError::Busy) => {}
+                Ok(_) => recovering = false,
+                Err(IngestError::Busy) => {}
+                Err(IngestError::Recovering) => {
+                    if !recovering && let Some(wakeup) = &self.recovery_wakeup {
+                        wakeup.send_modify(|value| *value = value.wrapping_add(1));
+                    }
+                    recovering = true;
+                }
                 Err(error) => return Err(error),
             }
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(if recovering { 1000 } else { 100 })) => {},
                 result = shutdown.changed() => { if result.is_err() || *shutdown.borrow() { return Ok(()); } },
             }
         }
@@ -123,29 +126,42 @@ impl EvidenceIngestor {
                 .map_err(|_| IngestError::Snapshot)?,
         )
         .map_err(map_spool)?;
-        if !spool.pending_gap_markers().map_err(map_spool)?.is_empty()
+        let recovering = !spool.pending_gap_markers().map_err(map_spool)?.is_empty()
             || std::fs::read_dir(self.snapshot.spool_dir.join("quarantine"))
                 .map_err(|_| IngestError::Spool)?
                 .next()
                 .transpose()
                 .map_err(|_| IngestError::Spool)?
-                .is_some()
-        {
-            return Err(IngestError::Recovering);
-        }
+                .is_some();
+        // Markers do not authorize discarding a carrier or upgrading capture,
+        // but healthy independent records can supply the missing attribution.
         if cursor.is_none() {
             spool
                 .seal_active(self.snapshot.generation)
                 .map_err(map_spool)?;
         }
-        let segments = spool.sealed_page(cursor.as_ref()).map_err(map_spool)?;
+        let segments = match spool.ingest_page(cursor.as_ref()) {
+            Err(evertrace_capture::SpoolError::RecoveryRequired) => {
+                *cursor = None;
+                return Err(IngestError::Recovering);
+            }
+            result => result.map_err(map_spool)?,
+        };
         if segments.is_empty() {
-            return Ok(DrainProgress::default());
+            return if recovering {
+                Err(IngestError::Recovering)
+            } else {
+                Ok(DrainProgress::default())
+            };
         }
         let next = segments[0].continuation().map_err(map_spool)?;
         let result = self.drain_segments(&spool, segments, None, true).await?;
         *cursor = next;
-        Ok(result)
+        if recovering {
+            Err(IngestError::Recovering)
+        } else {
+            Ok(result)
+        }
     }
     pub fn new(
         snapshot: RuntimeSnapshot,
@@ -165,6 +181,7 @@ impl EvidenceIngestor {
             algorithm_revision,
             config: None,
             operation_config: None,
+            recovery_wakeup: None,
         })
     }
 
@@ -1011,6 +1028,8 @@ fn map_writer_error(error: WriterActorError) -> IngestError {
 fn map_spool(error: evertrace_capture::SpoolError) -> IngestError {
     if error == evertrace_capture::SpoolError::Busy {
         IngestError::Busy
+    } else if error == evertrace_capture::SpoolError::RecoveryRequired {
+        IngestError::Recovering
     } else {
         IngestError::Spool
     }

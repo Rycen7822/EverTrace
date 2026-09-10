@@ -123,9 +123,19 @@ pub(super) fn compile(
         ("cas_metadata", runtime.map(|value| value.cas_dir.as_path())),
     ] {
         let count = path.and_then(|path| directory_metadata(path, deadline));
+        let recovery_artifacts = if name == "spool_metadata" {
+            path.and_then(|path| {
+                directory_metadata(&path.join("emergency"), deadline)?
+                    .checked_add(directory_metadata(&path.join("quarantine"), deadline)?)
+            })
+        } else {
+            Some(0)
+        };
         add(
             name,
-            if count.is_some() {
+            if recovery_artifacts.is_some_and(|count| count != 0) {
+                Inconsistent
+            } else if count.is_some() && recovery_artifacts.is_some() {
                 Checked
             } else {
                 Unavailable

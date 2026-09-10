@@ -264,6 +264,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
     let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
     let (backup_request_tx, mut backup_request_rx) = mpsc::channel(1);
+    let dispatch_gate = Arc::new(RwLock::new(()));
     let scheduler = BackgroundScheduler::new(
         writer_handle.clone(),
         session_catalog,
@@ -273,6 +274,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         engine.synthesis_planner(),
         engine.effective_config().config().dreaming.clone(),
     )
+    .with_dispatch(Arc::clone(&dispatch_gate))
     .with_backup_requests(backup_request_tx)
     .with_inventory(evertrace_engine::jobs::InventoryWorker::new(
         writer_handle.clone(),
@@ -324,14 +326,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let maintenance_active = Arc::new(AtomicBool::new(false));
-    let dispatch_gate = Arc::new(RwLock::new(()));
     let ingestor = evertrace_engine::EvidenceIngestor::new(
         runtime_snapshot.clone(),
         writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
         runtime_snapshot.effective_config_hash,
         "ordinary-hook-ingest-v1",
     )?
-    .with_config(Arc::clone(&config_reload));
+    .with_config(Arc::clone(&config_reload))
+    .with_recovery_wakeup(session_import_wakeup_tx.clone());
     let mut ingest_task = tokio::spawn(ingestor.run(
         Arc::clone(&dispatch_gate),
         session_import_shutdown_tx.subscribe(),

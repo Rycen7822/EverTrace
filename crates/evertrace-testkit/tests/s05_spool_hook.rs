@@ -199,6 +199,7 @@ fn spool_pages_advance_release_claims_and_defer_busy_without_collecting_isolated
         .unwrap();
     let reserved_path = reserved.path().to_owned();
     drop(reserved);
+    assert!(spool.has_ordinary_backlog().unwrap());
     let page = spool.sealed_page(None).unwrap().remove(0);
     assert_eq!(page.frames().len(), 256);
     let cursor = page.continuation().unwrap().unwrap();
@@ -211,6 +212,7 @@ fn spool_pages_advance_release_claims_and_defer_busy_without_collecting_isolated
     spool.acknowledge_segment(page, 1).unwrap();
     assert!(spool.sealed_page(None).unwrap().is_empty());
     assert!(reserved_path.exists());
+    assert!(!spool.has_ordinary_backlog().unwrap());
     spool.append(&record("bad-active", b"body")).unwrap();
     OpenOptions::new()
         .append(true)
@@ -219,6 +221,7 @@ fn spool_pages_advance_release_claims_and_defer_busy_without_collecting_isolated
         .write_all(b"ETS")
         .unwrap();
     let broken = fs::read(spool.active_path()).unwrap();
+    assert!(spool.has_ordinary_backlog().unwrap());
     let _admission = CaptureRuntime::open_for_admission(snapshot(
         temp.path(),
         SpoolLimits {
@@ -284,6 +287,64 @@ fn durable_pin_scan_rejects_canonical_header_mismatch_and_segment_overflow() {
     assert_eq!(
         spool.read_durable_records(1, limits().high_watermark_bytes),
         Err(SpoolError::ResourceExhausted)
+    );
+}
+
+#[test]
+fn ordinary_reader_preserves_complete_frames_and_torn_tail_across_interruption() {
+    if let Some(root) = std::env::var_os("EVERTRACE_TEST_SPOOL_INTERRUPTION_ROOT") {
+        let mut spool = DurableSpool::open_read_only(root, limits()).unwrap();
+        spool.seal_active(1).unwrap();
+        // Exit without destructors before the ordinary reader examines/handles
+        // corruption. No product fault switch or replacement binary is used.
+        std::process::exit(37);
+    }
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("spool");
+    let (mut spool, _) = DurableSpool::open(&root, limits()).unwrap();
+    spool.append(&record("one", b"body-one")).unwrap();
+    let torn = encode_frame(&record("two", b"body-two")).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(spool.active_path())
+        .unwrap()
+        .write_all(&torn[..torn.len() - 4])
+        .unwrap();
+    let original = fs::read(spool.active_path()).unwrap();
+    assert_eq!(scan_frames(&original).unwrap().frames.len(), 1);
+    // Interrupted before processing: no recovery open may truncate this tail.
+    drop(spool);
+    let spool = DurableSpool::open_read_only(&root, limits()).unwrap();
+    assert_eq!(fs::read(spool.active_path()).unwrap(), original);
+    let interrupted = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "ordinary_reader_preserves_complete_frames_and_torn_tail_across_interruption",
+            "--test-threads=1",
+        ])
+        .env("EVERTRACE_TEST_SPOOL_INTERRUPTION_ROOT", &root)
+        .output()
+        .unwrap();
+    assert_eq!(interrupted.status.code(), Some(37));
+    assert_eq!(
+        spool.ingest_page(None).unwrap_err(),
+        SpoolError::RecoveryRequired
+    );
+    let carrier = spool.pending_quarantine(1).unwrap().remove(0);
+    assert_eq!(fs::read(carrier.path()).unwrap(), original);
+    assert!(!spool.below_low_watermark().unwrap());
+    drop(spool);
+    let spool = DurableSpool::open_read_only(&root, limits()).unwrap();
+    let reopened = spool.pending_quarantine(1).unwrap().remove(0);
+    assert_eq!(fs::read(reopened.path()).unwrap(), original);
+    assert_eq!(
+        (reopened.device(), reopened.inode()),
+        (carrier.device(), carrier.inode())
+    );
+    spool.probe_recovery_write().unwrap();
+    assert!(
+        !spool.below_low_watermark().unwrap(),
+        "write probe cannot waive propagation"
     );
 }
 
