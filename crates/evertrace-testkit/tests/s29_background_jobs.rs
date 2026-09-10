@@ -595,6 +595,12 @@ fn scheduler_priority_bounds_coalescing_and_pressure_are_deterministic() {
         jobs.push(job("support_closure", &format!("support:{index}"), 1, 0));
         jobs.push(job("session_import_v1", &format!("import:{index}"), 1, 0));
         jobs.push(job(
+            "procedure_cohort_promotion_v1",
+            &format!("promotion:{index}"),
+            1,
+            0,
+        ));
+        jobs.push(job(
             "semantic_synthesis_v1",
             &format!("semantic:{index}"),
             1,
@@ -602,7 +608,14 @@ fn scheduler_priority_bounds_coalescing_and_pressure_are_deterministic() {
         ));
     }
     let selected = select_jobs(&view(jobs, Vec::new()), CaptureAdmissionState::Normal).unwrap();
-    assert_eq!(selected.len(), 24);
+    assert_eq!(selected.len(), 32);
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|item| item.lane == BackgroundLane::Deterministic)
+            .count(),
+        8
+    );
     assert_eq!(
         selected
             .iter()
@@ -635,6 +648,7 @@ fn scheduler_priority_bounds_coalescing_and_pressure_are_deterministic() {
                 job("objects_projection", "objects", 1, 0),
                 job("session_import_v1", "import", 1, 0),
                 job("semantic_synthesis_v1", "semantic", 1, 0),
+                job("procedure_cohort_promotion_v1", "promotion", 1, 0),
             ],
             Vec::new(),
         ),

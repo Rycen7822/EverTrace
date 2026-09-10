@@ -1458,6 +1458,406 @@ async fn s25_keeps_the_production_store_at_four_tables() {
 }
 
 #[tokio::test]
+async fn scheduler_promotes_existing_cohorts_with_reload_claim_and_lost_ack_boundaries() {
+    use evertrace_domain::config::{DreamingConfig, EffectiveConfig, LlmConfig};
+    use evertrace_engine::{
+        BackgroundScheduler, ConfigReloadOutcome, ConfigReloadService, ConfigReloadSource,
+        EngineService, RuntimeMode, SessionImportWorker, jobs::SynthesisPlanner,
+        session_import::SessionCatalogService,
+    };
+    use evertrace_store::{JobStatus, RuntimeSchedulerView};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, task::Poll};
+    use tokio::sync::RwLock;
+
+    const KIND: &str = "procedure_cohort_promotion_v1";
+    for (required, invalidation) in [
+        (5, "none"),
+        (3, "none"),
+        (4, "none"),
+        (3, "harm"),
+        (3, "delete"),
+    ] {
+        let ActiveProcedureFixture {
+            _temp,
+            store_path,
+            mut writer,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            procedure,
+            ..
+        } = active_procedure_fixture("scheduled-cohort", false).await;
+        let roots = if required == 4 {
+            vec![vec!["x", "y"], vec!["x"], vec!["y"], vec!["z"], vec!["w"]]
+        } else {
+            ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .take(required as usize)
+                .map(|root| vec![root])
+                .collect()
+        };
+        for (index, roots) in roots.iter().enumerate() {
+            let at = 30 + index as i64;
+            let mut use_task = task(repository_id, worktree_id, at);
+            use_task.request_root_refs = roots
+                .iter()
+                .map(|root| format!("request:s25:{root}"))
+                .collect();
+            let prepared = prepare_usage_evidence(
+                &mut writer,
+                &procedure,
+                5,
+                ProcedurePublicationState::ActiveProbationary,
+                repository_id,
+                worktree_id,
+                snapshot_id,
+                use_task,
+                true,
+                None,
+                PhysicalEvidenceCase::Exact,
+                ResultEvidenceCase::Passed,
+                at,
+                &format!("scheduled-success-{index}"),
+            )
+            .await;
+            assert!(!has_objective_success_state(&prepared.command));
+            writer.commit(&prepared.command, at).await.unwrap();
+        }
+        let harm = if invalidation == "harm" {
+            let mut use_task = task(repository_id, worktree_id, 38);
+            use_task.request_root_refs = vec!["request:s25:scheduled-harm".into()];
+            let prepared = prepare_usage_evidence(
+                &mut writer,
+                &procedure,
+                5,
+                ProcedurePublicationState::ActiveProbationary,
+                repository_id,
+                worktree_id,
+                snapshot_id,
+                use_task,
+                true,
+                None,
+                PhysicalEvidenceCase::Exact,
+                ResultEvidenceCase::NeutralFailure,
+                38,
+                "scheduled-harm",
+            )
+            .await;
+            writer.commit(&prepared.command, 38).await.unwrap();
+            Some((
+                prepared.usage.procedure_usage_id,
+                prepared.result.revision_id,
+            ))
+        } else {
+            None
+        };
+        let usage_count = |snapshot: &evertrace_store::ProjectionSnapshot| {
+            snapshot
+                .data_rows()
+                .filter(|row| row.object_kind.as_deref() == Some("procedure_usage_revision"))
+                .count()
+        };
+        let successes = |snapshot: &evertrace_store::ProjectionSnapshot| {
+            snapshot
+                .data_rows()
+                .filter(|row| row.object_kind.as_deref() == Some("procedure_state_event"))
+                .filter_map(|row| {
+                    serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()
+                })
+                .filter_map(|payload| match payload {
+                    JournalPayload::ProcedureStateRecorded(event)
+                        if event.reason == ProcedureStateReason::ObjectiveSuccesses =>
+                    {
+                        Some(event)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshot = writer.project().await.unwrap();
+        let count = usage_count(&snapshot);
+        // Prepare the immutable failure evidence/preview before claiming. Only
+        // its real commit belongs inside the five-second lease; fixture reads
+        // and the independently tested config reload must not consume it.
+        let harm = harm.map(|(procedure_usage_id, result)| {
+            let view = ProcedureUsageCurrentView::from_snapshot(&snapshot).unwrap();
+            let ProcedureNegativeResolution::Command { command, .. } = record_procedure_negative(
+                &view,
+                proposal_context(40),
+                ProcedureNegativeRequest {
+                    procedure_usage_id,
+                    session_id: "session-s25-scheduled-harm".into(),
+                    result_revision_ids: vec![result],
+                },
+            )
+            .unwrap() else {
+                panic!("actual failed evidence must support harm review");
+            };
+            command
+        });
+        let deletion = (invalidation == "delete").then(|| {
+            let target = evertrace_domain::purge::ObjectDeletionTarget::Procedure {
+                procedure_id: procedure.procedure_id,
+            };
+            let preview = evertrace_store::object_deletion_preview(&snapshot, target).unwrap();
+            (target, preview)
+        });
+        drop(snapshot);
+        let mut file = EffectiveConfig::default().config().clone();
+        file.runtime.data_dir = store_path.to_string_lossy().into_owned();
+        file.llm.enabled = false;
+        file.procedure.stable_min_outcome_supported = 5;
+        let config = EffectiveConfig::new(file.clone()).unwrap();
+        let config_path = _temp.path().join("scheduler.toml");
+        fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let engine = Arc::new(
+            EngineService::from_toml(&config.to_toml().unwrap(), RuntimeMode::Normal).unwrap(),
+        );
+        let (handle, writer_task) = spawn_writer(writer, 16).unwrap();
+        let reload = Arc::new(
+            ConfigReloadService::new(
+                engine,
+                handle.clone(),
+                store_path.clone(),
+                config_path.clone(),
+            )
+            .unwrap(),
+        );
+        let runtime = reload.initialize_runtime().await.unwrap();
+        evertrace_capture::CaptureRuntime::open(runtime.clone()).unwrap();
+        let make_scheduler = |handle: evertrace_engine::WriterHandle| {
+            let report = Arc::new(RwLock::new(None));
+            BackgroundScheduler::new(
+                handle.clone(),
+                SessionCatalogService::new(handle.clone(), config.hash()),
+                SessionImportWorker::new(handle, runtime.clone(), Arc::clone(&report)).unwrap(),
+                report,
+                runtime.clone(),
+                SynthesisPlanner::new(LlmConfig {
+                    enabled: false,
+                    ..LlmConfig::default()
+                }),
+                DreamingConfig::default(),
+            )
+        };
+        let scheduler = make_scheduler(handle.clone()).with_config(Arc::clone(&reload));
+        if required != 5 {
+            scheduler.run_once().await.unwrap();
+            let before = handle.project().await.unwrap();
+            assert!(
+                RuntimeSchedulerView::from_snapshot(&before)
+                    .unwrap()
+                    .jobs
+                    .iter()
+                    .all(|job| job.kind != KIND)
+            );
+            file.procedure.stable_min_outcome_supported = required;
+            fs::write(
+                &config_path,
+                EffectiveConfig::new(file.clone())
+                    .unwrap()
+                    .to_toml()
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut wakeup = handle.subscribe_background_frontier();
+            assert_eq!(
+                reload
+                    .reload(ConfigReloadSource::Cli)
+                    .await
+                    .unwrap()
+                    .outcome,
+                ConfigReloadOutcome::Applied
+            );
+            assert!(wakeup.has_changed().unwrap());
+            wakeup.borrow_and_update();
+        }
+        let claimed_hash = reload.admit().await.unwrap().hash();
+        let mut activity = handle.subscribe_background_frontier();
+        let mut running = Box::pin(scheduler.run_once());
+        // Drive only this scheduler future until the real writer has committed
+        // its lease. Pausing polling keeps the claim boundary deterministic,
+        // without a product fault API, fake job or a scheduler substitute.
+        let mut leased_frontier = None;
+        for _ in 0..128 {
+            // Wait for the scheduler's own await to wake, then leave it
+            // unpolled. Inspect only real durable changes, not every I/O await.
+            let mut polled = false;
+            let result = std::future::poll_fn(|cx| {
+                if polled {
+                    return Poll::Ready(Poll::Pending);
+                }
+                polled = true;
+                running.as_mut().poll(cx).map(Poll::Ready)
+            })
+            .await;
+            assert!(
+                result.is_pending(),
+                "before lease for {required}/{invalidation}: {result:?}"
+            );
+            if !activity.has_changed().unwrap() {
+                continue;
+            }
+            activity.borrow_and_update();
+            let snapshot = handle.project().await.unwrap();
+            if RuntimeSchedulerView::from_snapshot(&snapshot)
+                .unwrap()
+                .jobs
+                .iter()
+                .any(|job| job.kind == KIND && job.state == JobStatus::Leased)
+            {
+                leased_frontier = Some(snapshot.frontier);
+                break;
+            }
+        }
+        let leased_frontier = leased_frontier.unwrap();
+        if invalidation == "none" {
+            file.procedure.stable_min_outcome_supported = 256;
+            fs::write(
+                &config_path,
+                EffectiveConfig::new(file.clone())
+                    .unwrap()
+                    .to_toml()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                reload
+                    .reload(ConfigReloadSource::Cli)
+                    .await
+                    .unwrap()
+                    .outcome,
+                ConfigReloadOutcome::Applied
+            );
+        }
+        if let Some(command) = harm {
+            handle.commit(command, 40).await.unwrap();
+        } else if let Some((target, preview)) = deletion {
+            assert!(matches!(
+                HumanGovernanceService::new(handle.clone(), claimed_hash)
+                    .forget_object(
+                        RequestId::new_v7(),
+                        leased_frontier,
+                        target,
+                        preview.exact_revision_ids,
+                        preview.deletion_generation
+                    )
+                    .await
+                    .unwrap(),
+                HumanActionOutcome::Applied { .. }
+            ));
+        }
+        let resumed_at_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        if required == 5 {
+            // Stop polling after the final command commits: discard its ack,
+            // then let ordinary scheduling/reopen observe the durable result.
+            let mut committed = false;
+            activity.borrow_and_update();
+            for _ in 0..128 {
+                let mut polled = false;
+                let result = std::future::poll_fn(|cx| {
+                    if polled {
+                        return Poll::Ready(Poll::Pending);
+                    }
+                    polled = true;
+                    running.as_mut().poll(cx).map(Poll::Ready)
+                })
+                .await;
+                assert!(result.is_pending(), "before completion ack: {result:?}");
+                if !activity.has_changed().unwrap() {
+                    continue;
+                }
+                activity.borrow_and_update();
+                let snapshot = handle.project().await.unwrap();
+                if !successes(&snapshot).is_empty() {
+                    committed = true;
+                    break;
+                }
+            }
+            assert!(committed);
+            drop(running);
+        } else {
+            running.await.unwrap();
+        }
+        let after = handle.project().await.unwrap();
+        let states = successes(&after);
+        assert_eq!(states.len(), usize::from(invalidation == "none"));
+        if invalidation == "none" {
+            assert_eq!(states[0].evidence_refs.len(), required as usize);
+        }
+        if invalidation != "delete" {
+            assert_eq!(usage_count(&after), count);
+        }
+        let jobs = RuntimeSchedulerView::from_snapshot(&after).unwrap();
+        let jobs = jobs
+            .jobs
+            .iter()
+            .filter(|job| job.kind == KIND)
+            .collect::<Vec<_>>();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].state,
+            if invalidation == "none" {
+                JobStatus::Succeeded
+            } else {
+                JobStatus::Failed
+            },
+            "case {required}/{invalidation}; resumed_at_us={resumed_at_us}; lease_until_us={:?}",
+            jobs[0].lease_until_us,
+        );
+        assert_eq!(jobs[0].config_hash, claimed_hash);
+        scheduler.run_once().await.unwrap();
+        let quiet = handle.project().await.unwrap();
+        assert_eq!(
+            RuntimeSchedulerView::from_snapshot(&quiet)
+                .unwrap()
+                .jobs
+                .iter()
+                .filter(|job| job.kind == KIND)
+                .count(),
+            1
+        );
+        if invalidation != "delete" {
+            assert_eq!(quiet.frontier, after.frontier);
+        }
+        drop(scheduler);
+        drop(reload);
+        handle.shutdown().await.unwrap();
+        writer_task.await.unwrap().unwrap();
+        let reopened = JournalWriter::open(&store_path).await.unwrap();
+        assert_eq!(
+            successes(&reopened.full_projection().await.unwrap()),
+            states
+        );
+        let (handle, writer_task) = spawn_writer(reopened, 16).unwrap();
+        let scheduler = make_scheduler(handle.clone());
+        let before = handle.project().await.unwrap();
+        scheduler.run_once().await.unwrap();
+        let quiet = handle.project().await.unwrap();
+        assert_eq!(successes(&quiet), states);
+        assert_eq!(
+            RuntimeSchedulerView::from_snapshot(&quiet)
+                .unwrap()
+                .jobs
+                .iter()
+                .filter(|job| job.kind == KIND)
+                .count(),
+            1
+        );
+        if invalidation != "delete" {
+            assert_eq!(quiet.frontier, before.frontier);
+        }
+        drop(scheduler);
+        handle.shutdown().await.unwrap();
+        writer_task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn configured_promotion_uses_existing_exact_cohorts_without_new_usage() {
     for required in [5, 3] {
         let ActiveProcedureFixture {

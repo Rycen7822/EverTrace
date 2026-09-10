@@ -604,33 +604,57 @@ impl ProcedureUsageCurrentView {
     }
 
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, SemanticServiceError> {
+        Self::from_snapshot_input(snapshot, false)
+    }
+
+    /// Promotion consumes existing, validated usage outcomes, not the execution
+    /// history needed to derive a new usage. Select rows before decoding bodies,
+    /// while sharing current-revision and negative-review reduction below.
+    pub(crate) fn from_promotion_snapshot(
+        snapshot: &ProjectionSnapshot,
+    ) -> Result<Self, SemanticServiceError> {
+        Self::from_snapshot_input(snapshot, true)
+    }
+
+    fn from_snapshot_input(
+        snapshot: &ProjectionSnapshot,
+        promotion_only: bool,
+    ) -> Result<Self, SemanticServiceError> {
         let mut view = Self {
             frontier: snapshot.frontier,
             ..Self::default()
         };
         for row in snapshot.data_rows() {
-            if !matches!(
+            let promotion_input = matches!(
                 row.object_kind.as_deref(),
                 Some(
                     "procedure_revision"
                         | "procedure_state_event"
                         | "task"
-                        | "workstream"
-                        | "work_binding"
-                        | "attempt"
-                        | "experiment_run"
-                        | "result_evidence"
-                        | "work_episode"
-                        | "host_occurrence"
-                        | "operation"
-                        | "source_observation"
-                        | "source_receipt"
-                        | "scope_effect"
                         | "procedure_usage_revision"
                         | "procedure_negative_evidence"
                         | "procedure_negative_review"
                 )
-            ) {
+            );
+            if !promotion_input
+                && (promotion_only
+                    || !matches!(
+                        row.object_kind.as_deref(),
+                        Some(
+                            "workstream"
+                                | "work_binding"
+                                | "attempt"
+                                | "experiment_run"
+                                | "result_evidence"
+                                | "work_episode"
+                                | "host_occurrence"
+                                | "operation"
+                                | "source_observation"
+                                | "source_receipt"
+                                | "scope_effect"
+                        )
+                    ))
+            {
                 continue;
             }
             let Some(payload_json) = row.payload_json.as_deref() else {
@@ -2490,6 +2514,121 @@ fn validate_physical_usage(
     Ok((!operations.is_empty(), adopted_attempt))
 }
 
+pub(crate) const PROMOTION_USAGE_LIMIT: usize = 4096;
+
+pub(crate) struct ProcedurePromotionCohort {
+    pub(crate) procedure_revision_id: RevisionId,
+    pub(crate) usage_revision_refs: Vec<RevisionId>,
+}
+
+impl ProcedureUsageCurrentView {
+    /// A finite, deterministic search, not proof that an unselected cohort
+    /// does not exist. Prefer smaller root sets so a broad early Task cannot
+    /// hide the simple {x,y}, {x}, {y}, {z}, {w} four-Task cohort.
+    pub(crate) fn promotion_cohorts(
+        &self,
+        threshold: u32,
+        occurred_at_us: i64,
+        target: Option<RevisionId>,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<ProcedurePromotionCohort>, SemanticServiceError> {
+        validate_promotion_threshold(threshold)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+        let mut candidate_count = 0;
+        for usage in self.usages.values() {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if target.is_none_or(|id| id == usage.procedure_revision_id)
+                && usage.stage == evertrace_domain::procedure::ProcedureUsageStage::Outcome
+                && usage.outcome_supported == evertrace_domain::procedure::ProcedureTruth::True
+                && usage.created_at_us <= occurred_at_us
+                && self.promotion_allowed(usage.procedure_revision_id, occurred_at_us)
+                && independent_tasks(self, &[usage])
+            {
+                groups
+                    .entry(usage.procedure_revision_id)
+                    .or_default()
+                    .push(usage);
+                candidate_count += 1;
+                if candidate_count == PROMOTION_USAGE_LIMIT {
+                    break;
+                }
+            }
+        }
+        let mut selected = Vec::new();
+        for (procedure_revision_id, mut candidates) in groups {
+            candidates.sort_by_key(|usage| {
+                (
+                    self.tasks[&usage.task_id].request_root_refs.len(),
+                    usage.task_id,
+                    usage.usage_revision_id,
+                )
+            });
+            let mut cohort = Vec::new();
+            for usage in candidates {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                cohort.push(usage);
+                if !independent_tasks(self, &cohort) {
+                    cohort.pop();
+                }
+                if cohort.len() == threshold as usize {
+                    break;
+                }
+            }
+            if cohort.len() == threshold as usize
+                && cohort_promotion_event(
+                    self,
+                    procedure_revision_id,
+                    &cohort,
+                    threshold,
+                    occurred_at_us,
+                )?
+                .is_some()
+            {
+                selected.push(ProcedurePromotionCohort {
+                    procedure_revision_id,
+                    usage_revision_refs: cohort
+                        .iter()
+                        .map(|usage| usage.usage_revision_id)
+                        .collect(),
+                });
+                if selected.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    fn promotion_allowed(&self, revision_id: RevisionId, occurred_at_us: i64) -> bool {
+        self.current_procedure_by_revision(revision_id).is_some_and(|procedure| {
+            (!matches!(procedure.draft.scope, ProcedureScope::Global)
+                || self.procedure_support.get(&revision_id).and_then(|value| value.as_deref()) == Some("valid"))
+                && self.publications.get(&revision_id).is_some_and(|(event, _)| {
+                    event.to_state == ProcedurePublicationState::ActiveProbationary
+                        && event.created_at_us <= occurred_at_us
+                })
+                && !self.has_local_quarantine(revision_id)
+                && !self.negatives.values().any(|negative| {
+                    negative.procedure_revision_id == revision_id
+                        && negative.level != evertrace_domain::procedure::ProcedureNegativeLevel::Ineffective
+                        && self.negative_reviews.get(&negative.negative_evidence_id).is_some_and(|review| {
+                            matches!(review.status,
+                                evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending
+                                    | evertrace_domain::procedure::ProcedureNegativeReviewStatus::Upheld)
+                        })
+                })
+        })
+    }
+}
+
 /// Validate a specified current cohort and promote without manufacturing a
 /// usage successor. Cohort selection belongs to the calling planner; None is
 /// not a claim that no other qualifying cohort exists.
@@ -2577,8 +2716,7 @@ fn cohort_promotion_event(
         return Err(SemanticServiceError::InvalidInput);
     }
     if successes.len() < threshold as usize
-        || publication.0.to_state != ProcedurePublicationState::ActiveProbationary
-        || view.has_local_quarantine(procedure_revision_id)
+        || !view.promotion_allowed(procedure_revision_id, occurred_at_us)
     {
         return Ok(None);
     }
@@ -2659,26 +2797,23 @@ fn independent_tasks(
     view: &ProcedureUsageCurrentView,
     usages: &[&evertrace_domain::procedure::ProcedureUsageRevision],
 ) -> bool {
-    for (index, usage) in usages.iter().enumerate() {
+    let mut tasks = std::collections::BTreeSet::new();
+    let mut roots = std::collections::BTreeSet::<&str>::new();
+    for usage in usages {
         let Some(task) = view.tasks.get(&usage.task_id) else {
             return false;
         };
-        if task.continuation_of_task_id.is_some() || task.split_from_task_id.is_some() {
+        if task.continuation_of_task_id.is_some()
+            || task.split_from_task_id.is_some()
+            || !tasks.insert(task.task_id)
+            || task
+                .request_root_refs
+                .iter()
+                .any(|root| roots.contains(root.as_str()))
+        {
             return false;
         }
-        for other in &usages[..index] {
-            let Some(other_task) = view.tasks.get(&other.task_id) else {
-                return false;
-            };
-            if task.task_id == other_task.task_id
-                || task
-                    .request_root_refs
-                    .iter()
-                    .any(|value| other_task.request_root_refs.contains(value))
-            {
-                return false;
-            }
-        }
+        roots.extend(task.request_root_refs.iter().map(String::as_str));
     }
     true
 }
@@ -2748,6 +2883,199 @@ mod negative_review_selection_tests {
             VariableDeclaration,
         },
     };
+
+    #[test]
+    fn promotion_selection_does_not_spend_candidate_budget_on_unrelated_history() {
+        use evertrace_domain::{
+            procedure::{ProcedureDraft, ProcedureKind, ProcedureWhen},
+            semantic::{ConstraintExpr, ConstraintField, ConstraintValue},
+            work::{Task, TaskIdentityConfidence, TaskLifecycle, TaskScopeMembership},
+        };
+
+        let (history, _) = review_view(ResultKind::Passed);
+        let template = history.usages.values().next().unwrap();
+        let revision = template.procedure_revision_id;
+        let procedure_id = ProcedureId::new_v7();
+        let repository_id = evertrace_domain::ids::RepositoryId::new_v7();
+        let condition = |value: &str| ConstraintExpr::Eq {
+            field: ConstraintField::Phase,
+            value: ConstraintValue::Text(value.into()),
+        };
+        let procedure = ProcedureRevision {
+            procedure_id,
+            revision_id: revision,
+            parent_revision_id: None,
+            revision_generation: 1,
+            draft: ProcedureDraft {
+                scope: ProcedureScope::Repository { repository_id },
+                title: "Existing cohort".into(),
+                summary: "Selection from validated outcomes".into(),
+                kind: ProcedureKind::Diagnostic,
+                when: ProcedureWhen {
+                    goals: vec![],
+                    targets: vec![],
+                    signals: vec![],
+                    stage: "verify".into(),
+                    requires: vec![],
+                    excludes: vec![],
+                },
+                condition_ir_version: 1,
+                applicability_expr: condition("verify"),
+                avoid_expr: condition("unsafe"),
+                completion_expr: condition("done"),
+                stage_alignment: None,
+                actions: ProcedureActions {
+                    stages: vec!["verify".into()],
+                    branches: vec![],
+                    avoid: vec![],
+                },
+                done: ProcedureDone {
+                    success: vec!["passed".into()],
+                    abort: vec!["stop".into()],
+                    verify: vec!["fixed verifier".into()],
+                },
+                pitfalls: vec![],
+                evidence_refs: vec!["existing:evidence".into()],
+                support_revision_refs: vec![],
+            },
+            source_watermark: 1,
+            created_at_us: 1,
+        };
+        procedure.validate().unwrap();
+        let mut view = ProcedureUsageCurrentView::default();
+        view.procedures.insert(revision, procedure);
+        view.current_procedures.insert(procedure_id, revision);
+        view.publications.insert(
+            revision,
+            (
+                ProcedureStateEvent {
+                    state_event_id: RevisionId::new_v7(),
+                    procedure_revision_id: revision,
+                    from_state: None,
+                    to_state: ProcedurePublicationState::ActiveProbationary,
+                    reason: ProcedureStateReason::Accepted,
+                    resume_state: None,
+                    evidence_refs: vec!["existing:evidence".into()],
+                    created_at_us: 1,
+                },
+                1,
+            ),
+        );
+        // Only in-memory current metadata: no thousands of persisted histories.
+        let mut ids = (0..PROMOTION_USAGE_LIMIT + 3)
+            .map(|_| ProcedureUsageId::new_v7())
+            .collect::<Vec<_>>();
+        ids.sort();
+        for (index, procedure_usage_id) in ids.into_iter().enumerate() {
+            let mut usage = template.clone();
+            usage.procedure_usage_id = procedure_usage_id;
+            usage.usage_revision_id = RevisionId::new_v7();
+            usage.outcome_supported = ProcedureTruth::True;
+            if index < PROMOTION_USAGE_LIMIT {
+                if index % 2 == 0 {
+                    usage.stage = ProcedureUsageStage::Routed;
+                } else {
+                    usage.procedure_revision_id = RevisionId::new_v7();
+                }
+            } else {
+                usage.task_id = TaskId::new_v7();
+                view.tasks.insert(
+                    usage.task_id,
+                    Task {
+                        task_id: usage.task_id,
+                        revision_id: RevisionId::new_v7(),
+                        predecessor_revision_id: None,
+                        request_root_refs: vec![format!("request:{index}")],
+                        canonical_goal: "verify".into(),
+                        scope_memberships: vec![TaskScopeMembership {
+                            repository_instance_id: Some(repository_id),
+                            worktree_instance_ids: vec![],
+                        }],
+                        identity_confidence: TaskIdentityConfidence::Explicit,
+                        lifecycle: TaskLifecycle::Active,
+                        continuation_of_task_id: None,
+                        split_from_task_id: None,
+                        split_into_task_ids: vec![],
+                        merged_from_task_ids: vec![],
+                        merged_into_task_id: None,
+                        created_at_us: 1,
+                        closed_at_us: None,
+                        source_watermark: 1,
+                    },
+                );
+            }
+            view.usages.insert(procedure_usage_id, usage);
+        }
+        for target in [None, Some(revision)] {
+            let cohorts = view
+                .promotion_cohorts(
+                    3,
+                    20,
+                    target,
+                    1,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(cohorts.len(), 1);
+            assert_eq!(cohorts[0].procedure_revision_id, revision);
+            assert_eq!(cohorts[0].usage_revision_refs.len(), 3);
+        }
+    }
+
+    #[test]
+    fn promotion_snapshot_skips_execution_bodies_before_shared_reduction() {
+        let (view, _) = review_view(ResultKind::Passed);
+        let mut snapshot = ProjectionSnapshot {
+            frontier: 20,
+            rows: [
+                (
+                    "procedure_usage_revision",
+                    JournalPayload::ProcedureUsageRecorded(Box::new(
+                        view.usages.values().next().unwrap().clone(),
+                    )),
+                ),
+                (
+                    "procedure_negative_evidence",
+                    JournalPayload::ProcedureNegativeEvidenceRecorded(Box::new(
+                        view.negatives.values().next().unwrap().clone(),
+                    )),
+                ),
+                (
+                    "procedure_negative_review",
+                    JournalPayload::ProcedureNegativeReviewRecorded(Box::new(
+                        view.negative_reviews.values().next().unwrap().clone(),
+                    )),
+                ),
+            ]
+            .into_iter()
+            .map(|(kind, payload)| evertrace_store::ObjectRow {
+                row_kind: evertrace_store::ObjectRowKind::Data,
+                object_kind: Some(kind.into()),
+                payload_json: Some(serde_json::to_string(&payload).unwrap()),
+                ..evertrace_store::ObjectRow::checkpoint(20, 1)
+            })
+            .collect(),
+        };
+        let full = ProcedureUsageCurrentView::from_snapshot(&snapshot).unwrap();
+        // A deliberately undecodable sentinel proves this unrelated body does
+        // not reach serde. It is not offered as valid durable receipt evidence.
+        snapshot.rows.push(evertrace_store::ObjectRow {
+            row_kind: evertrace_store::ObjectRowKind::Data,
+            object_kind: Some("source_receipt".into()),
+            payload_json: Some("x".repeat(64 * 1024)),
+            ..evertrace_store::ObjectRow::checkpoint(20, 1)
+        });
+        assert!(ProcedureUsageCurrentView::from_snapshot(&snapshot).is_err());
+        let narrow = ProcedureUsageCurrentView::from_promotion_snapshot(&snapshot).unwrap();
+        assert_eq!(narrow.frontier, full.frontier);
+        assert_eq!(narrow.usages, full.usages);
+        assert_eq!(narrow.negatives, full.negatives);
+        assert_eq!(narrow.negative_reviews, full.negative_reviews);
+        assert_eq!(narrow.quarantines, full.quarantines);
+        assert!(narrow.receipt_times.is_empty());
+        snapshot.rows.last_mut().unwrap().object_kind = Some("procedure_usage_revision".into());
+        assert!(ProcedureUsageCurrentView::from_promotion_snapshot(&snapshot).is_err());
+    }
 
     #[test]
     fn compiled_quarantine_context_distinguishes_unknown_from_known_difference() {
