@@ -1180,6 +1180,22 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
         )
     );
     let purged_frontier = purged.frontier;
+    // Source-summary input selection uses this same retained-source ledger,
+    // with the join narrowed before unrelated receipt bodies are decoded.
+    let full_suppression = ObjectDeletionCandidateAdmissionView::from_snapshot(&purged).unwrap();
+    for (observation, suppressed) in [
+        (exclusive_observation.source_observation_id, true),
+        (host_shared_observation.source_observation_id, false),
+    ] {
+        let refs = vec![observation.to_string()];
+        let selected =
+            ObjectDeletionCandidateAdmissionView::for_source_refs(&purged, &refs).unwrap();
+        assert_eq!(selected.source_refs_suppressed(&refs).unwrap(), suppressed);
+        assert_eq!(
+            full_suppression.source_refs_suppressed(&refs).unwrap(),
+            suppressed
+        );
+    }
     let mut old_id_resurrection = target_atom.clone();
     old_id_resurrection.revision_id = evertrace_domain::revision::RevisionId::new_v7();
     old_id_resurrection.parent_revision_id = Some(target_atom.revision_id);

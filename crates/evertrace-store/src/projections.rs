@@ -2828,6 +2828,31 @@ pub struct ObjectDeletionCandidateAdmissionView {
 
 impl ObjectDeletionCandidateAdmissionView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_selected_snapshot(snapshot, None)
+    }
+
+    /// The same deletion reduction, restricted before body decoding to the
+    /// frozen source input's observation/receipt/surface join.
+    pub fn for_source_refs(
+        snapshot: &ProjectionSnapshot,
+        refs: &[String],
+    ) -> Result<Self, StoreError> {
+        if refs.is_empty()
+            || refs.len() > 64
+            || !refs.windows(2).all(|pair| pair[0] < pair[1])
+            || refs
+                .iter()
+                .any(|reference| reference.parse::<SourceObservationId>().is_err())
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        Self::from_selected_snapshot(snapshot, Some(refs))
+    }
+
+    fn from_selected_snapshot(
+        snapshot: &ProjectionSnapshot,
+        selected: Option<&[String]>,
+    ) -> Result<Self, StoreError> {
         let ledger = crate::purge::ObjectDeletionCurrentView::from_snapshot(snapshot)?;
         let deletions = ledger.events.into_values().collect::<Vec<_>>();
         if deletions.is_empty() {
@@ -2840,46 +2865,66 @@ impl ObjectDeletionCandidateAdmissionView {
         }
         let mut source_observation_receipts = BTreeMap::new();
         let mut source_receipts = BTreeMap::new();
-        for row in snapshot.data_rows().filter(|row| {
-            matches!(
-                row.object_kind.as_deref(),
-                Some("source_observation" | "source_receipt")
-            )
-        }) {
-            let payload: JournalPayload = serde_json::from_str(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?,
-            )
-            .map_err(|_| StoreError::StoreCorrupt)?;
-            match payload {
-                JournalPayload::SourceObservationRecorded(value) => {
-                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
-                    if source_observation_receipts
-                        .insert(value.source_observation_id, value.source_receipt_ref)
-                        .is_some()
-                    {
-                        return Err(StoreError::StoreCorrupt);
+        let mut selected_receipts = BTreeSet::new();
+        for kind in ["source_observation", "source_receipt"] {
+            for row in snapshot.data_rows().filter(|row| {
+                row.object_kind.as_deref() == Some(kind)
+                    && selected.is_none_or(|refs| {
+                        row.object_id.as_ref().is_some_and(|id| {
+                            if kind == "source_observation" {
+                                refs.binary_search(id).is_ok()
+                            } else {
+                                selected_receipts.contains(id)
+                            }
+                        })
+                    })
+            }) {
+                let payload: JournalPayload = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+                match payload {
+                    JournalPayload::SourceObservationRecorded(value) => {
+                        value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                        if source_observation_receipts
+                            .insert(value.source_observation_id, value.source_receipt_ref)
+                            .is_some()
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
                     }
-                }
-                JournalPayload::SourceReceiptRecorded(value) => {
-                    value.validate().map_err(|_| StoreError::StoreCorrupt)?;
-                    if source_receipts
-                        .insert(value.source_receipt_id, *value)
-                        .is_some()
-                    {
-                        return Err(StoreError::StoreCorrupt);
+                    JournalPayload::SourceReceiptRecorded(value) => {
+                        value.validate().map_err(|_| StoreError::StoreCorrupt)?;
+                        if source_receipts
+                            .insert(value.source_receipt_id, *value)
+                            .is_some()
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
                     }
+                    _ => return Err(StoreError::StoreCorrupt),
                 }
-                _ => return Err(StoreError::StoreCorrupt),
+            }
+            if selected.is_some() && kind == "source_observation" {
+                selected_receipts.extend(
+                    source_observation_receipts
+                        .values()
+                        .map(ToString::to_string),
+                );
             }
         }
         let mut source_suppression_refs = BTreeMap::new();
         let mut seen_surfaces = BTreeSet::new();
-        for row in snapshot
-            .data_rows()
-            .filter(|row| row.object_kind.as_deref() == Some("evidence_surface"))
-        {
+        for row in snapshot.data_rows().filter(|row| {
+            row.object_kind.as_deref() == Some("evidence_surface")
+                && selected.is_none_or(|refs| {
+                    row.current_revision_id
+                        .as_ref()
+                        .is_some_and(|id| refs.binary_search(id).is_ok())
+                })
+        }) {
             let payload: JournalPayload = serde_json::from_str(
                 row.payload_json
                     .as_deref()
@@ -2936,6 +2981,30 @@ impl ObjectDeletionCandidateAdmissionView {
                 suppression_refs: &self.source_suppression_refs,
             },
         )
+    }
+
+    /// Source-summary inputs use the same retained-source suppression hashes as
+    /// ordinary retrieval and proposal admission, without creating an asset.
+    pub fn source_refs_suppressed(&self, refs: &[String]) -> Result<bool, StoreError> {
+        if self.deletions.is_empty() {
+            return Ok(false);
+        }
+        for reference in refs {
+            let id = reference
+                .parse::<SourceObservationId>()
+                .map_err(|_| StoreError::InvalidInput)?;
+            if self.source_suppression_refs.get(&id).is_some_and(|hashes| {
+                self.deletions.iter().any(|event| {
+                    event
+                        .default_retrieval_suppression_ref_hashes
+                        .iter()
+                        .any(|hash| hashes.contains(hash))
+                })
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -4557,7 +4626,9 @@ fn derive_repository_scope_purge_preview(
             .values()
             .filter(|(digest, _)| {
                 digest.repository_id == Some(repository_id)
-                    || target_episodes.contains(&digest.episode_id)
+                    || digest
+                        .episode_id
+                        .is_some_and(|id| target_episodes.contains(&id))
                     || digest.selected_direct_refs.iter().any(|reference| {
                         typed_text_references_target(
                             reference,
@@ -4573,7 +4644,8 @@ fn derive_repository_scope_purge_preview(
             .runs()
             .values()
             .filter(|(run, _)| {
-                target_episodes.contains(&run.episode_id)
+                run.episode_id
+                    .is_some_and(|id| target_episodes.contains(&id))
                     || run.selected_direct_refs.iter().any(|reference| {
                         typed_text_references_target(
                             reference,
@@ -5054,10 +5126,21 @@ fn job_targets_repository(
             .idempotency_key
             .strip_prefix("session_import:")
             .is_some_and(|session_id| session_ids.contains(session_id)),
-        "semantic_synthesis_v1" => job
-            .target_revision
-            .parse::<RevisionId>()
-            .is_ok_and(|id| episode_revision_ids.contains(&id)),
+        "semantic_synthesis_v1" => evertrace_domain::semantic::SemanticJobTarget::parse(
+            &job.target_revision,
+        )
+        .is_ok_and(|target| match target {
+            evertrace_domain::semantic::SemanticJobTarget::Episode(id) => {
+                episode_revision_ids.contains(&id)
+            }
+            evertrace_domain::semantic::SemanticJobTarget::Source {
+                first_observation_id,
+                last_observation_id,
+            } => {
+                observation_ids.contains(&first_observation_id)
+                    || observation_ids.contains(&last_observation_id)
+            }
+        }),
         "physical_normalization" | "capture_reconciliation" => job
             .target_revision
             .parse::<SourceObservationId>()
@@ -5575,7 +5658,9 @@ impl RepositoryClosureKeys {
             }
             JournalPayload::SemanticDigestRecorded(value) => {
                 value.repository_id == Some(repository_id)
-                    || self.episode_ids.contains(&value.episode_id)
+                    || value
+                        .episode_id
+                        .is_some_and(|id| self.episode_ids.contains(&id))
                     || value.selected_direct_refs.iter().any(|reference| {
                         typed_text_references_target(
                             reference,
@@ -5586,7 +5671,13 @@ impl RepositoryClosureKeys {
                     })
             }
             JournalPayload::SemanticDerivationRunRecorded(value) => {
-                self.episode_ids.contains(&value.episode_id)
+                value
+                    .episode_id
+                    .is_some_and(|id| self.episode_ids.contains(&id))
+                    || value
+                        .source_target
+                        .as_ref()
+                        .is_some_and(|source| source.repository_id == repository_id)
                     || value.selected_direct_refs.iter().any(|reference| {
                         typed_text_references_target(
                             reference,
@@ -6341,6 +6432,8 @@ impl JournalAdmissionState {
                     s23: &self.s23,
                     refs: &synthesis_refs,
                     proposal_evidence_refs: &proposal_evidence_refs,
+                    source_receipts: &self.source_receipts,
+                    source_observations: &self.source_observations,
                 },
                 command.events().iter().map(|event| &event.payload),
             )
@@ -6540,6 +6633,8 @@ impl JournalAdmissionState {
                 s23: &self.s23,
                 refs: &synthesis_refs,
                 proposal_evidence_refs: &proposal_evidence_refs,
+                source_receipts: &self.source_receipts,
+                source_observations: &self.source_observations,
             },
             parsed.iter().map(|(payload, _, _)| payload),
         )?;
@@ -9902,8 +9997,12 @@ impl ReducerState {
         semantic::rebuild_proposals(&mut self.proposals, &self.proposal_revisions)?;
         self.procedure.rebuild()?;
         self.s23.rebuild()?;
-        self.synthesis
-            .rebuild(&self.episodes, &self.episode_revisions)?;
+        self.synthesis.rebuild(
+            &self.episodes,
+            &self.episode_revisions,
+            &self.source_receipts,
+            &self.source_observations,
+        )?;
         Ok(())
     }
 

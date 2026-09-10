@@ -93,9 +93,22 @@ impl SnapshotRefIndex {
     }
 }
 
+/// Fully resolved input for one claim. Source job anchors are resolved through
+/// their immutable receipts; this is not a second durable target codec.
+pub enum SynthesisTarget {
+    Episode(RevisionId),
+    Source {
+        source: evertrace_domain::semantic::SemanticSourceTarget,
+        after_sequence: u64,
+        through_sequence: u64,
+    },
+}
+
+pub(crate) mod source;
+
 pub struct SynthesisRequest<'a> {
     pub snapshot: &'a ProjectionSnapshot,
-    pub episode_revision_id: RevisionId,
+    pub target: SynthesisTarget,
     pub trigger: SemanticDigestTrigger,
     pub direct_delta: Vec<ProtectedDeltaItem>,
     pub selected_direct_refs: Vec<String>,
@@ -103,6 +116,31 @@ pub struct SynthesisRequest<'a> {
     pub occurred_at_us: i64,
     pub algorithm_revision: String,
     pub effective_config_hash: [u8; 32],
+}
+
+impl SynthesisRequest<'_> {
+    fn source_target(&self) -> Option<&evertrace_domain::semantic::SemanticSourceTarget> {
+        match &self.target {
+            SynthesisTarget::Source { source, .. } => Some(source),
+            SynthesisTarget::Episode(_) => None,
+        }
+    }
+
+    fn interval(
+        &self,
+        episode: Option<&WorkEpisode>,
+    ) -> Result<(u64, u64), crate::semantic::SemanticServiceError> {
+        match &self.target {
+            SynthesisTarget::Source {
+                after_sequence,
+                through_sequence,
+                ..
+            } => Ok((*after_sequence, *through_sequence)),
+            SynthesisTarget::Episode(_) => episode
+                .map(|episode| (episode.semantic_watermark, episode.source_watermark))
+                .ok_or(crate::semantic::SemanticServiceError::InvalidInput),
+        }
+    }
 }
 
 pub enum SynthesisResolution {
@@ -114,7 +152,7 @@ pub enum SynthesisResolution {
     Success {
         digest: Box<SemanticDigest>,
         run: SemanticDerivationRun,
-        episode: Box<WorkEpisode>,
+        episode: Option<Box<WorkEpisode>>,
         command: JournalCommand,
     },
 }
@@ -302,7 +340,7 @@ impl SynthesisPlanner {
         let resolution = self
             .execute(SynthesisRequest {
                 snapshot,
-                episode_revision_id: episode.revision_id,
+                target: SynthesisTarget::Episode(episode.revision_id),
                 trigger,
                 direct_delta,
                 selected_direct_refs,
@@ -312,65 +350,16 @@ impl SynthesisPlanner {
                 effective_config_hash: job.config_hash,
             })
             .await?;
-        let (mut events, outcome, reason, result_ref) = match resolution {
-            SynthesisResolution::NoDelta => (
-                Vec::new(),
-                JobTerminalOutcome::Succeeded,
-                JobTerminalReason::Completed,
-                Some(job.target_revision.clone()),
-            ),
-            SynthesisResolution::Audit { run, command } => {
-                let reason = match run.status {
-                    DerivationRunStatus::BudgetExhausted => JobTerminalReason::BudgetExhausted,
-                    DerivationRunStatus::ProviderUnavailable
-                    | DerivationRunStatus::ProviderFailed => JobTerminalReason::SourceUnavailable,
-                    DerivationRunStatus::PlannerNotAdmitted
-                    | DerivationRunStatus::SchemaRejected => JobTerminalReason::Unsupported,
-                    DerivationRunStatus::Succeeded => JobTerminalReason::IntegrityFailure,
-                };
-                (
-                    command.events().to_vec(),
-                    JobTerminalOutcome::Failed,
-                    reason,
-                    Some(run.derivation_run_id.to_string()),
-                )
-            }
-            SynthesisResolution::Success {
-                digest, command, ..
-            } => (
-                command.events().to_vec(),
-                JobTerminalOutcome::Succeeded,
-                JobTerminalReason::Completed,
-                Some(digest.semantic_digest_id.to_string()),
-            ),
-        };
-        let mut terminal = job.clone();
-        terminal.state = match outcome {
-            JobTerminalOutcome::Succeeded => JobStatus::Succeeded,
-            JobTerminalOutcome::Failed => JobStatus::Failed,
-        };
-        terminal.lease_until_us = None;
-        terminal.terminal = Some(Box::new(JobTerminalAudit {
-            outcome,
-            reason,
-            result_ref,
-        }));
-        events.push(JournalEventDraft {
+        durable_resolution(
+            job,
+            resolution,
             occurred_at_us,
-            source_kind: SourceKind::System,
-            scope: EventScope {
+            EventScope {
                 task_id: Some(episode.task_id.to_string()),
                 workstream_id: Some(episode.workstream_id.to_string()),
                 ..EventScope::default()
             },
-            causation_id: None,
-            correlation_id: None,
-            effective_config_hash: job.config_hash,
-            algorithm_revision: job.algorithm_revision.clone(),
-            payload: JournalPayload::JobState(terminal),
-        });
-        JournalCommand::new(CommandId::new_v7(), events)
-            .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)
+        )
     }
 
     pub(crate) fn job_identity_is_current(
@@ -417,8 +406,22 @@ impl SynthesisPlanner {
 
     pub async fn execute(
         &self,
-        mut request: SynthesisRequest<'_>,
+        request: SynthesisRequest<'_>,
     ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError> {
+        self.execute_admitted(request, || async { Ok(()) }, None)
+            .await
+    }
+
+    async fn execute_admitted<F, Fut>(
+        &self,
+        mut request: SynthesisRequest<'_>,
+        admission: F,
+        input_omission: Option<evertrace_domain::semantic::SemanticOmission>,
+    ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError>
+    where
+        F: Fn() -> Fut + Sync,
+        Fut: std::future::Future<Output = Result<(), ProviderError>> + Send,
+    {
         let original_ref_count = request.selected_direct_refs.len();
         request.selected_direct_refs.sort();
         request.selected_direct_refs.dedup();
@@ -462,36 +465,86 @@ impl SynthesisPlanner {
         {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let episode = current_episode(request.snapshot, request.episode_revision_id)?;
-        if episode.semantic_watermark >= episode.source_watermark
-            || episode.pending_semantic_delta
-                != Some(PendingSemanticInterval {
-                    after_watermark: episode.semantic_watermark,
-                    through_watermark: episode.source_watermark,
-                })
-            || request.trigger == SemanticDigestTrigger::EpisodeFinalization
-                && episode.lifecycle_status != EpisodeLifecycle::Closed
-            || request.trigger != SemanticDigestTrigger::EpisodeFinalization
-                && episode.lifecycle_status != EpisodeLifecycle::Open
-        {
+        let episode = match &request.target {
+            SynthesisTarget::Episode(revision) => {
+                Some(current_episode(request.snapshot, *revision)?)
+            }
+            SynthesisTarget::Source {
+                source,
+                after_sequence,
+                through_sequence,
+            } => {
+                if request.trigger != SemanticDigestTrigger::SourceMessages {
+                    return Err(crate::semantic::SemanticServiceError::InvalidInput);
+                }
+                source::validate_input(
+                    request.snapshot,
+                    source,
+                    *after_sequence,
+                    *through_sequence,
+                    &request.selected_direct_refs,
+                )?;
+                None
+            }
+        };
+        if episode.as_ref().is_some_and(|episode| {
+            episode.semantic_watermark >= episode.source_watermark
+                || episode.pending_semantic_delta
+                    != Some(PendingSemanticInterval {
+                        after_watermark: episode.semantic_watermark,
+                        through_watermark: episode.source_watermark,
+                    })
+                || request.trigger == SemanticDigestTrigger::EpisodeFinalization
+                    && episode.lifecycle_status != EpisodeLifecycle::Closed
+                || request.trigger != SemanticDigestTrigger::EpisodeFinalization
+                    && episode.lifecycle_status != EpisodeLifecycle::Open
+        }) {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let fingerprint = evertrace_domain::semantic::job_fingerprint(
-            episode.episode_id,
-            episode.revision_id,
-            episode.semantic_watermark,
-            episode.source_watermark,
-            &request.selected_direct_refs,
-            &self.llm.model,
-            &self.prompt_hash,
-            SEMANTIC_SCHEMA_VERSION,
-            &request.algorithm_revision,
-            &request.effective_config_hash,
-        )
+        let (from_watermark, to_watermark) = request.interval(episode.as_ref())?;
+        let prompt_hash = if request.source_target().is_some() {
+            crate::provider::source_prompt_hash()
+        } else {
+            self.prompt_hash
+        };
+        let fingerprint = if let Some(episode) = &episode {
+            evertrace_domain::semantic::job_fingerprint(
+                episode.episode_id,
+                episode.revision_id,
+                episode.semantic_watermark,
+                episode.source_watermark,
+                &request.selected_direct_refs,
+                &self.llm.model,
+                &prompt_hash,
+                SEMANTIC_SCHEMA_VERSION,
+                &request.algorithm_revision,
+                &request.effective_config_hash,
+            )
+        } else {
+            evertrace_domain::semantic::source_job_fingerprint(
+                request
+                    .source_target()
+                    .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?,
+                from_watermark,
+                to_watermark,
+                &request.selected_direct_refs,
+                &self.llm.model,
+                &prompt_hash,
+                SEMANTIC_SCHEMA_VERSION,
+                &request.algorithm_revision,
+                &request.effective_config_hash,
+            )
+        }
         .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
         let prior = prior_runs(request.snapshot)?;
         if prior.iter().any(|run| {
-            run.job_fingerprint == fingerprint && run.status == DerivationRunStatus::Succeeded
+            run.status == DerivationRunStatus::Succeeded
+                && (run.job_fingerprint == fingerprint
+                    || request.source_target().is_some_and(|source| {
+                        run.source_target.as_ref() == Some(source)
+                            && run.from_watermark < to_watermark
+                            && from_watermark < run.to_watermark
+                    }))
         }) {
             return Ok(SynthesisResolution::NoDelta);
         }
@@ -499,19 +552,26 @@ impl SynthesisPlanner {
         let episode_successes = prior
             .iter()
             .filter(|run| {
-                run.episode_id == episode.episode_id && run.status == DerivationRunStatus::Succeeded
+                episode
+                    .as_ref()
+                    .is_some_and(|episode| run.episode_id == Some(episode.episode_id))
+                    && run.status == DerivationRunStatus::Succeeded
             })
             .count();
         let input = ProtectedSemanticInput {
-            episode_id: episode.episode_id,
-            episode_revision_id: episode.revision_id,
-            task_id: episode.task_id,
-            from_watermark: episode.semantic_watermark,
-            to_watermark: episode.source_watermark,
+            episode_id: episode.as_ref().map(|episode| episode.episode_id),
+            episode_revision_id: episode.as_ref().map(|episode| episode.revision_id),
+            task_id: episode.as_ref().map(|episode| episode.task_id),
+            from_watermark,
+            to_watermark,
             trigger: trigger_name(request.trigger),
             direct_delta: request.direct_delta.clone(),
             source_refs: request.selected_direct_refs.clone(),
-            stage_trace: crate::procedure::StageTrace::compile(request.snapshot, &episode)?,
+            stage_trace: episode
+                .as_ref()
+                .map(|episode| crate::procedure::StageTrace::compile(request.snapshot, episode))
+                .transpose()?,
+            source_target: request.source_target().cloned(),
         };
         let estimated_input = u64::try_from(
             serde_json::to_vec(&input)
@@ -520,14 +580,14 @@ impl SynthesisPlanner {
                 .div_ceil(4),
         )
         .unwrap_or(u64::MAX);
-        let quota_blocked = self.llm.episode_enrichment
-            == evertrace_domain::config::EpisodeEnrichment::Off
-            || episode.lifecycle_status == EpisodeLifecycle::Open
-                && episode_successes
-                    >= usize::from(self.llm.max_episode_enrichments.saturating_sub(1))
-            || episode.lifecycle_status != EpisodeLifecycle::Open
-                && episode_successes >= usize::from(self.llm.max_episode_enrichments)
-            || daily.calls >= self.llm.daily_call_budget
+        let quota_blocked = episode.as_ref().is_some_and(|episode| {
+            self.llm.episode_enrichment == evertrace_domain::config::EpisodeEnrichment::Off
+                || episode.lifecycle_status == EpisodeLifecycle::Open
+                    && episode_successes
+                        >= usize::from(self.llm.max_episode_enrichments.saturating_sub(1))
+                || episode.lifecycle_status != EpisodeLifecycle::Open
+                    && episode_successes >= usize::from(self.llm.max_episode_enrichments)
+        }) || daily.calls >= self.llm.daily_call_budget
             || daily.wall_time_us
                 >= self
                     .llm
@@ -542,7 +602,7 @@ impl SynthesisPlanner {
             return audit_resolution(
                 self,
                 &request,
-                &episode,
+                episode.as_ref(),
                 fingerprint,
                 DerivationRunStatus::BudgetExhausted,
                 DerivationQuotaUsage::default(),
@@ -554,7 +614,7 @@ impl SynthesisPlanner {
                 return audit_resolution(
                     self,
                     &request,
-                    &episode,
+                    episode.as_ref(),
                     fingerprint,
                     DerivationRunStatus::ProviderUnavailable,
                     DerivationQuotaUsage::default(),
@@ -562,7 +622,7 @@ impl SynthesisPlanner {
             }
         };
         let started = std::time::Instant::now();
-        let derived = match provider.derive(&input).await {
+        let derived = match provider.derive_admitted(&input, &admission).await {
             Ok(value) => value,
             Err(error) => {
                 let status = if error == ProviderError::Schema {
@@ -584,7 +644,7 @@ impl SynthesisPlanner {
                 return audit_resolution(
                     self,
                     &request,
-                    &episode,
+                    episode.as_ref(),
                     fingerprint,
                     status,
                     DerivationQuotaUsage {
@@ -611,7 +671,7 @@ impl SynthesisPlanner {
             return audit_resolution(
                 self,
                 &request,
-                &episode,
+                episode.as_ref(),
                 fingerprint,
                 DerivationRunStatus::BudgetExhausted,
                 DerivationQuotaUsage {
@@ -630,17 +690,17 @@ impl SynthesisPlanner {
             .collect::<Vec<_>>();
         let mut application = match materialize_application(
             derived.application,
-            &episode,
+            episode.as_ref(),
             &evidence_refs,
             request.occurred_at_us,
-            &input.stage_trace,
+            input.stage_trace.as_ref(),
         ) {
             Ok(value) => value,
             Err(_) => {
                 return audit_resolution(
                     self,
                     &request,
-                    &episode,
+                    episode.as_ref(),
                     fingerprint,
                     DerivationRunStatus::SchemaRejected,
                     DerivationQuotaUsage {
@@ -652,11 +712,22 @@ impl SynthesisPlanner {
                 );
             }
         };
-        if validate_candidates(&application.candidates, &episode, request.snapshot).is_err() {
+        if let Some(omission) = input_omission {
+            application.omissions.push(omission);
+            if application.completeness
+                == evertrace_domain::semantic::SemanticCompleteness::Complete
+            {
+                application.completeness =
+                    evertrace_domain::semantic::SemanticCompleteness::Partial;
+            }
+        }
+        if episode.as_ref().is_some_and(|episode| {
+            validate_candidates(&application.candidates, episode, request.snapshot).is_err()
+        }) {
             return audit_resolution(
                 self,
                 &request,
-                &episode,
+                episode.as_ref(),
                 fingerprint,
                 DerivationRunStatus::SchemaRejected,
                 DerivationQuotaUsage {
@@ -680,36 +751,47 @@ impl SynthesisPlanner {
         if let (Some(coverage), Some(candidate)) = (&coverage, application.candidates.first_mut()) {
             coverage.apply_incremental_boundary(candidate);
         }
-        validate_candidates(&application.candidates, &episode, request.snapshot)?;
+        if let Some(episode) = &episode {
+            validate_candidates(&application.candidates, episode, request.snapshot)?;
+        }
         let digest_id = SemanticDigestId::new_v7();
         let digest = SemanticDigest {
             semantic_digest_id: digest_id,
-            episode_id: episode.episode_id,
-            episode_revision_id: episode.revision_id,
-            task_id: episode.task_id,
-            repository_id: episode.repository_instance_id,
-            worktree_id: episode.worktree_instance_id,
-            from_watermark: episode.semantic_watermark,
-            to_watermark: episode.source_watermark,
-            episode_source_watermark: episode.source_watermark,
-            episode_confirmation_watermark: episode.confirmation_watermark,
+            episode_id: input.episode_id,
+            episode_revision_id: input.episode_revision_id,
+            task_id: input.task_id,
+            repository_id: episode
+                .as_ref()
+                .and_then(|episode| episode.repository_instance_id)
+                .or_else(|| request.source_target().map(|source| source.repository_id)),
+            worktree_id: episode
+                .as_ref()
+                .and_then(|episode| episode.worktree_instance_id)
+                .or_else(|| request.source_target().map(|source| source.worktree_id)),
+            from_watermark,
+            to_watermark,
+            episode_source_watermark: episode.as_ref().map(|episode| episode.source_watermark),
+            episode_confirmation_watermark: episode
+                .as_ref()
+                .map(|episode| episode.confirmation_watermark),
             trigger: request.trigger,
             selected_direct_refs: request.selected_direct_refs.clone(),
             application,
             model_id: self.llm.model.clone(),
-            prompt_hash: self.prompt_hash,
+            prompt_hash,
             schema_version: SEMANTIC_SCHEMA_VERSION,
             algorithm_revision: request.algorithm_revision.clone(),
             effective_config_hash: request.effective_config_hash,
             job_fingerprint: fingerprint,
             status: SemanticDigestStatus::LlmEnriched,
             created_at_us: request.occurred_at_us,
+            source_target: request.source_target().cloned(),
         };
         if digest.validate().is_err() {
             return audit_resolution(
                 self,
                 &request,
-                &episode,
+                episode.as_ref(),
                 fingerprint,
                 DerivationRunStatus::SchemaRejected,
                 DerivationQuotaUsage {
@@ -723,7 +805,7 @@ impl SynthesisPlanner {
         let run = run(
             self,
             &request,
-            &episode,
+            episode.as_ref(),
             fingerprint,
             DerivationRunStatus::Succeeded,
             DerivationQuotaUsage {
@@ -732,41 +814,123 @@ impl SynthesisPlanner {
                 calls: 1,
                 wall_time_us: derived.wall_time_us.max(1),
             },
-        );
-        let mut successor = episode.clone();
-        successor.revision_id = RevisionId::new_v7();
-        successor.predecessor_revision_id = Some(episode.revision_id);
-        successor.revision_generation = episode
-            .revision_generation
-            .checked_add(1)
-            .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
-        successor.semantic_watermark = episode.source_watermark;
-        successor.pending_semantic_delta = None;
-        successor.semantic_digest_refs.push(digest_id.to_string());
-        successor.semantic_digest_refs.sort();
-        episode
-            .validate_successor(&successor)
-            .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
-        let mut payloads = proposal_payloads(
-            &digest,
-            request.snapshot,
-            &request,
-            &evidence_refs,
-            coverage.as_ref(),
         )?;
+        let mut payloads = if episode.is_some() {
+            proposal_payloads(
+                &digest,
+                request.snapshot,
+                &request,
+                &evidence_refs,
+                coverage.as_ref(),
+            )?
+        } else {
+            Vec::new()
+        };
+        let successor = if let Some(episode) = episode {
+            let mut successor = episode.clone();
+            successor.revision_id = RevisionId::new_v7();
+            successor.predecessor_revision_id = Some(episode.revision_id);
+            successor.revision_generation = episode
+                .revision_generation
+                .checked_add(1)
+                .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
+            successor.semantic_watermark = episode.source_watermark;
+            successor.pending_semantic_delta = None;
+            successor.semantic_digest_refs.push(digest_id.to_string());
+            successor.semantic_digest_refs.sort();
+            episode
+                .validate_successor(&successor)
+                .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+            Some(Box::new(successor))
+        } else {
+            None
+        };
         payloads.extend([
             JournalPayload::SemanticDigestRecorded(Box::new(digest.clone())),
             JournalPayload::SemanticDerivationRunRecorded(Box::new(run.clone())),
-            JournalPayload::WorkEpisodeRecorded(Box::new(successor.clone())),
         ]);
+        if let Some(successor) = &successor {
+            payloads.push(JournalPayload::WorkEpisodeRecorded(successor.clone()));
+        }
         let command = command(&request, payloads)?;
         Ok(SynthesisResolution::Success {
             digest: Box::new(digest),
             run,
-            episode: Box::new(successor),
+            episode: successor,
             command,
         })
     }
+}
+
+fn durable_resolution(
+    job: &DurableJob,
+    resolution: SynthesisResolution,
+    occurred_at_us: i64,
+    scope: EventScope,
+) -> Result<JournalCommand, crate::semantic::SemanticServiceError> {
+    let backoff = match &resolution {
+        SynthesisResolution::Audit { run, .. } if run.source_target.is_some() => {
+            source::retry_not_before(run, job.attempt)
+        }
+        _ => None,
+    };
+    let (mut events, outcome, reason, result_ref) = match resolution {
+        SynthesisResolution::NoDelta => (
+            Vec::new(),
+            JobTerminalOutcome::Succeeded,
+            JobTerminalReason::Completed,
+            Some(job.target_revision.clone()),
+        ),
+        SynthesisResolution::Audit { run, command } => {
+            let reason =
+                match run.status {
+                    DerivationRunStatus::BudgetExhausted => JobTerminalReason::BudgetExhausted,
+                    DerivationRunStatus::ProviderUnavailable
+                    | DerivationRunStatus::ProviderFailed => JobTerminalReason::SourceUnavailable,
+                    DerivationRunStatus::PlannerNotAdmitted
+                    | DerivationRunStatus::SchemaRejected => JobTerminalReason::Unsupported,
+                    DerivationRunStatus::Succeeded => JobTerminalReason::IntegrityFailure,
+                };
+            (
+                command.events().to_vec(),
+                JobTerminalOutcome::Failed,
+                reason,
+                Some(run.derivation_run_id.to_string()),
+            )
+        }
+        SynthesisResolution::Success {
+            digest, command, ..
+        } => (
+            command.events().to_vec(),
+            JobTerminalOutcome::Succeeded,
+            JobTerminalReason::Completed,
+            Some(digest.semantic_digest_id.to_string()),
+        ),
+    };
+    let mut terminal = job.clone();
+    terminal.state = match outcome {
+        JobTerminalOutcome::Succeeded => JobStatus::Succeeded,
+        JobTerminalOutcome::Failed => JobStatus::Failed,
+    };
+    terminal.lease_until_us = None;
+    terminal.backoff_until_us = backoff;
+    terminal.terminal = Some(Box::new(JobTerminalAudit {
+        outcome,
+        reason,
+        result_ref,
+    }));
+    events.push(JournalEventDraft {
+        occurred_at_us,
+        source_kind: SourceKind::System,
+        scope,
+        causation_id: None,
+        correlation_id: None,
+        effective_config_hash: job.config_hash,
+        algorithm_revision: job.algorithm_revision.clone(),
+        payload: JournalPayload::JobState(terminal),
+    });
+    JournalCommand::new(CommandId::new_v7(), events)
+        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)
 }
 
 pub(crate) fn current_synthesis_episodes(
@@ -856,7 +1020,15 @@ pub(crate) fn synthesis_budget(
 }
 
 pub(crate) fn synthesis_target_is_current(snapshot: &ProjectionSnapshot, job: &DurableJob) -> bool {
-    scheduled_input(snapshot, job).is_ok()
+    match evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision) {
+        Ok(evertrace_domain::semantic::SemanticJobTarget::Episode(_)) => {
+            scheduled_input(snapshot, job).is_ok()
+        }
+        Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. }) => {
+            source::input(snapshot, job).is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 fn scheduled_input(
@@ -871,8 +1043,12 @@ fn scheduled_input(
     ),
     crate::semantic::SemanticServiceError,
 > {
-    let revision_id = RevisionId::from_str(&job.target_revision)
-        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+    let evertrace_domain::semantic::SemanticJobTarget::Episode(revision_id) =
+        evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision)
+            .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?
+    else {
+        return Err(crate::semantic::SemanticServiceError::InvalidInput);
+    };
     let episode = current_episode(snapshot, revision_id)?;
     let trigger =
         synthesis_trigger(&episode).ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
@@ -1160,124 +1336,131 @@ fn validate_candidates(
 
 fn materialize_application(
     provider: ProviderSemanticApplication,
-    episode: &WorkEpisode,
+    episode: Option<&WorkEpisode>,
     evidence_refs: &[String],
     occurred_at_us: i64,
-    stage_trace: &crate::procedure::StageTrace,
+    stage_trace: Option<&crate::procedure::StageTrace>,
 ) -> Result<SemanticDigestApplication, crate::semantic::SemanticServiceError> {
-    if provider.candidates.len() > 1 || !provider.candidates.is_empty() && evidence_refs.is_empty()
+    if provider.candidates.len() > 1
+        || !provider.candidates.is_empty() && (evidence_refs.is_empty() || episode.is_none())
     {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     }
     let candidates = provider
         .candidates
         .into_iter()
-        .map(|candidate| match candidate {
-            ProviderSemanticCandidate::ScenarioPatch {
-                scenario_revision_id,
-                current_state_delta,
-                open_loop_delta,
-                outcome_delta,
-            } => Ok(SemanticCandidate::ScenarioPatch {
-                scenario_revision_id,
-                task_id: episode.task_id,
-                repository_id: episode.repository_instance_id,
-                worktree_id: episode.worktree_instance_id,
-                current_state_delta,
-                open_loop_delta,
-                outcome_delta,
-            }),
-            ProviderSemanticCandidate::AtomCandidate {
-                operation,
-                target_id,
-                base_revision_id,
-                atom_kind,
-                value,
-                applicability_expr,
-            } => {
-                let draft = AtomDraft {
-                    kind: atom_kind,
-                    epistemic_status: if atom_kind.is_normative() {
-                        EpistemicStatus::NotApplicable
-                    } else {
-                        EpistemicStatus::Unverified
-                    },
-                    value: value.into(),
-                    scope: AtomScope::Task {
-                        task_id: episode.task_id,
-                    },
+        .map(|candidate| {
+            let episode = episode.ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
+            match candidate {
+                ProviderSemanticCandidate::ScenarioPatch {
+                    scenario_revision_id,
+                    current_state_delta,
+                    open_loop_delta,
+                    outcome_delta,
+                } => Ok(SemanticCandidate::ScenarioPatch {
+                    scenario_revision_id,
+                    task_id: episode.task_id,
+                    repository_id: episode.repository_instance_id,
+                    worktree_id: episode.worktree_instance_id,
+                    current_state_delta,
+                    open_loop_delta,
+                    outcome_delta,
+                }),
+                ProviderSemanticCandidate::AtomCandidate {
+                    operation,
+                    target_id,
+                    base_revision_id,
+                    atom_kind,
+                    value,
                     applicability_expr,
-                    future_cue_lifecycle_exprs: None,
-                    validity_interval: ValidityInterval {
-                        valid_from_us: occurred_at_us,
-                        valid_until_us: None,
-                    },
-                    provenance: vec![AtomProvenance::LlmDerived],
-                    source_observation_refs: Vec::new(),
-                    evidence_refs: evidence_refs.to_vec(),
-                    supersedes_revision_refs: Vec::new(),
-                    supports_revision_refs: Vec::new(),
-                    contradicts_revision_refs: Vec::new(),
-                };
-                let payload = match operation {
-                    ProviderAtomOperation::Create => AtomProposalPayload::Create { draft },
-                    ProviderAtomOperation::Replace => AtomProposalPayload::Replace { draft },
-                    ProviderAtomOperation::Reclassify => AtomProposalPayload::Reclassify { draft },
-                };
-                Ok(SemanticCandidate::AtomProposal {
-                    target_id,
-                    base_revision_id,
-                    payload: Box::new(payload),
-                })
-            }
-            ProviderSemanticCandidate::ProcedureCandidate {
-                operation,
-                target_id,
-                base_revision_id,
-                content,
-            } => {
-                let scope = match (episode.repository_instance_id, episode.worktree_instance_id) {
-                    (Some(repository_id), Some(worktree_id)) => ProcedureScope::Worktree {
-                        repository_id,
-                        worktree_id,
-                    },
-                    (Some(repository_id), None) => ProcedureScope::Repository { repository_id },
-                    _ => return Err(crate::semantic::SemanticServiceError::InvalidInput),
-                };
-                let content = *content;
-                let draft = ProcedureDraft {
-                    scope,
-                    title: content.title,
-                    summary: content.summary,
-                    kind: content.procedure_kind,
-                    when: content.when,
-                    condition_ir_version: 1,
-                    applicability_expr: content.applicability_expr,
-                    avoid_expr: content.avoid_expr,
-                    completion_expr: content.completion_expr,
-                    stage_alignment: content.stage_alignment,
-                    actions: content.actions,
-                    done: content.done,
-                    pitfalls: content.pitfalls,
-                    evidence_refs: evidence_refs.to_vec(),
-                    support_revision_refs: Vec::new(),
-                };
-                if !stage_trace.supports(&draft) {
-                    return Err(crate::semantic::SemanticServiceError::InvalidInput);
+                } => {
+                    let draft = AtomDraft {
+                        kind: atom_kind,
+                        epistemic_status: if atom_kind.is_normative() {
+                            EpistemicStatus::NotApplicable
+                        } else {
+                            EpistemicStatus::Unverified
+                        },
+                        value: value.into(),
+                        scope: AtomScope::Task {
+                            task_id: episode.task_id,
+                        },
+                        applicability_expr,
+                        future_cue_lifecycle_exprs: None,
+                        validity_interval: ValidityInterval {
+                            valid_from_us: occurred_at_us,
+                            valid_until_us: None,
+                        },
+                        provenance: vec![AtomProvenance::LlmDerived],
+                        source_observation_refs: Vec::new(),
+                        evidence_refs: evidence_refs.to_vec(),
+                        supersedes_revision_refs: Vec::new(),
+                        supports_revision_refs: Vec::new(),
+                        contradicts_revision_refs: Vec::new(),
+                    };
+                    let payload = match operation {
+                        ProviderAtomOperation::Create => AtomProposalPayload::Create { draft },
+                        ProviderAtomOperation::Replace => AtomProposalPayload::Replace { draft },
+                        ProviderAtomOperation::Reclassify => {
+                            AtomProposalPayload::Reclassify { draft }
+                        }
+                    };
+                    Ok(SemanticCandidate::AtomProposal {
+                        target_id,
+                        base_revision_id,
+                        payload: Box::new(payload),
+                    })
                 }
-                let payload = match operation {
-                    ProviderProcedureOperation::Create => {
-                        evertrace_domain::semantic::ProcedureProposalPayload::Create { draft }
-                    }
-                    ProviderProcedureOperation::Replace => {
-                        evertrace_domain::semantic::ProcedureProposalPayload::Replace { draft }
-                    }
-                };
-                Ok(SemanticCandidate::ProcedureProposal {
+                ProviderSemanticCandidate::ProcedureCandidate {
+                    operation,
                     target_id,
                     base_revision_id,
-                    payload: Box::new(payload),
-                })
+                    content,
+                } => {
+                    let scope = match (episode.repository_instance_id, episode.worktree_instance_id)
+                    {
+                        (Some(repository_id), Some(worktree_id)) => ProcedureScope::Worktree {
+                            repository_id,
+                            worktree_id,
+                        },
+                        (Some(repository_id), None) => ProcedureScope::Repository { repository_id },
+                        _ => return Err(crate::semantic::SemanticServiceError::InvalidInput),
+                    };
+                    let content = *content;
+                    let draft = ProcedureDraft {
+                        scope,
+                        title: content.title,
+                        summary: content.summary,
+                        kind: content.procedure_kind,
+                        when: content.when,
+                        condition_ir_version: 1,
+                        applicability_expr: content.applicability_expr,
+                        avoid_expr: content.avoid_expr,
+                        completion_expr: content.completion_expr,
+                        stage_alignment: content.stage_alignment,
+                        actions: content.actions,
+                        done: content.done,
+                        pitfalls: content.pitfalls,
+                        evidence_refs: evidence_refs.to_vec(),
+                        support_revision_refs: Vec::new(),
+                    };
+                    if stage_trace.is_none_or(|trace| !trace.supports(&draft)) {
+                        return Err(crate::semantic::SemanticServiceError::InvalidInput);
+                    }
+                    let payload = match operation {
+                        ProviderProcedureOperation::Create => {
+                            evertrace_domain::semantic::ProcedureProposalPayload::Create { draft }
+                        }
+                        ProviderProcedureOperation::Replace => {
+                            evertrace_domain::semantic::ProcedureProposalPayload::Replace { draft }
+                        }
+                    };
+                    Ok(SemanticCandidate::ProcedureProposal {
+                        target_id,
+                        base_revision_id,
+                        payload: Box::new(payload),
+                    })
+                }
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1417,39 +1600,45 @@ fn has_unique_existing_exact_proposal(
 fn run(
     planner: &SynthesisPlanner,
     request: &SynthesisRequest<'_>,
-    episode: &WorkEpisode,
+    episode: Option<&WorkEpisode>,
     fingerprint: [u8; 32],
     status: DerivationRunStatus,
     quota_usage: DerivationQuotaUsage,
-) -> SemanticDerivationRun {
-    SemanticDerivationRun {
+) -> Result<SemanticDerivationRun, crate::semantic::SemanticServiceError> {
+    let (from_watermark, to_watermark) = request.interval(episode)?;
+    Ok(SemanticDerivationRun {
         derivation_run_id: SemanticDerivationRunId::new_v7(),
-        episode_id: episode.episode_id,
-        episode_revision_id: episode.revision_id,
-        from_watermark: episode.semantic_watermark,
-        to_watermark: episode.source_watermark,
+        episode_id: episode.map(|episode| episode.episode_id),
+        episode_revision_id: episode.map(|episode| episode.revision_id),
+        from_watermark,
+        to_watermark,
         selected_direct_refs: request.selected_direct_refs.clone(),
         job_fingerprint: fingerprint,
         status,
         quota_usage,
         model_id: planner.llm.model.clone(),
-        prompt_hash: planner.prompt_hash,
+        prompt_hash: if request.source_target().is_some() {
+            crate::provider::source_prompt_hash()
+        } else {
+            planner.prompt_hash
+        },
         schema_version: SEMANTIC_SCHEMA_VERSION,
         algorithm_revision: request.algorithm_revision.clone(),
         effective_config_hash: request.effective_config_hash,
         created_at_us: request.occurred_at_us,
-    }
+        source_target: request.source_target().cloned(),
+    })
 }
 
 fn audit_resolution(
     planner: &SynthesisPlanner,
     request: &SynthesisRequest<'_>,
-    episode: &WorkEpisode,
+    episode: Option<&WorkEpisode>,
     fingerprint: [u8; 32],
     status: DerivationRunStatus,
     quota: DerivationQuotaUsage,
 ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError> {
-    let run = run(planner, request, episode, fingerprint, status, quota);
+    let run = run(planner, request, episode, fingerprint, status, quota)?;
     run.validate()
         .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
     let command = command(
@@ -1489,6 +1678,7 @@ fn trigger_name(trigger: SemanticDigestTrigger) -> &'static str {
         SemanticDigestTrigger::ExperimentTerminal => "experiment_terminal",
         SemanticDigestTrigger::BudgetBackstop => "budget_backstop",
         SemanticDigestTrigger::EpisodeFinalization => "episode_finalization",
+        SemanticDigestTrigger::SourceMessages => "source_messages",
     }
 }
 
@@ -1500,8 +1690,8 @@ mod daily_usage_tests {
     fn daily_reduction_preserves_day_boundary_and_saturating_usage() {
         let run = SemanticDerivationRun {
             derivation_run_id: evertrace_domain::ids::SemanticDerivationRunId::new_v7(),
-            episode_id: evertrace_domain::ids::WorkEpisodeId::new_v7(),
-            episode_revision_id: evertrace_domain::revision::RevisionId::new_v7(),
+            episode_id: Some(evertrace_domain::ids::WorkEpisodeId::new_v7()),
+            episode_revision_id: Some(evertrace_domain::revision::RevisionId::new_v7()),
             from_watermark: 0,
             to_watermark: 1,
             selected_direct_refs: vec!["source:one".into()],
@@ -1519,6 +1709,7 @@ mod daily_usage_tests {
             algorithm_revision: "test".into(),
             effective_config_hash: [0; 32],
             created_at_us: DAY_US,
+            source_target: None,
         };
         let mut previous_day = run.clone();
         previous_day.created_at_us = DAY_US - 1;

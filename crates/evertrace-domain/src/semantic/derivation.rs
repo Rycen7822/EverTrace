@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     canonical::{CanonicalValue, sha256},
+    evidence::{SourceInstanceId, SourceRevision},
     ids::{
         AtomId, CasId, ProcedureId, RepositoryId, SemanticDerivationRunId, SemanticDigestId,
         TaskId, WikiProjectionId, WorkEpisodeId, WorktreeId,
@@ -25,6 +26,98 @@ pub enum SemanticDigestTrigger {
     ExperimentTerminal,
     BudgetBackstop,
     EpisodeFinalization,
+    SourceMessages,
+}
+
+/// An archived source's confirmed scope, not a synthetic Work identity.
+/// Digest/Run from/to watermarks are source_sequence (after, through] for this
+/// target, never journal or Episode watermarks.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticSourceTarget {
+    pub source_instance_id: SourceInstanceId,
+    pub source_revision: SourceRevision,
+    pub repository_id: RepositoryId,
+    pub worktree_id: WorktreeId,
+}
+
+impl SemanticSourceTarget {
+    pub fn validate(&self) -> Result<(), SemanticError> {
+        SourceInstanceId::parse(self.source_instance_id.as_str())
+            .and_then(|_| SourceRevision::parse(self.source_revision.as_str()))
+            .map(|_| ())
+            .map_err(|_| SemanticError::InvalidProposal)
+    }
+
+    pub fn contains_message(
+        &self,
+        receipt: &crate::evidence::SourceReceipt,
+        observation: &crate::evidence::SourceObservation,
+        after_sequence: u64,
+        through_sequence: u64,
+    ) -> bool {
+        receipt.source_kind == crate::evidence::EvidenceSourceKind::CodexSessionJsonl
+            && receipt.observation_role == crate::evidence::ObservationRole::Message
+            && receipt.unsupported_record_classification.is_none()
+            && receipt.source_instance_id == self.source_instance_id
+            && receipt.source_revision == self.source_revision
+            && receipt.repository_instance_id == Some(self.repository_id)
+            && receipt.worktree_instance_id == Some(self.worktree_id)
+            && receipt.source_sequence > after_sequence
+            && receipt.source_sequence <= through_sequence
+            && observation.source_receipt_ref == receipt.source_receipt_id
+            && observation.source_observation_id == receipt.source_observation_id
+            && observation.source_instance_id == receipt.source_instance_id
+            && observation.source_revision == receipt.source_revision
+            && observation.source_record_identity == receipt.source_record_identity
+            && observation.observation_role == receipt.observation_role
+    }
+}
+
+/// One closed codec for scheduler admission, execution, recovery and purge.
+/// Existing Episode targets remain bare revision IDs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SemanticJobTarget {
+    Episode(RevisionId),
+    Source {
+        first_observation_id: crate::ids::SourceObservationId,
+        last_observation_id: crate::ids::SourceObservationId,
+    },
+}
+
+impl SemanticJobTarget {
+    pub fn encode(&self) -> Result<String, SemanticError> {
+        match self {
+            Self::Episode(revision) => Ok(revision.to_string()),
+            Self::Source {
+                first_observation_id,
+                last_observation_id,
+            } => Ok(format!(
+                "source:v1:{first_observation_id}/{last_observation_id}"
+            )),
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, SemanticError> {
+        if value.len() > 256 {
+            return Err(SemanticError::InvalidProposal);
+        }
+        let target = if let Some(value) = value.strip_prefix("source:v1:") {
+            let (first, last) = value
+                .split_once('/')
+                .ok_or(SemanticError::InvalidProposal)?;
+            Self::Source {
+                first_observation_id: first.parse().map_err(|_| SemanticError::InvalidProposal)?,
+                last_observation_id: last.parse().map_err(|_| SemanticError::InvalidProposal)?,
+            }
+        } else {
+            Self::Episode(value.parse().map_err(|_| SemanticError::InvalidProposal)?)
+        };
+        if target.encode()? != value {
+            return Err(SemanticError::InvalidProposal);
+        }
+        Ok(target)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,15 +290,20 @@ impl SemanticDigestApplication {
 #[serde(deny_unknown_fields)]
 pub struct SemanticDigest {
     pub semantic_digest_id: SemanticDigestId,
-    pub episode_id: WorkEpisodeId,
-    pub episode_revision_id: RevisionId,
-    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<WorkEpisodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_revision_id: Option<RevisionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
     pub repository_id: Option<RepositoryId>,
     pub worktree_id: Option<WorktreeId>,
     pub from_watermark: u64,
     pub to_watermark: u64,
-    pub episode_source_watermark: u64,
-    pub episode_confirmation_watermark: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_source_watermark: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_confirmation_watermark: Option<u64>,
     pub trigger: SemanticDigestTrigger,
     pub selected_direct_refs: Vec<String>,
     pub application: SemanticDigestApplication,
@@ -217,11 +315,43 @@ pub struct SemanticDigest {
     pub job_fingerprint: [u8; 32],
     pub status: SemanticDigestStatus,
     pub created_at_us: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_target: Option<SemanticSourceTarget>,
 }
 
 impl SemanticDigest {
     pub fn validate(&self) -> Result<(), SemanticError> {
         self.application.validate()?;
+        match &self.source_target {
+            Some(source) => {
+                source.validate()?;
+                if self.episode_id.is_some()
+                    || self.episode_revision_id.is_some()
+                    || self.task_id.is_some()
+                    || self.episode_source_watermark.is_some()
+                    || self.episode_confirmation_watermark.is_some()
+                    || self.repository_id != Some(source.repository_id)
+                    || self.worktree_id != Some(source.worktree_id)
+                    || self.trigger != SemanticDigestTrigger::SourceMessages
+                    || !self.application.candidates.is_empty()
+                {
+                    return Err(SemanticError::InvalidProposal);
+                }
+            }
+            None => {
+                if self.episode_id.is_none()
+                    || self.episode_revision_id.is_none()
+                    || self.task_id.is_none()
+                    || self.episode_source_watermark != Some(self.to_watermark)
+                    || self
+                        .episode_confirmation_watermark
+                        .is_none_or(|value| value > self.to_watermark)
+                    || self.trigger == SemanticDigestTrigger::SourceMessages
+                {
+                    return Err(SemanticError::InvalidProposal);
+                }
+            }
+        }
         let output_refs = [
             &self.application.progress_delta,
             &self.application.decision_delta,
@@ -246,8 +376,6 @@ impl SemanticDigest {
                 .iter()
                 .collect::<std::collections::BTreeSet<_>>();
         if self.from_watermark >= self.to_watermark
-            || self.to_watermark != self.episode_source_watermark
-            || self.episode_confirmation_watermark > self.episode_source_watermark
             || self.worktree_id.is_some() && self.repository_id.is_none()
             || !valid_refs(&self.selected_direct_refs, false)
             || !output_refs_valid
@@ -265,9 +393,23 @@ impl SemanticDigest {
     }
 
     pub fn recompute_job_fingerprint(&self) -> Result<[u8; 32], SemanticError> {
+        if let Some(source) = &self.source_target {
+            return source_job_fingerprint(
+                source,
+                self.from_watermark,
+                self.to_watermark,
+                &self.selected_direct_refs,
+                &self.model_id,
+                &self.prompt_hash,
+                self.schema_version,
+                &self.algorithm_revision,
+                &self.effective_config_hash,
+            );
+        }
         job_fingerprint(
-            self.episode_id,
-            self.episode_revision_id,
+            self.episode_id.ok_or(SemanticError::InvalidProposal)?,
+            self.episode_revision_id
+                .ok_or(SemanticError::InvalidProposal)?,
             self.from_watermark,
             self.to_watermark,
             &self.selected_direct_refs,
@@ -304,8 +446,10 @@ pub struct DerivationQuotaUsage {
 #[serde(deny_unknown_fields)]
 pub struct SemanticDerivationRun {
     pub derivation_run_id: SemanticDerivationRunId,
-    pub episode_id: WorkEpisodeId,
-    pub episode_revision_id: RevisionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<WorkEpisodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_revision_id: Option<RevisionId>,
     pub from_watermark: u64,
     pub to_watermark: u64,
     pub selected_direct_refs: Vec<String>,
@@ -318,10 +462,19 @@ pub struct SemanticDerivationRun {
     pub algorithm_revision: String,
     pub effective_config_hash: [u8; 32],
     pub created_at_us: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_target: Option<SemanticSourceTarget>,
 }
 
 impl SemanticDerivationRun {
     pub fn validate(&self) -> Result<(), SemanticError> {
+        match &self.source_target {
+            Some(source) if self.episode_id.is_none() && self.episode_revision_id.is_none() => {
+                source.validate()?
+            }
+            None if self.episode_id.is_some() && self.episode_revision_id.is_some() => {}
+            _ => return Err(SemanticError::InvalidProposal),
+        }
         if self.from_watermark >= self.to_watermark
             || !valid_refs(&self.selected_direct_refs, false)
             || !valid_text(&self.model_id)
@@ -334,9 +487,30 @@ impl SemanticDerivationRun {
         {
             return Err(SemanticError::InvalidProposal);
         }
-        if job_fingerprint(
-            self.episode_id,
-            self.episode_revision_id,
+        if self.recompute_job_fingerprint()? != self.job_fingerprint {
+            return Err(SemanticError::InvalidProposal);
+        }
+        Ok(())
+    }
+
+    pub fn recompute_job_fingerprint(&self) -> Result<[u8; 32], SemanticError> {
+        if let Some(source) = &self.source_target {
+            return source_job_fingerprint(
+                source,
+                self.from_watermark,
+                self.to_watermark,
+                &self.selected_direct_refs,
+                &self.model_id,
+                &self.prompt_hash,
+                self.schema_version,
+                &self.algorithm_revision,
+                &self.effective_config_hash,
+            );
+        }
+        job_fingerprint(
+            self.episode_id.ok_or(SemanticError::InvalidProposal)?,
+            self.episode_revision_id
+                .ok_or(SemanticError::InvalidProposal)?,
             self.from_watermark,
             self.to_watermark,
             &self.selected_direct_refs,
@@ -345,11 +519,7 @@ impl SemanticDerivationRun {
             self.schema_version,
             &self.algorithm_revision,
             &self.effective_config_hash,
-        )? != self.job_fingerprint
-        {
-            return Err(SemanticError::InvalidProposal);
-        }
-        Ok(())
+        )
     }
 }
 
@@ -423,6 +593,46 @@ pub fn job_fingerprint(
             CanonicalValue::Bytes(prompt_hash.to_vec()),
             CanonicalValue::Integer(i128::from(schema_version)),
             CanonicalValue::String(algorithm_revision.to_owned()),
+            CanonicalValue::Bytes(effective_config_hash.to_vec()),
+        ]),
+    )
+    .map_err(|_| SemanticError::InvalidProposal)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn source_job_fingerprint(
+    source: &SemanticSourceTarget,
+    after_sequence: u64,
+    through_sequence: u64,
+    selected_direct_refs: &[String],
+    model_id: &str,
+    prompt_hash: &[u8; 32],
+    schema_version: u32,
+    algorithm_revision: &str,
+    effective_config_hash: &[u8; 32],
+) -> Result<[u8; 32], SemanticError> {
+    source.validate()?;
+    sha256(
+        "evertrace.semantic_derivation.source_job",
+        1,
+        &CanonicalValue::Sequence(vec![
+            CanonicalValue::String(source.source_instance_id.as_str().into()),
+            CanonicalValue::String(source.source_revision.as_str().into()),
+            CanonicalValue::String(source.repository_id.to_string()),
+            CanonicalValue::String(source.worktree_id.to_string()),
+            CanonicalValue::Integer(i128::from(after_sequence)),
+            CanonicalValue::Integer(i128::from(through_sequence)),
+            CanonicalValue::Sequence(
+                selected_direct_refs
+                    .iter()
+                    .cloned()
+                    .map(CanonicalValue::String)
+                    .collect(),
+            ),
+            CanonicalValue::String(model_id.into()),
+            CanonicalValue::Bytes(prompt_hash.to_vec()),
+            CanonicalValue::Integer(i128::from(schema_version)),
+            CanonicalValue::String(algorithm_revision.into()),
             CanonicalValue::Bytes(effective_config_hash.to_vec()),
         ]),
     )

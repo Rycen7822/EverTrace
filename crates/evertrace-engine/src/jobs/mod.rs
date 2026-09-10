@@ -15,4 +15,4 @@ pub use import::{
 };
 pub use inventory::{InventoryProgress, InventoryWorker, InventoryWorkerError};
 pub(crate) use inventory::{inventory_budget, inventory_snapshot_current};
-pub use synthesis::{SynthesisPlanner, SynthesisRequest, SynthesisResolution};
+pub use synthesis::{SynthesisPlanner, SynthesisRequest, SynthesisResolution, SynthesisTarget};

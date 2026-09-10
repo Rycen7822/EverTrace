@@ -12,6 +12,7 @@ pub struct ProviderStub {
     pub base_url: String,
     requests: oneshot::Receiver<Vec<Vec<u8>>>,
     task: tokio::task::JoinHandle<()>,
+    received: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl ProviderStub {
@@ -23,8 +24,35 @@ impl ProviderStub {
         Self::repeat_delayed(status, body, delay, 1).await
     }
 
+    #[allow(dead_code)] // Not every test target exercises in-flight admission.
+    pub async fn once_paused(status: u16, body: Vec<u8>) -> (Self, oneshot::Sender<()>) {
+        let (release, gate) = oneshot::channel();
+        (
+            Self::serve(
+                status,
+                body,
+                std::time::Duration::ZERO,
+                1,
+                Some(gate),
+                false,
+            )
+            .await,
+            release,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub async fn wait_received(&self) {
+        self.received.notified().await;
+    }
+
     pub async fn repeat(status: u16, body: Vec<u8>, count: usize) -> Self {
         Self::repeat_delayed(status, body, std::time::Duration::ZERO, count).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn recovering(body: Vec<u8>) -> Self {
+        Self::serve(200, body, std::time::Duration::ZERO, 2, None, true).await
     }
 
     async fn repeat_delayed(
@@ -33,13 +61,26 @@ impl ProviderStub {
         delay: std::time::Duration,
         count: usize,
     ) -> Self {
+        Self::serve(status, body, delay, count, None, false).await
+    }
+
+    async fn serve(
+        status: u16,
+        body: Vec<u8>,
+        delay: std::time::Duration,
+        count: usize,
+        mut gate: Option<oneshot::Receiver<()>>,
+        fail_first: bool,
+    ) -> Self {
         assert!(count > 0);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (requests_tx, requests) = oneshot::channel();
+        let received = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = std::sync::Arc::clone(&received);
         let task = tokio::spawn(async move {
             let mut captured = Vec::with_capacity(count);
-            for _ in 0..count {
+            for index in 0..count {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut chunk = [0_u8; 4096];
@@ -69,7 +110,16 @@ impl ProviderStub {
                     }
                 }
                 captured.push(bytes);
+                notify.notify_one();
+                if let Some(gate) = gate.take() {
+                    let _ = gate.await;
+                }
                 tokio::time::sleep(delay).await;
+                let status = if fail_first && index == 0 {
+                    503
+                } else {
+                    status
+                };
                 let reason = if status == 200 { "OK" } else { "ERROR" };
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -86,6 +136,7 @@ impl ProviderStub {
             base_url: endpoint_base(address),
             requests,
             task,
+            received,
         }
     }
 

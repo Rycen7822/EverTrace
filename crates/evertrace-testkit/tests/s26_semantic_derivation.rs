@@ -56,6 +56,83 @@ use tempfile::TempDir;
 
 const CONFIG: [u8; 32] = [0x26; 32];
 
+#[test]
+fn episode_digest_run_wire_and_fingerprint_remain_fixed_and_targets_are_exclusive() {
+    use evertrace_domain::semantic::{SemanticDerivationRun, SemanticDigest, SemanticSourceTarget};
+    // Pre-source Episode field order and nulls are command-identity bytes, not
+    // merely semantically equivalent JSON. The fingerprint is an independent
+    // ETC1 fixture for the unchanged Episode algorithm.
+    let fingerprint = [
+        237, 36, 79, 139, 201, 124, 217, 125, 63, 149, 186, 24, 35, 231, 214, 122, 68, 112, 157,
+        35, 128, 113, 119, 120, 125, 167, 20, 45, 75, 193, 114, 181,
+    ];
+    let expand = |text: &str| {
+        text.replace("@prompt@", &serde_json::to_string(&[1_u8; 32]).unwrap())
+            .replace("@config@", &serde_json::to_string(&[2_u8; 32]).unwrap())
+            .replace(
+                "@fingerprint@",
+                &serde_json::to_string(&fingerprint).unwrap(),
+            )
+    };
+    let run_json = expand(
+        r#"{"derivation_run_id":"srun:019d0000-0000-7000-8000-000000000028","episode_id":"ep:019d0000-0000-7000-8000-000000000026","episode_revision_id":"019d0000-0000-7000-8000-000000000027","from_watermark":1,"to_watermark":2,"selected_direct_refs":["source:a"],"job_fingerprint":@fingerprint@,"status":"succeeded","quota_usage":{"input_tokens":1,"output_tokens":1,"calls":1,"wall_time_us":1},"model_id":"fixture","prompt_hash":@prompt@,"schema_version":1,"algorithm_revision":"semantic_synthesis_v1","effective_config_hash":@config@,"created_at_us":3}"#,
+    );
+    let digest_json = expand(
+        r#"{"semantic_digest_id":"sdig:019d0000-0000-7000-8000-000000000029","episode_id":"ep:019d0000-0000-7000-8000-000000000026","episode_revision_id":"019d0000-0000-7000-8000-000000000027","task_id":"task:019d0000-0000-7000-8000-000000000030","repository_id":null,"worktree_id":null,"from_watermark":1,"to_watermark":2,"episode_source_watermark":2,"episode_confirmation_watermark":0,"trigger":"adopted_decision","selected_direct_refs":["source:a"],"application":{"progress_delta":[],"decision_delta":[],"failed_routes":[],"resolved_items":[],"open_loops":[],"outcome_delta":[],"omissions":[{"category":"unobserved","reason":"descriptive only","direct_refs":["source:a"]}],"candidates":[],"completeness":"partial"},"model_id":"fixture","prompt_hash":@prompt@,"schema_version":1,"algorithm_revision":"semantic_synthesis_v1","effective_config_hash":@config@,"job_fingerprint":@fingerprint@,"status":"llm_enriched","created_at_us":3}"#,
+    );
+    let mut run: SemanticDerivationRun = serde_json::from_str(&run_json).unwrap();
+    let mut digest: SemanticDigest = serde_json::from_str(&digest_json).unwrap();
+    run.validate().unwrap();
+    digest.validate().unwrap();
+    assert_eq!(run.recompute_job_fingerprint().unwrap(), fingerprint);
+    for (payload, wire, tag) in [
+        (
+            JournalPayload::SemanticDigestRecorded(Box::new(digest.clone())),
+            &digest_json,
+            "semantic_digest_recorded",
+        ),
+        (
+            JournalPayload::SemanticDerivationRunRecorded(Box::new(run.clone())),
+            &run_json,
+            "semantic_derivation_run_recorded",
+        ),
+    ] {
+        assert_eq!(
+            payload.canonical_json().unwrap(),
+            format!("{{\"kind\":\"{tag}\",\"value\":{wire}}}")
+        );
+        assert_eq!(
+            payload.canonical_value(),
+            CanonicalValue::Map(vec![
+                ("kind".into(), CanonicalValue::String(tag.into())),
+                (
+                    "value".into(),
+                    CanonicalValue::Map(vec![(
+                        "closed_payload_json".into(),
+                        CanonicalValue::String(wire.clone())
+                    )])
+                ),
+            ])
+        );
+    }
+    let source = SemanticSourceTarget {
+        source_instance_id: SourceInstanceId::parse("session-rollout:a:b").unwrap(),
+        source_revision: SourceRevision::parse("source-revision").unwrap(),
+        repository_id: RepositoryId::new_v7(),
+        worktree_id: WorktreeId::new_v7(),
+    };
+    run.source_target = Some(source.clone());
+    digest.source_target = Some(source);
+    assert!(run.validate().is_err() && digest.validate().is_err());
+    run.source_target = None;
+    run.episode_id = None;
+    run.episode_revision_id = None;
+    digest.source_target = None;
+    digest.episode_id = None;
+    digest.episode_revision_id = None;
+    assert!(run.validate().is_err() && digest.validate().is_err());
+}
+
 fn application() -> ProviderSemanticApplication {
     ProviderSemanticApplication {
         progress_delta: vec![],
@@ -164,10 +241,11 @@ fn response(content: serde_json::Value) -> Vec<u8> {
 
 fn input() -> ProtectedSemanticInput {
     ProtectedSemanticInput {
-        stage_trace: Default::default(),
-        episode_id: WorkEpisodeId::new_v7(),
-        episode_revision_id: RevisionId::new_v7(),
-        task_id: TaskId::new_v7(),
+        stage_trace: Some(Default::default()),
+        episode_id: Some(WorkEpisodeId::new_v7()),
+        episode_revision_id: Some(RevisionId::new_v7()),
+        task_id: Some(TaskId::new_v7()),
+        source_target: None,
         from_watermark: 3,
         to_watermark: 4,
         trigger: "strategy_pivot",
@@ -876,7 +954,7 @@ async fn planner_commits_one_atomic_digest_run_and_semantic_episode_successor() 
     let resolution = planner
         .execute(SynthesisRequest {
             snapshot: &snapshot,
-            episode_revision_id: episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Progress,
@@ -902,7 +980,10 @@ async fn planner_commits_one_atomic_digest_run_and_semantic_episode_successor() 
         panic!("strict success must produce the atomic cohort")
     };
     assert_eq!(run.job_fingerprint, digest.job_fingerprint);
-    assert_eq!(successor.semantic_watermark, episode.source_watermark);
+    assert_eq!(
+        successor.unwrap().semantic_watermark,
+        episode.source_watermark
+    );
     let mut mismatched_time_payloads = success_command
         .events()
         .iter()
@@ -1009,7 +1090,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let resolution = planner
         .execute(SynthesisRequest {
             snapshot: &snapshot,
-            episode_revision_id: episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Failure,
@@ -1042,11 +1123,11 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
         .collect::<Vec<_>>();
     for payload in &mut wrong_episode_payloads {
         if let JournalPayload::SemanticDerivationRunRecorded(run) = payload {
-            run.episode_revision_id = RevisionId::new_v7();
+            run.episode_revision_id = Some(RevisionId::new_v7());
             run.to_watermark += 1;
             run.job_fingerprint = job_fingerprint(
-                run.episode_id,
-                run.episode_revision_id,
+                run.episode_id.unwrap(),
+                run.episode_revision_id.unwrap(),
                 run.from_watermark,
                 run.to_watermark,
                 &run.selected_direct_refs,
@@ -1110,7 +1191,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let retry = recovered_planner
         .execute(SynthesisRequest {
             snapshot: &after,
-            episode_revision_id: episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Failure,
@@ -1137,7 +1218,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let shared_ref = planner
         .execute(SynthesisRequest {
             snapshot: &after,
-            episode_revision_id: episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![
                 ProtectedDeltaItem {
@@ -1166,7 +1247,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let bounded = planner
         .execute(SynthesisRequest {
             snapshot: &after,
-            episode_revision_id: episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![
                 ProtectedDeltaItem {
@@ -1216,7 +1297,7 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
     let first_resolution = planner
         .execute(SynthesisRequest {
             snapshot: &first.snapshot,
-            episode_revision_id: first.episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(first.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Decision,
@@ -1235,7 +1316,7 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
     let second_resolution = planner
         .execute(SynthesisRequest {
             snapshot: &second.snapshot,
-            episode_revision_id: second.episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(second.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Decision,
@@ -1473,7 +1554,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     let resolution = planner
         .execute(SynthesisRequest {
             snapshot: &seed.snapshot,
-            episode_revision_id: seed.episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Decision,
@@ -1621,7 +1702,7 @@ async fn scenario_patch_scope_is_filled_from_the_current_episode() {
     let resolution = planner
         .execute(SynthesisRequest {
             snapshot: &snapshot,
-            episode_revision_id: seed.episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Progress,
@@ -1729,7 +1810,7 @@ async fn existing_exact_proposal_skips_a_new_revision_but_commits_digest_run_and
     let resolution = planner
         .execute(SynthesisRequest {
             snapshot: &before,
-            episode_revision_id: seed.episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Decision,
@@ -1863,7 +1944,7 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
     let resolution = planner
         .execute(SynthesisRequest {
             snapshot: &seed.snapshot,
-            episode_revision_id: seed.episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::EpisodeFinalization,
             direct_delta: vec![ProtectedDeltaItem {
                 kind: ProtectedDeltaKind::Progress,
@@ -1970,7 +2051,10 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
         .and_then(|json| serde_json::from_str::<WikiProjection>(json).ok())
         .expect("the reviewed repository atom must compile one Wiki page");
     assert_eq!(wiki.source_atom_ids, vec![accepted_atom.atom_id]);
-    assert_eq!(wiki.source_episode_ids, vec![semantic_episode.episode_id]);
+    assert_eq!(
+        wiki.source_episode_ids,
+        vec![semantic_episode.as_ref().unwrap().episode_id]
+    );
     let page_id = wiki.page_id.to_string();
     let search = SearchIndex::open(&store_root).await.unwrap();
     assert!(
@@ -1999,7 +2083,7 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
     )));
     assert!(wiki_relations.contains(&(
         "wiki_to_source_episode".into(),
-        semantic_episode.episode_id.to_string()
+        semantic_episode.as_ref().unwrap().episode_id.to_string()
     )));
 
     let mut missing_atom = accepted_snapshot.clone();

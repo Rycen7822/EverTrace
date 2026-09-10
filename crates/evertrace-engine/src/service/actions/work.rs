@@ -897,8 +897,34 @@ impl McpActionService {
                     truncated = true;
                 }
             }
+            let sessions = evertrace_store::SessionImportCurrentView::from_snapshot(&snapshot)
+                .map_err(|_| McpServiceError::Store)?;
+            let sources = sessions
+                .sessions
+                .values()
+                .filter(|current| current.session_id == session)
+                .map(|current| current.source_instance())
+                .collect::<BTreeSet<_>>();
+            for row in snapshot.data_rows().filter(|row| {
+                row.object_kind.as_deref() == Some("semantic_digest")
+                    && row.task_id.is_none()
+                    && row.repository_id.is_some()
+                    && row.worktree_id.is_some()
+            }) {
+                let Some(source) = source_digest_target(row)? else {
+                    continue;
+                };
+                if !sources.contains(source.source_instance_id.as_str()) {
+                    continue;
+                }
+                recent.insert((row.source_event_seq, row.row_id.as_str()), row);
+                if recent.len() > 32 {
+                    recent.pop_first();
+                    truncated = true;
+                }
+            }
             let selected = recent.values().copied().collect::<Vec<_>>();
-            let blocked = self
+            let mut blocked = self
                 .blocked_read_rows(
                     binding.repository_report.as_deref().or(report.as_ref()),
                     &snapshot,
@@ -907,6 +933,57 @@ impl McpActionService {
                 )
                 .await
                 .map_err(|_| McpServiceError::Store)?;
+            let digest_refs = selected
+                .iter()
+                .filter(|row| {
+                    row.object_kind.as_deref() == Some("semantic_digest")
+                        && !blocked.contains(&row.row_id)
+                })
+                .filter_map(|row| row.object_id.clone())
+                .collect::<Vec<_>>();
+            let mut digest_text = if digest_refs.is_empty() {
+                BTreeMap::new()
+            } else {
+                self.search_index
+                    .snapshot()
+                    .await
+                    .map_err(|_| McpServiceError::Store)?
+                    .fts_selected(&input, &digest_refs, 32)
+                    .await
+                    .map_err(|_| McpServiceError::Store)?
+                    .into_iter()
+                    .filter_map(|row| row.candidate_id.map(|id| (id, row.text)))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            if !digest_refs.is_empty() {
+                // FTS awaited after the first gate. Revalidate suppression,
+                // purge and source access at the output boundary as well.
+                let current = self
+                    .writer
+                    .project()
+                    .await
+                    .map_err(|_| McpServiceError::Store)?;
+                let current_rows = selected
+                    .iter()
+                    .filter_map(|row| {
+                        let found = current.row(&row.row_id);
+                        if found.is_none() {
+                            blocked.insert(row.row_id.clone());
+                        }
+                        found
+                    })
+                    .collect::<Vec<_>>();
+                blocked.extend(
+                    self.blocked_read_rows(
+                        binding.repository_report.as_deref().or(report.as_ref()),
+                        &current,
+                        &current_rows,
+                        None,
+                    )
+                    .await
+                    .map_err(|_| McpServiceError::Store)?,
+                );
+            }
             let mut remaining = 8 * 1024 * 1024usize;
             for (_, row) in recent.into_iter().rev() {
                 if blocked.contains(&row.row_id) {
@@ -922,6 +999,32 @@ impl McpActionService {
                     break;
                 }
                 remaining -= bytes;
+                if let Some(digest) = source_digest(row)? {
+                    let source = digest.source_target.as_ref().unwrap();
+                    let Some(text) = digest_text.remove(reference) else {
+                        continue;
+                    };
+                    if !repository_visible(
+                        &snapshot,
+                        &binding,
+                        source.repository_id,
+                        &[source.worktree_id],
+                        &mut trust_budget,
+                    )? {
+                        continue;
+                    }
+                    items.push(classify_object_row(
+                        row,
+                        Some(text),
+                        true,
+                        unix_time_us_for_mcp(),
+                    ));
+                    if items.len() == 3 {
+                        truncated = true;
+                        break;
+                    }
+                    continue;
+                }
                 let Some((receipt, observation)) = source_pair(&snapshot, reference)? else {
                     continue;
                 };
@@ -1021,6 +1124,18 @@ impl McpActionService {
                             ContentTrust::AgentClaim,
                         ));
                     }
+                } else if let Some(digest) = source_digest(row)? {
+                    let source = digest.source_target.as_ref().unwrap();
+                    if repository_visible(
+                        &snapshot,
+                        &binding,
+                        source.repository_id,
+                        &[source.worktree_id],
+                        &mut trust_budget,
+                    )? {
+                        let text = row.payload_json.clone().filter(|text| text.len() <= 8192);
+                        items.push(classify_object_row(row, text, true, unix_time_us_for_mcp()));
+                    }
                 } else if let Some((receipt, observation)) = source_pair(&snapshot, reference)?
                     && (submitted(&receipt, &observation, session)
                         || archived_claim(&receipt, &observation, session))
@@ -1058,6 +1173,61 @@ impl McpActionService {
         }
         Ok(result)
     }
+}
+
+// Candidate metadata only: serde skips the six summary groups before allocation.
+// The selected bounded window still goes through full typed validation below.
+fn source_digest_target(
+    row: &ObjectRow,
+) -> Result<Option<evertrace_domain::semantic::SemanticSourceTarget>, McpServiceError> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+    enum Projection {
+        SemanticDigestRecorded(Target),
+    }
+    #[derive(serde::Deserialize)]
+    struct Target {
+        source_target: Option<evertrace_domain::semantic::SemanticSourceTarget>,
+    }
+    let Projection::SemanticDigestRecorded(target) =
+        serde_json::from_str(row.payload_json.as_deref().ok_or(McpServiceError::Store)?)
+            .map_err(|_| McpServiceError::Store)?;
+    Ok(target.source_target)
+}
+
+#[cfg(test)]
+#[test]
+fn source_digest_candidate_metadata_does_not_decode_summary_body() {
+    let source = evertrace_domain::semantic::SemanticSourceTarget {
+        source_instance_id: evertrace_domain::evidence::SourceInstanceId::parse(
+            "session-rollout:test:one",
+        )
+        .unwrap(),
+        source_revision: evertrace_domain::evidence::SourceRevision::parse("revision-one").unwrap(),
+        repository_id: evertrace_domain::ids::RepositoryId::new_v7(),
+        worktree_id: evertrace_domain::ids::WorktreeId::new_v7(),
+    };
+    let mut row = ObjectRow::checkpoint(1, 1);
+    row.object_kind = Some("semantic_digest".into());
+    row.payload_json = Some(serde_json::json!({"kind":"semantic_digest_recorded","value":{"source_target":source,"application":"not a decoded summary"}}).to_string());
+    assert_eq!(source_digest_target(&row).unwrap(), Some(source));
+    assert!(source_digest(&row).is_err()); // Full validation still guards actual output.
+}
+
+fn source_digest(
+    row: &ObjectRow,
+) -> Result<Option<Box<evertrace_domain::semantic::SemanticDigest>>, McpServiceError> {
+    if row.object_kind.as_deref() != Some("semantic_digest") {
+        return Ok(None);
+    }
+    let JournalPayload::SemanticDigestRecorded(digest) =
+        serde_json::from_str(row.payload_json.as_deref().ok_or(McpServiceError::Store)?)
+            .map_err(|_| McpServiceError::Store)?
+    else {
+        return Err(McpServiceError::Store);
+    };
+    digest.validate().map_err(|_| McpServiceError::Store)?;
+    Ok(digest.source_target.is_some().then_some(digest))
 }
 
 fn presentation_text(receipt: &evertrace_domain::evidence::SourceReceipt) -> String {

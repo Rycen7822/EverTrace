@@ -17,6 +17,8 @@ use crate::{JournalPayload, ObjectFamily, ObjectRow, ObjectRowClass, ObjectRowKi
 
 use super::PROJECTION_GENERATION;
 
+mod source;
+
 pub(super) const WIKI_PROJECTION_KIND: &str = "wiki_projection";
 
 #[derive(Clone, Default)]
@@ -37,6 +39,14 @@ pub(super) struct SynthesisAdmissionView<'a> {
     pub(super) s23: &'a super::s23::S23State,
     pub(super) refs: &'a std::collections::BTreeSet<String>,
     pub(super) proposal_evidence_refs: &'a std::collections::BTreeSet<String>,
+    pub(super) source_receipts: &'a BTreeMap<
+        evertrace_domain::ids::SourceReceiptId,
+        (evertrace_domain::evidence::SourceReceipt, u64),
+    >,
+    pub(super) source_observations: &'a BTreeMap<
+        evertrace_domain::ids::SourceObservationId,
+        (evertrace_domain::evidence::SourceObservation, u64),
+    >,
 }
 
 pub(super) fn wiki_rows(
@@ -114,7 +124,7 @@ pub(super) fn wiki_rows(
             .flat_map(|(atom, proposal, _, _)| {
                 proposal.evidence_refs.iter().filter_map(|reference| {
                     let digest = digests_by_ref.get(reference)?;
-                    let episode = &episodes.get(&digest.episode_id)?.0;
+                    let episode = &episodes.get(&digest.episode_id?)?.0;
                     (episode.lifecycle_status == EpisodeLifecycle::Closed
                         && episode.repository_instance_id.is_some()
                         && episode.repository_instance_id == atom.scope.repository_id()
@@ -458,12 +468,16 @@ impl SynthesisState {
             return Err(StoreError::StoreCorrupt);
         }
         for run in &runs {
+            if run.source_target.is_some() {
+                self.validate_source_run(&view, &payloads, run, &digests)?;
+                continue;
+            }
             let current = &view
                 .episodes
-                .get(&run.episode_id)
+                .get(&run.episode_id.ok_or(StoreError::StoreCorrupt)?)
                 .ok_or(StoreError::StoreCorrupt)?
                 .0;
-            if run.episode_revision_id != current.revision_id
+            if run.episode_revision_id != Some(current.revision_id)
                 || run.from_watermark != current.semantic_watermark
                 || run.to_watermark != current.source_watermark
             {
@@ -492,19 +506,19 @@ impl SynthesisState {
                 let matching_episodes = episodes
                     .iter()
                     .copied()
-                    .filter(|episode| episode.episode_id == run.episode_id)
+                    .filter(|episode| Some(episode.episode_id) == run.episode_id)
                     .collect::<Vec<_>>();
                 let [successor] = matching_episodes.as_slice() else {
                     return Err(StoreError::StoreCorrupt);
                 };
-                if digest.episode_revision_id != current.revision_id
-                    || digest.episode_id != current.episode_id
-                    || digest.task_id != current.task_id
+                if digest.episode_revision_id != Some(current.revision_id)
+                    || digest.episode_id != Some(current.episode_id)
+                    || digest.task_id != Some(current.task_id)
                     || digest.repository_id != current.repository_instance_id
                     || digest.worktree_id != current.worktree_instance_id
                     || digest.from_watermark != current.semantic_watermark
                     || digest.to_watermark != current.source_watermark
-                    || run.episode_revision_id != current.revision_id
+                    || run.episode_revision_id != Some(current.revision_id)
                     || run.from_watermark != digest.from_watermark
                     || run.to_watermark != digest.to_watermark
                     || run.selected_direct_refs != digest.selected_direct_refs
@@ -695,7 +709,7 @@ impl SynthesisState {
                 .iter()
                 .any(|digest| digest.job_fingerprint == run.job_fingerprint)
                 || episodes.iter().any(|episode| {
-                    episode.episode_id == run.episode_id
+                    Some(episode.episode_id) == run.episode_id
                         && episode.semantic_watermark == run.to_watermark
                 })
             {
@@ -721,7 +735,7 @@ impl SynthesisState {
                     .iter()
                     .filter(|run| {
                         run.status == DerivationRunStatus::Succeeded
-                            && run.episode_id == successor.episode_id
+                            && run.episode_id == Some(successor.episode_id)
                     })
                     .count();
                 if matching != 1 {
@@ -776,19 +790,38 @@ impl SynthesisState {
         &mut self,
         episodes: &BTreeMap<evertrace_domain::ids::WorkEpisodeId, (WorkEpisode, u64)>,
         episode_revisions: &BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
+        source_receipts: &BTreeMap<
+            evertrace_domain::ids::SourceReceiptId,
+            (evertrace_domain::evidence::SourceReceipt, u64),
+        >,
+        source_observations: &BTreeMap<
+            evertrace_domain::ids::SourceObservationId,
+            (evertrace_domain::evidence::SourceObservation, u64),
+        >,
     ) -> Result<(), StoreError> {
         self.successful_fingerprints.clear();
         for (id, (run, _)) in &self.runs {
             run.validate().map_err(|_| StoreError::StoreCorrupt)?;
-            let bound_episode = &episode_revisions
-                .get(&run.episode_revision_id)
-                .ok_or(StoreError::StoreCorrupt)?
-                .0;
-            if bound_episode.episode_id != run.episode_id
-                || bound_episode.semantic_watermark != run.from_watermark
-                || bound_episode.source_watermark != run.to_watermark
-            {
-                return Err(StoreError::StoreCorrupt);
+            if let Some(source) = &run.source_target {
+                source::validate_refs(
+                    source,
+                    run.from_watermark,
+                    run.to_watermark,
+                    &run.selected_direct_refs,
+                    source_receipts,
+                    source_observations,
+                )?;
+            } else {
+                let bound_episode = &episode_revisions
+                    .get(&run.episode_revision_id.ok_or(StoreError::StoreCorrupt)?)
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .0;
+                if Some(bound_episode.episode_id) != run.episode_id
+                    || bound_episode.semantic_watermark != run.from_watermark
+                    || bound_episode.source_watermark != run.to_watermark
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
             if run.status == DerivationRunStatus::Succeeded
                 && self
@@ -809,6 +842,8 @@ impl SynthesisState {
                 if matching.next().is_some()
                     || digest.episode_id != run.episode_id
                     || digest.episode_revision_id != run.episode_revision_id
+                    || digest.source_target != run.source_target
+                    || digest.selected_direct_refs != run.selected_direct_refs
                     || digest.from_watermark != run.from_watermark
                     || digest.to_watermark != run.to_watermark
                     || digest.created_at_us != run.created_at_us
@@ -832,11 +867,30 @@ impl SynthesisState {
             {
                 return Err(StoreError::StoreCorrupt);
             }
+            if let Some(source) = &digest.source_target {
+                source::validate_refs(
+                    source,
+                    digest.from_watermark,
+                    digest.to_watermark,
+                    &digest.selected_direct_refs,
+                    source_receipts,
+                    source_observations,
+                )?;
+                if self.digests.values().any(|(other, _)| {
+                    other.semantic_digest_id != digest.semantic_digest_id
+                        && other.source_target == digest.source_target
+                        && other.from_watermark < digest.to_watermark
+                        && digest.from_watermark < other.to_watermark
+                }) {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                continue;
+            }
             let episode = &episodes
-                .get(&digest.episode_id)
+                .get(&digest.episode_id.ok_or(StoreError::StoreCorrupt)?)
                 .ok_or(StoreError::StoreCorrupt)?
                 .0;
-            if episode.task_id != digest.task_id
+            if Some(episode.task_id) != digest.task_id
                 || episode.repository_instance_id != digest.repository_id
                 || episode.worktree_instance_id != digest.worktree_id
                 || episode.semantic_watermark < digest.to_watermark
@@ -855,7 +909,7 @@ impl SynthesisState {
                 if self
                     .digests
                     .get(&id)
-                    .is_none_or(|(digest, _)| digest.episode_id != episode.episode_id)
+                    .is_none_or(|(digest, _)| digest.episode_id != Some(episode.episode_id))
                 {
                     return Err(StoreError::StoreCorrupt);
                 }
@@ -867,7 +921,7 @@ impl SynthesisState {
     pub(super) fn rows(self) -> Result<Vec<ObjectRow>, StoreError> {
         let mut rows = Vec::with_capacity(self.digests.len() + self.runs.len());
         for (id, (value, seq)) in self.digests {
-            let task_id = value.task_id.to_string();
+            let task_id = value.task_id.map(|id| id.to_string());
             let repository_id = value.repository_id.map(|id| id.to_string());
             let worktree_id = value.worktree_id.map(|id| id.to_string());
             rows.push(row(
@@ -880,13 +934,20 @@ impl SynthesisState {
             )?);
         }
         for (id, (value, seq)) in self.runs {
+            let scope = value.source_target.as_ref().map(|source| {
+                (
+                    None,
+                    Some(source.repository_id.to_string()),
+                    Some(source.worktree_id.to_string()),
+                )
+            });
             rows.push(row(
                 format!("object:work:semantic_derivation_run:{id}"),
                 "semantic_derivation_run",
                 id.to_string(),
                 &JournalPayload::SemanticDerivationRunRecorded(Box::new(value)),
                 seq,
-                None,
+                scope,
             )?);
         }
         Ok(rows)
@@ -928,11 +989,9 @@ fn row(
     id: String,
     payload: &JournalPayload,
     seq: u64,
-    scope: Option<(String, Option<String>, Option<String>)>,
+    scope: Option<(Option<String>, Option<String>, Option<String>)>,
 ) -> Result<ObjectRow, StoreError> {
-    let (task_id, repository_id, worktree_id) = scope
-        .map(|(task, repository, worktree)| (Some(task), repository, worktree))
-        .unwrap_or((None, None, None));
+    let (task_id, repository_id, worktree_id) = scope.unwrap_or((None, None, None));
     Ok(ObjectRow {
         row_id,
         row_kind: ObjectRowKind::Data,
@@ -943,7 +1002,7 @@ fn row(
         current_revision_id: Some(id),
         lifecycle: Some("immutable".into()),
         epistemic: Some("derived".into()),
-        authority: Some("none".into()),
+        authority: Some(if matches!(payload, JournalPayload::SemanticDigestRecorded(value) if value.source_target.is_some()) { "agent_inferred" } else { "none" }.into()),
         publication_state: None,
         support_state: None,
         project_id: None,

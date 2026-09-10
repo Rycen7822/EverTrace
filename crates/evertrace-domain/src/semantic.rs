@@ -26,8 +26,8 @@ pub use constraint::{
 pub use derivation::{
     DerivationQuotaUsage, DerivationRunStatus, SemanticCandidate, SemanticCompleteness,
     SemanticDerivationRun, SemanticDigest, SemanticDigestApplication, SemanticDigestStatus,
-    SemanticDigestTrigger, SemanticOmission, SemanticStructuredDelta, WikiProjection,
-    job_fingerprint,
+    SemanticDigestTrigger, SemanticJobTarget, SemanticOmission, SemanticSourceTarget,
+    SemanticStructuredDelta, WikiProjection, job_fingerprint, source_job_fingerprint,
 };
 pub use proposal::{
     AcceptedProposalTarget, AtomProposalPayload, CoreMembershipProposalPayload,

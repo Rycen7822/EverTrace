@@ -1,3 +1,7 @@
+#[path = "../src/provider.rs"]
+#[allow(dead_code)]
+mod provider_stub;
+
 use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
 use evertrace_capture::{
@@ -46,6 +50,1097 @@ fn runtime(root: &std::path::Path) -> RuntimeSnapshot {
         recall_cue_adapter_manifest_id: None,
         recall_cues: Vec::new(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
+    async fn read(
+        mcp: &evertrace_engine::McpActionService,
+        bindings: &evertrace_engine::McpBindingAuthority,
+        report: &evertrace_codex::HostProbeReport,
+        workspace: &std::path::Path,
+        session: &str,
+        action: evertrace_engine::McpServiceAction,
+        input: String,
+    ) -> evertrace_engine::McpServiceResult {
+        let grant = bindings
+            .issue_with_report(
+                evertrace_engine::McpBindingIssue {
+                    session_id: session.into(),
+                    turn_id: "turn".into(),
+                    tool_use_id: "source-summary".into(),
+                    agent_id: None,
+                    action: if action == evertrace_engine::McpServiceAction::Get {
+                        "get"
+                    } else {
+                        "search"
+                    }
+                    .into(),
+                    workspace: "@active".into(),
+                    input: input.clone(),
+                    refs: vec![],
+                    launcher_protocol_revision: 1,
+                },
+                Some(Arc::new(report.clone())),
+            )
+            .unwrap();
+        mcp.handle(
+            "source-summary-read",
+            evertrace_engine::McpServiceRequest {
+                request_id: RequestId::new_v7(),
+                action,
+                workspace: grant.bound_workspace,
+                input,
+                refs: vec![],
+                client_cwd: workspace.to_str().unwrap().into(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+    use evertrace_domain::{
+        config::{DreamingConfig, DurationValue, EpisodeEnrichment, LlmConfig, ValidatedBaseUrl},
+        evidence::{ContentTrust, ObservationRole},
+        semantic::{SemanticCompleteness, SemanticStructuredDelta},
+    };
+    use evertrace_engine::{BackgroundScheduler, SynthesisPlanner};
+    use provider_stub::ProviderStub;
+
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = temp.path().join("workspace");
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/10");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&dated).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial"
+            ])
+            .current_dir(&workspace)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&workspace)
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+    let clock = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ %s"])
+        .output()
+        .unwrap();
+    assert!(clock.status.success());
+    let clock = String::from_utf8(clock.stdout).unwrap();
+    let (timestamp, seconds) = clock.trim().split_once(' ').unwrap();
+    let observed_at_us = seconds.parse::<i64>().unwrap() * 1_000_000;
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let session = "019d0000-0000-7000-8000-000000000061";
+    let source = format!("session-rollout:{session}:{session}");
+    let transcript = dated.join(format!("rollout-2026-09-10T00-00-00-{session}.jsonl"));
+    let header = serde_json::json!({"timestamp":timestamp,"type":"session_meta","payload":{"id":session,"session_id":session,"cwd":workspace,"git":{"commit_hash":head}}});
+    let message = serde_json::json!({"timestamp":"2026-09-10T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":format!("marigold descriptive source memory {}", "bounded context ".repeat(300))}});
+    fs::write(&transcript, format!("{header}\n{message}\n")).unwrap();
+    let report_value =
+        observe_session_catalog_report(transcript.to_str(), session, "source-summary", None)
+            .unwrap();
+    let report = Arc::new(RwLock::new(Some(report_value.clone())));
+    let data = temp.path().join("data");
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+    // The source's repository attribution is an input to this package: retain
+    // the existing source-time S11 proof gate using an actual local Git probe.
+    // No Task, Episode, lane or binding is created by this registration.
+    let evidence = evertrace_engine::repository::probe_repository(
+        &workspace,
+        evertrace_engine::repository::HostTrustDecision::Trusted,
+        std::slice::from_ref(&source),
+        observed_at_us,
+        &evertrace_engine::repository::ProbeLimits::default(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let repositories = evertrace_store::repository::RepositoryCurrentView::default();
+    let registration = evertrace_engine::repository::resolve_repository(
+        &evertrace_engine::repository::RepositoryResolveInput {
+            view: &repositories,
+            evidence: &evidence,
+            derived_from_hint: None,
+        },
+    )
+    .unwrap();
+    writer
+        .commit(
+            registration
+                .journal_command(observed_at_us, CONFIG, "source-attribution")
+                .unwrap()
+                .unwrap(),
+            observed_at_us,
+        )
+        .await
+        .unwrap();
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    catalog.refresh(&report_value).await.unwrap();
+    let context = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let repository = context
+        .current
+        .metadata
+        .resolved_repository_instance_id
+        .unwrap();
+    let worktree = context
+        .current
+        .metadata
+        .resolved_worktree_instance_id
+        .unwrap();
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                SessionImportAdminAction::QueueImport,
+                10
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    let worker =
+        SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap();
+    let mut imported = 0;
+    for _ in 0..4 {
+        let progress = worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap();
+        imported += progress.records;
+        if progress.completed {
+            break;
+        }
+    }
+    assert_eq!(imported, 2);
+    let snapshot = writer.project().await.unwrap();
+    let receipt = snapshot
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceReceiptRecorded(receipt)
+                    if receipt.observation_role == ObservationRole::Message =>
+                {
+                    Some(receipt)
+                }
+                _ => None,
+            }
+        })
+        .next()
+        .unwrap();
+    let application = evertrace_engine::provider::ProviderSemanticApplication {
+        progress_delta: vec![SemanticStructuredDelta {
+            label: "message claim".into(),
+            value: "marigold descriptive source memory".into(),
+            direct_refs: vec![receipt.source_observation_id.to_string()],
+        }],
+        decision_delta: vec![],
+        failed_routes: vec![],
+        resolved_items: vec![],
+        open_loops: vec![],
+        outcome_delta: vec![],
+        omissions: vec![],
+        candidates: vec![],
+        completeness: SemanticCompleteness::Complete,
+    };
+    let stub = ProviderStub::recovering(serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":serde_json::to_string(&application).unwrap()}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap()).await;
+    let llm = LlmConfig {
+        base_url: ValidatedBaseUrl::parse(&stub.base_url).unwrap(),
+        api_key_env: "PATH".into(),
+        episode_enrichment: EpisodeEnrichment::Off,
+        ..Default::default()
+    };
+    // Only accelerate the existing idle clock for this local scheduler test;
+    // production configuration still validates its existing five-minute minimum.
+    let dreaming = DreamingConfig {
+        idle_after: DurationValue::from_seconds(1).unwrap(),
+        ..Default::default()
+    };
+    let scheduler = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(llm.clone()),
+        dreaming.clone(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Box::pin(scheduler.run_once()).await.unwrap();
+    let failed_snapshot = writer.project().await.unwrap();
+    let failed = evertrace_store::RuntimeSchedulerView::from_snapshot(&failed_snapshot)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.kind == "semantic_synthesis_v1")
+        .unwrap();
+    assert_eq!(failed.state, JobStatus::Failed);
+    assert!(failed.backoff_until_us.is_some());
+    assert!(
+        !failed_snapshot
+            .data_rows()
+            .any(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+    );
+    Box::pin(scheduler.run_once()).await.unwrap();
+    assert_eq!(
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .into_iter()
+            .filter(|job| job.kind == "semantic_synthesis_v1")
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&failed)
+    );
+    // The same provider/config and immutable job recover after real backoff.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    Box::pin(scheduler.run_once()).await.unwrap();
+    let snapshot = writer.project().await.unwrap();
+    let source_jobs = evertrace_store::RuntimeSchedulerView::from_snapshot(&snapshot)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .filter(|job| job.kind == "semantic_synthesis_v1")
+        .collect::<Vec<_>>();
+    assert_eq!(source_jobs.len(), 1);
+    let succeeded = &source_jobs[0];
+    assert_eq!(succeeded.job_id, failed.job_id);
+    assert_eq!(
+        (succeeded.state, succeeded.attempt),
+        (JobStatus::Succeeded, failed.attempt + 2)
+    );
+    let digests = snapshot
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SemanticDigestRecorded(digest) => Some(digest),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        digests.len(),
+        1,
+        "source synthesis did not commit: {:?}",
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&snapshot)
+            .unwrap()
+            .jobs
+    );
+    let digest = &digests[0];
+    assert!(digest.episode_id.is_none() && digest.task_id.is_none());
+    assert_eq!(
+        (digest.repository_id, digest.worktree_id),
+        (Some(repository), Some(worktree))
+    );
+    assert!(digest.application.candidates.is_empty());
+    assert_eq!(
+        digest.application.completeness,
+        SemanticCompleteness::Partial
+    );
+    assert!(digest.application.omissions.iter().any(|omission| {
+        omission.category == "source_input_budget"
+            && omission.direct_refs == vec![receipt.source_observation_id.to_string()]
+    }));
+    assert!(!snapshot.data_rows().any(|row| matches!(
+        row.object_kind.as_deref(),
+        Some(
+            "task" | "work_episode" | "execution_lane" | "binding_resolution" | "revision_proposal"
+        )
+    )));
+    let mut requests = stub.finish_all().await;
+    assert_eq!(requests.len(), 2);
+    let request = requests.pop().unwrap();
+    let boundary = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let request: serde_json::Value = serde_json::from_slice(&request[boundary..]).unwrap();
+    let input: serde_json::Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert!(input.get("episode_id").is_none() && input.get("stage_trace").is_none());
+    assert_eq!(
+        input["source_target"]["source_revision"],
+        receipt.source_revision.as_str()
+    );
+    let bindings = evertrace_engine::McpBindingAuthority::new(
+        DeviceKeyStore::new(temp.path().join("keys"))
+            .load_or_create()
+            .unwrap(),
+    );
+    let mcp = evertrace_engine::McpActionService::open(
+        bindings.clone(),
+        &data,
+        writer.clone(),
+        runtime(temp.path()),
+    )
+    .await
+    .unwrap()
+    .with_session_report(Arc::clone(&report));
+    for (action, input) in [
+        (
+            evertrace_engine::McpServiceAction::Search,
+            "marigold".to_owned(),
+        ),
+        (
+            evertrace_engine::McpServiceAction::Get,
+            digest.semantic_digest_id.to_string(),
+        ),
+    ] {
+        let result = read(
+            &mcp,
+            &bindings,
+            &report_value,
+            &workspace,
+            session,
+            action,
+            input,
+        )
+        .await;
+        let item = result
+            .items
+            .iter()
+            .find(|item| item.object_ref == Some(digest.semantic_digest_id.to_string()))
+            .unwrap_or_else(|| panic!("MCP must return the digest: {action:?} {result:?}"));
+        assert_eq!(item.content_trust, ContentTrust::AgentClaim);
+        assert_eq!(item.authority.as_deref(), Some("agent_inferred"));
+        assert_eq!(
+            item.instruction_authority,
+            evertrace_domain::evidence::InstructionAuthority::None
+        );
+        assert!(item.text.as_ref().unwrap().contains("marigold"));
+    }
+    let other_workspace = temp.path().join("other-workspace");
+    fs::create_dir(&other_workspace).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&other_workspace)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let other_session = "019d0000-0000-7000-8000-000000000062";
+    let other_path = dated.join(format!("rollout-2026-09-10T00-00-00-{other_session}.jsonl"));
+    fs::write(&other_path,format!("{}\n",serde_json::json!({"timestamp":timestamp,"type":"session_meta","payload":{"id":other_session,"session_id":other_session,"cwd":other_workspace}}))).unwrap();
+    let other_report =
+        observe_session_catalog_report(other_path.to_str(), other_session, "source-summary", None)
+            .unwrap();
+    catalog.refresh(&other_report).await.unwrap();
+    assert!(
+        read(
+            &mcp,
+            &bindings,
+            &other_report,
+            &other_workspace,
+            other_session,
+            evertrace_engine::McpServiceAction::Search,
+            "marigold".into()
+        )
+        .await
+        .items
+        .is_empty()
+    );
+    Box::pin(scheduler.run_once()).await.unwrap();
+    let final_snapshot = writer.project().await.unwrap();
+    assert_eq!(
+        final_snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+            .count(),
+        1
+    );
+    let old_id = digest.semantic_digest_id.to_string();
+    // Normal append keeps the logical revision and advances only the new
+    // imported message interval. Disabling the LLM does not hide old memory.
+    let body = fs::read_to_string(&transcript).unwrap();
+    let delta = serde_json::json!({"type":"event_msg","payload":{"type":"agent_message","message":"marigold appended claim"}});
+    fs::write(&transcript, format!("{body}{delta}\n")).unwrap();
+    catalog.refresh(&report_value).await.unwrap();
+    let mut imported_delta = 0;
+    for _ in 0..3 {
+        let progress = worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap();
+        imported_delta += progress.records;
+        if progress.completed {
+            break;
+        }
+    }
+    assert_eq!(imported_delta, 1);
+    let appended = writer.project().await.unwrap();
+    let second = appended
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceReceiptRecorded(value)
+                    if value.observation_role == ObservationRole::Message
+                        && value.source_observation_id != receipt.source_observation_id =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            }
+        })
+        .next()
+        .unwrap();
+    assert_eq!(second.source_revision, receipt.source_revision);
+    let disabled = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(LlmConfig {
+            enabled: false,
+            ..llm.clone()
+        }),
+        dreaming.clone(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Box::pin(disabled.run_once()).await.unwrap();
+    assert_eq!(
+        writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+            .count(),
+        1
+    );
+    assert!(
+        read(
+            &mcp,
+            &bindings,
+            &report_value,
+            &workspace,
+            session,
+            evertrace_engine::McpServiceAction::Get,
+            old_id.clone()
+        )
+        .await
+        .items
+        .iter()
+        .any(|item| item.object_ref.as_deref() == Some(&old_id))
+    );
+    let mut second_application = application.clone();
+    second_application.progress_delta[0].direct_refs =
+        vec![second.source_observation_id.to_string()];
+    second_application.progress_delta[0].value = "marigold appended claim".into();
+    let (second_stub, release) = ProviderStub::once_paused(200, serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":serde_json::to_string(&second_application).unwrap()}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap()).await;
+    let second_scheduler = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(LlmConfig {
+            base_url: ValidatedBaseUrl::parse(&second_stub.base_url).unwrap(),
+            ..llm.clone()
+        }),
+        dreaming.clone(),
+    );
+    let running = tokio::spawn({
+        let scheduler = second_scheduler.clone();
+        async move { Box::pin(scheduler.run_once()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), second_stub.wait_received())
+        .await
+        .unwrap();
+    // Append while the provider owns a frozen interval; this non-message is
+    // not another LLM trigger and does not invalidate archived input.
+    let body = fs::read_to_string(&transcript).unwrap();
+    let tool = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":null}});
+    fs::write(&transcript, format!("{body}{tool}\n")).unwrap();
+    catalog.refresh(&report_value).await.unwrap();
+    for _ in 0..3 {
+        if worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap()
+            .completed
+        {
+            break;
+        }
+    }
+    release.send(()).unwrap();
+    running.await.unwrap().unwrap();
+    let second_request = second_stub.finish().await;
+    let boundary = second_request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let second_request: serde_json::Value =
+        serde_json::from_slice(&second_request[boundary..]).unwrap();
+    let second_input: serde_json::Value =
+        serde_json::from_str(second_request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        second_input["source_refs"],
+        serde_json::json!([second.source_observation_id.to_string()])
+    );
+    assert_eq!(
+        writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+            .count(),
+        2
+    );
+    drop((disabled, second_scheduler, catalog, worker));
+    drop((scheduler, mcp));
+    writer.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+    let mcp = evertrace_engine::McpActionService::open(
+        bindings.clone(),
+        &data,
+        writer.clone(),
+        runtime(temp.path()),
+    )
+    .await
+    .unwrap()
+    .with_session_report(Arc::clone(&report));
+    assert!(
+        read(
+            &mcp,
+            &bindings,
+            &report_value,
+            &workspace,
+            session,
+            evertrace_engine::McpServiceAction::Get,
+            old_id.clone()
+        )
+        .await
+        .items
+        .iter()
+        .any(|item| item.object_ref.as_deref() == Some(&old_id))
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let restarted = BackgroundScheduler::new(
+        writer.clone(),
+        SessionCatalogService::new(writer.clone(), CONFIG),
+        SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(LlmConfig {
+            base_url: ValidatedBaseUrl::parse(&format!(
+                "http://{}/v1",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap(),
+            model: "changed-model".into(),
+            ..llm.clone()
+        }),
+        dreaming.clone(),
+    );
+    Box::pin(restarted.run_once()).await.unwrap();
+    Box::pin(restarted.run_once()).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+            .count(),
+        2
+    );
+    // Keep the lifecycle's independent negative phase off the positive
+    // phase's debug-build poll stack; do not enlarge thread/resource limits.
+    tokio::spawn(async move {
+    drop(restarted);
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let worker =
+        SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap();
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+    // A true rewrite has a separate source revision. Its old protected archive
+    // and descriptive digest remain readable without consulting the old JSONL.
+    let rewritten = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"marigold replacement claim"}});
+    fs::write(&transcript, format!("{header}\n{rewritten}\n")).unwrap();
+    catalog.refresh(&report_value).await.unwrap();
+    admin
+        .handle(
+            RequestId::new_v7(),
+            session,
+            SessionImportAdminAction::QueueImport,
+            observed_at_us + 1,
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        if worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap()
+            .completed
+        {
+            break;
+        }
+    }
+    let rewritten_snapshot = writer.project().await.unwrap();
+    let replacement = rewritten_snapshot
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceReceiptRecorded(value)
+                    if value.observation_role == ObservationRole::Message
+                        && value.source_revision != receipt.source_revision =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            }
+        })
+        .next()
+        .unwrap();
+    assert!(
+        read(
+            &mcp,
+            &bindings,
+            &report_value,
+            &workspace,
+            session,
+            evertrace_engine::McpServiceAction::Get,
+            old_id.clone()
+        )
+        .await
+        .items
+        .iter()
+        .any(|item| item.object_ref.as_deref() == Some(&old_id))
+    );
+    let target = evertrace_domain::semantic::SemanticSourceTarget {
+        source_instance_id: replacement.source_instance_id.clone(),
+        source_revision: replacement.source_revision.clone(),
+        repository_id: repository,
+        worktree_id: worktree,
+    };
+    let mut mixed = vec![
+        receipt.source_observation_id.to_string(),
+        replacement.source_observation_id.to_string(),
+    ];
+    mixed.sort();
+    assert!(
+        Box::pin(SynthesisPlanner::new(llm.clone())
+            .execute(evertrace_engine::jobs::SynthesisRequest {
+                snapshot: &rewritten_snapshot,
+                target: evertrace_engine::jobs::SynthesisTarget::Source {
+                    source: target,
+                    after_sequence: 0,
+                    through_sequence: replacement.source_sequence
+                },
+                trigger: evertrace_domain::semantic::SemanticDigestTrigger::SourceMessages,
+                direct_delta: vec![evertrace_engine::provider::ProtectedDeltaItem {
+                    kind: evertrace_engine::provider::ProtectedDeltaKind::Progress,
+                    value: "descriptive fixture".into(),
+                    direct_refs: mixed.clone()
+                }],
+                selected_direct_refs: mixed,
+                command_id: evertrace_domain::ids::CommandId::new_v7(),
+                occurred_at_us: observed_at_us + 2,
+                algorithm_revision: "semantic_synthesis_v1".into(),
+                effective_config_hash: CONFIG,
+            }))
+            .await
+            .is_err()
+    );
+    let mut replacement_application = application.clone();
+    replacement_application.progress_delta[0].direct_refs =
+        vec![replacement.source_observation_id.to_string()];
+    replacement_application.progress_delta[0].value = "marigold replacement claim".into();
+    let response = |application: &evertrace_engine::provider::ProviderSemanticApplication| {
+        serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":serde_json::to_string(application).unwrap()}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap()
+    };
+    let (revoked_stub, release) =
+        ProviderStub::once_paused(200, response(&replacement_application)).await;
+    let revoking = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(LlmConfig {
+            base_url: ValidatedBaseUrl::parse(&revoked_stub.base_url).unwrap(),
+            ..llm.clone()
+        }),
+        dreaming.clone(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let running = tokio::spawn({
+        let scheduler = revoking.clone();
+        async move { Box::pin(scheduler.run_once()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), revoked_stub.wait_received())
+        .await
+        .unwrap();
+    admin
+        .handle(
+            RequestId::new_v7(),
+            session,
+            SessionImportAdminAction::RevokeAccess,
+            observed_at_us + 3,
+        )
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    running.await.unwrap().unwrap();
+    revoked_stub.finish().await;
+    assert_eq!(
+        writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+            .count(),
+        2
+    );
+    for (action, input) in [
+        (evertrace_engine::McpServiceAction::Get, old_id.clone()),
+        (
+            evertrace_engine::McpServiceAction::Search,
+            "marigold".into(),
+        ),
+    ] {
+        assert!(
+            read(
+                &mcp,
+                &bindings,
+                &report_value,
+                &workspace,
+                session,
+                action,
+                input
+            )
+            .await
+            .items
+            .is_empty()
+        );
+    }
+    drop((revoking, catalog, worker, admin, mcp));
+    writer.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let worker =
+        SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap();
+    let mcp = evertrace_engine::McpActionService::open(
+        bindings.clone(),
+        &data,
+        writer.clone(),
+        runtime(temp.path()),
+    )
+    .await
+    .unwrap()
+    .with_session_report(Arc::clone(&report));
+    let quiet = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(llm.clone()),
+        dreaming.clone(),
+    );
+    Box::pin(quiet.run_once()).await.unwrap();
+    assert!(
+        read(
+            &mcp,
+            &bindings,
+            &report_value,
+            &workspace,
+            session,
+            evertrace_engine::McpServiceAction::Get,
+            old_id.clone()
+        )
+        .await
+        .items
+        .is_empty()
+    );
+    assert!(
+        !evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .iter()
+            .any(|job| job.kind == "semantic_synthesis_v1"
+                && matches!(job.state, JobStatus::Queued | JobStatus::Leased))
+    );
+    // Revocation remains closed. A separate normally admitted source in this
+    // same real repository tests purge while its claim is in flight.
+    let purge_session="019d0000-0000-7000-8000-000000000063";
+    let purge_source=format!("session-rollout:{purge_session}:{purge_session}");
+    let purge_path=transcript.parent().unwrap().join(format!("rollout-2026-09-10T00-00-00-{purge_session}.jsonl"));
+    let purge_workspace=workspace.parent().unwrap().join("purge-worktree");
+    assert!(std::process::Command::new("git").args(["worktree","add","-q","--detach",purge_workspace.to_str().unwrap()])
+        .current_dir(&workspace).env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_NOSYSTEM","1").status().unwrap().success());
+    let config_path=adapter.join("config.toml");
+    let config=fs::read_to_string(&config_path).unwrap();
+    fs::write(config_path,format!("{config}\n[projects.{}]\ntrust_level = \"trusted\"\n",serde_json::to_string(purge_workspace.to_str().unwrap()).unwrap())).unwrap();
+    let clock=std::process::Command::new("date").args(["-u","+%Y-%m-%dT%H:%M:%SZ %s"]).output().unwrap();
+    assert!(clock.status.success());
+    let clock=String::from_utf8(clock.stdout).unwrap();
+    let (timestamp,seconds)=clock.trim().split_once(' ').unwrap();
+    let purge_at=seconds.parse::<i64>().unwrap()*1_000_000;
+    let mut purge_header=header.clone();
+    purge_header["timestamp"]=timestamp.into();
+    purge_header["payload"]["id"]=purge_session.into();
+    purge_header["payload"]["session_id"]=purge_session.into();
+    purge_header["payload"]["cwd"]=purge_workspace.to_str().unwrap().into();
+    let final_message=serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"marigold purge claim"}});
+    fs::write(&purge_path,format!("{purge_header}\n{final_message}\n")).unwrap();
+    let current=evertrace_store::repository::RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    let known_heads=current.snapshots.values().filter_map(|snapshot|snapshot.head_oid.as_deref()).map(|head|evertrace_engine::repository::GitOid::parse(head).unwrap()).collect::<Vec<_>>();
+    let probe=evertrace_engine::repository::probe_repository(&purge_workspace,evertrace_engine::repository::HostTrustDecision::Trusted,std::slice::from_ref(&purge_source),purge_at,&evertrace_engine::repository::ProbeLimits::default(),&current.known_admin_paths(),&known_heads).unwrap();
+    let registration=evertrace_engine::repository::resolve_repository(&evertrace_engine::repository::RepositoryResolveInput {view:&current,evidence:&probe,derived_from_hint:None}).unwrap();
+    writer.commit(registration.journal_command(purge_at,CONFIG,"source-attribution").unwrap().unwrap(),purge_at).await.unwrap();
+    catalog.refresh(&report_value).await.unwrap();
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+    admin
+        .handle(
+            RequestId::new_v7(),
+            purge_session,
+            SessionImportAdminAction::QueueImport,
+            observed_at_us + 4,
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        if worker
+            .process_checkpoint(
+                &purge_source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap()
+            .completed
+        {
+            break;
+        }
+    }
+    let final_snapshot = writer.project().await.unwrap();
+    let final_receipt = final_snapshot
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceReceiptRecorded(value)
+                    if value.observation_role == ObservationRole::Message
+                        && value.source_instance_id.as_str() == purge_source =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            }
+        })
+        .next()
+        .unwrap();
+    replacement_application.progress_delta[0].direct_refs =
+        vec![final_receipt.source_observation_id.to_string()];
+    assert_eq!(final_receipt.repository_instance_id, Some(repository));
+    assert!(final_receipt.worktree_instance_id.is_some());
+    let (purged_stub, release) =
+        ProviderStub::once_paused(200, response(&replacement_application)).await;
+    let purging = BackgroundScheduler::new(
+        writer.clone(),
+        catalog,
+        worker,
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(LlmConfig {
+            base_url: ValidatedBaseUrl::parse(&purged_stub.base_url).unwrap(),
+            ..llm
+        }),
+        dreaming,
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let running = tokio::spawn({
+        let scheduler = purging.clone();
+        async move { Box::pin(scheduler.run_once()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), purged_stub.wait_received())
+        .await
+        .unwrap();
+    let claimed = writer.project().await.unwrap();
+    let current =
+        evertrace_store::repository::RepositoryCurrentView::from_snapshot(&claimed).unwrap();
+    let preview = evertrace_store::projections::repository_scope_purge_preview(
+        &claimed,
+        repository,
+        current.repositories[&repository].repository_revision,
+    )
+    .unwrap();
+    assert!(preview.blockers.is_empty());
+    let command = evertrace_engine::purge::pending_repository_purge_command(
+        RequestId::new_v7(),
+        &preview,
+        preview.deletion_generation,
+        observed_at_us + 5,
+        claimed.frontier,
+        CONFIG,
+    )
+    .unwrap();
+    assert!(command.events().iter().any(|event|matches!(&event.payload,JournalPayload::JobState(job) if job.kind=="semantic_synthesis_v1" && job.state==JobStatus::Failed)));
+    writer
+        .commit_if_frontier(command, observed_at_us + 5, claimed.frontier)
+        .await
+        .unwrap();
+    let pending = writer.project().await.expect("purge pending projection");
+    evertrace_store::RuntimeSchedulerView::from_snapshot(&pending).expect("purge pending jobs");
+    release.send(()).unwrap();
+    running.await.unwrap().unwrap();
+    purged_stub.finish().await;
+    assert_eq!(
+        writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+            .count(),
+        0
+    );
+    assert!(
+        read(
+            &mcp,
+            &bindings,
+            &report_value,
+            &workspace,
+            session,
+            evertrace_engine::McpServiceAction::Get,
+            old_id.clone()
+        )
+        .await
+        .items
+        .is_empty()
+    );
+    drop((quiet, purging, mcp, admin));
+    writer.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+    let mcp = evertrace_engine::McpActionService::open(
+        bindings.clone(),
+        &data,
+        writer.clone(),
+        runtime(temp.path()),
+    )
+    .await
+    .unwrap()
+    .with_session_report(Arc::clone(&report));
+    assert!(
+        read(
+            &mcp,
+            &bindings,
+            &report_value,
+            &workspace,
+            session,
+            evertrace_engine::McpServiceAction::Search,
+            "marigold".into()
+        )
+        .await
+        .items
+        .is_empty()
+    );
+    assert!(
+        !evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .iter()
+            .any(|job| job.kind == "semantic_synthesis_v1"
+                && matches!(job.state, JobStatus::Queued | JobStatus::Leased))
+    );
+    drop(mcp);
+    writer.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    }).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

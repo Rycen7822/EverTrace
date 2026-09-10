@@ -1146,7 +1146,13 @@ fn job_target_is_current(
     job: &DurableJob,
     config_hash: [u8; 32],
 ) -> Result<bool, evertrace_store::StoreError> {
-    if job.target_watermark > snapshot.frontier {
+    // Source targets use immutable source_sequence, not the journal frontier.
+    let source_synthesis = job.kind == "semantic_synthesis_v1"
+        && matches!(
+            evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision),
+            Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. })
+        );
+    if !source_synthesis && job.target_watermark > snapshot.frontier {
         return Ok(false);
     }
     Ok(match job.kind.as_str() {
@@ -2006,7 +2012,8 @@ impl BackgroundScheduler {
         let synthesis_candidates = if self.dreaming.max_llm_tasks_per_run == 0 {
             Vec::new()
         } else {
-            self.synthesis
+            let episodes = self
+                .synthesis
                 .durable_jobs_for_episodes(
                     idle.ready_episodes(&self.dreaming, selection_time),
                     self.runtime.effective_config_hash,
@@ -2014,7 +2021,49 @@ impl BackgroundScheduler {
                     PER_LANE_LIMIT,
                     max_synthesis_wall_time,
                 )
-                .map_err(|_| BackgroundSchedulerError::Store)?
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let report = self.report.read().await.clone();
+            let sources = self
+                .synthesis
+                .durable_source_jobs(
+                    &snapshot,
+                    &self.writer,
+                    report.as_ref(),
+                    self.runtime.effective_config_hash,
+                    PER_LANE_LIMIT,
+                    max_synthesis_wall_time,
+                    selection_time,
+                    |source| {
+                        idle.source_delay(
+                            source.repository_id,
+                            source.worktree_id,
+                            &self.dreaming,
+                            selection_time,
+                        )
+                        .is_some_and(|delay| delay.is_zero())
+                    },
+                )
+                .await
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let mut candidates = episodes
+                .iter()
+                .filter(|job| job.priority < 10)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut open = episodes.into_iter().filter(|job| job.priority >= 10);
+            let mut sources = sources.into_iter();
+            while candidates.len() < PER_LANE_LIMIT {
+                let pair = [sources.next(), open.next()];
+                if pair.iter().all(Option::is_none) {
+                    break;
+                }
+                candidates.extend(
+                    pair.into_iter()
+                        .flatten()
+                        .take(PER_LANE_LIMIT - candidates.len()),
+                );
+            }
+            candidates
         };
         if !synthesis_candidates.is_empty() {
             let occurred_at_us = now_us()?;
@@ -2257,8 +2306,9 @@ impl BackgroundScheduler {
                     .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
                     .await?
                 {
-                    self.fail_stale(&claimed.job, claimed.snapshot.frontier)
-                        .await?;
+                    // Permission revalidation may itself record a revocation.
+                    let frontier = self.writer.project().await.map_err(map_writer)?.frontier;
+                    self.fail_stale(&claimed.job, frontier).await?;
                     completed += 1;
                     continue;
                 }
@@ -2267,13 +2317,39 @@ impl BackgroundScheduler {
                     .synthesis
                     .remaining_daily_wall_time(&claimed.snapshot, occurred_at_us)
                     .map_err(|_| BackgroundSchedulerError::Store)?;
-                let execution_future = self.synthesis.execute_durable_job(
-                    &claimed.snapshot,
-                    &claimed.job,
-                    self.runtime.effective_config_hash,
-                    occurred_at_us,
-                    max_synthesis_wall_time,
+                let source_job = matches!(
+                    evertrace_domain::semantic::SemanticJobTarget::parse(
+                        &claimed.job.target_revision
+                    ),
+                    Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. })
                 );
+                let execution_future = async {
+                    if source_job {
+                        let report = self.report.read().await.clone();
+                        self.synthesis
+                            .execute_source_job(
+                                &claimed.snapshot,
+                                &claimed.job,
+                                self.runtime.effective_config_hash,
+                                occurred_at_us,
+                                max_synthesis_wall_time,
+                                &self.runtime,
+                                &self.writer,
+                                report.as_ref(),
+                            )
+                            .await
+                    } else {
+                        self.synthesis
+                            .execute_durable_job(
+                                &claimed.snapshot,
+                                &claimed.job,
+                                self.runtime.effective_config_hash,
+                                occurred_at_us,
+                                max_synthesis_wall_time,
+                            )
+                            .await
+                    }
+                };
                 let execution = if daily_wall_time.is_zero() {
                     Ok(execution_future.await)
                 } else {
@@ -2289,6 +2365,12 @@ impl BackgroundScheduler {
                         break;
                     }
                     Ok(Ok(command)) => {
+                        if source_job {
+                            let result = self.commit_source_synthesis(&claimed, command).await?;
+                            completed += result.completed;
+                            retryable |= result.retryable;
+                            continue;
+                        }
                         if !self
                             .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
                             .await?
@@ -2322,11 +2404,87 @@ impl BackgroundScheduler {
         })
     }
 
+    async fn commit_source_synthesis(
+        &self,
+        claimed: &ClaimedJob,
+        command: JournalCommand,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let id = command.command_id();
+        let expected = command
+            .events()
+            .iter()
+            .map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            let snapshot = self.writer.project().await.map_err(map_writer)?;
+            let jobs = RuntimeSchedulerView::from_snapshot(&snapshot)
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            if !jobs.jobs.iter().any(|job| job == &claimed.job) {
+                return Ok(BackgroundProgress::default());
+            }
+            if !self
+                .synthesis_repository_allowed(&snapshot, &claimed.job)
+                .await?
+            {
+                let frontier = self.writer.project().await.map_err(map_writer)?.frontier;
+                self.fail_stale(&claimed.job, frontier).await?;
+                return Ok(BackgroundProgress {
+                    completed: 1,
+                    retryable: false,
+                });
+            }
+            let result = self
+                .writer
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier)
+                .await;
+            if result.is_ok()
+                || self
+                    .writer
+                    .committed_command(id)
+                    .await
+                    .map_err(map_writer)?
+                    .is_some_and(|committed| committed.payloads == expected)
+            {
+                return Ok(BackgroundProgress {
+                    completed: 1,
+                    retryable: false,
+                });
+            }
+            if let Err(error) = result
+                && !matches!(error, WriterActorError::StaleFrontier)
+            {
+                return Err(map_writer(error));
+            }
+        }
+        Ok(BackgroundProgress {
+            completed: 0,
+            retryable: true,
+        })
+    }
+
     async fn synthesis_repository_allowed(
         &self,
         snapshot: &evertrace_store::ProjectionSnapshot,
         job: &DurableJob,
     ) -> Result<bool, BackgroundSchedulerError> {
+        if matches!(
+            evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision),
+            Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. })
+        ) {
+            let Ok(input) = crate::jobs::synthesis::source::input(snapshot, job) else {
+                return Ok(false);
+            };
+            let report = self.report.read().await.clone();
+            return crate::jobs::synthesis::source::allowed(
+                &self.writer,
+                report.as_ref(),
+                snapshot,
+                &input,
+                self.runtime.effective_config_hash,
+            )
+            .await
+            .map_err(|_| BackgroundSchedulerError::Store);
+        }
         let ids = snapshot
             .data_rows()
             .filter(|row| {
@@ -2666,6 +2824,28 @@ impl BackgroundScheduler {
             .min()
         {
             delay = delay.min(idle_delay);
+        }
+        if let Some(source_delay) = idle
+            .source_scopes
+            .iter()
+            .filter_map(|(repository, worktree)| {
+                idle.source_delay(*repository, *worktree, &dreaming, now)
+            })
+            .filter(|delay| !delay.is_zero())
+            .min()
+        {
+            delay = delay.min(source_delay);
+        }
+        if let Some(backoff) = view
+            .jobs
+            .iter()
+            .filter(|job| job.kind == "semantic_synthesis_v1" && job.state == JobStatus::Failed)
+            .filter_map(|job| job.backoff_until_us)
+            .filter(|due| *due > now)
+            .map(|due| Duration::from_micros((due - now) as u64))
+            .min()
+        {
+            delay = delay.min(backoff);
         }
         if retryable {
             delay = delay.min(RETRY_DELAY);
@@ -3166,7 +3346,7 @@ impl BackgroundScheduler {
             let mut fresh = SynthesisIdle::default();
             let idle = idle.unwrap_or(&mut fresh);
             idle.refresh(&snapshot)?;
-            if !idle.job_ready(current, &self.dreaming, now_us()?) {
+            if !idle.job_ready(&snapshot, current, &self.dreaming, now_us()?) {
                 return Ok(None);
             }
         }
@@ -3561,6 +3741,10 @@ struct SynthesisIdle {
         std::collections::BTreeSet<evertrace_domain::ids::WorkEpisodeId>,
     >,
     episodes: BTreeMap<evertrace_domain::ids::WorkEpisodeId, evertrace_domain::work::WorkEpisode>,
+    source_scopes: std::collections::BTreeSet<(
+        evertrace_domain::ids::RepositoryId,
+        evertrace_domain::ids::WorktreeId,
+    )>,
     #[cfg(test)]
     decoded_receipts: usize,
 }
@@ -3684,6 +3868,7 @@ impl SynthesisIdle {
             self.repositories.clear();
             self.worktrees.clear();
             self.local.clear();
+            self.source_scopes.clear();
         }
         for row in snapshot
             .data_rows()
@@ -3709,6 +3894,14 @@ impl SynthesisIdle {
             receipt
                 .validate()
                 .map_err(|_| BackgroundSchedulerError::Store)?;
+            if receipt.source_kind
+                == evertrace_domain::evidence::EvidenceSourceKind::CodexSessionJsonl
+                && receipt.observation_role == evertrace_domain::evidence::ObservationRole::Message
+                && let (Some(repository), Some(worktree)) =
+                    (receipt.repository_instance_id, receipt.worktree_instance_id)
+            {
+                self.source_scopes.insert((repository, worktree));
+            }
             #[cfg(test)]
             {
                 self.decoded_receipts += 1;
@@ -3792,12 +3985,47 @@ impl SynthesisIdle {
         ))
     }
 
+    fn source_delay(
+        &self,
+        repository: evertrace_domain::ids::RepositoryId,
+        worktree: evertrace_domain::ids::WorktreeId,
+        config: &evertrace_domain::config::DreamingConfig,
+        now: i64,
+    ) -> Option<Duration> {
+        if !config.idle_enabled {
+            return None;
+        }
+        let last = [
+            (Some(repository), None),
+            (Some(repository), Some(worktree)),
+            (None, Some(worktree)),
+        ]
+        .iter()
+        .filter_map(|key| self.scoped.get(key))
+        .max()?;
+        let idle_us = i64::try_from(config.idle_after.seconds().saturating_mul(1_000_000)).ok()?;
+        Some(Duration::from_micros(
+            last.saturating_add(idle_us).saturating_sub(now).max(0) as u64,
+        ))
+    }
+
     fn job_ready(
         &self,
+        snapshot: &evertrace_store::ProjectionSnapshot,
         job: &DurableJob,
         config: &evertrace_domain::config::DreamingConfig,
         now: i64,
     ) -> bool {
+        if let Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. }) =
+            evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision)
+        {
+            return crate::jobs::synthesis::source::job_scope(snapshot, job)
+                .ok()
+                .and_then(|source| {
+                    self.source_delay(source.repository_id, source.worktree_id, config, now)
+                })
+                .is_some_and(|delay| delay.is_zero());
+        }
         self.episodes
             .values()
             .find(|episode| episode.revision_id.to_string() == job.target_revision)
@@ -3839,7 +4067,7 @@ impl SynthesisIdle {
             // verifier before admitting terminal cleanup, never infer readiness
             // from a missing clock. Current busy targets consume no lane slot.
             if job.kind != "semantic_synthesis_v1"
-                || self.job_ready(job, config, now)
+                || self.job_ready(snapshot, job, config, now)
                 || (config.idle_enabled
                     && !target_present
                     && !job_target_is_current(snapshot, view, job, job.config_hash)
@@ -4012,7 +4240,15 @@ mod idle_tests {
         );
         // Activity observed at fresh claim makes the formerly selected target busy.
         idle.record((quiet.repository_instance_id, None), observation, now);
-        assert!(!idle.job_ready(&planned[0], &config, now));
+        assert!(!idle.job_ready(
+            &evertrace_store::ProjectionSnapshot {
+                frontier: 100,
+                rows: vec![]
+            },
+            &planned[0],
+            &config,
+            now
+        ));
         let tree_a = WorktreeId::new_v7();
         let tree_b = WorktreeId::new_v7();
         quiet.worktree_instance_id = Some(tree_a);

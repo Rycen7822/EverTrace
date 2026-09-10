@@ -5627,7 +5627,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
     let generated = planner
         .execute(evertrace_engine::jobs::SynthesisRequest {
             snapshot: &snapshot,
-            episode_revision_id: current_episode.revision_id,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(current_episode.revision_id),
             trigger: evertrace_domain::semantic::SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![evertrace_engine::provider::ProtectedDeltaItem {
                 kind: evertrace_engine::provider::ProtectedDeltaKind::Decision,

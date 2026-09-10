@@ -302,16 +302,20 @@ pub fn build_semantic_digest_relation_rows(
     for digest in digests {
         digest.validate().map_err(|_| StoreError::InvalidInput)?;
         let source_id = digest.semantic_digest_id.to_string();
-        rows.insert(SemanticRelationRow {
-            kind: SemanticRelationKind::SemanticDigestToEpisode,
-            source_id: source_id.clone(),
-            target_id: digest.episode_id.to_string(),
-        });
-        rows.insert(SemanticRelationRow {
-            kind: SemanticRelationKind::SemanticDigestToTask,
-            source_id: source_id.clone(),
-            target_id: digest.task_id.to_string(),
-        });
+        if let Some(episode_id) = digest.episode_id {
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::SemanticDigestToEpisode,
+                source_id: source_id.clone(),
+                target_id: episode_id.to_string(),
+            });
+        }
+        if let Some(task_id) = digest.task_id {
+            rows.insert(SemanticRelationRow {
+                kind: SemanticRelationKind::SemanticDigestToTask,
+                source_id: source_id.clone(),
+                target_id: task_id.to_string(),
+            });
+        }
         for reference in &digest.selected_direct_refs {
             rows.insert(SemanticRelationRow {
                 kind: SemanticRelationKind::SemanticDigestToDirectSource,

@@ -1207,6 +1207,8 @@ fn background_relevant(command: &JournalCommand) -> bool {
                 | evertrace_store::JournalPayload::WorkEpisodeRecorded(_)
                 | evertrace_store::JournalPayload::WorkCheckpointRecorded(_)
                 | evertrace_store::JournalPayload::SessionImportEventRecorded(_)
+                | evertrace_store::JournalPayload::SourceReceiptRecorded(_)
+                | evertrace_store::JournalPayload::SourceObservationRecorded(_)
                 | evertrace_store::JournalPayload::ProcedureUsageRecorded(_)
                 | evertrace_store::JournalPayload::ProcedureRevisionRecorded(_)
                 | evertrace_store::JournalPayload::ProcedureStateRecorded(_)

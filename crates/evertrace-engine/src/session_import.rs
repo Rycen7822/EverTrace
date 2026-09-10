@@ -1664,9 +1664,84 @@ pub(crate) async fn preflight_import_context(
     Ok(true)
 }
 
-/// Resolve only the requested evidence rows. A single bounded observation
-/// join is shared by the request; neither receipt bodies nor a global trust
-/// cache are retained.
+/// Validate only selected archived message records; never reopen a source path
+/// or require its historical revision to equal today's catalog revision.
+pub(crate) fn source_summary_receipts(
+    snapshot: &evertrace_store::ProjectionSnapshot,
+    source: &evertrace_domain::semantic::SemanticSourceTarget,
+    after_sequence: u64,
+    through_sequence: u64,
+    refs: &[String],
+) -> Result<Vec<evertrace_domain::evidence::SourceReceipt>, SessionImportServiceError> {
+    if refs.is_empty()
+        || refs.len() > 64
+        || !refs.windows(2).all(|pair| pair[0] < pair[1])
+        || !evertrace_store::is_session_import_source(source.source_instance_id.as_str())
+    {
+        return Err(SessionImportServiceError::Corrupt);
+    }
+    let mut observations = BTreeMap::new();
+    for row in snapshot.data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("source_observation")
+            && row
+                .object_id
+                .as_ref()
+                .is_some_and(|id| refs.binary_search(id).is_ok())
+    }) {
+        let JournalPayload::SourceObservationRecorded(observation) = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(SessionImportServiceError::Corrupt)?,
+        )
+        .map_err(|_| SessionImportServiceError::Corrupt)?
+        else {
+            return Err(SessionImportServiceError::Corrupt);
+        };
+        observations.insert(observation.source_receipt_ref.to_string(), observation);
+    }
+    let mut receipts = Vec::new();
+    for row in snapshot.data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("source_receipt")
+            && row
+                .object_id
+                .as_ref()
+                .is_some_and(|id| observations.contains_key(id))
+    }) {
+        let JournalPayload::SourceReceiptRecorded(receipt) = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(SessionImportServiceError::Corrupt)?,
+        )
+        .map_err(|_| SessionImportServiceError::Corrupt)?
+        else {
+            return Err(SessionImportServiceError::Corrupt);
+        };
+        let observation = observations
+            .get(&receipt.source_receipt_id.to_string())
+            .ok_or(SessionImportServiceError::Corrupt)?;
+        if !source.contains_message(&receipt, observation, after_sequence, through_sequence) {
+            return Err(SessionImportServiceError::Corrupt);
+        }
+        receipts.push(*receipt);
+    }
+    receipts.sort_by_key(|receipt| receipt.source_sequence);
+    if receipts.len() != refs.len()
+        || receipts.last().map(|receipt| receipt.source_sequence) != Some(through_sequence)
+        || !receipts
+            .windows(2)
+            .all(|pair| pair[0].source_sequence < pair[1].source_sequence)
+    {
+        return Err(SessionImportServiceError::Corrupt);
+    }
+    if evertrace_store::ObjectDeletionCandidateAdmissionView::for_source_refs(snapshot, refs)
+        .and_then(|view| view.source_refs_suppressed(refs))
+        .map_err(|_| SessionImportServiceError::Corrupt)?
+    {
+        return Err(SessionImportServiceError::Unavailable);
+    }
+    Ok(receipts)
+}
+
 pub(crate) async fn blocked_source_rows(
     writer: &WriterHandle,
     report: Option<&HostProbeReport>,
@@ -1679,10 +1754,11 @@ pub(crate) async fn blocked_source_rows(
     }
     let mut sources = BTreeMap::new();
     let mut observations = BTreeMap::new();
+    let mut blocked = std::collections::BTreeSet::new();
     for row in rows {
         if !matches!(
             row.object_kind.as_deref(),
-            Some("source_receipt" | "source_observation" | "evidence_surface")
+            Some("source_receipt" | "source_observation" | "evidence_surface" | "semantic_digest")
         ) {
             continue;
         }
@@ -1693,6 +1769,30 @@ pub(crate) async fn blocked_source_rows(
         )
         .map_err(|_| SessionImportServiceError::Corrupt)?;
         match payload {
+            JournalPayload::SemanticDigestRecorded(digest) => {
+                let Some(source) = &digest.source_target else {
+                    continue;
+                };
+                digest
+                    .validate()
+                    .map_err(|_| SessionImportServiceError::Corrupt)?;
+                if source_summary_receipts(
+                    snapshot,
+                    source,
+                    digest.from_watermark,
+                    digest.to_watermark,
+                    &digest.selected_direct_refs,
+                )
+                .is_err()
+                {
+                    blocked.insert(row.row_id.clone());
+                    continue;
+                }
+                sources.insert(
+                    row.row_id.clone(),
+                    source.source_instance_id.as_str().to_owned(),
+                );
+            }
             JournalPayload::SourceReceiptRecorded(receipt) => {
                 sources.insert(
                     row.row_id.clone(),
@@ -1784,10 +1884,12 @@ pub(crate) async fn blocked_source_rows(
     crate::repository::record_trust_revocations(writer, revoked, config_hash)
         .await
         .map_err(map_writer)?;
-    Ok(sources
-        .into_iter()
-        .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row))
-        .collect())
+    blocked.extend(
+        sources
+            .into_iter()
+            .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row)),
+    );
+    Ok(blocked)
 }
 
 fn resolve_workspace(

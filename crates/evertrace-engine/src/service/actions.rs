@@ -622,7 +622,9 @@ fn classify_object_row(
             None,
             None,
         ),
-        Some(JournalPayload::RevisionProposalRecorded(_)) => (
+        Some(
+            JournalPayload::RevisionProposalRecorded(_) | JournalPayload::SemanticDigestRecorded(_),
+        ) => (
             McpItemPartition::Evidence,
             ContentTrust::AgentClaim,
             None,

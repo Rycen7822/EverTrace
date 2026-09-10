@@ -1705,8 +1705,8 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
     };
     let mut prior = SemanticDerivationRun {
         derivation_run_id: SemanticDerivationRunId::new_v7(),
-        episode_id: first.episode_id,
-        episode_revision_id: first.revision_id,
+        episode_id: Some(first.episode_id),
+        episode_revision_id: Some(first.revision_id),
         from_watermark: first.semantic_watermark,
         to_watermark: first.source_watermark,
         selected_direct_refs: vec!["source:prior-wall-usage".into()],
@@ -1723,10 +1723,11 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
         algorithm_revision: "semantic_synthesis_v1".into(),
         effective_config_hash: CONFIG,
         created_at_us: 2,
+        source_target: None,
     };
     prior.job_fingerprint = job_fingerprint(
-        prior.episode_id,
-        prior.episode_revision_id,
+        prior.episode_id.unwrap(),
+        prior.episode_revision_id.unwrap(),
         prior.from_watermark,
         prior.to_watermark,
         &prior.selected_direct_refs,

@@ -1147,6 +1147,12 @@ fn dirty_targets_owned_support(
 }
 
 fn journal_payload(row: &ObjectRow) -> Result<Option<JournalPayload>, StoreError> {
+    // Imported-source current rows contain their typed projection, not a
+    // JournalPayload. The repository closure handles them through the existing
+    // non-journal path, including unrelated sources that must remain visible.
+    if crate::session_import::restore_current(row)?.is_some() {
+        return Ok(None);
+    }
     if row.row_class == Some(ObjectRowClass::Projection)
         && matches!(
             row.object_kind.as_deref(),

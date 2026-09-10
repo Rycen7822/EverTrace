@@ -220,6 +220,39 @@ impl SearchSnapshot {
         }
         query_rows(&self.table, filter_sql(filter), limit, Some(query)).await
     }
+
+    /// The passive MCP read has no Work anchor: its typed, session-bound
+    /// candidate window must constrain FTS before LIMIT, never search globally.
+    pub async fn fts_selected(
+        &self,
+        query: &str,
+        identifiers: &[String],
+        limit: usize,
+    ) -> Result<Vec<SearchProjectionRow>, StoreError> {
+        if identifiers.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        if query.is_empty() || identifiers.len() > 32 || limit > 32 {
+            return Err(StoreError::InvalidInput);
+        }
+        let selected = format!(
+            "candidate_id IN ({})",
+            identifiers
+                .iter()
+                .map(|id| sql_literal(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let filter = combine_filter(
+            filter_sql(&SearchHardFilter {
+                object_only: true,
+                current_only: true,
+                ..Default::default()
+            }),
+            Some(selected),
+        );
+        query_rows(&self.table, filter, limit, Some(query)).await
+    }
 }
 
 const SEARCH_COLUMNS: [&str; 26] = [
