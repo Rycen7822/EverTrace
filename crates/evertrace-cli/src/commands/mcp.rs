@@ -241,15 +241,13 @@ fn error_response(id: Value, code: i32, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use evertrace_protocol::mcp::MCP_TOOL_DESCRIPTION;
 
     #[test]
     fn tool_definition_is_single_closed_and_small() {
         let definition = tool_definition();
         assert_eq!(definition["name"], MCP_TOOL_NAME);
-        assert_eq!(
-            definition["description"],
-            "Search, inspect, record, or organize EverTrace data for a workspace."
-        );
+        assert_eq!(definition["description"], MCP_TOOL_DESCRIPTION);
         assert_eq!(definition["inputSchema"]["additionalProperties"], false);
         assert!(serde_json::to_vec(&definition).unwrap().len() < 1_000);
     }
