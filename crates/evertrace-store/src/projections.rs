@@ -8807,6 +8807,22 @@ fn validate_job_successor(
             )
         );
     let valid = match (current.state, next.state) {
+        (JobStatus::Queued, JobStatus::Queued) => {
+            let mut expected = current.clone();
+            expected.backoff_until_us = next.backoff_until_us;
+            matches!(
+                current.kind.as_str(),
+                "semantic_synthesis_v1" | "procedure_review_v1"
+            ) && next == &expected
+                && current.lease_until_us.is_none()
+                && current.terminal.is_none()
+                && current
+                    .backoff_until_us
+                    .is_none_or(|deadline| deadline <= occurred_at_us)
+                && next
+                    .backoff_until_us
+                    .is_some_and(|deadline| deadline > occurred_at_us)
+        }
         (JobStatus::Leased, JobStatus::Succeeded | JobStatus::Failed) => {
             next.attempt == current.attempt
         }
@@ -13915,6 +13931,27 @@ mod tests {
             lease_until_us: None,
         };
         let mut forged_initial_lease = job.clone();
+        let mut waiting = job.clone();
+        waiting.backoff_until_us = Some(100);
+        assert!(validate_job_successor(&job, &waiting, 10).is_err());
+        for kind in ["semantic_synthesis_v1", "procedure_review_v1"] {
+            let mut llm = job.clone();
+            llm.kind = kind.into();
+            llm.model_id = Some("test".into());
+            llm.budget.max_bytes = Some(1024);
+            llm.budget.max_input_tokens = Some(1024);
+            llm.budget.max_output_tokens = Some(1024);
+            llm.budget.max_calls = Some(1);
+            let mut waiting = llm.clone();
+            waiting.backoff_until_us = Some(100);
+            assert!(validate_job_successor(&llm, &waiting, 10).is_ok());
+            let mut extended = waiting.clone();
+            extended.backoff_until_us = Some(200);
+            assert!(validate_job_successor(&waiting, &extended, 20).is_err());
+            assert!(validate_job_successor(&waiting, &extended, 101).is_ok());
+            extended.attempt += 1;
+            assert!(validate_job_successor(&waiting, &extended, 101).is_err());
+        }
         forged_initial_lease.state = JobStatus::Leased;
         forged_initial_lease.lease_until_us = Some(100);
         let mut forged_rows = Vec::new();

@@ -688,6 +688,20 @@ impl JournalWriter {
         read_all_journal_rows(&self.journal).await
     }
 
+    pub fn llm_budget_page(
+        &self,
+        day_start_us: i64,
+        after: u64,
+        frontier: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<crate::JournalRow>, StoreError>> + Send + use<>
+    {
+        let journal = self.journal.clone();
+        let frontier = frontier.min(self.frontier());
+        async move {
+            crate::journal::read_llm_budget_page(&journal, day_start_us, after, frontier).await
+        }
+    }
+
     pub async fn mark_gc(
         &self,
         runtime: &evertrace_capture::RuntimeSnapshot,

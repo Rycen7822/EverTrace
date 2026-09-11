@@ -618,6 +618,11 @@ impl RevisionProposal {
     }
 
     pub fn validate_successor(&self, next: &Self) -> Result<(), SemanticError> {
+        if self.payload != next.payload
+            && next.review_reason.as_deref() == Some("procedure_review_v1")
+        {
+            return self.validate_procedure_review_successor(next);
+        }
         next.validate()?;
         if self.proposal_id != next.proposal_id
             || next.parent_proposal_revision_id != Some(self.proposal_revision_id)
@@ -689,6 +694,42 @@ impl RevisionProposal {
             {
                 return Err(SemanticError::InvalidProposalSuccessor);
             }
+        }
+        Ok(())
+    }
+
+    /// A bounded background review preserves the Inbox identity and cannot
+    /// inherit acceptance or automatic eligibility for changed content.
+    pub fn validate_procedure_review_successor(&self, next: &Self) -> Result<(), SemanticError> {
+        next.validate()?;
+        let (ProposalPayload::Procedure(before), ProposalPayload::Procedure(after)) =
+            (&self.payload, &next.payload)
+        else {
+            return Err(SemanticError::InvalidProposalSuccessor);
+        };
+        if !matches!(
+            self.status,
+            ProposalStatus::Pending | ProposalStatus::Validating
+        ) || next.status != self.status
+            || self.proposal_id != next.proposal_id
+            || next.parent_proposal_revision_id != Some(self.proposal_revision_id)
+            || self.proposal_revision_id == next.proposal_revision_id
+            || self.target_kind != next.target_kind
+            || self.target_id != next.target_id
+            || self.base_revision_id != next.base_revision_id
+            || self.operation != next.operation
+            || self.created_by != next.created_by
+            || !contains_all(&next.source_cohort_refs, &self.source_cohort_refs)
+            || !contains_all(&next.evidence_refs, &self.evidence_refs)
+            || before.draft().scope != after.draft().scope
+            || !contains_all(&after.draft().evidence_refs, &before.draft().evidence_refs)
+            || before.draft().support_revision_refs != after.draft().support_revision_refs
+            || next.eligibility != ProposalEligibility::ManualRequired
+            || next.created_at_us < self.created_at_us
+            || next.review_reason.as_deref() != Some("procedure_review_v1")
+            || self.payload == next.payload
+        {
+            return Err(SemanticError::InvalidProposalSuccessor);
         }
         Ok(())
     }

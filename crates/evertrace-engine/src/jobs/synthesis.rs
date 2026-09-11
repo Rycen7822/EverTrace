@@ -159,11 +159,11 @@ pub enum SynthesisResolution {
 
 #[derive(Clone)]
 pub struct SynthesisPlanner {
-    llm: LlmConfig,
-    provider: Option<OpenAiCompatibleProvider>,
+    pub(crate) llm: LlmConfig,
+    pub(crate) provider: Option<OpenAiCompatibleProvider>,
     prompt_hash: [u8; 32],
     concurrency: std::sync::Arc<crate::provider::ProviderConcurrency>,
-    inventory: Option<super::InventoryWorker>,
+    pub(crate) inventory: Option<super::InventoryWorker>,
 }
 
 impl SynthesisPlanner {
@@ -721,41 +721,38 @@ impl SynthesisPlanner {
                     evertrace_domain::semantic::SemanticCompleteness::Partial;
             }
         }
-        if episode.as_ref().is_some_and(|episode| {
-            validate_candidates(&application.candidates, episode, request.snapshot).is_err()
-        }) {
-            return audit_resolution(
-                self,
-                &request,
-                episode.as_ref(),
-                fingerprint,
-                DerivationRunStatus::SchemaRejected,
-                DerivationQuotaUsage {
-                    input_tokens: derived.input_tokens,
-                    output_tokens: derived.output_tokens,
-                    calls: 1,
-                    wall_time_us: derived.wall_time_us,
-                },
-            );
+        if let Some(episode) = &episode {
+            isolate_invalid_candidates(&mut application, episode, request.snapshot)?;
         }
         // The closed provider result permits at most one candidate. Resolve
         // its cohort's assets once, after schema/protection, not per record.
         let coverage = match (application.candidates.first(), &self.inventory) {
-            (Some(SemanticCandidate::ProcedureProposal { payload, .. }), Some(inventory)) => Some(
-                inventory
+            (Some(SemanticCandidate::ProcedureProposal { payload, .. }), Some(inventory)) => {
+                match inventory
                     .procedure_coverage(request.snapshot, payload.draft(), &evidence_refs)
-                    .await?,
-            ),
+                    .await
+                {
+                    Ok(coverage) => Some(coverage),
+                    Err(
+                        crate::semantic::SemanticServiceError::InvalidInput
+                        | crate::semantic::SemanticServiceError::BaseConflict,
+                    ) => {
+                        application.candidates.clear();
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             _ => None,
         };
         if let (Some(coverage), Some(candidate)) = (&coverage, application.candidates.first_mut()) {
             coverage.apply_incremental_boundary(candidate);
         }
         if let Some(episode) = &episode {
-            validate_candidates(&application.candidates, episode, request.snapshot)?;
+            isolate_invalid_candidates(&mut application, episode, request.snapshot)?;
         }
         let digest_id = SemanticDigestId::new_v7();
-        let digest = SemanticDigest {
+        let mut digest = SemanticDigest {
             semantic_digest_id: digest_id,
             episode_id: input.episode_id,
             episode_revision_id: input.episode_revision_id,
@@ -817,7 +814,7 @@ impl SynthesisPlanner {
         )?;
         let mut payloads = if episode.is_some() {
             proposal_payloads(
-                &digest,
+                &mut digest,
                 request.snapshot,
                 &request,
                 &evidence_refs,
@@ -1184,6 +1181,138 @@ pub(crate) fn recorded_daily_usage(
     Ok(daily_usage(&prior_runs(snapshot)?, occurred_at_us))
 }
 
+/// Rebuild reservations from the existing claim history. Unacknowledged,
+/// failed and interrupted calls keep their whole ceiling; a committed synthesis
+/// run replaces only its own final reservation, so it is never counted twice.
+/// A per-query reduction of bounded daily pages, borrowing existing current jobs.
+/// No history payloads or cross-query cache are retained by the writer actor.
+pub(crate) struct DailyLlmUsage<'a> {
+    jobs: std::collections::BTreeMap<JobId, &'a DurableJob>,
+    claims: std::collections::BTreeMap<JobId, u32>,
+    usage: DerivationQuotaUsage,
+    run_command: Option<CommandId>,
+    day_start_us: i64,
+}
+
+impl<'a> DailyLlmUsage<'a> {
+    pub(crate) fn new(jobs: &'a [DurableJob], at: i64) -> Self {
+        Self {
+            jobs: jobs
+                .iter()
+                .filter(|job| {
+                    job.model_id.is_some()
+                        && matches!(
+                            job.kind.as_str(),
+                            "semantic_synthesis_v1" | super::procedure::KIND
+                        )
+                })
+                .map(|job| (job.job_id, job))
+                .collect(),
+            claims: Default::default(),
+            usage: Default::default(),
+            run_command: None,
+            day_start_us: at / DAY_US * DAY_US,
+        }
+    }
+
+    pub(crate) fn day_start_us(&self) -> i64 {
+        self.day_start_us
+    }
+
+    pub(crate) fn extend(
+        &mut self,
+        rows: &[evertrace_store::JournalRow],
+    ) -> Result<(), evertrace_store::StoreError> {
+        for row in rows.iter().filter(|row| {
+            row.occurred_at_us >= self.day_start_us
+                && row.occurred_at_us < self.day_start_us.saturating_add(DAY_US)
+        }) {
+            match row.payload()? {
+                JournalPayload::SemanticDerivationRunRecorded(run) => {
+                    let actual = daily_usage(&[*run], self.day_start_us);
+                    self.usage.input_tokens =
+                        self.usage.input_tokens.saturating_add(actual.input_tokens);
+                    self.usage.output_tokens = self
+                        .usage
+                        .output_tokens
+                        .saturating_add(actual.output_tokens);
+                    self.usage.calls = self.usage.calls.saturating_add(actual.calls);
+                    self.usage.wall_time_us =
+                        self.usage.wall_time_us.saturating_add(actual.wall_time_us);
+                    self.run_command = Some(row.command_id);
+                }
+                JournalPayload::JobState(job)
+                    if job.kind == "semantic_synthesis_v1"
+                        && self.run_command == Some(row.command_id) =>
+                {
+                    // The terminal's real run replaces only its latest claim;
+                    // failed/interrupted earlier attempts stay reserved.
+                    if let Some(count) = self.claims.get_mut(&job.job_id) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+                JournalPayload::JobLease(lease) if self.jobs.contains_key(&lease.job_id) => {
+                    let count = self.claims.entry(lease.job_id).or_default();
+                    *count = count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> DerivationQuotaUsage {
+        for (id, job) in self.jobs {
+            // Current leased metadata also reserves a call started on a prior
+            // day, without looking up any old journal body or creation event.
+            let count = self
+                .claims
+                .get(&id)
+                .copied()
+                .unwrap_or(0)
+                .max(u32::from(job.state == JobStatus::Leased));
+            let reserved = claim_reservation(job);
+            self.usage.input_tokens = self
+                .usage
+                .input_tokens
+                .saturating_add(reserved.input_tokens.saturating_mul(u64::from(count)));
+            self.usage.output_tokens = self
+                .usage
+                .output_tokens
+                .saturating_add(reserved.output_tokens.saturating_mul(u64::from(count)));
+            self.usage.calls = self
+                .usage
+                .calls
+                .saturating_add(reserved.calls.saturating_mul(count));
+            self.usage.wall_time_us = self
+                .usage
+                .wall_time_us
+                .saturating_add(reserved.wall_time_us.saturating_mul(u64::from(count)));
+        }
+        self.usage
+    }
+}
+
+pub(crate) fn claim_reservation(job: &DurableJob) -> DerivationQuotaUsage {
+    DerivationQuotaUsage {
+        // The adapter enforces these byte/token ceilings even when an older
+        // durable job declares the larger daily ceilings. Its immutable audit
+        // remains valid without replacing queued work on upgrade.
+        input_tokens: job
+            .budget
+            .max_input_tokens
+            .unwrap_or(0)
+            .min(crate::provider::PROVIDER_REQUEST_MAX_BYTES as u64),
+        output_tokens: job
+            .budget
+            .max_output_tokens
+            .unwrap_or(0)
+            .min(crate::provider::PROVIDER_OUTPUT_MAX_TOKENS),
+        calls: job.budget.max_calls.unwrap_or(0),
+        wall_time_us: job.budget.max_wall_time_ms.saturating_mul(1000),
+    }
+}
+
 fn daily_usage(prior: &[SemanticDerivationRun], occurred_at_us: i64) -> DerivationQuotaUsage {
     prior
         .iter()
@@ -1224,6 +1353,24 @@ fn prior_runs(
         .collect()
 }
 
+fn isolate_invalid_candidates(
+    application: &mut SemanticDigestApplication,
+    episode: &WorkEpisode,
+    snapshot: &ProjectionSnapshot,
+) -> Result<(), crate::semantic::SemanticServiceError> {
+    match validate_candidates(&application.candidates, episode, snapshot) {
+        Ok(()) => Ok(()),
+        Err(
+            crate::semantic::SemanticServiceError::InvalidInput
+            | crate::semantic::SemanticServiceError::BaseConflict,
+        ) => {
+            application.candidates.clear();
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn validate_candidates(
     candidates: &[SemanticCandidate],
     episode: &WorkEpisode,
@@ -1232,8 +1379,7 @@ fn validate_candidates(
     if candidates.len() > 1 {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     }
-    let semantic = SemanticCurrentView::from_snapshot(snapshot)
-        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
+    let semantic = SemanticCurrentView::from_snapshot(snapshot)?;
     for candidate in candidates {
         candidate
             .validate()
@@ -1302,28 +1448,16 @@ fn validate_candidates(
                     return Err(crate::semantic::SemanticServiceError::InvalidInput);
                 }
                 if let Some(target_id) = target_id {
-                    let mut current = snapshot.data_rows().filter_map(|row| {
-                        let payload: JournalPayload =
-                            serde_json::from_str(row.payload_json.as_deref()?).ok()?;
-                        let JournalPayload::ProcedureRevisionRecorded(value) = payload else {
-                            return None;
-                        };
-                        (value.procedure_id == *target_id).then_some(*value)
-                    });
-                    let Some(first) = current.next() else {
-                        return Err(crate::semantic::SemanticServiceError::InvalidInput);
-                    };
-                    let latest = current.try_fold(first, |selected, candidate| {
-                        if candidate.revision_generation == selected.revision_generation {
-                            Err(crate::semantic::SemanticServiceError::ImmutableConflict)
-                        } else if candidate.revision_generation > selected.revision_generation {
-                            Ok(candidate)
-                        } else {
-                            Ok(selected)
-                        }
-                    })?;
-                    if Some(latest.revision_id) != *base_revision_id
-                        || latest.draft.scope != expected
+                    let current =
+                        crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(
+                            snapshot,
+                        )?;
+                    if base_revision_id
+                        .and_then(|revision| current.current_procedure_by_revision(revision))
+                        .is_none_or(|procedure| {
+                            procedure.procedure_id != *target_id
+                                || procedure.draft.scope != expected
+                        })
                     {
                         return Err(crate::semantic::SemanticServiceError::BaseConflict);
                     }
@@ -1341,9 +1475,7 @@ fn materialize_application(
     occurred_at_us: i64,
     stage_trace: Option<&crate::procedure::StageTrace>,
 ) -> Result<SemanticDigestApplication, crate::semantic::SemanticServiceError> {
-    if provider.candidates.len() > 1
-        || !provider.candidates.is_empty() && (evidence_refs.is_empty() || episode.is_none())
-    {
+    if provider.candidates.len() > 1 || !provider.candidates.is_empty() && episode.is_none() {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     }
     let candidates = provider
@@ -1463,7 +1595,9 @@ fn materialize_application(
                 }
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(Result::ok)
+        .filter(|candidate| !evidence_refs.is_empty() && candidate.validate().is_ok())
+        .collect();
     Ok(SemanticDigestApplication {
         progress_delta: provider.progress_delta,
         decision_delta: provider.decision_delta,
@@ -1492,7 +1626,7 @@ fn atom_payload_scopes(
 }
 
 fn proposal_payloads(
-    digest: &SemanticDigest,
+    digest: &mut SemanticDigest,
     snapshot: &ProjectionSnapshot,
     request: &SynthesisRequest<'_>,
     evidence_refs: &[String],
@@ -1502,15 +1636,19 @@ fn proposal_payloads(
     let deletion_admission = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
     let service = RevisionProposalService;
     let mut payloads = Vec::new();
-    for candidate in &digest.application.candidates {
-        if matches!(candidate, SemanticCandidate::ProcedureProposal { payload, .. }
+    let mut retained = Vec::new();
+    for candidate in std::mem::take(&mut digest.application.candidates) {
+        if matches!(&candidate, SemanticCandidate::ProcedureProposal { payload, .. }
             if payload.operation() == evertrace_domain::semantic::ProposalOperation::Create)
             && coverage.is_some_and(|coverage| coverage.suppresses_duplicate_create())
         {
             continue;
         }
-        let submit = match candidate {
-            SemanticCandidate::ScenarioPatch { .. } => continue,
+        let submit = match &candidate {
+            SemanticCandidate::ScenarioPatch { .. } => {
+                retained.push(candidate);
+                continue;
+            }
             SemanticCandidate::AtomProposal {
                 target_id,
                 base_revision_id,
@@ -1543,6 +1681,7 @@ fn proposal_payloads(
             },
         };
         if has_unique_existing_exact_proposal(&view, &submit)? {
+            retained.push(candidate);
             continue;
         }
         match service.submit_with_deletion_admission(
@@ -1555,19 +1694,26 @@ fn proposal_payloads(
                 algorithm_revision: request.algorithm_revision.clone(),
             },
             submit,
-        )? {
-            DeletionAwareProposalResolution::Proposal(ProposalResolution::Revision {
+        ) {
+            Ok(DeletionAwareProposalResolution::Proposal(ProposalResolution::Revision {
                 command,
                 ..
-            }) => {
+            })) => {
                 payloads.extend(command.events().iter().map(|event| event.payload.clone()));
+                retained.push(candidate);
             }
-            DeletionAwareProposalResolution::FixedSuppression => {}
-            DeletionAwareProposalResolution::Proposal(ProposalResolution::NoDelta) => {
-                return Err(crate::semantic::SemanticServiceError::ImmutableConflict);
-            }
+            Ok(
+                DeletionAwareProposalResolution::FixedSuppression
+                | DeletionAwareProposalResolution::Proposal(ProposalResolution::NoDelta),
+            )
+            | Err(
+                crate::semantic::SemanticServiceError::InvalidInput
+                | crate::semantic::SemanticServiceError::BaseConflict,
+            ) => {}
+            Err(error) => return Err(error),
         }
     }
+    digest.application.candidates = retained;
     Ok(payloads)
 }
 
@@ -1685,6 +1831,98 @@ fn trigger_name(trigger: SemanticDigestTrigger) -> &'static str {
 #[cfg(test)]
 mod daily_usage_tests {
     use super::*;
+
+    #[test]
+    fn review_claim_reservation_survives_replay_and_midnight_until_terminal() {
+        let job = DurableJob {
+            job_id: JobId::new_v7(),
+            idempotency_key: "review-cohort".into(),
+            target_revision: RevisionId::new_v7().to_string(),
+            target_watermark: 1,
+            target_generation: 1,
+            kind: super::super::procedure::KIND.into(),
+            algorithm_revision: super::super::procedure::KIND.into(),
+            model_id: Some("test".into()),
+            priority: 5,
+            state: JobStatus::Queued,
+            attempt: 1,
+            backoff_until_us: None,
+            config_hash: [1; 32],
+            budget: JobBudget {
+                max_items: 16,
+                max_bytes: Some(16_384),
+                max_input_tokens: Some(8192),
+                max_output_tokens: Some(2048),
+                max_calls: Some(1),
+                max_wall_time_ms: 1000,
+            },
+            terminal: None,
+            lease_until_us: None,
+        };
+        let row = |payload: JournalPayload, at| evertrace_store::JournalRow {
+            event_id: "budget-reduction".into(),
+            command_id: CommandId::new_v7(),
+            command_hash: [0; 32],
+            ordinal: 0,
+            command_event_count: 1,
+            seq: 1,
+            event_type: payload.event_type().into(),
+            record_class: evertrace_store::RecordClass::RuntimeEvent,
+            object_family: None,
+            object_id: None,
+            revision_id: None,
+            scope: EventScope::default(),
+            occurred_at_us: at,
+            ingested_at_us: at,
+            source_kind: SourceKind::System,
+            source_ref_json: None,
+            payload_schema: 1,
+            payload_json: serde_json::to_string(&payload).unwrap(),
+            content_hash: [0; 32],
+            causation_id: None,
+            correlation_id: None,
+            effective_config_hash: [1; 32],
+            algorithm_revision: super::super::procedure::KIND.into(),
+        };
+        let mut rows = vec![
+            row(JournalPayload::JobState(job.clone()), DAY_US - 2),
+            row(
+                JournalPayload::JobLease(evertrace_store::JobLease {
+                    job_id: job.job_id,
+                    target_generation: 1,
+                    attempt: 2,
+                    lease_until_us: DAY_US + 1000,
+                }),
+                DAY_US - 1,
+            ),
+        ];
+        let reserved = claim_reservation(&job);
+        let reduce = |rows: &[evertrace_store::JournalRow], current: &DurableJob, at| {
+            let jobs = [current.clone()];
+            let mut usage = DailyLlmUsage::new(&jobs, at);
+            usage.extend(rows).unwrap();
+            usage.finish()
+        };
+        let mut leased = job.clone();
+        leased.state = JobStatus::Leased;
+        assert_eq!(reduce(&rows, &leased, DAY_US - 1), reserved);
+        assert_eq!(reduce(&[], &leased, DAY_US + 1), reserved);
+        // Rebuilding from the same durable facts never reserves a second call.
+        assert_eq!(reduce(&[], &leased, DAY_US + 1), reserved);
+        let mut terminal = job;
+        terminal.state = JobStatus::Failed;
+        terminal.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: JobTerminalOutcome::Failed,
+            reason: JobTerminalReason::SourceUnavailable,
+            result_ref: None,
+        }));
+        rows.push(row(JournalPayload::JobState(terminal.clone()), DAY_US + 2));
+        assert_eq!(reduce(&rows, &terminal, DAY_US - 1), reserved);
+        assert_eq!(
+            reduce(&rows, &terminal, DAY_US + 3),
+            DerivationQuotaUsage::default()
+        );
+    }
 
     #[test]
     fn daily_reduction_preserves_day_boundary_and_saturating_usage() {

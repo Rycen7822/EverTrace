@@ -1665,6 +1665,445 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
             .len(),
         1
     );
+
+    // The original scheduler consumes Inbox facts without another Episode delta.
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+    use tokio::sync::RwLock;
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/11");
+    fs::create_dir_all(&dated).unwrap();
+    fs::create_dir_all(&seed.repository.current_path).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = 'trusted'\n",
+            serde_json::to_string(&seed.repository.current_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let session = "019d0000-0000-7000-8000-000000000026";
+    let transcript = dated.join(format!("rollout-2026-09-11T00-00-00-{session}.jsonl"));
+    fs::write(&transcript, format!("{}\n", serde_json::json!({"timestamp":"2026-09-11T00:00:00Z","type":"session_meta","payload":{"id":session,"session_id":session,"cwd":seed.repository.current_path}}))).unwrap();
+    let report = Arc::new(RwLock::new(Some(
+        evertrace_engine::repository::observe_session_catalog_report(
+            transcript.to_str(),
+            session,
+            "procedure-review",
+            None,
+        )
+        .unwrap(),
+    )));
+    evertrace_capture::CaptureRuntime::open(runtime.clone()).unwrap();
+    let (handle, actor) = evertrace_engine::spawn_writer(seed.writer, 16).unwrap();
+    let make_scheduler = |llm| {
+        evertrace_engine::BackgroundScheduler::new(
+            handle.clone(),
+            evertrace_engine::session_import::SessionCatalogService::new(handle.clone(), CONFIG),
+            evertrace_engine::jobs::SessionImportWorker::new(
+                handle.clone(),
+                runtime.clone(),
+                Arc::clone(&report),
+            )
+            .unwrap(),
+            Arc::clone(&report),
+            runtime.clone(),
+            SynthesisPlanner::new(llm),
+            evertrace_domain::config::DreamingConfig::default(),
+        )
+    };
+    let scheduler = make_scheduler(config("http://127.0.0.1:9/v1"));
+    scheduler.run_once().await.unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let reviews = evertrace_store::RuntimeSchedulerView::from_snapshot(&snapshot)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .filter(|job| job.kind == "procedure_review_v1")
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].state, evertrace_store::JobStatus::Succeeded);
+    assert!(reviews[0].model_id.is_none());
+    assert!(reviews[0].budget.max_calls.is_none());
+    let original = SemanticCurrentView::from_snapshot(&snapshot)
+        .unwrap()
+        .proposals
+        .into_values()
+        .next()
+        .unwrap();
+    scheduler.run_once().await.unwrap();
+    assert_eq!(
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|job| job.kind == "procedure_review_v1")
+            .count(),
+        1
+    );
+    drop(scheduler);
+    let surface = |receipt: &SourceReceipt, observation: &SourceObservation, text: &str| {
+        JournalPayload::EvidenceSurfaceRecorded(Box::new(
+            evertrace_domain::evidence::EvidenceSurface {
+                source_observation_revision_ref: observation.source_observation_id,
+                source_role: observation.source_role,
+                content_trust: observation.content_trust,
+                instruction_authority: evertrace_domain::evidence::InstructionAuthority::None,
+                task_id: receipt.task_id,
+                repository_instance_id: receipt.repository_instance_id,
+                worktree_instance_id: receipt.worktree_instance_id,
+                event_time_us: 1,
+                recorded_at_us: 1,
+                source_sequence: receipt.source_sequence,
+                capture_completeness: receipt.capture_completeness,
+                canonicalization_version: 1,
+                span_hash: evertrace_domain::evidence::hex(
+                    &evertrace_domain::evidence::evidence_span_hash(
+                        observation.source_observation_id,
+                        1,
+                        text,
+                    )
+                    .unwrap(),
+                ),
+                projection_generation: 1,
+                protected_text: text.into(),
+            },
+        ))
+    };
+    for (label, text) in [
+        (
+            "review-first",
+            "A failed restoration must retain the old journal.",
+        ),
+        (
+            "review-second",
+            "Retaining the previous journal permits rollback.",
+        ),
+    ] {
+        let (receipt, observation) = source(
+            label,
+            text,
+            seed.task.task_id,
+            seed.repository.repository_id,
+            seed.worktree.worktree_instance_id,
+        );
+        handle
+            .commit(
+                command(
+                    4,
+                    vec![
+                        JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                        JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                        JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                            source_instance_id: receipt.source_instance_id.clone(),
+                            source_revision: receipt.source_revision.clone(),
+                            source_sequence: 1,
+                            confirmed_prefix_digest: None,
+                        }),
+                        JournalPayload::DirtyTarget(DirtyTarget {
+                            target_kind: DirtyTargetKind::EvidenceSurface,
+                            target_id: observation.source_observation_id.to_string(),
+                            algorithm_revision: "s26-v1".into(),
+                            source_watermark: 1,
+                        }),
+                        JournalPayload::DirtyTarget(DirtyTarget {
+                            target_kind: DirtyTargetKind::PhysicalNormalization,
+                            target_id: observation.source_observation_id.to_string(),
+                            algorithm_revision: "s26-v1".into(),
+                            source_watermark: 1,
+                        }),
+                        surface(&receipt, &observation, text),
+                    ],
+                ),
+                4,
+            )
+            .await
+            .unwrap();
+    }
+    let ProposalPayload::Procedure(payload) = &original.payload else {
+        unreachable!()
+    };
+    let mut reviewed = match procedure_application().candidates.remove(0) {
+        ProviderSemanticCandidate::ProcedureCandidate { content, .. } => *content,
+        _ => unreachable!(),
+    };
+    reviewed.stage_alignment = payload.draft().stage_alignment.clone();
+    reviewed
+        .pitfalls
+        .push("A failed restoration must retain the old journal.".into());
+    let stub = ProviderStub::once(
+        200,
+        response(serde_json::json!({"operation":"revise","content":reviewed})),
+    )
+    .await;
+    let mut disabled = config(&stub.base_url);
+    disabled.enabled = false;
+    let disabled_scheduler = make_scheduler(disabled);
+    disabled_scheduler.run_once().await.unwrap();
+    let queued =
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.kind == "procedure_review_v1" && job.model_id.is_some())
+            .unwrap();
+    assert_eq!(queued.state, evertrace_store::JobStatus::Queued);
+    assert_eq!(queued.attempt, 1);
+    assert!(queued.lease_until_us.is_none() && queued.terminal.is_none());
+    let (_wakeup, wakeup) = tokio::sync::watch::channel(0);
+    let (shutdown, stopping) = tokio::sync::watch::channel(false);
+    let mut disabled_run = tokio::spawn(disabled_scheduler.run(wakeup, stopping));
+    tokio::select! {
+        result = &mut disabled_run => panic!("disabled scheduler exited: {result:?}"),
+        _ = stub.wait_received() => panic!("disabled scheduler called the provider"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+    shutdown.send(true).unwrap();
+    disabled_run.await.unwrap().unwrap();
+    assert_eq!(
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == queued.job_id),
+        Some(queued)
+    );
+    let scheduler = make_scheduler(config(&stub.base_url));
+    let mut activity = handle.subscribe_background_frontier();
+    let mut running = Box::pin(scheduler.run_once());
+    let mut committed = false;
+    // Stop polling after the writer commits, leaving the actual completion
+    // acknowledgement unread. Ordinary idle/reopen must recover this result.
+    for _ in 0..128 {
+        let mut polled = false;
+        let result = std::future::poll_fn(|cx| {
+            if polled {
+                return std::task::Poll::Ready(std::task::Poll::Pending);
+            }
+            polled = true;
+            running.as_mut().poll(cx).map(std::task::Poll::Ready)
+        })
+        .await;
+        assert!(
+            result.is_pending(),
+            "scheduler ended before the review commit: {result:?}"
+        );
+        if !activity.has_changed().unwrap() {
+            continue;
+        }
+        activity.borrow_and_update();
+        if SemanticCurrentView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .proposals
+            .get(&original.proposal_id)
+            .is_some_and(|value| {
+                value.parent_proposal_revision_id == Some(original.proposal_revision_id)
+            })
+        {
+            committed = true;
+            break;
+        }
+    }
+    assert!(committed);
+    drop(running);
+    let _ = stub.finish().await;
+    let snapshot = handle.project().await.unwrap();
+    let after = SemanticCurrentView::from_snapshot(&snapshot).unwrap();
+    assert_eq!(after.proposals.len(), 1);
+    let reviewed = after.proposals.get(&original.proposal_id).unwrap();
+    assert_eq!(
+        reviewed.parent_proposal_revision_id,
+        Some(original.proposal_revision_id)
+    );
+    assert_eq!(reviewed.eligibility, ProposalEligibility::ManualRequired);
+    assert_eq!(reviewed.status, ProposalStatus::Pending);
+    assert_ne!(reviewed.fingerprint, original.fingerprint);
+    assert_eq!(
+        after.proposal_revisions.get(&original.proposal_revision_id),
+        Some(&original)
+    );
+    scheduler.run_once().await.unwrap();
+    assert_eq!(
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|job| job.kind == "procedure_review_v1")
+            .count(),
+        2
+    );
+    drop(scheduler);
+    let add_evidence = |label: &str, text: &str| {
+        let (receipt, observation) = source(
+            label,
+            text,
+            seed.task.task_id,
+            seed.repository.repository_id,
+            seed.worktree.worktree_instance_id,
+        );
+        command(
+            5,
+            vec![
+                JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                    source_instance_id: receipt.source_instance_id.clone(),
+                    source_revision: receipt.source_revision.clone(),
+                    source_sequence: 1,
+                    confirmed_prefix_digest: None,
+                }),
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::EvidenceSurface,
+                    target_id: observation.source_observation_id.to_string(),
+                    algorithm_revision: "s26-v1".into(),
+                    source_watermark: 1,
+                }),
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::PhysicalNormalization,
+                    target_id: observation.source_observation_id.to_string(),
+                    algorithm_revision: "s26-v1".into(),
+                    source_watermark: 1,
+                }),
+                surface(&receipt, &observation, text),
+            ],
+        )
+    };
+    handle
+        .commit(
+            add_evidence(
+                "review-budget",
+                "Further evidence changes the bounded cohort.",
+            ),
+            5,
+        )
+        .await
+        .unwrap();
+    let mut limited = config("http://127.0.0.1:9/v1");
+    limited.daily_call_budget = 1;
+    let scheduler = make_scheduler(limited);
+    scheduler.run_once().await.unwrap();
+    let jobs =
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .jobs;
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.kind == "procedure_review_v1")
+            .count(),
+        3
+    );
+    let waiting = jobs
+        .iter()
+        .find(|job| {
+            job.kind == "procedure_review_v1" && job.state == evertrace_store::JobStatus::Queued
+        })
+        .unwrap();
+    assert_eq!(waiting.attempt, 1);
+    assert!(waiting.lease_until_us.is_none());
+    assert!(waiting.terminal.is_none());
+    assert!(waiting.backoff_until_us.is_some());
+    let waiting_frontier = handle.project().await.unwrap().frontier;
+    scheduler.run_once().await.unwrap();
+    assert_eq!(handle.project().await.unwrap().frontier, waiting_frontier);
+    drop(scheduler);
+    handle
+        .commit(
+            add_evidence(
+                "review-revocation",
+                "Check authorization again before saving the new boundary.",
+            ),
+            5,
+        )
+        .await
+        .unwrap();
+    let (stub, release) =
+        ProviderStub::once_paused(200, response(serde_json::json!({"operation":"no_op"}))).await;
+    let scheduler = make_scheduler(config(&stub.base_url));
+    let running = tokio::spawn(async move { scheduler.run_once().await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), stub.wait_received())
+        .await
+        .unwrap();
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = 'untrusted'\n",
+            serde_json::to_string(&seed.repository.current_path).unwrap()
+        ),
+    )
+    .unwrap();
+    release.send(()).unwrap();
+    running.await.unwrap().unwrap();
+    let _ = stub.finish().await;
+    let snapshot = handle.project().await.unwrap();
+    assert_eq!(
+        SemanticCurrentView::from_snapshot(&snapshot)
+            .unwrap()
+            .proposals,
+        after.proposals
+    );
+    assert!(
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&snapshot)
+            .unwrap()
+            .jobs
+            .iter()
+            .any(|job| job.kind == "procedure_review_v1"
+                && job.terminal.as_ref().is_some_and(|terminal| terminal.reason
+                    == evertrace_store::JobTerminalReason::StaleGeneration))
+    );
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+    let writer = JournalWriter::open(&temp.path().join("store"))
+        .await
+        .unwrap();
+    assert_eq!(
+        SemanticCurrentView::from_snapshot(&writer.project().await.unwrap())
+            .unwrap()
+            .proposals,
+        after.proposals
+    );
+    let before_restart =
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
+            .unwrap()
+            .jobs;
+    let (reopened, reopened_actor) = evertrace_engine::spawn_writer(writer, 16).unwrap();
+    let scheduler = evertrace_engine::BackgroundScheduler::new(
+        reopened.clone(),
+        evertrace_engine::session_import::SessionCatalogService::new(reopened.clone(), CONFIG),
+        evertrace_engine::jobs::SessionImportWorker::new(
+            reopened.clone(),
+            runtime.clone(),
+            Arc::clone(&report),
+        )
+        .unwrap(),
+        report,
+        runtime,
+        SynthesisPlanner::new(config("http://127.0.0.1:9/v1")),
+        evertrace_domain::config::DreamingConfig::default(),
+    );
+    scheduler.run_once().await.unwrap();
+    let restarted = reopened.project().await.unwrap();
+    assert_eq!(
+        SemanticCurrentView::from_snapshot(&restarted)
+            .unwrap()
+            .proposals,
+        after.proposals
+    );
+    assert_eq!(
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&restarted)
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|job| job.kind == "procedure_review_v1")
+            .cloned()
+            .collect::<Vec<_>>(),
+        before_restart
+            .into_iter()
+            .filter(|job| job.kind == "procedure_review_v1")
+            .collect::<Vec<_>>()
+    );
+    drop(scheduler);
+    reopened.shutdown().await.unwrap();
+    reopened_actor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1744,6 +2183,152 @@ async fn scenario_patch_scope_is_filled_from_the_current_episode() {
         .commit_if_frontier(&command, 3, snapshot.frontier)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn separable_candidate_failure_and_rejection_preserve_reopenable_summary() {
+    for rejected in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("store");
+        let mut seed = seed_store(&root).await;
+        let refs = seed.direct_refs();
+        if rejected {
+            let service = RevisionProposalService;
+            let ProposalResolution::Revision { value, command } = service
+                .submit(
+                    &SemanticCurrentView::from_snapshot(&seed.snapshot).unwrap(),
+                    proposal_context(2),
+                    SubmitProposalRequest {
+                        target_kind: ProposalTargetKind::Atom,
+                        target_id: None,
+                        base_revision_id: None,
+                        operation: ProposalOperation::Create,
+                        payload: ProposalPayload::Atom(Box::new(AtomProposalPayload::Create {
+                            draft: atom_draft(
+                                &seed,
+                                "optional seed",
+                                AtomScope::Task {
+                                    task_id: seed.task.task_id,
+                                },
+                                3,
+                            ),
+                        })),
+                        evidence_refs: refs.clone(),
+                        source_cohort_refs: refs.clone(),
+                        eligibility: ProposalEligibility::ManualRequired,
+                        created_by: ProposalCreatedBy::Agent,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("seed proposal")
+            };
+            seed.writer.commit(&command, 2).await.unwrap();
+            let snapshot = seed.writer.project().await.unwrap();
+            let ProposalResolution::Revision { command, .. } = service
+                .revise_status(
+                    &SemanticCurrentView::from_snapshot(&snapshot).unwrap(),
+                    proposal_context(2),
+                    value.proposal_id,
+                    ProposalStatus::Rejected,
+                    vec![],
+                    Some("duplicate guidance".into()),
+                )
+                .unwrap()
+            else {
+                panic!("reject seed")
+            };
+            seed.writer.commit(&command, 2).await.unwrap();
+        }
+        let snapshot = seed.writer.project().await.unwrap();
+        let mut output = atom_application("optional seed");
+        output.progress_delta.push(SemanticStructuredDelta {
+            label: "progress".into(),
+            value: "surviving checkpoint".into(),
+            direct_refs: refs.clone(),
+        });
+        if !rejected {
+            let ProviderSemanticCandidate::AtomCandidate {
+                base_revision_id, ..
+            } = &mut output.candidates[0]
+            else {
+                unreachable!()
+            };
+            *base_revision_id = Some(RevisionId::new_v7());
+        }
+        let stub = ProviderStub::once(200, response(serde_json::to_value(output).unwrap())).await;
+        let planner = SynthesisPlanner::new(config(&stub.base_url));
+        let request = SynthesisRequest {
+            snapshot: &snapshot,
+            target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
+            trigger: SemanticDigestTrigger::AdoptedDecision,
+            direct_delta: vec![ProtectedDeltaItem {
+                kind: ProtectedDeltaKind::Decision,
+                value: "surviving checkpoint".into(),
+                direct_refs: refs.clone(),
+            }],
+            selected_direct_refs: refs,
+            command_id: CommandId::new_v7(),
+            occurred_at_us: 3,
+            algorithm_revision: "s26-v1".into(),
+            effective_config_hash: CONFIG,
+        };
+        let SynthesisResolution::Success {
+            digest, command, ..
+        } = planner
+            .execute(SynthesisRequest {
+                snapshot: request.snapshot,
+                target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
+                trigger: request.trigger,
+                direct_delta: request.direct_delta.clone(),
+                selected_direct_refs: request.selected_direct_refs.clone(),
+                command_id: request.command_id,
+                occurred_at_us: request.occurred_at_us,
+                algorithm_revision: request.algorithm_revision.clone(),
+                effective_config_hash: CONFIG,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("summary must survive")
+        };
+        stub.finish().await;
+        assert!(digest.application.candidates.is_empty());
+        assert!(
+            !command
+                .events()
+                .iter()
+                .any(|event| matches!(event.payload, JournalPayload::RevisionProposalRecorded(_)))
+        );
+        seed.writer.commit(&command, 3).await.unwrap();
+        assert!(seed.writer.commit(&command, 4).await.unwrap().replayed);
+        seed.writer.full_projection().await.unwrap();
+        drop(seed.writer);
+        let writer = JournalWriter::open(&root).await.unwrap();
+        let reopened = writer.project().await.unwrap();
+        assert!(
+            planner
+                .durable_jobs(
+                    &reopened,
+                    CONFIG,
+                    &Default::default(),
+                    1,
+                    std::time::Duration::from_secs(60)
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let search = SearchIndex::open(&root).await.unwrap();
+        assert!(
+            search
+                .fts("surviving")
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.candidate_id.as_deref()
+                    == Some(&digest.semantic_digest_id.to_string()))
+        );
+    }
 }
 
 #[tokio::test]

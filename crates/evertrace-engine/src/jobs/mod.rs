@@ -2,6 +2,7 @@ mod deterministic;
 mod executor;
 mod import;
 mod inventory;
+pub(crate) mod procedure;
 pub(crate) mod synthesis;
 
 pub use deterministic::{

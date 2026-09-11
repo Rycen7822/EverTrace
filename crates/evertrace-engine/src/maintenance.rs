@@ -1234,6 +1234,9 @@ fn job_target_is_current(
         "semantic_synthesis_v1" => {
             crate::jobs::synthesis::synthesis_target_is_current(snapshot, job)
         }
+        crate::jobs::procedure::KIND => {
+            job.config_hash == config_hash && crate::jobs::procedure::current(snapshot, job).is_ok()
+        }
         PROCEDURE_USAGE_JOB_KIND => {
             job.config_hash == config_hash
                 && job.algorithm_revision == job.kind
@@ -2070,9 +2073,9 @@ impl BackgroundScheduler {
             }
         }
         let mut idle = SynthesisIdle::default();
-        idle.refresh(&snapshot)?;
+        idle.refresh(&snapshot, &view)?;
         let selection_time = now_us()?;
-        let synthesis_candidates = if self.dreaming.max_llm_tasks_per_run == 0 {
+        let mut synthesis_candidates = if self.dreaming.max_llm_tasks_per_run == 0 {
             Vec::new()
         } else {
             let episodes = self
@@ -2128,6 +2131,18 @@ impl BackgroundScheduler {
             }
             candidates
         };
+        if self.dreaming.idle_enabled && self.dreaming.max_llm_tasks_per_run != 0 {
+            synthesis_candidates.extend(
+                crate::jobs::procedure::jobs(
+                    &snapshot,
+                    &self.synthesis,
+                    self.runtime.effective_config_hash,
+                    max_synthesis_wall_time,
+                    PER_LANE_LIMIT,
+                )
+                .map_err(|_| BackgroundSchedulerError::Store)?,
+            );
+        }
         if !synthesis_candidates.is_empty() {
             let occurred_at_us = now_us()?;
             let events = synthesis_candidates
@@ -2159,6 +2174,7 @@ impl BackgroundScheduler {
                 Err(error) => return Err(map_writer(error)),
             }
         }
+        idle.refresh(&snapshot, &view)?;
         let selected = idle.select(
             &snapshot,
             &view,
@@ -2174,6 +2190,7 @@ impl BackgroundScheduler {
                     "physical_normalization"
                         | "session_import_v1"
                         | "semantic_synthesis_v1"
+                        | crate::jobs::procedure::KIND
                         | PROCEDURE_PROMOTION_JOB_KIND
                         | PROCEDURE_USAGE_JOB_KIND
                         | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
@@ -2378,6 +2395,14 @@ impl BackgroundScheduler {
                     continue;
                 };
                 let job_wall_time = Duration::from_millis(claimed.job.budget.max_wall_time_ms);
+                if claimed.job.kind == crate::jobs::procedure::KIND {
+                    let progress = self
+                        .run_procedure_review(claimed, remaining_wall_time)
+                        .await?;
+                    completed += progress.completed;
+                    retryable |= progress.retryable;
+                    continue;
+                }
                 if !self
                     .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
                     .await?
@@ -2477,6 +2502,120 @@ impl BackgroundScheduler {
         Ok(BackgroundProgress {
             completed,
             retryable,
+        })
+    }
+
+    async fn run_procedure_review(
+        &self,
+        claimed: ClaimedJob,
+        remaining: Duration,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let report = self.report.read().await.clone();
+        let at = now_us()?;
+        let result = tokio::time::timeout(
+            remaining.min(Duration::from_millis(claimed.job.budget.max_wall_time_ms)),
+            crate::jobs::procedure::execute(
+                &self.writer,
+                &self.synthesis,
+                &claimed.snapshot,
+                &claimed.job,
+                report.as_ref(),
+                at,
+            ),
+        )
+        .await;
+        let command = match result {
+            Ok(Ok(command)) => command,
+            Ok(Err(crate::semantic::SemanticServiceError::Store(_))) => {
+                return Err(BackgroundSchedulerError::Store);
+            }
+            _ => {
+                return self
+                    .finish_job(
+                        &claimed.job,
+                        self.writer.project().await.map_err(map_writer)?.frontier,
+                        JobTerminalOutcome::Failed,
+                        JobTerminalReason::SourceUnavailable,
+                    )
+                    .await;
+            }
+        };
+        let expected = command
+            .events()
+            .iter()
+            .map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            if self
+                .writer
+                .committed_command(command.command_id())
+                .await
+                .map_err(map_writer)?
+                .is_some_and(|committed| committed.payloads == expected)
+            {
+                return Ok(BackgroundProgress {
+                    completed: 1,
+                    retryable: false,
+                });
+            }
+            let snapshot = self.writer.project().await.map_err(map_writer)?;
+            let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            if !view.jobs.iter().any(|job| job == &claimed.job) {
+                return Ok(BackgroundProgress::default());
+            }
+            if now_us()? >= claimed.job.lease_until_us.unwrap_or(0)
+                || !crate::jobs::procedure::allowed(
+                    &self.writer,
+                    &snapshot,
+                    &claimed.job,
+                    report.as_ref(),
+                )
+                .await
+                .map_err(|_| BackgroundSchedulerError::Store)?
+            {
+                let frontier = self.writer.project().await.map_err(map_writer)?.frontier;
+                return self
+                    .finish_job(
+                        &claimed.job,
+                        frontier,
+                        JobTerminalOutcome::Failed,
+                        JobTerminalReason::StaleGeneration,
+                    )
+                    .await;
+            }
+            match self
+                .writer
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier)
+                .await
+            {
+                Ok(_) => {
+                    return Ok(BackgroundProgress {
+                        completed: 1,
+                        retryable: false,
+                    });
+                }
+                Err(WriterActorError::StaleFrontier) => {}
+                Err(error) => {
+                    if self
+                        .writer
+                        .committed_command(command.command_id())
+                        .await
+                        .map_err(map_writer)?
+                        .is_some_and(|committed| committed.payloads == expected)
+                    {
+                        return Ok(BackgroundProgress {
+                            completed: 1,
+                            retryable: false,
+                        });
+                    }
+                    return Err(map_writer(error));
+                }
+            }
+        }
+        Ok(BackgroundProgress {
+            completed: 0,
+            retryable: true,
         })
     }
 
@@ -2899,7 +3038,7 @@ impl BackgroundScheduler {
             }
         }
         let mut idle = SynthesisIdle::default();
-        idle.refresh(&snapshot)?;
+        idle.refresh(&snapshot, &view)?;
         if let Some(idle_delay) = idle
             .episodes
             .values()
@@ -2924,7 +3063,12 @@ impl BackgroundScheduler {
         if let Some(backoff) = view
             .jobs
             .iter()
-            .filter(|job| job.kind == "semantic_synthesis_v1" && job.state == JobStatus::Failed)
+            .filter(|job| {
+                matches!(
+                    job.kind.as_str(),
+                    "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+                ) && matches!(job.state, JobStatus::Queued | JobStatus::Failed)
+            })
             .filter_map(|job| job.backoff_until_us)
             .filter(|due| *due > now)
             .map(|due| Duration::from_micros((due - now) as u64))
@@ -3741,10 +3885,13 @@ impl BackgroundScheduler {
             }
             return Ok(None);
         }
-        if current.kind == "semantic_synthesis_v1" {
+        if matches!(
+            current.kind.as_str(),
+            "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+        ) {
             let mut fresh = SynthesisIdle::default();
             let idle = idle.unwrap_or(&mut fresh);
-            idle.refresh(&snapshot)?;
+            idle.refresh(&snapshot, &view)?;
             if !idle.job_ready(&snapshot, current, &self.dreaming, now_us()?) {
                 return Ok(None);
             }
@@ -3775,11 +3922,42 @@ impl BackgroundScheduler {
             }
         }
         let occurred_at_us = now_us()?;
+        let llm_job = matches!(
+            current.kind.as_str(),
+            "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+        );
+        if llm_job
+            && current
+                .backoff_until_us
+                .is_some_and(|deadline| deadline > occurred_at_us)
+        {
+            return Ok(None);
+        }
+        let needs_model =
+            current.kind != crate::jobs::procedure::KIND || current.model_id.is_some();
+        if llm_job && needs_model {
+            let llm = &self.synthesis.llm;
+            if !llm.enabled {
+                return Ok(None);
+            }
+            if current.attempt >= 6 {
+                fail_exhausted_llm_job(&self.writer, current, snapshot.frontier, occurred_at_us)
+                    .await?;
+                return Ok(None);
+            }
+            if defer_llm_budget(&self.writer, current, &view, llm, occurred_at_us).await? {
+                return Ok(None);
+            }
+        }
         let lease_until_us = occurred_at_us
             .checked_add(
-                i64::try_from(current.budget.max_wall_time_ms.min(5_000))
-                    .map_err(|_| BackgroundSchedulerError::Store)?
-                    .saturating_mul(1_000),
+                i64::try_from(if llm_job {
+                    current.budget.max_wall_time_ms
+                } else {
+                    current.budget.max_wall_time_ms.min(5_000)
+                })
+                .map_err(|_| BackgroundSchedulerError::Store)?
+                .saturating_mul(1_000),
             )
             .ok_or(BackgroundSchedulerError::Store)?;
         let command = JournalCommand::new(
@@ -3988,16 +4166,110 @@ fn resolve_capture_report(
         .find(|report| capture_item_manifest_matches(item, report))
 }
 
+async fn fail_exhausted_llm_job(
+    writer: &WriterHandle,
+    current: &DurableJob,
+    frontier: u64,
+    at: i64,
+) -> Result<(), BackgroundSchedulerError> {
+    if current.state != JobStatus::Queued
+        || current.attempt < 6
+        || current.terminal.is_some()
+        || !matches!(
+            current.kind.as_str(),
+            "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+        )
+    {
+        return Err(BackgroundSchedulerError::Store);
+    }
+    let mut terminal = current.clone();
+    terminal.state = JobStatus::Failed;
+    terminal.backoff_until_us = None;
+    terminal.terminal = Some(Box::new(JobTerminalAudit {
+        outcome: JobTerminalOutcome::Failed,
+        reason: JobTerminalReason::Unsupported,
+        result_ref: Some(current.target_revision.clone()),
+    }));
+    let command = JournalCommand::new(
+        CommandId::new_v7(),
+        vec![JournalEventDraft::runtime(
+            at,
+            current.config_hash,
+            current.algorithm_revision.clone(),
+            JournalPayload::JobState(terminal),
+        )],
+    )
+    .map_err(|_| BackgroundSchedulerError::Store)?;
+    match writer.commit_if_frontier(command, at, frontier).await {
+        Ok(_) | Err(WriterActorError::StaleFrontier) => Ok(()),
+        Err(error) => Err(map_writer(error)),
+    }
+}
+
+async fn defer_llm_budget(
+    writer: &WriterHandle,
+    current: &DurableJob,
+    view: &RuntimeSchedulerView,
+    llm: &evertrace_domain::config::LlmConfig,
+    at: i64,
+) -> Result<bool, BackgroundSchedulerError> {
+    if current
+        .backoff_until_us
+        .is_some_and(|deadline| deadline > at)
+    {
+        return Ok(true);
+    }
+    let usage = writer
+        .llm_daily_usage(at, view.frontier, &view.jobs)
+        .await
+        .map_err(map_writer)?;
+    let reserved = crate::jobs::synthesis::claim_reservation(current);
+    if usage.calls.saturating_add(reserved.calls) <= llm.daily_call_budget
+        && usage.wall_time_us.saturating_add(reserved.wall_time_us)
+            <= llm
+                .daily_wall_time_budget
+                .seconds()
+                .saturating_mul(1_000_000)
+        && (llm.unlimited_token_budget
+            || usage.input_tokens.saturating_add(reserved.input_tokens)
+                <= llm.daily_input_token_budget
+                && usage.output_tokens.saturating_add(reserved.output_tokens)
+                    <= llm.daily_output_token_budget)
+    {
+        return Ok(false);
+    }
+    let mut waiting = current.clone();
+    waiting.backoff_until_us = Some((at / 86_400_000_000 + 1).saturating_mul(86_400_000_000));
+    let command = JournalCommand::new(
+        CommandId::new_v7(),
+        vec![JournalEventDraft::runtime(
+            at,
+            current.config_hash,
+            current.algorithm_revision.clone(),
+            JournalPayload::JobState(waiting),
+        )],
+    )
+    .map_err(|_| BackgroundSchedulerError::Store)?;
+    match writer.commit_if_frontier(command, at, view.frontier).await {
+        Ok(_) | Err(WriterActorError::StaleFrontier) => Ok(true),
+        Err(error) => Err(map_writer(error)),
+    }
+}
+
 pub fn select_jobs(
     view: &RuntimeSchedulerView,
     capture_state: CaptureAdmissionState,
 ) -> Result<Vec<ScheduledJob>, BackgroundSchedulerError> {
+    let now = now_us()?;
     let mut active = BTreeMap::<(String, String), DurableJob>::new();
-    for job in view
-        .jobs
-        .iter()
-        .filter(|job| job.state == JobStatus::Queued && executable_job(job))
-    {
+    for job in view.jobs.iter().filter(|job| {
+        job.state == JobStatus::Queued
+            && (!matches!(
+                job.kind.as_str(),
+                "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+            ) || job.backoff_until_us.is_none_or(|deadline| deadline <= now))
+            && executable_job(job)
+    }) {
         let key = (job.kind.clone(), job.idempotency_key.clone());
         if let Some(existing) = active.get(&key) {
             if existing.target_generation == job.target_generation {
@@ -4054,6 +4326,7 @@ fn executable_job(job: &DurableJob) -> bool {
             | "session_import_v1"
             | "capability_inventory_v1"
             | "semantic_synthesis_v1"
+            | crate::jobs::procedure::KIND
             | PROCEDURE_PROMOTION_JOB_KIND
             | PROCEDURE_USAGE_JOB_KIND
             | QUIESCED_BACKUP_CREATE_JOB_KIND
@@ -4072,7 +4345,7 @@ fn job_lane(job: &DurableJob) -> BackgroundLane {
         | PROCEDURE_PROMOTION_JOB_KIND
         | PROCEDURE_USAGE_JOB_KIND => BackgroundLane::Deterministic,
         "session_import_v1" => BackgroundLane::Import,
-        "semantic_synthesis_v1" => BackgroundLane::Synthesis,
+        "semantic_synthesis_v1" | crate::jobs::procedure::KIND => BackgroundLane::Synthesis,
         _ => BackgroundLane::Maintenance,
     }
 }
@@ -4127,6 +4400,7 @@ fn support_context(
 // lease/audit writes do not decode the same receipts again. No bodies retained.
 #[derive(Default)]
 struct SynthesisIdle {
+    procedure_scopes: BTreeMap<String, evertrace_domain::procedure::ProcedureScope>,
     receipts: BTreeMap<String, (u64, Option<String>, Option<String>)>,
     attribution_rows: BTreeMap<String, u64>,
     episode_rows: BTreeMap<String, u64>,
@@ -4157,7 +4431,60 @@ impl SynthesisIdle {
     fn refresh(
         &mut self,
         snapshot: &evertrace_store::ProjectionSnapshot,
+        runtime: &RuntimeSchedulerView,
     ) -> Result<(), BackgroundSchedulerError> {
+        let targets = runtime
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.kind == crate::jobs::procedure::KIND
+                    && matches!(job.state, JobStatus::Queued | JobStatus::Leased)
+            })
+            .map(|job| job.target_revision.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut scopes = BTreeMap::new();
+        for row in snapshot.data_rows().filter(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some("revision_proposal_revision" | "procedure_revision")
+            ) && row
+                .current_revision_id
+                .as_deref()
+                .is_some_and(|id| targets.contains(id))
+        }) {
+            let revision = row
+                .current_revision_id
+                .as_ref()
+                .ok_or(BackgroundSchedulerError::Store)?;
+            let scope = if let Some(scope) = self.procedure_scopes.get(revision) {
+                Some(*scope)
+            } else {
+                match serde_json::from_str::<JournalPayload>(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(BackgroundSchedulerError::Store)?,
+                )
+                .map_err(|_| BackgroundSchedulerError::Store)?
+                {
+                    JournalPayload::RevisionProposalRecorded(proposal) => match proposal.payload {
+                        evertrace_domain::semantic::ProposalPayload::Procedure(payload) => {
+                            Some(payload.draft().scope)
+                        }
+                        _ => None,
+                    },
+                    JournalPayload::ProcedureRevisionRecorded(procedure) => {
+                        Some(procedure.draft.scope)
+                    }
+                    _ => return Err(BackgroundSchedulerError::Store),
+                }
+            };
+            if let Some(scope) =
+                scope.filter(|scope| *scope != evertrace_domain::procedure::ProcedureScope::Global)
+            {
+                scopes.insert(revision.clone(), scope);
+            }
+        }
+        self.procedure_scopes = scopes;
         let attribution_rows = snapshot
             .data_rows()
             .filter(|row| {
@@ -4420,6 +4747,34 @@ impl SynthesisIdle {
         config: &evertrace_domain::config::DreamingConfig,
         now: i64,
     ) -> bool {
+        if job.kind == crate::jobs::procedure::KIND {
+            if !config.idle_enabled {
+                return false;
+            }
+            return self
+                .procedure_scopes
+                .get(&job.target_revision)
+                .copied()
+                .and_then(|scope| match scope {
+                    evertrace_domain::procedure::ProcedureScope::Worktree {
+                        repository_id,
+                        worktree_id,
+                    } => self.source_delay(repository_id, worktree_id, config, now),
+                    evertrace_domain::procedure::ProcedureScope::Repository { repository_id } => {
+                        self.repositories.get(&repository_id).map(|last| {
+                            Duration::from_micros(
+                                last.saturating_add(
+                                    config.idle_after.seconds().saturating_mul(1_000_000) as i64,
+                                )
+                                .saturating_sub(now)
+                                .max(0) as u64,
+                            )
+                        })
+                    }
+                    evertrace_domain::procedure::ProcedureScope::Global => None,
+                })
+                .is_some_and(|delay| delay.is_zero());
+        }
         if let Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. }) =
             evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision)
         {
@@ -4477,16 +4832,22 @@ impl SynthesisIdle {
             {
                 continue;
             }
-            let target_present = self.episodes.values().any(|episode| {
-                episode.revision_id.to_string() == job.target_revision
-                    && episode.revision_generation == job.target_generation
-                    && episode.source_watermark == job.target_watermark
-            });
+            let target_present = if job.kind == crate::jobs::procedure::KIND {
+                self.procedure_scopes.contains_key(&job.target_revision)
+            } else {
+                self.episodes.values().any(|episode| {
+                    episode.revision_id.to_string() == job.target_revision
+                        && episode.revision_generation == job.target_generation
+                        && episode.source_watermark == job.target_watermark
+                })
+            };
             // Missing/superseded metadata is only a hint: use the original
             // verifier before admitting terminal cleanup, never infer readiness
             // from a missing clock. Current busy targets consume no lane slot.
-            if job.kind != "semantic_synthesis_v1"
-                || self.job_ready(snapshot, job, config, now)
+            if !matches!(
+                job.kind.as_str(),
+                "semantic_synthesis_v1" | crate::jobs::procedure::KIND
+            ) || self.job_ready(snapshot, job, config, now)
                 || (config.idle_enabled
                     && !target_present
                     && !job_target_is_current(snapshot, view, job, job.config_hash)
@@ -4517,6 +4878,229 @@ fn map_writer(error: WriterActorError) -> BackgroundSchedulerError {
 mod idle_tests {
     use super::*;
     use evertrace_domain::{ids::*, revision::RevisionId, work::*};
+
+    #[tokio::test]
+    async fn exhausted_llm_budget_preserves_the_job_and_resumes_after_reopen_next_day() {
+        let temp =
+            std::env::temp_dir().join(format!("evertrace-review-budget-{}", JobId::new_v7()));
+        std::fs::create_dir(&temp).unwrap();
+        evertrace_capture::DeviceKeyStore::new(temp.join("keys"))
+            .load_or_create()
+            .unwrap();
+        let store = temp.join("store");
+        let (handle, actor) =
+            crate::spawn_writer(crate::open_writer(&store).await.unwrap(), 8).unwrap();
+        let day = 86_400_000_000;
+        let job = DurableJob {
+            job_id: JobId::new_v7(),
+            idempotency_key: "review-budget-cohort".into(),
+            target_revision: RevisionId::new_v7().to_string(),
+            target_watermark: 1,
+            target_generation: 1,
+            kind: crate::jobs::procedure::KIND.into(),
+            algorithm_revision: crate::jobs::procedure::KIND.into(),
+            model_id: Some("test".into()),
+            priority: 5,
+            state: JobStatus::Queued,
+            attempt: 1,
+            backoff_until_us: None,
+            config_hash: [1; 32],
+            budget: JobBudget {
+                max_items: 16,
+                max_bytes: Some(16384),
+                max_input_tokens: Some(8192),
+                max_output_tokens: Some(2048),
+                max_calls: Some(1),
+                max_wall_time_ms: 1000,
+            },
+            terminal: None,
+            lease_until_us: None,
+        };
+        let mut waiting = job.clone();
+        waiting.job_id = JobId::new_v7();
+        waiting.idempotency_key = "waiting-review-cohort".into();
+        let command = |at, payloads: Vec<JournalPayload>| {
+            JournalCommand::new(
+                CommandId::new_v7(),
+                payloads
+                    .into_iter()
+                    .map(|payload| {
+                        JournalEventDraft::runtime(
+                            at,
+                            [1; 32],
+                            crate::jobs::procedure::KIND,
+                            payload,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        handle
+            .commit(
+                command(
+                    day + 1,
+                    vec![
+                        JournalPayload::JobState(job.clone()),
+                        JournalPayload::JobState(waiting.clone()),
+                    ],
+                ),
+                day + 1,
+            )
+            .await
+            .unwrap();
+        handle
+            .commit(
+                command(
+                    day + 2,
+                    vec![JournalPayload::JobLease(JobLease {
+                        job_id: job.job_id,
+                        target_generation: 1,
+                        attempt: 2,
+                        lease_until_us: day + 1000,
+                    })],
+                ),
+                day + 2,
+            )
+            .await
+            .unwrap();
+        let mut spent = job;
+        spent.attempt = 2;
+        spent.state = JobStatus::Failed;
+        spent.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: JobTerminalOutcome::Failed,
+            reason: JobTerminalReason::SourceUnavailable,
+            result_ref: None,
+        }));
+        handle
+            .commit(
+                command(day + 3, vec![JournalPayload::JobState(spent)]),
+                day + 3,
+            )
+            .await
+            .unwrap();
+        let llm = evertrace_domain::config::LlmConfig {
+            enabled: true,
+            daily_call_budget: 1,
+            ..Default::default()
+        };
+        let view = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+        assert!(
+            defer_llm_budget(&handle, &waiting, &view, &llm, day + 4)
+                .await
+                .unwrap()
+        );
+        let snapshot = handle.project().await.unwrap();
+        let view = RuntimeSchedulerView::from_snapshot(&snapshot).unwrap();
+        let held = view
+            .jobs
+            .iter()
+            .find(|value| value.job_id == waiting.job_id)
+            .unwrap();
+        assert_eq!(held.state, JobStatus::Queued);
+        assert_eq!(held.attempt, 1);
+        assert!(held.lease_until_us.is_none() && held.terminal.is_none());
+        assert_eq!(held.backoff_until_us, Some(day * 2));
+        assert!(
+            defer_llm_budget(&handle, held, &view, &llm, day + 5)
+                .await
+                .unwrap()
+        );
+        assert_eq!(handle.project().await.unwrap().frontier, snapshot.frontier);
+        let mut cancelled = Box::pin(handle.llm_daily_usage(day + 5, view.frontier, &view.jobs));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(cancelled.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        // The actor has taken the budget request before its receiver is dropped.
+        handle.read_diagnostics().await.unwrap();
+        drop(cancelled);
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+        let (handle, actor) =
+            crate::spawn_writer(crate::open_writer(&store).await.unwrap(), 8).unwrap();
+        let view = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+        let held = view
+            .jobs
+            .iter()
+            .find(|value| value.job_id == waiting.job_id)
+            .unwrap();
+        // Same job, cohort and configuration; only the daily budget boundary moved.
+        assert!(
+            !defer_llm_budget(&handle, held, &view, &llm, day * 2 + 1)
+                .await
+                .unwrap()
+        );
+        handle
+            .commit(
+                command(
+                    day * 2 + 1,
+                    vec![JournalPayload::JobLease(JobLease {
+                        job_id: held.job_id,
+                        target_generation: held.target_generation,
+                        attempt: held.attempt + 1,
+                        lease_until_us: day * 2 + 1000,
+                    })],
+                ),
+                day * 2 + 1,
+            )
+            .await
+            .unwrap();
+        let view = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+        let claimed = view
+            .jobs
+            .iter()
+            .find(|value| value.job_id == waiting.job_id)
+            .unwrap();
+        assert_eq!(claimed.state, JobStatus::Leased);
+        assert_eq!(claimed.attempt, 2);
+        assert_eq!(
+            handle
+                .llm_daily_usage(day * 3 + 1, view.frontier, &view.jobs)
+                .await
+                .unwrap()
+                .calls,
+            1,
+            "an unfinished prior-day claim remains reserved"
+        );
+        // Lease recovery may return a spent-attempt job to Queued. Exhaustion
+        // terminates that queue entry directly, without another artificial claim.
+        let mut exhausted = claimed.clone();
+        exhausted.state = JobStatus::Queued;
+        exhausted.lease_until_us = None;
+        exhausted.attempt = 6;
+        handle
+            .commit(
+                command(
+                    day * 3 + 2,
+                    vec![JournalPayload::JobState(exhausted.clone())],
+                ),
+                day * 3 + 2,
+            )
+            .await
+            .unwrap();
+        let frontier = handle.project().await.unwrap().frontier;
+        fail_exhausted_llm_job(&handle, &exhausted, frontier, day * 3 + 3)
+            .await
+            .unwrap();
+        let view = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+        let stopped = view
+            .jobs
+            .iter()
+            .find(|job| job.job_id == exhausted.job_id)
+            .unwrap();
+        assert_eq!(stopped.state, JobStatus::Failed);
+        assert_eq!(stopped.attempt, 6);
+        assert!(stopped.lease_until_us.is_none());
+        assert_eq!(
+            stopped.terminal.as_ref().unwrap().reason,
+            JobTerminalReason::Unsupported
+        );
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
 
     #[test]
     fn procedure_usage_fairness_serves_targets_beyond_a_changing_first_lane() {
@@ -4860,7 +5444,11 @@ mod idle_tests {
             "receipt".into(),
             JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
         ));
-        idle.refresh(&snapshot).unwrap();
+        idle.refresh(
+            &snapshot,
+            &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+        )
+        .unwrap();
         let config = evertrace_domain::config::DreamingConfig::default();
         assert!(
             idle.delay(&episode, &config, 2_000_000_000)
@@ -4883,7 +5471,11 @@ mod idle_tests {
         snapshot.rows.last_mut().unwrap().payload_json = Some("invalid".into());
         for frontier in 10..13 {
             snapshot.frontier = frontier;
-            idle.refresh(&snapshot).unwrap();
+            idle.refresh(
+                &snapshot,
+                &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+            )
+            .unwrap();
         }
         assert_eq!(idle.decoded_receipts, 1);
         let mut future = receipt.clone();
@@ -4893,14 +5485,24 @@ mod idle_tests {
                 .unwrap(),
         );
         snapshot.rows.last_mut().unwrap().source_event_seq = 13;
-        assert!(idle.refresh(&snapshot).is_err());
+        assert!(
+            idle.refresh(
+                &snapshot,
+                &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap()
+            )
+            .is_err()
+        );
         let mut fresh = receipt;
         fresh.recorded_at_us = 2_000_000_000;
         snapshot.rows.last_mut().unwrap().payload_json = Some(
             serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(fresh))).unwrap(),
         );
         snapshot.rows.last_mut().unwrap().source_event_seq = 14;
-        idle.refresh(&snapshot).unwrap();
+        idle.refresh(
+            &snapshot,
+            &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+        )
+        .unwrap();
         assert_eq!(idle.decoded_receipts, 2);
         assert!(
             !idle

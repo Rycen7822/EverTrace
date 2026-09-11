@@ -14,10 +14,16 @@ use std::{
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 
 enum WriterRequest {
+    LlmBudgetPage {
+        day_start_us: i64,
+        after: u64,
+        frontier: u64,
+        reply: oneshot::Sender<Result<Vec<evertrace_store::JournalRow>, WriterActorError>>,
+    },
     ReadDiagnostics {
         reply: oneshot::Sender<evertrace_store::NativeDiagnostics>,
     },
@@ -106,6 +112,34 @@ pub struct WriterHandle {
 }
 
 impl WriterHandle {
+    pub(crate) async fn llm_daily_usage(
+        &self,
+        at: i64,
+        frontier: u64,
+        jobs: &[DurableJob],
+    ) -> Result<evertrace_domain::semantic::DerivationQuotaUsage, WriterActorError> {
+        let mut usage = super::synthesis::DailyLlmUsage::new(jobs, at);
+        let mut after = 0;
+        loop {
+            let (reply, response) = oneshot::channel();
+            self.sender
+                .send(WriterRequest::LlmBudgetPage {
+                    day_start_us: usage.day_start_us(),
+                    after,
+                    frontier,
+                    reply,
+                })
+                .await
+                .map_err(|_| WriterActorError::Stopped)?;
+            let rows = response.await.map_err(|_| WriterActorError::Stopped)??;
+            let Some(last) = rows.last() else {
+                break;
+            };
+            after = last.seq;
+            usage.extend(&rows).map_err(map_store_error)?;
+        }
+        Ok(usage.finish())
+    }
     pub async fn read_diagnostics(
         &self,
     ) -> Result<evertrace_store::NativeDiagnostics, WriterActorError> {
@@ -469,299 +503,357 @@ async fn run_writer(
         background_frontier.send_replace(frontier);
     }
     let mut shutdown_replies = Vec::new();
-    while let Some(request) = receiver.recv().await {
-        match request {
-            WriterRequest::Commit {
-                command,
-                ingested_at_us,
-                reply,
-            } => {
-                let result = writer
-                    .as_mut()
-                    .ok_or(WriterActorError::Stopped)?
-                    .commit(&command, ingested_at_us)
-                    .await
-                    .map_err(map_store_error);
-                let notify = result
-                    .as_ref()
-                    .ok()
-                    .filter(|_| recall_relevant(&command))
-                    .map(|outcome| outcome.last_seq);
-                let background_notify = result
-                    .as_ref()
-                    .ok()
-                    .filter(|_| background_relevant(&command))
-                    .map(|outcome| outcome.last_seq);
-                let fatal = result.as_ref().err().copied().filter(|error| {
-                    matches!(
-                        error,
-                        WriterActorError::Store | WriterActorError::StoreCorrupt
-                    )
-                });
-                let reconcile = result.is_ok() && object_deletion_relevant(&command);
-                let _ = reply.send(result);
-                if let Some(frontier) = notify {
-                    recall_frontier.send_replace(frontier);
+    let mut budget_reads = JoinSet::new();
+    let result = async {
+        loop {
+            let request = tokio::select! {
+                request = receiver.recv() => {
+                    let Some(request) = request else { break };
+                    request
                 }
-                if let Some(frontier) = background_notify {
-                    background_frontier.send_replace(frontier);
+                Some(result) = budget_reads.join_next(), if !budget_reads.is_empty() => {
+                    result.map_err(|_| WriterActorError::Store)?;
+                    continue;
                 }
-                if let Some(error) = fatal {
-                    return Err(error);
-                }
-                if reconcile
-                    && let Some(frontier) = Box::pin(reconcile_object_deletions(
-                        writer.as_mut().ok_or(WriterActorError::Stopped)?,
-                    ))
-                    .await?
-                {
-                    recall_frontier.send_replace(frontier);
-                    background_frontier.send_replace(frontier);
-                }
-            }
-            WriterRequest::CommitIfFrontier {
-                command,
-                ingested_at_us,
-                expected_frontier,
-                reply,
-            } => {
-                let result = writer
-                    .as_mut()
-                    .ok_or(WriterActorError::Stopped)?
-                    .commit_if_frontier(&command, ingested_at_us, expected_frontier)
-                    .await
-                    .map_err(map_store_error);
-                let notify = result
-                    .as_ref()
-                    .ok()
-                    .filter(|_| recall_relevant(&command))
-                    .map(|outcome| outcome.last_seq);
-                let background_notify = result
-                    .as_ref()
-                    .ok()
-                    .filter(|_| background_relevant(&command))
-                    .map(|outcome| outcome.last_seq);
-                let fatal = result.as_ref().err().copied().filter(|error| {
-                    matches!(
-                        error,
-                        WriterActorError::Store | WriterActorError::StoreCorrupt
-                    )
-                });
-                let reconcile = result.is_ok() && object_deletion_relevant(&command);
-                let _ = reply.send(result);
-                if let Some(frontier) = notify {
-                    recall_frontier.send_replace(frontier);
-                }
-                if let Some(frontier) = background_notify {
-                    background_frontier.send_replace(frontier);
-                }
-                if let Some(error) = fatal {
-                    return Err(error);
-                }
-                if reconcile
-                    && let Some(frontier) = Box::pin(reconcile_object_deletions(
-                        writer.as_mut().ok_or(WriterActorError::Stopped)?,
-                    ))
-                    .await?
-                {
-                    recall_frontier.send_replace(frontier);
-                    background_frontier.send_replace(frontier);
-                }
-            }
-            WriterRequest::ReadDiagnostics { reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .read_diagnostics()
-                    .await;
-                let _ = reply.send(result);
-            }
-            WriterRequest::Project { reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .project()
-                    .await
-                    .map_err(map_store_error);
-                let fatal = result.is_err();
-                let _ = reply.send(result);
-                if fatal {
-                    return Err(WriterActorError::Store);
-                }
-            }
-            WriterRequest::CommittedCommand { command_id, reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .committed_command(command_id)
-                    .await
-                    .map_err(map_store_error);
-                let fatal = result.is_err();
-                let _ = reply.send(result);
-                if fatal {
-                    return Err(WriterActorError::Store);
-                }
-            }
-            WriterRequest::RecallCurrentContexts { limit, reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .recall_current_contexts(limit)
-                    .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
-            WriterRequest::SessionImportContext {
-                source,
-                repository_locator,
-                reply,
-            } => {
-                let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
-                let result = match repository_locator {
-                    Some((identity, path)) => {
-                        writer.session_import_context_with_repository(&source, identity, &path)
+            };
+            match request {
+                WriterRequest::LlmBudgetPage {
+                    day_start_us,
+                    after,
+                    frontier,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
                     }
-                    None => writer.session_import_context(&source),
+                    // Acquire inside the actor, after any earlier backup request.
+                    // The owned guard fences the cloned table until its read ends.
+                    let guard = Arc::clone(&projection_worker).read_owned().await;
+                    let read = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .llm_budget_page(day_start_us, after, frontier);
+                    budget_reads.spawn(reply_llm_budget_page(guard, read, reply));
                 }
-                .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
-            WriterRequest::RepositoryReadContext { ids, reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .repository_read_context(&ids)
-                    .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
-            WriterRequest::InventoryContext {
-                context,
-                job_id,
-                reply,
-            } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .inventory_context(&context, job_id)
-                    .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
-            WriterRequest::SessionImportContexts {
-                after,
-                limit,
-                reply,
-            } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .session_import_contexts(after.as_deref(), limit)
-                    .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
-            WriterRequest::SessionImportPrefixPage { request, reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .session_import_prefix_page(&request)
-                    .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
-            WriterRequest::ReconciliationFrontier { limit, reply } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .reconciliation_frontier(limit)
-                    .await
-                    .map_err(map_store_error);
-                let fatal = result.as_ref().err().copied().filter(|error| {
-                    matches!(
-                        error,
-                        WriterActorError::Store | WriterActorError::StoreCorrupt
-                    )
-                });
-                let _ = reply.send(result);
-                if let Some(error) = fatal {
-                    return Err(error);
+                WriterRequest::Commit {
+                    command,
+                    ingested_at_us,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_mut()
+                        .ok_or(WriterActorError::Stopped)?
+                        .commit(&command, ingested_at_us)
+                        .await
+                        .map_err(map_store_error);
+                    let notify = result
+                        .as_ref()
+                        .ok()
+                        .filter(|_| recall_relevant(&command))
+                        .map(|outcome| outcome.last_seq);
+                    let background_notify = result
+                        .as_ref()
+                        .ok()
+                        .filter(|_| background_relevant(&command))
+                        .map(|outcome| outcome.last_seq);
+                    let fatal = result.as_ref().err().copied().filter(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
+                    let reconcile = result.is_ok() && object_deletion_relevant(&command);
+                    let _ = reply.send(result);
+                    if let Some(frontier) = notify {
+                        recall_frontier.send_replace(frontier);
+                    }
+                    if let Some(frontier) = background_notify {
+                        background_frontier.send_replace(frontier);
+                    }
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
+                    if reconcile
+                        && let Some(frontier) = Box::pin(reconcile_object_deletions(
+                            writer.as_mut().ok_or(WriterActorError::Stopped)?,
+                        ))
+                        .await?
+                    {
+                        recall_frontier.send_replace(frontier);
+                        background_frontier.send_replace(frontier);
+                    }
                 }
-            }
-            WriterRequest::ReconciliationArtifactContext {
-                descriptors,
-                limit,
-                reply,
-            } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .reconciliation_artifact_context(&descriptors, limit)
-                    .await
-                    .map_err(map_store_error);
-                let fatal = result.as_ref().err().copied().filter(|error| {
-                    matches!(
-                        error,
-                        WriterActorError::Store | WriterActorError::StoreCorrupt
-                    )
-                });
-                let _ = reply.send(result);
-                if let Some(error) = fatal {
-                    return Err(error);
+                WriterRequest::CommitIfFrontier {
+                    command,
+                    ingested_at_us,
+                    expected_frontier,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_mut()
+                        .ok_or(WriterActorError::Stopped)?
+                        .commit_if_frontier(&command, ingested_at_us, expected_frontier)
+                        .await
+                        .map_err(map_store_error);
+                    let notify = result
+                        .as_ref()
+                        .ok()
+                        .filter(|_| recall_relevant(&command))
+                        .map(|outcome| outcome.last_seq);
+                    let background_notify = result
+                        .as_ref()
+                        .ok()
+                        .filter(|_| background_relevant(&command))
+                        .map(|outcome| outcome.last_seq);
+                    let fatal = result.as_ref().err().copied().filter(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
+                    let reconcile = result.is_ok() && object_deletion_relevant(&command);
+                    let _ = reply.send(result);
+                    if let Some(frontier) = notify {
+                        recall_frontier.send_replace(frontier);
+                    }
+                    if let Some(frontier) = background_notify {
+                        background_frontier.send_replace(frontier);
+                    }
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
+                    if reconcile
+                        && let Some(frontier) = Box::pin(reconcile_object_deletions(
+                            writer.as_mut().ok_or(WriterActorError::Stopped)?,
+                        ))
+                        .await?
+                    {
+                        recall_frontier.send_replace(frontier);
+                        background_frontier.send_replace(frontier);
+                    }
                 }
-            }
-            WriterRequest::CreateBackup {
-                backup_job_id,
-                config_path,
-                runtime,
-                reply,
-            } => {
-                let result = create_quiesced_backup(
-                    &mut writer,
-                    &projection_worker,
+                WriterRequest::ReadDiagnostics { reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .read_diagnostics()
+                        .await;
+                    let _ = reply.send(result);
+                }
+                WriterRequest::Project { reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .project()
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::CommittedCommand { command_id, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .committed_command(command_id)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::RecallCurrentContexts { limit, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .recall_current_contexts(limit)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::SessionImportContext {
+                    source,
+                    repository_locator,
+                    reply,
+                } => {
+                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                    let result = match repository_locator {
+                        Some((identity, path)) => {
+                            writer.session_import_context_with_repository(&source, identity, &path)
+                        }
+                        None => writer.session_import_context(&source),
+                    }
+                    .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::RepositoryReadContext { ids, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .repository_read_context(&ids)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::InventoryContext {
+                    context,
+                    job_id,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .inventory_context(&context, job_id)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::SessionImportContexts {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .session_import_contexts(after.as_deref(), limit)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::SessionImportPrefixPage { request, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .session_import_prefix_page(&request)
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::ReconciliationFrontier { limit, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .reconciliation_frontier(limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.as_ref().err().copied().filter(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
+                    let _ = reply.send(result);
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
+                }
+                WriterRequest::ReconciliationArtifactContext {
+                    descriptors,
+                    limit,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .reconciliation_artifact_context(&descriptors, limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.as_ref().err().copied().filter(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
+                    let _ = reply.send(result);
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
+                }
+                WriterRequest::CreateBackup {
                     backup_job_id,
                     config_path,
-                    *runtime,
-                )
-                .await;
-                let fatal = result.as_ref().err().copied();
-                let _ = reply.send(result);
-                if let Some(error) = fatal {
-                    return Err(error);
+                    runtime,
+                    reply,
+                } => {
+                    let result = create_quiesced_backup(
+                        &mut writer,
+                        &projection_worker,
+                        backup_job_id,
+                        config_path,
+                        *runtime,
+                    )
+                    .await;
+                    let fatal = result.as_ref().err().copied();
+                    let _ = reply.send(result);
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
+                }
+                WriterRequest::Shutdown { reply } => {
+                    receiver.close();
+                    shutdown_replies.push(reply);
+                }
+                WriterRequest::MarkGc {
+                    runtime,
+                    cursor,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .mark_gc_page(&runtime, cursor)
+                        .await
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
+                }
+                WriterRequest::SweepGc {
+                    runtime,
+                    job_id,
+                    round,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .sweep_gc(&runtime, job_id, &round)
+                        .await
+                        .map_err(map_store_error);
+                    let _ = reply.send(result);
                 }
             }
-            WriterRequest::Shutdown { reply } => {
-                receiver.close();
-                shutdown_replies.push(reply);
-            }
-            WriterRequest::MarkGc {
-                runtime,
-                cursor,
-                reply,
-            } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .mark_gc_page(&runtime, cursor)
-                    .await
-                    .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
-            WriterRequest::SweepGc {
-                runtime,
-                job_id,
-                round,
-                reply,
-            } => {
-                let result = writer
-                    .as_ref()
-                    .ok_or(WriterActorError::Stopped)?
-                    .sweep_gc(&runtime, job_id, &round)
-                    .await
-                    .map_err(map_store_error);
-                let _ = reply.send(result);
-            }
         }
+        Ok::<(), WriterActorError>(())
     }
+    .await;
+    // Drain cancellation even on a writer error. All table futures and read
+    // fences are gone before shutdown acknowledgement or writer-table closure.
+    budget_reads.shutdown().await;
+    result?;
     for reply in shutdown_replies {
         let _ = reply.send(());
     }
     Ok(())
+}
+
+fn reply_llm_budget_page(
+    guard: tokio::sync::OwnedRwLockReadGuard<Option<ProjectionWorker>>,
+    read: impl Future<Output = Result<Vec<evertrace_store::JournalRow>, StoreError>>,
+    mut reply: oneshot::Sender<Result<Vec<evertrace_store::JournalRow>, WriterActorError>>,
+) -> impl Future<Output = ()> {
+    // Tuple fields drop in order, including if the task is cancelled before
+    // its first poll: the table future must die before the backup read fence.
+    let mut fenced = (Box::pin(read), guard);
+    async move {
+        let result = tokio::select! {
+            biased;
+            _ = reply.closed() => None,
+            result = &mut fenced.0 => Some(result.map_err(map_store_error)),
+        };
+        drop(fenced);
+        if let Some(result) = result {
+            let _ = reply.send(result);
+        }
+    }
 }
 
 async fn create_quiesced_backup(
@@ -1209,6 +1301,8 @@ fn background_relevant(command: &JournalCommand) -> bool {
                 | evertrace_store::JournalPayload::SessionImportEventRecorded(_)
                 | evertrace_store::JournalPayload::SourceReceiptRecorded(_)
                 | evertrace_store::JournalPayload::SourceObservationRecorded(_)
+                | evertrace_store::JournalPayload::EvidenceSurfaceRecorded(_)
+                | evertrace_store::JournalPayload::RevisionProposalRecorded(_)
                 | evertrace_store::JournalPayload::ProcedureUsageRecorded(_)
                 | evertrace_store::JournalPayload::ProcedureRevisionRecorded(_)
                 | evertrace_store::JournalPayload::ProcedureStateRecorded(_)
@@ -1246,6 +1340,70 @@ fn map_store_error(error: StoreError) -> WriterActorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_llm_budget_read_drops_the_page_before_releasing_backup_fence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct PageDrop {
+            fence: Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Drop for PageDrop {
+            fn drop(&mut self) {
+                assert!(self.fence.try_write().is_err());
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        let fence = Arc::new(tokio::sync::RwLock::new(None));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let page = PageDrop {
+            fence: Arc::clone(&fence),
+            dropped: Arc::clone(&dropped),
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let polled = Arc::clone(&started);
+        let read = std::future::poll_fn(move |_| {
+            let _ = &page;
+            polled.notify_one();
+            std::task::Poll::Pending
+        });
+        let (reply, response) = oneshot::channel();
+        let task = tokio::spawn(reply_llm_budget_page(
+            Arc::clone(&fence).read_owned().await,
+            read,
+            reply,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        assert!(fence.try_write().is_err());
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(fence.try_write().is_ok());
+
+        // An actor abort before the first poll has the same table/fence order.
+        let page = PageDrop {
+            fence: Arc::clone(&fence),
+            dropped: Arc::clone(&dropped),
+        };
+        let read = std::future::poll_fn(move |_| {
+            let _ = &page;
+            std::task::Poll::Pending
+        });
+        let (reply, _response) = oneshot::channel();
+        dropped.store(false, Ordering::SeqCst);
+        drop(reply_llm_budget_page(
+            Arc::clone(&fence).read_owned().await,
+            read,
+            reply,
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(fence.try_write().is_ok());
+    }
 
     #[test]
     fn zero_capacity_is_rejected_without_spawning() {

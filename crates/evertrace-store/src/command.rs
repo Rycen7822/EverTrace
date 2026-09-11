@@ -2030,7 +2030,8 @@ fn validate_job(value: &DurableJob) -> Result<(), StoreError> {
             .as_ref()
             .and_then(|terminal| terminal.result_ref.as_deref()),
     )?;
-    let synthesis = value.kind == "semantic_synthesis_v1";
+    let synthesis = value.kind == "semantic_synthesis_v1"
+        || value.kind == "procedure_review_v1" && value.model_id.is_some();
     let import = value.kind == "session_import_v1";
     if value.target_generation == 0
         || value.attempt == 0

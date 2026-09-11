@@ -158,6 +158,26 @@ pub(crate) async fn read_journal_page(
     .await
 }
 
+/// Bounded runtime-budget facts only: never load source or semantic text history.
+pub(crate) async fn read_llm_budget_page(
+    table: &Table,
+    day_start_us: i64,
+    after: u64,
+    frontier: u64,
+) -> Result<Vec<JournalRow>, StoreError> {
+    let day_end_us = day_start_us.saturating_add(86_400_000_000);
+    read_query(
+        table
+            .query()
+            .only_if(format!(
+                "seq > {after} AND seq <= {frontier} AND CAST(occurred_at_us AS BIGINT) >= {day_start_us} AND CAST(occurred_at_us AS BIGINT) < {day_end_us} AND event_type IN ('job_state_v1', 'job_lease_v1', 'semantic_derivation_run_recorded_v1')"
+            ))
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("seq".into())]))
+            .limit(256),
+    )
+    .await
+}
+
 pub(crate) async fn read_journal_frontier(table: &Table) -> Result<u64, StoreError> {
     let query = table
         .query()
@@ -642,6 +662,52 @@ mod tests {
             journal_schema().fields()[..28].to_vec(),
         )));
         assert_eq!(rows_from_batch(&partial), Err(StoreError::StoreCorrupt));
+    }
+
+    #[tokio::test]
+    async fn llm_budget_pages_exclude_old_and_unrelated_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection = lancedb::connect(temp.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let table = connection
+            .create_empty_table(JOURNAL_TABLE, journal_schema())
+            .execute()
+            .await
+            .unwrap();
+        let template = valid_rows().remove(0);
+        let day = 86_400_000_000;
+        let rows = (1..=302)
+            .map(|seq| {
+                let mut row = template.clone();
+                row.seq = seq;
+                row.event_type = "job_lease_v1".into();
+                row.occurred_at_us = day;
+                if seq == 1 {
+                    row.occurred_at_us = day - 1;
+                }
+                if seq == 2 {
+                    row.event_type = "semantic_digest_recorded_v1".into();
+                    row.payload_json = "unrelated body must not be loaded".repeat(100);
+                }
+                row
+            })
+            .collect::<Vec<_>>();
+        append_rows(&table, &rows).await.unwrap();
+        let first = read_llm_budget_page(&table, day, 0, 301).await.unwrap();
+        assert_eq!(first.len(), 256);
+        assert_eq!(first.first().unwrap().seq, 3);
+        assert_eq!(first.last().unwrap().seq, 258);
+        let second = read_llm_budget_page(&table, day, 258, 301).await.unwrap();
+        assert_eq!(second.len(), 43);
+        assert_eq!(second.last().unwrap().seq, 301);
+        assert!(
+            read_llm_budget_page(&table, day, 301, 301)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
