@@ -67,6 +67,18 @@ pub struct ProcedureUsageCurrentView {
         (u64, evertrace_domain::ids::SourceReceiptId),
     >,
     receipt_times: std::collections::BTreeMap<evertrace_domain::ids::SourceReceiptId, i64>,
+    observations: std::collections::BTreeMap<
+        evertrace_domain::ids::SourceObservationId,
+        evertrace_domain::evidence::SourceObservation,
+    >,
+    receipts: std::collections::BTreeMap<
+        evertrace_domain::ids::SourceReceiptId,
+        evertrace_domain::evidence::SourceReceipt,
+    >,
+    surfaces: std::collections::BTreeMap<
+        evertrace_domain::ids::SourceObservationId,
+        evertrace_domain::evidence::EvidenceSurface,
+    >,
     legacy_returned_usages: std::collections::BTreeSet<evertrace_domain::ids::ProcedureUsageId>,
     first_returned_times: std::collections::BTreeMap<evertrace_domain::ids::ProcedureUsageId, i64>,
     host_occurrences: std::collections::BTreeMap<
@@ -604,7 +616,217 @@ impl ProcedureUsageCurrentView {
     }
 
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, SemanticServiceError> {
-        Self::from_snapshot_input(snapshot, false)
+        Self::from_snapshot_input(snapshot, false, false)
+    }
+
+    /// Candidate text is only a read filter. Every selected binding and source
+    /// is subsequently decoded and checked by the normal physical validator.
+    /// Retain all successors of a selected Operation's binding, including a
+    /// correction that assigns it to another Task.
+    pub(crate) fn execution_snapshot(
+        snapshot: &ProjectionSnapshot,
+        usage_id: evertrace_domain::ids::ProcedureUsageId,
+        budget: &evertrace_store::JobBudget,
+        deadline: std::time::Instant,
+    ) -> Result<Option<ProjectionSnapshot>, SemanticServiceError> {
+        use std::collections::BTreeSet;
+        let usage_key = usage_id.to_string();
+        let mut task = None;
+        let mut stream = None;
+        let mut procedure_id = None;
+        let mut procedure_revision = None;
+        let mut wanted = BTreeSet::from([usage_key.clone()]);
+        let mut operation_ids = BTreeSet::new();
+        let mut negative_ids = BTreeSet::new();
+        let mut selected = BTreeSet::new();
+        let mut bytes = 0usize;
+        let mut packet = ProjectionSnapshot {
+            frontier: snapshot.frontier,
+            rows: Vec::new(),
+        };
+        // A finite closure over these concrete Work/L0 types, not a persistent
+        // cursor or a general dependency registry. Large traces remain pending.
+        for _ in 0..8 {
+            let mut changed = false;
+            for row in snapshot.data_rows() {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                if selected.contains(&row.row_id) {
+                    continue;
+                }
+                let Some(kind) = row.object_kind.as_deref() else {
+                    continue;
+                };
+                if !matches!(
+                    kind,
+                    "procedure_revision"
+                        | "procedure_state_event"
+                        | "global_support_validation"
+                        | "repository"
+                        | "procedure_usage_revision"
+                        | "procedure_negative_evidence"
+                        | "procedure_negative_review"
+                        | "task"
+                        | "workstream"
+                        | "work_binding"
+                        | "attempt"
+                        | "experiment_run"
+                        | "result_evidence"
+                        | "work_episode"
+                        | "work_checkpoint"
+                        | "host_occurrence"
+                        | "operation"
+                        | "source_observation"
+                        | "source_receipt"
+                        | "scope_effect"
+                        | "evidence_surface"
+                ) {
+                    continue;
+                }
+                let json = row
+                    .payload_json
+                    .as_deref()
+                    .ok_or(SemanticServiceError::InvalidInput)?;
+                let exact_ref = row
+                    .object_id
+                    .as_ref()
+                    .into_iter()
+                    .chain(&row.current_revision_id)
+                    .any(|id| wanted.contains(id));
+                let contextual = matches!(
+                    kind,
+                    "workstream" | "work_binding" | "attempt" | "experiment_run" | "work_episode"
+                ) && task.as_ref().is_some_and(|id: &String| json.contains(id))
+                    && stream.as_ref().is_some_and(|id: &String| json.contains(id));
+                let procedure_control = match kind {
+                    "procedure_revision" => procedure_id.as_ref(),
+                    "procedure_state_event"
+                    | "procedure_negative_evidence"
+                    | "global_support_validation" => procedure_revision.as_ref(),
+                    _ => None,
+                }
+                .is_some_and(|id: &String| json.contains(id));
+                let corrected_binding = kind == "work_binding"
+                    && operation_ids.iter().any(|id: &String| json.contains(id));
+                let negative_review = kind == "procedure_negative_review"
+                    && negative_ids.iter().any(|id: &String| json.contains(id));
+                if !exact_ref
+                    && !contextual
+                    && !corrected_binding
+                    && !procedure_control
+                    && !negative_review
+                {
+                    continue;
+                }
+                bytes = bytes.saturating_add(json.len());
+                if budget.max_bytes.is_some_and(|limit| bytes as u64 > limit)
+                    || packet.rows.len() >= budget.max_items as usize
+                {
+                    return Ok(None);
+                }
+                let payload: JournalPayload =
+                    serde_json::from_str(json).map_err(|_| SemanticServiceError::InvalidInput)?;
+                match payload {
+                    JournalPayload::ProcedureUsageRecorded(value) => {
+                        // Only this usage's history establishes its first Returned
+                        // boundary. Cohort promotion has its own bounded consumer.
+                        if value.procedure_usage_id != usage_id {
+                            return Err(SemanticServiceError::InvalidInput);
+                        }
+                        task = Some(value.task_id.to_string());
+                        stream = Some(value.workstream_id.to_string());
+                        procedure_revision = Some(value.procedure_revision_id.to_string());
+                        wanted.insert(value.task_id.to_string());
+                        wanted.insert(value.workstream_id.to_string());
+                        wanted.insert(value.procedure_revision_id.to_string());
+                        wanted.extend(
+                            value
+                                .local_context
+                                .repository_id
+                                .iter()
+                                .map(ToString::to_string),
+                        );
+                        wanted.insert(value.exposure_episode_revision_id.to_string());
+                        wanted.extend(
+                            value
+                                .work_binding_revision_refs
+                                .iter()
+                                .map(ToString::to_string),
+                        );
+                        wanted.extend(value.evidence_refs);
+                    }
+                    JournalPayload::ProcedureRevisionRecorded(value) => {
+                        procedure_id = Some(value.procedure_id.to_string());
+                    }
+                    JournalPayload::ProcedureNegativeEvidenceRecorded(value) => {
+                        negative_ids.insert(value.negative_evidence_id.to_string());
+                    }
+                    JournalPayload::WorkBindingRecorded(value) => {
+                        wanted.insert(value.operation_id.to_string());
+                        operation_ids.insert(value.operation_id.to_string());
+                        wanted.extend(
+                            value
+                                .primary_binding
+                                .experiment_run_id
+                                .iter()
+                                .map(ToString::to_string),
+                        );
+                        wanted.extend(value.scope_effect_refs.iter().map(ToString::to_string));
+                    }
+                    JournalPayload::WorkEpisodeRecorded(value) => {
+                        wanted.extend(value.checkpoint_refs);
+                    }
+                    JournalPayload::AttemptRecorded(value) => {
+                        wanted.extend(value.experiment_run_ids.iter().map(ToString::to_string));
+                        wanted.extend(value.outcome_refs);
+                    }
+                    JournalPayload::ExperimentRunRecorded(value) => {
+                        wanted.insert(value.run_id.to_string());
+                    }
+                    JournalPayload::ResultEvidenceRecorded(value) => {
+                        wanted.insert(value.result_evidence_id.to_string());
+                        wanted.insert(value.experiment_run_id.to_string());
+                    }
+                    JournalPayload::OperationDerived(value) => {
+                        wanted.insert(value.host_occurrence_id.to_string());
+                        wanted.extend(
+                            value
+                                .input_source_observation_refs
+                                .iter()
+                                .chain(&value.result_source_observation_refs)
+                                .map(ToString::to_string),
+                        );
+                        wanted.extend(value.scope_effect_ids.iter().map(ToString::to_string));
+                    }
+                    JournalPayload::HostOccurrenceNormalized(value) => {
+                        wanted.extend(
+                            value
+                                .source_observation_refs
+                                .iter()
+                                .map(ToString::to_string),
+                        );
+                    }
+                    JournalPayload::SourceObservationRecorded(value) => {
+                        wanted.insert(value.source_receipt_ref.to_string());
+                    }
+                    _ => {}
+                }
+                selected.insert(row.row_id.clone());
+                packet.rows.push(row.clone());
+                changed = true;
+            }
+            if !changed && std::time::Instant::now() < deadline {
+                return Ok(Some(packet));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn from_execution_snapshot(
+        snapshot: &ProjectionSnapshot,
+    ) -> Result<Self, SemanticServiceError> {
+        Self::from_snapshot_input(snapshot, false, true)
     }
 
     /// Promotion consumes existing, validated usage outcomes, not the execution
@@ -613,12 +835,13 @@ impl ProcedureUsageCurrentView {
     pub(crate) fn from_promotion_snapshot(
         snapshot: &ProjectionSnapshot,
     ) -> Result<Self, SemanticServiceError> {
-        Self::from_snapshot_input(snapshot, true)
+        Self::from_snapshot_input(snapshot, true, false)
     }
 
     fn from_snapshot_input(
         snapshot: &ProjectionSnapshot,
         promotion_only: bool,
+        execution_inputs: bool,
     ) -> Result<Self, SemanticServiceError> {
         let mut view = Self {
             frontier: snapshot.frontier,
@@ -653,7 +876,8 @@ impl ProcedureUsageCurrentView {
                                 | "source_receipt"
                                 | "scope_effect"
                         )
-                    ))
+                    ) && !(execution_inputs
+                        && row.object_kind.as_deref() == Some("evidence_surface")))
             {
                 continue;
             }
@@ -668,10 +892,21 @@ impl ProcedureUsageCurrentView {
                         value.source_observation_id,
                         (row.source_event_seq, value.source_receipt_ref),
                     );
+                    if execution_inputs {
+                        view.observations
+                            .insert(value.source_observation_id, *value);
+                    }
                 }
                 JournalPayload::SourceReceiptRecorded(value) => {
                     view.receipt_times
                         .insert(value.source_receipt_id, value.recorded_at_us);
+                    if execution_inputs {
+                        view.receipts.insert(value.source_receipt_id, *value);
+                    }
+                }
+                JournalPayload::EvidenceSurfaceRecorded(value) => {
+                    view.surfaces
+                        .insert(value.source_observation_revision_ref, *value);
                 }
                 JournalPayload::ProcedureRevisionRecorded(value) => {
                     let current = view
@@ -2227,6 +2462,32 @@ pub fn advance_procedure_usage(
     ),
     SemanticServiceError,
 > {
+    advance_procedure_usage_inner(
+        view,
+        context,
+        stable_min_outcome_supported,
+        request,
+        constraints,
+        previous_constraints,
+        true,
+    )
+}
+
+fn advance_procedure_usage_inner(
+    view: &ProcedureUsageCurrentView,
+    context: ProposalCommandContext,
+    stable_min_outcome_supported: u32,
+    request: ProcedureUsageAdvance,
+    constraints: &ConstraintState,
+    previous_constraints: Option<&ConstraintState>,
+    inline_promotion: bool,
+) -> Result<
+    (
+        evertrace_domain::procedure::ProcedureUsageRevision,
+        JournalCommand,
+    ),
+    SemanticServiceError,
+> {
     validate_promotion_threshold(stable_min_outcome_supported)?;
     let current = view
         .usages
@@ -2337,7 +2598,7 @@ pub fn advance_procedure_usage(
     }
     // Retain the existing three-success selection only. Larger configured
     // cohorts are submitted explicitly, not searched with N nested loops.
-    let promotion = if stable_min_outcome_supported == 3 {
+    let promotion = if inline_promotion && stable_min_outcome_supported == 3 {
         promotion_event(view, &next, context.occurred_at_us)?
     } else {
         None
@@ -2418,13 +2679,7 @@ fn validate_physical_usage(
         }) {
             return Ok((false, adopted_attempt));
         }
-        let bindings = usage
-            .work_binding_revision_refs
-            .iter()
-            .filter_map(|id| view.bindings.get(id))
-            .filter(|binding| binding.operation_id == *operation_id)
-            .collect::<Vec<_>>();
-        let [binding] = bindings.as_slice() else {
+        let Some(binding) = view.usage_binding(usage, *operation_id) else {
             return Ok((false, adopted_attempt));
         };
         let current_binding = view
@@ -2495,12 +2750,9 @@ fn validate_physical_usage(
             !operations.contains(&effect.operation_id)
                 || usage.local_context.repository_id != effect.repository_instance_id
                 || usage.local_context.worktree_id != effect.worktree_instance_id
-                || !usage.work_binding_revision_refs.iter().any(|binding_id| {
-                    view.bindings.get(binding_id).is_some_and(|binding| {
-                        binding.operation_id == effect.operation_id
-                            && binding.scope_effect_refs.contains(scope_id)
-                    })
-                })
+                || view
+                    .usage_binding(usage, effect.operation_id)
+                    .is_none_or(|binding| !binding.scope_effect_refs.contains(scope_id))
         })
     }) {
         return Ok((false, adopted_attempt));
@@ -2515,6 +2767,620 @@ fn validate_physical_usage(
 }
 
 pub(crate) const PROMOTION_USAGE_LIMIT: usize = 4096;
+
+pub(crate) const PROCEDURE_USAGE_JOB_KIND: &str = "procedure_usage_evaluation_v1";
+
+/// Job/lease/audit writes are deliberately outside this input frontier. An
+/// incomplete evaluation sleeps until evidence changes, including late bindings
+/// and checkpoints; completing its own job cannot wake it again.
+pub(crate) fn procedure_input_watermark(snapshot: &ProjectionSnapshot) -> u64 {
+    snapshot
+        .data_rows()
+        .filter(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some(
+                    "source_observation"
+                        | "source_receipt"
+                        | "evidence_surface"
+                        | "operation"
+                        | "host_occurrence"
+                        | "work_binding"
+                        | "attempt"
+                        | "experiment_run"
+                        | "result_evidence"
+                        | "work_episode"
+                        | "work_checkpoint"
+                        | "task"
+                        | "workstream"
+                        | "procedure_state_event"
+                        | "procedure_negative_evidence"
+                        | "procedure_negative_review"
+                        | "repository"
+                        | "global_support_validation"
+                )
+            )
+        })
+        .map(|row| row.source_event_seq)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Select current usage rows using projection identities, without decoding or
+/// copying every Procedure, Task and usage body before the selection deadline.
+pub(crate) struct ProcedureUsageCandidates<'a> {
+    pub(crate) rows: Vec<&'a evertrace_store::ObjectRow>,
+    pub(crate) context_watermarks: std::collections::BTreeMap<(&'a str, Option<&'a str>), u64>,
+}
+
+pub(crate) fn procedure_usage_candidates(
+    snapshot: &ProjectionSnapshot,
+    deadline: std::time::Instant,
+) -> Option<ProcedureUsageCandidates<'_>> {
+    let mut current = std::collections::BTreeMap::<&str, &evertrace_store::ObjectRow>::new();
+    let mut context_watermarks = std::collections::BTreeMap::new();
+    for row in snapshot.data_rows() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if row.object_kind.as_deref() != Some("procedure_usage_revision") {
+            if let Some(task) = row.task_id.as_deref() {
+                let watermark = context_watermarks
+                    .entry((task, row.workstream_id.as_deref()))
+                    .or_insert(0);
+                *watermark = (*watermark).max(row.source_event_seq);
+            }
+            continue;
+        }
+        let id = row.object_id.as_deref()?;
+        if current
+            .get(id)
+            .is_none_or(|prior| prior.source_event_seq < row.source_event_seq)
+        {
+            current.insert(id, row);
+        }
+    }
+    Some(ProcedureUsageCandidates {
+        rows: current.into_values().collect(),
+        context_watermarks,
+    })
+}
+
+impl ProcedureUsageCurrentView {
+    fn usage_binding(
+        &self,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+        operation: evertrace_domain::ids::OperationId,
+    ) -> Option<&evertrace_domain::work::WorkBindingRevision> {
+        let current = self
+            .bindings
+            .get(self.current_bindings_by_operation.get(&operation)?)?;
+        if !usage
+            .work_binding_revision_refs
+            .contains(&current.work_binding_revision_id)
+        {
+            return None;
+        }
+        let mut references = std::collections::BTreeSet::new();
+        for id in &usage.work_binding_revision_refs {
+            if self
+                .bindings
+                .get(id)
+                .is_some_and(|binding| binding.operation_id == operation)
+            {
+                references.insert(*id);
+            }
+        }
+        let mut binding = current;
+        loop {
+            // Retained references are audit history, never an alternative
+            // authority. Every link to them must preserve the resolved owner.
+            if !references.is_empty()
+                && (binding.assignment_status != evertrace_domain::work::AssignmentStatus::Resolved
+                    || binding.primary_binding.task_id != current.primary_binding.task_id
+                    || binding.primary_binding.workstream_id
+                        != current.primary_binding.workstream_id
+                    || binding.primary_binding.attempt_id != current.primary_binding.attempt_id
+                    || binding.primary_binding.episode_id != current.primary_binding.episode_id
+                    || binding
+                        .primary_binding
+                        .experiment_run_id
+                        .is_some_and(|id| Some(id) != current.primary_binding.experiment_run_id))
+            {
+                return None;
+            }
+            references.remove(&binding.work_binding_revision_id);
+            let Some(predecessor_id) = binding.predecessor_revision_id else {
+                return (references.is_empty() && binding.revision_generation == 1)
+                    .then_some(current);
+            };
+            let predecessor = self.bindings.get(&predecessor_id)?;
+            predecessor.validate_successor(binding).ok()?;
+            binding = predecessor;
+        }
+    }
+
+    pub(crate) fn usage_repository(
+        &self,
+        id: evertrace_domain::ids::ProcedureUsageId,
+    ) -> Option<evertrace_domain::ids::RepositoryId> {
+        self.usages
+            .get(&id)
+            .and_then(|usage| usage.local_context.repository_id)
+    }
+
+    pub(crate) fn pending_usage_ids(
+        &self,
+    ) -> impl Iterator<Item = evertrace_domain::ids::ProcedureUsageId> + '_ {
+        use evertrace_domain::procedure::{
+            ProcedureTruth, ProcedureUsageRouteDecision, ProcedureUsageStage,
+        };
+        self.usages
+            .values()
+            .filter(|usage| {
+                usage.stage >= ProcedureUsageStage::Returned
+                    && usage.route_decision == ProcedureUsageRouteDecision::Apply
+                    && usage.outcome_supported != ProcedureTruth::True
+                    && self.usage_publication_current(usage)
+            })
+            .map(|usage| usage.procedure_usage_id)
+    }
+
+    fn usage_publication_current(
+        &self,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> bool {
+        self.current_procedure_by_revision(usage.procedure_revision_id)
+            .is_some_and(|revision| {
+                (!matches!(revision.draft.scope, ProcedureScope::Global)
+                    || self
+                        .procedure_support
+                        .get(&revision.revision_id)
+                        .and_then(|value| value.as_deref())
+                        == Some("valid"))
+                    && self
+                        .publications
+                        .get(&revision.revision_id)
+                        .is_some_and(|(state, _)| {
+                            matches!(
+                                state.to_state,
+                                ProcedurePublicationState::ActiveProbationary
+                                    | ProcedurePublicationState::ActiveStable
+                            )
+                        })
+                    && !self.local_quarantined(revision.revision_id, &usage.local_context)
+            })
+    }
+
+    /// Exact authored action bytes are the conservative executable subset of
+    /// the existing text contract. No tool-name, phase-label or fuzzy match can
+    /// stand in for a Procedure-specific action. Prose without such a witness
+    /// remains unaligned, without poisoning the append-only usage references.
+    fn observed_text<'a>(
+        &'a self,
+        id: &evertrace_domain::ids::SourceObservationId,
+        cas: &evertrace_capture::CasStore,
+    ) -> Option<&'a str> {
+        use evertrace_domain::evidence::{
+            CaptureCompleteness, ContentTrust, SourceArchiveMode, SourceRole,
+        };
+        let observation = self.observations.get(id)?;
+        let receipt = self.receipts.get(&observation.source_receipt_ref)?;
+        let surface = self.surfaces.get(id)?;
+        if !matches!(observation.source_role, SourceRole::Host | SourceRole::Tool)
+            || observation.content_trust != ContentTrust::Observed
+            || observation.capture_completeness != CaptureCompleteness::Complete
+            || receipt.capture_completeness != CaptureCompleteness::Complete
+            || surface.capture_completeness != CaptureCompleteness::Complete
+            || receipt.archive_mode != SourceArchiveMode::Exact
+            || receipt.protected_secret_digest.is_some()
+            || !receipt.redaction_spans.is_empty()
+            || receipt.unsupported_record_classification.is_some()
+            || receipt.protected_length > 65_536
+        {
+            return None;
+        }
+        let digest = receipt.cas_ref.parse().ok()?;
+        let (bytes, _) = cas.read_bounded(&digest, 65_536, 65_536).ok()?;
+        (bytes == surface.protected_text.as_bytes()).then_some(surface.protected_text.as_str())
+    }
+
+    fn physical_operation(
+        &self,
+        operation: &evertrace_domain::evidence::Operation,
+        attempt: &evertrace_domain::work::Attempt,
+    ) -> Option<&evertrace_domain::work::WorkBindingRevision> {
+        use evertrace_domain::evidence::{CorrelationStrength, NormalizationState, PairingState};
+        let binding = self.bindings.get(
+            self.current_bindings_by_operation
+                .get(&operation.operation_id)?,
+        )?;
+        let (occurrence, _) = self.host_occurrences.get(&operation.host_occurrence_id)?;
+        (binding.assignment_status == evertrace_domain::work::AssignmentStatus::Resolved
+            && binding.primary_binding.task_id == Some(attempt.task_id)
+            && binding.primary_binding.workstream_id == Some(attempt.workstream_id)
+            && binding.primary_binding.attempt_id == Some(attempt.attempt_id)
+            && binding.primary_binding.episode_id == attempt.episode_id
+            && attempt.episode_id.is_some()
+            && operation.pairing_state == PairingState::Paired
+            && occurrence.pairing_state == PairingState::Paired
+            && occurrence.correlation_strength == CorrelationStrength::Exact
+            && occurrence.normalization_state != NormalizationState::NormalizationConflicted
+            && occurrence.possible_duplicate_group_id.is_none())
+        .then_some(binding)
+    }
+
+    fn matching_operations(
+        &self,
+        attempt: &evertrace_domain::work::Attempt,
+        steps: &[String],
+        cas: &evertrace_capture::CasStore,
+        usage: evertrace_domain::ids::ProcedureUsageId,
+        after: u64,
+        deadline: std::time::Instant,
+    ) -> Option<Vec<evertrace_domain::ids::OperationId>> {
+        if steps.is_empty() {
+            return None;
+        }
+        let mut selected = Vec::new();
+        let mut previous = after;
+        for step in steps {
+            let window = super::alignment::ActionWindow {
+                text: step.clone(),
+                after_sequence: previous,
+                before_sequence: None,
+            };
+            let candidate =
+                self.operation_in_window(attempt, &window, cas, usage, &selected, deadline)?;
+            selected.push(candidate);
+            previous = self.operation_end(&self.operations[&candidate].0);
+        }
+        Some(selected)
+    }
+
+    fn matching_windows(
+        &self,
+        attempt: &evertrace_domain::work::Attempt,
+        windows: &[super::alignment::ActionWindow],
+        cas: &evertrace_capture::CasStore,
+        usage: evertrace_domain::ids::ProcedureUsageId,
+        deadline: std::time::Instant,
+    ) -> Option<Vec<evertrace_domain::ids::OperationId>> {
+        if windows.is_empty() {
+            return None;
+        }
+        let mut selected = Vec::new();
+        for window in windows {
+            selected
+                .push(self.operation_in_window(attempt, window, cas, usage, &selected, deadline)?);
+        }
+        Some(selected)
+    }
+
+    fn operation_in_window(
+        &self,
+        attempt: &evertrace_domain::work::Attempt,
+        window: &super::alignment::ActionWindow,
+        cas: &evertrace_capture::CasStore,
+        usage: evertrace_domain::ids::ProcedureUsageId,
+        used: &[evertrace_domain::ids::OperationId],
+        deadline: std::time::Instant,
+    ) -> Option<evertrace_domain::ids::OperationId> {
+        self.operations
+            .values()
+            .filter(|(operation, _)| {
+                std::time::Instant::now() < deadline
+                    && !used.contains(&operation.operation_id)
+                    && operation.input_source_observation_refs.iter().all(|id| {
+                        self.observation_seqs
+                            .get(id)
+                            .is_some_and(|(seq, _)| *seq > window.after_sequence)
+                    })
+                    && window
+                        .before_sequence
+                        .is_none_or(|before| self.operation_end(operation) <= before)
+                    && self.operation_after_return(usage, &operation.operation_id)
+                    && self.physical_operation(operation, attempt).is_some()
+                    && operation
+                        .input_source_observation_refs
+                        .iter()
+                        .any(|id| self.observed_text(id, cas) == Some(window.text.as_str()))
+                    && operation
+                        .result_source_observation_refs
+                        .iter()
+                        .all(|id| self.observed_text(id, cas).is_some())
+            })
+            .min_by_key(|(operation, _)| self.operation_end(operation))
+            .map(|(operation, _)| operation.operation_id)
+    }
+
+    fn operation_end(&self, operation: &evertrace_domain::evidence::Operation) -> u64 {
+        operation
+            .result_source_observation_refs
+            .iter()
+            .filter_map(|id| self.observation_seqs.get(id).map(|(seq, _)| *seq))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn result_operation(
+        &self,
+        operation_id: &evertrace_domain::ids::OperationId,
+        result: &evertrace_domain::semantic::ResultEvidence,
+    ) -> Option<evertrace_domain::ids::SourceObservationId> {
+        let binding = self
+            .bindings
+            .get(self.current_bindings_by_operation.get(operation_id)?)?;
+        if binding.primary_binding.experiment_run_id != Some(result.experiment_run_id) {
+            return None;
+        }
+        self.operations
+            .get(operation_id)?
+            .0
+            .result_source_observation_refs
+            .iter()
+            .copied()
+            .find(|id| {
+                self.observations
+                    .get(id)
+                    .and_then(|observation| self.receipts.get(&observation.source_receipt_ref))
+                    .is_some_and(|receipt| {
+                        result
+                            .raw_cas_refs
+                            .iter()
+                            .any(|cas| cas.to_string() == format!("cas:{}", receipt.cas_ref))
+                    })
+            })
+    }
+
+    pub(crate) fn compile_usage_command(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        cas: &evertrace_capture::CasStore,
+        context: ProposalCommandContext,
+        usage_id: evertrace_domain::ids::ProcedureUsageId,
+        threshold: u32,
+        deadline: std::time::Instant,
+    ) -> Result<Option<JournalCommand>, SemanticServiceError> {
+        use evertrace_domain::procedure::{ProcedureTruth, ProcedureUsageStage};
+        let Some(usage) = self
+            .usages
+            .get(&usage_id)
+            .filter(|usage| self.usage_publication_current(usage))
+        else {
+            return Ok(None);
+        };
+        if usage.stage < ProcedureUsageStage::Returned
+            || usage.outcome_supported == ProcedureTruth::True
+        {
+            return Ok(None);
+        }
+        // Persisted ownership references are append-only. Once a usage names
+        // an Attempt, stronger evidence from a sibling cannot replace it or
+        // be merged into it. This only narrows selection: the same current
+        // physical and semantic gates still validate all retained evidence.
+        let pinned_attempt = match usage.attempt_ids.as_slice() {
+            [id] => Some(*id),
+            [] if usage.stage < ProcedureUsageStage::Adopted
+                && usage.action_operation_refs.is_empty()
+                && usage.verification_operation_refs.is_empty() =>
+            {
+                None
+            }
+            _ => return Ok(None),
+        };
+        let mut selected = None;
+        let mut ambiguous = false;
+        for attempt in self.attempts.values().filter(|attempt| {
+            pinned_attempt.is_none_or(|id| id == attempt.attempt_id)
+                && usage.accepts_adopted_attempt(attempt)
+        }) {
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let Some((request, trace)) =
+                self.compile_attempt_usage(snapshot, cas, usage, attempt, deadline)?
+            else {
+                continue;
+            };
+            match selected.as_ref().map(
+                |(prior, _): &(ProcedureUsageAdvance, super::alignment::StageTrace)| {
+                    prior.stage.cmp(&request.stage)
+                },
+            ) {
+                None | Some(std::cmp::Ordering::Less) => {
+                    selected = Some((request, trace));
+                    ambiguous = false;
+                }
+                Some(std::cmp::Ordering::Equal) => ambiguous = true,
+                Some(std::cmp::Ordering::Greater) => {}
+            }
+        }
+        if ambiguous || std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let Some((request, trace)) = selected else {
+            return Ok(None);
+        };
+        if request.stage <= usage.stage
+            && request
+                .action_operation_refs
+                .iter()
+                .all(|id| usage.action_operation_refs.contains(id))
+            && request
+                .verification_operation_refs
+                .iter()
+                .all(|id| usage.verification_operation_refs.contains(id))
+            && request
+                .work_binding_revision_refs
+                .iter()
+                .all(|id| usage.work_binding_revision_refs.contains(id))
+            && request
+                .scope_effect_refs
+                .iter()
+                .all(|id| usage.scope_effect_refs.contains(id))
+            && request
+                .evidence_refs
+                .iter()
+                .all(|id| usage.evidence_refs.contains(id))
+        {
+            return Ok(None);
+        }
+        let empty = ConstraintState::default();
+        match advance_procedure_usage_inner(
+            self,
+            context,
+            threshold,
+            request,
+            trace.current().unwrap_or(&empty),
+            trace.previous(),
+            false,
+        ) {
+            Ok((_, command)) => Ok(Some(command)),
+            Err(SemanticServiceError::InvalidInput) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn compile_attempt_usage(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        cas: &evertrace_capture::CasStore,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+        attempt: &evertrace_domain::work::Attempt,
+        deadline: std::time::Instant,
+    ) -> Result<Option<(ProcedureUsageAdvance, super::alignment::StageTrace)>, SemanticServiceError>
+    {
+        use evertrace_domain::procedure::ProcedureUsageStage;
+        let usage_id = usage.procedure_usage_id;
+        let draft = &self.procedures[&usage.procedure_revision_id].draft;
+        let Some(episode) = attempt
+            .episode_id
+            .and_then(|id| self.current_episode_revisions.get(&id))
+            .and_then(|id| self.episodes.get(id))
+        else {
+            return Ok(None);
+        };
+        let trace = super::alignment::StageTrace::compile_for_attempt(
+            snapshot,
+            episode,
+            attempt.attempt_id,
+        )?;
+        let (action, path_completed) = if draft.stage_alignment.is_some() {
+            let Some((phase, windows)) = trace.action_windows(draft) else {
+                return Ok(None);
+            };
+            let Some(action) = self.matching_windows(attempt, &windows, cas, usage_id, deadline)
+            else {
+                return Ok(None);
+            };
+            (action, phase == ProcedurePhase::AlreadyCompleted)
+        } else {
+            // Without a source-bound branch mapping there is no unique path.
+            if !draft.actions.branches.is_empty() {
+                return Ok(None);
+            }
+            let Some(action) = self.matching_operations(
+                attempt,
+                &draft.actions.stages,
+                cas,
+                usage_id,
+                0,
+                deadline,
+            ) else {
+                return Ok(None);
+            };
+            (action, true)
+        };
+        let after = action
+            .iter()
+            .map(|id| self.operation_end(&self.operations[id].0))
+            .max()
+            .unwrap_or(0);
+        let verification = self
+            .matching_operations(attempt, &draft.done.verify, cas, usage_id, after, deadline)
+            .unwrap_or_default();
+        let mut request = ProcedureUsageAdvance {
+            usage_id,
+            stage: ProcedureUsageStage::Action,
+            attempt_ids: vec![attempt.attempt_id],
+            action_episode_revision_ids: vec![episode.revision_id],
+            verification_episode_revision_ids: Vec::new(),
+            action_operation_refs: action,
+            verification_operation_refs: Vec::new(),
+            work_binding_revision_refs: Vec::new(),
+            scope_effect_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+        };
+        // Reparse Passed alone is only metric integrity. The current Work
+        // verifier and its pinned completion expression must independently
+        // establish this exact acceptance boundary.
+        let complete = path_completed
+            && attempt.verification == evertrace_domain::work::AttemptVerification::Passed
+            && trace.current().is_some_and(|state| {
+                draft.completion_expr.evaluate(state, trace.previous()) == ConstraintTruth::True
+            });
+        if complete && !verification.is_empty() {
+            for reference in &attempt.outcome_refs {
+                if let Ok(id) = reference.parse::<RevisionId>()
+                    && let Some(result) = self.results.get(&id)
+                    && !self.results.values().any(|other| {
+                        other.result_evidence_id == result.result_evidence_id
+                            && self.result_seqs.get(&other.revision_id) > self.result_seqs.get(&id)
+                    })
+                    && result.completeness
+                        == evertrace_domain::semantic::EvidenceCompleteness::Complete
+                    && result.verifier_receipt.as_ref().is_some_and(|receipt| {
+                        receipt.status == evertrace_domain::semantic::VerifierStatus::Passed
+                    })
+                    && self
+                        .runs
+                        .get(&result.experiment_run_id)
+                        .is_some_and(|(run, _)| {
+                            run.revision_id == result.experiment_run_revision_id
+                                && run.attempt_id == Some(attempt.attempt_id)
+                                && run.observability
+                                    == evertrace_domain::work::RunObservability::Full
+                                && run.execution_status
+                                    == evertrace_domain::work::RunExecutionStatus::Completed
+                                && run.contract_validity
+                                    == evertrace_domain::work::RunContractValidity::Valid
+                        })
+                    && verification
+                        .iter()
+                        .any(|operation_id| self.result_operation(operation_id, result).is_some())
+                {
+                    request.evidence_refs.push(reference.clone());
+                }
+            }
+            if !request.evidence_refs.is_empty() {
+                request.stage = ProcedureUsageStage::Outcome;
+                request.verification_operation_refs = verification;
+                request
+                    .verification_episode_revision_ids
+                    .push(episode.revision_id);
+            }
+        }
+        for id in request
+            .action_operation_refs
+            .iter()
+            .chain(&request.verification_operation_refs)
+        {
+            let binding = &self.bindings[&self.current_bindings_by_operation[id]];
+            request
+                .work_binding_revision_refs
+                .push(binding.work_binding_revision_id);
+            request
+                .scope_effect_refs
+                .extend(binding.scope_effect_refs.iter().copied());
+        }
+        request.work_binding_revision_refs.sort();
+        request.work_binding_revision_refs.dedup();
+        request.scope_effect_refs.sort();
+        request.scope_effect_refs.dedup();
+        Ok(Some((request, trace)))
+    }
+}
 
 pub(crate) struct ProcedurePromotionCohort {
     pub(crate) procedure_revision_id: RevisionId,
@@ -2883,6 +3749,227 @@ mod negative_review_selection_tests {
             VariableDeclaration,
         },
     };
+
+    #[test]
+    fn execution_packet_counts_control_history_and_ignores_unrelated_input() {
+        let (view, _) = review_view(ResultKind::Passed);
+        let usage = view.usages.values().next().unwrap();
+        let make_row =
+            |id: String, kind: &str, payload: JournalPayload, seq| evertrace_store::ObjectRow {
+                row_id: format!("usage-input:{seq}"),
+                row_kind: evertrace_store::ObjectRowKind::Data,
+                object_id: Some(id),
+                object_kind: Some(kind.into()),
+                payload_json: Some(serde_json::to_string(&payload).unwrap()),
+                source_event_seq: seq,
+                ..evertrace_store::ObjectRow::checkpoint(seq, 1)
+            };
+        let first = make_row(
+            usage.procedure_usage_id.to_string(),
+            "procedure_usage_revision",
+            JournalPayload::ProcedureUsageRecorded(Box::new(usage.clone())),
+            1,
+        );
+        let mut next = usage.clone();
+        next.usage_revision_id = RevisionId::new_v7();
+        next.predecessor_revision_id = Some(usage.usage_revision_id);
+        next.revision_generation += 1;
+        let second = make_row(
+            usage.procedure_usage_id.to_string(),
+            "procedure_usage_revision",
+            JournalPayload::ProcedureUsageRecorded(Box::new(next)),
+            2,
+        );
+        let bytes = first.payload_json.as_ref().unwrap().len()
+            + second.payload_json.as_ref().unwrap().len();
+        let mut snapshot = ProjectionSnapshot {
+            frontier: 99,
+            rows: vec![first, second],
+        };
+        // These controls are intentionally undecodable: no unrelated body is
+        // copied or consumed while collecting this target's historical closure.
+        for kind in [
+            "task",
+            "procedure_revision",
+            "procedure_usage_revision",
+            "procedure_negative_evidence",
+        ] {
+            snapshot.rows.push(evertrace_store::ObjectRow {
+                row_id: format!("unrelated:{kind}"),
+                object_id: Some(RevisionId::new_v7().to_string()),
+                object_kind: Some(kind.into()),
+                row_kind: evertrace_store::ObjectRowKind::Data,
+                payload_json: Some("invalid unrelated control".into()),
+                source_event_seq: 99,
+                ..evertrace_store::ObjectRow::checkpoint(99, 1)
+            });
+        }
+        let mut budget = evertrace_store::JobBudget {
+            max_items: 1,
+            max_bytes: Some(bytes as u64),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            max_calls: None,
+            max_wall_time_ms: 5000,
+        };
+        let select = |budget: &evertrace_store::JobBudget| {
+            ProcedureUsageCurrentView::execution_snapshot(
+                &snapshot,
+                usage.procedure_usage_id,
+                budget,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap()
+        };
+        assert!(select(&budget).is_none());
+        budget.max_items = 2;
+        assert_eq!(select(&budget).unwrap().rows.len(), 2);
+        budget.max_bytes = Some(bytes as u64 - 1);
+        assert!(select(&budget).is_none());
+        assert!(
+            ProcedureUsageCurrentView::execution_snapshot(
+                &snapshot,
+                usage.procedure_usage_id,
+                &budget,
+                std::time::Instant::now()
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let binding = evertrace_domain::work::WorkBindingRevision {
+            work_binding_revision_id: evertrace_domain::ids::WorkBindingRevisionId::new_v7(),
+            operation_id: evertrace_domain::ids::OperationId::new_v7(),
+            revision_generation: 1,
+            predecessor_revision_id: None,
+            primary_binding: evertrace_domain::work::PrimaryWorkBinding {
+                task_id: Some(usage.task_id),
+                workstream_id: Some(usage.workstream_id),
+                ..Default::default()
+            },
+            secondary_bindings: vec![],
+            scope_effect_refs: vec![],
+            assignment_status: evertrace_domain::work::AssignmentStatus::Resolved,
+            evidence_refs: vec!["source:binding".into()],
+            resolver_version: 1,
+        };
+        snapshot.rows.push(make_row(
+            binding.work_binding_revision_id.to_string(),
+            "work_binding",
+            JournalPayload::WorkBindingRecorded(Box::new(binding.clone())),
+            3,
+        ));
+        budget.max_items = 4;
+        budget.max_bytes = Some(1_000_000);
+        let packet = ProcedureUsageCurrentView::execution_snapshot(
+            &snapshot,
+            usage.procedure_usage_id,
+            &budget,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(procedure_input_watermark(&packet), 3);
+        let mut corrected = binding;
+        corrected.predecessor_revision_id = Some(corrected.work_binding_revision_id);
+        corrected.work_binding_revision_id = evertrace_domain::ids::WorkBindingRevisionId::new_v7();
+        corrected.revision_generation += 1;
+        corrected.primary_binding.task_id = Some(TaskId::new_v7());
+        snapshot.rows.push(make_row(
+            corrected.work_binding_revision_id.to_string(),
+            "work_binding",
+            JournalPayload::WorkBindingRecorded(Box::new(corrected)),
+            4,
+        ));
+        let packet = ProcedureUsageCurrentView::execution_snapshot(
+            &snapshot,
+            usage.procedure_usage_id,
+            &budget,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            procedure_input_watermark(&packet),
+            4,
+            "a reassigned binding must wake and invalidate its old target"
+        );
+    }
+
+    #[test]
+    fn retained_binding_history_requires_current_compatible_lineage() {
+        use evertrace_domain::{
+            ids::{OperationId, WorkBindingRevisionId, WorkEpisodeId},
+            work::{AssignmentStatus, PrimaryWorkBinding, WorkBindingRevision},
+        };
+        let (mut view, _) = review_view(ResultKind::Passed);
+        let mut usage = view.usages.values().next().unwrap().clone();
+        let first = WorkBindingRevision {
+            work_binding_revision_id: WorkBindingRevisionId::new_v7(),
+            operation_id: OperationId::new_v7(),
+            revision_generation: 1,
+            predecessor_revision_id: None,
+            primary_binding: PrimaryWorkBinding {
+                task_id: Some(usage.task_id),
+                workstream_id: Some(usage.workstream_id),
+                attempt_id: Some(usage.attempt_ids[0]),
+                episode_id: Some(WorkEpisodeId::new_v7()),
+                ..Default::default()
+            },
+            secondary_bindings: vec![],
+            scope_effect_refs: vec![],
+            assignment_status: AssignmentStatus::Resolved,
+            evidence_refs: vec!["source:binding".into()],
+            resolver_version: 1,
+        };
+        let mut current = first.clone();
+        current.work_binding_revision_id = WorkBindingRevisionId::new_v7();
+        current.revision_generation = 2;
+        current.predecessor_revision_id = Some(first.work_binding_revision_id);
+        current.primary_binding.experiment_run_id = Some(ExperimentRunId::new_v7());
+        first.validate_successor(&current).unwrap();
+        usage.action_operation_refs = vec![first.operation_id];
+        usage.work_binding_revision_refs = vec![first.work_binding_revision_id];
+        view.bindings
+            .insert(first.work_binding_revision_id, first.clone());
+        view.bindings
+            .insert(current.work_binding_revision_id, current.clone());
+        view.current_bindings_by_operation
+            .insert(first.operation_id, current.work_binding_revision_id);
+        assert!(view.usage_binding(&usage, first.operation_id).is_none());
+        usage
+            .work_binding_revision_refs
+            .push(current.work_binding_revision_id);
+        assert_eq!(
+            view.usage_binding(&usage, first.operation_id),
+            Some(&current)
+        );
+        // Additional audit-only references in older ledgers cannot replace
+        // the actual Operation's required current binding or its lineage.
+        let mut audit = first.clone();
+        audit.work_binding_revision_id = WorkBindingRevisionId::new_v7();
+        audit.operation_id = OperationId::new_v7();
+        usage
+            .work_binding_revision_refs
+            .push(audit.work_binding_revision_id);
+        view.bindings.insert(audit.work_binding_revision_id, audit);
+        assert_eq!(
+            view.usage_binding(&usage, first.operation_id),
+            Some(&current)
+        );
+        for mutate in [0, 1, 2, 3] {
+            let mut invalid = first.clone();
+            match mutate {
+                0 => invalid.primary_binding.task_id = Some(TaskId::new_v7()),
+                1 => invalid.primary_binding.attempt_id = Some(AttemptId::new_v7()),
+                2 => invalid.operation_id = OperationId::new_v7(),
+                _ => invalid.assignment_status = AssignmentStatus::Conflicted,
+            }
+            view.bindings
+                .insert(first.work_binding_revision_id, invalid);
+            assert!(view.usage_binding(&usage, first.operation_id).is_none());
+        }
+    }
 
     #[test]
     fn promotion_selection_does_not_spend_candidate_budget_on_unrelated_history() {

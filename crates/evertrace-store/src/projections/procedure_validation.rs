@@ -450,20 +450,52 @@ impl JournalAdmissionState {
             let (current_binding, _) = history
                 .binding_before(*operation_id, as_of_seq)
                 .ok_or(StoreError::StoreCorrupt)?;
-            let referenced = usage
+            if !usage
                 .work_binding_revision_refs
-                .iter()
-                .filter_map(|id| {
-                    self.work_bindings
-                        .get(id)
-                        .filter(|(_, seq)| *seq < as_of_seq)
-                        .map(|(value, _)| value)
-                })
-                .filter(|value| value.operation_id == *operation_id)
-                .collect::<Vec<_>>();
-            let [binding] = referenced.as_slice() else {
+                .contains(&current_binding.work_binding_revision_id)
+            {
                 return Err(StoreError::StoreCorrupt);
-            };
+            }
+            let mut referenced = BTreeSet::new();
+            for id in &usage.work_binding_revision_refs {
+                if self.work_bindings.get(id).is_some_and(|(value, seq)| {
+                    *seq < as_of_seq && value.operation_id == *operation_id
+                }) {
+                    referenced.insert(*id);
+                }
+            }
+            let mut link = current_binding;
+            loop {
+                if link.assignment_status != AssignmentStatus::Resolved
+                    || link.primary_binding.task_id != current_binding.primary_binding.task_id
+                    || link.primary_binding.workstream_id
+                        != current_binding.primary_binding.workstream_id
+                    || link.primary_binding.attempt_id != current_binding.primary_binding.attempt_id
+                    || link.primary_binding.episode_id != current_binding.primary_binding.episode_id
+                    || link.primary_binding.experiment_run_id.is_some_and(|id| {
+                        Some(id) != current_binding.primary_binding.experiment_run_id
+                    })
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                referenced.remove(&link.work_binding_revision_id);
+                if referenced.is_empty() {
+                    break;
+                }
+                let (predecessor, seq) = self
+                    .work_bindings
+                    .get(
+                        &link
+                            .predecessor_revision_id
+                            .ok_or(StoreError::StoreCorrupt)?,
+                    )
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if *seq >= as_of_seq || predecessor.validate_successor(link).is_err() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                link = predecessor;
+            }
+            let binding = current_binding;
             let attempt_id = binding
                 .primary_binding
                 .attempt_id
@@ -549,15 +581,14 @@ impl JournalAdmissionState {
                             || !operation_ids.contains(&effect.operation_id)
                             || effect.repository_instance_id != usage.local_context.repository_id
                             || effect.worktree_instance_id != usage.local_context.worktree_id
-                            || !usage.work_binding_revision_refs.iter().any(|binding_id| {
-                                self.work_bindings.get(binding_id).is_some_and(
-                                    |(binding, binding_seq)| {
-                                        *binding_seq < as_of_seq
-                                            && binding.operation_id == effect.operation_id
-                                            && binding.scope_effect_refs.contains(scope_id)
-                                    },
-                                )
-                            })
+                            || history
+                                .binding_before(effect.operation_id, as_of_seq)
+                                .is_none_or(|(binding, _)| {
+                                    !usage
+                                        .work_binding_revision_refs
+                                        .contains(&binding.work_binding_revision_id)
+                                        || !binding.scope_effect_refs.contains(scope_id)
+                                })
                     })
             })
         {

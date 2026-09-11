@@ -607,7 +607,28 @@ impl ControlledFacts {
         let mut workstream_seq = std::collections::BTreeMap::new();
         let mut worktree_seq = std::collections::BTreeMap::new();
         let mut usage_seq = std::collections::BTreeMap::new();
-        for row in snapshot.data_rows() {
+        // Background projections also carry derived summaries, which are not
+        // JournalPayload envelopes. Read only this resolver's concrete inputs.
+        for row in snapshot.data_rows().filter(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some(
+                    "attempt"
+                        | "procedure_revision"
+                        | "procedure_usage_revision"
+                        | "task"
+                        | "workstream"
+                        | "work_episode"
+                        | "worktree"
+                        | "worktree_snapshot"
+                        | "source_receipt"
+                        | "source_observation"
+                        | "evidence_surface"
+                        | "operation"
+                        | "work_binding"
+                )
+            )
+        }) {
             let Some(payload) = row.payload_json.as_deref() else {
                 continue;
             };

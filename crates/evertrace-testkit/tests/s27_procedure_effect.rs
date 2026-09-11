@@ -727,26 +727,52 @@ mod controlled_projection_proof {
         run_id: Option<evertrace_domain::ids::ExperimentRunId>,
         at: i64,
     ) {
-        let current = latest_attempt(&writer.project().await.unwrap(), attempt_id);
+        let snapshot = writer.project().await.unwrap();
+        let current = latest_attempt(&snapshot, attempt_id);
+        let prior_binding = snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("work_binding"))
+            .filter_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::WorkBindingRecorded(value)
+                        if value.operation_id == operation_id =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                }
+            })
+            .max_by_key(|binding| binding.revision_generation);
         let binding_id = WorkBindingRevisionId::new_v7();
         let binding = WorkBindingRevision {
             work_binding_revision_id: binding_id,
             operation_id,
-            revision_generation: 1,
-            predecessor_revision_id: None,
+            revision_generation: prior_binding
+                .as_ref()
+                .map_or(1, |prior| prior.revision_generation + 1),
+            predecessor_revision_id: prior_binding
+                .as_ref()
+                .map(|prior| prior.work_binding_revision_id),
             primary_binding: PrimaryWorkBinding {
                 task_id: Some(current.task_id),
                 workstream_id: Some(current.workstream_id),
                 attempt_id: Some(attempt_id),
+                episode_id: current.episode_id,
                 experiment_run_id: run_id,
                 ..Default::default()
             },
             secondary_bindings: Vec::new(),
             scope_effect_refs: Vec::new(),
             assignment_status: AssignmentStatus::Resolved,
-            evidence_refs: vec![evidence_id.to_string()],
+            evidence_refs: prior_binding.as_ref().map_or_else(
+                || vec![evidence_id.to_string()],
+                |prior| prior.evidence_refs.clone(),
+            ),
             resolver_version: 1,
         };
+        if let Some(prior) = prior_binding {
+            prior.validate_successor(&binding).unwrap();
+        }
         let mut next = current.clone();
         next.revision_id = RevisionId::new_v7();
         next.predecessor_revision_id = Some(current.revision_id);
@@ -1767,8 +1793,23 @@ mod controlled_projection_proof {
         );
     }
 
-    #[tokio::test]
-    async fn controlled_writer_authority_uses_ingested_exact_surfaces_and_atomic_terminal() {
+    struct ControlledSetup {
+        temp: tempfile::TempDir,
+        runtime: RuntimeSnapshot,
+        store_root: std::path::PathBuf,
+        repository_id: RepositoryId,
+        worktree_id: WorktreeId,
+        snapshot_id: WorktreeSnapshotId,
+        procedure: Box<evertrace_domain::procedure::ProcedureRevision>,
+        task: Task,
+        stream: Workstream,
+        attempts: Vec<evertrace_domain::work::Attempt>,
+        episode: evertrace_domain::work::WorkEpisode,
+        initial_usage: ProcedureUsageRevision,
+        config: GlobalPromotionConfig,
+    }
+
+    async fn controlled_setup(consumer: bool) -> ControlledSetup {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(
             temp.path(),
@@ -1794,7 +1835,7 @@ mod controlled_projection_proof {
         let repository_id = RepositoryId::new_v7();
         let worktree_id = WorktreeId::new_v7();
         let snapshot_id = WorktreeSnapshotId::new_v7();
-        let repository = RepositoryInstance {
+        let mut repository = RepositoryInstance {
             user_disabled: false,
             capability_state: None,
             repository_id,
@@ -1818,7 +1859,7 @@ mod controlled_projection_proof {
             identity_evidence_refs: vec![evidence_receipt_id.to_string()],
             recorded_at_us: 2,
         };
-        let worktree = WorktreeInstance {
+        let mut worktree = WorktreeInstance {
             worktree_instance_id: worktree_id,
             worktree_revision: 1,
             predecessor_revision: None,
@@ -1845,6 +1886,14 @@ mod controlled_projection_proof {
             recreated_from_worktree_instance_id: None,
             recorded_at_us: 2,
         };
+        if consumer {
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            repository.current_path = workspace.to_str().unwrap().into();
+            repository.path_history[0].path = repository.current_path.clone();
+            worktree.current_path = Some(repository.current_path.clone());
+            worktree.path_history[0].path = repository.current_path.clone();
+        }
         let snapshot = WorktreeSnapshot {
             worktree_snapshot_id: snapshot_id,
             worktree_instance_id: worktree_id,
@@ -1890,6 +1939,53 @@ mod controlled_projection_proof {
         .revision
         .draft;
         draft.evidence_refs = vec![evidence_receipt_id.to_string()];
+        if consumer {
+            use evertrace_domain::procedure::{
+                ProcedureBranch, ProcedureBranchAlignment, ProcedureStageAlignment,
+                ProcedureStepAlignment,
+            };
+            use evertrace_domain::semantic::{ConstraintExpr, ConstraintField, ConstraintValue};
+            draft.actions.stages = vec!["inspect terminal measurement in isolated worktree".into()];
+            let pending = ConstraintExpr::Eq {
+                field: ConstraintField::VerifierState,
+                value: ConstraintValue::Text("unverified".into()),
+            };
+            let phase = ConstraintExpr::Eq {
+                field: ConstraintField::Phase,
+                value: ConstraintValue::Text("verify".into()),
+            };
+            let passed = ConstraintExpr::Eq {
+                field: ConstraintField::VerifierState,
+                value: ConstraintValue::Text("passed".into()),
+            };
+            draft.actions.branches = vec![ProcedureBranch {
+                label: "normalize pending measurement".into(),
+                condition: pending.clone(),
+                stages: vec!["normalize terminal measurement in isolated worktree".into()],
+            }];
+            draft.stage_alignment = Some(ProcedureStageAlignment {
+                main: vec![ProcedureStepAlignment {
+                    entry: phase.clone(),
+                    progress: phase,
+                    completed: passed.clone(),
+                }],
+                branches: vec![ProcedureBranchAlignment {
+                    at_main_step: 0,
+                    steps: vec![ProcedureStepAlignment {
+                        entry: pending.clone(),
+                        progress: pending,
+                        completed: passed.clone(),
+                    }],
+                }],
+            });
+            draft.done.verify = vec!["collect terminal result".into()];
+            draft.done.success = vec!["The current acceptance verifier has passed".into()];
+            draft.completion_expr = passed;
+            draft.avoid_expr = evertrace_domain::semantic::ConstraintExpr::Eq {
+                field: evertrace_domain::semantic::ConstraintField::Phase,
+                value: evertrace_domain::semantic::ConstraintValue::Text("abort".into()),
+            };
+        }
         let ProposalResolution::Revision {
             value: proposal,
             command: submit,
@@ -2026,7 +2122,7 @@ mod controlled_projection_proof {
             target_refs: vec!["target:fixture".into()],
             acceptance_boundary_ref: "acceptance:s27".into(),
         };
-        let mut attempts = (0..4)
+        let mut attempts = (0..if consumer { 2 } else { 4 })
             .map(|_| {
                 new_attempt(
                     task.task_id,
@@ -2085,6 +2181,16 @@ mod controlled_projection_proof {
         )
         .unwrap();
         writer.commit(&activation, 6).await.unwrap();
+        if consumer {
+            episode = Box::pin(consumer_checkpoint(
+                &mut writer,
+                attempts[0].attempt_id,
+                episode.episode_id,
+                evertrace_domain::work::CheckpointReason::PhaseCandidate,
+                6,
+            ))
+            .await;
+        }
         let initial_usage = ProcedureUsageRevision {
             procedure_usage_id: ProcedureUsageId::new_v7(),
             usage_revision_id: RevisionId::new_v7(),
@@ -2112,7 +2218,11 @@ mod controlled_projection_proof {
             local_context: ProcedureLocalContext {
                 repository_id: Some(repository_id),
                 worktree_id: Some(worktree_id),
-                phase: ProcedureUsagePhase::InProgress,
+                phase: if consumer {
+                    ProcedureUsagePhase::RecoverableDeviation
+                } else {
+                    ProcedureUsagePhase::InProgress
+                },
                 failure_signature: None,
             },
             source_watermark: writer.frontier(),
@@ -2131,33 +2241,70 @@ mod controlled_projection_proof {
             )
             .await
             .unwrap();
-        let mut claimed_usage = initial_usage.clone();
-        claimed_usage.usage_revision_id = RevisionId::new_v7();
-        claimed_usage.predecessor_revision_id = Some(initial_usage.usage_revision_id);
-        claimed_usage.revision_generation += 1;
-        claimed_usage.stage = ProcedureUsageStage::Claimed;
-        claimed_usage.attempt_ids = attempts.iter().map(|value| value.attempt_id).collect();
-        claimed_usage.attempt_ids.sort();
-        claimed_usage.source_watermark = writer.frontier();
-        claimed_usage.created_at_us = 8;
-        initial_usage
-            .validate_successor(&claimed_usage)
-            .then_some(())
-            .unwrap();
-        writer
-            .commit(
-                &journal_command(
+        if !consumer {
+            let mut claimed_usage = initial_usage.clone();
+            claimed_usage.usage_revision_id = RevisionId::new_v7();
+            claimed_usage.predecessor_revision_id = Some(initial_usage.usage_revision_id);
+            claimed_usage.revision_generation += 1;
+            claimed_usage.stage = ProcedureUsageStage::Claimed;
+            claimed_usage.attempt_ids = attempts.iter().map(|value| value.attempt_id).collect();
+            claimed_usage.attempt_ids.sort();
+            claimed_usage.source_watermark = writer.frontier();
+            claimed_usage.created_at_us = 8;
+            initial_usage
+                .validate_successor(&claimed_usage)
+                .then_some(())
+                .unwrap();
+            writer
+                .commit(
+                    &journal_command(
+                        8,
+                        vec![JournalPayload::ProcedureUsageRecorded(Box::new(
+                            claimed_usage,
+                        ))],
+                    ),
                     8,
-                    vec![JournalPayload::ProcedureUsageRecorded(Box::new(
-                        claimed_usage,
-                    ))],
-                ),
-                8,
-            )
-            .await
-            .unwrap();
-        let resolver = ControlledRunResolver::new(CasStore::open(runtime.cas_dir.clone()).unwrap());
+                )
+                .await
+                .unwrap();
+        }
         drop(writer);
+        ControlledSetup {
+            temp,
+            runtime,
+            store_root,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            procedure,
+            task,
+            stream,
+            attempts,
+            episode,
+            initial_usage,
+            config,
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_writer_authority_uses_ingested_exact_surfaces_and_atomic_terminal() {
+        let ControlledSetup {
+            temp: _temp,
+            runtime,
+            store_root,
+            repository_id,
+            worktree_id,
+            snapshot_id,
+            procedure,
+            task,
+            stream,
+            attempts,
+            config,
+            ..
+        } = Box::pin(controlled_setup(false)).await;
+        let service = RevisionProposalService;
+        let (_, evidence_receipt_id) = captured_ids("procedure-evidence");
+        let resolver = ControlledRunResolver::new(CasStore::open(runtime.cas_dir.clone()).unwrap());
         let exposures = [
             Some(procedure.revision_id),
             Some(procedure.revision_id),
@@ -2745,6 +2892,940 @@ mod controlled_projection_proof {
             final_writer.project().await.unwrap(),
             final_writer.full_projection().await.unwrap()
         );
+    }
+
+    fn consumer_report(root: &Path) -> evertrace_codex::HostProbeReport {
+        let dated = root.join("adapter/sessions/2026/09/11");
+        std::fs::create_dir_all(&dated).unwrap();
+        std::fs::set_permissions(
+            root.join("adapter"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("adapter/config.toml"),
+            format!(
+                "[projects.{}]\ntrust_level = 'trusted'\n",
+                serde_json::to_string(root.join("workspace").to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        let path =
+            dated.join("rollout-2026-09-11T00-00-00-019d0000-0000-7000-8000-000000000072.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-09-11T00:00:00Z", "type": "session_meta", "payload": {
+                        "id": "019d0000-0000-7000-8000-000000000072",
+                        "session_id": "019d0000-0000-7000-8000-000000000072",
+                        "cwd": root.join("workspace")
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        // Synthetic source/Work declarations. Capture, CAS, normalization,
+        // controlled terminal resolution and the scheduler are real producers.
+        evertrace_engine::repository::observe_session_catalog_report(
+            path.to_str(),
+            "019d0000-0000-7000-8000-000000000072",
+            "consumer-proof",
+            None,
+        )
+        .unwrap()
+    }
+
+    async fn consumer_round(
+        runtime: &RuntimeSnapshot,
+        path: &Path,
+        report: &evertrace_codex::HostProbeReport,
+    ) -> ProjectionSnapshot {
+        Box::pin(consumer_round_with_report(
+            runtime,
+            path,
+            Some(report.clone()),
+        ))
+        .await
+    }
+
+    async fn consumer_round_with_report(
+        runtime: &RuntimeSnapshot,
+        path: &Path,
+        report: Option<evertrace_codex::HostProbeReport>,
+    ) -> ProjectionSnapshot {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        let writer = JournalWriter::open(path).await.unwrap();
+        let (handle, actor) = spawn_writer(writer, 8).unwrap();
+        let report = Arc::new(RwLock::new(report));
+        let scheduler = evertrace_engine::BackgroundScheduler::new(
+            handle.clone(),
+            evertrace_engine::session_import::SessionCatalogService::new(
+                handle.clone(),
+                runtime.effective_config_hash,
+            ),
+            evertrace_engine::SessionImportWorker::new(
+                handle.clone(),
+                runtime.clone(),
+                Arc::clone(&report),
+            )
+            .unwrap(),
+            report,
+            runtime.clone(),
+            evertrace_engine::SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+            evertrace_domain::config::DreamingConfig::default(),
+        );
+        Box::pin(scheduler.run_once()).await.unwrap();
+        let snapshot = handle.project().await.unwrap();
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+        snapshot
+    }
+
+    fn current_usage(
+        snapshot: &ProjectionSnapshot,
+        id: ProcedureUsageId,
+    ) -> ProcedureUsageRevision {
+        snapshot
+            .data_rows()
+            .filter(|row| row.object_kind.as_deref() == Some("procedure_usage_revision"))
+            .filter_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::ProcedureUsageRecorded(value)
+                        if value.procedure_usage_id == id =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                }
+            })
+            .max_by_key(|usage| usage.revision_generation)
+            .unwrap()
+    }
+
+    async fn consumer_action(
+        runtime: &RuntimeSnapshot,
+        path: &Path,
+        attempt_id: evertrace_domain::ids::AttemptId,
+        action: &str,
+        capture: CaptureSpec<'_>,
+    ) {
+        let intent_record = format!("{}-intent", capture.name);
+        let result_record = format!("{}-result", capture.name);
+        let mut intent = capture_input(
+            &intent_record,
+            capture.source_sequence,
+            ObservationRole::Intent,
+            action.as_bytes().to_vec(),
+        );
+        let mut result = capture_input(
+            &result_record,
+            capture.source_sequence + 1,
+            ObservationRole::Result,
+            b"action completed".to_vec(),
+        );
+        for input in [&mut intent, &mut result] {
+            input.correlation.native_request_id = Some(capture.name.into());
+            input.correlation.physical_execution_ordinal = Some(capture.physical_ordinal);
+        }
+        let (intent_id, _) = captured_ids(&intent_record);
+        let (result_id, _) = captured_ids(&result_record);
+        let operation = capture_operation(
+            runtime,
+            path,
+            vec![intent, result],
+            &[intent_id, result_id],
+            capture.at,
+        )
+        .await;
+        let mut writer = JournalWriter::open(path).await.unwrap();
+        bind_operation(
+            &mut writer,
+            attempt_id,
+            operation.operation_id,
+            result_id,
+            None,
+            capture.at + 1,
+        )
+        .await;
+    }
+
+    async fn consumer_verification(
+        path: &Path,
+        attempt_id: evertrace_domain::ids::AttemptId,
+        result: &evertrace_domain::semantic::ResultEvidence,
+        at: i64,
+    ) {
+        use evertrace_domain::work::AttemptVerification;
+        use evertrace_engine::work::attempt::{
+            AttemptResolution, record_attempt_revision, revise_verification,
+        };
+        let mut writer = JournalWriter::open(path).await.unwrap();
+        let current = latest_attempt(&writer.project().await.unwrap(), attempt_id);
+        let AttemptResolution::Revision(mut verified) = revise_verification(
+            &current,
+            AttemptVerification::Passed,
+            vec![result.revision_id.to_string()],
+            writer.frontier() + 1,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        verified.outcome_refs = vec![result.revision_id.to_string()];
+        verified.outcome_state = evertrace_domain::work::AttemptOutcomeState::Known;
+        let context = |occurred_at_us| WorkCommandContext {
+            command_id: CommandId::new_v7(),
+            occurred_at_us,
+            effective_config_hash: [27; 32],
+            algorithm_revision: "consumer-synthetic-work",
+        };
+        let command = record_attempt_revision(context(at), &current, *verified).unwrap();
+        writer.commit(&command, at).await.unwrap();
+    }
+
+    async fn consumer_checkpoint(
+        writer: &mut JournalWriter,
+        attempt_id: evertrace_domain::ids::AttemptId,
+        episode_id: evertrace_domain::ids::WorkEpisodeId,
+        reason: evertrace_domain::work::CheckpointReason,
+        at: i64,
+    ) -> evertrace_domain::work::WorkEpisode {
+        use evertrace_domain::work::WorkCheckpoint;
+        let snapshot = writer.project().await.unwrap();
+        let mut episode = snapshot
+            .data_rows()
+            .filter_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::WorkEpisodeRecorded(value)
+                        if value.episode_id == episode_id =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                }
+            })
+            .max_by_key(|episode| episode.revision_generation)
+            .unwrap();
+        assert!(episode.attempt_ids.contains(&attempt_id));
+        // The synthetic Work producer acknowledges the newly persisted
+        // evidence before pinning it. Repeated Manual checkpoints at the old
+        // watermark would otherwise reuse the same durable checkpoint key.
+        if episode.source_watermark < writer.frontier() {
+            let prior = episode.clone();
+            episode.revision_id = RevisionId::new_v7();
+            episode.predecessor_revision_id = Some(prior.revision_id);
+            episode.revision_generation += 1;
+            episode.source_watermark = writer.frontier();
+            episode.pending_semantic_delta =
+                Some(evertrace_domain::work::PendingSemanticInterval {
+                    after_watermark: episode.semantic_watermark,
+                    through_watermark: episode.source_watermark,
+                });
+            prior.validate_successor(&episode).unwrap();
+            writer
+                .commit(
+                    &journal_command(
+                        at,
+                        vec![JournalPayload::WorkEpisodeRecorded(Box::new(
+                            episode.clone(),
+                        ))],
+                    ),
+                    at,
+                )
+                .await
+                .unwrap();
+        }
+        let attempts = episode
+            .attempt_ids
+            .iter()
+            .map(|id| latest_attempt(&snapshot, *id))
+            .collect::<Vec<_>>();
+        let checkpoint = WorkCheckpoint::derive(&episode, &attempts, None, reason).unwrap();
+        let command = evertrace_engine::work::save_checkpoint(
+            WorkCommandContext {
+                command_id: CommandId::new_v7(),
+                occurred_at_us: at,
+                effective_config_hash: [27; 32],
+                algorithm_revision: "consumer-synthetic-work",
+            },
+            &episode,
+            checkpoint,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let successor = command
+            .events()
+            .iter()
+            .find_map(|event| match &event.payload {
+                JournalPayload::WorkEpisodeRecorded(value) => Some(value.as_ref().clone()),
+                _ => None,
+            })
+            .unwrap();
+        writer.commit(&command, at).await.unwrap();
+        successor
+    }
+
+    #[tokio::test]
+    async fn scheduler_consumes_exact_actions_and_late_real_result_without_treating_reparse_as_success()
+     {
+        use evertrace_domain::work::AttemptAdoptionStatus;
+        use evertrace_engine::work::attempt::{AttemptResolution, revise_adoption};
+        let ControlledSetup {
+            temp,
+            runtime,
+            store_root,
+            procedure,
+            task: template_task,
+            stream: template_stream,
+            attempts,
+            episode,
+            snapshot_id,
+            initial_usage,
+            ..
+        } = Box::pin(controlled_setup(true)).await;
+        let report = consumer_report(temp.path());
+        let first = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(
+            current_usage(&first, initial_usage.procedure_usage_id),
+            initial_usage
+        );
+        let no_input = consumer_round(&runtime, &store_root, &report).await;
+        let jobs = |snapshot: &ProjectionSnapshot| {
+            evertrace_store::RuntimeSchedulerView::from_snapshot(snapshot)
+                .unwrap()
+                .jobs
+                .into_iter()
+                .filter(|job| job.kind == "procedure_usage_evaluation_v1")
+                .count()
+        };
+        assert_eq!(jobs(&first), jobs(&no_input));
+        {
+            let mut writer = JournalWriter::open(&store_root).await.unwrap();
+            let mut unrelated_task = template_task.clone();
+            unrelated_task.task_id = TaskId::new_v7();
+            unrelated_task.request_root_refs = vec!["request:consumer-unrelated".into()];
+            writer
+                .commit(
+                    &journal_command(
+                        9,
+                        vec![JournalPayload::TaskRecorded(Box::new(unrelated_task))],
+                    ),
+                    9,
+                )
+                .await
+                .unwrap();
+        }
+        let unrelated_task = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(jobs(&no_input), jobs(&unrelated_task));
+        let attempt_id = attempts[0].attempt_id;
+        let mut writer = JournalWriter::open(&store_root).await.unwrap();
+        let current = latest_attempt(&writer.project().await.unwrap(), attempt_id);
+        let AttemptResolution::Revision(selected) = revise_adoption(
+            &current,
+            AttemptAdoptionStatus::Selected,
+            vec![],
+            writer.frontier() + 1,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        writer
+            .commit(
+                &journal_command(10, vec![JournalPayload::AttemptRecorded(selected)]),
+                10,
+            )
+            .await
+            .unwrap();
+        // A retry with the same strategy is not ambiguous merely because an
+        // older selected Attempt remains present. Only this Attempt acquires
+        // the complete, physically resolved action sequence below.
+        let older = latest_attempt(&writer.project().await.unwrap(), attempts[1].attempt_id);
+        let AttemptResolution::Revision(selected) = revise_adoption(
+            &older,
+            AttemptAdoptionStatus::Selected,
+            vec![],
+            writer.frontier() + 1,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        writer
+            .commit(
+                &journal_command(11, vec![JournalPayload::AttemptRecorded(selected)]),
+                11,
+            )
+            .await
+            .unwrap();
+        drop(writer);
+        let resolver = ControlledRunResolver::new(CasStore::open(runtime.cas_dir.clone()).unwrap());
+        Box::pin(consumer_action(
+            &runtime,
+            &store_root,
+            attempt_id,
+            "unrelated action",
+            CaptureSpec {
+                name: "consumer-action",
+                source_sequence: 4,
+                physical_ordinal: 21,
+                at: 30,
+            },
+        ))
+        .await;
+        let unrelated = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(
+            current_usage(&unrelated, initial_usage.procedure_usage_id).stage,
+            ProcedureUsageStage::Returned
+        );
+        Box::pin(consumer_action(
+            &runtime,
+            &store_root,
+            attempt_id,
+            &procedure.draft.actions.stages[0],
+            CaptureSpec {
+                name: "consumer-aligned",
+                source_sequence: 6,
+                physical_ordinal: 22,
+                at: 40,
+            },
+        ))
+        .await;
+        let missing_branch_action = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(
+            current_usage(&missing_branch_action, initial_usage.procedure_usage_id).stage,
+            ProcedureUsageStage::Returned
+        );
+        Box::pin(consumer_action(
+            &runtime,
+            &store_root,
+            attempt_id,
+            &procedure.draft.actions.branches[0].stages[0],
+            CaptureSpec {
+                name: "consumer-branch",
+                source_sequence: 8,
+                physical_ordinal: 23,
+                at: 45,
+            },
+        ))
+        .await;
+        let unavailable = Box::pin(consumer_round_with_report(&runtime, &store_root, None)).await;
+        assert_eq!(
+            current_usage(&unavailable, initial_usage.procedure_usage_id).stage,
+            ProcedureUsageStage::Returned
+        );
+        assert_eq!(jobs(&unavailable), jobs(&missing_branch_action));
+        // The trusted report changes only in memory: no Work/journal update
+        // between the unavailable pass and admission of the existing action.
+        let aligned = consumer_round(&runtime, &store_root, &report).await;
+        assert!(
+            evertrace_store::RuntimeSchedulerView::from_snapshot(&aligned)
+                .unwrap()
+                .jobs
+                .iter()
+                .filter(|job| job.kind == "procedure_usage_evaluation_v1"
+                    && job.target_revision == initial_usage.procedure_usage_id.to_string())
+                .all(|job| job.target_watermark <= unavailable.frontier),
+            "report-only admission must consume already persisted input"
+        );
+        assert_eq!(
+            current_usage(&aligned, initial_usage.procedure_usage_id).stage,
+            ProcedureUsageStage::Action
+        );
+        let run = Box::pin(declare_controlled_run(
+            &runtime,
+            &store_root,
+            &resolver,
+            attempt_id,
+            procedure.revision_id,
+            snapshot_id,
+            Some(procedure.revision_id),
+            CaptureSpec {
+                name: "consumer-run",
+                source_sequence: 10,
+                physical_ordinal: 24,
+                at: 50,
+            },
+        ))
+        .await;
+        // As in controlled_setup's non-consumer fixture, a separate synthetic
+        // Returned/Claimed exposure anchors B's controlled producer. It claims
+        // no action or outcome truth; only the scheduler can establish those.
+        let competing_usage_id = ProcedureUsageId::new_v7();
+        {
+            let mut writer = JournalWriter::open(&store_root).await.unwrap();
+            let exposure = Box::pin(consumer_checkpoint(
+                &mut writer,
+                attempts[1].attempt_id,
+                episode.episode_id,
+                evertrace_domain::work::CheckpointReason::Manual,
+                55,
+            ))
+            .await;
+            let mut returned = initial_usage.clone();
+            returned.procedure_usage_id = competing_usage_id;
+            returned.usage_revision_id = RevisionId::new_v7();
+            returned.exposure_episode_revision_id = exposure.revision_id;
+            returned.source_watermark = writer.frontier();
+            returned.created_at_us = 56;
+            writer
+                .commit(
+                    &journal_command(
+                        56,
+                        vec![JournalPayload::ProcedureUsageRecorded(Box::new(
+                            returned.clone(),
+                        ))],
+                    ),
+                    56,
+                )
+                .await
+                .unwrap();
+            let mut claimed = returned.clone();
+            claimed.usage_revision_id = RevisionId::new_v7();
+            claimed.predecessor_revision_id = Some(returned.usage_revision_id);
+            claimed.revision_generation += 1;
+            claimed.stage = ProcedureUsageStage::Claimed;
+            claimed.attempt_ids = vec![attempts[1].attempt_id];
+            claimed.source_watermark = writer.frontier();
+            writer
+                .commit(
+                    &journal_command(
+                        56,
+                        vec![JournalPayload::ProcedureUsageRecorded(Box::new(claimed))],
+                    ),
+                    56,
+                )
+                .await
+                .unwrap();
+        }
+        for (index, text) in [
+            &procedure.draft.actions.stages[0],
+            &procedure.draft.actions.branches[0].stages[0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            Box::pin(consumer_action(
+                &runtime,
+                &store_root,
+                attempts[1].attempt_id,
+                text,
+                CaptureSpec {
+                    name: if index == 0 {
+                        "consumer-competing-main"
+                    } else {
+                        "consumer-competing-branch"
+                    },
+                    source_sequence: 14 + index as u64 * 2,
+                    physical_ordinal: 26 + index as u32,
+                    at: 60 + index as i64 * 5,
+                },
+            ))
+            .await;
+        }
+        let competing = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(
+            current_usage(&competing, initial_usage.procedure_usage_id),
+            current_usage(&aligned, initial_usage.procedure_usage_id)
+        );
+        // The usage already belongs to A. B remains Selected and obtains its
+        // own complete result first; neither that result nor a later tie may
+        // reselect B or prevent A from consuming its own binding and result.
+        let competing_run = Box::pin(declare_controlled_run(
+            &runtime,
+            &store_root,
+            &resolver,
+            attempts[1].attempt_id,
+            procedure.revision_id,
+            snapshot_id,
+            Some(procedure.revision_id),
+            CaptureSpec {
+                name: "consumer-competing-run",
+                source_sequence: 18,
+                physical_ordinal: 28,
+                at: 70,
+            },
+        ))
+        .await;
+        let (_, competing_result) = Box::pin(complete_controlled_run(
+            &runtime,
+            &store_root,
+            &resolver,
+            &competing_run,
+            "0.96",
+            CaptureSpec {
+                name: "consumer-competing-run",
+                source_sequence: 20,
+                physical_ordinal: 29,
+                at: 80,
+            },
+        ))
+        .await;
+        Box::pin(consumer_verification(
+            &store_root,
+            attempts[1].attempt_id,
+            &competing_result,
+            90,
+        ))
+        .await;
+        {
+            let mut writer = JournalWriter::open(&store_root).await.unwrap();
+            Box::pin(consumer_checkpoint(
+                &mut writer,
+                attempts[1].attempt_id,
+                episode.episode_id,
+                evertrace_domain::work::CheckpointReason::Manual,
+                91,
+            ))
+            .await;
+        }
+        let stronger_competitor = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(
+            current_usage(&stronger_competitor, initial_usage.procedure_usage_id),
+            current_usage(&aligned, initial_usage.procedure_usage_id),
+            "B's verified result cannot supply A's missing completion"
+        );
+        assert_eq!(
+            latest_attempt(&stronger_competitor, attempts[1].attempt_id).adoption_status,
+            AttemptAdoptionStatus::Selected
+        );
+        assert_eq!(
+            current_usage(&stronger_competitor, competing_usage_id).outcome_supported,
+            ProcedureTruth::True,
+            "B has independently complete evidence, not merely a stronger label"
+        );
+        {
+            let mut writer = JournalWriter::open(&store_root).await.unwrap();
+            let prior = current_usage(&aligned, initial_usage.procedure_usage_id);
+            Box::pin(bind_operation(
+                &mut writer,
+                attempt_id,
+                prior.action_operation_refs[0],
+                captured_ids("consumer-aligned-result").0,
+                Some(run.run_id),
+                92,
+            ))
+            .await;
+            let mut stale = prior;
+            stale.usage_revision_id = RevisionId::new_v7();
+            // Keep B1 only after B2 exists: a valid usage successor shape must
+            // still fail the Store's current binding check.
+            stale.predecessor_revision_id =
+                Some(current_usage(&aligned, initial_usage.procedure_usage_id).usage_revision_id);
+            stale.revision_generation += 1;
+            stale.source_watermark = writer.frontier();
+            stale.created_at_us += 1;
+            assert!(
+                writer
+                    .commit(
+                        &journal_command(
+                            stale.created_at_us,
+                            vec![JournalPayload::ProcedureUsageRecorded(Box::new(
+                                stale.clone()
+                            ))]
+                        ),
+                        stale.created_at_us
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let rebound = consumer_round(&runtime, &store_root, &report).await;
+        let rebound_usage = current_usage(&rebound, initial_usage.procedure_usage_id);
+        let old_usage = current_usage(&aligned, initial_usage.procedure_usage_id);
+        assert_eq!(rebound_usage.stage, ProcedureUsageStage::Action);
+        assert_eq!(
+            rebound_usage.work_binding_revision_refs.len(),
+            old_usage.work_binding_revision_refs.len() + 1
+        );
+        assert!(
+            old_usage
+                .work_binding_revision_refs
+                .iter()
+                .all(|id| rebound_usage.work_binding_revision_refs.contains(id))
+        );
+        let (_, result) = complete_controlled_run(
+            &runtime,
+            &store_root,
+            &resolver,
+            &run,
+            "0.95",
+            CaptureSpec {
+                name: "consumer-run",
+                source_sequence: 12,
+                physical_ordinal: 25,
+                at: 100,
+            },
+        )
+        .await;
+        assert_eq!(
+            result.verifier_receipt.as_ref().unwrap().status,
+            evertrace_domain::semantic::VerifierStatus::Passed
+        );
+        let reparse_only = consumer_round(&runtime, &store_root, &report).await;
+        assert_ne!(
+            current_usage(&reparse_only, initial_usage.procedure_usage_id).outcome_supported,
+            ProcedureTruth::True
+        );
+        consumer_verification(&store_root, attempt_id, &result, 110).await;
+        // Even current Work verification plus a real Passed Result does not
+        // establish the Procedure's source-bound completion without its pin.
+        let no_completion_boundary = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(
+            latest_attempt(&no_completion_boundary, attempt_id).verification,
+            evertrace_domain::work::AttemptVerification::Passed
+        );
+        assert_ne!(
+            current_usage(&no_completion_boundary, initial_usage.procedure_usage_id)
+                .outcome_supported,
+            ProcedureTruth::True
+        );
+        {
+            let mut writer = JournalWriter::open(&store_root).await.unwrap();
+            Box::pin(consumer_checkpoint(
+                &mut writer,
+                attempt_id,
+                episode.episode_id,
+                evertrace_domain::work::CheckpointReason::Manual,
+                111,
+            ))
+            .await;
+        }
+        let final_snapshot = consumer_round(&runtime, &store_root, &report).await;
+        let final_usage = current_usage(&final_snapshot, initial_usage.procedure_usage_id);
+        assert_eq!(final_usage.stage, ProcedureUsageStage::Outcome);
+        assert_eq!(final_usage.outcome_supported, ProcedureTruth::True);
+        assert_eq!(final_usage.attempt_ids, vec![attempt_id]);
+        assert!(
+            final_usage
+                .evidence_refs
+                .contains(&result.revision_id.to_string())
+        );
+        assert!(
+            !final_usage
+                .evidence_refs
+                .contains(&competing_result.revision_id.to_string())
+        );
+        let reopened = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(
+            current_usage(&reopened, initial_usage.procedure_usage_id),
+            final_usage
+        );
+        assert_eq!(jobs(&final_snapshot), jobs(&reopened));
+        {
+            let writer = JournalWriter::open(&store_root).await.unwrap();
+            assert_eq!(
+                writer.project().await.unwrap(),
+                writer.full_projection().await.unwrap()
+            );
+        }
+
+        // Two distinct synthetic request roots, each followed by real capture
+        // and controlled Result producers. Only the scheduler advances usage.
+        for index in 1..=2 {
+            let at = 100 + index * 100;
+            let mut writer = JournalWriter::open(&store_root).await.unwrap();
+            let mut task = template_task.clone();
+            task.task_id = TaskId::new_v7();
+            task.revision_id = RevisionId::new_v7();
+            task.request_root_refs = vec![format!("request:consumer-independent-{index}")];
+            task.created_at_us = at;
+            task.source_watermark = writer.frontier();
+            let mut stream = template_stream.clone();
+            stream.task_id = task.task_id;
+            stream.workstream_id = WorkstreamId::new_v7();
+            stream.revision_id = RevisionId::new_v7();
+            stream.source_watermark = writer.frontier();
+            let attempt = new_attempt(
+                task.task_id,
+                stream.workstream_id,
+                stream.repository_instance_id,
+                stream.worktree_instance_ids.clone(),
+                vec![],
+                attempts[0].strategy_contract.clone(),
+                writer.frontier(),
+            )
+            .unwrap();
+            writer
+                .commit(
+                    &journal_command(
+                        at,
+                        vec![
+                            JournalPayload::TaskRecorded(Box::new(task.clone())),
+                            JournalPayload::WorkstreamRecorded(Box::new(stream.clone())),
+                            JournalPayload::AttemptRecorded(Box::new(attempt.clone())),
+                        ],
+                    ),
+                    at,
+                )
+                .await
+                .unwrap();
+            let mut episode = new_episode(&stream, Some(snapshot_id), writer.frontier()).unwrap();
+            episode.attempt_ids = vec![attempt.attempt_id];
+            let linked =
+                link_attempt_to_episode(&attempt, &episode, writer.frontier() + 1).unwrap();
+            let command = activate_episode(
+                WorkCommandContext {
+                    command_id: CommandId::new_v7(),
+                    occurred_at_us: at + 1,
+                    effective_config_hash: [27; 32],
+                    algorithm_revision: "consumer-synthetic-work",
+                },
+                &stream,
+                episode.clone(),
+                vec![linked],
+                vec![],
+            )
+            .unwrap();
+            writer.commit(&command, at + 1).await.unwrap();
+            episode = Box::pin(consumer_checkpoint(
+                &mut writer,
+                attempt.attempt_id,
+                episode.episode_id,
+                evertrace_domain::work::CheckpointReason::PhaseCandidate,
+                at + 1,
+            ))
+            .await;
+            let mut usage = initial_usage.clone();
+            usage.procedure_usage_id = ProcedureUsageId::new_v7();
+            usage.usage_revision_id = RevisionId::new_v7();
+            usage.task_id = task.task_id;
+            usage.workstream_id = stream.workstream_id;
+            usage.exposure_episode_revision_id = episode.revision_id;
+            usage.source_watermark = writer.frontier();
+            usage.created_at_us = at + 2;
+            writer
+                .commit(
+                    &journal_command(
+                        at + 2,
+                        vec![JournalPayload::ProcedureUsageRecorded(Box::new(
+                            usage.clone(),
+                        ))],
+                    ),
+                    at + 2,
+                )
+                .await
+                .unwrap();
+            let current = latest_attempt(&writer.project().await.unwrap(), attempt.attempt_id);
+            let AttemptResolution::Revision(selected) = revise_adoption(
+                &current,
+                AttemptAdoptionStatus::Selected,
+                vec![],
+                writer.frontier() + 1,
+            )
+            .unwrap() else {
+                panic!()
+            };
+            writer
+                .commit(
+                    &journal_command(at + 3, vec![JournalPayload::AttemptRecorded(selected)]),
+                    at + 3,
+                )
+                .await
+                .unwrap();
+            drop(writer);
+            let name = format!("consumer-independent-{index}");
+            let sequence = 20 + index as u64 * 10;
+            Box::pin(consumer_action(
+                &runtime,
+                &store_root,
+                attempt.attempt_id,
+                &procedure.draft.actions.stages[0],
+                CaptureSpec {
+                    name: &name,
+                    source_sequence: sequence,
+                    physical_ordinal: sequence as u32,
+                    at: at + 10,
+                },
+            ))
+            .await;
+            let branch_name = format!("{name}-branch");
+            Box::pin(consumer_action(
+                &runtime,
+                &store_root,
+                attempt.attempt_id,
+                &procedure.draft.actions.branches[0].stages[0],
+                CaptureSpec {
+                    name: &branch_name,
+                    source_sequence: sequence + 2,
+                    physical_ordinal: (sequence + 2) as u32,
+                    at: at + 15,
+                },
+            ))
+            .await;
+            let action = consumer_round(&runtime, &store_root, &report).await;
+            assert_eq!(
+                current_usage(&action, usage.procedure_usage_id).stage,
+                ProcedureUsageStage::Action
+            );
+            let run = declare_controlled_run(
+                &runtime,
+                &store_root,
+                &resolver,
+                attempt.attempt_id,
+                procedure.revision_id,
+                snapshot_id,
+                Some(procedure.revision_id),
+                CaptureSpec {
+                    name: &name,
+                    source_sequence: sequence + 4,
+                    physical_ordinal: (sequence + 4) as u32,
+                    at: at + 20,
+                },
+            )
+            .await;
+            let (_, result) = complete_controlled_run(
+                &runtime,
+                &store_root,
+                &resolver,
+                &run,
+                "0.95",
+                CaptureSpec {
+                    name: &name,
+                    source_sequence: sequence + 6,
+                    physical_ordinal: (sequence + 6) as u32,
+                    at: at + 30,
+                },
+            )
+            .await;
+            consumer_verification(&store_root, attempt.attempt_id, &result, at + 40).await;
+            {
+                let mut writer = JournalWriter::open(&store_root).await.unwrap();
+                Box::pin(consumer_checkpoint(
+                    &mut writer,
+                    attempt.attempt_id,
+                    episode.episode_id,
+                    evertrace_domain::work::CheckpointReason::Manual,
+                    at + 41,
+                ))
+                .await;
+            }
+            let outcome = consumer_round(&runtime, &store_root, &report).await;
+            assert_eq!(
+                current_usage(&outcome, usage.procedure_usage_id).outcome_supported,
+                ProcedureTruth::True
+            );
+            if index == 1 {
+                assert!(!outcome.data_rows().any(|row| row.object_kind.as_deref()
+                    == Some("procedure_revision")
+                    && row.current_revision_id.as_deref()
+                        == Some(&procedure.revision_id.to_string())
+                    && row.publication_state.as_deref() == Some("active_stable")));
+            }
+        }
+        // Cohort promotion consumes these persisted outcomes independently;
+        // the third execution job need not load or publish the whole cohort.
+        let published = consumer_round(&runtime, &store_root, &report).await;
+        let reopened = consumer_round(&runtime, &store_root, &report).await;
+        assert_eq!(jobs(&published), jobs(&reopened));
+        assert!(reopened.data_rows().any(|row| row.object_kind.as_deref()
+            == Some("procedure_revision")
+            && row.current_revision_id.as_deref() == Some(&procedure.revision_id.to_string())
+            && row.publication_state.as_deref() == Some("active_stable")));
     }
 
     #[tokio::test]

@@ -30,10 +30,34 @@ pub struct StageTrace {
     pub(crate) truncated: bool,
 }
 
+/// A source-bound step interval, not proof that its action actually occurred.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActionWindow {
+    pub text: String,
+    pub after_sequence: u64,
+    pub before_sequence: Option<u64>,
+}
+
 impl StageTrace {
     pub(crate) fn compile(
         snapshot: &ProjectionSnapshot,
         target: &WorkEpisode,
+    ) -> Result<Self, SemanticServiceError> {
+        Self::compile_with_attempt(snapshot, target, None)
+    }
+
+    pub(crate) fn compile_for_attempt(
+        snapshot: &ProjectionSnapshot,
+        target: &WorkEpisode,
+        attempt: evertrace_domain::ids::AttemptId,
+    ) -> Result<Self, SemanticServiceError> {
+        Self::compile_with_attempt(snapshot, target, Some(attempt))
+    }
+
+    fn compile_with_attempt(
+        snapshot: &ProjectionSnapshot,
+        target: &WorkEpisode,
+        target_attempt: Option<evertrace_domain::ids::AttemptId>,
     ) -> Result<Self, SemanticServiceError> {
         let decode = |value: &str| {
             serde_json::from_str::<JournalPayload>(value)
@@ -144,7 +168,16 @@ impl StageTrace {
             checkpoint
                 .validate()
                 .map_err(|_| SemanticServiceError::InvalidInput)?;
-            let selected = if checkpoint.active_attempt_ids.len() == 1 {
+            // Usage evaluates each physically bound Attempt separately. Its
+            // checkpoint pin must exist; another Attempt's verifier cannot
+            // supply the missing state. Unscoped routing keeps its unique-pin rule.
+            let selected = if let Some(id) = target_attempt.as_ref() {
+                checkpoint
+                    .attempt_revision_refs
+                    .iter()
+                    .find(|reference| reference.attempt_id == *id)
+                    .map(|reference| &reference.attempt_id)
+            } else if checkpoint.active_attempt_ids.len() == 1 {
                 checkpoint.active_attempt_ids.first()
             } else if checkpoint.active_attempt_ids.is_empty()
                 && episode.selected_attempt_ids.len() == 1
@@ -371,11 +404,36 @@ impl StageTrace {
         &self,
         draft: &ProcedureDraft,
     ) -> Option<(ProcedurePhase, ProcedureActions)> {
+        self.align_with_windows(draft)
+            .map(|(phase, actions, _)| (phase, actions))
+    }
+
+    pub(crate) fn action_windows(
+        &self,
+        draft: &ProcedureDraft,
+    ) -> Option<(ProcedurePhase, Vec<ActionWindow>)> {
+        self.align_with_windows(draft)
+            .map(|(phase, _, windows)| (phase, windows))
+    }
+
+    fn action_window(&self, text: &str, entry: usize, completed: Option<usize>) -> ActionWindow {
+        ActionWindow {
+            text: text.into(),
+            after_sequence: self.frames[entry].sequence,
+            before_sequence: completed.map(|index| self.frames[index].sequence),
+        }
+    }
+
+    fn align_with_windows(
+        &self,
+        draft: &ProcedureDraft,
+    ) -> Option<(ProcedurePhase, ProcedureActions, Vec<ActionWindow>)> {
         let mapping = draft.stage_alignment.as_ref()?;
         if self.truncated || self.frames.is_empty() {
             return None;
         }
         let mut from = 0;
+        let mut windows = Vec::new();
         for (main_index, step) in mapping.main.iter().enumerate() {
             let entered = match self.entry(step, from) {
                 Some(entry) => entry,
@@ -393,7 +451,7 @@ impl StageTrace {
                 {
                     let mut actions = draft.actions.clone();
                     actions.branches.clear();
-                    return Some((ProcedurePhase::BeforeEntry, actions));
+                    return Some((ProcedurePhase::BeforeEntry, actions, windows));
                 }
                 None => return None,
             };
@@ -436,14 +494,29 @@ impl StageTrace {
                     for (step_index, step) in branch.steps.iter().enumerate() {
                         let entry = self.entry(step, branch_cursor)?;
                         if let Some(completed) = self.completed(step, entry, entry) {
+                            windows.push(self.action_window(
+                                &draft.actions.branches[branch_index].stages[step_index],
+                                entry,
+                                Some(completed),
+                            ));
                             branch_cursor = completed;
                         } else {
                             self.position(step)?;
+                            windows.push(self.action_window(
+                                &draft.actions.branches[branch_index].stages[step_index],
+                                entry,
+                                None,
+                            ));
+                            windows.push(self.action_window(
+                                &draft.actions.stages[main_index],
+                                entered,
+                                None,
+                            ));
                             let mut actions = draft.actions.clone();
                             actions.stages =
                                 draft.actions.branches[branch_index].stages[step_index..].to_vec();
                             actions.branches.clear();
-                            return Some((ProcedurePhase::RecoverableDeviation, actions));
+                            return Some((ProcedurePhase::RecoverableDeviation, actions, windows));
                         }
                     }
                     cursor = branch_cursor;
@@ -453,14 +526,20 @@ impl StageTrace {
                     continue;
                 }
                 if let Some(completed) = main_completed {
+                    windows.push(self.action_window(
+                        &draft.actions.stages[main_index],
+                        entered,
+                        Some(completed),
+                    ));
                     from = completed;
                     break;
                 }
                 let phase = self.position(step)?;
+                windows.push(self.action_window(&draft.actions.stages[main_index], entered, None));
                 let mut actions = draft.actions.clone();
                 actions.stages = actions.stages[main_index..].to_vec();
                 actions.branches.clear();
-                return Some((phase, actions));
+                return Some((phase, actions, windows));
             }
         }
         Some((
@@ -470,6 +549,7 @@ impl StageTrace {
                 branches: vec![],
                 avoid: draft.actions.avoid.clone(),
             },
+            windows,
         ))
     }
 
@@ -735,6 +815,26 @@ mod tests {
     fn explicit_prefix_branches_rejoin_and_fail_closed() {
         let mut draft = draft();
         draft.validate().unwrap();
+        let (phase, windows) = trace(&["one", "repair1", "repair2", "one", "two", "done"])
+            .action_windows(&draft)
+            .unwrap();
+        assert_eq!(phase, ProcedurePhase::AlreadyCompleted);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| (
+                    window.text.as_str(),
+                    window.after_sequence,
+                    window.before_sequence
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("repair first", 2, Some(3)),
+                ("repair second", 3, Some(4)),
+                ("first", 1, Some(5)),
+                ("second", 5, Some(6))
+            ]
+        );
         for (phases, actions, phase) in [
             (
                 vec!["one"],
@@ -794,6 +894,7 @@ mod tests {
             .push(draft.actions.branches[0].clone());
         let mapping = draft.stage_alignment.as_mut().unwrap();
         mapping.branches.push(mapping.branches[0].clone());
+        assert!(trace(&["one", "repair1"]).action_windows(&draft).is_none());
         assert!(trace(&["one", "repair1"]).align(&draft).is_none());
         let mut draft = self::draft();
         draft.stage_alignment.as_mut().unwrap().main[1].completed =

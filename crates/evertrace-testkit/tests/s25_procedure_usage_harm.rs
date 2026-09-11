@@ -678,7 +678,21 @@ async fn active_procedure_fixture_with_draft(
     let repository_id = RepositoryId::new_v7();
     let worktree_id = WorktreeId::new_v7();
     let snapshot_id = WorktreeSnapshotId::new_v7();
-    let (worktree, worktree_snapshot) = worktree(repository_id, worktree_id, snapshot_id);
+    let (mut worktree, worktree_snapshot) = worktree(repository_id, worktree_id, snapshot_id);
+    let mut repository = repository(repository_id);
+    if label == "mcp" {
+        // Synthetic repository/Work foundation, with a real private source
+        // root for the daemon's normal catalog and scope-admission checks.
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let path = workspace.to_string_lossy().into_owned();
+        repository.current_path = path.clone();
+        repository.path_history[0].path = path.clone();
+        repository.git_common_dir_path = Some(format!("{path}/.git"));
+        worktree.current_path = Some(path.clone());
+        worktree.path_history[0].path = path.clone();
+        worktree.git_admin_path_history[0].path = format!("{path}/.git");
+    }
     let (mut evidence_receipt, evidence_observation) = source(
         &format!("{label}-evidence"),
         "procedure evidence",
@@ -694,7 +708,7 @@ async fn active_procedure_fixture_with_draft(
         .unwrap()
         .as_hex();
     let mut initial = vec![
-        JournalPayload::RepositoryInstanceRecorded(Box::new(repository(repository_id))),
+        JournalPayload::RepositoryInstanceRecorded(Box::new(repository)),
         JournalPayload::WorktreeInstanceRecorded(Box::new(worktree)),
         JournalPayload::WorktreeSnapshotRecorded(Box::new(worktree_snapshot)),
     ];
@@ -4237,8 +4251,6 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
             trigger_usage.clone(),
         ))],
     );
-    assert!(writer.commit(&usage_only, 16).await.is_err());
-    assert_eq!(writer.project().await.unwrap().frontier, third_frontier);
     let state_only = command(
         16,
         vec![JournalPayload::ProcedureStateRecorded(Box::new(
@@ -4247,11 +4259,15 @@ async fn complete_real_router_usage_stage(stage: RealUsageStage) -> StableProced
     );
     assert!(writer.commit(&state_only, 16).await.is_err());
     assert_eq!(writer.project().await.unwrap().frontier, third_frontier);
+    // A real third success may precede publication. The configured cohort
+    // consumer does not need to manufacture another usage to promote it.
+    writer.commit(&usage_only, 16).await.unwrap();
+    let usage_frontier = writer.project().await.unwrap().frontier;
     let promoted = writer
-        .commit_if_frontier(&third_success_command, 16, third_frontier)
+        .commit_if_frontier(&state_only, 16, usage_frontier)
         .await
         .unwrap();
-    let replayed = writer.commit(&third_success_command, 16).await.unwrap();
+    let replayed = writer.commit(&state_only, 16).await.unwrap();
     assert_eq!(promoted.first_seq, replayed.first_seq);
     assert_eq!(promoted.last_seq, replayed.last_seq);
     assert_eq!(promoted.event_ids, replayed.event_ids);
@@ -5305,6 +5321,40 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         };
     })
     .await;
+    let workspace = fixture._temp.path().join("workspace");
+    let session_id = "019d0000-0000-7000-8000-000000000075";
+    let adapter = fixture._temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/11");
+    fs::create_dir_all(&dated).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = 'trusted'\n",
+            serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let transcript = dated.join(format!("rollout-2026-09-11T00-00-00-{session_id}.jsonl"));
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": "2026-09-11T00:00:00Z", "type": "session_meta", "payload": {
+                    "id": session_id, "session_id": session_id, "cwd": workspace
+                }
+            })
+        ),
+    )
+    .unwrap();
+    evertrace_engine::repository::observe_session_catalog_report(
+        transcript.to_str(),
+        session_id,
+        "mcp-source-proof",
+        Some(session_id),
+    )
+    .unwrap();
     let mut config_source = EffectiveConfig::default().config().clone();
     config_source.runtime.data_dir = fixture.store_path.to_string_lossy().into_owned();
     config_source.llm.enabled = false;
@@ -5336,7 +5386,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         source_kind: EvidenceSourceKind::CodexHook,
         identity_domain: "mcp-test-lifecycle".into(),
         source_ref: "mcp-test-lifecycle".into(),
-        session_ref: "mcp-test-session".into(),
+        session_ref: session_id.into(),
         turn_ref: None,
         tool_ref: None,
         source_sequence: 0,
@@ -5352,8 +5402,8 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         correlation: observation.correlation,
         scope_effect_claims: Vec::new(),
         lifecycle: Some(LaneLifecycleEvidence {
-            host_session_id: "mcp-test-session".into(),
-            agent_id: "mcp-test-agent".into(),
+            host_session_id: session_id.into(),
+            agent_id: session_id.into(),
             incarnation_ref: Some("mcp-test-incarnation".into()),
             child_session_id: None,
             host_lane_key: "mcp-test-lane".into(),
@@ -5950,7 +6000,12 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
             let mut episodes = Vec::new();
             let mut streams = Vec::new();
             let mut old_scenario = None;
-            for row in snapshot.data_rows() {
+            for row in snapshot.data_rows().filter(|row| {
+                matches!(
+                    row.object_kind.as_deref(),
+                    Some("work_episode" | "workstream" | "scenario")
+                )
+            }) {
                 let payload: JournalPayload =
                     serde_json::from_str(row.payload_json.as_deref().unwrap()).unwrap();
                 match payload {
@@ -6284,36 +6339,99 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
                     .unwrap();
         }
         let mut grants = Vec::new();
-        for repetition in 0..if delivery == 4 { 2 } else { 1 } {
-            let Response::McpBindingIssued(grant) = hook
-                .request(
-                    RequestId::new_v7(),
-                    Rpc::IssueMcpBinding(McpBindingIssueCommand {
-                        session_id: lane.host_session_id.clone(),
-                        turn_id: "turn-mcp".into(),
-                        tool_use_id: format!("tool-mcp-{delivery}-{repetition}"),
-                        agent_id: Some(if delivery == 5 {
-                            "unobserved-agent".into()
-                        } else {
-                            lane.agent_id.clone()
-                        }),
-                        transcript_path: None,
-                        original_input: McpToolInput {
-                            action: McpAction::Search,
-                            workspace: fixture.worktree_id.to_string(),
-                            input: query.into(),
-                            refs: Vec::new(),
-                        },
-                        launcher_protocol_revision:
-                            evertrace_codex::binding::BINDING_PROTOCOL_REVISION,
-                    }),
+        for claim_round in 0..2 {
+            if claim_round == 1 {
+                hook = LocalClient::connect(
+                    &socket,
+                    "s25-mcp",
+                    ClientKind::Hook,
+                    Duration::from_secs(2),
                 )
                 .await
-                .unwrap()
-            else {
-                panic!("binding issue failed")
-            };
-            grants.push(grant);
+                .unwrap();
+            }
+            grants.clear();
+            for repetition in 0..if delivery == 4 { 2 } else { 1 } {
+                let Response::McpBindingIssued(grant) = hook
+                    .request(
+                        RequestId::new_v7(),
+                        Rpc::IssueMcpBinding(McpBindingIssueCommand {
+                            session_id: lane.host_session_id.clone(),
+                            turn_id: "turn-mcp".into(),
+                            tool_use_id: format!("tool-mcp-{delivery}-{claim_round}-{repetition}"),
+                            agent_id: Some(if delivery == 5 {
+                                "unobserved-agent".into()
+                            } else {
+                                lane.agent_id.clone()
+                            }),
+                            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                            original_input: McpToolInput {
+                                action: McpAction::Search,
+                                workspace: fixture.worktree_id.to_string(),
+                                input: query.into(),
+                                refs: Vec::new(),
+                            },
+                            launcher_protocol_revision:
+                                evertrace_codex::binding::BINDING_PROTOCOL_REVISION,
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("binding issue failed")
+                };
+                grants.push(grant);
+            }
+            if claim_round == 1 {
+                break;
+            }
+            // This is a serial stdout-delivery proof. Let the normal source
+            // discovery/background writer settle after each new binding/phase;
+            // its frontier-checked route must not race this fixture's setup.
+            // Issue the actual short-lived claims only after this warm-up settles.
+            let mut observer = LocalClient::connect(
+                &socket,
+                "s25-observer",
+                ClientKind::Cli,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut previous = None;
+            let mut unchanged_since = Instant::now();
+            loop {
+                use evertrace_protocol::dto::{
+                    HumanGovernanceRequest, HumanGovernanceResponse, HumanReadRequest, HumanSurface,
+                };
+                let Response::HumanGovernance(HumanGovernanceResponse::Snapshot {
+                    frontier, ..
+                }) = observer
+                    .request(
+                        RequestId::new_v7(),
+                        Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                            request: HumanReadRequest::List {
+                                surface: HumanSurface::System,
+                                expected_frontier: None,
+                                after: None,
+                                limit: 1,
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("source setup frontier");
+                };
+                if previous != Some(frontier) {
+                    previous = Some(frontier);
+                    unchanged_since = Instant::now();
+                } else if unchanged_since.elapsed() >= Duration::from_secs(1) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "source setup did not settle");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
         let grant = &grants[0];
         if delivery == 0 {
@@ -6331,7 +6449,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
                             input: query.into(),
                             refs: Vec::new(),
                         },
-                        client_cwd: fixture._temp.path().to_string_lossy().into_owned(),
+                        client_cwd: workspace.to_string_lossy().into_owned(),
                     }),
                 )
                 .await
@@ -6348,7 +6466,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
             .arg(&config_path)
             .arg("mcp")
             .env_clear()
-            .current_dir(fixture._temp.path())
+            .current_dir(&workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -6415,7 +6533,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         assert_eq!(
             result["items"]["procedures"].as_array().unwrap().len(),
             1,
-            "{result}"
+            "delivery {delivery}: {result}"
         );
         let item = &result["items"]["procedures"][0];
         // Entry comes from the accepted explicit IR and actual checkpoint,

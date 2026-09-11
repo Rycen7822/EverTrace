@@ -99,6 +99,7 @@ use evertrace_store::{
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 
+use crate::procedure::PROCEDURE_USAGE_JOB_KIND;
 use crate::{
     SessionImportBudget, SessionImportWorker, WriterActorError, WriterHandle,
     capture::{ReconcileError, ReconcileInput, reconcile_observations_once},
@@ -122,6 +123,30 @@ fn procedure_promotion_budget() -> JobBudget {
         max_calls: None,
         max_wall_time_ms: 5_000,
     }
+}
+
+fn procedure_usage_budget() -> JobBudget {
+    JobBudget {
+        max_bytes: Some(8 * 1024 * 1024),
+        ..procedure_promotion_budget()
+    }
+}
+
+fn procedure_usage_last_jobs(
+    runtime: &RuntimeSchedulerView,
+    deadline: Instant,
+) -> Option<std::collections::BTreeMap<&str, JobId>> {
+    let mut last_jobs = std::collections::BTreeMap::<&str, JobId>::new();
+    for job in &runtime.jobs {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if job.kind == PROCEDURE_USAGE_JOB_KIND {
+            let last = last_jobs.entry(&job.target_revision).or_insert(job.job_id);
+            *last = (*last).max(job.job_id);
+        }
+    }
+    Some(last_jobs)
 }
 
 pub(crate) fn freeze_hook_backup(
@@ -1209,6 +1234,14 @@ fn job_target_is_current(
         "semantic_synthesis_v1" => {
             crate::jobs::synthesis::synthesis_target_is_current(snapshot, job)
         }
+        PROCEDURE_USAGE_JOB_KIND => {
+            job.config_hash == config_hash
+                && job.algorithm_revision == job.kind
+                && job.model_id.is_none()
+                && job.budget == procedure_usage_budget()
+                && job.target_generation == job.target_watermark.max(1)
+                && job.idempotency_key == format!("{}:{}", job.kind, job.target_revision)
+        }
         PROCEDURE_PROMOTION_JOB_KIND => {
             let valid_job = job.config_hash == config_hash
                 && job.algorithm_revision == PROCEDURE_PROMOTION_JOB_KIND
@@ -1610,8 +1643,10 @@ impl BackgroundScheduler {
                 matches!(job.state, JobStatus::Queued | JobStatus::Leased)
                     && (job.kind == "session_import_v1"
                         && !import_job_is_current(job, self.runtime.effective_config_hash)
-                        || job.kind == PROCEDURE_PROMOTION_JOB_KIND
-                            && job.state == JobStatus::Queued
+                        || matches!(
+                            job.kind.as_str(),
+                            PROCEDURE_PROMOTION_JOB_KIND | PROCEDURE_USAGE_JOB_KIND
+                        ) && job.state == JobStatus::Queued
                             && job.config_hash != self.runtime.effective_config_hash
                         || job.kind == "semantic_synthesis_v1"
                             && (!self
@@ -1694,6 +1729,11 @@ impl BackgroundScheduler {
             }
         }
         if optional_allowed {
+            if self.enqueue_procedure_consumers(&snapshot, &view).await? {
+                snapshot = self.writer.project().await.map_err(map_writer)?;
+                view = RuntimeSchedulerView::from_snapshot(&snapshot)
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
+            }
             let occurred_at_us = now_us()?;
             let deadline = Instant::now() + Duration::from_millis(250);
             let usage =
@@ -2135,6 +2175,7 @@ impl BackgroundScheduler {
                         | "session_import_v1"
                         | "semantic_synthesis_v1"
                         | PROCEDURE_PROMOTION_JOB_KIND
+                        | PROCEDURE_USAGE_JOB_KIND
                         | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
                 )
         });
@@ -2170,6 +2211,12 @@ impl BackgroundScheduler {
             .filter(|selected| selected.lane == BackgroundLane::Deterministic)
         {
             if let Some(claimed) = self.claim_job(&selected_job.job).await? {
+                if claimed.job.kind == PROCEDURE_USAGE_JOB_KIND {
+                    let progress = Box::pin(self.run_procedure_consumer(claimed)).await?;
+                    completed += progress.completed;
+                    retryable |= progress.retryable;
+                    continue;
+                }
                 if claimed.job.kind == PROCEDURE_PROMOTION_JOB_KIND {
                     let progress = self.run_procedure_promotion(claimed).await?;
                     completed += progress.completed;
@@ -3112,6 +3159,319 @@ impl BackgroundScheduler {
             .await
     }
 
+    async fn enqueue_procedure_consumers(
+        &self,
+        snapshot: &evertrace_store::ProjectionSnapshot,
+        runtime: &RuntimeSchedulerView,
+    ) -> Result<bool, BackgroundSchedulerError> {
+        let at = now_us()?;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let Some(mut candidates) = crate::procedure::procedure_usage_candidates(snapshot, deadline)
+        else {
+            return Ok(false);
+        };
+        // Existing job identities provide finite fairness: an unscheduled or
+        // less recently scheduled target precedes a repeatedly changing one.
+        let Some(last_jobs) = procedure_usage_last_jobs(runtime, deadline) else {
+            return Ok(false);
+        };
+        candidates.rows.sort_by_key(|row| {
+            last_jobs
+                .get(row.object_id.as_deref().unwrap_or_default())
+                .copied()
+        });
+        let report = self.report.read().await.clone();
+        let budget = procedure_usage_budget();
+        let mut events = Vec::new();
+        for row in candidates.rows {
+            if Instant::now() >= deadline || events.len() == PER_LANE_LIMIT {
+                break;
+            }
+            let target = row
+                .object_id
+                .as_ref()
+                .ok_or(BackgroundSchedulerError::Store)?;
+            let jobs = runtime
+                .jobs
+                .iter()
+                .filter(|job| {
+                    job.kind == PROCEDURE_USAGE_JOB_KIND && job.target_revision == *target
+                })
+                .collect::<Vec<_>>();
+            if jobs
+                .iter()
+                .any(|job| matches!(job.state, JobStatus::Queued | JobStatus::Leased))
+            {
+                continue;
+            }
+            let json = row
+                .payload_json
+                .as_deref()
+                .ok_or(BackgroundSchedulerError::Store)?;
+            if budget
+                .max_bytes
+                .is_some_and(|limit| json.len() as u64 > limit)
+            {
+                continue;
+            }
+            let JournalPayload::ProcedureUsageRecorded(usage) =
+                serde_json::from_str(json).map_err(|_| BackgroundSchedulerError::Store)?
+            else {
+                return Err(BackgroundSchedulerError::Store);
+            };
+            if usage.stage < evertrace_domain::procedure::ProcedureUsageStage::Returned
+                || usage.route_decision
+                    != evertrace_domain::procedure::ProcedureUsageRouteDecision::Apply
+                || usage.outcome_supported == evertrace_domain::procedure::ProcedureTruth::True
+            {
+                continue;
+            }
+            // No report is a temporary admission failure. Keep the target
+            // pending so the daemon's report-only wakeup can admit it later.
+            if !crate::repository::blocked_repositories(
+                &self.writer,
+                usage.local_context.repository_id.into_iter().collect(),
+                report.as_ref(),
+                self.runtime.effective_config_hash,
+            )
+            .await
+            .map_err(map_writer)?
+            .is_empty()
+            {
+                continue;
+            }
+            let task = row
+                .task_id
+                .as_deref()
+                .ok_or(BackgroundSchedulerError::Store)?;
+            let contextual_watermark = [None, row.workstream_id.as_deref()]
+                .into_iter()
+                .filter_map(|stream| candidates.context_watermarks.get(&(task, stream)).copied())
+                .max()
+                .unwrap_or(0);
+            let packet = crate::procedure::ProcedureUsageCurrentView::execution_snapshot(
+                snapshot,
+                usage.procedure_usage_id,
+                &budget,
+                deadline,
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+            if let Some(packet) = &packet {
+                let control =
+                    crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(packet)
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                if !control
+                    .pending_usage_ids()
+                    .any(|id| id == usage.procedure_usage_id)
+                {
+                    continue;
+                }
+            }
+            let watermark = packet
+                .as_ref()
+                .map(crate::procedure::procedure_input_watermark)
+                .unwrap_or(contextual_watermark)
+                .max(1);
+            if jobs.iter().any(|job| {
+                job.config_hash == self.runtime.effective_config_hash
+                    && job.budget == budget
+                    && job.target_watermark >= watermark
+            }) {
+                continue;
+            }
+            let kind = PROCEDURE_USAGE_JOB_KIND;
+            events.push(JournalEventDraft::runtime(
+                at,
+                self.runtime.effective_config_hash,
+                kind,
+                JournalPayload::JobState(DurableJob {
+                    job_id: JobId::new_v7(),
+                    idempotency_key: format!("{kind}:{target}"),
+                    target_revision: target.clone(),
+                    target_watermark: watermark,
+                    target_generation: watermark,
+                    kind: kind.into(),
+                    algorithm_revision: kind.into(),
+                    model_id: None,
+                    priority: 0,
+                    state: JobStatus::Queued,
+                    attempt: 1,
+                    backoff_until_us: None,
+                    config_hash: self.runtime.effective_config_hash,
+                    budget: budget.clone(),
+                    terminal: None,
+                    lease_until_us: None,
+                }),
+            ));
+        }
+        if events.is_empty() {
+            return Ok(false);
+        }
+        let command = JournalCommand::new(CommandId::new_v7(), events)
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+        match self
+            .writer
+            .commit_if_frontier(command, at, snapshot.frontier)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(WriterActorError::StaleFrontier) => Ok(false),
+            Err(error) => Err(map_writer(error)),
+        }
+    }
+
+    async fn run_procedure_consumer(
+        &self,
+        claimed: ClaimedJob,
+    ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let lease = claimed
+            .job
+            .lease_until_us
+            .ok_or(BackgroundSchedulerError::Store)?;
+        let deadline = Instant::now() + Duration::from_millis(claimed.job.budget.max_wall_time_ms);
+        // The operation clone owns the configuration admitted for this claim.
+        // Fresh evidence and authorization are re-read; configuration is not.
+        for _ in 0..3 {
+            let snapshot = self.writer.project().await.map_err(map_writer)?;
+            let runtime = RuntimeSchedulerView::from_snapshot(&snapshot)
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            if !runtime.jobs.iter().any(|job| job == &claimed.job) {
+                return Ok(BackgroundProgress::default());
+            }
+            let at = now_us()?;
+            let context = crate::semantic::ProposalCommandContext {
+                command_id: CommandId::new_v7(),
+                occurred_at_us: at,
+                effective_config_hash: claimed.job.config_hash,
+                algorithm_revision: claimed.job.kind.clone(),
+            };
+            let mut exhausted = false;
+            let mut result = {
+                let id = claimed
+                    .job
+                    .target_revision
+                    .parse()
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
+                match crate::procedure::ProcedureUsageCurrentView::execution_snapshot(
+                    &snapshot,
+                    id,
+                    &claimed.job.budget,
+                    deadline,
+                )
+                .map_err(|_| BackgroundSchedulerError::Store)?
+                {
+                    Some(packet) => {
+                        let view =
+                            crate::procedure::ProcedureUsageCurrentView::from_execution_snapshot(
+                                &packet,
+                            )
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
+                        let report = self.report.read().await.clone();
+                        if !crate::repository::blocked_repositories(
+                            &self.writer,
+                            view.usage_repository(id).into_iter().collect(),
+                            report.as_ref(),
+                            claimed.job.config_hash,
+                        )
+                        .await
+                        .map_err(map_writer)?
+                        .is_empty()
+                        {
+                            return Ok(BackgroundProgress {
+                                completed: 0,
+                                retryable: true,
+                            });
+                        }
+                        let cas = evertrace_capture::CasStore::open_existing(&self.runtime.cas_dir)
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
+                        view.compile_usage_command(
+                            &packet,
+                            &cas,
+                            context.clone(),
+                            id,
+                            self.stable_min_outcome_supported,
+                            deadline,
+                        )
+                        .map_err(|_| BackgroundSchedulerError::Store)?
+                    }
+                    None => {
+                        exhausted = true;
+                        None
+                    }
+                }
+            };
+            if now_us()? >= lease {
+                break;
+            }
+            if Instant::now() >= deadline {
+                exhausted = true;
+                result = None;
+            }
+            let mut events = result
+                .map(|command| command.events().to_vec())
+                .unwrap_or_default();
+            let mut terminal = claimed.job.clone();
+            terminal.state = if exhausted {
+                JobStatus::Failed
+            } else {
+                JobStatus::Succeeded
+            };
+            terminal.lease_until_us = None;
+            terminal.terminal = Some(Box::new(JobTerminalAudit {
+                outcome: if exhausted {
+                    JobTerminalOutcome::Failed
+                } else {
+                    JobTerminalOutcome::Succeeded
+                },
+                reason: if exhausted {
+                    JobTerminalReason::BudgetExhausted
+                } else {
+                    JobTerminalReason::Completed
+                },
+                result_ref: Some(terminal.target_revision.clone()),
+            }));
+            events.push(JournalEventDraft::runtime(
+                at,
+                claimed.job.config_hash,
+                claimed.job.kind.clone(),
+                JournalPayload::JobState(terminal),
+            ));
+            let command = JournalCommand::new(context.command_id, events)
+                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let expected = command
+                .events()
+                .iter()
+                .map(|event| event.payload.clone())
+                .collect::<Vec<_>>();
+            let result = self
+                .writer
+                .commit_if_frontier(command, at, snapshot.frontier)
+                .await;
+            if result.is_ok()
+                || self
+                    .writer
+                    .committed_command(context.command_id)
+                    .await
+                    .map_err(map_writer)?
+                    .is_some_and(|command| command.payloads == expected)
+            {
+                return Ok(BackgroundProgress {
+                    completed: 1,
+                    retryable: false,
+                });
+            }
+            if let Err(error) = result
+                && !matches!(error, WriterActorError::StaleFrontier)
+            {
+                return Err(map_writer(error));
+            }
+        }
+        Ok(BackgroundProgress {
+            completed: 0,
+            retryable: true,
+        })
+    }
+
     async fn run_procedure_promotion(
         &self,
         claimed: ClaimedJob,
@@ -3695,6 +4055,7 @@ fn executable_job(job: &DurableJob) -> bool {
             | "capability_inventory_v1"
             | "semantic_synthesis_v1"
             | PROCEDURE_PROMOTION_JOB_KIND
+            | PROCEDURE_USAGE_JOB_KIND
             | QUIESCED_BACKUP_CREATE_JOB_KIND
             | QUIESCED_BACKUP_VERIFY_JOB_KIND
             | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
@@ -3706,9 +4067,10 @@ fn job_lane(job: &DurableJob) -> BackgroundLane {
         "support_closure" | "capture_reconciliation" | CAPTURE_ARTIFACT_JOB_KIND => {
             BackgroundLane::Critical
         }
-        "objects_projection" | "physical_normalization" | PROCEDURE_PROMOTION_JOB_KIND => {
-            BackgroundLane::Deterministic
-        }
+        "objects_projection"
+        | "physical_normalization"
+        | PROCEDURE_PROMOTION_JOB_KIND
+        | PROCEDURE_USAGE_JOB_KIND => BackgroundLane::Deterministic,
         "session_import_v1" => BackgroundLane::Import,
         "semantic_synthesis_v1" => BackgroundLane::Synthesis,
         _ => BackgroundLane::Maintenance,
@@ -4155,6 +4517,61 @@ fn map_writer(error: WriterActorError) -> BackgroundSchedulerError {
 mod idle_tests {
     use super::*;
     use evertrace_domain::{ids::*, revision::RevisionId, work::*};
+
+    #[test]
+    fn procedure_usage_fairness_serves_targets_beyond_a_changing_first_lane() {
+        let rows = (0..PER_LANE_LIMIT + 2)
+            .map(|index| evertrace_store::ObjectRow {
+                object_id: Some(format!("usage:{index:02}")),
+                ..evertrace_store::ObjectRow::checkpoint(1, 1)
+            })
+            .collect::<Vec<_>>();
+        let mut runtime = RuntimeSchedulerView {
+            frontier: 1,
+            jobs: vec![],
+            dirty: vec![],
+            outbox: vec![],
+        };
+        let mut served = std::collections::BTreeSet::new();
+        for round in 0..2 {
+            let mut candidates = rows.iter().collect::<Vec<_>>();
+            let last_jobs =
+                procedure_usage_last_jobs(&runtime, Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+            candidates.sort_by_key(|row| last_jobs.get(row.object_id.as_deref().unwrap()).copied());
+            for row in candidates.into_iter().take(PER_LANE_LIMIT) {
+                let target = row.object_id.clone().unwrap();
+                served.insert(target.clone());
+                runtime.jobs.push(DurableJob {
+                    job_id: JobId::new_v7(),
+                    idempotency_key: format!("{PROCEDURE_USAGE_JOB_KIND}:{target}"),
+                    target_revision: target,
+                    target_watermark: round + 1,
+                    target_generation: round + 1,
+                    kind: PROCEDURE_USAGE_JOB_KIND.into(),
+                    algorithm_revision: PROCEDURE_USAGE_JOB_KIND.into(),
+                    model_id: None,
+                    priority: 0,
+                    state: JobStatus::Succeeded,
+                    attempt: 1,
+                    backoff_until_us: None,
+                    config_hash: [1; 32],
+                    budget: procedure_usage_budget(),
+                    terminal: Some(Box::new(JobTerminalAudit {
+                        outcome: JobTerminalOutcome::Succeeded,
+                        reason: JobTerminalReason::Completed,
+                        result_ref: None,
+                    })),
+                    lease_until_us: None,
+                });
+            }
+        }
+        assert_eq!(
+            served.len(),
+            rows.len(),
+            "new evidence for early targets cannot monopolize each enqueue batch"
+        );
+    }
 
     fn episode() -> WorkEpisode {
         let stream = Workstream {
