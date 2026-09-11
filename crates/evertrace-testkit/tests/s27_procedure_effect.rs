@@ -3807,7 +3807,18 @@ mod controlled_projection_proof {
             let outcome = consumer_round(&runtime, &store_root, &report).await;
             assert_eq!(
                 current_usage(&outcome, usage.procedure_usage_id).outcome_supported,
-                ProcedureTruth::True
+                ProcedureTruth::True,
+                "cohort {index}: stage={:?}; generation={}; watermark={}; jobs={:?}",
+                current_usage(&outcome, usage.procedure_usage_id).stage,
+                current_usage(&outcome, usage.procedure_usage_id).revision_generation,
+                current_usage(&outcome, usage.procedure_usage_id).source_watermark,
+                evertrace_store::RuntimeSchedulerView::from_snapshot(&outcome)
+                    .unwrap()
+                    .jobs
+                    .into_iter()
+                    .filter(|job| job.kind == "procedure_usage_evaluation_v1"
+                        && job.target_revision == usage.procedure_usage_id.to_string())
+                    .collect::<Vec<_>>()
             );
             if index == 1 {
                 assert!(!outcome.data_rows().any(|row| row.object_kind.as_deref()
