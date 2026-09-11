@@ -18,6 +18,14 @@ use tokio::{
 };
 
 enum WriterRequest {
+    ConfirmProcedureReturn {
+        original_request: evertrace_domain::ids::RequestId,
+        acknowledgement: evertrace_domain::ids::RequestId,
+        returned: Vec<evertrace_domain::revision::RevisionId>,
+        effective_config_hash: [u8; 32],
+        stable_min_outcome_supported: u32,
+        reply: oneshot::Sender<Result<(), WriterActorError>>,
+    },
     LlmBudgetPage {
         day_start_us: i64,
         after: u64,
@@ -325,6 +333,29 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub(crate) async fn confirm_procedure_return(
+        &self,
+        original_request: evertrace_domain::ids::RequestId,
+        acknowledgement: evertrace_domain::ids::RequestId,
+        returned: Vec<evertrace_domain::revision::RevisionId>,
+        effective_config_hash: [u8; 32],
+        stable_min_outcome_supported: u32,
+    ) -> Result<(), WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ConfirmProcedureReturn {
+                original_request,
+                acknowledgement,
+                returned,
+                effective_config_hash,
+                stable_min_outcome_supported,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub async fn project(&self) -> Result<ProjectionSnapshot, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -534,6 +565,44 @@ async fn run_writer(
                         .ok_or(WriterActorError::Stopped)?
                         .llm_budget_page(day_start_us, after, frontier);
                     budget_reads.spawn(reply_llm_budget_page(guard, read, reply));
+                }
+                WriterRequest::ConfirmProcedureReturn {
+                    original_request,
+                    acknowledgement,
+                    returned,
+                    effective_config_hash,
+                    stable_min_outcome_supported,
+                    reply,
+                } => {
+                    // Keep the current usage read, compilation and append in one
+                    // writer turn: background commits cannot stale this receipt.
+                    let result = confirm_procedure_return(
+                        writer.as_mut().ok_or(WriterActorError::Stopped)?,
+                        original_request,
+                        acknowledgement,
+                        &returned,
+                        effective_config_hash,
+                        stable_min_outcome_supported,
+                    )
+                    .await;
+                    let fatal = result.as_ref().err().copied().filter(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
+                    if let Ok(Some((command, frontier))) = &result {
+                        if recall_relevant(command) {
+                            recall_frontier.send_replace(*frontier);
+                        }
+                        if background_relevant(command) {
+                            background_frontier.send_replace(*frontier);
+                        }
+                    }
+                    let _ = reply.send(result.map(|_| ()));
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
                 }
                 WriterRequest::Commit {
                     command,
@@ -1260,6 +1329,74 @@ fn current_cas_pins(
             .map_err(|_| WriterActorError::Store)?,
     );
     Ok(refs)
+}
+
+async fn confirm_procedure_return(
+    writer: &mut JournalWriter,
+    original_request: evertrace_domain::ids::RequestId,
+    acknowledgement: evertrace_domain::ids::RequestId,
+    returned: &[evertrace_domain::revision::RevisionId],
+    effective_config_hash: [u8; 32],
+    stable_min_outcome_supported: u32,
+) -> Result<Option<(JournalCommand, u64)>, WriterActorError> {
+    use evertrace_domain::ids::CommandId;
+    let original_id = CommandId::from_uuid(original_request.as_uuid())
+        .map_err(|_| WriterActorError::InvalidInput)?;
+    let original = writer
+        .committed_command(original_id)
+        .await
+        .map_err(map_store_error)?;
+    // Only the protocol's same-connection final Search set reaches this path.
+    // Historical exposure without a new routed command needs no new ledger row.
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let snapshot = writer.project().await.map_err(map_store_error)?;
+    let view = crate::procedure::ProcedureUsageCurrentView::from_snapshot(&snapshot)
+        .map_err(|_| WriterActorError::StoreCorrupt)?;
+    let command_id = CommandId::from_uuid(acknowledgement.as_uuid())
+        .map_err(|_| WriterActorError::InvalidInput)?;
+    let now = now_us()?;
+    let events = view
+        .confirmed_return_events(
+            crate::semantic::ProposalCommandContext {
+                command_id,
+                occurred_at_us: now,
+                effective_config_hash,
+                algorithm_revision: "s34-mcp-procedure-return-v1".into(),
+            },
+            &original.payloads,
+            returned,
+            stable_min_outcome_supported,
+        )
+        .map_err(|_| WriterActorError::InvalidInput)?;
+    if events.is_empty() {
+        return Ok(None);
+    }
+    let command = JournalCommand::new(command_id, events).map_err(map_store_error)?;
+    let outcome = writer
+        .commit_if_frontier(&command, now, snapshot.frontier)
+        .await;
+    let frontier = match outcome {
+        Ok(outcome) => outcome.last_seq,
+        Err(StoreError::StoreCorrupt) => return Err(WriterActorError::StoreCorrupt),
+        Err(error) => {
+            let committed = writer
+                .committed_command(command_id)
+                .await
+                .map_err(map_store_error)?;
+            if committed.is_none_or(|committed| {
+                !committed
+                    .payloads
+                    .iter()
+                    .eq(command.events().iter().map(|event| &event.payload))
+            }) {
+                return Err(map_store_error(error));
+            }
+            writer.project().await.map_err(map_store_error)?.frontier
+        }
+    };
+    Ok(Some((command, frontier)))
 }
 
 fn now_us() -> Result<i64, WriterActorError> {
