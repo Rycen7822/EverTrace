@@ -53,6 +53,246 @@ fn fixture() -> (TempDir, ManagedInstallPaths, EffectiveConfig) {
     (root, paths, config)
 }
 
+#[test]
+fn cli_help_succeeds_without_config_or_daemon_and_lists_available_commands() {
+    let (root, paths, _) = fixture();
+    for help in ["help", "--help"] {
+        for explicit in [false, true] {
+            let mut command = Command::new(&paths.cli);
+            command.env_clear();
+            if explicit {
+                command
+                    .arg("--config")
+                    .arg(root.path().join("missing.toml"));
+            }
+            let output = command.arg(help).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            for entry in [
+                "config check",
+                "config show --effective",
+                "config reload [--socket",
+                "doctor [--refresh-host",
+                "install CODEX_EXECUTABLE",
+                "uninstall",
+                "upgrade",
+                "backup create",
+                "backup verify BACKUP_JOB_ID",
+                "restore BACKUP_PATH",
+                "mcp [--host-executable",
+                "--host-config",
+                "tui",
+                "admin session",
+                "admin repository",
+            ] {
+                assert!(text.contains(entry), "missing {entry}: {text}");
+            }
+            assert!(!text.contains("export"), "{text}");
+        }
+    }
+    assert!(!paths.data_root.exists());
+}
+
+#[tokio::test]
+async fn cli_backup_queues_real_daemon_jobs_and_reports_completion_separately() {
+    use evertrace_domain::ids::{JobId, RequestId};
+    use evertrace_protocol::{
+        LocalClient,
+        command::Command as Rpc,
+        dto::{
+            ClientKind, HumanBackupValidationResult, HumanGovernanceRequest,
+            HumanGovernanceResponse, HumanJobState, HumanJobTerminalReason, HumanReadRequest,
+            HumanSurface, HumanSystemDetail,
+        },
+        error::{ErrorCode, ProtocolError},
+        response::Response,
+    };
+    use std::time::{Duration, Instant};
+
+    let (root, paths, _) = fixture();
+    let missing_backup = JobId::new_v7().to_string();
+    for args in [vec!["create"], vec!["verify", &missing_backup]] {
+        let output = Command::new(&paths.cli)
+            .env_clear()
+            .arg("--config")
+            .arg(&paths.config)
+            .arg("backup")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    assert!(
+        !paths.data_root.exists(),
+        "offline CLI must not open a store"
+    );
+
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut daemon = Daemon(
+        Command::new(&paths.daemon)
+            .env_clear()
+            .arg("--config")
+            .arg(&paths.config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(root.path().join("backup-daemon.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut client = LocalClient::connect(
+        &socket,
+        "s34-backup-cli",
+        ClientKind::Cli,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    let mut backup_id = String::new();
+    for phase in 0..3 {
+        let mut command = Command::new(&paths.cli);
+        command
+            .env_clear()
+            .arg("--config")
+            .arg(&paths.config)
+            .arg("backup");
+        match phase {
+            0 => {
+                command.arg("create");
+            }
+            1 => {
+                command.arg("verify").arg(&backup_id);
+            }
+            _ => {
+                command.arg("verify").arg(&missing_backup);
+            }
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["status"], "queued");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("completion has not been checked")
+        );
+        let job_id = result["job_id"].as_str().unwrap();
+        assert!(job_id.parse::<JobId>().is_ok());
+        assert!(result["audit_event_ref"].as_str().is_some());
+        if phase == 0 {
+            backup_id = job_id.to_owned();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut delay = Duration::from_millis(100);
+        let detail = loop {
+            assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(1));
+            let response = client
+                .request(
+                    RequestId::new_v7(),
+                    Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                        request: HumanReadRequest::List {
+                            surface: HumanSurface::System,
+                            expected_frontier: None,
+                            after: None,
+                            limit: 1,
+                        },
+                    }),
+                )
+                .await;
+            let response = match response {
+                Err(ProtocolError::Wire(ErrorCode::MaintenanceMode)) => continue,
+                other => other.unwrap(),
+            };
+            let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { frontier, .. }) =
+                response
+            else {
+                panic!("System snapshot unavailable");
+            };
+            let response = client
+                .request(
+                    RequestId::new_v7(),
+                    Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                        request: HumanReadRequest::Detail {
+                            surface: HumanSurface::System,
+                            object_ref: format!("runtime:job:{job_id}"),
+                            expected_frontier: frontier,
+                            expected_revision_ref: None,
+                        },
+                    }),
+                )
+                .await;
+            let response = match response {
+                Err(ProtocolError::Wire(ErrorCode::MaintenanceMode)) => continue,
+                other => other.unwrap(),
+            };
+            if let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { items, .. }) =
+                response
+                && let Some(HumanSystemDetail::Job { detail }) =
+                    items.into_iter().find_map(|item| item.system_detail)
+                && matches!(
+                    detail.state,
+                    HumanJobState::Succeeded | HumanJobState::Failed
+                )
+            {
+                break detail;
+            }
+        };
+        assert_eq!(detail.job_id.to_string(), job_id);
+        if phase == 2 {
+            assert_eq!(detail.state, HumanJobState::Failed);
+            assert_eq!(
+                detail.terminal_reason,
+                Some(HumanJobTerminalReason::SourceUnavailable)
+            );
+            assert!(detail.backup_summary.is_none());
+            assert!(detail.terminal_result_ref.is_none());
+        } else {
+            assert_eq!(detail.state, HumanJobState::Succeeded);
+            assert_eq!(
+                detail.terminal_reason,
+                Some(HumanJobTerminalReason::Completed)
+            );
+            assert_eq!(
+                detail.terminal_result_ref.as_deref(),
+                Some(backup_id.as_str())
+            );
+            let summary = detail.backup_summary.unwrap();
+            assert_eq!(
+                summary.validation_result,
+                if phase == 0 {
+                    HumanBackupValidationResult::VerifiedBeforePublish
+                } else {
+                    HumanBackupValidationResult::VerifyJobPassed
+                }
+            );
+            assert!(
+                paths
+                    .data_root
+                    .join("backups")
+                    .join(format!("backup-{backup_id}"))
+                    .join("manifest.json")
+                    .is_file()
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn strict_reload_keeps_last_good_and_withdraws_whole_pending_config() {
     use evertrace_engine::{

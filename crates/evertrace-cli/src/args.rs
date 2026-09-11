@@ -8,6 +8,7 @@ pub struct Args {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
+    Help,
     ConfigCheck,
     ConfigShowEffective,
     ConfigReload {
@@ -26,6 +27,10 @@ pub enum Command {
         live_canary: bool,
     },
     Uninstall,
+    BackupCreate,
+    BackupVerify {
+        backup_job_id: evertrace_domain::ids::JobId,
+    },
     Restore {
         backup: PathBuf,
     },
@@ -64,7 +69,21 @@ impl Args {
         } else {
             first
         };
-        let command = if command == "restore" {
+        let command = if command == "--help" || command == "help" {
+            Command::Help
+        } else if command == "backup" {
+            match values.next().as_deref().and_then(|value| value.to_str()) {
+                Some("create") => Command::BackupCreate,
+                Some("verify") => Command::BackupVerify {
+                    backup_job_id: values
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .and_then(|value| value.parse().ok())
+                        .ok_or("backup verify requires a valid backup job ID")?,
+                },
+                _ => return Err(usage()),
+            }
+        } else if command == "restore" {
             Command::Restore {
                 backup: PathBuf::from(values.next().ok_or("restore requires a backup path")?),
             }
@@ -246,13 +265,78 @@ impl Args {
     }
 }
 
-const fn usage() -> &'static str {
-    "usage: evertrace [--config PATH] config check|config show --effective|restore BACKUP_PATH|upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]|upgrade PACKAGE_DIRECTORY --live-host CODEX_EXECUTABLE|install CODEX_EXECUTABLE [--live-canary]|uninstall|doctor [--refresh-host CODEX_EXECUTABLE]|mcp|tui|admin session queue|revoke SESSION_ID|admin repository disable REPOSITORY_ID REVISION|admin repository enable|rescan REPOSITORY_ID REVISION WORKTREE_ID [INVENTORY_JOB_ID]"
+pub const fn usage() -> &'static str {
+    "usage: evertrace [--config PATH] COMMAND
+
+Commands:
+  help | --help
+  config check
+  config show --effective
+  config reload [--socket ABSOLUTE_SOCKET_PATH]
+  doctor [--refresh-host CODEX_EXECUTABLE]
+  install CODEX_EXECUTABLE [--live-canary]
+  uninstall
+  upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]
+  upgrade PACKAGE_DIRECTORY --live-host CODEX_EXECUTABLE
+  backup create
+  backup verify BACKUP_JOB_ID
+  restore BACKUP_PATH
+  mcp [--host-executable ABSOLUTE_CODEX_EXECUTABLE --host-config ABSOLUTE_CONFIG_PATH]
+  tui
+  admin session queue|revoke SESSION_ID
+  admin repository disable REPOSITORY_ID REVISION
+  admin repository enable|rescan REPOSITORY_ID REVISION WORKTREE_ID [INVENTORY_JOB_ID]
+
+Backup commands submit durable jobs. Exit 0 means queued, not completed.
+Use evertrace [--config PATH] tui and inspect the job in System for its final result."
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_and_backup_commands_require_exact_arguments() {
+        let parse = |args: &[&str]| Args::parse(args.iter().map(OsString::from));
+        for help in ["help", "--help"] {
+            assert_eq!(parse(&[help]).unwrap().command, Command::Help);
+            assert_eq!(
+                parse(&["--config", "/missing/config.toml", help])
+                    .unwrap()
+                    .command,
+                Command::Help
+            );
+        }
+        assert_eq!(
+            parse(&["backup", "create"]).unwrap().command,
+            Command::BackupCreate
+        );
+        let backup_job_id = evertrace_domain::ids::JobId::new_v7();
+        assert_eq!(
+            parse(&[
+                "--config",
+                "/config.toml",
+                "backup",
+                "verify",
+                &backup_job_id.to_string()
+            ])
+            .unwrap(),
+            Args {
+                config: Some(PathBuf::from("/config.toml")),
+                command: Command::BackupVerify { backup_job_id },
+            }
+        );
+        for invalid in [
+            vec!["help", "extra"],
+            vec!["backup"],
+            vec!["backup", "create", "extra"],
+            vec!["backup", "verify"],
+            vec!["backup", "verify", "invalid"],
+            vec!["backup", "verify", &backup_job_id.to_string(), "extra"],
+        ] {
+            assert!(parse(&invalid).is_err(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn host_lifecycle_requires_an_explicit_live_option() {
