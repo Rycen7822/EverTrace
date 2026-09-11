@@ -1391,6 +1391,43 @@ async fn supervised_patch_is_real_at_most_once_and_unsupported_is_zero_delta() {
     let git_dir = canonical_root.join(".git");
     let git_metadata = fs::metadata(&git_dir).unwrap();
     let path = canonical_root.to_string_lossy().into_owned();
+    let adapter = root.path().join("adapter");
+    let dated = adapter.join("sessions/2026/09/09");
+    fs::create_dir_all(&dated).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    let session = "019d0000-0000-7000-8000-000000000117";
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta",
+                "payload":{"id":session,"session_id":session,"cwd":path,
+                "originator":"codex_cli_rs","model_provider":"test","git":null}
+            })
+        ),
+    )
+    .unwrap();
+    let config = adapter.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(&path).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let report = std::sync::Arc::new(tokio::sync::RwLock::new(Some(
+        evertrace_engine::repository::observe_session_catalog_report(
+            transcript.to_str(),
+            session,
+            "tool",
+            None,
+        )
+        .unwrap(),
+    )));
     let path_observation = PathObservation {
         path: path.clone(),
         first_observed_at_us: 1,
@@ -1562,7 +1599,8 @@ async fn supervised_patch_is_real_at_most_once_and_unsupported_is_zero_delta() {
     let frontier_before = writer.project().await.unwrap().frontier;
     let (handle, writer_task) = spawn_writer(writer, 16).unwrap();
     let barrier = RecoveryBarrierService::new(runtime.clone(), handle.clone());
-    let service = RecoveryActionService::new(runtime, handle.clone(), barrier.mutation_fence());
+    let service = RecoveryActionService::new(runtime, handle.clone(), barrier.mutation_fence())
+        .with_session_report(report);
     let server = LocalServer::bind(&store_root, ServerOptions::new("s17-test")).unwrap();
     let socket = server.socket_path().to_path_buf();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
