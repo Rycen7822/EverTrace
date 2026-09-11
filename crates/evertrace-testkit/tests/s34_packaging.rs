@@ -672,12 +672,42 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
         },
     };
     use evertrace_engine::semantic::{AtomAuthorityBasis, AtomMaterialization, materialize_atom};
+    use evertrace_protocol::{
+        LocalClient,
+        command::{Command as Rpc, McpBindingIssueCommand},
+        dto::ClientKind,
+        mcp::{McpAction, McpToolInput},
+        response::Response,
+    };
     use evertrace_store::{JournalCommand, JournalEventDraft};
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
     let (_root, paths, config) = fixture();
     let repository_id = RepositoryId::new_v7();
     install_offline(&paths, false).unwrap();
+    // The daemon must observe a real private catalog and current Host trust
+    // before repository-scoped rows are eligible for output-budget trimming.
+    let session = "019d0000-0000-7000-8000-000000000034";
+    let dated = paths
+        .host_config
+        .parent()
+        .unwrap()
+        .join("sessions/2026/09/09");
+    fs::create_dir_all(&dated).unwrap();
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    fs::write(
+        &transcript,
+        format!("{}\n", json!({"ordinal":0,"timestamp":"2026-09-09T00:00:00Z","type":"session_meta","payload":{"id":session,"session_id":session,"cwd":paths.data_root,"originator":"codex_cli_rs","model_provider":"test","git":null}})),
+    )
+    .unwrap();
+    let installed_host = fs::read_to_string(&paths.host_config).unwrap();
+    let host_trust = |level: &str| {
+        format!(
+            "{installed_host}\n[projects.{}]\ntrust_level = \"{level}\"\n",
+            serde_json::to_string(paths.data_root.to_str().unwrap()).unwrap()
+        )
+    };
+    fs::write(&paths.host_config, host_trust("trusted")).unwrap();
     invoke(&paths, &serde_json::to_vec(&json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"budget-session","tool_input":{"command":"echo budgetneedle ".repeat(2500)},"tool_name":"Bash","tool_use_id":"budget-tool","transcript_path":null,"turn_id":"budget-turn"})).unwrap());
     let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
     let (mut spool, _) =
@@ -849,6 +879,35 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let mut hook = LocalClient::connect(
+            &paths.data_root.join("runtime/evertraced-v1.sock"),
+            "s34-budget-test",
+            ClientKind::Hook,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let issued = hook
+            .request(
+                evertrace_domain::ids::RequestId::new_v7(),
+                Rpc::IssueMcpBinding(McpBindingIssueCommand {
+                    session_id: session.into(),
+                    turn_id: "budget-turn".into(),
+                    tool_use_id: "budget-read".into(),
+                    agent_id: None,
+                    transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                    original_input: McpToolInput {
+                        action: McpAction::Search,
+                        workspace: repository_id.to_string(),
+                        input: "budgetneedle".into(),
+                        refs: Vec::new(),
+                    },
+                    launcher_protocol_revision: 1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(issued, Response::McpBindingIssued(_)));
         if (search, get) == (600, 1_200) {
             fs::write(&paths.config, desired.to_toml().unwrap()).unwrap();
             let reloaded = Command::new(&paths.cli)
@@ -875,31 +934,34 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
         ] {
             requests.push(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"evertrace","arguments":{"action":action,"workspace":repository_id.to_string(),"input":input,"refs":[]}}}));
         }
-        let mut cli = Command::new(&paths.cli)
-            .arg("--config")
-            .arg(&paths.config)
-            .arg("mcp")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = cli.stdin.take().unwrap();
-        for request in requests {
-            writeln!(stdin, "{request}").unwrap();
-        }
-        drop(stdin);
-        let output = cli.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let messages: Vec<Value> = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let run_mcp = || {
+            let mut cli = Command::new(&paths.cli)
+                .arg("--config")
+                .arg(&paths.config)
+                .arg("mcp")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = cli.stdin.take().unwrap();
+            for request in &requests {
+                writeln!(stdin, "{request}").unwrap();
+            }
+            drop(stdin);
+            let output = cli.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect::<Vec<Value>>()
+        };
+        let messages = run_mcp();
         let mut pair = Vec::new();
         for (index, target, hard) in [(1, search, 4_800), (2, get, 9_600)] {
             let result = &messages[index]["result"]["structuredContent"];
@@ -919,7 +981,8 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
                     result["next_refs"]
                         .as_array()
                         .unwrap()
-                        .contains(&json!(reference))
+                        .contains(&json!(reference)),
+                    "action_index={index} target={target} expected_ref={reference} actual={result}"
                 );
             } else {
                 assert!(!items.is_empty(), "{result}");
@@ -943,6 +1006,29 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
                 "{text}"
             );
             assert!(!text.contains("source_instance_id"));
+        }
+        if (search, get) == (1_200, 2_400) {
+            fs::write(&paths.host_config, host_trust("untrusted")).unwrap();
+            let denied = run_mcp();
+            for (index, status) in [(1, "no_match"), (2, "not_found"), (3, "not_found")] {
+                let result = &denied[index]["result"]["structuredContent"];
+                assert_eq!(result["status"], status, "{result}");
+                assert!(
+                    result["items"]["evidence"].as_array().unwrap().is_empty(),
+                    "{result}"
+                );
+                assert!(
+                    result["next_refs"].as_array().unwrap().is_empty(),
+                    "{result}"
+                );
+                assert!(
+                    result["warnings"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("source_read_restricted")),
+                    "{result}"
+                );
+            }
         }
         drop(daemon);
     }
@@ -2047,6 +2133,29 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     let backups_before = fs::read_dir(paths.data_root.join("backups"))
         .unwrap()
         .count();
+    let dangling_host = root.path().join("dangling-host");
+    std::os::unix::fs::symlink(root.path().join("missing-host"), &dangling_host).unwrap();
+    let rejected = Command::new(&paths.cli)
+        .arg("--config")
+        .arg(&paths.config)
+        .args(["upgrade", "--check"])
+        .arg(&package)
+        .arg("--live-host")
+        .arg(&dangling_host)
+        .env("CODEX_HOME", paths.host_config.parent().unwrap())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .output()
+        .unwrap();
+    assert!(
+        !rejected.status.success() && rejected.stdout.is_empty(),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        fs::read_dir(paths.data_root.join("backups"))
+            .unwrap()
+            .count(),
+        backups_before
+    );
     let output = Command::new(&paths.cli)
         .arg("--config")
         .arg(&paths.config)
@@ -2059,10 +2168,11 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    let diagnostic = format!("{output:?}");
     let output = String::from_utf8(output.stdout).unwrap();
     assert!(
         output.contains("scope=package_prepublication check=not-ready"),
-        "{output}"
+        "{diagnostic}"
     );
     assert!(output.contains("materials_validated=true"), "{output}");
     assert!(
@@ -3200,7 +3310,15 @@ enabled_tools = ["evertrace"]
         .replace("/experiment/old-home/.local/share/evertrace", paths.data_root.to_str().unwrap())
         .replace("/experiment/old.toml", paths.config.to_str().unwrap())
         .replace("/package/evertrace", paths.cli.to_str().unwrap());
-    fs::write(&paths.host_config, format!("{original}{historical}")).unwrap();
+    let historical_with_state = historical.replace(
+        "# END EverTrace managed wiring v1",
+        &format!("{host_state}# END EverTrace managed wiring v1"),
+    );
+    fs::write(
+        &paths.host_config,
+        format!("{original}{historical_with_state}"),
+    )
+    .unwrap();
     assert!(
         evertrace_codex::install::validate_installed_wiring(
             &paths.data_root,
@@ -3211,14 +3329,32 @@ enabled_tools = ["evertrace"]
     );
     install_offline(&paths, false).unwrap();
     assert_eq!(wiring_hash(), hash);
+    let upgraded = fs::read_to_string(&paths.host_config).unwrap();
+    // Only the owned MCP args change while the new submission hook is appended.
+    // Keep the historical literal independent of the current wiring generator.
+    let old_args = format!(
+        "args = [\"--config\", \"{}\", \"mcp\"]",
+        paths.config.display()
+    );
+    let current_args = format!(
+        "args = [\"--config\", \"{}\", \"mcp\", \"--host-executable\", \"{}\", \"--host-config\", \"{}\"]",
+        paths.config.display(),
+        paths.host_executable.display(),
+        paths.host_config.display()
+    );
     assert!(
-        fs::read_to_string(&paths.host_config)
-            .unwrap()
-            .starts_with(&format!(
-                "{original}{}",
-                historical.split("# END EverTrace").next().unwrap()
-            ))
+        upgraded.starts_with(&format!(
+            "{original}{}",
+            historical_with_state
+                .split("# END EverTrace")
+                .next()
+                .unwrap()
+                .replace(&old_args, &current_args)
+        )),
+        "actual upgraded config={upgraded}"
     ); // Existing array positions survive adding the submission declaration.
+    assert!(install_offline(&paths, false).unwrap().backups.is_empty());
+    assert_eq!(fs::read_to_string(&paths.host_config).unwrap(), upgraded);
     let edited_old = format!(
         "{original}{}",
         historical.replace("timeout = 3", "timeout = 4")

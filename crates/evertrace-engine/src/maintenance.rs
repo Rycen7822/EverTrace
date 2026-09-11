@@ -323,9 +323,20 @@ where
     )
     .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
     if let Some(host) = &live_host {
-        preflight
-            .bind_inventory_host(Path::new(&host.host_executable))
-            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+        let executable = Path::new(&host.host_executable);
+        // A check can still verify the native candidate and package binaries
+        // when the selected Host is absent. Its canary reports Unavailable;
+        // publication continues to require a validated executable locator.
+        let absent = match std::fs::symlink_metadata(executable) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => return Err(RestoreError::Io.into()),
+        };
+        if systemctl.is_some() || !absent {
+            preflight
+                .bind_inventory_host(executable)
+                .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
+        }
     }
     preflight
         .bind_runtime_source(&RuntimeSnapshot::snapshot_path(data_dir))

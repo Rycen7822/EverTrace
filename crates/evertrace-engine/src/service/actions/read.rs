@@ -117,6 +117,7 @@ impl McpActionService {
             .iter()
             .take(3)
             .map(|candidate| candidate.candidate_id.as_str())
+            .chain(found.omitted_refs.iter().map(String::as_str))
             .collect::<BTreeSet<_>>();
         let selected = scope
             .snapshot
@@ -151,7 +152,18 @@ impl McpActionService {
             )
             .await
             .map_err(|_| McpServiceError::Store)?;
-        let blocked_candidates = selected
+        let reviewed_candidates = selected
+            .iter()
+            .flat_map(|row| {
+                [
+                    row.object_id.as_deref(),
+                    row.current_revision_id.as_deref(),
+                    Some(row.row_id.as_str()),
+                ]
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let mut blocked_candidates = selected
             .iter()
             .filter(|row| blocked.contains(&row.row_id))
             .flat_map(|row| {
@@ -162,12 +174,19 @@ impl McpActionService {
                 ]
             })
             .flatten()
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>();
+        // The bounded review must not turn unchecked continuation refs into
+        // an alternate path around source access checks.
+        blocked_candidates.extend(
+            candidate_ids
+                .difference(&reviewed_candidates)
+                .map(|reference| (*reference).to_owned()),
+        );
         let now = unix_time_us_for_mcp();
         let mut procedure_revisions = Vec::new();
         for candidate in found.candidates.into_iter().take(3) {
             if blocked_candidates.contains(candidate.candidate_id.as_str()) {
-                classification_omitted.insert(candidate.candidate_id);
                 continue;
             }
             if candidate.object_kind.as_deref() == Some("procedure_revision") {
@@ -271,6 +290,10 @@ impl McpActionService {
         }
         let mut omitted_refs = found.omitted_refs;
         omitted_refs.extend(classification_omitted);
+        omitted_refs.retain(|reference| !blocked_candidates.contains(reference.as_str()));
+        if !blocked_candidates.is_empty() && classified.is_empty() && omitted_refs.is_empty() {
+            status = McpServiceStatus::NoMatch;
+        }
         if !omitted_refs.is_empty() {
             status = McpServiceStatus::Partial;
             completeness = "partial";
@@ -290,6 +313,9 @@ impl McpActionService {
                 let mut warnings = found.degraded_reasons.into_iter().collect::<Vec<_>>();
                 if scope.anchor.cwd_only {
                     warnings.push("cwd_only_scope".into());
+                }
+                if !blocked_candidates.is_empty() {
+                    warnings.push("source_read_restricted".into());
                 }
                 warnings
             },
