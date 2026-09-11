@@ -2362,6 +2362,26 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
         input: &str,
         refs: &[String],
     ) -> Value {
+        for attempt in 0..4 {
+            // A fresh Hook invocation stamps a new claim for the same logical request.
+            let result = call_once(paths, session, action, input, refs);
+            if attempt == 3
+                || result["status"] != "conflict"
+                || result["warnings"] != json!(["frontier_changed_retry_same_target"])
+            {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        unreachable!()
+    }
+    fn call_once(
+        paths: &ManagedInstallPaths,
+        session: &str,
+        action: &str,
+        input: &str,
+        refs: &[String],
+    ) -> Value {
         let arguments = json!({"action":action,"workspace":"@active","input":input,"refs":refs});
         let raw = json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test",
             "permission_mode":"default","session_id":session,"turn_id":"work-turn",
@@ -2487,22 +2507,13 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
         "acceptance_boundary":"source inspection recorded","phase_contract":{"local_goal":"inspect source",
         "phase_kind":"inspect","phase_label":"inspection","primary_targets":["source"],
         "entry_conditions":["source available"],"acceptance_boundary":"inspection recorded","expected_state_transition":"uninspected to inspected"}}});
-    let mut result = call(
+    let result = call(
         &paths,
         "work-session",
         "add",
         &declaration.to_string(),
         std::slice::from_ref(&reference),
     );
-    if result["status"] == "conflict" {
-        result = call(
-            &paths,
-            "work-session",
-            "add",
-            &declaration.to_string(),
-            std::slice::from_ref(&reference),
-        );
-    }
     assert_eq!(result["status"], "partial", "{result}");
     assert_eq!(
         result["items"]["evidence"].as_array().unwrap().len(),
