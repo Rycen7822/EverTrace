@@ -633,6 +633,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             return Err(ErrorCode::InvalidInput);
                         }
                         let response = match command {
+                            HumanGovernanceRequest::Export { selections } => {
+                                let result = human_governance.export(selections.into_iter().map(|item| evertrace_engine::HumanExportSelection {
+                                    object_ref: item.object_ref,
+                                    expected_revision_ref: item.expected_revision_ref,
+                                }).collect()).await;
+                                HumanGovernanceResponse::Export {
+                                    result: evertrace_protocol::dto::HumanExportResult {
+                                        status: match result.status {
+                                            evertrace_engine::HumanExportStatus::Published => evertrace_protocol::dto::HumanExportStatus::Published,
+                                            evertrace_engine::HumanExportStatus::PublicationUncertain => evertrace_protocol::dto::HumanExportStatus::PublicationUncertain,
+                                            evertrace_engine::HumanExportStatus::Conflict => evertrace_protocol::dto::HumanExportStatus::Conflict,
+                                            evertrace_engine::HumanExportStatus::Denied => evertrace_protocol::dto::HumanExportStatus::Denied,
+                                            evertrace_engine::HumanExportStatus::Failed => evertrace_protocol::dto::HumanExportStatus::Failed,
+                                        },
+                                        path: result.path,
+                                        frontier: result.frontier,
+                                        object_count: result.object_count,
+                                        total_bytes: result.total_bytes,
+                                        reason: result.reason.map(str::to_owned),
+                                    },
+                                }
+                            }
                             HumanGovernanceRequest::Read { request } => match request {
                                 HumanReadRequest::List {
                                     surface,

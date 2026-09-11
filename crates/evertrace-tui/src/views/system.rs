@@ -2,8 +2,36 @@ use crate::{AppState, components};
 use ratatui::{Frame, layout::Rect};
 pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
     let in_detail = state.detail.is_some() || state.detail_message.is_some();
-    let mut body = crate::views::page_body(state, "No current system projection facts");
+    let mut body = format!(
+        "Export: select objects in Explorer with s; X here exports {} selected objects",
+        state.export_selections.len()
+    );
+    if let Some(result) = &state.export_result {
+        body.push_str(&format!(
+            "\nExport {:?}: {} objects / {} bytes\n{}\n{}",
+            result.status,
+            result.object_count,
+            result.total_bytes,
+            result.path.as_deref().unwrap_or(
+                if result.status == evertrace_protocol::dto::HumanExportStatus::PublicationUncertain
+                {
+                    "Location unknown; inspect the configured exports directory before retrying"
+                } else {
+                    "No published path"
+                }
+            ),
+            result.reason.as_deref().unwrap_or("")
+        ));
+    }
+    body.push('\n');
+    body.push_str(&crate::views::page_body(
+        state,
+        "No current system projection facts",
+    ));
     if !in_detail {
+        for selected in &state.export_selections {
+            body.push_str(&format!("\nSelected: {}", selected.object_ref));
+        }
         if let Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
             diagnostics: Some(report),
             ..
@@ -39,12 +67,14 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
         );
     }
     let mut widget = components::table("System", body).scroll((state.detail_scroll, 0));
-    if state.detail.as_ref().is_some_and(|item| {
-        matches!(
-            item.system_detail,
-            Some(evertrace_protocol::dto::HumanSystemDetail::SessionImport { .. })
-        )
-    }) {
+    if state.export_result.is_some()
+        || state.detail.as_ref().is_some_and(|item| {
+            matches!(
+                item.system_detail,
+                Some(evertrace_protocol::dto::HumanSystemDetail::SessionImport { .. })
+            )
+        })
+    {
         widget = widget.wrap(ratatui::widgets::Wrap { trim: false });
     }
     f.render_widget(widget, a)
@@ -192,5 +222,29 @@ mod tests {
         assert!(text.contains(source));
         assert!(text.contains("body: Partial"));
         assert!(text.contains("access: Approved; workspace: NonRepository"));
+        let state = AppState {
+            route: crate::Route::System,
+            export_result: Some(evertrace_protocol::dto::HumanExportResult {
+                status: evertrace_protocol::dto::HumanExportStatus::Published,
+                path: Some("/private/data/exports/export-selected".into()),
+                frontier: 9,
+                object_count: 2,
+                total_bytes: 100_001,
+                reason: None,
+            }),
+            ..AppState::default()
+        };
+        terminal
+            .draw(|frame| render(frame, frame.area(), &state))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Export Published: 2 objects / 100001 bytes"));
+        assert!(text.contains("/private/data/exports/export-selected"));
     }
 }

@@ -2,6 +2,7 @@ mod admin;
 mod backup;
 mod config;
 mod doctor;
+mod export;
 mod install;
 mod mcp;
 mod restore;
@@ -32,6 +33,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         } => install::run(args.config, Some(host_executable), live_canary).await,
         Command::Uninstall => install::run(args.config, None, false).await,
         Command::BackupCreate => backup::run(args.config, None).await,
+        Command::Export { refs } => export::run(args.config, refs).await,
         Command::BackupVerify { backup_job_id } => {
             backup::run(args.config, Some(backup_job_id)).await
         }

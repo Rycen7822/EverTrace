@@ -32,6 +32,7 @@ enum PendingKind {
     Health,
     HumanRead(HumanSurface, HumanReadLocator),
     HumanAction,
+    Export,
     Recovery,
     ConfigRead,
     ConfigWrite,
@@ -88,6 +89,7 @@ async fn send_human(
     request: HumanGovernanceRequest,
 ) -> Result<(), evertrace_protocol::error::ProtocolError> {
     let kind = match &request {
+        HumanGovernanceRequest::Export { .. } => PendingKind::Export,
         HumanGovernanceRequest::Read { request } => match request {
             HumanReadRequest::List { surface, .. } => {
                 PendingKind::HumanRead(*surface, HumanReadLocator::List)
@@ -138,12 +140,24 @@ fn human_inflight(pending: &BTreeMap<RequestId, (Instant, PendingKind)>) -> bool
     pending.values().any(|(_, kind)| {
         matches!(
             kind,
-            PendingKind::HumanRead(_, _) | PendingKind::HumanAction
+            PendingKind::HumanRead(_, _) | PendingKind::HumanAction | PendingKind::Export
         )
     })
 }
 
-fn local_human_rejection(reason: &str) -> AppEvent {
+pub(super) fn local_human_rejection(request: &HumanGovernanceRequest, reason: &str) -> AppEvent {
+    if matches!(request, HumanGovernanceRequest::Export { .. }) {
+        return AppEvent::HumanAction(HumanGovernanceResponse::Export {
+            result: evertrace_protocol::dto::HumanExportResult {
+                status: evertrace_protocol::dto::HumanExportStatus::Failed,
+                path: None,
+                frontier: 0,
+                object_count: 0,
+                total_bytes: 0,
+                reason: Some(reason.into()),
+            },
+        });
+    }
     AppEvent::HumanAction(HumanGovernanceResponse::Action {
         result: HumanActionResult {
             status: HumanActionStatus::Unavailable,
@@ -172,10 +186,10 @@ fn stage_human(
         return HumanHandoff::RejectedInvalid;
     }
     match request {
-        HumanGovernanceRequest::Act { .. } => {
+        HumanGovernanceRequest::Act { .. } | HumanGovernanceRequest::Export { .. } => {
             let action_inflight = pending
                 .values()
-                .any(|(_, kind)| matches!(kind, PendingKind::HumanAction));
+                .any(|(_, kind)| matches!(kind, PendingKind::HumanAction | PendingKind::Export));
             if action_inflight || queued_action.is_some() {
                 return HumanHandoff::RejectedBusy;
             }
@@ -210,12 +224,14 @@ async fn handoff_human(
         HumanHandoff::Queued => Ok(HumanHandoff::Queued),
         HumanHandoff::RejectedInvalid => {
             let _ = events
-                .send(local_human_rejection("local_invalid_request"))
+                .send(local_human_rejection(&request, "local_invalid_request"))
                 .await;
             Ok(HumanHandoff::RejectedInvalid)
         }
         HumanHandoff::RejectedBusy => {
-            let _ = events.send(local_human_rejection("local_busy")).await;
+            let _ = events
+                .send(local_human_rejection(&request, "local_busy"))
+                .await;
             Ok(HumanHandoff::RejectedBusy)
         }
     }
@@ -314,7 +330,9 @@ pub(crate) async fn run(
                 .values()
                 .map(|(started, kind)| {
                     *started
-                        + if matches!(kind, PendingKind::ConfigWrite) {
+                        + if matches!(kind, PendingKind::Export) {
+                            Duration::from_secs(35)
+                        } else if matches!(kind, PendingKind::ConfigWrite) {
                             Duration::from_secs(10)
                         } else {
                             RESPONSE_DEADLINE
@@ -404,6 +422,10 @@ pub(crate) async fn run(
                                     let _ = events.send(AppEvent::HumanRead { surface, locator, response }).await;
                                     true
                                 }
+                                (PendingKind::Export, Response::HumanGovernance(response @ HumanGovernanceResponse::Export { .. })) if response.validate() => {
+                                    let _ = events.send(AppEvent::HumanAction(response)).await;
+                                    true
+                                }
                                 (PendingKind::HumanAction, Response::HumanGovernance(response @ (HumanGovernanceResponse::Action { .. } | HumanGovernanceResponse::Conflict { .. }))) if response.validate() => {
                                     let _ = events.send(AppEvent::HumanAction(response)).await;
                                     true
@@ -451,9 +473,12 @@ pub(crate) async fn run(
         if shutdown_requested {
             return;
         }
-        if queued_action.take().is_some() {
+        if let Some(request) = queued_action.take() {
             let _ = events
-                .send(local_human_rejection("local_transport_unavailable"))
+                .send(local_human_rejection(
+                    &request,
+                    "local_transport_unavailable",
+                ))
                 .await;
         }
         let _ = events.send(AppEvent::Disconnected).await;
@@ -478,8 +503,8 @@ async fn wait_or_shutdown(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(ClientCommand::Refresh(_)) => continue,
-                Some(ClientCommand::Human(HumanGovernanceRequest::Act { .. })) => {
-                    let _ = events.send(local_human_rejection("local_transport_unavailable")).await;
+                Some(ClientCommand::Human(request @ (HumanGovernanceRequest::Act { .. } | HumanGovernanceRequest::Export { .. }))) => {
+                    let _ = events.send(local_human_rejection(&request, "local_transport_unavailable")).await;
                 }
                 Some(ClientCommand::Human(HumanGovernanceRequest::Read { .. })) => continue,
                 Some(ClientCommand::Recovery(_)) => {
@@ -573,6 +598,27 @@ mod tests {
             HumanHandoff::RejectedBusy
         );
         assert_eq!(queued_action.as_ref(), Some(&action));
+
+        let export = HumanGovernanceRequest::Export {
+            selections: vec![evertrace_protocol::dto::HumanExportSelection {
+                object_ref: "object:work:task:test".into(),
+                expected_revision_ref: None,
+            }],
+        };
+        assert_eq!(
+            stage_human(&pending, &mut queued_action, &mut latest_read, &export),
+            HumanHandoff::RejectedBusy
+        );
+        let AppEvent::HumanAction(HumanGovernanceResponse::Export { result }) =
+            local_human_rejection(&export, "local_busy")
+        else {
+            panic!("unsent export rejection");
+        };
+        assert_eq!(
+            result.status,
+            evertrace_protocol::dto::HumanExportStatus::Failed
+        );
+        assert_eq!(result.reason.as_deref(), Some("local_busy"));
 
         for surface in [HumanSurface::Explorer, HumanSurface::System] {
             assert_eq!(

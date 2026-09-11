@@ -50,6 +50,8 @@ pub fn command(k: KeyEvent) -> UiCommand {
         KeyCode::Char('F') => UiCommand::PrepareForgetObject,
         KeyCode::Char('P') => UiCommand::PrepareRepositoryPurge,
         KeyCode::Char('B') => UiCommand::PrepareCreateBackup,
+        KeyCode::Char('s') => UiCommand::ToggleExportSelection,
+        KeyCode::Char('X') => UiCommand::ExportSelection,
         KeyCode::Char('G') => UiCommand::PrepareCollectGarbage,
         KeyCode::Char('V') => UiCommand::PrepareVerifyBackup,
         KeyCode::Char('p') => {

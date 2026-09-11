@@ -1,7 +1,9 @@
 mod diagnostics;
+mod export;
 pub use diagnostics::{
     HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
 };
+pub use export::{HumanExportResult, HumanExportSelection, HumanExportStatus};
 
 use std::{
     collections::{BTreeMap, BTreeSet},

@@ -26,6 +26,8 @@ pub enum UiCommand {
     PrepareRepositoryPurge,
     PrepareRepositoryAccess(evertrace_protocol::dto::RepositoryAccessAction),
     PrepareCreateBackup,
+    ToggleExportSelection,
+    ExportSelection,
     PrepareCollectGarbage,
     PrepareVerifyBackup,
     ConfirmProposal,

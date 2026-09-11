@@ -504,6 +504,23 @@ fn procedure_draft(repository_id: RepositoryId, evidence: String) -> ProcedureDr
 
 #[test]
 fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
+    let selection = evertrace_protocol::dto::HumanExportSelection {
+        object_ref: "selected-object".into(),
+        expected_revision_ref: None,
+    };
+    assert!(
+        HumanGovernanceRequest::Export {
+            selections: vec![selection.clone(); 64]
+        }
+        .validate()
+    );
+    assert!(
+        !HumanGovernanceRequest::Export {
+            selections: vec![selection; 65]
+        }
+        .validate()
+    );
+    assert!(serde_json::from_value::<HumanGovernanceRequest>(serde_json::json!({"operation":"export","selections":[{"object_ref":"selected-object","expected_revision_ref":null,"cas_ref":"untrusted"}]})).is_err());
     let request = HumanGovernanceRequest::Read {
         request: HumanReadRequest::List {
             surface: WireSurface::Inbox,
@@ -1597,6 +1614,76 @@ async fn mark_new_attempt_creates_one_unknown_child_and_replays_after_reopen() {
         reopened_handle.project().await.unwrap().frontier,
         multiple_children_frontier
     );
+    // Real retained Work revisions: export logical current, never a stale row.
+    let export_service = HumanGovernanceService::with_acceptance(
+        reopened_handle.clone(),
+        CONFIG,
+        runtime_snapshot(root.path()),
+        GlobalPromotionConfig {
+            atom: PromotionLevel::Manual,
+            procedure: PromotionLevel::Manual,
+            core_membership: PromotionLevel::Manual,
+        },
+    );
+    let mut revision = source_attempt.clone();
+    let mut displayed = None;
+    for generation in 2..=3 {
+        revision.predecessor_revision_id = Some(revision.revision_id);
+        revision.revision_id = RevisionId::new_v7();
+        revision.revision_generation = generation;
+        revision.source_watermark += 1;
+        let command = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                10 + generation as i64,
+                CONFIG,
+                "s31-test-v1",
+                JournalPayload::AttemptRecorded(Box::new(revision.clone())),
+            )],
+        )
+        .unwrap();
+        reopened_handle
+            .commit(command, 10 + generation as i64)
+            .await
+            .unwrap();
+        if let Some(selection) = displayed.take() {
+            let stale = export_service.export(vec![selection]).await;
+            assert_eq!(
+                stale.status,
+                evertrace_engine::HumanExportStatus::Conflict,
+                "{stale:?}"
+            );
+            assert!(stale.path.is_none());
+        }
+        let selection = evertrace_engine::HumanExportSelection {
+            object_ref: revision.attempt_id.to_string(),
+            expected_revision_ref: Some(revision.revision_id.to_string()),
+        };
+        let exported = export_service.export(vec![selection.clone()]).await;
+        assert_eq!(
+            exported.status,
+            evertrace_engine::HumanExportStatus::Published,
+            "{exported:?}"
+        );
+        let body = std::fs::read_to_string(
+            std::path::Path::new(exported.path.as_ref().unwrap()).join("01-object.md"),
+        )
+        .unwrap();
+        assert!(body.contains(&revision.revision_id.to_string()));
+        let stale = export_service
+            .export(vec![evertrace_engine::HumanExportSelection {
+                object_ref: source_attempt.revision_id.to_string(),
+                expected_revision_ref: None,
+            }])
+            .await;
+        assert_eq!(
+            stale.status,
+            evertrace_engine::HumanExportStatus::Conflict,
+            "{stale:?}"
+        );
+        assert!(stale.path.is_none());
+        displayed = Some(selection);
+    }
     reopened_handle.shutdown().await.unwrap();
     reopened_task.await.unwrap().unwrap();
 }
@@ -3514,6 +3601,74 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         _ => panic!("procedure target expected"),
     };
 
+    let exported = service
+        .export(vec![evertrace_engine::HumanExportSelection {
+            object_ref: procedure_id.to_string(),
+            expected_revision_ref: Some(procedure_revision_id.to_string()),
+        }])
+        .await;
+    assert_eq!(
+        exported.status,
+        evertrace_engine::HumanExportStatus::Published,
+        "{exported:?}"
+    );
+    let document = std::fs::read_to_string(
+        std::path::Path::new(exported.path.as_ref().unwrap()).join("01-object.md"),
+    )
+    .unwrap();
+    let full_payload = procedure_command
+        .payloads
+        .iter()
+        .find(|payload| matches!(payload, JournalPayload::ProcedureRevisionRecorded(_)))
+        .unwrap();
+    let full_text = serde_json::to_string_pretty(full_payload)
+        .unwrap()
+        .lines()
+        .map(|line| format!("    {line}\n"))
+        .collect::<String>();
+    assert!(
+        document.contains(&full_text),
+        "export must include complete Procedure actions and proof refs"
+    );
+    let rejected = service
+        .export(vec![evertrace_engine::HumanExportSelection {
+            object_ref: procedure_id.to_string(),
+            expected_revision_ref: Some(RevisionId::new_v7().to_string()),
+        }])
+        .await;
+    assert_eq!(
+        rejected.status,
+        evertrace_engine::HumanExportStatus::Conflict
+    );
+    assert!(rejected.path.is_none());
+
+    let stale_proposal = service
+        .export(vec![evertrace_engine::HumanExportSelection {
+            object_ref: procedure_proposal.proposal_revision_id.to_string(),
+            expected_revision_ref: None,
+        }])
+        .await;
+    assert_eq!(
+        stale_proposal.status,
+        evertrace_engine::HumanExportStatus::Conflict
+    );
+    assert!(stale_proposal.path.is_none());
+    let current_proposal = service
+        .export(vec![evertrace_engine::HumanExportSelection {
+            object_ref: procedure_proposal.proposal_id.to_string(),
+            expected_revision_ref: Some(
+                procedure_view.proposals[&procedure_proposal.proposal_id]
+                    .proposal_revision_id
+                    .to_string(),
+            ),
+        }])
+        .await;
+    assert_eq!(
+        current_proposal.status,
+        evertrace_engine::HumanExportStatus::Published,
+        "{current_proposal:?}"
+    );
+
     let view = SemanticCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
     let mut ack_loss_draft = atom_draft(repository_id, &receipt, &observation);
     ack_loss_draft.value.text = "preserve ack-loss evidence".into();
@@ -4427,7 +4582,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             core_membership: PromotionLevel::Manual,
         },
     )
-    .with_session_report(report);
+    .with_session_report(report.clone());
     reopened_service.reconcile_reserved_once().await.unwrap();
     let rebuilt = reopened_handle.project().await.unwrap();
     assert_eq!(rebuilt.frontier, before_reconcile.frontier);
@@ -4645,8 +4800,199 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         before_stale_reconcile.frontier
     );
     assert!(!stale_edit_path.exists());
+    let snapshot = reopened_handle.project().await.unwrap();
+    let target = evertrace_domain::purge::ObjectDeletionTarget::Procedure { procedure_id };
+    let preview = evertrace_store::object_deletion_preview(&snapshot, target).unwrap();
+    assert!(matches!(
+        reopened_service
+            .forget_object(
+                RequestId::new_v7(),
+                snapshot.frontier,
+                target,
+                preview.exact_revision_ids,
+                preview.deletion_generation,
+            )
+            .await
+            .unwrap(),
+        evertrace_engine::HumanActionOutcome::Applied { .. }
+    ));
+    let forgotten = reopened_service
+        .export(vec![evertrace_engine::HumanExportSelection {
+            object_ref: procedure_id.to_string(),
+            expected_revision_ref: None,
+        }])
+        .await;
+    assert!(
+        matches!(
+            forgotten.status,
+            evertrace_engine::HumanExportStatus::Conflict
+                | evertrace_engine::HumanExportStatus::Denied
+        ),
+        "{forgotten:?}"
+    );
+    assert!(forgotten.path.is_none());
     reopened_handle.shutdown().await.unwrap();
     reopened_task.await.unwrap().unwrap();
+}
+
+async fn protected_archive_export(
+    root: &Path,
+    transcript: &Path,
+    report: std::sync::Arc<tokio::sync::RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    session: &str,
+) {
+    // Exercise a source-only archive through the existing import pipeline.
+    let import_data = root.join("export-import");
+    std::fs::create_dir(&import_data).unwrap();
+    std::fs::set_permissions(
+        &import_data,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
+    let import_runtime = runtime_snapshot(&import_data);
+    DeviceKeyStore::new(import_runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    let cold = import_runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        drop(evertrace_capture::CaptureRuntime::open(cold).unwrap())
+    })
+    .await
+    .unwrap();
+    let writer = tokio::spawn(async move { open_writer(&import_data).await.unwrap() })
+        .await
+        .unwrap();
+    let (import_handle, import_task) = spawn_writer(writer, 8).unwrap();
+    let import_service = HumanGovernanceService::with_acceptance(
+        import_handle.clone(),
+        CONFIG,
+        import_runtime.clone(),
+        GlobalPromotionConfig::default(),
+    )
+    .with_session_report(report.clone());
+    let catalog =
+        evertrace_engine::session_import::SessionCatalogService::new(import_handle.clone(), CONFIG);
+    catalog
+        .refresh(report.read().await.as_ref().unwrap())
+        .await
+        .unwrap();
+    let source = evertrace_store::SessionImportCurrentView::from_snapshot(
+        &import_handle.project().await.unwrap(),
+    )
+    .unwrap()
+    .sessions
+    .into_values()
+    .next()
+    .unwrap()
+    .source_key();
+    let admin = evertrace_engine::session_import::SessionImportAdminService::new(
+        import_handle.clone(),
+        report.clone(),
+        CONFIG,
+    );
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                evertrace_engine::session_import::SessionImportAdminAction::QueueImport,
+                100
+            )
+            .await
+            .unwrap(),
+        evertrace_engine::session_import::SessionImportAdminOutcome::Queued
+    );
+    let worker = evertrace_engine::SessionImportWorker::new(
+        import_handle.clone(),
+        import_runtime,
+        report.clone(),
+    )
+    .unwrap();
+    for _ in 0..8 {
+        let progress = Box::pin(worker.process_checkpoint(
+            &source,
+            evertrace_engine::SessionImportBudget {
+                max_bytes: 256 * 1024,
+                max_records: 16,
+                max_work_time: std::time::Duration::from_millis(250),
+            },
+        ))
+        .await
+        .unwrap();
+        if progress.completed {
+            break;
+        }
+    }
+    let imported = import_handle.project().await.unwrap();
+    let archived = imported.data_rows().find(|row| {
+        row.object_kind.as_deref() == Some("source_receipt") && row.payload_json.as_deref().is_some_and(|json| {
+            matches!(serde_json::from_str::<JournalPayload>(json), Ok(JournalPayload::SourceReceiptRecorded(receipt))
+                if evertrace_store::is_session_import_source(receipt.source_instance_id.as_str()))
+        })
+    }).unwrap();
+    let selection = vec![evertrace_engine::HumanExportSelection {
+        object_ref: archived.row_id.clone(),
+        expected_revision_ref: archived.current_revision_id.clone(),
+    }];
+    std::fs::remove_file(transcript).unwrap();
+    let archived_export = import_service.export(selection.clone()).await;
+    assert_eq!(
+        archived_export.status,
+        evertrace_engine::HumanExportStatus::Published,
+        "{archived_export:?}"
+    );
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                evertrace_engine::session_import::SessionImportAdminAction::RevokeAccess,
+                101
+            )
+            .await
+            .unwrap(),
+        evertrace_engine::session_import::SessionImportAdminOutcome::Revoked
+    );
+    let revoked_export = import_service.export(selection).await;
+    assert_eq!(
+        revoked_export.status,
+        evertrace_engine::HumanExportStatus::Denied,
+        "{revoked_export:?}"
+    );
+    assert!(revoked_export.path.is_none());
+    import_handle.shutdown().await.unwrap();
+    import_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn protected_source_export_survives_deleted_original_and_rejects_revocation() {
+    let root = TempDir::new().unwrap();
+    let dated = root.path().join("host/sessions/2026/09/09");
+    std::fs::create_dir_all(&dated).unwrap();
+    std::fs::set_permissions(
+        root.path().join("host"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
+    let session = "019d0000-0000-7000-8000-000000000032";
+    let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
+    let header = serde_json::json!({"timestamp":"2026-09-09T00:00:00Z", "type":"session_meta", "payload":{"id":session,"session_id":session,"cwd":root.path()}});
+    let message = serde_json::json!({"timestamp":"2026-09-09T00:00:01Z", "type":"event_msg", "payload":{"type":"user_message","message":"original removed, archive retained"}});
+    std::fs::write(&transcript, format!("{header}\n{message}\n")).unwrap();
+    let report = evertrace_engine::repository::observe_session_catalog_report(
+        transcript.to_str(),
+        session,
+        "export",
+        None,
+    )
+    .unwrap();
+    Box::pin(protected_archive_export(
+        root.path(),
+        &transcript,
+        std::sync::Arc::new(tokio::sync::RwLock::new(Some(report))),
+        session,
+    ))
+    .await;
 }
 
 #[tokio::test]

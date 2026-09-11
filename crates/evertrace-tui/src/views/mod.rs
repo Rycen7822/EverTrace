@@ -14,6 +14,13 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
 pub(super) fn snapshot_rows(state: &AppState, empty: &str) -> String {
     use evertrace_protocol::dto::HumanGovernanceResponse;
     match state.human.as_ref() {
+        Some(HumanGovernanceResponse::Export { result }) => format!(
+            "export: {:?} {} objects / {} bytes {}",
+            result.status,
+            result.object_count,
+            result.total_bytes,
+            result.path.as_deref().unwrap_or("")
+        ),
         Some(HumanGovernanceResponse::Snapshot {
             frontier,
             status,

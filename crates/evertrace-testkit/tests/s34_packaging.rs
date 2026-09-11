@@ -79,6 +79,7 @@ fn cli_help_succeeds_without_config_or_daemon_and_lists_available_commands() {
                 "upgrade",
                 "backup create",
                 "backup verify BACKUP_JOB_ID",
+                "export OBJECT_REF",
                 "restore BACKUP_PATH",
                 "mcp [--host-executable",
                 "--host-config",
@@ -88,7 +89,6 @@ fn cli_help_succeeds_without_config_or_daemon_and_lists_available_commands() {
             ] {
                 assert!(text.contains(entry), "missing {entry}: {text}");
             }
-            assert!(!text.contains("export"), "{text}");
         }
     }
     assert!(!paths.data_root.exists());
@@ -291,6 +291,213 @@ async fn cli_backup_queues_real_daemon_jobs_and_reports_completion_separately() 
             );
         }
     }
+}
+
+#[tokio::test]
+async fn protected_export_cli_and_system_publish_complete_cas() {
+    use evertrace_domain::ids::RequestId;
+    use evertrace_protocol::{
+        command::Command as Rpc,
+        dto::{
+            ClientKind, HumanExportStatus, HumanGovernanceRequest, HumanGovernanceResponse,
+            HumanReadRequest, HumanSurface,
+        },
+        response::Response,
+    };
+    use std::time::Duration;
+    let (_root, paths, initial) = fixture();
+    let mut settings = initial.config().clone();
+    settings.capture.preview_bytes = 256;
+    settings.capture.inline_payload_bytes = 1024;
+    fs::write(
+        &paths.config,
+        EffectiveConfig::new(settings).unwrap().to_toml().unwrap(),
+    )
+    .unwrap();
+    install_offline(&paths, false).unwrap();
+    let secret = "sk-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv";
+    let text = format!(
+        "{} token={secret} export-tail",
+        "complete protected export ".repeat(4000)
+    );
+    let native = serde_json::json!({"cwd":paths.data_root,"hook_event_name":"PreToolUse","model":"test","permission_mode":"default","session_id":"export-source","tool_input":{"command":text},"tool_name":"Bash","tool_use_id":"one","transcript_path":null,"turn_id":"one"});
+    invoke(&paths, &serde_json::to_vec(&native).unwrap());
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut daemon = Daemon(
+        Command::new(&paths.daemon)
+            .arg("--config")
+            .arg(&paths.config)
+            .env_clear()
+            .env("HOME", paths.data_root.parent().unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !package_health(socket.clone()).await {
+        assert!(tokio::time::Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut client = evertrace_protocol::LocalClient::connect(
+        &socket,
+        "export-test",
+        ClientKind::Cli,
+        Duration::from_secs(35),
+    )
+    .await
+    .unwrap();
+    let (snapshot, index) = loop {
+        let Response::HumanGovernance(snapshot) = client
+            .request(
+                RequestId::new_v7(),
+                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                    request: HumanReadRequest::List {
+                        surface: HumanSurface::Explorer,
+                        expected_frontier: None,
+                        after: None,
+                        limit: 64,
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("snapshot");
+        };
+        if let HumanGovernanceResponse::Snapshot { items, .. } = &snapshot
+            && let Some(index) = items
+                .iter()
+                .position(|item| item.object_kind == "source_receipt")
+        {
+            break (snapshot, index);
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let HumanGovernanceResponse::Snapshot {
+        items, frontier, ..
+    } = &snapshot
+    else {
+        unreachable!()
+    };
+    let selected = &items[index];
+    let Response::HumanGovernance(HumanGovernanceResponse::Snapshot { items: details, .. }) =
+        client
+            .request(
+                RequestId::new_v7(),
+                Rpc::HumanGovernance(HumanGovernanceRequest::Read {
+                    request: HumanReadRequest::Detail {
+                        surface: HumanSurface::Explorer,
+                        object_ref: selected.stable_key.clone(),
+                        expected_frontier: *frontier,
+                        expected_revision_ref: selected.revision_ref.clone(),
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+    else {
+        panic!("source detail");
+    };
+    let evidence = details[0].evidence_detail.as_ref().unwrap();
+    let cas = evertrace_capture::CasStore::open_existing(paths.data_root.join("cas")).unwrap();
+    let digest = evertrace_capture::CasStore::parse_digest(&evidence.cas_ref).unwrap();
+    let protected = cas.read(&digest).unwrap();
+    assert!(protected.len() > 65_536);
+    let protected_text = String::from_utf8(protected).unwrap();
+    assert!(!protected_text.contains(secret));
+    let output = Command::new(&paths.cli)
+        .arg("--config")
+        .arg(&paths.config)
+        .arg("export")
+        .arg(&selected.stable_key)
+        .env_clear()
+        .env("HOME", paths.data_root.parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let cli_result: evertrace_protocol::dto::HumanExportResult =
+        serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cli_result.status, HumanExportStatus::Published);
+    let verify = |result: &evertrace_protocol::dto::HumanExportResult| {
+        let directory = std::path::Path::new(result.path.as_ref().unwrap());
+        assert!(directory.starts_with(paths.data_root.join("exports")));
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let file = directory.join("01-object.md");
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let document = fs::read_to_string(file).unwrap();
+        assert!(document.contains(&protected_text));
+        assert!(document.contains("export-tail"));
+        assert!(!document.contains(secret));
+        assert_eq!(document.len() as u64, result.total_bytes);
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+    };
+    verify(&cli_result);
+    let mut app = evertrace_tui::App::new();
+    app.dispatch(evertrace_tui::UiCommand::Navigate(
+        evertrace_tui::Route::Explorer,
+    ));
+    app.handle(evertrace_tui::AppEvent::HumanRead {
+        surface: HumanSurface::Explorer,
+        locator: evertrace_tui::HumanReadLocator::List,
+        response: snapshot,
+    });
+    for _ in 0..index {
+        app.dispatch(evertrace_tui::UiCommand::SelectNext);
+    }
+    app.dispatch(evertrace_tui::UiCommand::ToggleExportSelection);
+    app.dispatch(evertrace_tui::UiCommand::Navigate(
+        evertrace_tui::Route::System,
+    ));
+    assert_eq!(
+        app.dispatch(evertrace_tui::UiCommand::ExportSelection),
+        evertrace_tui::UiCommand::ExportSelection
+    );
+    let request = app.take_export_request().unwrap();
+    let Response::HumanGovernance(response @ HumanGovernanceResponse::Export { .. }) = client
+        .request(RequestId::new_v7(), Rpc::HumanGovernance(request.clone()))
+        .await
+        .unwrap()
+    else {
+        panic!("export");
+    };
+    app.handle(evertrace_tui::AppEvent::HumanAction(response));
+    let system_result = app.state().export_result.as_ref().unwrap();
+    assert_eq!(system_result.status, HumanExportStatus::Published);
+    assert_ne!(system_result.path, cli_result.path);
+    verify(system_result);
+    // The same real daemon path rejects a corrupt CAS rather than publishing a preview.
+    fs::write(cas.blob_path(&digest), b"corrupt").unwrap();
+    let Response::HumanGovernance(HumanGovernanceResponse::Export { result }) = client
+        .request(RequestId::new_v7(), Rpc::HumanGovernance(request))
+        .await
+        .unwrap()
+    else {
+        panic!("export");
+    };
+    assert_eq!(result.status, HumanExportStatus::Failed);
+    assert!(result.path.is_none());
+    assert_eq!(
+        fs::read_dir(paths.data_root.join("exports"))
+            .unwrap()
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

@@ -27,6 +27,9 @@ pub enum Command {
         live_canary: bool,
     },
     Uninstall,
+    Export {
+        refs: Vec<String>,
+    },
     BackupCreate,
     BackupVerify {
         backup_job_id: evertrace_domain::ids::JobId,
@@ -71,6 +74,19 @@ impl Args {
         };
         let command = if command == "--help" || command == "help" {
             Command::Help
+        } else if command == "export" {
+            let refs = values
+                .by_ref()
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| "export requires UTF-8 object refs")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if refs.is_empty() || refs.len() > 64 {
+                return Err("export requires 1 to 64 object refs");
+            }
+            Command::Export { refs }
         } else if command == "backup" {
             match values.next().as_deref().and_then(|value| value.to_str()) {
                 Some("create") => Command::BackupCreate,
@@ -279,6 +295,7 @@ Commands:
   upgrade [--check PACKAGE_DIRECTORY [--live-host CODEX_EXECUTABLE]]
   upgrade PACKAGE_DIRECTORY --live-host CODEX_EXECUTABLE
   backup create
+  export OBJECT_REF [OBJECT_REF ...] (1 to 64 selected current objects)
   backup verify BACKUP_JOB_ID
   restore BACKUP_PATH
   mcp [--host-executable ABSOLUTE_CODEX_EXECUTABLE --host-config ABSOLUTE_CONFIG_PATH]
@@ -298,6 +315,13 @@ mod tests {
     #[test]
     fn help_and_backup_commands_require_exact_arguments() {
         let parse = |args: &[&str]| Args::parse(args.iter().map(OsString::from));
+        assert_eq!(
+            parse(&["export", "first", "second"]).unwrap().command,
+            Command::Export {
+                refs: vec!["first".into(), "second".into()]
+            }
+        );
+        assert!(parse(&["export"]).is_err());
         for help in ["help", "--help"] {
             assert_eq!(parse(&[help]).unwrap().command, Command::Help);
             assert_eq!(

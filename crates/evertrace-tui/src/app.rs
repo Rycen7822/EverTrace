@@ -33,6 +33,23 @@ impl App {
         &self.state
     }
 
+    pub fn take_export_request(
+        &mut self,
+    ) -> Option<evertrace_protocol::dto::HumanGovernanceRequest> {
+        if self.state.route != crate::Route::System
+            || self.state.write_queued
+            || self.state.export_selections.is_empty()
+        {
+            return None;
+        }
+        self.state.write_queued = true;
+        self.state.export_result = None;
+        self.state.export_pending = true;
+        Some(evertrace_protocol::dto::HumanGovernanceRequest::Export {
+            selections: self.state.export_selections.clone(),
+        })
+    }
+
     pub fn handle(&mut self, event: AppEvent) -> UiCommand {
         match event {
             AppEvent::Key(key) if self.state.repository_purge_confirmation.is_some() => {
@@ -223,7 +240,11 @@ impl App {
                         ));
                         UiCommand::None
                     }
-                    (_, HumanGovernanceResponse::Action { .. }) => UiCommand::None,
+                    (
+                        _,
+                        HumanGovernanceResponse::Action { .. }
+                        | HumanGovernanceResponse::Export { .. },
+                    ) => UiCommand::None,
                 }
             }
             AppEvent::HumanAction(response) => {
@@ -231,6 +252,12 @@ impl App {
                     HumanActionResult, HumanActionStatus, HumanGovernanceResponse,
                 };
                 let result = match response {
+                    HumanGovernanceResponse::Export { result } => {
+                        self.state.export_result = Some(result);
+                        self.state.export_pending = false;
+                        self.state.write_queued = false;
+                        return UiCommand::None;
+                    }
                     HumanGovernanceResponse::Action { result } => result,
                     HumanGovernanceResponse::Conflict {
                         current_revision_ref,
@@ -275,6 +302,17 @@ impl App {
                 UiCommand::None
             }
             AppEvent::Disconnected => {
+                if self.state.export_pending {
+                    self.state.export_result = Some(evertrace_protocol::dto::HumanExportResult {
+                        status: evertrace_protocol::dto::HumanExportStatus::PublicationUncertain,
+                        path: None,
+                        frontier: 0,
+                        object_count: self.state.export_selections.len() as u16,
+                        total_bytes: 0,
+                        reason: Some("connection_lost_inspect_exports_before_retrying".into()),
+                    });
+                    self.state.export_pending = false;
+                }
                 self.state.shell.connection = ConnectionState::Disconnected;
                 if !is_config_editor(&self.state) {
                     self.state.proposal_edit = None;
@@ -695,6 +733,41 @@ impl App {
                     self.state.last_action = Some(local_unavailable("backup_create_unavailable"));
                 }
             }
+            UiCommand::ToggleExportSelection => {
+                if self.state.route == crate::Route::Explorer
+                    && let Some(item) =
+                        self.state
+                            .detail
+                            .as_ref()
+                            .or_else(|| match self.state.human.as_ref() {
+                                Some(
+                                    evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
+                                        items,
+                                        ..
+                                    },
+                                ) => items.get(self.state.selection),
+                                _ => None,
+                            })
+                {
+                    let reference = item.stable_key.clone();
+                    if let Some(index) = self
+                        .state
+                        .export_selections
+                        .iter()
+                        .position(|selected| selected.object_ref == reference)
+                    {
+                        self.state.export_selections.remove(index);
+                    } else if self.state.export_selections.len() < 64 {
+                        self.state.export_selections.push(
+                            evertrace_protocol::dto::HumanExportSelection {
+                                object_ref: reference,
+                                expected_revision_ref: item.revision_ref.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            UiCommand::ExportSelection => {}
             UiCommand::PrepareCollectGarbage => {
                 if self.state.write_queued {
                     self.state.last_action = Some(local_transport_error());
@@ -1449,6 +1522,16 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => app.state.last_action = Some(local_transport_error()),
                 }
             }
+            if command == UiCommand::ExportSelection
+                && let Some(request) = app.take_export_request()
+                && ui_commands
+                    .try_send(client::ClientCommand::Human(request))
+                    .is_err()
+            {
+                app.state.write_queued = false;
+                app.state.export_pending = false;
+                app.state.last_action = Some(local_transport_error());
+            }
             if command == UiCommand::ConfirmProposal
                 && let Some((expected_frontier, action, _)) =
                     app.state.proposal_confirmation.clone()
@@ -2168,6 +2251,43 @@ fn spawn_input(events: AppEventSender, stop: Arc<AtomicBool>) -> tokio::task::Jo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_disconnect_reports_unknown_and_does_not_retry() {
+        let mut app = App::new();
+        app.state.route = crate::Route::System;
+        app.state
+            .export_selections
+            .push(evertrace_protocol::dto::HumanExportSelection {
+                object_ref: "selected".into(),
+                expected_revision_ref: None,
+            });
+        assert!(app.take_export_request().is_some());
+        assert!(app.take_export_request().is_none());
+        assert_eq!(app.handle(AppEvent::Disconnected), UiCommand::None);
+        let result = app.state.export_result.as_ref().unwrap();
+        assert_eq!(
+            result.status,
+            evertrace_protocol::dto::HumanExportStatus::PublicationUncertain
+        );
+        assert!(result.path.is_none());
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("connection_lost_inspect_exports_before_retrying")
+        );
+        let request = app.take_export_request().unwrap();
+        app.handle(client::local_human_rejection(&request, "local_busy"));
+        assert!(!app.state.export_pending);
+        assert!(!app.state.write_queued);
+        app.handle(AppEvent::Disconnected);
+        let result = app.state.export_result.as_ref().unwrap();
+        assert_eq!(
+            result.status,
+            evertrace_protocol::dto::HumanExportStatus::Failed
+        );
+        assert_eq!(result.reason.as_deref(), Some("local_busy"));
+        assert!(result.path.is_none());
+    }
     use evertrace_domain::ids::{
         AtomId, AttemptId, CaptureReceiptId, CompetingAttemptGroupId, ExecutionLaneId, JobId,
         RecoveryBundleId, RevisionProposalId, WorktreeId,

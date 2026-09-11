@@ -224,6 +224,9 @@ pub enum HumanActionRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceRequest {
+    Export {
+        selections: Vec<HumanExportSelection>,
+    },
     Read {
         request: HumanReadRequest,
     },
@@ -231,6 +234,34 @@ pub enum HumanGovernanceRequest {
         expected_frontier: u64,
         action: HumanActionRequest,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanExportSelection {
+    pub object_ref: String,
+    pub expected_revision_ref: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanExportStatus {
+    Published,
+    PublicationUncertain,
+    Conflict,
+    Denied,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanExportResult {
+    pub status: HumanExportStatus,
+    pub path: Option<String>,
+    pub frontier: u64,
+    pub object_count: u16,
+    pub total_bytes: u64,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -825,6 +856,9 @@ pub struct HumanActionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanGovernanceResponse {
+    Export {
+        result: HumanExportResult,
+    },
     Snapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostics: Option<Box<HumanDiagnostics>>,
@@ -846,6 +880,14 @@ pub enum HumanGovernanceResponse {
 impl HumanGovernanceRequest {
     pub fn validate(&self) -> bool {
         match self {
+            Self::Export { selections } => {
+                !selections.is_empty()
+                    && selections.len() <= 64
+                    && selections.iter().all(|item| {
+                        valid_ref(&item.object_ref)
+                            && item.expected_revision_ref.as_deref().is_none_or(valid_ref)
+                    })
+            }
             Self::Read { request } => request.validate(),
             Self::Act { action, .. } => action.validate(),
         }
@@ -1069,6 +1111,18 @@ impl HumanDiagnostics {
 impl HumanGovernanceResponse {
     pub fn validate(&self) -> bool {
         match self {
+            Self::Export { result } => {
+                result.object_count <= 64
+                    && result
+                        .path
+                        .as_ref()
+                        .is_none_or(|path| path.len() <= 4096 && path.starts_with('/'))
+                    && result.reason.as_deref().is_none_or(valid_ref)
+                    && (!matches!(
+                        result.status,
+                        HumanExportStatus::Published | HumanExportStatus::PublicationUncertain
+                    ) || result.path.is_some())
+            }
             Self::Snapshot {
                 diagnostics,
                 status,
