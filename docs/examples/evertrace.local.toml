@@ -1,0 +1,10 @@
+# Local first-run configuration / 首次本地试用配置。
+# No background model calls until llm.enabled is explicitly changed.
+# 在明确启用 llm.enabled 前，不调用后台模型。
+config_version = 1
+
+[runtime]
+data_dir = "~/.local/share/evertrace-trial"
+
+[llm]
+enabled = false
