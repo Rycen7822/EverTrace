@@ -26,6 +26,10 @@ Hook 是同步、轻量的采集入口，不打开 LanceDB，不等待后台 LLM
 
 The Hook is a synchronous capture entry point. It does not open LanceDB, wait for background LLM work, or inject memory bodies into the host. The daemon owns ingestion, interpretation, background work, access checks and writes. User interfaces use the daemon rather than independent database writers.
 
+后台模型复用 Engine 的单一 `SemanticProvider`，显式选择 Chat Completions、Responses 或 Messages 的 wire 格式；共用 HTTP、并发、预算和业务 JSON 校验。协议差异不进入领域对象、持久化 schema、Hook 或 MCP 操作面；不增加 SDK、模型路由器、自动提供方回退或远程会话。配置与兼容限制见[后台模型](configuration.md#后台模型--background-model)。
+
+Background models share the Engine's `SemanticProvider`: explicit Chat Completions, Responses or Messages wire formats, with common HTTP, concurrency, budgets and application validation. Protocol differences do not enter domain objects, storage schemas, Hook or MCP actions. No SDK, model router, automatic provider fallback or remote conversation is added; see the [configuration guide](configuration.md#后台模型--background-model).
+
 ## 模块职责 / Component responsibilities
 
 | Crate | 职责 / Responsibility |

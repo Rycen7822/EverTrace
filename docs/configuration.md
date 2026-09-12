@@ -47,9 +47,25 @@ See the [full example](../config/evertrace.example.toml) for fields/defaults and
 
 ## 后台模型 / Background model
 
-当前提供方实现为 `openai_compatible`：在 `base_url` 后追加 `/chat/completions`，发送非流式、`response_format=json_object` 的请求。提供方必须兼容实际请求和结构化响应要求；“兼容”名称不保证所有模型都能工作。把 `base_url` 设置到 API 根，例如以 `/v1` 结尾，而不是完整的 `/chat/completions` 路径。
+后台 LLM 在同一个有界客户端中支持以下三种协议。`provider` 显式选择协议，不自动识别、不在失败后切换提供方。`base_url` 填 API 根地址（通常以 `/v1` 结尾），不要包含表中的接口后缀；模型名必须是该服务实际支持的 ID。
 
-The implemented provider is `openai_compatible`: it appends `/chat/completions` to `base_url` and sends non-streaming requests with `response_format=json_object`. The provider/model must support the actual request and structured response contract. Use the API base, such as a `/v1` endpoint, not the full completion URL.
+One bounded background client supports three protocols. Select one explicitly with `provider`; there is no auto-detection or cross-provider fallback. Set `base_url` to the API root, usually ending in `/v1`, without the endpoint suffix below. Use a model ID supported by that service.
+
+HTTP 重定向被拒绝，避免自定义认证头泄漏到其他地址；请填写最终 API 根地址。HTTP redirects are rejected to prevent credential forwarding; configure the final API base URL.
+
+| `provider` | 追加路径 / Appended path | 官方根地址示例 / Official base example | 认证 / Authentication |
+|---|---|---|---|
+| `openai_compatible` | `/chat/completions` | `https://api.openai.com/v1` | Bearer API key |
+| `openai_responses` | `/responses` | `https://api.openai.com/v1` | Bearer API key |
+| `anthropic` | `/messages` | `https://api.anthropic.com/v1` | `x-api-key` + `anthropic-version: 2023-06-01` |
+
+三种协议都使用非流式、无工具调用的单次请求，共享现有超时、并发、访问复验和预算。Chat Completions 使用 `response_format=json_object`；Responses 使用 `text.format=json_object`、`max_output_tokens` 和 `store=false`，不建立远程会话，仅解析 completed 输出中的文本，忽略 reasoning 项。Anthropic 使用顶层 `system`、用户消息和必填 `max_tokens`，通过提示词要求纯 JSON，不开启扩展思考或依赖模型专属 structured-output 功能；只接受正常 `end_turn` 文本。新增 Responses/Messages 适配会拒绝协议中的 refusal、工具调用和截断状态；三种协议均要求合法 usage 和业务 JSON，失败不写入有效记忆。Anthropic 输入预算计入 input、cache creation 和 cache read tokens；不是按缓存折扣计算账单。
+
+All protocols use non-streaming, tool-free requests with shared timeout, concurrency, permission revalidation and budgets. Chat Completions uses JSON mode. Responses uses `text.format=json_object`, `max_output_tokens` and `store=false`, without remote conversation state; only completed text output is consumed, not reasoning items. Messages uses top-level `system` and required `max_tokens`, requests plain JSON via instructions, and accepts only normal `end_turn` text; extended thinking and model-specific structured-output features are not enabled. The new Responses/Messages adapters reject protocol refusals, tool calls and truncation. All three require valid usage and business JSON before accepting memory. Messages input accounting includes cache creation/read tokens, without pricing discounts.
+
+协议依据：[OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)、[OpenAI JSON mode](https://developers.openai.com/api/docs/guides/structured-outputs)、[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)、[Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)。`config check` 不访问远端；兼容网关与模型仍须支持所选协议和 JSON 输出，文档及本地 mock 验证不等于真实服务连通性验证。
+
+The linked official specifications define these wire formats. `config check` does not contact the provider. Gateways/models must support the selected protocol and JSON output; documentation and local mock verification do not prove live-service connectivity.
 
 下面只展示需要修改的 `[llm]` 段，不是含密钥的完整配置。保留原有 `config_version` 和其他段，替换占位地址与模型名后再校验。
 
@@ -58,7 +74,9 @@ The following is an `[llm]` section to merge into your existing configuration, n
 ```toml
 [llm]
 enabled = true
+# Choose / 三选一: openai_compatible, openai_responses, anthropic.
 provider = "openai_compatible"
+# API root only / 填 API 根地址，不含 /chat/completions、/responses 或 /messages。
 base_url = "https://your-provider.example/v1"
 model = "your-model-name"
 api_key_env = "EVERTRACE_LLM_API_KEY"

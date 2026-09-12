@@ -23,9 +23,9 @@ use evertrace_store::{
 
 use crate::{
     provider::{
-        OpenAiCompatibleProvider, ProtectedDeltaItem, ProtectedDeltaKind, ProtectedSemanticInput,
-        ProviderAtomOperation, ProviderError, ProviderProcedureOperation,
-        ProviderSemanticApplication, ProviderSemanticCandidate, SEMANTIC_SCHEMA_VERSION,
+        ProtectedDeltaItem, ProtectedDeltaKind, ProtectedSemanticInput, ProviderAtomOperation,
+        ProviderError, ProviderProcedureOperation, ProviderSemanticApplication,
+        ProviderSemanticCandidate, SEMANTIC_SCHEMA_VERSION, SemanticProvider,
         canonical_prompt_hash,
     },
     semantic::{
@@ -160,7 +160,7 @@ pub enum SynthesisResolution {
 #[derive(Clone)]
 pub struct SynthesisPlanner {
     pub(crate) llm: LlmConfig,
-    pub(crate) provider: Option<OpenAiCompatibleProvider>,
+    pub(crate) provider: Option<SemanticProvider>,
     prompt_hash: [u8; 32],
     concurrency: std::sync::Arc<crate::provider::ProviderConcurrency>,
     pub(crate) inventory: Option<super::InventoryWorker>,
@@ -170,8 +170,7 @@ impl SynthesisPlanner {
     pub fn new(llm: LlmConfig) -> Self {
         let concurrency = crate::provider::ProviderConcurrency::new(llm.max_concurrency);
         let provider =
-            OpenAiCompatibleProvider::with_concurrency(&llm, std::sync::Arc::clone(&concurrency))
-                .ok();
+            SemanticProvider::with_concurrency(&llm, std::sync::Arc::clone(&concurrency)).ok();
         Self {
             llm,
             provider,
@@ -190,7 +189,7 @@ impl SynthesisPlanner {
         &self,
         llm: LlmConfig,
     ) -> Result<Self, crate::provider::ProviderError> {
-        let provider = match OpenAiCompatibleProvider::with_concurrency(
+        let provider = match SemanticProvider::with_concurrency(
             &llm,
             std::sync::Arc::clone(&self.concurrency),
         ) {

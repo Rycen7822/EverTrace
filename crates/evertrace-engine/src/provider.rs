@@ -227,8 +227,9 @@ pub struct ProviderDerivation {
 }
 
 #[derive(Clone)]
-pub struct OpenAiCompatibleProvider {
+pub struct SemanticProvider {
     client: reqwest::Client,
+    protocol: WireProtocol,
     endpoint: String,
     model: String,
     api_key_env: String,
@@ -236,6 +237,13 @@ pub struct OpenAiCompatibleProvider {
     timeout: Duration,
     max_output_tokens: u64,
     max_input_tokens: u64,
+}
+
+#[derive(Clone, Copy)]
+enum WireProtocol {
+    ChatCompletions,
+    Responses,
+    Messages,
 }
 
 pub(crate) struct ProviderConcurrency {
@@ -296,6 +304,79 @@ mod concurrency_tests {
     use super::*;
 
     #[tokio::test]
+    async fn messages_credentials_do_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{address}/forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let cfg = LlmConfig {
+            provider: "anthropic".into(),
+            base_url: evertrace_domain::config::ValidatedBaseUrl::parse(&format!(
+                "http://{address}/v1"
+            ))
+            .unwrap(),
+            api_key_env: "PATH".into(),
+            ..LlmConfig::default()
+        };
+        let client = SemanticProvider::new(&cfg).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.complete_json("JSON", "{}".into(), Some(32), &|| async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(ProviderError::NonSuccess));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn wire_output_rejects_refusal_tools_missing_usage_and_overflow() {
+        let responses = serde_json::json!({
+            "status":"completed", "output":[{"type":"message","role":"assistant",
+                "status":"completed","content":[{"type":"output_text","text":"{}"}]}],
+            "usage":{"input_tokens":1,"output_tokens":2}
+        });
+        let messages = serde_json::json!({
+            "type":"message","role":"assistant","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"{}"}],
+            "usage":{"input_tokens":1,"output_tokens":2}
+        });
+        for (protocol, mut value) in [
+            (WireProtocol::Responses, responses.clone()),
+            (WireProtocol::Messages, messages.clone()),
+        ] {
+            value["usage"] = serde_json::Value::Null;
+            assert_eq!(
+                response_content(protocol, &value),
+                Err(ProviderError::Schema)
+            );
+        }
+        let mut refused = responses;
+        refused["output"][0]["content"][0]["type"] = "refusal".into();
+        assert_eq!(
+            response_content(WireProtocol::Responses, &refused),
+            Err(ProviderError::Schema)
+        );
+        let mut tool = messages.clone();
+        tool["content"][0]["type"] = "tool_use".into();
+        assert_eq!(
+            response_content(WireProtocol::Messages, &tool),
+            Err(ProviderError::Schema)
+        );
+        let mut overflow = messages;
+        overflow["usage"]["cache_read_input_tokens"] = u64::MAX.into();
+        assert_eq!(
+            response_content(WireProtocol::Messages, &overflow),
+            Err(ProviderError::Schema)
+        );
+    }
+
+    #[tokio::test]
     async fn changed_limit_keeps_existing_requests_in_the_same_count() {
         let pool = ProviderConcurrency::new(2);
         let first = pool.acquire().await;
@@ -345,7 +426,7 @@ pub enum ProviderError {
     Schema,
 }
 
-impl OpenAiCompatibleProvider {
+impl SemanticProvider {
     pub fn new(config: &LlmConfig) -> Result<Self, ProviderError> {
         Self::with_concurrency(config, ProviderConcurrency::new(config.max_concurrency))
     }
@@ -354,19 +435,25 @@ impl OpenAiCompatibleProvider {
         config: &LlmConfig,
         concurrency: Arc<ProviderConcurrency>,
     ) -> Result<Self, ProviderError> {
-        if !config.enabled || config.provider != "openai_compatible" {
+        if !config.enabled {
             return Err(ProviderError::Disabled);
         }
-        let endpoint = format!(
-            "{}/chat/completions",
-            config.base_url.as_str().trim_end_matches('/')
-        );
+        let (protocol, path) = match config.provider.as_str() {
+            "openai_compatible" => (WireProtocol::ChatCompletions, "chat/completions"),
+            "openai_responses" => (WireProtocol::Responses, "responses"),
+            "anthropic" => (WireProtocol::Messages, "messages"),
+            _ => return Err(ProviderError::Disabled),
+        };
+        let endpoint = format!("{}/{path}", config.base_url.as_str().trim_end_matches('/'));
         let client = reqwest::Client::builder()
+            // Custom authentication headers must never follow redirects to another origin.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(config.timeout.seconds().min(30)))
             .build()
             .map_err(|_| ProviderError::Transport)?;
         Ok(Self {
             client,
+            protocol,
             endpoint,
             model: config.model.clone(),
             api_key_env: config.api_key_env.clone(),
@@ -431,9 +518,9 @@ impl OpenAiCompatibleProvider {
                 admission,
             )
             .await?;
-        let (content, input_tokens, output_tokens) = response_content(&envelope)?;
+        let (content, input_tokens, output_tokens) = response_content(self.protocol, &envelope)?;
         let mut application_json: serde_json::Value =
-            serde_json::from_str(content).map_err(|_| ProviderError::Schema)?;
+            serde_json::from_str(&content).map_err(|_| ProviderError::Schema)?;
         let candidates = application_json
             .get_mut("candidates")
             .and_then(serde_json::Value::as_array_mut)
@@ -476,7 +563,7 @@ impl OpenAiCompatibleProvider {
         )
         .await
         .map_err(|_| ProviderError::Timeout)??;
-        let (content, input_tokens, output_tokens) = response_content(&envelope)?;
+        let (content, input_tokens, output_tokens) = response_content(self.protocol, &envelope)?;
         #[derive(Deserialize)]
         #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
         enum Review {
@@ -485,7 +572,7 @@ impl OpenAiCompatibleProvider {
                 content: Box<ProviderProcedureContent>,
             },
         }
-        let content = match serde_json::from_str(content).map_err(|_| ProviderError::Schema)? {
+        let content = match serde_json::from_str(&content).map_err(|_| ProviderError::Schema)? {
             Review::NoOp => None,
             Review::Revise { content } => Some(*content),
         };
@@ -509,7 +596,7 @@ impl OpenAiCompatibleProvider {
         )
         .await
         .map_err(|_| ProviderError::Timeout)??;
-        let (content, input_tokens, output_tokens) = response_content(&envelope)?;
+        let (content, input_tokens, output_tokens) = response_content(self.protocol, &envelope)?;
         #[derive(Deserialize)]
         #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
         enum Proposal {
@@ -519,7 +606,7 @@ impl OpenAiCompatibleProvider {
                 direct_refs: Vec<String>,
             },
         }
-        let value = match serde_json::from_str(content).map_err(|_| ProviderError::Schema)? {
+        let value = match serde_json::from_str(&content).map_err(|_| ProviderError::Schema)? {
             Proposal::NoOp => None,
             Proposal::Create {
                 content,
@@ -544,19 +631,31 @@ impl OpenAiCompatibleProvider {
             .ok()
             .filter(|value| !value.is_empty())
             .ok_or(ProviderError::MissingSecret)?;
-        let mut request = serde_json::json!({
-            "model": self.model,
-            "stream": false,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": input_json}
-            ]
-        });
-        if let Some(limit) = max_output_tokens {
-            request["max_tokens"] = limit.into();
-        }
+        let limit = max_output_tokens.unwrap_or(self.max_output_tokens);
+        let request = match self.protocol {
+            WireProtocol::ChatCompletions => serde_json::json!({
+                "model": self.model,
+                "stream": false,
+                "temperature": 0,
+                "max_tokens": limit,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": input_json}
+                ]
+            }),
+            WireProtocol::Responses => serde_json::json!({
+                "model": self.model, "stream": false, "store": false,
+                "instructions": format!("{prompt}\nReturn only a JSON object, without Markdown fences."), "input": input_json,
+                "text": {"format": {"type": "json_object"}},
+                "max_output_tokens": limit
+            }),
+            WireProtocol::Messages => serde_json::json!({
+                "model": self.model, "stream": false, "max_tokens": limit,
+                "system": format!("{prompt}\nReturn only a JSON object, without Markdown fences."),
+                "messages": [{"role": "user", "content": input_json}]
+            }),
+        };
         let encoded = serde_json::to_vec(&request).map_err(|_| ProviderError::Schema)?;
         if encoded.len() > PROVIDER_REQUEST_MAX_BYTES
             || encoded.len() as u64 > self.max_input_tokens
@@ -566,10 +665,14 @@ impl OpenAiCompatibleProvider {
         let _permit = self.concurrency.acquire().await;
         // A source permission may have changed while waiting for the shared slot.
         admission().await?;
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(secret)
+        let request = self.client.post(&self.endpoint);
+        let request = match self.protocol {
+            WireProtocol::Messages => request
+                .header("x-api-key", secret)
+                .header("anthropic-version", "2023-06-01"),
+            _ => request.bearer_auth(secret),
+        };
+        let response = request
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(encoded)
             .send()
@@ -600,26 +703,98 @@ impl OpenAiCompatibleProvider {
     }
 }
 
-fn response_content(envelope: &serde_json::Value) -> Result<(&str, u64, u64), ProviderError> {
-    let content = envelope
-        .get("choices")
-        .and_then(|value| value.as_array())
-        .filter(|choices| choices.len() == 1)
-        .and_then(|choices| choices[0].get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_str())
-        .ok_or(ProviderError::Schema)?;
+fn response_content(
+    protocol: WireProtocol,
+    envelope: &serde_json::Value,
+) -> Result<(String, u64, u64), ProviderError> {
+    let content = match protocol {
+        WireProtocol::ChatCompletions => envelope
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .filter(|choices| choices.len() == 1)
+            .and_then(|choices| choices[0].get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .ok_or(ProviderError::Schema)?
+            .to_owned(),
+        WireProtocol::Responses => {
+            if envelope["status"] != "completed" || !envelope["error"].is_null() {
+                return Err(ProviderError::Schema);
+            }
+            let items = envelope["output"].as_array().ok_or(ProviderError::Schema)?;
+            let mut text = String::new();
+            for item in items {
+                match item["type"].as_str() {
+                    Some("reasoning") => continue, // Never expose or persist reasoning blocks.
+                    Some("message")
+                        if item["role"] == "assistant" && item["status"] == "completed" =>
+                    {
+                        append_text_blocks(&mut text, &item["content"], "output_text")?;
+                    }
+                    _ => return Err(ProviderError::Schema),
+                }
+            }
+            text
+        }
+        WireProtocol::Messages => {
+            if envelope["type"] != "message"
+                || envelope["role"] != "assistant"
+                || envelope["stop_reason"] != "end_turn"
+                || envelope["stop_details"]["type"] == "refusal"
+            {
+                return Err(ProviderError::Schema);
+            }
+            let mut text = String::new();
+            append_text_blocks(&mut text, &envelope["content"], "text")?;
+            text
+        }
+    };
     if content.len() > PROVIDER_RESPONSE_MAX_BYTES {
         return Err(ProviderError::ResponseOversize);
     }
     let usage = envelope.get("usage").ok_or(ProviderError::Schema)?;
-    let input_tokens = usage
-        .get("prompt_tokens")
+    let (input_key, output_key) = match protocol {
+        WireProtocol::ChatCompletions => ("prompt_tokens", "completion_tokens"),
+        _ => ("input_tokens", "output_tokens"),
+    };
+    let mut input_tokens = usage
+        .get(input_key)
         .and_then(serde_json::Value::as_u64)
         .ok_or(ProviderError::Schema)?;
     let output_tokens = usage
-        .get("completion_tokens")
+        .get(output_key)
         .and_then(serde_json::Value::as_u64)
         .ok_or(ProviderError::Schema)?;
+    if matches!(protocol, WireProtocol::Messages) {
+        // Messages reports cached input separately; include it once in our input budget.
+        for key in ["cache_creation_input_tokens", "cache_read_input_tokens"] {
+            if let Some(value) = usage.get(key) {
+                input_tokens = input_tokens
+                    .checked_add(value.as_u64().ok_or(ProviderError::Schema)?)
+                    .ok_or(ProviderError::Schema)?;
+            }
+        }
+    }
+    if content.is_empty() {
+        return Err(ProviderError::Schema);
+    }
     Ok((content, input_tokens, output_tokens))
+}
+
+fn append_text_blocks(
+    text: &mut String,
+    blocks: &serde_json::Value,
+    expected_type: &str,
+) -> Result<(), ProviderError> {
+    for block in blocks.as_array().ok_or(ProviderError::Schema)? {
+        if block["type"] != expected_type {
+            return Err(ProviderError::Schema);
+        }
+        let part = block["text"].as_str().ok_or(ProviderError::Schema)?;
+        if text.len().saturating_add(part.len()) > PROVIDER_RESPONSE_MAX_BYTES {
+            return Err(ProviderError::ResponseOversize);
+        }
+        text.push_str(part);
+    }
+    Ok(())
 }

@@ -35,9 +35,9 @@ use evertrace_domain::{
 use evertrace_engine::{
     jobs::{SynthesisPlanner, SynthesisRequest, SynthesisResolution},
     provider::{
-        OpenAiCompatibleProvider, ProtectedDeltaItem, ProtectedDeltaKind, ProtectedSemanticInput,
-        ProviderAtomOperation, ProviderAtomValue, ProviderError, ProviderProcedureContent,
-        ProviderProcedureOperation, ProviderSemanticApplication, ProviderSemanticCandidate,
+        ProtectedDeltaItem, ProtectedDeltaKind, ProtectedSemanticInput, ProviderAtomOperation,
+        ProviderAtomValue, ProviderError, ProviderProcedureContent, ProviderProcedureOperation,
+        ProviderSemanticApplication, ProviderSemanticCandidate, SemanticProvider,
         canonical_prompt_hash, canonical_system_prompt,
     },
     semantic::{
@@ -806,7 +806,7 @@ async fn seed_store_with_lifecycle(path: &std::path::Path, lifecycle: EpisodeLif
 async fn openai_compatible_provider_is_single_bounded_strict_boundary() {
     let stub =
         ProviderStub::once(200, response(serde_json::to_value(application()).unwrap())).await;
-    let provider = OpenAiCompatibleProvider::new(&config(&stub.base_url)).unwrap();
+    let provider = SemanticProvider::new(&config(&stub.base_url)).unwrap();
     let result = provider.derive(&input()).await.unwrap();
     assert_eq!(result.application, application());
     assert_eq!((result.input_tokens, result.output_tokens), (17, 5));
@@ -851,12 +851,106 @@ async fn openai_compatible_provider_is_single_bounded_strict_boundary() {
 }
 
 #[tokio::test]
+async fn provider_wire_adapters_preserve_application_and_usage() {
+    let content = serde_json::to_string(&application()).unwrap();
+    for (name, path, envelope, usage) in [
+        (
+            "openai_responses",
+            "responses",
+            serde_json::json!({
+                "status":"completed", "output":[
+                    {"type":"reasoning","summary":[]},
+                    {"type":"message","role":"assistant","status":"completed",
+                     "content":[{"type":"output_text","text":content}]}],
+                "usage":{"input_tokens":17,"output_tokens":5}
+            }),
+            (17, 5),
+        ),
+        (
+            "anthropic",
+            "messages",
+            serde_json::json!({
+                "type":"message", "role":"assistant", "stop_reason":"end_turn",
+                "content":[{"type":"text","text":content}],
+                "usage":{"input_tokens":17,"output_tokens":5,
+                    "cache_creation_input_tokens":3,"cache_read_input_tokens":7}
+            }),
+            (27, 5),
+        ),
+    ] {
+        let stub = ProviderStub::once(200, serde_json::to_vec(&envelope).unwrap()).await;
+        let mut cfg = config(&stub.base_url);
+        cfg.provider = name.into();
+        let result = SemanticProvider::new(&cfg)
+            .unwrap()
+            .derive(&input())
+            .await
+            .unwrap();
+        assert_eq!(result.application, application());
+        assert_eq!((result.input_tokens, result.output_tokens), usage);
+        let raw = stub.finish().await;
+        let split = raw.windows(4).position(|v| v == b"\r\n\r\n").unwrap();
+        let headers = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        assert!(headers.starts_with(&format!("post /v1/{path} http/1.1")));
+        let body: serde_json::Value = serde_json::from_slice(&raw[split + 4..]).unwrap();
+        assert_eq!(body["stream"], false);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("tools").is_none());
+        if name == "anthropic" {
+            assert!(headers.contains("x-api-key: "));
+            assert!(headers.contains("anthropic-version: 2023-06-01"));
+            assert!(!headers.contains("authorization:"));
+            assert!(
+                body["system"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(canonical_system_prompt())
+            );
+            assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(body["messages"][0]["role"], "user");
+            assert_eq!(body["max_tokens"], 4096);
+        } else {
+            assert!(headers.contains("authorization: bearer "));
+            assert!(!headers.contains("x-api-key:"));
+            assert_eq!(body["store"], false);
+            assert_eq!(body["text"]["format"]["type"], "json_object");
+            assert_eq!(body["max_output_tokens"], 4096);
+            assert!(
+                body["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(canonical_system_prompt())
+            );
+            assert!(body["input"].is_string());
+        }
+        // Even valid application JSON must not escape a truncated remote response.
+        let mut truncated = envelope;
+        if name == "anthropic" {
+            truncated["stop_reason"] = "max_tokens".into();
+        } else {
+            truncated["status"] = "incomplete".into();
+        }
+        let stub = ProviderStub::once(200, serde_json::to_vec(&truncated).unwrap()).await;
+        cfg.base_url = ValidatedBaseUrl::parse(&stub.base_url).unwrap();
+        assert_eq!(
+            SemanticProvider::new(&cfg)
+                .unwrap()
+                .derive(&input())
+                .await
+                .unwrap_err(),
+            ProviderError::Schema
+        );
+        stub.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn provider_rejects_non_success_and_authority_injection() {
     let missing = LlmConfig {
         api_key_env: "EVERTRACE_S26_TEST_KEY_MUST_NOT_EXIST".into(),
         ..LlmConfig::default()
     };
-    let provider = OpenAiCompatibleProvider::new(&missing).unwrap();
+    let provider = SemanticProvider::new(&missing).unwrap();
     assert_eq!(
         provider.derive(&input()).await.unwrap_err(),
         ProviderError::MissingSecret
@@ -866,12 +960,12 @@ async fn provider_rejects_non_success_and_authority_injection() {
         ..LlmConfig::default()
     };
     assert!(matches!(
-        OpenAiCompatibleProvider::new(&disabled),
+        SemanticProvider::new(&disabled),
         Err(ProviderError::Disabled)
     ));
 
     let failed = ProviderStub::once(503, b"{}".to_vec()).await;
-    let provider = OpenAiCompatibleProvider::new(&config(&failed.base_url)).unwrap();
+    let provider = SemanticProvider::new(&config(&failed.base_url)).unwrap();
     assert_eq!(
         provider.derive(&input()).await.unwrap_err(),
         ProviderError::NonSuccess
@@ -881,7 +975,7 @@ async fn provider_rejects_non_success_and_authority_injection() {
     let mut injected = serde_json::to_value(application()).unwrap();
     injected["authority"] = serde_json::json!("user_explicit");
     let malformed = ProviderStub::once(200, response(injected)).await;
-    let provider = OpenAiCompatibleProvider::new(&config(&malformed.base_url)).unwrap();
+    let provider = SemanticProvider::new(&config(&malformed.base_url)).unwrap();
     assert_eq!(
         provider.derive(&input()).await.unwrap_err(),
         ProviderError::Schema
@@ -889,7 +983,7 @@ async fn provider_rejects_non_success_and_authority_injection() {
     let _ = malformed.finish().await;
 
     let oversized = ProviderStub::once(200, vec![b'x'; 256 * 1024 + 1]).await;
-    let provider = OpenAiCompatibleProvider::new(&config(&oversized.base_url)).unwrap();
+    let provider = SemanticProvider::new(&config(&oversized.base_url)).unwrap();
     assert_eq!(
         provider.derive(&input()).await.unwrap_err(),
         ProviderError::ResponseOversize
@@ -904,7 +998,7 @@ async fn provider_rejects_non_success_and_authority_injection() {
     .await;
     let mut timeout_config = config(&delayed.base_url);
     timeout_config.timeout = DurationValue::from_seconds(1).unwrap();
-    let provider = OpenAiCompatibleProvider::new(&timeout_config).unwrap();
+    let provider = SemanticProvider::new(&timeout_config).unwrap();
     assert_eq!(
         provider.derive(&input()).await.unwrap_err(),
         ProviderError::Timeout

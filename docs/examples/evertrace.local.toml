@@ -8,3 +8,5 @@ data_dir = "~/.local/share/evertrace-trial"
 
 [llm]
 enabled = false
+# When enabling, choose openai_compatible, openai_responses or anthropic; see ../configuration.md.
+# 启用时按配置指南选择协议，填写 API 根地址、模型和密钥环境变量；不要填完整接口路径。
