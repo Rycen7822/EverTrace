@@ -35,7 +35,11 @@ pub fn resolve_query_anchor(
     }
     match (&binding.anchor, binding.mechanism, &binding.workspace) {
         (Some(anchor), McpScopeMechanism::ExactClaim | McpScopeMechanism::ConnectionScoped, _) => {
-            let active = exact_anchor(snapshot, anchor, binding.mechanism)?;
+            let active = exact_anchor(snapshot, anchor, binding.mechanism).or_else(|| {
+                let mut read = cwd_anchor(snapshot, client_cwd)?;
+                read.session_id = Some(anchor.session_id.clone());
+                Some(read)
+            })?;
             select_workspace(snapshot, active, &binding.workspace)
         }
         (None, McpScopeMechanism::CwdOnly, PublicWorkspace::Active) => {

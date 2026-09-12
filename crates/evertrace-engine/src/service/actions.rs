@@ -326,6 +326,16 @@ impl McpActionService {
         let Some(anchor) = anchor else {
             return Ok(scope_unresolved(request_id));
         };
+        if anchor.task_id.is_none()
+            && binding.anchor.is_some()
+            && (!refs.is_empty()
+                || !matches!(action, McpServiceAction::Search | McpServiceAction::Get)
+                || input == "@due")
+        {
+            return self
+                .passive_work_read(request_id, action, binding, snapshot, input, refs)
+                .await;
+        }
         let scope = McpRequestScope {
             binding,
             anchor,
@@ -571,9 +581,13 @@ fn classify_object_row(
             None,
             None,
         ),
-        Some(
-            JournalPayload::RevisionProposalRecorded(_) | JournalPayload::SemanticDigestRecorded(_),
-        ) => (
+        Some(JournalPayload::RevisionProposalRecorded(_)) => (
+            McpItemPartition::Evidence,
+            ContentTrust::AgentClaim,
+            Some("unaccepted; effectiveness unverified".into()),
+            Some("agent_inferred".into()),
+        ),
+        Some(JournalPayload::SemanticDigestRecorded(_)) => (
             McpItemPartition::Evidence,
             ContentTrust::AgentClaim,
             None,
@@ -590,7 +604,22 @@ fn classify_object_row(
         .task_id
         .clone()
         .or_else(|| row.worktree_id.clone())
-        .or_else(|| row.repository_id.clone());
+        .or_else(|| row.repository_id.clone())
+        .or_else(|| match &payload {
+            Some(JournalPayload::RevisionProposalRecorded(proposal)) => match &proposal.payload {
+                ProposalPayload::Procedure(value) => match value.draft().scope {
+                    evertrace_domain::procedure::ProcedureScope::Repository { repository_id } => {
+                        Some(repository_id.to_string())
+                    }
+                    evertrace_domain::procedure::ProcedureScope::Worktree {
+                        worktree_id, ..
+                    } => Some(worktree_id.to_string()),
+                    evertrace_domain::procedure::ProcedureScope::Global => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        });
     McpServiceItem {
         partition,
         kind: row.object_kind.clone().unwrap_or_else(|| "object".into()),

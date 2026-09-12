@@ -194,7 +194,7 @@ pub(crate) async fn blocked_repositories(
     .await
 }
 
-async fn blocked_repositories_before(
+pub(crate) async fn blocked_repositories_before(
     writer: &crate::WriterHandle,
     ids: BTreeSet<RepositoryId>,
     report: Option<&evertrace_codex::probe::HostProbeReport>,

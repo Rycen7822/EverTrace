@@ -5141,6 +5141,19 @@ fn job_targets_repository(
                     || observation_ids.contains(&last_observation_id)
             }
         }),
+        "procedure_review_v1" => job
+            .target_revision
+            .strip_prefix("procedure_source_v1|")
+            .and_then(|value| value.split_once('|'))
+            .and_then(|(first, last)| {
+                Some((
+                    first.parse::<SourceObservationId>().ok()?,
+                    last.parse::<SourceObservationId>().ok()?,
+                ))
+            })
+            .is_some_and(|(first, last)| {
+                observation_ids.contains(&first) || observation_ids.contains(&last)
+            }),
         "physical_normalization" | "capture_reconciliation" => job
             .target_revision
             .parse::<SourceObservationId>()

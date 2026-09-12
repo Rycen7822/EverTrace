@@ -88,7 +88,29 @@ impl McpActionService {
             || evertrace_domain::config::ProcedureConfig::default().include_probationary,
             |config| config.config().procedure.include_probationary,
         );
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        let method_deadline = std::time::Instant::now()
+            + std::time::Duration::from_micros(context.budget.latency_us_remaining);
+        let methods = crate::jobs::procedure::readable_revisions(
+            &self.writer,
+            &scope.snapshot,
+            scope
+                .binding
+                .repository_report
+                .as_deref()
+                .or(report.as_ref()),
+            self.runtime_snapshot.effective_config_hash,
+            (scope.anchor.repository_id, scope.anchor.worktree_id),
+            None,
+            method_deadline,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
         let found = ProductionSearch::new(self.search_index.clone())
+            .with_method_proposals(methods)
             .with_procedure_revisions(
                 procedure_view.searchable_procedure_revisions(include_probationary),
             )
@@ -183,9 +205,43 @@ impl McpActionService {
                 .difference(&reviewed_candidates)
                 .map(|reference| (*reference).to_owned()),
         );
+        let fresh = self
+            .writer
+            .project()
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        let method_hits = found
+            .candidates
+            .iter()
+            .take(3)
+            .filter(|candidate| {
+                candidate.object_kind.as_deref() == Some("revision_proposal_revision")
+            })
+            .map(|candidate| candidate.candidate_id.clone())
+            .collect();
+        let methods = crate::jobs::procedure::readable_revisions(
+            &self.writer,
+            &fresh,
+            scope
+                .binding
+                .repository_report
+                .as_deref()
+                .or(report.as_ref()),
+            self.runtime_snapshot.effective_config_hash,
+            (scope.anchor.repository_id, scope.anchor.worktree_id),
+            Some(&method_hits),
+            method_deadline,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
         let now = unix_time_us_for_mcp();
         let mut procedure_revisions = Vec::new();
         for candidate in found.candidates.into_iter().take(3) {
+            if candidate.object_kind.as_deref() == Some("revision_proposal_revision")
+                && !methods.contains(&candidate.candidate_id)
+            {
+                continue;
+            }
             if blocked_candidates.contains(candidate.candidate_id.as_str()) {
                 continue;
             }
@@ -589,6 +645,43 @@ impl McpActionService {
             Some(report) => report.read().await.clone(),
             None => None,
         };
+        if row.object_kind.as_deref() == Some("revision_proposal_revision") {
+            let selected = row.current_revision_id.iter().cloned().collect();
+            let fresh = self
+                .writer
+                .project()
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            let methods = crate::jobs::procedure::readable_revisions(
+                &self.writer,
+                &fresh,
+                scope
+                    .binding
+                    .repository_report
+                    .as_deref()
+                    .or(report.as_ref()),
+                self.runtime_snapshot.effective_config_hash,
+                (scope.anchor.repository_id, scope.anchor.worktree_id),
+                Some(&selected),
+                std::time::Instant::now() + std::time::Duration::from_micros(750_000),
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+            if !is_current
+                || !row
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|id| methods.contains(id))
+            {
+                return Ok(empty_result(
+                    request_id,
+                    McpServiceStatus::NotFound,
+                    &scope_label(&scope),
+                    "current",
+                    [],
+                ));
+            }
+        }
         if !self
             .blocked_read_rows(
                 scope

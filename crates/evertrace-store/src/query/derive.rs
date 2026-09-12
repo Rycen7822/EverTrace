@@ -121,6 +121,27 @@ pub(super) fn exact_identifier_row(
     };
     let text = bounded_search_text(id, &semantic);
     let source_ref = id.clone();
+    let (repository_id, worktree_id) = match &payload {
+        JournalPayload::RevisionProposalRecorded(proposal) => match &proposal.payload {
+            evertrace_domain::semantic::ProposalPayload::Procedure(value) => {
+                match value.draft().scope {
+                    evertrace_domain::procedure::ProcedureScope::Repository { repository_id } => {
+                        (Some(repository_id.to_string()), None)
+                    }
+                    evertrace_domain::procedure::ProcedureScope::Worktree {
+                        repository_id,
+                        worktree_id,
+                    } => (
+                        Some(repository_id.to_string()),
+                        Some(worktree_id.to_string()),
+                    ),
+                    evertrace_domain::procedure::ProcedureScope::Global => (None, None),
+                }
+            }
+            _ => (None, None),
+        },
+        _ => (row.repository_id.clone(), row.worktree_id.clone()),
+    };
     Ok(Some(SearchProjectionRow {
         row_id: format!("search:object:{}", row.row_id),
         row_variant: "object".into(),
@@ -139,11 +160,19 @@ pub(super) fn exact_identifier_row(
         object_kind: row.object_kind.clone(),
         currentness: Some(if is_current { "current" } else { "historical" }.into()),
         lifecycle: Some(normalized_lifecycle(row.lifecycle.as_deref()).into()),
-        epistemic: row.epistemic.clone(),
-        authority: row.authority.clone(),
+        epistemic: if matches!(payload, JournalPayload::RevisionProposalRecorded(_)) {
+            Some("unverified".into())
+        } else {
+            row.epistemic.clone()
+        },
+        authority: if matches!(payload, JournalPayload::RevisionProposalRecorded(_)) {
+            Some("agent_inferred".into())
+        } else {
+            row.authority.clone()
+        },
         task_id: row.task_id.clone(),
-        repository_id: row.repository_id.clone(),
-        worktree_id: row.worktree_id.clone(),
+        repository_id,
+        worktree_id,
         event_time_us,
         recorded_at_us: 0,
         source_sequence: 0,
@@ -239,6 +268,25 @@ fn allowlisted_object_text(
         }
         JournalPayload::ProcedureRevisionRecorded(value) => {
             Some((value.route_text_fields(max_text_bytes), value.created_at_us))
+        }
+        JournalPayload::RevisionProposalRecorded(value) => {
+            let evertrace_domain::semantic::ProposalPayload::Procedure(payload) = &value.payload
+            else {
+                return None;
+            };
+            let draft = payload.draft();
+            let mut text = vec![
+                "Unaccepted method hypothesis; effectiveness unverified.".into(),
+                draft.title.clone(),
+                draft.summary.clone(),
+            ];
+            text.extend(draft.when.goals.clone());
+            text.extend(draft.when.requires.clone());
+            text.extend(draft.actions.stages.clone());
+            text.extend(draft.done.verify.clone());
+            text.extend(draft.pitfalls.clone());
+            text.extend(draft.evidence_refs.clone());
+            Some((text, value.created_at_us))
         }
         JournalPayload::CoreMembershipRecorded(_)
         | JournalPayload::GlobalSupportContractRecorded(_)

@@ -17,6 +17,7 @@ use thiserror::Error;
 pub struct ProductionSearch {
     index: SearchIndex,
     procedure_revisions: Option<BTreeSet<String>>,
+    method_proposal_revisions: BTreeSet<String>,
 }
 
 impl ProductionSearch {
@@ -24,11 +25,17 @@ impl ProductionSearch {
         Self {
             index,
             procedure_revisions: None,
+            method_proposal_revisions: BTreeSet::new(),
         }
     }
 
     pub fn with_procedure_revisions(mut self, revisions: BTreeSet<String>) -> Self {
         self.procedure_revisions = Some(revisions);
+        self
+    }
+
+    pub(crate) fn with_method_proposals(mut self, revisions: BTreeSet<String>) -> Self {
+        self.method_proposal_revisions = revisions;
         self
     }
 
@@ -97,6 +104,7 @@ impl ProductionSearch {
         let (source_role, authority) = source_filter(context.query_facets.source_boundary);
         let filter = SearchHardFilter {
             procedure_revisions: self.procedure_revisions.clone(),
+            method_proposal_revisions: self.method_proposal_revisions.clone(),
             task_id: context.task_id.map(|id| id.to_string()),
             repository_id: context.repository_id.map(|id| id.to_string()),
             worktree_id: context.worktree_id.map(|id| id.to_string()),

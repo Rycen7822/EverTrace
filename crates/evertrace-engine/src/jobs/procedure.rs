@@ -17,6 +17,23 @@ use evertrace_store::{
 use crate::{provider::ProviderProcedureContent, semantic::SemanticServiceError};
 
 pub(crate) const KIND: &str = "procedure_review_v1";
+mod source;
+pub(crate) use source::is_source as has_source_target;
+pub(crate) use source::jobs as source_jobs;
+pub(crate) fn source_scope(
+    snapshot: &ProjectionSnapshot,
+    job: &DurableJob,
+) -> Option<ProcedureScope> {
+    source::scope(snapshot, job)
+}
+
+pub(crate) fn is_current(snapshot: &ProjectionSnapshot, job: &DurableJob) -> bool {
+    if source::is_source(job) {
+        source::current(snapshot, job)
+    } else {
+        current(snapshot, job).is_ok()
+    }
+}
 
 pub(crate) struct Input {
     pub proposal: RevisionProposal,
@@ -48,6 +65,8 @@ struct ReviewInputs<'a> {
     refs: BTreeMap<&'a str, Vec<&'a evertrace_store::objects::ObjectRow>>,
     observations: BTreeMap<&'a str, &'a evertrace_store::objects::ObjectRow>,
     tasks: BTreeMap<(String, Option<String>, String), Vec<&'a evertrace_store::objects::ObjectRow>>,
+    source_by_observation: BTreeMap<String, (String, String)>,
+    sources: BTreeMap<(String, String), Vec<&'a evertrace_store::objects::ObjectRow>>,
 }
 
 impl<'a> ReviewInputs<'a> {
@@ -62,6 +81,8 @@ impl<'a> ReviewInputs<'a> {
             refs: Default::default(),
             observations: Default::default(),
             tasks: Default::default(),
+            source_by_observation: Default::default(),
+            sources: Default::default(),
         };
         for row in snapshot.data_rows() {
             for reference in row
@@ -110,6 +131,23 @@ impl<'a> ReviewInputs<'a> {
             }
         }
         for rows in result.tasks.values_mut() {
+            rows.sort_by_key(|row| std::cmp::Reverse(row.source_event_seq));
+            rows.truncate(16);
+        }
+        // Only admitted message metadata expands a taskless source cohort;
+        // tool/Stop records do not become automatic method-review triggers.
+        for (instance, revision, observation) in source::review_sources(snapshot)? {
+            let key = (instance, revision);
+            if let Some(surface) = result.observations.get(observation.as_str()) {
+                result
+                    .sources
+                    .entry(key.clone())
+                    .or_default()
+                    .push(*surface);
+                result.source_by_observation.insert(observation, key);
+            }
+        }
+        for rows in result.sources.values_mut() {
             rows.sort_by_key(|row| std::cmp::Reverse(row.source_event_seq));
             rows.truncate(16);
         }
@@ -197,6 +235,14 @@ fn select_input<'a>(
     let mut surfaces = observations
         .iter()
         .filter_map(|reference| context.observations.get(reference.as_str()).copied())
+        .chain(
+            observations
+                .iter()
+                .filter_map(|reference| context.source_by_observation.get(reference))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .flat_map(|key| context.sources.get(key).into_iter().flatten().copied()),
+        )
         .chain(tasks.into_iter().flat_map(|task| {
             context
                 .tasks
@@ -361,7 +407,9 @@ pub(crate) fn jobs(
     let mut covered = BTreeMap::<&str, u64>::new();
     let mut last_review = BTreeMap::<&str, JobId>::new();
     for job in runtime.jobs.iter().filter(|job| {
-        job.kind == KIND && (job.state == JobStatus::Succeeded || job.config_hash == config)
+        job.kind == KIND
+            && !source::is_source(job)
+            && (job.state == JobStatus::Succeeded || job.config_hash == config)
     }) {
         for reference in std::iter::once(job.idempotency_key.as_str())
             .chain(std::iter::once(job.target_revision.as_str()))
@@ -391,7 +439,21 @@ pub(crate) fn jobs(
             return Ok(false);
         }
         let selected = select_input(&context, proposal, existing)?;
+        let cohort_watermark = proposal
+            .source_cohort_refs
+            .iter()
+            .flat_map(|reference| context.refs.get(reference.as_str()).into_iter().flatten())
+            .map(|row| row.source_event_seq)
+            .max()
+            .unwrap_or(0);
         if selected.watermark == 0
+            || !selected.surfaces.iter().any(|row| {
+                row.source_event_seq > cohort_watermark
+                    && row
+                        .current_revision_id
+                        .as_ref()
+                        .is_some_and(|id| !proposal.source_cohort_refs.contains(id))
+            })
             || existing.is_some_and(|procedure| selected.watermark <= procedure.source_watermark)
             || [
                 selected.key.as_str(),
@@ -568,6 +630,9 @@ pub(crate) async fn allowed(
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<bool, SemanticServiceError> {
+    if source::is_source(job) {
+        return source::allowed(writer, snapshot, job, report).await;
+    }
     let input = match current(snapshot, job) {
         Ok(input) => input,
         Err(SemanticServiceError::BaseConflict | SemanticServiceError::InvalidInput) => {
@@ -585,40 +650,59 @@ async fn allowed_input(
     input: &Input,
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<bool, SemanticServiceError> {
+    let ProposalPayload::Procedure(payload) = &input.proposal.payload else {
+        unreachable!()
+    };
+    allowed_refs(
+        writer,
+        snapshot,
+        &input.refs,
+        &payload.draft().scope,
+        job.config_hash,
+        report,
+    )
+    .await
+}
+
+async fn allowed_refs(
+    writer: &crate::WriterHandle,
+    snapshot: &ProjectionSnapshot,
+    refs: &[String],
+    scope: &ProcedureScope,
+    config_hash: [u8; 32],
+    report: Option<&evertrace_codex::HostProbeReport>,
+) -> Result<bool, SemanticServiceError> {
     let rows = snapshot
         .data_rows()
         .filter(|row| {
-            row.object_id
-                .as_ref()
-                .is_some_and(|id| input.refs.contains(id))
+            row.object_id.as_ref().is_some_and(|id| refs.contains(id))
                 || row
                     .current_revision_id
                     .as_ref()
-                    .is_some_and(|id| input.refs.contains(id))
+                    .is_some_and(|id| refs.contains(id))
         })
         .collect::<Vec<_>>();
-    if input.refs.iter().any(|reference| {
-        !rows.iter().any(|row| {
-            row.object_id.as_ref() == Some(reference)
-                || row.current_revision_id.as_ref() == Some(reference)
+    if rows.len() > 64
+        || refs.iter().any(|reference| {
+            !rows.iter().any(|row| {
+                row.object_id.as_ref() == Some(reference)
+                    || row.current_revision_id.as_ref() == Some(reference)
+            })
         })
-    }) {
+    {
         return Ok(false);
     }
     let scopes = crate::repository::row_repository_contexts(snapshot, &rows)
         .map_err(|_| StoreError::StoreCorrupt)?;
     let mut ids = scopes.values().flatten().copied().collect::<BTreeSet<_>>();
-    let ProposalPayload::Procedure(payload) = &input.proposal.payload else {
-        unreachable!()
-    };
-    match payload.draft().scope {
+    match *scope {
         ProcedureScope::Worktree { repository_id, .. }
         | ProcedureScope::Repository { repository_id } => {
             ids.insert(repository_id);
         }
         ProcedureScope::Global => return Ok(false),
     }
-    if !crate::repository::blocked_repositories(writer, ids, report, job.config_hash)
+    if !crate::repository::blocked_repositories(writer, ids, report, config_hash)
         .await
         .map_err(|_| StoreError::StoreCorrupt)?
         .is_empty()
@@ -626,17 +710,197 @@ async fn allowed_input(
         return Ok(false);
     }
     Ok(
-        crate::session_import::blocked_source_rows(
-            writer,
-            report,
-            snapshot,
-            &rows,
-            job.config_hash,
-        )
-        .await
-        .map_err(|_| StoreError::StoreCorrupt)?
-        .is_empty(),
+        crate::session_import::blocked_source_rows(writer, report, snapshot, &rows, config_hash)
+            .await
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .is_empty(),
     )
+}
+
+pub(crate) async fn readable_revisions(
+    writer: &crate::WriterHandle,
+    snapshot: &ProjectionSnapshot,
+    report: Option<&evertrace_codex::HostProbeReport>,
+    config: [u8; 32],
+    scope: (
+        Option<evertrace_domain::ids::RepositoryId>,
+        Option<evertrace_domain::ids::WorktreeId>,
+    ),
+    selected: Option<&BTreeSet<String>>,
+    deadline: std::time::Instant,
+) -> Result<BTreeSet<String>, SemanticServiceError> {
+    let mut output = BTreeSet::new();
+    let (repository, worktree) = scope;
+    let Some(repository) = repository else {
+        return Ok(output);
+    };
+    if selected.is_some_and(BTreeSet::is_empty) {
+        return Ok(output);
+    }
+    let mut refs_index = BTreeMap::<&str, Vec<&evertrace_store::ObjectRow>>::new();
+    let mut lookup = BTreeMap::new();
+    let mut current = BTreeMap::<&str, &evertrace_store::ObjectRow>::new();
+    for row in snapshot.data_rows() {
+        lookup.insert(row.row_id.as_str(), row);
+        for reference in row
+            .object_id
+            .iter()
+            .chain(row.current_revision_id.iter())
+            .collect::<BTreeSet<_>>()
+        {
+            refs_index.entry(reference).or_default().push(row);
+        }
+        if matches!(
+            row.object_kind.as_deref(),
+            Some("revision_proposal_revision" | "procedure_revision")
+        ) {
+            let id = row.object_id.as_deref().ok_or(StoreError::StoreCorrupt)?;
+            match current.get(id) {
+                Some(previous) if previous.source_event_seq > row.source_event_seq => {}
+                Some(previous) if previous.source_event_seq == row.source_event_seq => {
+                    return Err(StoreError::StoreCorrupt.into());
+                }
+                _ => {
+                    current.insert(id, row);
+                }
+            }
+        }
+    }
+    let candidate_rows = current
+        .values()
+        .filter(|row| {
+            row.object_kind.as_deref() == Some("revision_proposal_revision")
+                && matches!(row.lifecycle.as_deref(), Some("pending" | "validating"))
+                && selected.is_none_or(|ids| {
+                    row.current_revision_id
+                        .as_ref()
+                        .is_some_and(|id| ids.contains(id))
+                })
+        })
+        .collect::<Vec<_>>();
+    if candidate_rows.is_empty() {
+        return Ok(output);
+    }
+    let deletion = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
+    let mut candidates = Vec::new();
+    let mut union = BTreeMap::new();
+    for row in candidate_rows {
+        let JournalPayload::RevisionProposalRecorded(proposal) = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?
+        else {
+            return Err(StoreError::StoreCorrupt.into());
+        };
+        proposal.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        if row.row_class != Some(evertrace_store::objects::ObjectRowClass::Object)
+            || row.object_id.as_deref() != Some(proposal.proposal_id.to_string().as_str())
+            || row.current_revision_id.as_deref()
+                != Some(proposal.proposal_revision_id.to_string().as_str())
+        {
+            return Err(StoreError::StoreCorrupt.into());
+        }
+        let ProposalPayload::Procedure(payload) = &proposal.payload else {
+            continue;
+        };
+        let scope = &payload.draft().scope;
+        let in_scope = match *scope {
+            ProcedureScope::Worktree {
+                repository_id,
+                worktree_id,
+            } => repository_id == repository && Some(worktree_id) == worktree,
+            ProcedureScope::Repository { repository_id } => repository_id == repository,
+            ProcedureScope::Global => false,
+        };
+        if !in_scope
+            || !matches!(
+                proposal.status,
+                ProposalStatus::Pending | ProposalStatus::Validating
+            )
+            || !matches!(
+                deletion.classify_proposal(&proposal)?,
+                ObjectDeletionCandidateAdmission::Clear
+            )
+        {
+            continue;
+        }
+        if let Some(evertrace_domain::semantic::ProposalTargetId::Procedure(id)) =
+            proposal.target_id
+            && proposal.base_revision_id.is_none_or(|revision| {
+                current.get(id.to_string().as_str()).is_none_or(|row| {
+                    row.object_kind.as_deref() != Some("procedure_revision")
+                        || row.current_revision_id.as_deref() != Some(revision.to_string().as_str())
+                })
+            })
+        {
+            continue;
+        }
+        let mut refs = proposal.source_cohort_refs.clone();
+        refs.extend(proposal.evidence_refs.clone());
+        refs.extend(payload.draft().evidence_refs.clone());
+        refs.sort();
+        refs.dedup();
+        if refs
+            .iter()
+            .any(|reference| !refs_index.contains_key(reference.as_str()))
+        {
+            continue;
+        }
+        let rows = refs
+            .iter()
+            .flat_map(|reference| refs_index[reference.as_str()].iter().copied())
+            .map(|row| (row.row_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        if rows.len() > 64 {
+            continue;
+        }
+        union.extend(rows.iter().map(|(id, row)| (*id, *row)));
+        candidates.push((
+            proposal.proposal_revision_id.to_string(),
+            rows.into_values().collect::<Vec<_>>(),
+        ));
+    }
+    if candidates.is_empty() {
+        return Ok(output);
+    }
+    let rows = union.into_values().collect::<Vec<_>>();
+    let contexts = crate::repository::row_repository_contexts(snapshot, &rows)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let ids = contexts
+        .values()
+        .flatten()
+        .copied()
+        .chain([repository])
+        .collect();
+    let blocked_repositories =
+        crate::repository::blocked_repositories_before(writer, ids, report, config, deadline)
+            .await
+            .map_err(|_| StoreError::StoreCorrupt)?;
+    if blocked_repositories.contains(&repository) {
+        return Ok(output);
+    }
+    let blocked_sources = crate::session_import::blocked_source_rows_before(
+        writer,
+        report,
+        snapshot,
+        &rows,
+        config,
+        Some(&lookup),
+        Some(deadline),
+    )
+    .await
+    .map_err(|_| StoreError::StoreCorrupt)?;
+    for (revision, rows) in candidates {
+        if rows.iter().all(|row| {
+            !blocked_sources.contains(&row.row_id)
+                && contexts[row.row_id.as_str()].is_disjoint(&blocked_repositories)
+        }) {
+            output.insert(revision);
+        }
+    }
+    Ok(output)
 }
 
 pub(crate) fn needs_model(input: &Input) -> bool {
@@ -668,7 +932,14 @@ pub(crate) async fn execute(
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
     at: i64,
+    runtime: &evertrace_capture::RuntimeSnapshot,
 ) -> Result<JournalCommand, SemanticServiceError> {
+    if source::is_source(job) {
+        return Box::pin(source::execute(
+            writer, planner, snapshot, job, report, at, runtime,
+        ))
+        .await;
+    }
     let input = current(snapshot, job)?;
     if !allowed_input(writer, snapshot, job, &input, report).await? {
         return Err(SemanticServiceError::BaseConflict);
@@ -816,6 +1087,15 @@ pub(crate) async fn execute(
             reason = JobTerminalReason::SourceUnavailable;
         }
     }
+    finish(job, payloads, reason, at)
+}
+
+fn finish(
+    job: &DurableJob,
+    mut payloads: Vec<JournalPayload>,
+    reason: JobTerminalReason,
+    at: i64,
+) -> Result<JournalCommand, SemanticServiceError> {
     let result_ref = payloads
         .iter()
         .find_map(|payload| match payload {

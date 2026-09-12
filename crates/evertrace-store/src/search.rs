@@ -41,6 +41,7 @@ pub struct SearchSnapshot {
 pub struct SearchHardFilter {
     /// Current publication eligibility, separate from deletion suppression.
     pub procedure_revisions: Option<BTreeSet<String>>,
+    pub method_proposal_revisions: BTreeSet<String>,
     pub task_id: Option<String>,
     pub repository_id: Option<String>,
     pub worktree_id: Option<String>,
@@ -319,6 +320,22 @@ async fn query_rows(
 
 fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
     let mut clauses = vec!["row_variant != 'checkpoint'".to_owned()];
+    let methods = if filter.method_proposal_revisions.is_empty() {
+        "FALSE".into()
+    } else {
+        format!(
+            "candidate_id IN ({})",
+            filter
+                .method_proposal_revisions
+                .iter()
+                .map(|value| sql_literal(value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    clauses.push(format!(
+        "(object_kind IS NULL OR object_kind != 'revision_proposal_revision' OR ({methods}))"
+    ));
     if let Some(revisions) = &filter.procedure_revisions {
         let allowed = if revisions.is_empty() {
             "FALSE".into()
@@ -542,6 +559,7 @@ impl SearchProjectionRow {
                             | "global_support_contract"
                             | "global_support_validation"
                             | "procedure_revision"
+                            | "revision_proposal_revision"
                             | "semantic_digest"
                             | "wiki_projection"
                     )

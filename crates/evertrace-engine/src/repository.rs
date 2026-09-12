@@ -19,7 +19,7 @@ mod session_catalog;
 #[cfg(test)]
 pub(crate) use access::read_inventory_snapshot;
 pub(crate) use access::{
-    blocked_repositories, read_inventory, read_inventory_before,
+    blocked_repositories, blocked_repositories_before, read_inventory, read_inventory_before,
     read_procedure_historical_inventory, record_trust_revocations, repository_read_gate,
     row_repository_contexts,
 };

@@ -1191,7 +1191,11 @@ fn job_target_is_current(
             evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision),
             Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. })
         );
-    if !source_synthesis && job.target_watermark > snapshot.frontier {
+    if !source_synthesis
+        && !(job.kind == crate::jobs::procedure::KIND
+            && crate::jobs::procedure::has_source_target(job))
+        && job.target_watermark > snapshot.frontier
+    {
         return Ok(false);
     }
     Ok(match job.kind.as_str() {
@@ -1246,7 +1250,7 @@ fn job_target_is_current(
             crate::jobs::synthesis::synthesis_target_is_current(snapshot, job)
         }
         crate::jobs::procedure::KIND => {
-            job.config_hash == config_hash && crate::jobs::procedure::current(snapshot, job).is_ok()
+            job.config_hash == config_hash && crate::jobs::procedure::is_current(snapshot, job)
         }
         PROCEDURE_USAGE_JOB_KIND => {
             job.config_hash == config_hash
@@ -2153,6 +2157,28 @@ impl BackgroundScheduler {
                 )
                 .map_err(|_| BackgroundSchedulerError::Store)?,
             );
+            let report = self.report.read().await.clone();
+            synthesis_candidates.extend(
+                crate::jobs::procedure::source_jobs(
+                    &snapshot,
+                    &self.synthesis,
+                    self.runtime.effective_config_hash,
+                    max_synthesis_wall_time,
+                    PER_LANE_LIMIT,
+                    (&self.writer, report.as_ref()),
+                    |source| {
+                        idle.source_delay(
+                            source.repository_id,
+                            source.worktree_id,
+                            &self.dreaming,
+                            selection_time,
+                        )
+                        .is_some_and(|delay| delay.is_zero())
+                    },
+                )
+                .await
+                .map_err(|_| BackgroundSchedulerError::Store)?,
+            );
         }
         if !synthesis_candidates.is_empty() {
             let occurred_at_us = now_us()?;
@@ -2532,6 +2558,7 @@ impl BackgroundScheduler {
                 &claimed.job,
                 report.as_ref(),
                 at,
+                &self.runtime,
             ),
         )
         .await;
@@ -3851,7 +3878,9 @@ impl BackgroundScheduler {
         let view = RuntimeSchedulerView::from_snapshot(&snapshot)
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let Some(current) = view.jobs.iter().find(|job| job.job_id == selected.job_id) else {
-            return Err(BackgroundSchedulerError::Store);
+            // A repository purge may remove a queued selection while an earlier
+            // job from this round is in flight. The old selection has no lease.
+            return Ok(None);
         };
         if current.state != JobStatus::Queued
             || current.target_generation != selected.target_generation
@@ -4495,6 +4524,15 @@ impl SynthesisIdle {
                 scopes.insert(revision.clone(), scope);
             }
         }
+        for job in runtime.jobs.iter().filter(|job| {
+            job.kind == crate::jobs::procedure::KIND
+                && crate::jobs::procedure::has_source_target(job)
+                && matches!(job.state, JobStatus::Queued | JobStatus::Leased)
+        }) {
+            if let Some(scope) = crate::jobs::procedure::source_scope(snapshot, job) {
+                scopes.insert(job.target_revision.clone(), scope);
+            }
+        }
         self.procedure_scopes = scopes;
         let attribution_rows = snapshot
             .data_rows()
@@ -4929,7 +4967,16 @@ mod idle_tests {
         };
         let mut waiting = job.clone();
         waiting.job_id = JobId::new_v7();
-        waiting.idempotency_key = "waiting-review-cohort".into();
+        // The first-proposal target uses the same claim accounting and wait
+        // transition as review; source transport is covered by the import test.
+        let observation = format!("obs:{}", "a".repeat(64));
+        waiting.target_revision = format!("procedure_source_v1|{observation}|{observation}");
+        waiting.idempotency_key = format!(
+            "{}:{}",
+            crate::jobs::procedure::KIND,
+            waiting.target_revision
+        );
+        assert!(crate::jobs::procedure::has_source_target(&waiting));
         let command = |at, payloads: Vec<JournalPayload>| {
             JournalCommand::new(
                 CommandId::new_v7(),

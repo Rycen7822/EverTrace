@@ -15,6 +15,15 @@ pub struct ProviderStub {
     received: std::sync::Arc<tokio::sync::Notify>,
 }
 
+enum StubBody {
+    Repeat(Vec<u8>),
+    Methods {
+        source: Vec<u8>,
+        review: Vec<u8>,
+        summary: Vec<u8>,
+    },
+}
+
 impl ProviderStub {
     pub async fn once(status: u16, body: Vec<u8>) -> Self {
         Self::once_delayed(status, body, std::time::Duration::ZERO).await
@@ -30,7 +39,7 @@ impl ProviderStub {
         (
             Self::serve(
                 status,
-                body,
+                StubBody::Repeat(body),
                 std::time::Duration::ZERO,
                 1,
                 Some(gate),
@@ -52,7 +61,31 @@ impl ProviderStub {
 
     #[allow(dead_code)]
     pub async fn recovering(body: Vec<u8>) -> Self {
-        Self::serve(200, body, std::time::Duration::ZERO, 2, None, true).await
+        Self::serve(
+            200,
+            StubBody::Repeat(body),
+            std::time::Duration::ZERO,
+            2,
+            None,
+            true,
+        )
+        .await
+    }
+
+    pub async fn methods(source: Vec<u8>, review: Vec<u8>, summary: Vec<u8>, count: usize) -> Self {
+        Self::serve(
+            200,
+            StubBody::Methods {
+                source,
+                review,
+                summary,
+            },
+            std::time::Duration::ZERO,
+            count,
+            None,
+            false,
+        )
+        .await
     }
 
     async fn repeat_delayed(
@@ -61,12 +94,12 @@ impl ProviderStub {
         delay: std::time::Duration,
         count: usize,
     ) -> Self {
-        Self::serve(status, body, delay, count, None, false).await
+        Self::serve(status, StubBody::Repeat(body), delay, count, None, false).await
     }
 
     async fn serve(
         status: u16,
-        body: Vec<u8>,
+        body: StubBody,
         delay: std::time::Duration,
         count: usize,
         mut gate: Option<oneshot::Receiver<()>>,
@@ -78,9 +111,24 @@ impl ProviderStub {
         let (requests_tx, requests) = oneshot::channel();
         let received = std::sync::Arc::new(tokio::sync::Notify::new());
         let notify = std::sync::Arc::clone(&received);
+        // Summary fixtures also service the independent method producer with
+        // a closed no-op. Preserve every request in finish_all for call audits.
+        let summary = serde_json::from_slice::<serde_json::Value>(match &body {
+            StubBody::Repeat(body) => body,
+            StubBody::Methods { .. } => &[],
+        })
+        .ok()
+        .and_then(|envelope| {
+            envelope["choices"][0]["message"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .is_some_and(|content| content.get("candidates").is_some());
         let task = tokio::spawn(async move {
             let mut captured = Vec::with_capacity(count);
-            for index in 0..count {
+            let mut index = 0;
+            while index < count {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut chunk = [0_u8; 4096];
@@ -109,16 +157,46 @@ impl ProviderStub {
                         break;
                     }
                 }
+                let method_no_op = summary
+                    && String::from_utf8_lossy(&bytes)
+                        .contains("Extract at most one nontrivial reusable method");
+                let selected_body = match &body {
+                    StubBody::Repeat(body) => body.as_slice(),
+                    StubBody::Methods {
+                        source,
+                        review,
+                        summary,
+                    } => {
+                        let request = String::from_utf8_lossy(&bytes);
+                        if request.contains("Extract at most one nontrivial reusable method") {
+                            source
+                        } else if request.contains("Review one Procedure") {
+                            review
+                        } else {
+                            summary
+                        }
+                    }
+                };
                 captured.push(bytes);
-                notify.notify_one();
-                if let Some(gate) = gate.take() {
+                if !method_no_op {
+                    notify.notify_one();
+                }
+                if !method_no_op && let Some(gate) = gate.take() {
                     let _ = gate.await;
                 }
                 tokio::time::sleep(delay).await;
-                let status = if fail_first && index == 0 {
+                let status = if method_no_op {
+                    200
+                } else if fail_first && index == 0 {
                     503
                 } else {
                     status
+                };
+                let no_op = br#"{"choices":[{"message":{"content":"{\"operation\":\"no_op\"}"}}],"usage":{"prompt_tokens":17,"completion_tokens":5}}"#;
+                let body = if method_no_op {
+                    no_op.as_slice()
+                } else {
+                    selected_body
                 };
                 let reason = if status == 200 { "OK" } else { "ERROR" };
                 let response = format!(
@@ -126,8 +204,11 @@ impl ProviderStub {
                     body.len()
                 );
                 if stream.write_all(response.as_bytes()).await.is_ok() {
-                    let _ = stream.write_all(&body).await;
+                    let _ = stream.write_all(body).await;
                     let _ = stream.shutdown().await;
+                }
+                if !method_no_op {
+                    index += 1;
                 }
             }
             let _ = requests_tx.send(captured);
@@ -143,6 +224,12 @@ impl ProviderStub {
     pub async fn finish(self) -> Vec<u8> {
         let mut requests = self.requests.await.unwrap();
         self.task.await.unwrap();
+        if requests.len() > 1 {
+            requests.retain(|request| {
+                !String::from_utf8_lossy(request)
+                    .contains("Extract at most one nontrivial reusable method")
+            });
+        }
         assert_eq!(requests.len(), 1);
         requests.remove(0)
     }

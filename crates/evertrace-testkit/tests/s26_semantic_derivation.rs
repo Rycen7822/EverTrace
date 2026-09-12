@@ -1721,10 +1721,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         .into_iter()
         .filter(|job| job.kind == "procedure_review_v1")
         .collect::<Vec<_>>();
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].state, evertrace_store::JobStatus::Succeeded);
-    assert!(reviews[0].model_id.is_none());
-    assert!(reviews[0].budget.max_calls.is_none());
+    assert!(reviews.is_empty(), "a proposal is not new review evidence");
     let original = SemanticCurrentView::from_snapshot(&snapshot)
         .unwrap()
         .proposals
@@ -1739,7 +1736,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
             .iter()
             .filter(|job| job.kind == "procedure_review_v1")
             .count(),
-        1
+        0
     );
     drop(scheduler);
     let surface = |receipt: &SourceReceipt, observation: &SourceObservation, text: &str| {
@@ -1831,9 +1828,11 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     reviewed
         .pitfalls
         .push("A failed restoration must retain the old journal.".into());
-    let stub = ProviderStub::once(
-        200,
+    let stub = ProviderStub::methods(
+        response(serde_json::json!({"operation":"no_op"})),
         response(serde_json::json!({"operation":"revise","content":reviewed})),
+        response(serde_json::json!({"operation":"no_op"})),
+        1,
     )
     .await;
     let mut disabled = config(&stub.base_url);
@@ -1930,7 +1929,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
             .iter()
             .filter(|job| job.kind == "procedure_review_v1")
             .count(),
-        2
+        1
     );
     drop(scheduler);
     let add_evidence = |label: &str, text: &str| {
@@ -1990,7 +1989,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         jobs.iter()
             .filter(|job| job.kind == "procedure_review_v1")
             .count(),
-        3
+        2
     );
     let waiting = jobs
         .iter()

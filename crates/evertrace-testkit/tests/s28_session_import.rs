@@ -54,6 +54,40 @@ fn runtime(root: &std::path::Path) -> RuntimeSnapshot {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
+    Box::pin(imported_messages_scenario(false, false, None, false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_methods_use_scheduler_and_cross_session_mcp_without_work_objects() {
+    Box::pin(imported_messages_scenario(true, false, None, false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_method_terminal_status_excludes_stale_references() {
+    Box::pin(imported_messages_scenario(true, true, None, false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_method_inflight_source_revocation_discards_result() {
+    Box::pin(imported_messages_scenario(true, false, Some(false), false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_method_inflight_repository_purge_discards_result() {
+    Box::pin(imported_messages_scenario(true, false, Some(true), false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_method_independent_append_remains_live_after_first_proposal() {
+    Box::pin(imported_messages_scenario(true, false, None, true)).await;
+}
+
+async fn imported_messages_scenario(
+    method: bool,
+    terminal: bool,
+    interruption: Option<bool>,
+    independent: bool,
+) {
     async fn read(
         mcp: &evertrace_engine::McpActionService,
         bindings: &evertrace_engine::McpBindingAuthority,
@@ -84,7 +118,7 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
                 Some(Arc::new(report.clone())),
             )
             .unwrap();
-        mcp.handle(
+        Box::pin(mcp.handle(
             "source-summary-read",
             evertrace_engine::McpServiceRequest {
                 request_id: RequestId::new_v7(),
@@ -94,9 +128,63 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
                 refs: vec![],
                 client_cwd: workspace.to_str().unwrap().into(),
             },
-        )
+        ))
         .await
         .unwrap()
+    }
+    async fn read_methods(
+        mcp: &evertrace_engine::McpActionService,
+        binding: &evertrace_engine::McpBindingAuthority,
+        report: &evertrace_codex::HostProbeReport,
+        workspace: &std::path::Path,
+        session: &str,
+        expected: &[(String, String)],
+    ) {
+        let (mcp, binding, report, workspace, session, expected) = (
+            mcp.clone(),
+            binding.clone(),
+            report.clone(),
+            workspace.to_owned(),
+            session.to_owned(),
+            expected.to_vec(),
+        );
+        tokio::spawn(async move {
+            for (id, revision) in expected {
+                let result = Box::pin(read(
+                    &mcp,
+                    &binding,
+                    &report,
+                    &workspace,
+                    &session,
+                    evertrace_engine::McpServiceAction::Get,
+                    id,
+                ))
+                .await;
+                assert!(
+                    result
+                        .items
+                        .iter()
+                        .any(|item| item.object_revision_ref.as_ref() == Some(&revision))
+                );
+            }
+            let result = Box::pin(read(
+                &mcp,
+                &binding,
+                &report,
+                &workspace,
+                &session,
+                evertrace_engine::McpServiceAction::Search,
+                "Saffron".into(),
+            ))
+            .await;
+            assert!(result.items.iter().any(|item| {
+                item.text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Saffron"))
+            }));
+        })
+        .await
+        .unwrap();
     }
     use evertrace_domain::{
         config::{DreamingConfig, DurationValue, EpisodeEnrichment, LlmConfig, ValidatedBaseUrl},
@@ -173,10 +261,14 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
     // Fixed source 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a:
     // rollout/src/policy.rs persists ItemCompleted for Paginated history;
     // history/src/rollout_payload.rs retains the separate raw response envelope.
-    let message_text = format!(
-        "marigold descriptive source memory {}",
-        "bounded context ".repeat(300)
-    );
+    let message_text = if method {
+        "Marigold journal recovery method: when a transaction acknowledgement is lost after journal append, first read the original command identity and compare its exact payload against committed events. If it is committed, resume from that receipt without reissuing the mutation; if absent, retry the same command with a fresh current frontier. Verify that replay contains one commit and that current projection matches its receipt. Abort if the payload differs. Reuse this only for ambiguous acknowledgement in this repository's single writer.".to_owned()
+    } else {
+        format!(
+            "marigold descriptive source memory {}",
+            "bounded context ".repeat(300)
+        )
+    };
     let raw_message = serde_json::json!({"type":"response_item","metadata":{"client_authored":false,"fallback_token_limit_override":8192},"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":message_text}]}});
     let message = serde_json::json!({"timestamp":"2026-09-10T00:00:01Z","type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":message_text,"text_elements":[]}]},"completed_at_ms":1788998401000i64}});
     fs::write(&transcript, format!("{header}\n{raw_message}\n{message}\n")).unwrap();
@@ -306,6 +398,255 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
         })
         .next()
         .unwrap();
+    if method {
+        Box::pin(async move {
+        let content = serde_json::json!({"title":"Marigold journal acknowledgement recovery","summary":"A reusable hypothesis for recovering ambiguous journal acknowledgements; effectiveness remains unverified.","procedure_kind":"diagnostic",
+            "when":{"goals":["Recover an ambiguous commit acknowledgement"],"targets":["repository journal"],"signals":["acknowledgement lost"],"stage":"recover","requires":["Original command identity and payload are available"],"excludes":["Changed command payload"]},
+            "applicability_expr":{"op":"exists","field":"failure_signature"},"avoid_expr":{"op":"eq","field":"phase","value":{"kind":"text","value":"unknown"}},"completion_expr":{"op":"eq","field":"verifier_state","value":{"kind":"text","value":"passed"}},
+            "actions":{"stages":["Look up the original command and compare its exact payload","Resume from the committed receipt, or retry the same absent command at the current frontier"],"branches":[],"avoid":["Never mint another command identity for a lost acknowledgement"]},
+            "done":{"success":["One matching commit and consistent projection"],"abort":["Payload differs"],"verify":["Replay and count the original command commit, then compare projection with its receipt"]},"pitfalls":["A missing acknowledgement does not establish that the transaction failed"]});
+        let body = serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":serde_json::json!({"operation":"create","content":content,"direct_refs":[receipt.source_observation_id.to_string()]}).to_string()}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap();
+        // Both independent consumers run. This method response deliberately
+        // fails the closed summary schema while the method can still commit.
+        let (stub, release) = if interruption.is_some() {
+            let (stub, release) = ProviderStub::once_paused(200, body).await;
+            (stub, Some(release))
+        } else { (ProviderStub::repeat(200, body, 2).await, None) };
+        let llm = LlmConfig { base_url: ValidatedBaseUrl::parse(&stub.base_url).unwrap(), api_key_env: "PATH".into(),
+            episode_enrichment: EpisodeEnrichment::Off, ..Default::default() };
+        let dreaming = DreamingConfig { idle_after: DurationValue::from_seconds(1).unwrap(), ..Default::default() };
+        let scheduler = BackgroundScheduler::new(writer.clone(), catalog.clone(), worker.clone(), Arc::clone(&report),
+            runtime(temp.path()), SynthesisPlanner::new(llm.clone()), dreaming.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some(release) = release {
+            let mut running = Box::pin(scheduler.run_once());
+            tokio::select! {
+                _ = stub.wait_received() => {},
+                result = &mut running => panic!("producer finished before provider gate: {result:?}"),
+            }
+            if interruption == Some(true) {
+                let claimed = writer.project().await.unwrap();
+                let current = evertrace_store::repository::RepositoryCurrentView::from_snapshot(&claimed).unwrap();
+                let preview = evertrace_store::projections::repository_scope_purge_preview(&claimed, repository, current.repositories[&repository].repository_revision).unwrap();
+                assert!(preview.blockers.is_empty());
+                let command = evertrace_engine::purge::pending_repository_purge_command(RequestId::new_v7(), &preview,
+                    preview.deletion_generation, observed_at_us + 5, claimed.frontier, CONFIG).unwrap();
+                assert!(command.events().iter().any(|event| matches!(&event.payload,
+                    JournalPayload::JobState(job) if job.kind == "procedure_review_v1" && job.state == JobStatus::Failed && job.lease_until_us.is_none())));
+                writer.commit_if_frontier(command, observed_at_us + 5, claimed.frontier).await.unwrap();
+            } else {
+                admin.handle(RequestId::new_v7(), session, SessionImportAdminAction::RevokeAccess, 10).await.unwrap();
+            }
+            release.send(()).unwrap();
+            running.await.unwrap();
+            assert!(SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap().proposals.is_empty());
+            let request = stub.finish().await;
+            assert!(String::from_utf8_lossy(&request).contains("Extract at most one nontrivial reusable method"));
+            drop(scheduler); drop(worker); drop(admin); drop(catalog); drop(writer);
+            task.await.unwrap().unwrap();
+            assert!(SemanticCurrentView::from_snapshot(&open_writer(&data).await.unwrap().project().await.unwrap()).unwrap().proposals.is_empty());
+            return;
+        }
+        Box::pin(scheduler.run_once()).await.unwrap();
+        let snapshot = writer.project().await.unwrap();
+        let proposals = SemanticCurrentView::from_snapshot(&snapshot).unwrap();
+        assert_eq!(proposals.proposals.len(), 1, "{:?}", evertrace_store::RuntimeSchedulerView::from_snapshot(&snapshot).unwrap().jobs);
+        let proposal = proposals.proposals.values().next().unwrap().clone();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(proposal.eligibility, evertrace_domain::semantic::ProposalEligibility::ManualRequired);
+        assert!(!snapshot.data_rows().any(|row| matches!(row.object_kind.as_deref(), Some("task" | "work_episode" | "procedure_revision" | "semantic_digest" | "procedure_usage"))));
+        let requests = stub.finish_all().await;
+        assert_eq!(requests.len(), 2);
+        Box::pin(scheduler.run_once()).await.unwrap();
+        let binding = evertrace_engine::McpBindingAuthority::new(DeviceKeyStore::new(temp.path().join("keys")).load_or_create().unwrap());
+        let mcp = evertrace_engine::McpActionService::open(binding.clone(), &data, writer.clone(), runtime(temp.path())).await.unwrap()
+            .with_session_report(Arc::clone(&report));
+        let cross_session = "019d0000-0000-7000-8000-000000000099";
+        for (action, input) in [(evertrace_engine::McpServiceAction::Search, "Marigold".into()),
+            (evertrace_engine::McpServiceAction::Get, proposal.proposal_id.to_string())] {
+            let result = read(&mcp, &binding, &report_value, &workspace, cross_session, action, input).await;
+            let item = result.items.iter().find(|item| item.object_ref.as_deref() == Some(proposal.proposal_id.to_string().as_str()))
+                .unwrap_or_else(|| panic!("method reference missing: {result:?}"));
+            assert_eq!(item.partition, evertrace_engine::McpItemPartition::Evidence);
+            assert_eq!(item.content_trust, ContentTrust::AgentClaim);
+            assert_eq!(item.instruction_authority, evertrace_domain::evidence::InstructionAuthority::None);
+            assert!(item.applicability.as_deref().unwrap().contains("unverified"));
+            assert!(result.items.iter().all(|item| item.partition != evertrace_engine::McpItemPartition::Procedure));
+        }
+        assert_eq!(SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap().proposals.len(), 1);
+        let other = temp.path().join("other-workspace");
+        fs::create_dir(&other).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&other).status().unwrap().success());
+        let evidence = evertrace_engine::repository::probe_repository(&other, evertrace_engine::repository::HostTrustDecision::Trusted,
+            std::slice::from_ref(&source), observed_at_us, &evertrace_engine::repository::ProbeLimits::default(), &[], &[]).unwrap();
+        let repositories = evertrace_store::repository::RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+        let registration = evertrace_engine::repository::resolve_repository(&evertrace_engine::repository::RepositoryResolveInput {
+            view: &repositories, evidence: &evidence, derived_from_hint: None }).unwrap();
+        writer.commit(registration.journal_command(observed_at_us, CONFIG, "other-attribution").unwrap().unwrap(), observed_at_us).await.unwrap();
+        let repositories = evertrace_store::repository::RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+        let other_id = repositories.repositories.values().find(|value| value.current_path == other.to_str().unwrap()).unwrap().repository_id;
+        use std::io::Write;
+        writeln!(fs::OpenOptions::new().append(true).open(adapter.join("config.toml")).unwrap(), "[projects.{}]\ntrust_level = \"trusted\"", serde_json::to_string(other.to_str().unwrap()).unwrap()).unwrap();
+        let other_scope = evertrace_codex::binding::PublicWorkspace::Repository(other_id).canonical();
+        for action in [evertrace_engine::McpServiceAction::Search, evertrace_engine::McpServiceAction::Get] {
+            let input = if action == evertrace_engine::McpServiceAction::Search { "Marigold".into() } else { proposal.proposal_id.to_string() };
+            let grant = binding.issue_with_report(evertrace_engine::McpBindingIssue { session_id: cross_session.into(), turn_id: "other".into(), tool_use_id: "other".into(), agent_id: None,
+                action: if action == evertrace_engine::McpServiceAction::Search { "search" } else { "get" }.into(), workspace: other_scope.clone(), input: input.clone(), refs: vec![], launcher_protocol_revision: 1 }, Some(Arc::new(report_value.clone()))).unwrap();
+            let result = Box::pin(mcp.handle("method-other-repository", evertrace_engine::McpServiceRequest { request_id: RequestId::new_v7(), action,
+                workspace: grant.bound_workspace, input, refs: vec![], client_cwd: workspace.to_str().unwrap().into() })).await.unwrap();
+            assert!(result.items.iter().all(|item| item.object_ref != Some(proposal.proposal_id.to_string())));
+        }
+        if independent {
+            Box::pin(async move {
+            Box::pin(async {
+                let appendix = serde_json::json!({"timestamp":timestamp,"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"independent","item":{"type":"UserMessage","id":"independent-method","content":[{"type":"text","text":"Saffron cache replacement method: when rebuilding a repository cache, preserve the live cache while writing the complete replacement into a sibling temporary directory. Validate its manifest and every referenced entry before one atomic rename. Abort on a missing entry; afterward reopen the live cache and compare its manifest against the replacement. This is a reusable suggested method, not proof of successful execution.","text_elements":[]}]},"completed_at_ms":1788998402000i64}});
+                writeln!(fs::OpenOptions::new().append(true).open(&transcript).unwrap(), "{appendix}").unwrap();
+                catalog.refresh(&report_value).await.unwrap();
+                admin.handle(RequestId::new_v7(), session, SessionImportAdminAction::QueueImport, 10).await.unwrap();
+                for _ in 0..4 {
+                    if Box::pin(worker.process_checkpoint(&source, SessionImportBudget { max_bytes: 64 * 1024, max_records: 16, max_work_time: Duration::from_millis(250) })).await.unwrap().completed { break; }
+                }
+                let snapshot = writer.project().await.unwrap();
+                let reference = snapshot.data_rows().filter_map(|row| {
+                    if row.object_kind.as_deref() != Some("source_receipt") { return None; }
+                    match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref().unwrap()).unwrap() {
+                        JournalPayload::SourceReceiptRecorded(value) if value.observation_role == ObservationRole::Message => Some(value), _ => None,
+                    }
+                }).max_by_key(|value| value.source_sequence).unwrap().source_observation_id;
+                let mut second = content.clone();
+                second["title"] = serde_json::json!("Saffron validated atomic cache replacement");
+                second["summary"] = serde_json::json!("Build and validate a sibling replacement before changing the live cache; effectiveness unverified.");
+                second["when"]["goals"] = serde_json::json!(["Replace a repository cache without exposing a partial build"]);
+                second["when"]["requires"] = serde_json::json!(["A sibling temporary directory and expected manifest are available"]);
+                second["actions"]["stages"] = serde_json::json!(["Build a complete sibling cache while preserving the live cache", "Validate the manifest and all entries, then atomically rename the replacement"]);
+                second["done"]["verify"] = serde_json::json!(["Reopen the live cache and compare its manifest with the validated replacement"]);
+                let response = |value: serde_json::Value| serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":value.to_string()}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap();
+                let stub = ProviderStub::methods(response(serde_json::json!({"operation":"create","content":second,"direct_refs":[reference.to_string()]})), response(serde_json::json!({"operation":"no_op"})), response(serde_json::json!({"operation":"no_op"})), 3).await;
+                let llm = LlmConfig { base_url: ValidatedBaseUrl::parse(&stub.base_url).unwrap(), ..llm.clone() };
+                let runner = BackgroundScheduler::new(writer.clone(), catalog.clone(), worker.clone(), Arc::clone(&report), runtime(temp.path()), SynthesisPlanner::new(llm), dreaming.clone());
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Box::pin(runner.run_once()).await.unwrap();
+                let view = SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+                assert_eq!(view.proposals.len(), 2, "a previous method must not consume an entire session forever");
+                assert_eq!(view.proposals[&proposal.proposal_id], proposal);
+                assert!(view.proposals.values().any(|value| value.evidence_refs.contains(&reference.to_string())));
+                let requests = stub.finish_all().await;
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests.iter().filter(|request| String::from_utf8_lossy(request).contains("Extract at most one nontrivial reusable method")).count(), 1);
+                assert_eq!(requests.iter().filter(|request| String::from_utf8_lossy(request).contains("Review one Procedure")).count(), 1);
+                let expected = view.proposals.values().map(|proposal| (proposal.proposal_id.to_string(), proposal.proposal_revision_id.to_string())).collect::<Vec<_>>();
+                Box::pin(read_methods(&mcp, &binding, &report_value, &workspace, cross_session, &expected)).await;
+                let jobs_before = evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap()).unwrap().jobs;
+                Box::pin(runner.run_once()).await.unwrap();
+                assert_eq!(SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap().proposals, view.proposals);
+                assert_eq!(evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap()).unwrap().jobs, jobs_before);
+            }).await;
+            drop(mcp); drop(scheduler); drop(worker); drop(admin); drop(catalog); drop(writer);
+            task.await.unwrap().unwrap();
+            let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+            let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+            let worker = SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report)).unwrap();
+            let runner = BackgroundScheduler::new(writer.clone(), catalog, worker, Arc::clone(&report), runtime(temp.path()), SynthesisPlanner::new(llm), dreaming);
+            let before = writer.project().await.unwrap();
+            Box::pin(runner.run_once()).await.unwrap();
+            let after = writer.project().await.unwrap();
+            assert_eq!(SemanticCurrentView::from_snapshot(&after).unwrap().proposals.len(), 2);
+            assert_eq!(evertrace_store::RuntimeSchedulerView::from_snapshot(&before).unwrap().jobs, evertrace_store::RuntimeSchedulerView::from_snapshot(&after).unwrap().jobs);
+            drop(runner); drop(writer); task.await.unwrap().unwrap();
+            }).await;
+            return;
+        }
+        Box::pin(async {
+        let jobs_before_tool = evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap()).unwrap()
+            .jobs.into_iter().filter(|job| job.kind == "procedure_review_v1").count();
+        let tool = serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"method-tool-1","output":"A tool result is not a new method-review message"}});
+        writeln!(fs::OpenOptions::new().append(true).open(&transcript).unwrap(), "{tool}").unwrap();
+        catalog.refresh(&report_value).await.unwrap();
+        admin.handle(RequestId::new_v7(), session, SessionImportAdminAction::QueueImport, 10).await.unwrap();
+        for _ in 0..4 {
+            if Box::pin(worker.process_checkpoint(&source, SessionImportBudget { max_bytes: 64 * 1024, max_records: 16,
+                max_work_time: Duration::from_millis(250) })).await.unwrap().completed { break; }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Box::pin(scheduler.run_once()).await.unwrap();
+        assert_eq!(evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap()).unwrap()
+            .jobs.into_iter().filter(|job| job.kind == "procedure_review_v1").count(), jobs_before_tool);
+        }).await;
+        // A new, related source message triggers the existing review consumer;
+        // the producer's own proposal and repeated idle ticks did not.
+        let appendix = serde_json::json!({"timestamp":timestamp,"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"next","item":{"type":"UserMessage","id":"user-2","content":[{"type":"text","text":"Marigold refinement: before counting commits during acknowledgement recovery, wait for the authoritative journal read to finish; a partial read cannot establish absence.","text_elements":[]}]},"completed_at_ms":1788998402000i64}});
+        writeln!(fs::OpenOptions::new().append(true).open(&transcript).unwrap(), "{appendix}").unwrap();
+        catalog.refresh(&report_value).await.unwrap();
+        admin.handle(RequestId::new_v7(), session, SessionImportAdminAction::QueueImport, 10).await.unwrap();
+        for _ in 0..4 {
+            if Box::pin(worker.process_checkpoint(&source, SessionImportBudget { max_bytes: 64 * 1024, max_records: 16,
+                max_work_time: Duration::from_millis(250) })).await.unwrap().completed { break; }
+        }
+        let mut revised = content.clone();
+        revised["summary"] = serde_json::json!("Marigold ambiguous acknowledgement recovery requires a complete authoritative read before treating a command as absent; effectiveness unverified.");
+        revised["pitfalls"].as_array_mut().unwrap().push(serde_json::json!("A partial journal read cannot establish command absence"));
+        let review_body = serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":serde_json::json!({"operation":"revise","content":revised}).to_string()}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap();
+        let no_op = serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":"{\"operation\":\"no_op\"}"}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap();
+        let review_stub = ProviderStub::methods(no_op.clone(), review_body, no_op, 3).await;
+        let review_llm = LlmConfig { base_url: ValidatedBaseUrl::parse(&review_stub.base_url).unwrap(), ..llm.clone() };
+        let reviewer = BackgroundScheduler::new(writer.clone(), catalog.clone(), worker.clone(), Arc::clone(&report),
+            runtime(temp.path()), SynthesisPlanner::new(review_llm.clone()), dreaming.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Box::pin(reviewer.run_once()).await.unwrap();
+        let reviewed = SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+        assert_eq!(reviewed.proposals.len(), 1);
+        let successor = reviewed.proposals[&proposal.proposal_id].clone();
+        assert_ne!(successor.proposal_revision_id, proposal.proposal_revision_id);
+        assert_eq!(successor.parent_proposal_revision_id, Some(proposal.proposal_revision_id));
+        assert!(successor.source_cohort_refs.len() > proposal.source_cohort_refs.len());
+        let review_requests = review_stub.finish_all().await;
+        assert_eq!(review_requests.len(), 3);
+        assert_eq!(review_requests.iter().filter(|request| String::from_utf8_lossy(request)
+            .contains("Extract at most one nontrivial reusable method")).count(), 1);
+        assert_eq!(review_requests.iter().filter(|request| String::from_utf8_lossy(request)
+            .contains("Review one Procedure")).count(), 1);
+        assert!(review_requests.iter().all(|request| !String::from_utf8_lossy(request)
+            .contains("A tool result is not a new method-review message")));
+        Box::pin(reviewer.run_once()).await.unwrap();
+        assert_eq!(SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap().proposals[&proposal.proposal_id], successor);
+        drop(reviewer);
+        drop(mcp); drop(scheduler); drop(worker); drop(admin); drop(catalog); drop(writer);
+        task.await.unwrap().unwrap();
+        let (writer, task) = spawn_writer(open_writer(&data).await.unwrap(), 32).unwrap();
+        let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+        let worker = SessionImportWorker::new(writer.clone(), runtime(temp.path()), Arc::clone(&report)).unwrap();
+        let off = BackgroundScheduler::new(writer.clone(), catalog.clone(), worker.clone(), Arc::clone(&report), runtime(temp.path()),
+            SynthesisPlanner::new(LlmConfig { enabled: false, ..review_llm }), dreaming);
+        Box::pin(off.run_once()).await.unwrap();
+        assert_eq!(SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap().proposals[&proposal.proposal_id], successor);
+        let mcp = evertrace_engine::McpActionService::open(binding.clone(), &data, writer.clone(), runtime(temp.path())).await.unwrap().with_session_report(Arc::clone(&report));
+        let result = read(&mcp, &binding, &report_value, &workspace, cross_session, evertrace_engine::McpServiceAction::Get, proposal.proposal_id.to_string()).await;
+        assert!(result.items.iter().any(|item| item.object_revision_ref == Some(successor.proposal_revision_id.to_string())));
+        let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+        if !terminal {
+        admin.handle(RequestId::new_v7(), session, SessionImportAdminAction::RevokeAccess, 10).await.unwrap();
+        for (action, input) in [(evertrace_engine::McpServiceAction::Search, "Marigold".into()), (evertrace_engine::McpServiceAction::Get, proposal.proposal_id.to_string()), (evertrace_engine::McpServiceAction::Get, proposal.proposal_revision_id.to_string())] {
+            let result = read(&mcp, &binding, &report_value, &workspace, cross_session, action, input).await;
+            assert!(result.items.iter().all(|item| item.object_ref != Some(proposal.proposal_id.to_string())));
+        }
+        } else {
+        let view = SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+        let at = observed_at_us + 20_000_000;
+        let evertrace_engine::semantic::ProposalResolution::Revision { command, .. } = evertrace_engine::semantic::RevisionProposalService.revise_status(&view,
+            evertrace_engine::semantic::ProposalCommandContext { command_id: evertrace_domain::ids::CommandId::new_v7(), occurred_at_us: at, effective_config_hash: CONFIG, algorithm_revision: "method-reference-test".into() },
+            proposal.proposal_id, ProposalStatus::Rejected, vec![], Some("Not accepted for execution".into())).unwrap() else { panic!("missing status transition") };
+        writer.commit(command, at).await.unwrap();
+        for (action, input) in [(evertrace_engine::McpServiceAction::Search, "Marigold".into()), (evertrace_engine::McpServiceAction::Get, successor.proposal_revision_id.to_string())] {
+            let result = read(&mcp, &binding, &report_value, &workspace, cross_session, action, input).await;
+            assert!(result.items.iter().all(|item| item.object_ref != Some(proposal.proposal_id.to_string())));
+        }
+        assert_eq!(SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap().proposals[&proposal.proposal_id].status, ProposalStatus::Rejected);
+        }
+        drop(mcp); drop(off); drop(worker); drop(admin); drop(catalog); drop(writer);
+        task.await.unwrap().unwrap();
+        }).await;
+        return;
+    }
     let application = evertrace_engine::provider::ProviderSemanticApplication {
         progress_delta: vec![SemanticStructuredDelta {
             label: "message claim".into(),
@@ -425,6 +766,12 @@ async fn imported_messages_use_normal_synthesis_and_mcp_without_work_objects() {
         )
     )));
     let mut requests = stub.finish_all().await;
+    assert!(requests.iter().any(|request| {
+        String::from_utf8_lossy(request).contains("Extract at most one nontrivial reusable method")
+    }));
+    requests.retain(|request| {
+        !String::from_utf8_lossy(request).contains("Extract at most one nontrivial reusable method")
+    });
     assert_eq!(requests.len(), 2);
     let request = requests.pop().unwrap();
     let boundary = request

@@ -1752,6 +1752,20 @@ pub(crate) async fn blocked_source_rows(
     if rows.len() > 64 {
         return Err(SessionImportServiceError::Unavailable);
     }
+    blocked_source_rows_before(writer, report, snapshot, rows, config_hash, None, None).await
+}
+
+/// Request-scoped batch entry: one borrowed projection index, one permission
+/// decision per source, and no deadline renewal for individual candidates.
+pub(crate) async fn blocked_source_rows_before(
+    writer: &WriterHandle,
+    report: Option<&HostProbeReport>,
+    snapshot: &evertrace_store::ProjectionSnapshot,
+    rows: &[&evertrace_store::ObjectRow],
+    config_hash: [u8; 32],
+    lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
+    deadline: Option<Instant>,
+) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
     let mut sources = BTreeMap::new();
     let mut observations = BTreeMap::new();
     let mut blocked = std::collections::BTreeSet::new();
@@ -1817,10 +1831,17 @@ pub(crate) async fn blocked_source_rows(
             _ => return Err(SessionImportServiceError::Corrupt),
         }
     }
-    for row in snapshot
-        .data_rows()
-        .filter(|row| observations.contains_key(&row.row_id))
-    {
+    let observation_rows = match lookup {
+        Some(lookup) => observations
+            .keys()
+            .filter_map(|id| lookup.get(id.as_str()).copied())
+            .collect::<Vec<_>>(),
+        None => snapshot
+            .data_rows()
+            .filter(|row| observations.contains_key(&row.row_id))
+            .collect(),
+    };
+    for row in observation_rows {
         let Some(target) = observations.get(&row.row_id) else {
             continue;
         };
@@ -1859,10 +1880,12 @@ pub(crate) async fn blocked_source_rows(
             .map_err(map_writer)?;
         contexts.insert(source.clone(), context);
     }
-    // Actor admission is control-plane preparation, not filesystem probe time.
-    // All sources share one bounded read quantum after their current contexts
-    // have been obtained; no per-source deadline renewal.
-    let deadline = Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET;
+    // Context collection is control-plane preparation. The standalone wrapper
+    // starts its filesystem quantum here; a request-scoped caller retains its
+    // existing deadline, including when admission waited. Neither path renews
+    // the deadline for an individual source.
+    let deadline =
+        deadline.unwrap_or_else(|| Instant::now() + crate::repository::SESSION_ROOT_PROBE_BUDGET);
     let mut revoked = Vec::new();
     let permissions = contexts
         .into_iter()
