@@ -49,18 +49,18 @@ Copy the [LLM-off trial configuration](docs/examples/evertrace.local.toml) to yo
 
 ```sh
 umask 077
-mkdir -p "$HOME/.config/evertrace"
-cp -n docs/examples/evertrace.local.toml "$HOME/.config/evertrace/config.toml"
-./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" config show --effective
+mkdir -p "$HOME/.evertrace"
+cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" config show --effective
 ```
 
 Check that LLM processing is disabled; an existing file was not replaced. Then start the daemon:
 
 ```sh
-./target/debug/evertraced --config "$HOME/.config/evertrace/config.toml"
+./target/debug/evertraced --config "$HOME/.evertrace/config.toml"
 ```
 
-In a second terminal, run `./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" doctor` or `tui`. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
+In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" doctor` or `tui`. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
 
 Do not run the installer as root. Installation changes managed host configuration and may enable a user service; it is a separate step, not part of the commands above.
 

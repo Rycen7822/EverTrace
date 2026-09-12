@@ -24,7 +24,7 @@ Effective-config output reads disk; doctor health/current diagnostics come from 
 | 现象 / Symptom | 检查与处理 / Check and action |
 |---|---|
 | `evertrace: command not found` | 构建后用 `./target/debug/evertrace`，或使用已安装的绝对路径；编译不会自动添加 PATH。 / Use the built relative path or installed absolute path; building does not install into PATH. |
-| 配置不存在 / Missing config | 核对 `--config`、`EVERTRACE_CONFIG`、XDG/HOME。CLI 的 `--config` 放在子命令前。 / Check precedence and argument order. |
+| 配置不存在 / Missing config | 核对 `--config`、`EVERTRACE_CONFIG`、`$HOME/.evertrace/config.toml`；默认不使用 XDG。CLI 的 `--config` 放在子命令前。 / Check precedence, HOME and argument order; the default does not use XDG. |
 | `configuration invalid` | 检查 `config_version=1`、未知字段、单位、范围和字段关系；不要删除校验或改依赖。 / Check version, fields, units, ranges and relationships; do not weaken validation. |
 | daemon unavailable / socket 失败 | 核对同一配置/data_dir、服务状态和运行用户；先看日志，不删 socket/lock。 / Check config/data root, service and user; inspect logs before touching socket/lock. |
 | writer lock busy | 查清原 daemon/维护任务是否仍在运行；正常关闭后再试。 / Identify the current daemon/maintenance writer and stop it normally. |

@@ -95,6 +95,73 @@ fn cli_help_succeeds_without_config_or_daemon_and_lists_available_commands() {
 }
 
 #[tokio::test]
+async fn default_config_uses_home_dot_evertrace_and_preserves_explicit_overrides() {
+    use std::time::{Duration, Instant};
+
+    let (root, paths, initial) = fixture();
+    let mut config = initial.config().clone();
+    config.llm.enabled = false;
+    let config_dir = root.path().join(".evertrace");
+    fs::create_dir(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        EffectiveConfig::new(config).unwrap().to_toml().unwrap(),
+    )
+    .unwrap();
+    let xdg = root.path().join("xdg");
+    fs::create_dir_all(xdg.join("evertrace")).unwrap();
+    fs::write(xdg.join("evertrace/config.toml"), "invalid = [").unwrap();
+    let mut cli = Command::new(&paths.cli);
+    cli.env_clear()
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", &xdg);
+    let output = cli.args(["config", "check"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let output = cli
+        .env("EVERTRACE_CONFIG", root.path().join("missing.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an explicit environment override must be honored"
+    );
+    let output = Command::new(&paths.cli)
+        .env_clear()
+        .env("EVERTRACE_CONFIG", root.path().join("missing.toml"))
+        .arg("--config")
+        .arg(&paths.config)
+        .args(["config", "check"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut daemon = Daemon(
+        Command::new(&paths.daemon)
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", &xdg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
 async fn cli_backup_queues_real_daemon_jobs_and_reports_completion_separately() {
     use evertrace_domain::ids::{JobId, RequestId};
     use evertrace_protocol::{

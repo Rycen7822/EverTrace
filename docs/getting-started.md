@@ -48,10 +48,10 @@ Check for an existing destination first. Inspect/reuse it or choose a separate p
 
 ```sh
 umask 077
-mkdir -p "$HOME/.config/evertrace"
-cp -n docs/examples/evertrace.local.toml "$HOME/.config/evertrace/config.toml"
-./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" config check
-./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" config show --effective
+mkdir -p "$HOME/.evertrace"
+cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" config check
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" config show --effective
 ```
 
 确认 `llm.enabled = false`。试用数据目录是 `~/.local/share/evertrace-trial`；不要与已有实例混用。`config check` 只证明配置合法，不测试模型、宿主或后台任务。
@@ -61,14 +61,14 @@ Confirm `llm.enabled = false`. The trial data directory is `~/.local/share/evert
 ## 4. 首次前台启动 / Start in the foreground
 
 ```sh
-./target/debug/evertraced --config "$HOME/.config/evertrace/config.toml"
+./target/debug/evertraced --config "$HOME/.evertrace/config.toml"
 ```
 
 另开终端，在仓库根目录执行： / In a second terminal, from the repository root:
 
 ```sh
-./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" doctor
-./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" tui
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" doctor
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" tui
 ```
 
 daemon 启动会创建本地运行数据。这一步没有接入宿主，空数据和 `host_canary=not_run` 是正常现象。TUI 的 `q` 只退出界面；在 daemon 所在终端按 Ctrl-C 才会请求关闭服务。不要同时为同一数据目录启动第二个 daemon。
@@ -110,7 +110,7 @@ export PATH="$HOME/.local/lib/evertrace:$PATH"
 This PATH change affects the current shell; use absolute paths in other terminals or add the directory to your user PATH. `/absolute/evertrace-bin/evertrace` below means the CLI you just prepared. The host executable must be an actual executable regular file; resolve symlinks to the real installed file rather than fabricating wrappers to bypass checks.
 
 ```sh
-/absolute/evertrace-bin/evertrace --config "$HOME/.config/evertrace/config.toml" install /absolute/path/to/codex
+/absolute/evertrace-bin/evertrace --config "$HOME/.evertrace/config.toml" install /absolute/path/to/codex
 ```
 
 无用户 systemd 时，按安装输出的手动 daemon 命令启动。若使用用户服务，先按[配置指南](configuration.md)将模型密钥提供给服务进程；shell 中的 `export` 不代表服务也收到了密钥。不要手工复制带占位符的 Hook 模板来绕过安装器。
@@ -120,7 +120,7 @@ Without user systemd, use the manual daemon command printed by the installer. Fo
 普通安装不执行真实模型 canary。需要真实接入验证时显式执行： / Installation does not run a live model canary by default. To request it explicitly:
 
 ```sh
-/absolute/evertrace-bin/evertrace --config "$HOME/.config/evertrace/config.toml" doctor --refresh-host /absolute/path/to/codex
+/absolute/evertrace-bin/evertrace --config "$HOME/.evertrace/config.toml" doctor --refresh-host /absolute/path/to/codex
 ```
 
 **费用与副作用：** live canary 使用宿主正常的配置、认证、模型和信任设置，可能产生模型费用；现有第三方 Hook、notify 或 MCP 的副作用不能保证不存在。探测成功也不等于五项能力门全部通过，必须阅读每项结果。`install ... --live-canary` 具有同类影响。

@@ -4,9 +4,9 @@
 
 ## 配置文件与路径 / Configuration file and paths
 
-CLI 和 daemon 使用同一选择顺序：显式 `--config PATH` → `EVERTRACE_CONFIG` 环境变量 → `$XDG_CONFIG_HOME/evertrace/config.toml`，未设置 XDG 时为 `~/.config/evertrace/config.toml`。CLI 的 `--config` 必须放在子命令之前。使用自定义配置时，每个入口都应指向同一文件。
+CLI 和 daemon 使用同一选择顺序：显式 `--config PATH` → `EVERTRACE_CONFIG` 环境变量 → `~/.evertrace/config.toml`。默认配置不使用 `XDG_CONFIG_HOME`，也不自动回退到旧目录。CLI 的 `--config` 必须放在子命令之前。使用自定义配置时，每个入口都应指向同一文件。systemd 用户 unit 仍使用标准用户服务目录，和 EverTrace 配置目录分开。
 
-Both CLI and daemon choose: explicit `--config PATH` → `EVERTRACE_CONFIG` → `$XDG_CONFIG_HOME/evertrace/config.toml`, falling back to `~/.config/evertrace/config.toml` without XDG. Put the CLI's `--config` before the command. Point every entry point at the same file when using a custom configuration.
+Both CLI and daemon choose: explicit `--config PATH` → `EVERTRACE_CONFIG` → `~/.evertrace/config.toml`. The default ignores `XDG_CONFIG_HOME` and does not fall back to the former directory. Put the CLI's `--config` before the command and point every entry point at the same file. The systemd user unit remains in the standard user-service directory, separate from EverTrace configuration.
 
 ```sh
 evertrace --config /absolute/config.toml config check
@@ -20,6 +20,12 @@ evertrace --config /absolute/config.toml config show --effective
 `runtime.data_dir` 可用绝对路径、`~/...`、以 `$NAME` 或 `${NAME}` 开头的路径；环境变量基路径必须为非空绝对路径。不接受任意 shell 表达式，不执行命令替换；相对路径和 `..` 等不合法路径会被拒绝。数据根需要当前用户拥有的私有本地目录，不要用 symlink 绕过校验。
 
 `runtime.data_dir` accepts absolute paths, `~/...`, and supported `$NAME`/`${NAME}` prefixes whose environment base is a nonempty absolute path. It is not a shell expression: no command substitution or arbitrary expansion. Relative/invalid paths are rejected. Use a private local directory owned by the current user, not a symlink workaround.
+
+## 已安装实例迁移 / Existing installations
+
+旧安装不会自动搬迁配置。先停止服务，确认 `~/.evertrace/` 中没有需要保留的冲突文件，再将原配置和 `provider.env` 移入该目录，保持目录 `0700`、文件 `0600`。保留 `runtime.data_dir`，不要把配置迁移当成数据库迁移。同步修改 EverTrace MCP 的 `--config` 参数、用户 unit 的 `ExecStart --config` 和凭据 drop-in 的 `EnvironmentFile`，不覆盖 Codex 的其他配置；执行 `systemctl --user daemon-reload` 并校验后再启动。确认新路径生效后，仅移除已空的旧配置目录，不建立自动回退或目录镜像。
+
+Existing installations are not automatically migrated. Stop the service, check for destination conflicts, then move the configuration and `provider.env` into `~/.evertrace/` with directory mode `0700` and file mode `0600`. Preserve `runtime.data_dir`; this is not a database migration. Update the EverTrace MCP `--config` argument, user-unit `ExecStart --config`, and credential drop-in `EnvironmentFile`, preserving unrelated Codex settings. Run `systemctl --user daemon-reload`, validate, then start. Remove only the empty former configuration directory after verifying the new paths; do not create a fallback or mirror.
 
 ## 配置段速查 / Section reference
 
@@ -75,15 +81,15 @@ Budgets are not exact billing caps: timeouts, remote billing and usage reporting
 
 ## 密钥与用户服务 / Credentials and user services
 
-前台 daemon 从启动它的 shell 继承环境。systemd 用户服务有自己的环境，终端中的 `export` 不会自动传给已经运行的服务。可通过受保护的环境文件向服务提供凭据：在 `~/.config/evertrace/provider.env` 中用编辑器写入 `EVERTRACE_LLM_API_KEY=你的密钥`，设为权限 `0600`，不要提交、截图或粘贴到 issue。
+前台 daemon 从启动它的 shell 继承环境。systemd 用户服务有自己的环境，终端中的 `export` 不会自动传给已经运行的服务。可通过受保护的环境文件向服务提供凭据：在 `~/.evertrace/provider.env` 中用编辑器写入 `EVERTRACE_LLM_API_KEY=你的密钥`，设为权限 `0600`，不要提交、截图或粘贴到 issue。
 
-A foreground daemon inherits its launching shell's environment. A systemd user service has a separate environment. One option is a private `~/.config/evertrace/provider.env` containing `EVERTRACE_LLM_API_KEY=your-key`, created with an editor and mode `0600`. Never commit it, screenshot it or attach it to an issue.
+A foreground daemon inherits its launching shell's environment. A systemd user service has a separate environment. One option is a private `~/.evertrace/provider.env` containing `EVERTRACE_LLM_API_KEY=your-key`, created with an editor and mode `0600`. Never commit it, screenshot it or attach it to an issue.
 
 在已安装的用户服务上执行 `systemctl --user edit evertraced.service`，添加 drop-in，而不是覆盖受管 unit： / For an installed user service, use `systemctl --user edit evertraced.service` and add a drop-in instead of replacing the managed unit:
 
 ```ini
 [Service]
-EnvironmentFile=%h/.config/evertrace/provider.env
+EnvironmentFile=%h/.evertrace/provider.env
 ```
 
 ```sh

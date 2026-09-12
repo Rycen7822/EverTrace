@@ -49,18 +49,18 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo +1.97.1 build --locked -p evertrace
 
 ```sh
 umask 077
-mkdir -p "$HOME/.config/evertrace"
-cp -n docs/examples/evertrace.local.toml "$HOME/.config/evertrace/config.toml"
-./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" config show --effective
+mkdir -p "$HOME/.evertrace"
+cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" config show --effective
 ```
 
 确认 LLM 已关闭；已有文件不会被替换。然后启动 daemon：
 
 ```sh
-./target/debug/evertraced --config "$HOME/.config/evertrace/config.toml"
+./target/debug/evertraced --config "$HOME/.evertrace/config.toml"
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.config/evertrace/config.toml" doctor` 或 `tui`。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" doctor` 或 `tui`。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
 
 不要以 root 身份运行安装命令。安装会修改受管宿主配置，并可能启用用户服务；它是单独的一步，不包含在上述命令中。
 

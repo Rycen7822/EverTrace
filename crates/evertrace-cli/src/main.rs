@@ -28,9 +28,7 @@ pub(crate) fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, 
     if let Some(path) = env::var_os("EVERTRACE_CONFIG") {
         return Ok(PathBuf::from(path));
     }
-    env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|base| base.join("evertrace/config.toml"))
-        .ok_or("no platform configuration directory")
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".evertrace/config.toml"))
+        .ok_or("HOME unavailable for default EverTrace configuration")
 }

@@ -2054,14 +2054,11 @@ fn config_path(explicit: Option<PathBuf>) -> Result<PathBuf, &'static str> {
     if let Some(path) = env::var_os("EVERTRACE_CONFIG") {
         return Ok(PathBuf::from(path));
     }
-    default_config_path().ok_or("no platform configuration directory")
+    default_config_path().ok_or("HOME unavailable for default EverTrace configuration")
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|base| base.join("evertrace/config.toml"))
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".evertrace/config.toml"))
 }
 
 fn wait_for_signal()
