@@ -2483,13 +2483,13 @@ mod tests {
             repository_revision: repository.repository_revision,
             snapshot_cas_ref: snapshot_ref.clone(),
             dependency_cas_refs: payloads.keys().cloned().collect(),
-            evidence_refs: vec!["fixture-probe".into()],
+            evidence_refs: vec!["fixture-probe".into(), "session:bounded".into()],
             recorded_at_us: at + 2,
         };
         let completion = inventory_completion_command(
             &repository,
             &leased,
-            Some(fact),
+            Some(fact.clone()),
             true,
             job.job_id,
             at + 2,
@@ -2497,6 +2497,45 @@ mod tests {
         .unwrap();
         writer.commit(&completion, at + 2).await.unwrap();
         let committed = writer.frontier();
+        let source = (
+            "session:bounded",
+            context.repository_id,
+            context.worktree_id,
+        );
+        assert!(crate::procedure::historical_inventory_at_source(
+            &fact,
+            committed,
+            source,
+            (committed, at + 3)
+        ));
+        assert!(!crate::procedure::historical_inventory_at_source(
+            &fact,
+            committed,
+            source,
+            (committed - 1, at + 3)
+        ));
+        assert!(!crate::procedure::historical_inventory_at_source(
+            &fact,
+            committed,
+            source,
+            (committed, at + 1)
+        ));
+        assert!(!crate::procedure::historical_inventory_at_source(
+            &fact,
+            committed,
+            ("session:other", context.repository_id, context.worktree_id),
+            (committed, at + 3)
+        ));
+        assert!(!crate::procedure::historical_inventory_at_source(
+            &fact,
+            committed,
+            (
+                "session:bounded",
+                context.repository_id,
+                WorktreeId::new_v7()
+            ),
+            (committed, at + 3)
+        ));
         drop(writer); // Simulate a lost acknowledgement, then recover the same command.
         let mut writer = crate::open_writer(&root.join("data")).await.unwrap();
         assert!(writer.commit(&completion, at + 3).await.unwrap().replayed);
@@ -2525,6 +2564,32 @@ mod tests {
         );
         assert_eq!(repository.repository_revision, 4);
         assert_eq!(current.job.unwrap().state, JobStatus::Succeeded);
+        let historical =
+            crate::repository::read_inventory_snapshot(&root.join("cas"), &fact).unwrap();
+        assert_eq!(historical, snapshot);
+        fs::write(
+            assets.join("SKILL.md"),
+            "---\nname: bounded\ndescription: subsequently installed content\n---\n",
+        )
+        .unwrap();
+        let (new_snapshot, new_payloads) = scan_test_skill(&assets, &key);
+        let new_ref = publish_inventory_cas(&cas, &new_snapshot, &new_payloads, &key).unwrap();
+        assert_ne!(new_ref, fact.snapshot_cas_ref);
+        assert!(!inventory_snapshot_current(
+            &historical,
+            Instant::now() + QUANTUM
+        ));
+        // The shared protected-CAS reader never substitutes current source
+        // bytes for a previously committed snapshot.
+        assert_eq!(
+            crate::repository::read_inventory_snapshot(&root.join("cas"), &fact).unwrap(),
+            historical
+        );
+        let mut mismatched = fact.clone();
+        mismatched.snapshot_cas_ref = new_ref;
+        assert!(
+            crate::repository::read_inventory_snapshot(&root.join("cas"), &mismatched).is_err()
+        );
         drop(writer);
         fs::remove_dir_all(&root).unwrap();
     }

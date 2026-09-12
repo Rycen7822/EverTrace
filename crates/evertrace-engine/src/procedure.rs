@@ -128,8 +128,8 @@ pub async fn resolve_procedure_coverage(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let mut sessions = BTreeSet::new();
+    let mut source_boundaries = std::collections::BTreeMap::new();
     let mut complete_capture = !refs.is_empty();
-    let mut source_boundary = None::<(u64, i64)>;
     let mut receipts = BTreeSet::new();
     let mut resolved_refs = BTreeSet::new();
     for row in snapshot
@@ -171,18 +171,32 @@ pub async fn resolve_procedure_coverage(
         else {
             return Err(SemanticServiceError::InvalidInput);
         };
+        let boundary = (
+            row.source_event_seq,
+            value.event_time_us.min(value.recorded_at_us),
+        );
+        if let (Some(repository), Some(worktree)) =
+            (value.repository_instance_id, value.worktree_instance_id)
+        {
+            source_boundaries
+                .entry((
+                    format!("session:{}", value.source_session_ref),
+                    repository,
+                    worktree,
+                ))
+                .and_modify(|old: &mut (u64, i64)| {
+                    *old = (old.0.min(boundary.0), old.1.min(boundary.1))
+                })
+                .or_insert(boundary);
+        }
         sessions.insert(format!("session:{}", value.source_session_ref));
-        let boundary = (row.source_event_seq, value.recorded_at_us);
-        source_boundary = Some(source_boundary.map_or(boundary, |old| {
-            (old.0.min(boundary.0), old.1.min(boundary.1))
-        }));
         resolved_refs.insert(value.source_receipt_id.to_string());
         receipts.remove(&value.source_receipt_id.to_string());
         complete_capture &= value.capture_completeness
             == evertrace_domain::evidence::CaptureCompleteness::Complete
             && value.close_watermark.is_some();
     }
-    if sessions.len() != 1 {
+    if sessions.is_empty() {
         coverage.omissions.push(Omission::SessionUnobserved);
     }
     if sessions.is_empty()
@@ -200,11 +214,51 @@ pub async fn resolve_procedure_coverage(
     let mut candidates = std::collections::BTreeMap::new();
     let mut historical = std::collections::BTreeMap::new();
     let mut incremental_targets = Vec::new();
-    if sessions.len() == 1 {
+    let inventory_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut inventory_bytes = 0usize;
+    let mut inventory_items = 0usize;
+    #[derive(serde::Deserialize)]
+    struct InventoryContextRow {
+        value: InventoryContextValue,
+    }
+    #[derive(serde::Deserialize)]
+    struct InventoryContextValue {
+        context: evertrace_domain::inventory::InventoryContext,
+    }
+    if !sessions.is_empty() {
         for row in snapshot
             .data_rows()
             .filter(|row| row.object_kind.as_deref() == Some("capability_inventory"))
         {
+            if std::time::Instant::now() >= inventory_deadline {
+                coverage.omissions.push(Omission::CandidateLimit);
+                break;
+            }
+            if row.repository_id.as_ref().is_some_and(|id| {
+                !source_boundaries
+                    .keys()
+                    .any(|(_, repository, _)| repository.to_string() == *id)
+            }) {
+                continue;
+            }
+            let context: InventoryContextRow = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(SemanticServiceError::InvalidInput)?,
+            )
+            .map_err(|_| SemanticServiceError::InvalidInput)?;
+            if !source_boundaries.keys().any(|(_, repository, worktree)| {
+                *repository == context.value.context.repository_id
+                    && *worktree == context.value.context.worktree_id
+            }) {
+                continue;
+            }
+            inventory_items += 1;
+            inventory_bytes += row.payload_json.as_ref().map_or(0, String::len);
+            if inventory_items > 256 || inventory_bytes > 2 * 1024 * 1024 {
+                coverage.omissions.push(Omission::CandidateLimit);
+                break;
+            }
             let JournalPayload::CapabilityInventoryRecorded(value) = serde_json::from_str(
                 row.payload_json
                     .as_deref()
@@ -219,6 +273,10 @@ pub async fn resolve_procedure_coverage(
                 worktree_id: value.context.worktree_id,
             };
             if draft.scope.contains(&scope)
+                && source_boundaries.keys().any(|(_, repository, worktree)| {
+                    *repository == value.context.repository_id
+                        && *worktree == value.context.worktree_id
+                })
                 && active.iter().any(|(host, report)| {
                     host.cwd.to_str() == Some(value.context.cwd.as_str())
                         && host.home.to_str() == Some(value.context.host_home.as_str())
@@ -227,23 +285,22 @@ pub async fn resolve_procedure_coverage(
                         && host.profile == value.context.host_profile
                         && report.manifest().adapter_manifest_id
                             == value.context.adapter_manifest_id
-                        && bindings
-                            .inventory_session_ref(host)
-                            .is_some_and(|reference| sessions.contains(&reference))
                 })
             {
-                if source_boundary.is_some_and(|(seq, time)| {
-                    row.source_event_seq <= seq && value.recorded_at_us <= time
-                }) && value
-                    .evidence_refs
-                    .iter()
-                    .any(|reference| sessions.contains(reference))
-                {
+                for ((session, repository, worktree), &(seq, time)) in &source_boundaries {
+                    if !historical_inventory_at_source(
+                        &value,
+                        row.source_event_seq,
+                        (session, *repository, *worktree),
+                        (seq, time),
+                    ) {
+                        continue;
+                    }
                     let entry = historical
-                        .entry(value.context.clone())
-                        .or_insert((row.source_event_seq, value.snapshot_cas_ref.clone()));
+                        .entry((session.clone(), value.context.clone()))
+                        .or_insert((row.source_event_seq, value.clone()));
                     if row.source_event_seq > entry.0 {
-                        *entry = (row.source_event_seq, value.snapshot_cas_ref.clone());
+                        *entry = (row.source_event_seq, value.clone());
                     }
                 }
                 let entry = candidates
@@ -252,7 +309,8 @@ pub async fn resolve_procedure_coverage(
                 if row.source_event_seq > entry.0 {
                     *entry = (row.source_event_seq, value);
                 }
-                if candidates.len() > 1 {
+                if candidates.len() > 4 {
+                    coverage.omissions.push(Omission::CandidateLimit);
                     break;
                 }
             }
@@ -261,34 +319,96 @@ pub async fn resolve_procedure_coverage(
     if candidates.is_empty() {
         coverage.omissions.push(Omission::InventoryMissing);
     }
-    // Different active cwd/profile observations for one source cohort are not
-    // interchangeable. Do not choose an arbitrary recent Host observation.
-    if candidates.len() > 1 {
-        coverage.omissions.push(Omission::SessionUnobserved);
-        candidates.clear();
-    }
-    for (_, (_, fact)) in candidates {
-        // Current presence is useful to the reviewer, but an inventory that
-        // completed after the source cannot prove that source's historical
-        // capability coverage, including when the same session resumes.
-        if historical
-            .get(&fact.context)
-            .is_none_or(|(_, cas_ref)| *cas_ref != fact.snapshot_cas_ref)
+    let contexts = source_boundaries
+        .keys()
+        .map(|(_, repository, worktree)| (*repository, *worktree))
+        .collect::<BTreeSet<_>>();
+    for (session, repository, worktree) in source_boundaries.keys() {
+        let related = candidates
+            .keys()
+            .filter(|context| {
+                context.repository_id == *repository && context.worktree_id == *worktree
+            })
+            .collect::<Vec<_>>();
+        if related.is_empty()
+            || related
+                .iter()
+                .any(|context| !historical.contains_key(&(session.clone(), (*context).clone())))
         {
             coverage
                 .omissions
                 .push(Omission::HistoricalCaptureUnobserved);
         }
-        let Some(inventory) = crate::repository::read_inventory(writer, bindings, runtime, &fact)
-            .await
-            .map_err(|_| SemanticServiceError::InvalidInput)?
+    }
+    for ((session, _), (_, fact)) in &historical {
+        if coverage.inventory_refs.len() >= 8 || std::time::Instant::now() >= inventory_deadline {
+            coverage.omissions.push(Omission::CandidateLimit);
+            break;
+        }
+        match crate::repository::read_procedure_historical_inventory(
+            writer,
+            bindings,
+            runtime,
+            snapshot,
+            fact,
+            (
+                session,
+                source_boundaries[&(
+                    session.clone(),
+                    fact.context.repository_id,
+                    fact.context.worktree_id,
+                )],
+            ),
+            inventory_deadline,
+        )
+        .await
+        .map_err(|_| SemanticServiceError::InvalidInput)?
+        {
+            Some(inventory) => {
+                if !coverage.inventory_refs.contains(&fact.job_id) {
+                    coverage.inventory_refs.push(fact.job_id);
+                }
+                if inventory.sources.iter().any(|source| !source.observed) {
+                    coverage.omissions.push(Omission::SourceUnobserved);
+                }
+            }
+            None => coverage
+                .omissions
+                .push(Omission::HistoricalCaptureUnobserved),
+        }
+    }
+    let mut present = BTreeSet::new();
+    for (_, (_, fact)) in candidates.into_iter().take(4) {
+        if std::time::Instant::now() >= inventory_deadline
+            || coverage.inventory_refs.len() >= 8 && !coverage.inventory_refs.contains(&fact.job_id)
+        {
+            coverage.omissions.push(Omission::CandidateLimit);
+            break;
+        }
+        // Current presence is useful to the reviewer, but an inventory that
+        // completed after the source cannot prove that source's historical
+        // capability coverage, including when the same session resumes.
+        let Some(inventory) = crate::repository::read_inventory_before(
+            writer,
+            bindings,
+            runtime,
+            &fact,
+            inventory_deadline,
+        )
+        .await
+        .map_err(|_| SemanticServiceError::InvalidInput)?
         else {
             coverage.omissions.push(Omission::InventoryStale);
             continue;
         };
-        coverage.inventory_refs.push(fact.job_id);
-        coverage.present_assets = inventory.signatures.len() as u32;
-        coverage.unobserved_sources = inventory
+        if !coverage.inventory_refs.contains(&fact.job_id) {
+            if coverage.inventory_refs.len() == 8 {
+                coverage.omissions.push(Omission::CandidateLimit);
+                continue;
+            }
+            coverage.inventory_refs.push(fact.job_id);
+        }
+        coverage.unobserved_sources += inventory
             .sources
             .iter()
             .filter(|source| !source.observed)
@@ -297,6 +417,13 @@ pub async fn resolve_procedure_coverage(
             coverage.omissions.push(Omission::SourceUnobserved);
         }
         for signature in &inventory.signatures {
+            if !present.insert((
+                (signature.scope.clone(), signature.source_path.clone()),
+                signature.content_cas_ref.clone(),
+            )) {
+                continue;
+            }
+            coverage.present_assets += 1;
             let (
                 Some(triggers),
                 Some(preconditions),
@@ -332,19 +459,27 @@ pub async fn resolve_procedure_coverage(
         if coverage.unknown_contracts != 0 {
             coverage.omissions.push(Omission::ContractUnknown);
         }
-        let usage = usage::ProcedureUsageCurrentView::from_snapshot(snapshot)?;
+    }
+    // Published procedures have their own current/scope evidence and remain
+    // comparable even when a file inventory is missing or revoked.
+    let usage = usage::ProcedureUsageCurrentView::from_coverage_snapshot(
+        snapshot,
+        &contexts,
+        inventory_deadline,
+    )?;
+    if usage.is_none() {
+        coverage.omissions.push(Omission::CandidateLimit);
+    }
+    if let Some(usage) = usage {
         for (index, (procedure, level)) in usage
-            .coverage_procedures(
-                draft.scope,
-                fact.context.repository_id,
-                fact.context.worktree_id,
-            )
+            .coverage_procedures(draft.scope, &contexts)
             .enumerate()
         {
             if index == MAX_CANDIDATES {
                 coverage.omissions.push(Omission::CandidateLimit);
                 break;
             }
+            coverage.present_assets += 1;
             if equivalent_procedure_contract(&procedure.draft, draft) {
                 coverage.equivalent_assets.push(CapabilityCoverageMatch {
                     revision_ref: procedure.revision_id.to_string(),
@@ -384,6 +519,26 @@ pub async fn resolve_procedure_coverage(
         source_refs: source_refs.to_vec(),
         incremental_target,
     })
+}
+
+pub(crate) fn historical_inventory_at_source(
+    fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
+    sequence: u64,
+    source: (
+        &str,
+        evertrace_domain::ids::RepositoryId,
+        evertrace_domain::ids::WorktreeId,
+    ),
+    boundary: (u64, i64),
+) -> bool {
+    sequence <= boundary.0
+        && fact.recorded_at_us <= boundary.1
+        && fact
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == source.0)
+        && fact.context.repository_id == source.1
+        && fact.context.worktree_id == source.2
 }
 
 fn extends_procedure_boundaries(

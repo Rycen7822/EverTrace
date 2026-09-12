@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
-    ids::{JobId, RepositoryId, WorktreeId},
+    evidence::{SourceObservation, SourceReceipt},
+    ids::{JobId, RepositoryId, SourceObservationId, SourceReceiptId, WorktreeId},
     inventory::{CapabilityInventoryRecorded, InventoryContext},
     repository::{RepositoryCapabilityState, RepositoryInstance, WorktreeInstance},
 };
@@ -105,6 +106,8 @@ pub(super) struct InventoryAdmission<'a> {
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
     pub jobs: &'a BTreeMap<JobId, DurableJob>,
     pub purges: &'a ScopePurgeState,
+    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
 }
 
 impl InventoryAdmission<'_> {
@@ -139,57 +142,105 @@ impl InventoryAdmission<'_> {
             let ProposalPayload::Procedure(procedure) = &proposal.payload else {
                 return Err(error);
             };
-            for reference in refs {
-                let (fact, _) = self.inventory.completed.get(reference).ok_or(error)?;
-                let (old, _) = self
-                    .repositories
-                    .get(&fact.context.repository_id)
-                    .ok_or(error)?;
-                let repository = payloads
-                    .iter()
-                    .find_map(|payload| match payload {
-                        JournalPayload::RepositoryInstanceRecorded(value)
-                            if value.repository_id == old.repository_id =>
-                        {
-                            Some(value.as_ref())
-                        }
-                        _ => None,
+            self.validate_procedure_inventory_refs(
+                procedure.draft().scope,
+                &proposal.source_cohort_refs,
+                refs,
+                &payloads,
+                error,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_procedure_inventory_refs(
+        &self,
+        procedure_scope: evertrace_domain::procedure::ProcedureScope,
+        source_refs: &[String],
+        refs: &[JobId],
+        payloads: &[&JournalPayload],
+        error: StoreError,
+    ) -> Result<(), StoreError> {
+        for reference in refs {
+            let (fact, fact_seq) = self.inventory.completed.get(reference).ok_or(error)?;
+            let current = self.inventory.latest(&fact.context).ok_or(error)?;
+            if !refs.contains(&current.job_id) {
+                return Err(error);
+            }
+            if current.job_id != *reference
+                && !source_refs.iter().any(|source| {
+                    let receipt = source
+                        .parse::<SourceReceiptId>()
+                        .ok()
+                        .and_then(|id| self.source_receipts.get(&id))
+                        .or_else(|| {
+                            source
+                                .parse::<SourceObservationId>()
+                                .ok()
+                                .and_then(|id| self.source_observations.get(&id))
+                                .and_then(|(observation, _)| {
+                                    self.source_receipts.get(&observation.source_receipt_ref)
+                                })
+                        });
+                    receipt.is_some_and(|(receipt, seq)| {
+                        receipt.repository_instance_id == Some(fact.context.repository_id)
+                            && receipt.worktree_instance_id == Some(fact.context.worktree_id)
+                            && fact
+                                .evidence_refs
+                                .contains(&format!("session:{}", receipt.source_session_ref))
+                            && fact_seq <= seq
+                            && fact.recorded_at_us
+                                <= receipt.event_time_us.min(receipt.recorded_at_us)
                     })
-                    .unwrap_or(old);
-                let boundary = repository
+                })
+            {
+                return Err(error);
+            }
+            let (old, _) = self
+                .repositories
+                .get(&fact.context.repository_id)
+                .ok_or(error)?;
+            let repository = payloads
+                .iter()
+                .find_map(|payload| match payload {
+                    JournalPayload::RepositoryInstanceRecorded(value)
+                        if value.repository_id == old.repository_id =>
+                    {
+                        Some(value.as_ref())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(old);
+            let boundary = repository
+                .capability_state
+                .as_ref()
+                .and_then(|state| state.revalidated_inventory_ref)
+                .and_then(|id| self.inventory.completed.get(&id))
+                .ok_or(error)?;
+            let scope = evertrace_domain::procedure::ProcedureScope::Worktree {
+                repository_id: fact.context.repository_id,
+                worktree_id: fact.context.worktree_id,
+            };
+            if repository.user_disabled
+                || repository
                     .capability_state
                     .as_ref()
-                    .and_then(|state| state.revalidated_inventory_ref)
-                    .and_then(|id| self.inventory.completed.get(&id))
-                    .ok_or(error)?;
-                let scope = evertrace_domain::procedure::ProcedureScope::Worktree {
-                    repository_id: fact.context.repository_id,
-                    worktree_id: fact.context.worktree_id,
-                };
-                if repository.user_disabled
-                    || repository
-                        .capability_state
-                        .as_ref()
-                        .is_none_or(|state| state.trust_revoked)
-                    || self.purges.current(repository.repository_id).is_some()
-                    || payloads.iter().any(|payload| {
-                        matches!(payload, JournalPayload::ScopePurgeProgressRecorded(value)
+                    .is_none_or(|state| state.trust_revoked)
+                || self.purges.current(repository.repository_id).is_some()
+                || payloads.iter().any(|payload| {
+                    matches!(payload, JournalPayload::ScopePurgeProgressRecorded(value)
                         if value.target.repository_id() == repository.repository_id)
-                    })
-                    || self
-                        .inventory
-                        .latest(&fact.context)
-                        .is_none_or(|value| value.job_id != *reference)
-                    || fact.repository_revision < boundary.0.repository_revision
-                    || fact.repository_revision > repository.repository_revision
-                    || !procedure.draft().scope.contains(&scope)
-                    || self
-                        .worktrees
-                        .get(&fact.context.worktree_id)
-                        .is_none_or(|(worktree, _)| worktree.lifecycle.is_terminal())
-                {
-                    return Err(error);
-                }
+                })
+                || current.repository_revision < boundary.0.repository_revision
+                || current.repository_revision > repository.repository_revision
+                || fact.repository_revision > repository.repository_revision
+                || !procedure_scope.contains(&scope)
+                || self
+                    .worktrees
+                    .get(&fact.context.worktree_id)
+                    .is_none_or(|(worktree, _)| worktree.lifecycle.is_terminal())
+            {
+                return Err(error);
             }
         }
         Ok(())
@@ -786,7 +837,7 @@ mod tests {
             repository_revision: 2,
             snapshot_cas_ref: "a".repeat(64),
             dependency_cas_refs: vec!["b".repeat(64)],
-            evidence_refs: vec!["probe-a".into()],
+            evidence_refs: vec!["probe-a".into(), "session:bounded".into()],
             recorded_at_us: 3,
         };
         let completion = command(
@@ -927,6 +978,150 @@ mod tests {
         let context_b = with_b.inventory_context(&fact_b.context, None).unwrap();
         assert_eq!(context_a.post_restoration_completion(), Some(&fact));
         assert_eq!(context_b.post_restoration_completion(), Some(&fact_b));
+        // Reuse the admitted completion chain for a newer snapshot of A.
+        // History remains readable only alongside this actual current ref.
+        let mut job_c = with_b.jobs[&fact_b.job_id].clone();
+        job_c.job_id = JobId::new_v7();
+        job_c.idempotency_key = format!(
+            "capability_inventory:scan:history|{}|new",
+            worktree.worktree_instance_id
+        );
+        job_c.state = JobStatus::Queued;
+        job_c.attempt = 1;
+        job_c.terminal = None;
+        let mut with_history = with_b
+            .apply_command(
+                &command(vec![JournalPayload::JobState(job_c.clone())], 7),
+                12,
+            )
+            .unwrap();
+        with_history = with_history
+            .apply_command(
+                &command(
+                    vec![JournalPayload::JobLease(JobLease {
+                        job_id: job_c.job_id,
+                        target_generation: 1,
+                        attempt: 2,
+                        lease_until_us: 100,
+                    })],
+                    8,
+                ),
+                13,
+            )
+            .unwrap();
+        let mut fact_c = fact.clone();
+        fact_c.job_id = job_c.job_id;
+        fact_c.snapshot_cas_ref = "e".repeat(64);
+        fact_c.recorded_at_us = 9;
+        job_c.state = JobStatus::Succeeded;
+        job_c.attempt = 2;
+        job_c.terminal = Some(Box::new(JobTerminalAudit {
+            outcome: JobTerminalOutcome::Succeeded,
+            reason: JobTerminalReason::Completed,
+            result_ref: Some(job_c.job_id.to_string()),
+        }));
+        with_history = with_history
+            .apply_command(
+                &command(
+                    vec![
+                        JournalPayload::CapabilityInventoryRecorded(Box::new(fact_c.clone())),
+                        JournalPayload::JobState(job_c),
+                    ],
+                    9,
+                ),
+                14,
+            )
+            .unwrap();
+        use evertrace_domain::evidence::{
+            SourceInstanceId, SourceRecordIdentity, SourceRevision, source_observation_id,
+            source_receipt_id,
+        };
+        let instance = SourceInstanceId::parse("inventory-source").unwrap();
+        let revision = SourceRevision::parse("revision-1").unwrap();
+        let record = SourceRecordIdentity::parse("record-1").unwrap();
+        let receipt_id = source_receipt_id(&instance, &revision, &record).unwrap();
+        let receipt: SourceReceipt = serde_json::from_value(serde_json::json!({
+            "source_receipt_id": receipt_id,
+            "source_observation_id": source_observation_id(&instance, &revision, &record).unwrap(),
+            "source_instance_id": instance, "source_kind": "codex_session_jsonl",
+            "identity_domain": "codex-session-v1", "source_ref": "source", "source_session_ref": "bounded",
+            "source_revision": revision, "source_record_identity": record, "identity_strength": "stable_native",
+            "source_sequence": 1, "task_id": null,
+            "repository_instance_id": repository.repository_id, "worktree_instance_id": worktree.worktree_instance_id,
+            "source_byte_range": null, "spool_byte_range": {"start": 0, "end": 1},
+            "source_revision_mode": "append", "previous_source_revision": null, "close_watermark": 1,
+            "observation_role": "message", "unsupported_record_classification": null,
+            "capture_completeness": "complete", "archive_mode": "exact", "cas_ref": "f".repeat(64),
+            "protected_length": 1, "original_length": 1, "protected_secret_digest": null, "redaction_spans": [],
+            "adapter_revision": 1, "adapter_manifest_ref": "inventory-test", "eligible_event_manifest_ref": "inventory-test",
+            "parser_revision": 1, "canonicalization_revision": 1, "detector_revision": 1, "redaction_revision": 1,
+            "protection_key_generation": 1, "event_time_us": 4, "recorded_at_us": 4
+        })).unwrap();
+        receipt.validate().unwrap();
+        let source_seq = with_history.inventory.completed[&fact.job_id].1 + 1;
+        with_history
+            .source_receipts
+            .insert(receipt_id, (receipt.clone(), source_seq));
+        let scope = evertrace_domain::procedure::ProcedureScope::Repository {
+            repository_id: repository.repository_id,
+        };
+        let source_refs = vec![receipt_id.to_string()];
+        let inventory_refs = vec![fact.job_id, fact_c.job_id];
+        let validate = |state: &JournalAdmissionState, refs: &[JobId]| {
+            state
+                .inventory_admission()
+                .validate_procedure_inventory_refs(
+                    scope,
+                    &source_refs,
+                    refs,
+                    &[],
+                    StoreError::InvalidInput,
+                )
+        };
+        assert!(validate(&with_history, &inventory_refs).is_ok());
+        assert!(validate(&with_history, &[fact.job_id]).is_err());
+        assert!(validate(&with_history, &[fact_c.job_id]).is_ok());
+        let mut future = with_history.clone();
+        future.source_receipts.get_mut(&receipt_id).unwrap().1 = source_seq - 2;
+        assert!(validate(&future, &inventory_refs).is_err());
+        let mut late_import = with_history.clone();
+        late_import
+            .source_receipts
+            .get_mut(&receipt_id)
+            .unwrap()
+            .0
+            .event_time_us = 2;
+        assert!(
+            validate(&late_import, &inventory_refs).is_err(),
+            "later ingestion cannot backfill an installation into the source's original time"
+        );
+        let mut wrong_source = with_history.clone();
+        wrong_source
+            .source_receipts
+            .get_mut(&receipt_id)
+            .unwrap()
+            .0
+            .source_session_ref = "other".into();
+        assert!(validate(&wrong_source, &inventory_refs).is_err());
+        wrong_source.source_receipts.get_mut(&receipt_id).unwrap().0 = receipt;
+        wrong_source
+            .source_receipts
+            .get_mut(&receipt_id)
+            .unwrap()
+            .0
+            .worktree_instance_id = Some(WorktreeId::new_v7());
+        assert!(validate(&wrong_source, &inventory_refs).is_err());
+        let mut disabled = with_history.repositories[&repository.repository_id]
+            .0
+            .clone();
+        disabled.repository_revision += 1;
+        disabled.predecessor_revision = Some(disabled.repository_revision - 1);
+        disabled.recorded_at_us = 10;
+        disabled.user_disabled = true;
+        let disabled = with_history
+            .apply_command(&repository_command(disabled, SourceKind::Manual, 10), 16)
+            .unwrap();
+        assert!(validate(&disabled, &inventory_refs).is_err());
         let mut changed_worktree = worktree.clone();
         changed_worktree.worktree_revision = 2;
         changed_worktree.predecessor_revision = Some(1);

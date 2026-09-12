@@ -557,6 +557,61 @@ async fn missing_inventory_blocks_auto_full_but_manual_acceptance_is_atomic_and_
             && row.publication_state.as_deref() == Some("active_probationary")
             && row.support_state.as_deref() == Some("valid")
     }));
+    let runtime = evertrace_capture::RuntimeSnapshot {
+        snapshot_version: evertrace_capture::RUNTIME_SNAPSHOT_VERSION,
+        generation: 1,
+        device_key_dir: temp.path().join("keys"),
+        cas_dir: temp.path().join("cas"),
+        spool_dir: temp.path().join("spool"),
+        main_high_watermark_bytes: 2 * 1024 * 1024,
+        main_low_watermark_bytes: 64 * 1024,
+        max_main_files: 16,
+        emergency_slots: 2,
+        recovery_gate: evertrace_capture::RecoveryGateMode::Disabled,
+        recovery_socket_path: temp.path().join("runtime/evertraced-v1.sock"),
+        recovery_preflight_timeout_ms: 250,
+        effective_config_hash: CONFIG,
+        recovery_adapter_manifest_id: None,
+        recovery_classifier_revision: 1,
+        recovery_max_bundle_bytes: 4 << 20,
+        recovery_max_untracked_file_bytes: 1 << 20,
+        recovery_max_untracked_total_bytes: 2 << 20,
+        recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+        recall_cue_adapter_manifest_id: None,
+        recall_cues: vec![],
+    };
+    let key = evertrace_capture::DeviceKeyStore::new(&runtime.device_key_dir)
+        .load_or_create()
+        .unwrap();
+    let bindings = evertrace_engine::McpBindingAuthority::new(key);
+    let (handle, actor) = evertrace_engine::spawn_writer(writer, 8).unwrap();
+    let coverage = evertrace_engine::procedure::resolve_procedure_coverage(
+        &handle,
+        &bindings,
+        &runtime,
+        &snapshot,
+        &procedure.draft,
+        &[receipt.source_receipt_id.to_string()],
+    )
+    .await
+    .unwrap();
+    assert!(
+        coverage
+            .summary()
+            .omissions
+            .contains(&evertrace_domain::inventory::CapabilityCoverageOmission::InventoryMissing)
+    );
+    assert_eq!(
+        coverage.summary().equivalent_assets,
+        vec![evertrace_domain::inventory::CapabilityCoverageMatch {
+            revision_ref: procedure.revision_id.to_string(),
+            level: evertrace_domain::inventory::CapabilityEvidenceLevel::Present,
+        }],
+        "an independently known published Procedure must survive a missing file inventory"
+    );
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+    let mut writer = JournalWriter::open(&root).await.unwrap();
     let hold = publication_event(
         &procedure,
         ProcedurePublicationState::ActiveProbationary,

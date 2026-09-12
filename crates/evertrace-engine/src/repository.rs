@@ -16,8 +16,11 @@ mod host_context;
 mod integration;
 mod resolver;
 mod session_catalog;
+#[cfg(test)]
+pub(crate) use access::read_inventory_snapshot;
 pub(crate) use access::{
-    blocked_repositories, read_inventory, record_trust_revocations, repository_read_gate,
+    blocked_repositories, read_inventory, read_inventory_before,
+    read_procedure_historical_inventory, record_trust_revocations, repository_read_gate,
     row_repository_contexts,
 };
 pub(crate) use host_context::NativeHostContext;

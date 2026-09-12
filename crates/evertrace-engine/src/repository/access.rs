@@ -184,11 +184,27 @@ pub(crate) async fn blocked_repositories(
     report: Option<&evertrace_codex::probe::HostProbeReport>,
     config_hash: [u8; 32],
 ) -> Result<BTreeSet<RepositoryId>, crate::WriterActorError> {
+    blocked_repositories_before(
+        writer,
+        ids,
+        report,
+        config_hash,
+        Instant::now() + Duration::from_millis(250),
+    )
+    .await
+}
+
+async fn blocked_repositories_before(
+    writer: &crate::WriterHandle,
+    ids: BTreeSet<RepositoryId>,
+    report: Option<&evertrace_codex::probe::HostProbeReport>,
+    config_hash: [u8; 32],
+    deadline: Instant,
+) -> Result<BTreeSet<RepositoryId>, crate::WriterActorError> {
     if ids.is_empty() {
         return Ok(BTreeSet::new());
     }
     let context = writer.repository_read_context(ids.clone()).await?;
-    let deadline = Instant::now() + Duration::from_millis(250);
     let observed_location = report
         .and_then(|report| report.inventory_host())
         .and_then(|host| {
@@ -241,6 +257,24 @@ pub(crate) async fn read_inventory(
     fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
 ) -> Result<Option<evertrace_domain::inventory::CapabilityInventorySnapshot>, crate::WriterActorError>
 {
+    read_inventory_before(
+        writer,
+        bindings,
+        runtime,
+        fact,
+        Instant::now() + Duration::from_millis(250),
+    )
+    .await
+}
+
+pub(crate) async fn read_inventory_before(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
+    deadline: Instant,
+) -> Result<Option<evertrace_domain::inventory::CapabilityInventorySnapshot>, crate::WriterActorError>
+{
     let context = writer.inventory_context(&fact.context, None).await?;
     let completion = context.post_restoration_completion();
     if completion.is_none_or(|current| current.job_id != fact.job_id) {
@@ -256,35 +290,155 @@ pub(crate) async fn read_inventory(
         }
         return Ok(None);
     }
-    let deadline = Instant::now() + Duration::from_millis(250);
+    let Some(host) =
+        inventory_read_gate(writer, bindings, runtime, &fact.context, deadline).await?
+    else {
+        return Ok(None);
+    };
+    let snapshot = read_inventory_snapshot(&runtime.cas_dir, fact)?;
+    if !host.current_before(deadline)
+        || !crate::jobs::inventory_snapshot_current(&snapshot, deadline)
+    {
+        bindings.inventory_context_stale(&fact.context);
+        return Ok(None);
+    }
+    if inventory_read_gate(writer, bindings, runtime, &fact.context, deadline)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let final_context = writer.inventory_context(&fact.context, None).await?;
+    if final_context.post_restoration_completion() != Some(fact) || !host.current_before(deadline) {
+        return Ok(None);
+    }
+    Ok(Some(snapshot))
+}
+
+// Live authorization only: old CAS must not trigger a second scan of current
+// assets. Both readers retain the same Host, trust and restoration gates.
+async fn inventory_read_gate(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    context: &evertrace_domain::inventory::InventoryContext,
+    deadline: Instant,
+) -> Result<Option<std::sync::Arc<super::NativeHostContext>>, crate::WriterActorError> {
+    if Instant::now() >= deadline
+        || writer
+            .inventory_context(context, None)
+            .await?
+            .post_restoration_completion()
+            .is_none()
+    {
+        return Ok(None);
+    }
     let observed = bindings
         .active_inventory_contexts()
         .into_iter()
         .find(|(host, report)| {
             Instant::now() < deadline
-                && host.cwd.to_str() == Some(fact.context.cwd.as_str())
-                && host.home.to_str() == Some(fact.context.host_home.as_str())
-                && host.config_root.to_str() == Some(fact.context.host_config_root.as_str())
-                && host.profile == fact.context.host_profile
-                && report.manifest().adapter_manifest_id == fact.context.adapter_manifest_id
+                && host.cwd.to_str() == Some(context.cwd.as_str())
+                && host.home.to_str() == Some(context.host_home.as_str())
+                && host.config_root.to_str() == Some(context.host_config_root.as_str())
+                && host.profile == context.host_profile
+                && report.manifest().adapter_manifest_id == context.adapter_manifest_id
                 && host.selections_observed
                 && host.current_before(deadline)
         });
     let Some((host, report)) = observed else {
         return Ok(None);
     };
-    if !blocked_repositories(
+    if !blocked_repositories_before(
         writer,
-        [fact.context.repository_id].into_iter().collect(),
+        [context.repository_id].into_iter().collect(),
         Some(&report),
         runtime.effective_config_hash,
+        deadline,
     )
     .await?
     .is_empty()
     {
         return Ok(None);
     }
-    let cas = evertrace_capture::CasStore::open_existing(&runtime.cas_dir)
+    Ok((Instant::now() < deadline).then_some(host))
+}
+
+/// Read an already committed session-time completion. Current authorization
+/// and a restored current completion remain necessary, but current asset bytes
+/// cannot rewrite the capabilities observed before the source boundary.
+pub(crate) async fn read_procedure_historical_inventory(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    projection: &evertrace_store::ProjectionSnapshot,
+    fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
+    source: (&str, (u64, i64)),
+    deadline: Instant,
+) -> Result<Option<evertrace_domain::inventory::CapabilityInventorySnapshot>, crate::WriterActorError>
+{
+    let (session, boundary) = source;
+    if fact.recorded_at_us > boundary.1
+        || !fact
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == session)
+    {
+        return Ok(None);
+    }
+    let fact_id = fact.job_id.to_string();
+    let Some(row) = projection
+        .data_rows()
+        .take_while(|_| Instant::now() < deadline)
+        .find(|row| {
+            row.object_kind.as_deref() == Some("capability_inventory")
+                && row.object_id.as_deref() == Some(fact_id.as_str())
+                && row.source_event_seq <= boundary.0
+        })
+    else {
+        return Ok(None);
+    };
+    let committed: JournalPayload = serde_json::from_str(
+        row.payload_json
+            .as_deref()
+            .ok_or(crate::WriterActorError::StoreCorrupt)?,
+    )
+    .map_err(|_| crate::WriterActorError::StoreCorrupt)?;
+    if !matches!(committed, JournalPayload::CapabilityInventoryRecorded(ref value) if value.as_ref() == fact)
+    {
+        return Err(crate::WriterActorError::StoreCorrupt);
+    }
+    let current = writer.inventory_context(&fact.context, None).await?;
+    let Some(completion) = current.post_restoration_completion() else {
+        return Ok(None);
+    };
+    let Some(host) =
+        inventory_read_gate(writer, bindings, runtime, &fact.context, deadline).await?
+    else {
+        return Ok(None);
+    };
+    let snapshot = read_inventory_snapshot(&runtime.cas_dir, fact)?;
+    if inventory_read_gate(writer, bindings, runtime, &fact.context, deadline)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let after = writer.inventory_context(&fact.context, None).await?;
+    if after.post_restoration_completion() != Some(completion)
+        || after.repository != current.repository
+        || !host.current_before(deadline)
+    {
+        return Ok(None);
+    }
+    Ok(Some(snapshot))
+}
+
+pub(crate) fn read_inventory_snapshot(
+    cas_dir: &std::path::Path,
+    fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
+) -> Result<evertrace_domain::inventory::CapabilityInventorySnapshot, crate::WriterActorError> {
+    let cas = evertrace_capture::CasStore::open_existing(cas_dir)
         .map_err(|_| crate::WriterActorError::Store)?;
     let digest = fact
         .snapshot_cas_ref
@@ -312,22 +466,5 @@ pub(crate) async fn read_inventory(
     {
         return Err(crate::WriterActorError::StoreCorrupt);
     }
-    if !host.current()
-        || !crate::jobs::inventory_snapshot_current(
-            &snapshot,
-            Instant::now() + Duration::from_millis(250),
-        )
-    {
-        bindings.inventory_context_stale(&fact.context);
-        return Ok(None);
-    }
-    let final_context = writer.inventory_context(&fact.context, None).await?;
-    if final_context
-        .post_restoration_completion()
-        .is_none_or(|current| current.job_id != fact.job_id)
-        || !host.current()
-    {
-        return Ok(None);
-    }
-    Ok(Some(snapshot))
+    Ok(snapshot)
 }

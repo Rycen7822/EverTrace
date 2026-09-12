@@ -560,8 +560,10 @@ impl ProcedureUsageCurrentView {
     pub(crate) fn coverage_procedures(
         &self,
         scope: evertrace_domain::procedure::ProcedureScope,
-        repository_id: evertrace_domain::ids::RepositoryId,
-        worktree_id: evertrace_domain::ids::WorktreeId,
+        contexts: &std::collections::BTreeSet<(
+            evertrace_domain::ids::RepositoryId,
+            evertrace_domain::ids::WorktreeId,
+        )>,
     ) -> impl Iterator<
         Item = (
             &ProcedureRevision,
@@ -572,6 +574,33 @@ impl ProcedureUsageCurrentView {
         use evertrace_domain::procedure::{
             ProcedureCorrelationState, ProcedureTruth, ProcedureUsageStage,
         };
+        let mut levels = std::collections::BTreeMap::new();
+        for usage in self.usages.values().filter(|usage| {
+            usage
+                .local_context
+                .repository_id
+                .zip(usage.local_context.worktree_id)
+                .is_some_and(|context| contexts.contains(&context))
+                && usage.correlation_state == ProcedureCorrelationState::Resolved
+                && usage.eligible == ProcedureTruth::True
+        }) {
+            let level = if usage.action_aligned == ProcedureTruth::True
+                && usage.verifier_aligned == ProcedureTruth::True
+                && usage.outcome_supported == ProcedureTruth::True
+            {
+                Level::OutcomeSupported
+            } else if usage.action_aligned == ProcedureTruth::True {
+                Level::ActionAligned
+            } else if usage.stage >= ProcedureUsageStage::Routed {
+                Level::Routed
+            } else {
+                Level::Present
+            };
+            levels
+                .entry(usage.procedure_revision_id)
+                .and_modify(|prior: &mut Level| *prior = (*prior).max(level))
+                .or_insert(level);
+        }
         self.current_procedures.values().filter_map(move |id| {
             let procedure = self.current_procedure_by_revision(*id)?;
             if !procedure.draft.scope.contains(&scope)
@@ -585,32 +614,7 @@ impl ProcedureUsageCurrentView {
             {
                 return None;
             }
-            let level = self
-                .usages
-                .values()
-                .filter(|usage| {
-                    usage.procedure_revision_id == *id
-                        && usage.local_context.repository_id == Some(repository_id)
-                        && usage.local_context.worktree_id == Some(worktree_id)
-                        && usage.correlation_state == ProcedureCorrelationState::Resolved
-                        && usage.eligible == ProcedureTruth::True
-                })
-                .map(|usage| {
-                    if usage.action_aligned == ProcedureTruth::True
-                        && usage.verifier_aligned == ProcedureTruth::True
-                        && usage.outcome_supported == ProcedureTruth::True
-                    {
-                        Level::OutcomeSupported
-                    } else if usage.action_aligned == ProcedureTruth::True {
-                        Level::ActionAligned
-                    } else if usage.stage >= ProcedureUsageStage::Routed {
-                        Level::Routed
-                    } else {
-                        Level::Present
-                    }
-                })
-                .max()
-                .unwrap_or(Level::Present);
+            let level = levels.get(id).copied().unwrap_or(Level::Present);
             Some((procedure, level))
         })
     }
@@ -836,6 +840,54 @@ impl ProcedureUsageCurrentView {
         snapshot: &ProjectionSnapshot,
     ) -> Result<Self, SemanticServiceError> {
         Self::from_snapshot_input(snapshot, true, false)
+    }
+
+    pub(crate) fn from_coverage_snapshot(
+        snapshot: &ProjectionSnapshot,
+        contexts: &std::collections::BTreeSet<(
+            evertrace_domain::ids::RepositoryId,
+            evertrace_domain::ids::WorktreeId,
+        )>,
+        deadline: std::time::Instant,
+    ) -> Result<Option<Self>, SemanticServiceError> {
+        let repositories = contexts
+            .iter()
+            .map(|(repository, _)| repository.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let worktrees = contexts
+            .iter()
+            .map(|(_, worktree)| worktree.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut selected = ProjectionSnapshot {
+            frontier: snapshot.frontier,
+            rows: Vec::new(),
+        };
+        let mut bytes = 0;
+        for row in snapshot.data_rows() {
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            if !matches!(
+                row.object_kind.as_deref(),
+                Some("procedure_revision" | "procedure_state_event" | "procedure_usage_revision")
+            ) || row
+                .repository_id
+                .as_ref()
+                .is_some_and(|id| !repositories.contains(id))
+                || row
+                    .worktree_id
+                    .as_ref()
+                    .is_some_and(|id| !worktrees.contains(id))
+            {
+                continue;
+            }
+            bytes += row.payload_json.as_ref().map_or(0, String::len);
+            if selected.rows.len() == 512 || bytes > 2 * 1024 * 1024 {
+                return Ok(None);
+            }
+            selected.rows.push(row.clone());
+        }
+        Self::from_promotion_snapshot(&selected).map(Some)
     }
 
     fn from_snapshot_input(

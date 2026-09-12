@@ -6243,6 +6243,8 @@ impl JournalAdmissionState {
             worktrees: &self.worktrees,
             jobs: &self.jobs,
             purges: &self.scope_purges,
+            source_receipts: &self.source_receipts,
+            source_observations: &self.source_observations,
         }
     }
 
