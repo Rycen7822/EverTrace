@@ -1,20 +1,24 @@
-EverTrace  Inbox / Explorer / System
-┌Inbox─────────────────────────────────────────────────────┐
-│No inbox items                                            │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-◌ connecting pending:0
-1 Inbox  2 Explorer  3 System  r refresh  q quit
+EverTrace [Inbox] [Explorer] [>System] [Commands] [Help]
+System / Overview — loaded page only
+[Overview] [Jobs] [Diagnostics] [Configuration] [Maintenance]
+Hook: not observed                                                         [+/-]
+Queued not read · Leased not read · Historical failures not read
+Model: not checked (no probe); recorded calls not read
+Projection watermarks: not read
+This page: no task result references
+┌Tasks · current page (leased = claimed)───────────────────────────────────────┐
+│Loading this page…                                                            │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+[Open detail] [Filter / find loaded content] [Next page] [Commands]
+Connecting | Read: not yet read | page not loaded
+↑↓ select  Enter detail  Tab focus  : commands

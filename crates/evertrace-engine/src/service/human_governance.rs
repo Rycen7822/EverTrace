@@ -1,9 +1,11 @@
 mod diagnostics;
 mod export;
+mod presentation;
 pub use diagnostics::{
     HumanDiagnosticCheck, HumanDiagnosticState, HumanDiagnostics, HumanTableDiagnostic,
 };
 pub use export::{HumanExportResult, HumanExportSelection, HumanExportStatus};
+pub use presentation::{HumanContentState, HumanSemanticContent, HumanSemanticDetail};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -168,6 +170,8 @@ pub enum HumanSurface {
 pub enum HumanRelationKind {
     ProposalEvidence,
     SupportDependencies,
+    ObjectSources,
+    ObjectRevisions,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -227,6 +231,8 @@ pub enum HumanItemCategory {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanSummary {
+    pub semantic_detail: Option<HumanSemanticDetail>,
+    pub proposal_base: Option<HumanSemanticDetail>,
     pub evidence_detail: Option<HumanEvidenceDetail>,
     pub work_detail: Option<HumanWorkDetail>,
     pub proposal: Option<HumanProposalSummary>,
@@ -954,6 +960,8 @@ impl HumanGovernanceService {
                 item.evidence_detail = None;
                 item.work_detail = None;
                 item.proposal_review = None;
+                item.semantic_detail = None;
+                item.proposal_base = None;
                 item.support_detail = None;
                 item.recovery_detail = None;
             }
@@ -1288,19 +1296,46 @@ impl HumanGovernanceService {
         }
         let mut matching = surface_rows(&snapshot, surface)?
             .into_iter()
-            .filter(|row| row.row_id == object_ref || row.object_id.as_deref() == Some(object_ref))
+            .filter(|row| {
+                row.row_id == object_ref
+                    || row.object_id.as_deref() == Some(object_ref)
+                    || row.current_revision_id.as_deref() == Some(object_ref)
+            })
             .collect::<Vec<_>>();
-        if let Some(expected) = expected_revision_ref
-            && let Some(current) = matching
+        if let Some(expected) = expected_revision_ref {
+            if matching
                 .iter()
-                .find_map(|row| row.current_revision_id.as_deref())
-            && current != expected
-        {
-            return Ok(Err((snapshot.frontier, Some(current.into()))));
+                .any(|row| row.current_revision_id.as_deref() == Some(expected))
+            {
+                matching.retain(|row| row.current_revision_id.as_deref() == Some(expected));
+            } else if let Some(current) = matching
+                .iter()
+                .max_by_key(|row| row.source_event_seq)
+                .and_then(|row| row.current_revision_id.clone())
+            {
+                return Ok(Err((snapshot.frontier, Some(current))));
+            }
         }
         if matching.len() > 1 {
+            if expected_revision_ref.is_none()
+                && matching.iter().any(|row| {
+                    row.object_kind != matching[0].object_kind
+                        || row.object_id != matching[0].object_id
+                })
+            {
+                return Err(HumanGovernanceError::InvalidInput);
+            }
+            if expected_revision_ref.is_none()
+                && surface == HumanSurface::Explorer
+                && let Some((current, _)) = super::actions::select_object_row(&snapshot, object_ref)
+                    .map_err(|_| HumanGovernanceError::InvalidInput)?
+            {
+                matching.retain(|row| row.row_id == current.row_id);
+            }
             matching.retain(|row| {
                 row.row_id == object_ref
+                    || (expected_revision_ref.is_none()
+                        && row.object_id.as_deref() == Some(object_ref))
                     || expected_revision_ref.is_some_and(|expected| {
                         row.current_revision_id.as_deref() == Some(expected)
                     })
@@ -1330,6 +1365,7 @@ impl HumanGovernanceService {
         if surface == HumanSurface::Explorer {
             self.restrict_import_evidence(&snapshot, &mut items).await?;
         }
+        self.semantic_details(&snapshot, &mut items).await?;
         self.inventory_detail(&snapshot, &mut items).await?;
         if let Some((index, backup_job_id, validation_result)) =
             items.iter().enumerate().find_map(|(index, item)| {
@@ -1433,9 +1469,48 @@ impl HumanGovernanceService {
             .data_rows()
             .find(|row| row.row_id == request.source_stable_key)
             .ok_or(HumanGovernanceError::InvalidInput)?;
+        self.readable_row(
+            &snapshot,
+            source,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
+        .await
+        .map_err(|_| HumanGovernanceError::InvalidInput)?;
         let semantic_view = SemanticCurrentView::from_snapshot(&snapshot)
             .map_err(|_| HumanGovernanceError::Store)?;
         let refs = match request.relation {
+            HumanRelationKind::ObjectSources | HumanRelationKind::ObjectRevisions => {
+                if source.current_revision_id.as_deref()
+                    != Some(request.expected_source_revision_ref)
+                {
+                    return Ok(Err((snapshot.frontier, source.current_revision_id.clone())));
+                }
+                if !matches!(
+                    source.object_kind.as_deref(),
+                    Some("atom_revision" | "procedure_revision" | "core_membership")
+                ) {
+                    return Err(HumanGovernanceError::InvalidInput);
+                }
+                if request.relation == HumanRelationKind::ObjectRevisions {
+                    snapshot
+                        .data_rows()
+                        .filter(|row| {
+                            row.object_id == source.object_id
+                                && row.object_kind == source.object_kind
+                        })
+                        .filter_map(|row| row.current_revision_id.clone())
+                        .collect()
+                } else {
+                    let payload: JournalPayload = serde_json::from_str(
+                        source
+                            .payload_json
+                            .as_deref()
+                            .ok_or(HumanGovernanceError::Store)?,
+                    )
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                    export::dependencies_for(source, &payload)
+                }
+            }
             HumanRelationKind::ProposalEvidence => {
                 let proposal_id = source
                     .object_id
@@ -4763,6 +4838,8 @@ fn summary(
             (None, None, None, None)
         };
     Ok(HumanSummary {
+        semantic_detail: None,
+        proposal_base: None,
         evidence_detail,
         work_detail,
         proposal,

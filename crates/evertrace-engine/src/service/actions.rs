@@ -463,7 +463,7 @@ fn contains_protected_patch_key(value: &Value) -> bool {
     }
 }
 
-fn select_object_row<'a>(
+pub(super) fn select_object_row<'a>(
     snapshot: &'a ProjectionSnapshot,
     identifier: &str,
 ) -> Result<Option<(&'a ObjectRow, bool)>, ()> {

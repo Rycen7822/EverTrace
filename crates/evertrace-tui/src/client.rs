@@ -1,3 +1,4 @@
+use crate::app_event::HumanReadFailure;
 use crate::{AppEvent, AppEventSender, app_event::HumanReadLocator};
 use evertrace_domain::ids::RequestId;
 use evertrace_protocol::{
@@ -15,11 +16,16 @@ use tokio::{sync::mpsc, task::JoinSet, time::Instant};
 const MAX_PENDING: usize = 8;
 const PENDING_AFTER: Duration = Duration::from_millis(100);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
+const HUMAN_READ_HARD_DEADLINE: Duration = Duration::from_secs(30);
 const RECONNECT_DELAYS_MS: [u64; 5] = [250, 500, 1_000, 2_000, 5_000];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClientCommand {
-    Refresh(HumanSurface),
+    Refresh(HumanSurface, u64),
+    ReadView {
+        request: HumanReadRequest,
+        generation: u64,
+    },
     Human(HumanGovernanceRequest),
     Recovery(RequestRecoveryCommand),
     ConfigRead,
@@ -36,6 +42,15 @@ enum PendingKind {
     Recovery,
     ConfigRead,
     ConfigWrite,
+}
+
+fn hard_deadline(kind: &PendingKind) -> Duration {
+    match kind {
+        PendingKind::HumanRead(_, _) => HUMAN_READ_HARD_DEADLINE,
+        PendingKind::Export => Duration::from_secs(35),
+        PendingKind::ConfigWrite => Duration::from_secs(10),
+        _ => RESPONSE_DEADLINE,
+    }
 }
 
 async fn send_recovery(
@@ -91,9 +106,14 @@ async fn send_human(
     let kind = match &request {
         HumanGovernanceRequest::Export { .. } => PendingKind::Export,
         HumanGovernanceRequest::Read { request } => match request {
-            HumanReadRequest::List { surface, .. } => {
-                PendingKind::HumanRead(*surface, HumanReadLocator::List)
-            }
+            HumanReadRequest::List { surface, after, .. } => PendingKind::HumanRead(
+                *surface,
+                after
+                    .as_ref()
+                    .map_or(HumanReadLocator::List, |after| HumanReadLocator::Page {
+                        after: after.clone(),
+                    }),
+            ),
             HumanReadRequest::Detail {
                 surface,
                 object_ref,
@@ -318,6 +338,10 @@ pub(crate) async fn run(
         let mut shutdown_requested = false;
         let mut queued_action = None;
         let mut latest_read = None;
+        // A slow read still owns its wire request until its terminal response.
+        // Keep the existing single human handoff bounded and coalesce newer reads.
+        let mut slow_read = None;
+        let mut view_generation = None;
 
         loop {
             let pending_deadline = pending
@@ -327,15 +351,14 @@ pub(crate) async fn run(
                 .map(|started| started + PENDING_AFTER)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
             let response_deadline = pending
-                .values()
-                .map(|(started, kind)| {
+                .iter()
+                .map(|(id, (started, kind))| {
                     *started
-                        + if matches!(kind, PendingKind::Export) {
-                            Duration::from_secs(35)
-                        } else if matches!(kind, PendingKind::ConfigWrite) {
-                            Duration::from_secs(10)
-                        } else {
+                        + if matches!(kind, PendingKind::HumanRead(_, _)) && Some(*id) != slow_read
+                        {
                             RESPONSE_DEADLINE
+                        } else {
+                            hard_deadline(kind)
                         }
                 })
                 .min()
@@ -343,7 +366,8 @@ pub(crate) async fn run(
             tokio::select! {
                 command = commands.recv() => {
                     match command {
-                        Some(ClientCommand::Refresh(surface)) => {
+                        Some(ClientCommand::Refresh(surface, generation)) => {
+                            view_generation=(generation>0).then_some(generation);
                             if handoff_human(
                                 &mut outgoing,
                                 &mut pending,
@@ -355,7 +379,12 @@ pub(crate) async fn run(
                                 break;
                             }
                         }
+                        Some(ClientCommand::ReadView { request, generation }) => {
+                            view_generation=Some(generation);
+                            if handoff_human(&mut outgoing,&mut pending,&mut queued_action,&mut latest_read,&events,HumanGovernanceRequest::Read {request}).await.is_err(){break;}
+                        }
                         Some(ClientCommand::Human(request)) => {
+                            if matches!(request,HumanGovernanceRequest::Read {..}){view_generation=None;}
                             if handoff_human(
                                 &mut outgoing,
                                 &mut pending,
@@ -395,6 +424,9 @@ pub(crate) async fn run(
                     match message {
                         Some(Ok(LocalIncoming::Response(envelope))) => {
                             let Some((_, kind)) = pending.remove(&envelope.request_id) else { break; };
+                            if slow_read == Some(envelope.request_id) {
+                                slow_read = None;
+                            }
                             if pending_visible {
                                 let _ = events.send(AppEvent::Pending(pending.len())).await;
                                 pending_visible = !pending.is_empty();
@@ -449,9 +481,23 @@ pub(crate) async fn run(
                             }
                         }
                         Some(Ok(LocalIncoming::Error(error))) => {
-                            if error.request_id.and_then(|id| pending.remove(&id)).is_some_and(|(_, kind)| matches!(kind, PendingKind::ConfigRead | PendingKind::ConfigWrite)) {
-                                let _ = events.send(AppEvent::ConfigFailed).await;
-                            } else { break; }
+                            let Some(id) = error.request_id else { break; };
+                            let Some((_, kind)) = pending.remove(&id) else { break; };
+                            if slow_read == Some(id) { slow_read = None; }
+                            match kind {
+                                PendingKind::ConfigRead | PendingKind::ConfigWrite => {
+                                    let _ = events.send(AppEvent::ConfigFailed).await;
+                                }
+                                PendingKind::HumanRead(surface, locator) => {
+                                    let _ = events.send(AppEvent::HumanReadFailed { surface, locator, code: HumanReadFailure::Rejected(error.code) }).await;
+                                }
+                                _ => break,
+                            }
+                            if pending_visible {
+                                let _ = events.send(AppEvent::Pending(pending.len())).await;
+                                pending_visible = !pending.is_empty();
+                            }
+                            if flush_human_handoff(&mut outgoing, &mut pending, &mut queued_action, &mut latest_read).await.is_err() { break; }
                         }
                         Some(Ok(LocalIncoming::Notification(notification))) => {
                             let _ = events.send(AppEvent::Notification(notification)).await;
@@ -463,7 +509,35 @@ pub(crate) async fn run(
                     pending_visible = true;
                     let _ = events.send(AppEvent::Pending(pending.len())).await;
                 }
-                () = tokio::time::sleep_until(response_deadline), if !pending.is_empty() => break,
+                () = tokio::time::sleep_until(response_deadline), if !pending.is_empty() => {
+                    // Hard expiration wins even when a read's soft threshold is also due.
+                    if let Some((_, (_, kind))) = pending.iter().find(|(_, (started, kind))| *started + hard_deadline(kind) <= Instant::now()) {
+                        if let PendingKind::HumanRead(surface, locator) = kind {
+                            let _ = events.send(AppEvent::HumanReadFailed { surface: *surface, locator: locator.clone(), code: HumanReadFailure::TimedOut }).await;
+                        }
+                        break;
+                    }
+                    let expired_read = pending.iter().find(|(id, (started, kind))| {
+                        Some(**id) != slow_read && matches!(kind, PendingKind::HumanRead(_, _))
+                            && *started + RESPONSE_DEADLINE <= Instant::now()
+                    });
+                    if let Some((id, (_, PendingKind::HumanRead(surface, locator)))) = expired_read {
+                        slow_read = Some(*id);
+                        let _ = events.send(AppEvent::HumanReadFailed { surface: *surface, locator: locator.clone(), code: HumanReadFailure::Slow }).await;
+                    } else { break; }
+                },
+            }
+            if let Some(generation) = view_generation {
+                for (_, kind) in pending.values_mut() {
+                    if let PendingKind::HumanRead(_, locator) = kind
+                        && !matches!(locator, HumanReadLocator::View { .. })
+                    {
+                        *locator = HumanReadLocator::View {
+                            generation,
+                            request: Box::new(locator.clone()),
+                        };
+                    }
+                }
             }
         }
 
@@ -502,7 +576,7 @@ async fn wait_or_shutdown(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Some(ClientCommand::Refresh(_)) => continue,
+                Some(ClientCommand::Refresh(_, _) | ClientCommand::ReadView { .. }) => continue,
                 Some(ClientCommand::Human(request @ (HumanGovernanceRequest::Act { .. } | HumanGovernanceRequest::Export { .. }))) => {
                     let _ = events.send(local_human_rejection(&request, "local_transport_unavailable")).await;
                 }
@@ -554,6 +628,104 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ordinary_read_failure_and_slow_response_keep_connection() {
+        let data = std::env::temp_dir().join(format!("evertrace-read-{}", RequestId::new_v7()));
+        let server = LocalServer::bind(&data, ServerOptions::new("read-test")).unwrap();
+        let socket = server.socket_path().to_path_buf();
+        let (shutdown, stop) = watch::channel(false);
+        let server_task = tokio::spawn(server.run_dispatch(stop, |_, command| async move {
+            match command {
+                Command::Health => Ok(Response::Health(health())),
+                Command::HumanGovernance(HumanGovernanceRequest::Read { request }) => {
+                    if matches!(
+                        request,
+                        HumanReadRequest::List {
+                            surface: HumanSurface::System,
+                            ..
+                        }
+                    ) {
+                        tokio::time::sleep(Duration::from_millis(2300)).await;
+                        return Ok(Response::HumanGovernance(
+                            HumanGovernanceResponse::Conflict {
+                                current_frontier: 1,
+                                current_revision_ref: None,
+                            },
+                        ));
+                    }
+                    Err(ErrorCode::InvalidInput)
+                }
+                _ => Err(ErrorCode::InvalidInput),
+            }
+        }));
+        let (events, mut receiver) = AppEventSender::channel();
+        let (commands, command_receiver) = channel();
+        let actor = tokio::spawn(run(socket, events, command_receiver));
+        assert!(matches!(receiver.recv().await, Some(AppEvent::Health(_))));
+        let mut saw_slow = false;
+        let mut saw_pending = false;
+        let mut saw_view = false;
+        for surface in [
+            HumanSurface::Inbox,
+            HumanSurface::System,
+            HumanSurface::Explorer,
+        ] {
+            commands
+                .send(if surface == HumanSurface::System {
+                    ClientCommand::ReadView {
+                        request: HumanReadRequest::List {
+                            surface,
+                            expected_frontier: None,
+                            after: None,
+                            limit: HUMAN_PAGE_LIMIT,
+                        },
+                        generation: 7,
+                    }
+                } else {
+                    ClientCommand::Refresh(surface, 0)
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    match receiver.recv().await {
+                        Some(AppEvent::HumanReadFailed {
+                            surface: actual,
+                            code: HumanReadFailure::Rejected(ErrorCode::InvalidInput),
+                            ..
+                        }) if actual == surface => break,
+                        Some(AppEvent::HumanReadFailed {
+                            surface: HumanSurface::System,
+                            code: HumanReadFailure::Slow,
+                            ..
+                        }) => saw_slow = true,
+                        Some(AppEvent::Pending(1)) => saw_pending = true,
+                        Some(AppEvent::HumanRead {
+                            surface: HumanSurface::System,
+                            locator,
+                            ..
+                        }) if surface == HumanSurface::System => {
+                            assert!(saw_slow && saw_pending);
+                            assert!(matches!(locator,HumanReadLocator::View {generation:7,request} if matches!(*request,HumanReadLocator::List)));
+                            saw_view=true;
+                            break;
+                        }
+                        Some(AppEvent::Disconnected) | None => panic!("ordinary read disconnected"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert!(saw_slow && saw_pending && saw_view);
+        commands.send(ClientCommand::Shutdown).await.unwrap();
+        actor.await.unwrap();
+        shutdown.send(true).unwrap();
+        server_task.await.unwrap().unwrap();
+        fs::remove_dir_all(data).unwrap();
+    }
+
     fn proposal_action() -> HumanGovernanceRequest {
         HumanGovernanceRequest::Act {
             expected_frontier: 1,
@@ -564,6 +736,102 @@ mod tests {
                 decision: evertrace_protocol::dto::ProposalHumanDecision::Defer,
                 edited_payload: None,
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_read_has_fixed_hard_deadline_and_does_not_replay_write() {
+        for config_write in [false, true] {
+            let data = std::env::temp_dir().join(format!("evertrace-read-{}", RequestId::new_v7()));
+            let server = LocalServer::bind(&data, ServerOptions::new("read-timeout")).unwrap();
+            let socket = server.socket_path().to_path_buf();
+            let (_shutdown, stop) = watch::channel(false);
+            let writes = Arc::new(AtomicUsize::new(0));
+            let observed_writes = writes.clone();
+            let server_task = tokio::spawn(server.run_dispatch(stop, move |_, command| {
+                let writes = observed_writes.clone();
+                async move {
+                    match command {
+                        Command::Health => Ok(Response::Health(health())),
+                        Command::HumanGovernance(HumanGovernanceRequest::Read { .. }) => {
+                            std::future::pending().await
+                        }
+                        _ => {
+                            writes.fetch_add(1, Ordering::Relaxed);
+                            Err(ErrorCode::InvalidInput)
+                        }
+                    }
+                }
+            }));
+            let (events, mut receiver) = AppEventSender::channel();
+            let (commands, command_receiver) = channel();
+            let actor = tokio::spawn(run(socket, events, command_receiver));
+            assert!(matches!(receiver.recv().await, Some(AppEvent::Health(_))));
+            let started = Instant::now();
+            commands
+                .send(ClientCommand::Refresh(HumanSurface::Inbox, 0))
+                .await
+                .unwrap();
+            commands
+                .send(ClientCommand::Human(proposal_action()))
+                .await
+                .unwrap();
+            if config_write {
+                commands
+                    .send(ClientCommand::ConfigWrite(
+                        evertrace_protocol::command::ConfigWriteCommand {
+                            source: String::new(),
+                            expected_file_hash: "0".repeat(64),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let mut refresh = tokio::time::interval(Duration::from_millis(200));
+            let mut timed_out = false;
+            let mut disconnected = false;
+            let mut rejected_unsent = false;
+            let expected_deadline = if config_write {
+                Duration::from_secs(10)
+            } else {
+                HUMAN_READ_HARD_DEADLINE
+            };
+            tokio::time::timeout(expected_deadline + Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    _ = refresh.tick(), if !disconnected => {
+                        commands.send(ClientCommand::Refresh(HumanSurface::System, 0)).await.unwrap();
+                    }
+                    event = receiver.recv() => match event {
+                        Some(AppEvent::HumanReadFailed { code: HumanReadFailure::TimedOut, surface: HumanSurface::Inbox, .. }) => {
+                            assert!(started.elapsed() >= HUMAN_READ_HARD_DEADLINE);
+                            timed_out = true;
+                        }
+                        Some(AppEvent::HumanAction(HumanGovernanceResponse::Action { result })) => {
+                            assert_eq!(result.reason.as_deref(), Some("local_transport_unavailable"));
+                            rejected_unsent = true;
+                        }
+                        Some(AppEvent::Disconnected) => {
+                            assert_eq!(timed_out, !config_write);
+                            assert!(started.elapsed() >= expected_deadline);
+                            disconnected = true;
+                        }
+                        Some(AppEvent::Health(_)) => {
+                            assert!(disconnected && rejected_unsent);
+                            break;
+                        }
+                        None => panic!("actor stopped"),
+                        _ => {}
+                    }
+                }
+            }
+        }).await.unwrap();
+            assert_eq!(writes.load(Ordering::Relaxed), 0);
+            commands.send(ClientCommand::Shutdown).await.unwrap();
+            actor.await.unwrap();
+            server_task.abort();
+            let _ = server_task.await;
+            fs::remove_dir_all(data).unwrap();
         }
     }
 
@@ -688,6 +956,20 @@ mod tests {
         .unwrap();
         assert_eq!(first.config_version, 1);
 
+        // An idle TUI must outlive the server's two-second frame deadline.
+        // Keep the existing notification/reconnect assertions on this same connection.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if matches!(receiver.recv().await, Some(AppEvent::Disconnected) | None) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .is_err()
+        );
+
         shutdown.send(true).unwrap();
         let stopping = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -782,7 +1064,7 @@ mod tests {
             let rendered = (0..20)
                 .flat_map(|y| (0..60).map(move |x| buffer[(x, y)].symbol()))
                 .collect::<String>();
-            assert!(rendered.contains("No objects loaded"));
+            assert!(rendered.contains("Loading this page"));
         })
         .await
         .unwrap();

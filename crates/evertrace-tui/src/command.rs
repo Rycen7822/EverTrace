@@ -3,6 +3,20 @@ use evertrace_domain::repository::RecoveryApplicationKind;
 use evertrace_protocol::dto::{NegativeReviewDecision, ProposalHumanDecision};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiCommand {
+    Commands,
+    Help,
+    Filter,
+    ClearFilter,
+    FindNext,
+    FindPrevious,
+    Zoom,
+    OpenResult,
+    OpenResultAt(usize),
+    CycleType,
+    CycleScope,
+    CycleState,
+    SystemView(crate::state::SystemView),
+    DetailView(crate::state::DetailView),
     Navigate(Route),
     Refresh,
     SelectNext,
@@ -36,4 +50,11 @@ pub enum UiCommand {
     CancelModal,
     Quit,
     None,
+}
+
+/// The three consumers (palette, help, buttons) share these current intents.
+pub(crate) struct UiCommandSpec {
+    pub command: UiCommand,
+    pub name: &'static str,
+    pub reason: Option<&'static str>,
 }

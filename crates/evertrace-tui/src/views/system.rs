@@ -1,100 +1,166 @@
-use crate::{AppState, components};
-use ratatui::{Frame, layout::Rect};
+use crate::{AppState, state::SystemView};
+use evertrace_protocol::dto::{HumanGovernanceResponse, HumanSystemDetail};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    widgets::{Paragraph, Wrap},
+};
 pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
-    let in_detail = state.detail.is_some() || state.detail_message.is_some();
-    let mut body = format!(
-        "Export: select objects in Explorer with s; X here exports {} selected objects",
-        state.export_selections.len()
-    );
-    if let Some(result) = &state.export_result {
-        body.push_str(&format!(
-            "\nExport {:?}: {} objects / {} bytes\n{}\n{}",
-            result.status,
-            result.object_count,
-            result.total_bytes,
-            result.path.as_deref().unwrap_or(
-                if result.status == evertrace_protocol::dto::HumanExportStatus::PublicationUncertain
-                {
-                    "Location unknown; inspect the configured exports directory before retrying"
-                } else {
-                    "No published path"
+    let report = match &state.human {
+        Some(HumanGovernanceResponse::Snapshot { diagnostics, .. }) => diagnostics.as_deref(),
+        _ => None,
+    };
+    match state.ui.system_view {
+        SystemView::Overview => {
+            let count = |name: &str| {
+                report
+                    .and_then(|r| r.checks.iter().find(|c| c.name == name))
+                    .and_then(|c| c.count)
+                    .map_or_else(|| "not read".into(), |n| n.to_string())
+            };
+            let capture = report.and_then(|r| r.host.as_ref()).map_or_else(
+                || {
+                    state
+                        .shell
+                        .health
+                        .as_ref()
+                        .and_then(|h| h.host_canary.as_ref())
+                        .map_or_else(
+                            || "Hook: not observed".into(),
+                            |h| {
+                                format!(
+                                    "Last Health: Host canary: {:?}; CaptureReceipt: {}",
+                                    h.status, h.capture_receipt_observed
+                                )
+                            },
+                        )
+                },
+                |h| {
+                    format!(
+                        "Hook: {:?}; receipt observed: {}",
+                        h.status, h.capture_receipt_observed
+                    )
+                },
+            );
+            let provider = report
+                .and_then(|r| r.checks.iter().find(|c| c.name == "provider_connectivity"))
+                .map_or_else(|| "not checked".into(), |c| format!("{:?}", c.state));
+            let water = report.map_or_else(
+                || "Projection watermarks: not read".into(),
+                |r| {
+                    format!(
+                        "Projection checkpoints: {} · metadata only",
+                        r.tables
+                            .iter()
+                            .map(|t| t
+                                .checkpoint
+                                .map_or_else(|| "unknown".into(), |n| n.to_string()))
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    )
+                },
+            );
+            let body = format!(
+                "{capture}\nQueued {} · Leased {} · Historical failures {}\nModel: {provider} (no probe); recorded calls {}\n{water}",
+                count("jobs_queued"),
+                count("jobs_leased"),
+                count("jobs_failed_history"),
+                count("llm_daily_calls")
+            );
+            let height = a.height.min(5);
+            f.render_widget(Paragraph::new(body), Rect::new(a.x, a.y, a.width, height));
+            super::render_list(
+                f,
+                Rect::new(a.x, a.y + height, a.width, a.height - height),
+                state,
+                "Tasks · current page (leased = claimed)",
+            );
+        }
+        SystemView::Jobs => {
+            super::render_list(f, a, state, "Tasks · name / state / target / reason")
+        }
+        SystemView::Diagnostics => {
+            if state.ui.diagnostic_detail {
+                let body=report.and_then(|r|r.checks.get(state.ui.diagnostic_selection).map(|c|(r,c))).map_or_else(||"Selected diagnostic is no longer available; Esc returns".into(),|(r,c)|format!("Check: {}\nObserved state: {:?}\nRecorded value: {}\nLimit: {}\nSample: {} microseconds since Unix epoch (UTC)\nScope: existing local diagnostic report, non-atomic.\nNotChecked means no check was executed; Historical is not a current failure.\nMetadata does not verify content integrity. This view never starts a provider probe.\nEsc returns to the same diagnostic row.",c.name,c.state,c.count.map_or_else(||"not supplied".into(),|v|v.to_string()),c.limit.map_or_else(||"not supplied".into(),|v|v.to_string()),r.observed_at_us));
+                f.render_widget(
+                    crate::components::table("Diagnostic detail", body)
+                        .wrap(Wrap { trim: false })
+                        .scroll((state.detail_scroll, 0)),
+                    a,
+                );
+                return;
+            }
+            let body=report.map_or_else(||"Diagnostics not yet read".into(),|r|{
+                let mut lines=vec![format!("Diagnostics sampled at {} microseconds since Unix epoch (UTC); non-atomic",r.observed_at_us),
+                    "Metadata is not content verification; terminal failures are history.".into(),
+                    "Provider NotChecked does not mean healthy; this view never calls the model.".into()];
+                for (index,c) in r.checks.iter().enumerate().filter(|(_,c)|c.name.to_lowercase().contains(&state.ui.filter.to_lowercase())) {lines.push(format!("{} {} | {:?} | recorded {} | limit {}",if index==state.ui.diagnostic_selection{">"}else{" "},c.name,c.state,c.count.map_or_else(||"not supplied".into(),|v|v.to_string()),c.limit.map_or_else(||"not supplied".into(),|v|v.to_string())));}
+                for (name,t) in ["journal","objects","relations","search"].into_iter().zip(&r.tables){lines.push(format!("{name}: version {:?}; checkpoint {:?}; schema {:?}",t.version,t.checkpoint,t.schema_matches));}
+                if let Some(h)=&r.host {lines.push(format!("Host canary: {:?}; CaptureReceipt: {}; native delivery: {}; MCP consumed: {}",h.status,h.capture_receipt_observed,h.native_delivery_observed,h.mcp_claim_consumed));} else {lines.push("Host canary: not_run".into());}
+                lines.join("\n")
+            });
+            f.render_widget(
+                crate::components::table("Capture / storage / model diagnostics", body)
+                    .scroll((state.detail_scroll, 0))
+                    .wrap(Wrap { trim: false }),
+                a,
+            );
+        }
+        SystemView::Configuration => {
+            let mut body="Configuration is read and written through the daemon.\nUse : Edit configuration to read the existing document.\nSaving uses its file hash; failed saves preserve the draft.\nRestartRequired means restart is needed; TUI does not restart the service.".to_string();
+            if let Some(HumanGovernanceResponse::Snapshot { items, .. }) = &state.human {
+                for i in items {
+                    if let Some(HumanSystemDetail::Config {
+                        config_version,
+                        effective_config_hash,
+                        reload,
+                    }) = &i.system_detail
+                    {
+                        body.push_str(&format!(
+                            "\nConfig version: {config_version}\nEffective hash: {}\nReload: {}",
+                            super::short(&evertrace_domain::evidence::hex(effective_config_hash)),
+                            reload.as_ref().map_or_else(
+                                || "not supplied".into(),
+                                |r| format!("{:?}", r.outcome)
+                            )
+                        ));
+                    }
                 }
-            ),
-            result.reason.as_deref().unwrap_or("")
-        ));
-    }
-    body.push('\n');
-    body.push_str(&crate::views::page_body(
-        state,
-        "No current system projection facts",
-    ));
-    if !in_detail {
-        for selected in &state.export_selections {
-            body.push_str(&format!("\nSelected: {}", selected.object_ref));
+            }
+            f.render_widget(
+                crate::components::table("Configuration", body).wrap(Wrap { trim: false }),
+                a,
+            );
         }
-        if let Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
-            diagnostics: Some(report),
-            ..
-        }) = &state.human
-        {
-            body.push_str(&format!("\nCurrent diagnostics (non-atomic; j/k scroll)\nconfig={}\nobserved_us={} algorithm_revision={}", report.config_hash, report.observed_at_us, report.algorithm_revision));
-            for (name, table) in ["journal", "objects", "relations", "search"]
-                .into_iter()
-                .zip(&report.tables)
-            {
+        SystemView::Maintenance => {
+            let mut body = format!(
+                "Export selection: {} objects (maximum 64).\nSelect objects in Explorer, then : Export selected objects.\nBackup / verification / GC submit durable jobs.\nRestore requires stopping the service and using the offline CLI.",
+                state.export_selections.len()
+            );
+            if let Some(r) = &state.export_result {
                 body.push_str(&format!(
-                    "\n{name}: schema={:?} version={:?} checkpoint={:?}",
-                    table.schema_matches, table.version, table.checkpoint
+                    "\nExport {:?}: {} objects / {} bytes\n{}\n{}",
+                    r.status,
+                    r.object_count,
+                    r.total_bytes,
+                    r.path.as_deref().unwrap_or("No confirmed published path"),
+                    r.reason.as_deref().unwrap_or("")
                 ));
             }
-            for check in &report.checks {
-                body.push_str(&format!(
-                    "\n{}: {:?} recorded={:?} limit={:?}",
-                    check.name, check.state, check.count, check.limit
-                ));
-            }
-            body.push_str("\nMetadata is not content verification; terminal failures are history.\nDaily usage does not predict next-request eligibility.");
-            append_canary(&mut body, report.host.as_ref());
-        } else {
-            body.push_str("\nCurrent diagnostics: unavailable");
-            if let Some(health) = &state.shell.health {
-                body.push_str("\nLast Health observation (not a current diagnostic report)");
-                append_canary(&mut body, health.host_canary.as_ref());
+            f.render_widget(
+                Paragraph::new(body).wrap(Wrap { trim: false }),
+                Rect::new(a.x, a.y, a.width, a.height.min(7)),
+            );
+            if a.height > 7 {
+                super::render_list(
+                    f,
+                    Rect::new(a.x, a.y + 7, a.width, a.height - 7),
+                    state,
+                    "Maintenance / repository facts · current page",
+                );
             }
         }
-        body.push_str(
-            "\nObject Forget: available in Explorer\nRepository/session purge: unavailable\nBackup create/verify: durable jobs (B/V)\nGC + normal prune (G): 24 h grace / 30 d versions\nRestore: offline CLI only\nConfiguration write: unavailable",
-        );
     }
-    let mut widget = components::table("System", body).scroll((state.detail_scroll, 0));
-    if state.export_result.is_some()
-        || state.detail.as_ref().is_some_and(|item| {
-            matches!(
-                item.system_detail,
-                Some(evertrace_protocol::dto::HumanSystemDetail::SessionImport { .. })
-            )
-        })
-    {
-        widget = widget.wrap(ratatui::widgets::Wrap { trim: false });
-    }
-    f.render_widget(widget, a)
-}
-
-fn append_canary(
-    body: &mut String,
-    canary: Option<&evertrace_protocol::dto::HostCanaryDiagnostic>,
-) {
-    match canary {
-        Some(value) => body.push_str(&format!(
-            "\nHost canary: {:?}\nNative delivery: {}\nMCP consumed: {}\nCaptureReceipt: {}",
-            value.status,
-            value.native_delivery_observed,
-            value.mcp_claim_consumed,
-            value.capture_receipt_observed,
-        )),
-        None => body.push_str("\nHost canary: not_run"),
-    }
-    body.push_str("\nCapability qualification is independent");
 }
 
 #[cfg(test)]
@@ -136,7 +202,7 @@ mod tests {
             host: None,
         };
         assert!(report.validate());
-        let state = AppState {
+        let mut state = AppState {
             route: crate::Route::System,
             human: Some(HumanGovernanceResponse::Snapshot {
                 diagnostics: Some(Box::new(report)),
@@ -148,6 +214,7 @@ mod tests {
             }),
             ..AppState::default()
         };
+        state.ui.system_view = SystemView::Diagnostics;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
         terminal
@@ -160,8 +227,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("fts_metadata: Inconsistent"));
-        assert!(text.contains("llm_daily_calls: Exhausted"));
+        assert!(text.contains("fts_metadata | Inconsistent"));
+        assert!(text.contains("llm_daily_calls | Exhausted"));
         assert!(text.contains("Host canary: not_run"));
         let source = "session-rollout:019d0000-0000-7000-8000-000000000001:019d0000-0000-7000-8000-000000000002";
         use evertrace_protocol::dto::{
@@ -169,6 +236,8 @@ mod tests {
             HumanSystemDetail,
         };
         let item = HumanSnapshotItem {
+            semantic_detail: None,
+            proposal_base: None,
             evidence_detail: None,
             work_detail: None,
             item_kind: HumanItemKind::Generic,
@@ -210,7 +279,12 @@ mod tests {
             ..AppState::default()
         };
         terminal
-            .draw(|frame| render(frame, frame.area(), &state))
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(crate::views::detail_text(&state)).wrap(Wrap { trim: false }),
+                    frame.area(),
+                )
+            })
             .unwrap();
         let text = terminal
             .backend()
@@ -222,7 +296,7 @@ mod tests {
         assert!(text.contains(source));
         assert!(text.contains("body: Partial"));
         assert!(text.contains("access: Approved; workspace: NonRepository"));
-        let state = AppState {
+        let mut state = AppState {
             route: crate::Route::System,
             export_result: Some(evertrace_protocol::dto::HumanExportResult {
                 status: evertrace_protocol::dto::HumanExportStatus::Published,
@@ -234,6 +308,7 @@ mod tests {
             }),
             ..AppState::default()
         };
+        state.ui.system_view = SystemView::Maintenance;
         terminal
             .draw(|frame| render(frame, frame.area(), &state))
             .unwrap();

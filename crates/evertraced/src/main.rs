@@ -719,6 +719,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             HumanRelationKind::SupportDependencies => {
                                                 EngineHumanRelationKind::SupportDependencies
                                             }
+                                            HumanRelationKind::ObjectSources => EngineHumanRelationKind::ObjectSources,
+                                            HumanRelationKind::ObjectRevisions => EngineHumanRelationKind::ObjectRevisions,
                                         },
                                         source_stable_key: &source_stable_key,
                                         expected_source_revision_ref: &expected_source_revision_ref,
@@ -1272,6 +1274,33 @@ fn map_human_surface(surface: HumanSurface) -> EngineHumanSurface {
     }
 }
 
+fn map_semantic_detail(
+    detail: evertrace_engine::HumanSemanticDetail,
+) -> evertrace_protocol::dto::HumanSemanticDetail {
+    use evertrace_protocol::dto::{HumanContentState as State, HumanSemanticContent as Content};
+    evertrace_protocol::dto::HumanSemanticDetail {
+        object_ref: detail.object_ref,
+        revision_ref: detail.revision_ref,
+        preview: detail.preview,
+        original_bytes: detail.original_bytes,
+        state: match detail.state {
+            evertrace_engine::HumanContentState::Ready => State::Ready,
+            evertrace_engine::HumanContentState::TooLarge => State::TooLarge,
+            evertrace_engine::HumanContentState::AccessDenied => State::AccessDenied,
+            evertrace_engine::HumanContentState::Missing => State::Missing,
+            evertrace_engine::HumanContentState::Unsupported => State::Unsupported,
+            evertrace_engine::HumanContentState::Unavailable => State::Unavailable,
+        },
+        content: detail.content.map(|content| match content {
+            evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),
+            evertrace_engine::HumanSemanticContent::Procedure(value) => Content::Procedure(value),
+            evertrace_engine::HumanSemanticContent::CoreMembership(value) => {
+                Content::CoreMembership(value)
+            }
+        }),
+    }
+}
+
 fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse {
     HumanGovernanceResponse::Snapshot {
         diagnostics: page.diagnostics.map(|value| Box::new(map_diagnostics(value))),
@@ -1293,6 +1322,8 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             .items
             .into_iter()
             .map(|item| HumanSnapshotItem {
+                semantic_detail: item.semantic_detail.map(map_semantic_detail),
+                proposal_base: item.proposal_base.map(map_semantic_detail),
                 work_detail: item.work_detail.map(|detail| evertrace_protocol::dto::HumanWorkDetail {
                     canonical_goal: detail.canonical_goal, identity_confidence: detail.identity_confidence,
                     source_refs: detail.source_refs, workstream_goal: detail.workstream_goal,

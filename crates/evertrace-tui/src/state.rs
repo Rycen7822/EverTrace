@@ -76,6 +76,7 @@ pub struct ShellSnapshot {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
+    pub(crate) ui: UiState,
     pub route: Route,
     pub shell: ShellSnapshot,
     pub human: Option<HumanGovernanceResponse>,
@@ -103,7 +104,8 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            route: Route::Inbox,
+            route: Route::System,
+            ui: UiState::default(),
             shell: ShellSnapshot {
                 health: None,
                 connection: ConnectionState::Connecting,
@@ -132,4 +134,83 @@ impl Default for AppState {
             quit: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SystemView {
+    #[default]
+    Overview,
+    Jobs,
+    Diagnostics,
+    Configuration,
+    Maintenance,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DetailView {
+    #[default]
+    Content,
+    Sources,
+    History,
+    Technical,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Focus {
+    Tabs,
+    Tools,
+    #[default]
+    List,
+    Detail,
+    Actions,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NavigationFrame {
+    pub page_cursor: Option<String>,
+    pub type_filter: Option<String>,
+    pub scope_filter: Option<String>,
+    pub state_filter: Option<String>,
+    pub system_view: SystemView,
+    pub read_at: Option<std::time::SystemTime>,
+    pub route: Route,
+    pub human: Option<HumanGovernanceResponse>,
+    pub detail: Option<HumanSnapshotItem>,
+    pub selection: usize,
+    pub scroll: u16,
+    pub offset: usize,
+    pub filter: String,
+    pub related: Option<RelatedContext>,
+    pub detail_view: DetailView,
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UiState {
+    pub read_generation: u64,
+    pub diagnostic_selection: usize,
+    pub diagnostic_detail: bool,
+    pub pending_edit: Option<ProposalEditState>,
+    pub confirmation_selected: bool,
+    pub action_submits_job: bool,
+    pub type_filter: Option<String>,
+    pub scope_filter: Option<String>,
+    pub state_filter: Option<String>,
+    pub reference_request: Option<(String, u64)>,
+    pub related_loaded: bool,
+    pub page_cursor: Option<String>,
+    pub focus: Focus,
+    pub system_view: SystemView,
+    pub detail_view: DetailView,
+    pub zoom: bool,
+    pub filter: String,
+    pub query: String,
+    pub query_cursor: usize,
+    pub input: Option<bool>, // true: commands; false: local filter/find
+    pub palette_selection: usize,
+    pub tool_selection: usize,
+    pub action_selection: usize,
+    pub list_offset: usize,
+    pub find: String,
+    pub history: Vec<NavigationFrame>,
+    pub read_at: Option<std::time::SystemTime>,
+    pub read_finished: Option<std::time::Instant>,
+    pub reading: bool,
+    pub unknown_write: bool,
+    pub help: bool,
 }

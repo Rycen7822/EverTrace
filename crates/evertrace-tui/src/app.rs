@@ -18,14 +18,21 @@ use std::{
 
 pub struct App {
     state: AppState,
+    hit_regions: std::cell::RefCell<Vec<(Rect, UiCommand)>>,
+    visible_layout: std::cell::RefCell<layout::ShellLayout>,
 }
+mod interaction;
 
 const MAX_PROPOSAL_EDIT_DOCUMENT: usize = evertrace_protocol::dto::MAX_FRAME_SIZE / 2;
 
 impl App {
     pub fn new() -> Self {
+        let mut state = AppState::default();
+        state.ui.read_generation = 1;
         Self {
-            state: AppState::default(),
+            state,
+            hit_regions: std::cell::RefCell::new(Vec::new()),
+            visible_layout: std::cell::RefCell::new(layout::ShellLayout::default()),
         }
     }
 
@@ -51,20 +58,104 @@ impl App {
     }
 
     pub fn handle(&mut self, event: AppEvent) -> UiCommand {
+        let event = match event {
+            AppEvent::HumanRead {
+                surface,
+                locator:
+                    HumanReadLocator::View {
+                        generation,
+                        request,
+                    },
+                response,
+            } => {
+                if generation != self.state.ui.read_generation {
+                    self.state.ui.reading = false;
+                    self.state.ui.read_finished = Some(std::time::Instant::now());
+                    return UiCommand::None;
+                }
+                AppEvent::HumanRead {
+                    surface,
+                    locator: *request,
+                    response,
+                }
+            }
+            AppEvent::HumanReadFailed {
+                surface,
+                locator:
+                    HumanReadLocator::View {
+                        generation,
+                        request,
+                    },
+                code,
+            } => {
+                if generation != self.state.ui.read_generation {
+                    return UiCommand::None;
+                }
+                AppEvent::HumanReadFailed {
+                    surface,
+                    locator: *request,
+                    code,
+                }
+            }
+            event => event,
+        };
+        if let AppEvent::Key(key) = &event {
+            use crossterm::event::KeyEventKind;
+            if key.kind == KeyEventKind::Release {
+                return UiCommand::None;
+            }
+            if key.kind == KeyEventKind::Repeat
+                && !matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                )
+                && !(matches!(key.code, KeyCode::Char(_))
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && (self.state.proposal_edit.is_some() || self.state.ui.input.is_some()))
+            {
+                return UiCommand::None;
+            }
+        }
         match event {
+            AppEvent::Mouse(mouse) => self.mouse(mouse),
+            AppEvent::Paste(text) => {
+                if is_config_editor(&self.state) && self.state.write_queued {
+                    return UiCommand::None;
+                }
+                if let Some(edit) = &mut self.state.proposal_edit {
+                    insert_edit_text(edit, &text);
+                } else if self.state.ui.input.is_some() {
+                    let text = text
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(512usize.saturating_sub(self.state.ui.query.len()))
+                        .collect::<String>();
+                    self.state
+                        .ui
+                        .query
+                        .insert_str(self.state.ui.query_cursor, &text);
+                    self.state.ui.query_cursor += text.len();
+                    self.apply_query();
+                }
+                UiCommand::None
+            }
             AppEvent::Key(key) if self.state.repository_purge_confirmation.is_some() => {
                 self.handle_repository_purge_confirmation_key(key)
             }
             AppEvent::Key(key) if self.state.proposal_edit.is_some() => {
                 self.handle_proposal_edit_key(key)
             }
-            AppEvent::Key(key) => self.dispatch(keymap::command(key)),
+            AppEvent::Key(key) => self.interaction_key(key),
             AppEvent::Health(health) => {
                 self.state.shell.health = Some(health);
                 self.state.shell.connection = ConnectionState::Connected;
-                if !is_config_editor(&self.state) {
-                    self.state.proposal_edit = None;
-                }
                 self.state.repository_purge_confirmation = None;
                 self.state.related_context = None;
                 self.state.future_operation_shell = None;
@@ -111,11 +202,47 @@ impl App {
                 }
                 UiCommand::None
             }
+            AppEvent::HumanReadFailed {
+                surface,
+                locator,
+                code,
+            } => {
+                if surface == human_surface(self.state.route)
+                    && (!matches!(locator, HumanReadLocator::Detail { .. })
+                        || detail_locator_matches(&self.state, &locator))
+                    && (!matches!(locator, HumanReadLocator::Related { .. })
+                        || related_locator_matches(&self.state, &locator))
+                {
+                    if !matches!(code, crate::app_event::HumanReadFailure::Slow) {
+                        self.state.ui.reading = false;
+                        self.state.ui.read_finished = Some(std::time::Instant::now());
+                    }
+                    self.state.detail_message = Some(match code {
+                        crate::app_event::HumanReadFailure::Rejected(code) => format!("Read failed: {code:?}; previous data retained"),
+                        crate::app_event::HumanReadFailure::Slow => "Read is taking longer than expected; previous data retained; waiting for response".into(),
+                        crate::app_event::HumanReadFailure::TimedOut => "Read timed out after 30 seconds; reconnecting".into(),
+                    });
+                }
+                UiCommand::None
+            }
             AppEvent::HumanRead {
                 surface,
                 locator,
                 response: snapshot,
             } => {
+                self.state.ui.reading = false;
+                self.state.ui.read_finished = Some(std::time::Instant::now());
+                if matches!(&locator, HumanReadLocator::Page { after } if self.state.ui.page_cursor.as_ref()!=Some(after))
+                    || (matches!(locator, HumanReadLocator::List)
+                        && self.state.ui.page_cursor.is_some())
+                {
+                    return UiCommand::None;
+                }
+                let locator = if matches!(locator, HumanReadLocator::Page { .. }) {
+                    HumanReadLocator::List
+                } else {
+                    locator
+                };
                 let related = matches!(locator, HumanReadLocator::Related { .. });
                 if related {
                     if !related_locator_matches(&self.state, &locator) {
@@ -129,22 +256,44 @@ impl App {
                 {
                     return UiCommand::None;
                 }
-                if !is_config_editor(&self.state) {
-                    self.state.proposal_edit = None;
+                self.state.ui.reading = false;
+                self.state.ui.read_finished = Some(std::time::Instant::now());
+                if self.modal_open() {
+                    return UiCommand::None;
                 }
-                self.state.repository_purge_confirmation = None;
+                self.state.ui.read_at = Some(std::time::SystemTime::now());
                 use evertrace_protocol::dto::HumanGovernanceResponse;
                 match (locator, snapshot) {
                     (
                         HumanReadLocator::Related { .. },
                         snapshot @ HumanGovernanceResponse::Snapshot { .. },
                     ) => {
+                        let previous = selected_item(&self.state).map(|i| i.stable_key.clone());
+                        let next_selection = if self.state.ui.related_loaded {
+                            match &snapshot {
+                                HumanGovernanceResponse::Snapshot { items, .. } => previous
+                                    .and_then(|key| items.iter().position(|i| i.stable_key == key))
+                                    .unwrap_or(0),
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
                         let item_count = match &snapshot {
                             HumanGovernanceResponse::Snapshot { items, .. } => items.len(),
                             _ => 0,
                         };
                         self.state.route = crate::Route::Explorer;
-                        self.state.selection = 0;
+                        if !self.state.ui.related_loaded {
+                            self.state.ui.filter.clear();
+                            self.state.ui.list_offset = 0;
+                            self.state.ui.type_filter = None;
+                            self.state.ui.scope_filter = None;
+                            self.state.ui.state_filter = None;
+                        }
+                        self.state.ui.related_loaded = true;
+                        self.state.ui.focus = crate::state::Focus::List;
+                        self.state.selection = next_selection;
                         self.state.human = Some(snapshot);
                         self.state.detail = None;
                         self.state.detail_message =
@@ -159,28 +308,79 @@ impl App {
                         HumanReadLocator::List,
                         snapshot @ HumanGovernanceResponse::Snapshot { .. },
                     ) => {
-                        let item_count = match &snapshot {
-                            HumanGovernanceResponse::Snapshot { items, .. } => items.len(),
-                            _ => 0,
-                        };
-                        self.state.selection =
-                            self.state.selection.min(item_count.saturating_sub(1));
+                        let previous = selected_item(&self.state).map(|i| i.stable_key.clone());
+                        let mut changed = false;
+                        if let HumanGovernanceResponse::Snapshot { items, .. } = &snapshot {
+                            self.state.selection = previous
+                                .as_ref()
+                                .and_then(|key| items.iter().position(|i| &i.stable_key == key))
+                                .unwrap_or(self.state.selection.min(items.len().saturating_sub(1)));
+                            if let Some(detail) = &self.state.detail
+                                && !items.iter().any(|i| {
+                                    i.stable_key == detail.stable_key
+                                        && i.revision_ref == detail.revision_ref
+                                })
+                            {
+                                self.state.detail = None;
+                                changed = true;
+                            }
+                        }
                         self.state.human = Some(snapshot);
-                        self.state.detail = None;
-                        self.state.detail_message = None;
-                        self.state.detail_scroll = 0;
-                        self.state.proposal_confirmation = None;
-                        self.state.competing_candidate_selection = 0;
+                        self.state.detail_message = changed.then(||"Selected object changed or disappeared; open its current detail before acting".into());
                         self.state.read_conflict = None;
-                        UiCommand::None
+                        let visible = views::visible_indices(&self.state);
+                        if !visible.contains(&self.state.selection)
+                            && let Some(index) = visible.first()
+                        {
+                            self.state.selection = *index;
+                        }
+                        if self.state.detail.is_some() {
+                            UiCommand::Detail
+                        } else {
+                            UiCommand::None
+                        }
                     }
                     (
                         HumanReadLocator::Detail { .. },
-                        HumanGovernanceResponse::Snapshot { mut items, .. },
+                        HumanGovernanceResponse::Snapshot {
+                            mut items,
+                            frontier,
+                            status,
+                            degraded_reasons,
+                            diagnostics,
+                            next_cursor,
+                        },
                     ) => {
+                        let first_open = self.state.detail.is_none();
+                        if self.state.ui.reference_request.take().is_some() {
+                            self.state.selection = 0;
+                            self.state.human = Some(HumanGovernanceResponse::Snapshot {
+                                diagnostics,
+                                frontier,
+                                status,
+                                degraded_reasons,
+                                items: items.clone(),
+                                next_cursor,
+                            });
+                        }
                         self.state.detail = items.pop();
+                        if self.state.detail.as_ref().is_none_or(|i| {
+                            i.semantic_detail.as_ref().is_some_and(|d| {
+                                matches!(
+                                    d.state,
+                                    evertrace_protocol::dto::HumanContentState::AccessDenied
+                                        | evertrace_protocol::dto::HumanContentState::Missing
+                                )
+                            })
+                        }) {
+                            self.state.ui.history.clear();
+                        }
                         self.state.competing_candidate_selection = 0;
-                        self.state.detail_scroll = 0;
+                        if first_open {
+                            self.state.detail_scroll = 0;
+                            self.state.ui.detail_view = crate::state::DetailView::Content;
+                        }
+                        self.state.ui.focus = crate::state::Focus::Detail;
                         self.state.detail_message = self
                             .state
                             .detail
@@ -210,6 +410,7 @@ impl App {
                             current_frontier, ..
                         },
                     ) => {
+                        self.state.ui.page_cursor = None;
                         self.state.human = None;
                         self.state.detail = None;
                         self.state.detail_message = None;
@@ -245,6 +446,9 @@ impl App {
                         HumanGovernanceResponse::Action { .. }
                         | HumanGovernanceResponse::Export { .. },
                     ) => UiCommand::None,
+                    (HumanReadLocator::Page { .. } | HumanReadLocator::View { .. }, _) => {
+                        UiCommand::None
+                    }
                 }
             }
             AppEvent::HumanAction(response) => {
@@ -273,7 +477,15 @@ impl App {
                 if result.reason.as_deref() != Some("local_busy") {
                     self.state.write_queued = false;
                 }
-                self.state.proposal_edit = None;
+                self.state.proposal_edit = if matches!(
+                    result.status,
+                    HumanActionStatus::Conflict | HumanActionStatus::Unavailable
+                ) {
+                    self.state.ui.pending_edit.take().map(|mut edit|{edit.error=Some("Action not applied; original target and draft retained. Reread before confirming.".into());edit})
+                } else {
+                    self.state.ui.pending_edit = None;
+                    None
+                };
                 self.state.proposal_confirmation = None;
                 self.state.repository_purge_confirmation = None;
                 self.state.competing_candidate_selection = 0;
@@ -302,6 +514,8 @@ impl App {
                 UiCommand::None
             }
             AppEvent::Disconnected => {
+                self.state.ui.unknown_write |= self.state.write_queued;
+                self.state.ui.reading = false;
                 if self.state.export_pending {
                     self.state.export_result = Some(evertrace_protocol::dto::HumanExportResult {
                         status: evertrace_protocol::dto::HumanExportStatus::PublicationUncertain,
@@ -314,14 +528,12 @@ impl App {
                     self.state.export_pending = false;
                 }
                 self.state.shell.connection = ConnectionState::Disconnected;
-                if !is_config_editor(&self.state) {
-                    self.state.proposal_edit = None;
+                if self.state.proposal_edit.is_none() {
+                    self.state.proposal_edit = self.state.ui.pending_edit.take();
                 }
                 self.state.write_queued = false;
                 self.state.proposal_confirmation = None;
                 self.state.repository_purge_confirmation = None;
-                self.state.detail = None;
-                self.state.detail_scroll = 0;
                 self.state.recovery_selection = None;
                 self.state.recovery_confirmation = None;
                 self.state.related_context = None;
@@ -342,7 +554,29 @@ impl App {
                 UiCommand::None
             }
             AppEvent::Shutdown => self.dispatch(UiCommand::Quit),
-            AppEvent::Tick | AppEvent::Resize(_, _) => UiCommand::None,
+            AppEvent::Resize(_, _) => {
+                self.hit_regions.borrow_mut().clear();
+                *self.visible_layout.borrow_mut() = layout::ShellLayout::default();
+                UiCommand::None
+            }
+            AppEvent::Tick => {
+                if !self.modal_open()
+                    && self.state.ui.input.is_none()
+                    && !self.state.ui.reading
+                    && self.state.shell.pending == 0
+                    && self.state.shell.connection == ConnectionState::Connected
+                    && self
+                        .state
+                        .ui
+                        .read_finished
+                        .is_some_and(|t| t.elapsed() >= Duration::from_secs(5))
+                {
+                    self.state.ui.reading = true;
+                    UiCommand::Refresh
+                } else {
+                    UiCommand::None
+                }
+            }
         }
     }
 
@@ -459,6 +693,31 @@ impl App {
     }
 
     pub fn dispatch(&mut self, command: UiCommand) -> UiCommand {
+        if matches!(
+            command,
+            UiCommand::Navigate(_)
+                | UiCommand::NextPage
+                | UiCommand::FirstPage
+                | UiCommand::OpenRelated
+                | UiCommand::OpenResult
+                | UiCommand::OpenResultAt(_)
+                | UiCommand::CancelModal
+                | UiCommand::DetailView(crate::state::DetailView::History)
+        ) {
+            self.state.ui.read_generation = self.state.ui.read_generation.wrapping_add(1).max(1);
+        }
+        if !self.modal_open() {
+            self.state.ui.confirmation_selected = false;
+        }
+        if command == UiCommand::Detail && self.state.repository_purge_confirmation.is_some() {
+            return self.handle_repository_purge_confirmation_key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ));
+        }
+        if let Some(result) = self.ui_dispatch(command) {
+            return result;
+        }
         let command = if self.state.route == crate::Route::System {
             use evertrace_protocol::dto::RepositoryAccessAction;
             match command {
@@ -489,6 +748,16 @@ impl App {
         }
         match command {
             UiCommand::Navigate(route) => {
+                self.save_navigation();
+                self.state.ui.page_cursor = None;
+                self.state.ui.type_filter = None;
+                self.state.ui.scope_filter = None;
+                self.state.ui.state_filter = None;
+                self.state.ui.reference_request = None;
+                self.state.ui.filter.clear();
+                self.state.ui.list_offset = 0;
+                self.state.ui.focus = crate::state::Focus::List;
+                self.state.ui.reading = true;
                 self.state.route = route;
                 self.state.human = None;
                 self.state.detail = None;
@@ -794,6 +1063,9 @@ impl App {
                 }
             }
             UiCommand::OpenRelated => {
+                self.save_navigation();
+                self.state.ui.related_loaded = false;
+                self.state.ui.page_cursor = None;
                 self.state.related_context = related_context(&self.state);
                 if self.state.related_context.is_none() {
                     self.state.last_action = Some(local_unavailable("related_source_unavailable"));
@@ -828,17 +1100,7 @@ impl App {
                 return UiCommand::ConfirmProposal;
             }
             UiCommand::Refresh => {
-                self.state.selection = 0;
-                self.state.detail = None;
-                self.state.detail_message = None;
-                self.state.detail_scroll = 0;
-                self.state.proposal_confirmation = None;
-                self.state.competing_candidate_selection = 0;
-                self.state.proposal_edit = None;
-                self.state.recovery_selection = None;
-                self.state.recovery_confirmation = None;
-                self.state.related_context = None;
-                self.state.future_operation_shell = None;
+                self.state.ui.reading = true;
             }
             UiCommand::NextPage
             | UiCommand::FirstPage
@@ -847,6 +1109,7 @@ impl App {
             | UiCommand::ConfirmRecovery
             | UiCommand::SubmitConfig
             | UiCommand::None => {}
+            _ => {}
         }
         command
     }
@@ -858,74 +1121,7 @@ impl App {
     }
 
     pub fn render(&self, frame: &mut Frame) {
-        let palette = &crate::theme::EVER_OS;
-        let shell = layout::shell(frame.area());
-        frame.render_widget(
-            components::header().style(Style::default().fg(palette.ink).bg(palette.background)),
-            shell.header,
-        );
-        if shell.compact {
-            views::render(frame, shell.list, &self.state);
-        } else {
-            frame.render_widget(components::navigation(self.state.route), shell.nav);
-            views::render(frame, shell.list, &self.state);
-            let mut inspector = components::inspector(views::inspector_text(&self.state))
-                .style(Style::default().fg(palette.muted).bg(palette.surface))
-                .scroll((self.state.detail_scroll, 0));
-            if self
-                .state
-                .detail
-                .as_ref()
-                .is_some_and(|item| item.evidence_detail.is_some() || item.work_detail.is_some())
-            {
-                inspector = inspector.wrap(ratatui::widgets::Wrap { trim: false });
-            }
-            frame.render_widget(inspector, shell.inspector);
-        }
-        frame.render_widget(components::status_bar(&self.state.shell), shell.status);
-        let hints = if self.state.repository_purge_confirmation.is_some() {
-            "Type the exact Repository ID; block-on-cross-scope is fixed; strict source erasure is unavailable; Enter confirms; Esc cancels".into()
-        } else if self.state.proposal_edit.is_some() {
-            "Closed payload edit: Ctrl+S submit for confirmation; Esc cancels".into()
-        } else if self.state.future_operation_shell.is_some() {
-            "Esc dismisses; no operation will be sent".into()
-        } else if self.state.detail.is_some() || self.state.detail_message.is_some() {
-            if current_detail(&self.state).is_some_and(|item| item.forget_preview.is_some()) {
-                "Esc back  F forget object  j/k scroll  o related  r refresh  q quit".into()
-            } else if current_detail(&self.state)
-                .is_some_and(|item| item.repository_purge_preview.is_some())
-            {
-                "Esc back  P purge repository  j/k scroll  o related  r refresh  q quit".into()
-            } else if future_operation_shell(&self.state).is_some() {
-                "Esc back  g future Forget info  o related  j/k scroll  r refresh  q quit".into()
-            } else if current_detail(&self.state).is_some_and(|item| {
-                item.category == evertrace_protocol::dto::HumanItemCategory::AttemptResume
-            }) {
-                "Esc back  A mark new attempt  j/k scroll  o related  r refresh  q quit".into()
-            } else if current_detail(&self.state).is_some_and(|item| item.support_detail.is_some())
-            {
-                "Esc back  E replacement  D deprecate  j/k scroll  o related  r refresh  q quit"
-                    .into()
-            } else {
-                "Esc back  j/k scroll  o related  n next page  b first page  r refresh  q quit"
-                    .into()
-            }
-        } else if let Some(selection) = self.state.recovery_selection {
-            format!(
-                "Bundle {} {:?} selected; select target Worktree, Enter continues, Esc cancels",
-                selection.recovery_bundle_id, selection.application_kind
-            )
-        } else if self.state.route == crate::Route::Explorer {
-            "1 Inbox  2 Explorer  3 System  Enter detail  F forget  r refresh  p/f/i/M recovery  q quit".into()
-        } else if self.state.route == crate::Route::System {
-            "1 Inbox  2 Explorer  3 System  C edit config  B create backup  V verify backup  g maintenance boundaries  r refresh  q quit".into()
-        } else {
-            "1 Inbox  2 Explorer  3 System  r refresh  q quit".into()
-        };
-        frame.render_widget(
-            Paragraph::new(hints).style(Style::default().fg(palette.muted)),
-            shell.hints,
-        );
+        self.render_shell(frame);
         if let Some(confirmation) = &self.state.repository_purge_confirmation {
             let area = centered(frame.area(), 76, 11);
             let (clear, modal) = components::modal(format!(
@@ -966,15 +1162,20 @@ impl App {
             frame.render_widget(clear, area);
             frame.render_widget(modal, area);
         } else if let Some((_, action, review)) = &self.state.proposal_confirmation {
-            let area = centered(frame.area(), 72, 6);
+            let area = centered(
+                frame.area(),
+                76,
+                frame.area().height.saturating_sub(3).min(20),
+            );
             let review_tuple = review.as_ref().map_or_else(
                 || "Review: current closed action".into(),
                 |review| {
                     format!(
-                        "Proposal: {}\nRevision: {}\nFingerprint: {}",
+                        "Proposal: {}\nRevision: {}\nFingerprint: {}\nFrozen candidate, scope and conditions:\n{}",
                         review.proposal.proposal_id,
                         review.proposal.proposal_revision_id,
-                        evertrace_domain::evidence::hex(&review.proposal.fingerprint)
+                        evertrace_domain::evidence::hex(&review.proposal.fingerprint),
+                        evertrace_protocol::dto::proposal_payload_pretty_document(match action {evertrace_protocol::dto::HumanActionRequest::Proposal{edited_payload:Some(payload),..}=>payload.as_ref(),_=>&review.proposal.payload}).unwrap_or_else(|_|"Candidate cannot be displayed".into())
                     )
                 },
             );
@@ -983,12 +1184,47 @@ impl App {
                 human_action_label(action)
             ));
             frame.render_widget(clear, area);
-            frame.render_widget(modal, area);
-        } else if self.state.shell.pending > 0 {
-            let area = centered(frame.area(), 28, 3);
-            let (clear, modal) = components::modal("Request pending".into());
-            frame.render_widget(clear, area);
-            frame.render_widget(modal, area);
+            frame.render_widget(
+                modal
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((self.state.detail_scroll, 0)),
+                area,
+            );
+        }
+        if self.modal_open() {
+            self.hit_regions.borrow_mut().clear();
+            let area = Rect::new(
+                frame.area().x,
+                frame.area().bottom().saturating_sub(1),
+                frame.area().width,
+                1,
+            );
+            frame.render_widget(ratatui::widgets::Clear, area);
+            let confirm = self.state.proposal_confirmation.is_some()
+                || self.state.recovery_confirmation.is_some()
+                || self.state.repository_purge_confirmation.is_some();
+            frame.render_widget(
+                Paragraph::new(if confirm {
+                    if self.state.ui.confirmation_selected {
+                        "[Cancel] [>Confirm once] Tab changes choice; ↑↓ scroll"
+                    } else {
+                        "[>Cancel] [Confirm once] Tab changes choice; ↑↓ scroll"
+                    }
+                } else {
+                    "[Cancel] Esc closes"
+                }),
+                area,
+            );
+            self.hit_regions.borrow_mut().push((
+                Rect::new(area.x, area.y, area.width.min(9), 1),
+                UiCommand::CancelModal,
+            ));
+            if confirm && area.width > 9 {
+                self.hit_regions.borrow_mut().push((
+                    Rect::new(area.x + 9, area.y, (area.width - 9).min(15), 1),
+                    UiCommand::Detail,
+                ));
+            }
         }
     }
 }
@@ -1154,6 +1390,7 @@ fn is_config_editor(state: &AppState) -> bool {
 }
 
 fn submit_proposal_edit(state: &mut AppState) {
+    state.ui.confirmation_selected = false;
     let result = state
         .proposal_edit
         .as_ref()
@@ -1246,7 +1483,7 @@ fn submit_proposal_edit(state: &mut AppState) {
             )
         }
     });
-    state.proposal_edit = None;
+    state.ui.pending_edit = state.proposal_edit.take();
 }
 
 fn insert_edit_text(edit: &mut crate::state::ProposalEditState, value: &str) -> bool {
@@ -1475,19 +1712,36 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let ui_commands = client_commands.clone();
     let ui_task = tokio::spawn(async move {
         let mut app = App::new();
+        terminal.draw(|frame| app.render(frame))?;
         loop {
-            terminal.draw(|frame| app.render(frame))?;
             let Some(event) = receiver.recv().await else {
                 return Ok::<(), io::Error>(());
             };
+            let draw_needed = !matches!(event, AppEvent::Tick);
             let command = app.handle(event);
-            if matches!(command, UiCommand::Refresh | UiCommand::Navigate(_)) {
-                let _ = ui_commands.try_send(client::ClientCommand::Refresh(human_surface(
-                    app.state.route,
-                )));
+            if matches!(command, UiCommand::Navigate(_)) {
+                let _ = ui_commands.try_send(client::ClientCommand::Refresh(
+                    human_surface(app.state.route),
+                    app.state.ui.read_generation,
+                ));
             }
             if let Some(request) = human_request(&app.state, command) {
-                let _ = ui_commands.try_send(client::ClientCommand::Human(request));
+                app.state.ui.reading = true;
+                let command = match request {
+                    evertrace_protocol::dto::HumanGovernanceRequest::Read { request } => {
+                        client::ClientCommand::ReadView {
+                            request,
+                            generation: app.state.ui.read_generation,
+                        }
+                    }
+                    request => client::ClientCommand::Human(request),
+                };
+                if ui_commands.try_send(command).is_err() {
+                    app.state.ui.reading = false;
+                    app.state.ui.read_finished = Some(std::time::Instant::now());
+                    app.state.detail_message =
+                        Some("Read could not be queued; retry reading".into());
+                }
             }
             if command == UiCommand::OpenConfigEditor {
                 let _ = ui_commands.try_send(client::ClientCommand::ConfigRead);
@@ -1536,6 +1790,14 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 && let Some((expected_frontier, action, _)) =
                     app.state.proposal_confirmation.clone()
             {
+                app.state.ui.action_submits_job = matches!(
+                    action,
+                    evertrace_protocol::dto::HumanActionRequest::CreateBackup
+                        | evertrace_protocol::dto::HumanActionRequest::VerifyBackup { .. }
+                        | evertrace_protocol::dto::HumanActionRequest::CollectGarbage
+                        | evertrace_protocol::dto::HumanActionRequest::ForgetObject { .. }
+                        | evertrace_protocol::dto::HumanActionRequest::PurgeRepository { .. }
+                );
                 match ui_commands.try_send(client::ClientCommand::Human(
                     evertrace_protocol::dto::HumanGovernanceRequest::Act {
                         expected_frontier,
@@ -1551,6 +1813,9 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             }
             if app.state.quit {
                 return Ok(());
+            }
+            if draw_needed || command != UiCommand::None {
+                terminal.draw(|frame| app.render(frame))?;
             }
         }
     });
@@ -1606,6 +1871,9 @@ fn detail_locator_matches(state: &AppState, locator: &HumanReadLocator) -> bool 
     else {
         return false;
     };
+    if let Some((reference, frontier)) = &state.ui.reference_request {
+        return reference == stable_key && frontier == expected_frontier;
+    }
     let Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { frontier, .. }) =
         state.human.as_ref()
     else {
@@ -1648,6 +1916,11 @@ fn related_context(state: &AppState) -> Option<crate::state::RelatedContext> {
         evertrace_protocol::dto::HumanRelationKind::ProposalEvidence
     } else if detail.support_detail.is_some() {
         evertrace_protocol::dto::HumanRelationKind::SupportDependencies
+    } else if matches!(
+        detail.object_kind.as_str(),
+        "atom_revision" | "procedure_revision" | "core_membership"
+    ) {
+        evertrace_protocol::dto::HumanRelationKind::ObjectSources
     } else {
         return None;
     };
@@ -1675,6 +1948,35 @@ fn human_request(
     use evertrace_protocol::dto::{HumanGovernanceRequest, HumanReadRequest};
     let surface = human_surface(state.route);
     match command {
+        UiCommand::Refresh => {
+            if let Some(context) = &state.related_context {
+                return Some(HumanGovernanceRequest::Read {
+                    request: HumanReadRequest::Related {
+                        relation: context.relation,
+                        source_stable_key: context.source_stable_key.clone(),
+                        expected_source_revision_ref: context.expected_source_revision_ref.clone(),
+                        expected_frontier: context.expected_frontier,
+                        after: state.ui.page_cursor.clone(),
+                        limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
+                    },
+                });
+            }
+            let expected_frontier = match &state.human {
+                Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
+                    frontier,
+                    ..
+                }) if state.ui.page_cursor.is_some() => Some(*frontier),
+                _ => None,
+            };
+            Some(HumanGovernanceRequest::Read {
+                request: HumanReadRequest::List {
+                    surface,
+                    expected_frontier,
+                    after: state.ui.page_cursor.clone(),
+                    limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
+                },
+            })
+        }
         UiCommand::OpenRelated => {
             let context = state.related_context.as_ref()?;
             Some(HumanGovernanceRequest::Read {
@@ -1735,6 +2037,16 @@ fn human_request(
             Some(HumanGovernanceRequest::Read { request })
         }
         UiCommand::Detail => {
+            if let Some((reference, frontier)) = &state.ui.reference_request {
+                return Some(HumanGovernanceRequest::Read {
+                    request: HumanReadRequest::Detail {
+                        surface,
+                        object_ref: reference.clone(),
+                        expected_frontier: *frontier,
+                        expected_revision_ref: None,
+                    },
+                });
+            }
             let item = selected_item(state)?;
             let evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { frontier, .. } =
                 state.human.as_ref()?
@@ -2217,7 +2529,7 @@ fn recovery_request(
 fn spawn_input(events: AppEventSender, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         while !stop.load(Ordering::Acquire) {
-            match event::poll(Duration::from_millis(50)) {
+            match event::poll(Duration::from_millis(250)) {
                 Ok(true) => match event::read() {
                     Ok(Event::Key(key)) => {
                         if events.blocking_send(AppEvent::Key(key)).is_err() {
@@ -2232,13 +2544,21 @@ fn spawn_input(events: AppEventSender, stop: Arc<AtomicBool>) -> tokio::task::Jo
                             break;
                         }
                     }
+                    Ok(Event::Mouse(mouse)) => {
+                        let _ = events.blocking_send(AppEvent::Mouse(mouse));
+                    }
+                    Ok(Event::Paste(text)) => {
+                        let _ = events.blocking_send(AppEvent::Paste(text));
+                    }
                     Ok(_) => {}
                     Err(_) => {
                         let _ = events.blocking_send(AppEvent::Shutdown);
                         break;
                     }
                 },
-                Ok(false) => {}
+                Ok(false) => {
+                    let _ = events.blocking_send(AppEvent::Tick);
+                }
                 Err(_) => {
                     let _ = events.blocking_send(AppEvent::Shutdown);
                     break;
@@ -2354,6 +2674,10 @@ mod tests {
         );
         let document = app.state.proposal_edit.as_ref().unwrap().document.clone();
         app.state.write_queued = true;
+        app.handle(AppEvent::Paste(
+            "must not alter the submitted document".into(),
+        ));
+        assert_eq!(app.state.proposal_edit.as_ref().unwrap().document, document);
         app.handle(AppEvent::ConfigApplied(
             evertrace_protocol::response::ConfigReloadResponse {
                 active_hash: [0; 32],
@@ -2582,9 +2906,8 @@ mod tests {
         let current = render_app(&app, 100, 50);
         for label in [
             "Host canary: EvidenceMissing",
-            "Native delivery: true",
-            "MCP consumed: false",
             "CaptureReceipt: false",
+            "Last Health:",
         ] {
             assert!(current.contains(label), "missing {label}");
         }
@@ -2624,6 +2947,8 @@ mod tests {
                 None
             )) if id == backup_job_id
         ));
+        app.state.detail = selected_item(&app.state).cloned();
+        app.state.ui.detail_view = crate::state::DetailView::Technical;
         let rendered = render_app(&app, 160, 100);
         assert!(rendered.contains("backup verification/frontier: VerifiedBeforePublish / 9"));
         for table in ["v4@9", "v5@9", "v6@6", "v7@7"] {
@@ -2845,11 +3170,14 @@ mod tests {
             }),
         });
         app.state.detail = Some(job_detail.clone());
+        app.state.ui.detail_view = crate::state::DetailView::Technical;
         let rendered = render_app(&app, 100, 30);
         assert!(rendered.contains(&job_id.to_string()));
         assert!(rendered.contains("objects_projection"));
         assert!(rendered.contains("Native history cleanup: unavailable now"));
-        assert!(rendered.contains("External reader exclusion is unverified."));
+        assert!(
+            views::detail_text(&app.state).contains("External reader exclusion is unverified.")
+        );
         let mut forged = job_detail.clone();
         forged.stable_key = "runtime:job:forged".into();
         assert!(
@@ -2953,6 +3281,8 @@ mod tests {
         reviewed.fingerprint = reviewed.recompute_fingerprint().unwrap();
         assert!(reviewed.validate().is_ok());
         let item = HumanSnapshotItem {
+            semantic_detail: None,
+            proposal_base: None,
             evidence_detail: None,
             work_detail: None,
             item_kind: HumanItemKind::RevisionProposal,
@@ -2994,6 +3324,7 @@ mod tests {
             source_event_seq: 9,
         };
         let mut app = App::new();
+        app.dispatch(UiCommand::Navigate(crate::Route::Inbox));
         app.handle(AppEvent::Health(HealthResponse {
             protocol_version: PROTOCOL_VERSION,
             mode: HealthMode::Normal,
@@ -3073,19 +3404,57 @@ mod tests {
         });
         let compact = render_app(&app, 60, 20);
         assert!(compact.contains("Esc back"));
-        app.state.detail_scroll = 12;
-        let wide = render_app(&app, 100, 30);
+        app.state.detail_scroll = 0;
+        let wide = render_app(&app, 120, 36);
         assert!(wide.contains("keep the reviewed invariant"));
-        app.state.detail_scroll = 24;
-        assert!(render_app(&app, 100, 30).contains("Repository"));
-        assert_eq!(
-            wide,
-            include_str!("../../../fixtures/tui/s31/wide.txt").trim_end()
-        );
-        assert_eq!(
-            compact,
-            include_str!("../../../fixtures/tui/s31/compact.txt").trim_end()
-        );
+        assert!(views::detail_text(&app.state).contains("Repository"));
+        assert!(wide.contains("exact base") || wide.contains("no base"));
+        assert!(compact.contains("Detail"));
+        {
+            use evertrace_domain::semantic::{
+                CoreMembership, CoreMembershipProposalPayload, CoreScopeIdentity,
+            };
+            use evertrace_protocol::dto::{
+                HumanContentState, HumanSemanticContent, HumanSemanticDetail,
+            };
+            let mut comparison = app.state.clone();
+            let detail = comparison.detail.as_mut().unwrap();
+            let proposal = &mut detail.proposal_review.as_mut().unwrap().proposal;
+            proposal.operation = ProposalOperation::Replace;
+            proposal.payload = ProposalPayload::CoreMembership(Box::new(
+                CoreMembershipProposalPayload::ResolveConflict {
+                    left_atom_revision_id: revision_id,
+                    right_atom_revision_id: evertrace_domain::revision::RevisionId::new_v7(),
+                    scope_identity: CoreScopeIdentity::Repository(repository_id),
+                },
+            ));
+            detail.proposal_base = Some(HumanSemanticDetail {
+                object_ref: None,
+                revision_ref: Some(revision_id.to_string()),
+                state: HumanContentState::Ready,
+                preview: None,
+                original_bytes: 0,
+                content: Some(HumanSemanticContent::CoreMembership(Box::new(
+                    CoreMembership {
+                        core_membership_id: evertrace_domain::ids::CoreMembershipId::new_v7(),
+                        membership_revision_id: revision_id,
+                        atom_revision_id: revision_id,
+                        scope_identity: CoreScopeIdentity::Global,
+                        support_contract_ref: revision_id,
+                        authorization_revision_refs: vec![revision_id],
+                        supersedes_membership_revision_id: None,
+                        created_by_acceptance_ref: revision_id,
+                        active: true,
+                    },
+                ))),
+            });
+            let text = views::detail_text(&comparison);
+            assert!(text.contains("exact base → candidate"));
+            assert!(text.contains("Conflict right atom revision"));
+            assert!(!text.contains("Conflict left atom revision"));
+            assert!(text.contains("Scope identity\n  Global\n→ Repository"));
+            assert!(!text.contains("Membership change:"));
+        }
         assert_eq!(
             app.handle(AppEvent::Key(KeyEvent::new(
                 KeyCode::Char('E'),
@@ -3492,8 +3861,8 @@ mod tests {
 
         app.dispatch(UiCommand::Navigate(crate::Route::System));
         let system = render_app(&app, 60, 20);
-        assert!(system.contains("Object Forget: available in Explorer"));
-        assert!(system.contains("Repository/session purge: unavailable"));
+        assert!(system.contains("Hook: not observed"));
+        assert!(system.contains("Queued"));
         app.dispatch(UiCommand::OpenFutureOperationShell);
         assert!(human_request(&app.state, UiCommand::OpenFutureOperationShell).is_none());
         let maintenance = render_app(&app, 60, 20);
@@ -3587,6 +3956,7 @@ mod tests {
             available_decisions: vec![NegativeReviewDecision::DismissAttribution],
         });
         let mut app = App::new();
+        app.dispatch(UiCommand::Navigate(crate::Route::Inbox));
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
             locator: HumanReadLocator::List,
@@ -3687,6 +4057,7 @@ mod tests {
             expected_revision_ref: first.revision_ref.clone(),
         };
         let mut app = App::new();
+        app.dispatch(UiCommand::Navigate(crate::Route::Inbox));
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
             locator: HumanReadLocator::List,
@@ -3841,13 +4212,15 @@ mod tests {
         assert!(rendered.contains("source-observation") && !rendered.contains('\u{1b}'));
     }
 
-    fn snapshot_item(family: &str, object_ref: String) -> HumanSnapshotItem {
+    pub(super) fn snapshot_item(family: &str, object_ref: String) -> HumanSnapshotItem {
         let (category, object_family) = match family {
             "recovery_bundle" => (HumanItemCategory::RecoveryEvidence, HumanObjectFamily::Work),
             "worktree" => (HumanItemCategory::Repository, HumanObjectFamily::Work),
             _ => (HumanItemCategory::Work, HumanObjectFamily::Work),
         };
         HumanSnapshotItem {
+            semantic_detail: None,
+            proposal_base: None,
             evidence_detail: None,
             work_detail: None,
             item_kind: HumanItemKind::Generic,

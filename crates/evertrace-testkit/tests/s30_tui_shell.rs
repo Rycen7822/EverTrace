@@ -1,9 +1,9 @@
 use evertrace_tui::{App, AppEvent, AppEventSender, ConnectionState, Route, UiCommand};
 
 #[test]
-fn three_pane_and_compact_shell_match_golden() {
-    let wide = evertrace_tui::headless_render(100, 30).unwrap();
-    let compact = evertrace_tui::headless_render(60, 20).unwrap();
+fn responsive_shell_matches_golden() {
+    let wide = evertrace_tui::headless_render(120, 36).unwrap();
+    let compact = evertrace_tui::headless_render(80, 24).unwrap();
     assert_eq!(
         wide,
         include_str!("../../../fixtures/tui/s30/wide.txt").trim_end()
@@ -30,7 +30,7 @@ async fn bounded_bus_processes_every_event_and_render_remains_responsive() {
         for _ in 0..1_000 {
             app.handle(receiver.recv().await.unwrap());
             let frame = evertrace_tui::headless_render(60, 20).unwrap();
-            assert!(frame.contains("No inbox items"));
+            assert!(frame.contains("Loading this page"));
         }
         app.handle(AppEvent::Disconnected);
         app.dispatch(UiCommand::Navigate(Route::Explorer));

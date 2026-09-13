@@ -94,6 +94,8 @@ pub enum HumanSurface {
 pub enum HumanRelationKind {
     ProposalEvidence,
     SupportDependencies,
+    ObjectSources,
+    ObjectRevisions,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -429,6 +431,10 @@ pub struct HumanRepositoryPurgePreview {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanSnapshotItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_detail: Option<HumanSemanticDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_base: Option<HumanSemanticDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_detail: Option<HumanEvidenceDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1152,9 +1158,129 @@ impl HumanGovernanceResponse {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum HumanSemanticContent {
+    Atom(Box<evertrace_domain::semantic::Atom>),
+    Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
+    CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanContentState {
+    Ready,
+    TooLarge,
+    AccessDenied,
+    Missing,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanSemanticDetail {
+    pub object_ref: Option<String>,
+    pub revision_ref: Option<String>,
+    pub state: HumanContentState,
+    pub preview: Option<String>,
+    pub original_bytes: u64,
+    pub content: Option<HumanSemanticContent>,
+}
+
+impl HumanSemanticDetail {
+    fn validate(&self) -> bool {
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|text| text.chars().count() > 160)
+            || self
+                .object_ref
+                .iter()
+                .chain(self.revision_ref.iter())
+                .any(|reference| reference.is_empty() || reference.len() > 4096)
+        {
+            return false;
+        }
+        let Some(content) = &self.content else {
+            return self.state != HumanContentState::Ready
+                && if self.state == HumanContentState::TooLarge {
+                    self.original_bytes > 32 * 1024
+                } else {
+                    self.preview.is_none() && self.original_bytes == 0
+                };
+        };
+        if self.state != HumanContentState::Ready {
+            return false;
+        }
+        let valid_identity = match content {
+            HumanSemanticContent::Atom(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref() == Some(value.atom_id.to_string().as_str())
+                    && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
+            }
+            HumanSemanticContent::Procedure(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref() == Some(value.procedure_id.to_string().as_str())
+                    && self.revision_ref.as_deref() == Some(value.revision_id.to_string().as_str())
+            }
+            HumanSemanticContent::CoreMembership(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref()
+                        == Some(value.core_membership_id.to_string().as_str())
+                    && self.revision_ref.as_deref()
+                        == Some(value.membership_revision_id.to_string().as_str())
+            }
+        };
+        valid_identity
+            && serde_json::to_vec(content).is_ok_and(|bytes| {
+                bytes.len() <= 32 * 1024 && bytes.len() as u64 == self.original_bytes
+            })
+    }
+}
+
 impl HumanSnapshotItem {
     fn validate(&self) -> bool {
-        ((self.item_kind == HumanItemKind::RevisionProposal) == self.proposal.is_some())
+        self.semantic_detail.as_ref().is_none_or(|detail| {
+            detail.validate()
+                && detail.object_ref == self.object_ref
+                && detail.revision_ref == self.revision_ref
+        }) && self.proposal_base.as_ref().is_none_or(|detail| {
+            detail.validate()
+                && self.proposal.as_ref().is_some_and(|proposal| {
+                    proposal.base_revision_id.is_some_and(|revision| {
+                        detail.revision_ref.as_deref() == Some(revision.to_string().as_str())
+                    }) && detail
+                        .object_ref
+                        .as_ref()
+                        .is_none_or(|object| match proposal.target_id {
+                            Some(ProposalTargetId::Atom(id)) => {
+                                object == &id.to_string()
+                                    && detail.content.as_ref().is_none_or(|value| {
+                                        matches!(value, HumanSemanticContent::Atom(_))
+                                    })
+                            }
+                            Some(ProposalTargetId::Procedure(id)) => {
+                                object == &id.to_string()
+                                    && detail.content.as_ref().is_none_or(|value| {
+                                        matches!(value, HumanSemanticContent::Procedure(_))
+                                    })
+                            }
+                            Some(ProposalTargetId::CoreMembership(id)) => {
+                                object == &id.to_string()
+                                    && detail.content.as_ref().is_none_or(|value| {
+                                        matches!(value, HumanSemanticContent::CoreMembership(_))
+                                    })
+                            }
+                            None => false,
+                        })
+                })
+        }) && ((self.item_kind == HumanItemKind::RevisionProposal) == self.proposal.is_some())
             && self.proposal_review.as_ref().is_none_or(|review| {
                 review.capability_coverage.as_ref().is_none_or(|coverage| {
                     coverage.validate()

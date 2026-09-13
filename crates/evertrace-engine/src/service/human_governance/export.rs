@@ -42,7 +42,7 @@ pub struct HumanExportResult {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Failure {
+pub(super) enum Failure {
     Conflict,
     Denied,
     Limit,
@@ -193,6 +193,51 @@ impl HumanGovernanceService {
         }
         check_deadline(deadline)
     }
+
+    // A Human detail may select an immutable historical row. Reuse the export
+    // dependency and access contract, without export's current-only selection
+    // rule or any CAS/output operation.
+    pub(super) async fn readable_row(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        row: &ObjectRow,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
+        let mut index = BTreeMap::<&str, Vec<&ObjectRow>>::new();
+        for candidate in snapshot.data_rows() {
+            check_deadline(deadline)?;
+            for key in [
+                Some(candidate.row_id.as_str()),
+                candidate.object_id.as_deref(),
+                candidate.current_revision_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            {
+                index.entry(key).or_default().push(candidate);
+            }
+        }
+        let mut charged = BTreeSet::new();
+        let mut remaining = MAX_METADATA_BYTES;
+        charge_metadata(row, &mut charged, &mut remaining, deadline)?;
+        let dependencies = collect_dependencies(
+            &index,
+            dependencies_for(row, &decode(row)?),
+            &mut charged,
+            &mut remaining,
+            deadline,
+        )?;
+        self.export_access(
+            snapshot,
+            &Selection {
+                rows: vec![row.clone()],
+                dependencies,
+            },
+            deadline,
+        )
+        .await
+    }
 }
 
 fn check_deadline(deadline: Instant) -> ExportResult<()> {
@@ -272,7 +317,6 @@ fn select(
         }
     }
     let mut rows = BTreeMap::new();
-    let mut dependencies = BTreeMap::new();
     let mut pending = BTreeSet::new();
     let mut remaining = MAX_METADATA_BYTES;
     let mut charged = BTreeSet::new();
@@ -375,6 +419,22 @@ fn select(
         pending.extend(dependencies_for(row, &payload));
         rows.insert(row.row_id.clone(), row.clone());
     }
+    let dependencies =
+        collect_dependencies(&index, pending, &mut charged, &mut remaining, deadline)?;
+    Ok(Selection {
+        rows: rows.into_values().collect(),
+        dependencies,
+    })
+}
+
+fn collect_dependencies(
+    index: &BTreeMap<&str, Vec<&ObjectRow>>,
+    mut pending: BTreeSet<String>,
+    charged: &mut BTreeSet<String>,
+    remaining: &mut u64,
+    deadline: Instant,
+) -> ExportResult<BTreeMap<String, Vec<ObjectRow>>> {
+    let mut dependencies = BTreeMap::new();
     // The bounded dependency closure is checked, never exported implicitly.
     while let Some(reference) = pending.pop_first() {
         check_deadline(deadline)?;
@@ -386,15 +446,12 @@ fn select(
         }
         let referenced = index.get(reference.as_str()).cloned().unwrap_or_default();
         for row in &referenced {
-            charge_metadata(row, &mut charged, &mut remaining, deadline)?;
+            charge_metadata(row, charged, remaining, deadline)?;
             pending.extend(dependencies_for(row, &decode(row)?));
         }
         dependencies.insert(reference, referenced.into_iter().cloned().collect());
     }
-    Ok(Selection {
-        rows: rows.into_values().collect(),
-        dependencies,
-    })
+    Ok(dependencies)
 }
 
 fn charge_metadata(
@@ -485,7 +542,7 @@ fn selected_current_revision(
     }
 }
 
-fn dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
+pub(super) fn dependencies_for(row: &ObjectRow, payload: &JournalPayload) -> BTreeSet<String> {
     let mut refs = [
         row.task_id.clone(),
         row.worktree_id.clone(),

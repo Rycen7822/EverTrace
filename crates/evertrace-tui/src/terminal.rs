@@ -21,7 +21,12 @@ impl TerminalOps for CrosstermOps {
         enable_raw_mode()
     }
     fn enter_alternate(&mut self) -> io::Result<()> {
-        execute!(stdout(), EnterAlternateScreen)
+        execute!(
+            stdout(),
+            EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
+        )
     }
     fn hide_cursor(&mut self) -> io::Result<()> {
         execute!(stdout(), Hide)
@@ -30,7 +35,12 @@ impl TerminalOps for CrosstermOps {
         execute!(stdout(), Show)
     }
     fn leave_alternate(&mut self) -> io::Result<()> {
-        execute!(stdout(), LeaveAlternateScreen)
+        execute!(
+            stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+            LeaveAlternateScreen
+        )
     }
     fn disable_raw(&mut self) -> io::Result<()> {
         disable_raw_mode()

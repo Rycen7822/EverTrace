@@ -369,11 +369,11 @@ where
     loop {
         let message = tokio::select! {
             result = async {
-                // Managed MCP is a long-lived connection, including between
-                // tool calls. Idle transport is not a disconnected Host. Once
+                // MCP and interactive CLI/TUI clients keep long-lived connections.
+                // Idle transport is not a disconnected client. Once
                 // a frame starts, the existing prefix/payload limits still
                 // apply; this grants no binding or repository authority.
-                if connection_context.client_kind == dto::ClientKind::Mcp {
+                if matches!(connection_context.client_kind, dto::ClientKind::Mcp | dto::ClientKind::Cli) {
                     read_frame_after_idle::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout).await
                 } else {
                     read_frame::<ClientEnvelope>(&mut stream, negotiated_max as usize, options.frame_timeout).await

@@ -3,12 +3,15 @@ use crossterm::event::{KeyCode, KeyEvent};
 pub fn command(k: KeyEvent) -> UiCommand {
     match k.code {
         KeyCode::Char('q') => UiCommand::Quit,
+        KeyCode::Char(':') => UiCommand::Commands,
+        KeyCode::Char('?') => UiCommand::Help,
+        KeyCode::Char('/') => UiCommand::Filter,
         KeyCode::Char('1') => UiCommand::Navigate(Route::Inbox),
         KeyCode::Char('2') => UiCommand::Navigate(Route::Explorer),
         KeyCode::Char('3') => UiCommand::Navigate(Route::System),
         KeyCode::Char('r') => UiCommand::Refresh,
-        KeyCode::Char('j') => UiCommand::SelectNext,
-        KeyCode::Char('k') => UiCommand::SelectPrevious,
+        KeyCode::Char('j') | KeyCode::Down => UiCommand::SelectNext,
+        KeyCode::Char('k') | KeyCode::Up => UiCommand::SelectPrevious,
         KeyCode::Char('n') => UiCommand::NextPage,
         KeyCode::Char('b') => UiCommand::FirstPage,
         KeyCode::Char('o') => UiCommand::OpenRelated,

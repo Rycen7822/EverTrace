@@ -1,7 +1,9 @@
+mod detail;
 mod explorer;
 mod inbox;
 mod system;
 use crate::{AppState, Route};
+pub(crate) use detail::{detail_text, wrap_content};
 use ratatui::{Frame, layout::Rect};
 pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
     match state.route {
@@ -11,89 +13,326 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
     }
 }
 
-pub(super) fn snapshot_rows(state: &AppState, empty: &str) -> String {
-    use evertrace_protocol::dto::HumanGovernanceResponse;
-    match state.human.as_ref() {
-        Some(HumanGovernanceResponse::Export { result }) => format!(
-            "export: {:?} {} objects / {} bytes {}",
-            result.status,
-            result.object_count,
-            result.total_bytes,
-            result.path.as_deref().unwrap_or("")
-        ),
-        Some(HumanGovernanceResponse::Snapshot {
-            frontier,
-            status,
-            degraded_reasons,
-            items,
-            next_cursor,
-            ..
-        }) => {
-            let mut lines = vec![format!(
-                "frontier:{frontier} status:{status:?}{}{}",
-                if next_cursor.is_some() { " more" } else { "" },
-                if degraded_reasons.is_empty() {
-                    String::new()
-                } else {
-                    format!(" reasons:{degraded_reasons:?}")
+pub(crate) fn visible_indices(state: &AppState) -> Vec<usize> {
+    let Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { items, .. }) =
+        &state.human
+    else {
+        return vec![];
+    };
+    let query = state.ui.filter.to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            let kind = if state.route == Route::System {
+                match state.ui.system_view {
+                    crate::state::SystemView::Jobs | crate::state::SystemView::Overview => {
+                        matches!(
+                            item.system_detail,
+                            Some(evertrace_protocol::dto::HumanSystemDetail::Job { .. })
+                        )
+                    }
+                    _ => true,
                 }
-            )];
-            lines.extend(items.iter().enumerate().map(|(index, item)| {
-                format!(
-                    "{} {}  {}  {}",
-                    if index == state.selection { ">" } else { " " },
-                    category_label(item.category),
-                    item.object_ref.as_deref().unwrap_or("-"),
-                    item.lifecycle
-                        .as_deref()
-                        .or(item.publication_state.as_deref())
-                        .or(item.support_state.as_deref())
-                        .unwrap_or("current")
-                )
-            }));
-            if let Some(result) = &state.last_action {
-                lines.push(format!(
-                    "action: {:?} {}",
-                    result.status,
-                    result.reason.as_deref().unwrap_or("")
-                ));
-            }
-            lines.join("\n")
+            } else {
+                true
+            };
+            kind && state
+                .ui
+                .type_filter
+                .as_ref()
+                .is_none_or(|v| v == &item.object_kind)
+                && state
+                    .ui
+                    .scope_filter
+                    .as_ref()
+                    .is_none_or(|v| Some(v) == item.scope_ref.as_ref())
+                && state
+                    .ui
+                    .state_filter
+                    .as_ref()
+                    .is_none_or(|v| v == &item_state(item))
+                && row_label(item).to_lowercase().contains(&query)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+pub(crate) fn item_state(item: &evertrace_protocol::dto::HumanSnapshotItem) -> String {
+    if let Some(evertrace_protocol::dto::HumanSystemDetail::Job { detail }) = &item.system_detail {
+        format!("{:?}", detail.state)
+    } else {
+        item.lifecycle
+            .as_deref()
+            .or(item.publication_state.as_deref())
+            .or(item.support_state.as_deref())
+            .unwrap_or("not supplied")
+            .into()
+    }
+}
+pub(crate) fn row_label(item: &evertrace_protocol::dto::HumanSnapshotItem) -> String {
+    if let Some(evertrace_protocol::dto::HumanSystemDetail::Job { detail: job }) =
+        &item.system_detail
+    {
+        return format!(
+            "{} | {:?} | {} | {}",
+            job.job_kind,
+            job.state,
+            short(&job.target_revision),
+            job.terminal_reason
+                .map_or_else(|| "reason not supplied".into(), |r| format!("{r:?}"))
+        );
+    }
+    format!(
+        "{} · {} | {} | {}",
+        item.object_kind,
+        short(item.object_ref.as_deref().unwrap_or(&item.stable_key)),
+        item.lifecycle
+            .as_deref()
+            .or(item.publication_state.as_deref())
+            .or(item.support_state.as_deref())
+            .unwrap_or("status not supplied"),
+        item.scope_ref.as_deref().unwrap_or("scope not supplied")
+    )
+}
+fn short(value: &str) -> String {
+    value.chars().take(14).collect()
+}
+pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'static str) {
+    use evertrace_protocol::dto::HumanGovernanceResponse;
+    if let Some(HumanGovernanceResponse::Snapshot { items, .. }) = &state.human {
+        let indices = visible_indices(state);
+        if !indices.is_empty() {
+            use ratatui::{
+                layout::Constraint,
+                style::Style,
+                widgets::{Block, Borders, Row, Table},
+            };
+            let rows = indices.into_iter().skip(state.ui.list_offset).map(|i| {
+                let item = &items[i];
+                let fields = row_label(item)
+                    .split(" | ")
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let mut columns = vec![
+                    format!(
+                        "{} {}",
+                        if i == state.selection { ">" } else { " " },
+                        fields.first().map_or("", String::as_str)
+                    ),
+                    fields.get(1).cloned().unwrap_or_default(),
+                ];
+                if a.width >= 85 {
+                    columns.push(
+                        fields
+                            .iter()
+                            .skip(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    );
+                }
+                Row::new(columns).style(Style::default().fg(if i == state.selection {
+                    crate::theme::EVER_OS.cyan
+                } else {
+                    crate::theme::EVER_OS.ink
+                }))
+            });
+            let widths = if a.width >= 85 {
+                vec![
+                    Constraint::Percentage(40),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(40),
+                ]
+            } else {
+                vec![Constraint::Percentage(65), Constraint::Percentage(35)]
+            };
+            f.render_widget(
+                Table::new(rows, widths).block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(
+                            if state.ui.focus == crate::state::Focus::List {
+                                crate::theme::EVER_OS.cyan
+                            } else {
+                                crate::theme::EVER_OS.border
+                            },
+                        )),
+                ),
+                a,
+            );
+            return;
         }
-        Some(HumanGovernanceResponse::Conflict {
-            current_frontier,
-            current_revision_ref,
+    }
+    let body = match &state.human {
+        Some(HumanGovernanceResponse::Snapshot {
+            items, next_cursor, ..
         }) => {
-            format!(
-                "optimistic conflict; reload frontier {current_frontier}{}",
-                current_revision_ref
-                    .as_deref()
-                    .map_or(String::new(), |revision| format!(" revision {revision}"))
-            )
+            let indices = visible_indices(state);
+            let loaded = items
+                .iter()
+                .filter(|item| {
+                    state.route != Route::System
+                        || !matches!(
+                            state.ui.system_view,
+                            crate::state::SystemView::Overview | crate::state::SystemView::Jobs
+                        )
+                        || matches!(
+                            item.system_detail,
+                            Some(evertrace_protocol::dto::HumanSystemDetail::Job { .. })
+                        )
+                })
+                .count();
+            let filtered = !state.ui.filter.is_empty()
+                || state.ui.type_filter.is_some()
+                || state.ui.scope_filter.is_some()
+                || state.ui.state_filter.is_some();
+            if loaded == 0 && !filtered {
+                match state.route {
+                    Route::Inbox => "No pending items in the visible scope",
+                    Route::Explorer => {
+                        "No objects in the visible scope; check capture/import in System"
+                    }
+                    Route::System => "No tasks on this page",
+                }
+                .into()
+            } else if indices.is_empty() {
+                format!(
+                    "No matches on this page ({} loaded){}; clear filter or change page",
+                    loaded,
+                    if next_cursor.is_some() {
+                        "; more pages available"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                indices
+                    .into_iter()
+                    .skip(state.ui.list_offset)
+                    .map(|i| {
+                        format!(
+                            "{} {}",
+                            if i == state.selection { ">" } else { " " },
+                            row_label(&items[i])
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
         }
-        Some(HumanGovernanceResponse::Action { result }) => format!(
-            "action: {:?} {}",
-            result.status,
-            result.reason.as_deref().unwrap_or("")
-        ),
-        None => match state.shell.connection {
-            crate::ConnectionState::Connecting => empty.into(),
-            crate::ConnectionState::Disconnected => "Daemon disconnected".into(),
-            crate::ConnectionState::ServerStopping => "Daemon stopping; read unavailable".into(),
-            crate::ConnectionState::Connected => state.read_conflict.map_or_else(
-                || empty.into(),
-                |frontier| format!("optimistic conflict; reload frontier {frontier}"),
+        _ => match state.shell.connection {
+            crate::ConnectionState::Disconnected => "Daemon disconnected; reconnecting",
+            crate::ConnectionState::ServerStopping => "Daemon stopping; read unavailable",
+            _ => "Loading this page…",
+        }
+        .into(),
+    };
+    f.render_widget(crate::components::table(title, body), a);
+}
+
+fn semantic_lines(detail: &evertrace_protocol::dto::HumanSemanticDetail) -> Vec<String> {
+    use evertrace_protocol::dto::{HumanContentState, HumanSemanticContent};
+    let Some(content) = &detail.content else {
+        return vec![match detail.state {
+            HumanContentState::TooLarge => format!(
+                "Content exceeds the 32 KiB detail limit ({} bytes); body not loaded",
+                detail.original_bytes
             ),
-        },
+            HumanContentState::AccessDenied => {
+                "Content access denied; source or repository restriction".into()
+            }
+            HumanContentState::Missing => {
+                "Exact revision is missing; current revision was not substituted".into()
+            }
+            HumanContentState::Unsupported => {
+                "Readable content is not supported for this object".into()
+            }
+            HumanContentState::Unavailable => {
+                "Content read could not finish within the bounded access check".into()
+            }
+            HumanContentState::Ready => "Content missing from response".into(),
+        }];
+    };
+    match content {
+        HumanSemanticContent::Atom(atom) => vec![
+            safe_content(&atom.value.text),
+            format!(
+                "Subject: {}\nPredicate: {}",
+                safe_content(&atom.value.subject),
+                safe_content(&atom.value.predicate)
+            ),
+            format!(
+                "Object: {}",
+                atom.value
+                    .object
+                    .as_deref()
+                    .map(safe_content)
+                    .unwrap_or_else(|| "not supplied".into())
+            ),
+            format!(
+                "Created at: {}",
+                detail::timestamp(Some(atom.created_at_us))
+            ),
+            format!(
+                "Parent revision: {}",
+                atom.parent_revision_id
+                    .map_or_else(|| "none".into(), |id| id.to_string())
+            ),
+        ],
+        HumanSemanticContent::Procedure(procedure) => {
+            let draft = &procedure.draft;
+            let mut lines = vec![
+                safe_content(&draft.title),
+                safe_content(&draft.summary),
+                format!("When / stage: {}", safe_content(&draft.when.stage)),
+            ];
+            for (label, values) in [
+                ("Goals", &draft.when.goals),
+                ("Targets", &draft.when.targets),
+                ("Signals", &draft.when.signals),
+                ("Requires", &draft.when.requires),
+                ("Excludes", &draft.when.excludes),
+                ("Do", &draft.actions.stages),
+                ("Avoid", &draft.actions.avoid),
+                ("Done / success", &draft.done.success),
+                ("Done / abort", &draft.done.abort),
+                ("Done / verify", &draft.done.verify),
+                ("Pitfalls", &draft.pitfalls),
+            ] {
+                lines.push(format!("{label}:"));
+                lines.extend(
+                    values
+                        .iter()
+                        .map(|value| format!("  {}", safe_content(value))),
+                );
+            }
+            lines.push(format!(
+                "Created at: {}",
+                detail::timestamp(Some(procedure.created_at_us))
+            ));
+            lines.push(format!(
+                "Parent revision: {}",
+                procedure
+                    .parent_revision_id
+                    .map_or_else(|| "none".into(), |id| id.to_string())
+            ));
+            lines
+        }
+        HumanSemanticContent::CoreMembership(membership) => vec![
+            format!(
+                "Core membership references Atom revision {}",
+                membership.atom_revision_id
+            ),
+            format!("Active: {}", membership.active),
+        ],
     }
 }
 
-pub(super) fn page_body(state: &AppState, empty: &str) -> String {
-    if state.detail.is_some() || state.detail_message.is_some() {
-        inspector_text(state)
-    } else {
-        snapshot_rows(state, empty)
-    }
+fn safe_content(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect()
 }
 
 pub(crate) fn inspector_text(state: &AppState) -> String {
@@ -145,6 +384,27 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
         format!("audit row: {}", item.stable_key),
         daemon_status,
     ];
+    lines.extend(content_lines(item, state.competing_candidate_selection));
+    if state.detail.is_some() {
+        lines.push("Esc returns to list".into());
+    } else {
+        lines.push("Enter opens detail".into());
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn content_lines(
+    item: &evertrace_protocol::dto::HumanSnapshotItem,
+    competing_candidate_selection: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(detail) = &item.semantic_detail {
+        lines.extend(semantic_lines(detail));
+    }
+    if let Some(base) = &item.proposal_base {
+        lines.push("Exact proposal base".into());
+        lines.extend(semantic_lines(base));
+    }
     if let Some(detail) = &item.work_detail {
         lines.push(format!(
             "Work identity: {:?}; instruction authority: none",
@@ -319,7 +579,7 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
     if let Some(detail) = &item.competing_detail {
         let selected = detail
             .eligible_attempt_ids
-            .get(state.competing_candidate_selection)
+            .get(competing_candidate_selection)
             .map_or_else(|| "-".into(), ToString::to_string);
         lines.extend([
             format!("competing revision: {}", detail.expected_group_revision_id),
@@ -807,12 +1067,7 @@ pub(crate) fn inspector_text(state: &AppState) -> String {
             }
         }
     }
-    if state.detail.is_some() {
-        lines.push("Esc returns to list".into());
-    } else {
-        lines.push("Enter opens detail".into());
-    }
-    lines.join("\n")
+    lines
 }
 
 fn category_label(category: evertrace_protocol::dto::HumanItemCategory) -> &'static str {

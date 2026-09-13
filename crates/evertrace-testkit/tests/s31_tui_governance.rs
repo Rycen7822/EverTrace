@@ -717,6 +717,8 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         status: ProposalStatus::Pending,
     };
     let proposal_item = HumanSnapshotItem {
+        semantic_detail: None,
+        proposal_base: None,
         evidence_detail: None,
         work_detail: None,
         item_kind: HumanItemKind::RevisionProposal,
@@ -813,6 +815,22 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         items: vec![item],
         next_cursor: None,
     };
+    let mut unavailable_item = proposal_item.clone();
+    unavailable_item.semantic_detail = Some(evertrace_protocol::dto::HumanSemanticDetail {
+        object_ref: unavailable_item.object_ref.clone(),
+        revision_ref: unavailable_item.revision_ref.clone(),
+        state: evertrace_protocol::dto::HumanContentState::AccessDenied,
+        preview: None,
+        original_bytes: 0,
+        content: None,
+    });
+    assert!(support_response(unavailable_item.clone()).validate());
+    unavailable_item.semantic_detail.as_mut().unwrap().preview = Some("must not leak".into());
+    assert!(!support_response(unavailable_item.clone()).validate());
+    unavailable_item.semantic_detail.as_mut().unwrap().preview = None;
+    unavailable_item.semantic_detail.as_mut().unwrap().state =
+        evertrace_protocol::dto::HumanContentState::Ready;
+    assert!(!support_response(unavailable_item).validate());
     assert!(support_response(support_item.clone()).validate());
     let mut inconsistent = support_item.clone();
     inconsistent
@@ -956,6 +974,9 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     attempt_item.revision_ref = Some(RevisionId::new_v7().to_string());
     attempt_item.lifecycle = Some("interrupted".into());
     let mut app = App::new();
+    app.dispatch(evertrace_tui::UiCommand::Navigate(
+        evertrace_tui::Route::Inbox,
+    ));
     app.handle(AppEvent::HumanRead {
         surface: WireSurface::Inbox,
         locator: evertrace_tui::HumanReadLocator::List,
@@ -1986,6 +2007,45 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         .unwrap()
         .atom_revisions[&accepted_atom_revision]
         .clone();
+
+    let readable = service
+        .detail(
+            HumanSurface::Explorer,
+            &first_atom.atom_id.to_string(),
+            handle.project().await.unwrap().frontier,
+            Some(&first_atom.revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let semantic = readable.items[0].semantic_detail.as_ref().unwrap();
+    assert_eq!(semantic.state, evertrace_engine::HumanContentState::Ready);
+    assert!(
+        matches!(&semantic.content, Some(evertrace_engine::HumanSemanticContent::Atom(atom))
+        if **atom == first_atom)
+    );
+    assert!(
+        atom_detail.items[0].proposal_base.is_none(),
+        "Create has no base"
+    );
+
+    let source_page = service
+        .related(HumanRelatedRequest {
+            relation: evertrace_engine::HumanRelationKind::ObjectSources,
+            source_stable_key: &readable.items[0].stable_key,
+            expected_source_revision_ref: &first_atom.revision_id.to_string(),
+            expected_frontier: readable.frontier,
+            after: None,
+            limit: 1,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_page.items.len(), 1);
+    assert!(
+        source_page.items[0].semantic_detail.is_none(),
+        "Related list never loads semantic bodies"
+    );
 
     fn prove_support_replacement<'a>(
         handle: &'a evertrace_engine::WriterHandle,
@@ -3365,6 +3425,11 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         .as_ref()
         .is_some_and(|review| !review.plain_accept_eligible
             && review.merge_and_accept_eligible));
+    assert!(
+        matches!(&merge_detail.items[0].proposal_base.as_ref().unwrap().content,
+        Some(evertrace_engine::HumanSemanticContent::Atom(atom))
+        if Some(atom.revision_id) == merge_proposal.base_revision_id)
+    );
     let before_plain_merge = handle.project().await.unwrap().frontier;
     assert!(matches!(
         service
@@ -3430,6 +3495,35 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
     assert_eq!(merged_atom.validity_interval, first_atom.validity_interval);
     assert_eq!(merged_atom.supersedes_revision_refs, merged_revision_refs);
     assert_eq!(view.atoms[&second_atom.atom_id], second_atom);
+
+    let historical = service
+        .detail(
+            HumanSurface::Explorer,
+            &first_atom.atom_id.to_string(),
+            handle.project().await.unwrap().frontier,
+            Some(&first_atom.revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&historical.items[0].semantic_detail.as_ref().unwrap().content,
+        Some(evertrace_engine::HumanSemanticContent::Atom(atom)) if **atom == first_atom)
+    );
+    let revisions = service
+        .related(HumanRelatedRequest {
+            relation: evertrace_engine::HumanRelationKind::ObjectRevisions,
+            source_stable_key: &historical.items[0].stable_key,
+            expected_source_revision_ref: &first_atom.revision_id.to_string(),
+            expected_frontier: historical.frontier,
+            after: None,
+            limit: 64,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(revisions.items.len() >= 2);
+    assert!(revisions.items.iter().all(|item| item.object_ref.as_deref() == Some(first_atom.atom_id.to_string().as_str())));
 
     let mut invalid_draft = atom_draft(repository_id, &receipt, &observation);
     invalid_draft.value.text = "invalid merge".into();
@@ -3600,6 +3694,21 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         } => (procedure_id, procedure_revision_id),
         _ => panic!("procedure target expected"),
     };
+    let readable_procedure = service
+        .detail(
+            HumanSurface::Explorer,
+            &procedure_id.to_string(),
+            handle.project().await.unwrap().frontier,
+            Some(&procedure_revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&readable_procedure.items[0].semantic_detail.as_ref().unwrap().content,
+        Some(evertrace_engine::HumanSemanticContent::Procedure(value))
+        if value.revision_id == procedure_revision_id && value.draft == procedure)
+    );
 
     let exported = service
         .export(vec![evertrace_engine::HumanExportSelection {
@@ -4800,6 +4909,70 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         before_stale_reconcile.frontier
     );
     assert!(!stale_edit_path.exists());
+    // A global object's source repository must remain in the access closure.
+    let global = SemanticCurrentView::from_snapshot(&reopened_handle.project().await.unwrap())
+        .unwrap()
+        .atoms
+        .into_values()
+        .find(|atom| atom.scope == AtomScope::Global)
+        .unwrap();
+    let global_read = reopened_service
+        .detail(
+            HumanSurface::Explorer,
+            &global.atom_id.to_string(),
+            reopened_handle.project().await.unwrap().frontier,
+            Some(&global.revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        global_read.items[0].semantic_detail.as_ref().unwrap().state,
+        evertrace_engine::HumanContentState::Ready
+    );
+    // Trust revocation is durable; exercise it after the acceptance scenario.
+    std::fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"untrusted\"\n",
+            serde_json::to_string(&repository_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let denied = reopened_service
+        .detail(
+            HumanSurface::Explorer,
+            &first_atom.atom_id.to_string(),
+            reopened_handle.project().await.unwrap().frontier,
+            Some(&first_atom.revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let denied = denied.items[0].semantic_detail.as_ref().unwrap();
+    assert_eq!(
+        denied.state,
+        evertrace_engine::HumanContentState::AccessDenied
+    );
+    assert!(denied.content.is_none() && denied.preview.is_none());
+    let global_denied = reopened_service
+        .detail(
+            HumanSurface::Explorer,
+            &global.atom_id.to_string(),
+            reopened_handle.project().await.unwrap().frontier,
+            Some(&global.revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        global_denied.items[0]
+            .semantic_detail
+            .as_ref()
+            .unwrap()
+            .state,
+        evertrace_engine::HumanContentState::AccessDenied
+    );
     let snapshot = reopened_handle.project().await.unwrap();
     let target = evertrace_domain::purge::ObjectDeletionTarget::Procedure { procedure_id };
     let preview = evertrace_store::object_deletion_preview(&snapshot, target).unwrap();
