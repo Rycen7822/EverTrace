@@ -1377,6 +1377,7 @@ pub(crate) async fn read_verified_store_tables(
     store_dir: &Path,
 ) -> Result<(BackupTableStates, ProjectionSnapshot), BackupError> {
     let connection = lancedb::connect(store_dir.to_str().ok_or(BackupError::Corrupt)?)
+        .session(crate::connection::native_session())
         .execute()
         .await
         .map_err(|_| BackupError::Corrupt)?;

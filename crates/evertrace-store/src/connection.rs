@@ -1,4 +1,4 @@
-use std::{future::poll_fn, path::Path};
+use std::{future::poll_fn, path::Path, sync::Arc};
 
 use arrow_array::RecordBatch;
 use lancedb::{Connection, Table, query::ExecutableQuery};
@@ -7,6 +7,17 @@ use thiserror::Error;
 /// The state root owns locks, CAS and spool; only this child is a normal native store.
 pub fn native_root(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("store")
+}
+
+/// One shared budget for all tables opened through a native connection.
+/// Upstream's 6 GiB index / 1 GiB metadata defaults target much larger
+/// workloads. Eviction changes read cost, never journal or projection truth.
+pub(crate) fn native_session() -> Arc<lancedb::Session> {
+    Arc::new(lancedb::Session::new(
+        64 * 1024 * 1024,
+        256 * 1024 * 1024,
+        Arc::new(lancedb::ObjectStoreRegistry::default()),
+    ))
 }
 
 pub(crate) fn prepare_native_root(data_dir: &Path) -> Result<(), crate::StoreError> {
@@ -54,6 +65,7 @@ pub(crate) async fn connect_native(data_dir: &Path) -> Result<Connection, crate:
     evertrace_capture::ConfinedRoot::open_owned_private(&native)
         .map_err(|_| crate::StoreError::StoreCorrupt)?;
     lancedb::connect(native.to_str().ok_or(crate::StoreError::InvalidPath)?)
+        .session(native_session())
         .execute()
         .await
         .map_err(|_| crate::StoreError::LanceDb)
@@ -71,6 +83,7 @@ impl CompatibilityStore {
         }
         let uri = path.to_str().ok_or(StoreProfileError::InvalidPath)?;
         let connection = lancedb::connect(uri)
+            .session(native_session())
             .execute()
             .await
             .map_err(|_| StoreProfileError::LanceDb)?;

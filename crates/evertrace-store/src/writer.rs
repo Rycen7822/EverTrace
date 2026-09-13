@@ -345,6 +345,7 @@ impl JournalWriter {
             Ok(_) => {}
         }
         let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
+            .session(crate::connection::native_session())
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
@@ -379,6 +380,7 @@ impl JournalWriter {
     ) -> Result<Self, StoreError> {
         lock.validate_held()?;
         let connection = lancedb::connect(native_dir.to_str().ok_or(StoreError::InvalidPath)?)
+            .session(crate::connection::native_session())
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;

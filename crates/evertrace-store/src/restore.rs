@@ -622,6 +622,7 @@ fn validate_upgrade_container_entries(native: &Path, tables: &[&str]) -> Result<
 
 async fn catch_up_upgrade_source(native: &Path, l0002: bool) -> Result<(), RestoreError> {
     let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
+        .session(crate::connection::native_session())
         .execute()
         .await
         .map_err(|_| StoreError::LanceDb)?;
@@ -665,6 +666,7 @@ async fn catch_up_upgrade_source(native: &Path, l0002: bool) -> Result<(), Resto
 
 async fn rebuild_upgrade_native(native: &Path) -> Result<(), RestoreError> {
     let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
+        .session(crate::connection::native_session())
         .execute()
         .await
         .map_err(|_| StoreError::LanceDb)?;
@@ -722,6 +724,7 @@ pub async fn verify_package_native(native: &Path, cas: &Path) -> Result<(), Rest
         return Err(StoreError::StoreCorrupt.into());
     }
     let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
+        .session(crate::connection::native_session())
         .execute()
         .await
         .map_err(|_| StoreError::LanceDb)?;
