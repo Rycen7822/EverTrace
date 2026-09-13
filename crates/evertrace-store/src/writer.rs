@@ -223,6 +223,12 @@ impl JournalWriter {
         ProjectionWorker::new(self.journal.clone(), self.objects.clone())
     }
 
+    /// Select GC candidates from already validated journal admission state.
+    /// Actual GC claims and authority checks still use their normal write path.
+    pub fn queued_gc_jobs(&self) -> Vec<crate::DurableJob> {
+        self.admission_state.queued_gc_jobs()
+    }
+
     pub fn recall_current_contexts(
         &self,
         limit: usize,
@@ -645,10 +651,15 @@ impl JournalWriter {
         })
     }
 
-    pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
-        let snapshot = ProjectionWorker::new(self.journal.clone(), self.objects.clone())
+    /// Restore and validate current objects without driving unrelated indexes.
+    pub async fn project_objects(&self) -> Result<ProjectionSnapshot, StoreError> {
+        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
             .catch_up()
-            .await?;
+            .await
+    }
+
+    pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
+        let snapshot = self.project_objects().await?;
         L0002ProjectionWorker::new(
             self.journal.clone(),
             self.relations.clone(),
@@ -1153,6 +1164,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        // Human object reads still validate objects, without repairing indexes.
+        let objects = writer.project_objects().await.unwrap();
+        assert_eq!(objects.frontier, writer.frontier());
+        assert_eq!(writer.search.version().await.unwrap(), version);
+        writer.objects.delete("true").await.unwrap();
+        assert!(writer.project_objects().await.is_err());
     }
 
     fn capture_pair(

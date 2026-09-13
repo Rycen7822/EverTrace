@@ -1569,7 +1569,7 @@ async fn capture_frontier_is_targeted_and_terminal_preserves_unresolved_dirty() 
 }
 
 #[tokio::test]
-async fn capture_round_robin_retries_and_reaches_the_next_page() {
+async fn capture_scan_finishes_unadmittable_pages_and_reaches_later_targets() {
     let temp = TempDir::new().unwrap();
     DeviceKeyStore::new(temp.path().join("keys"))
         .load_or_create()
@@ -1577,7 +1577,7 @@ async fn capture_round_robin_retries_and_reaches_the_next_page() {
     let runtime = runtime(temp.path());
     let report = synthetic_report();
     let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
-    for index in 0..41_u64 {
+    for index in 0..81_u64 {
         let mut input = capture_input(&report);
         input.spool_record_id = Some(format!("s29-fair-capture-{index}"));
         input.source_instance_id = format!("s29-fair-source-{index}");
@@ -1599,7 +1599,7 @@ async fn capture_round_robin_retries_and_reaches_the_next_page() {
         "s29-fair-capture-ingest-v1",
     )
     .unwrap();
-    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 41);
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 81);
     let frontier = handle
         .project()
         .await
@@ -1611,8 +1611,8 @@ async fn capture_round_robin_retries_and_reaches_the_next_page() {
         .into_iter()
         .filter(|item| item.target_kind == DirtyTargetKind::PhysicalNormalization)
         .collect::<Vec<_>>();
-    assert_eq!(physical.len(), 41);
-    let target = physical[40].target_id.clone();
+    assert_eq!(physical.len(), 81);
+    let target = physical[80].target_id.clone();
     let mut filler = capture_input(&report);
     filler.spool_record_id = Some("s29-fair-pressure-filler".into());
     filler.source_instance_id = "s29-fair-pressure-source".into();
@@ -1633,7 +1633,17 @@ async fn capture_round_robin_retries_and_reaches_the_next_page() {
         Arc::clone(&current_report),
     );
     assert!(scheduler.run_once().await.unwrap().retryable);
+    assert!(scheduler.run_once().await.unwrap().retryable);
+    assert!(!scheduler.run_once().await.unwrap().retryable);
     let first_page = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    assert_eq!(
+        first_page
+            .dirty
+            .iter()
+            .filter(|dirty| dirty.target_kind == DirtyTargetKind::PhysicalNormalization)
+            .count(),
+        81
+    );
     assert!(
         first_page
             .jobs
@@ -1641,6 +1651,8 @@ async fn capture_round_robin_retries_and_reaches_the_next_page() {
             .all(|job| job.target_revision != target)
     );
     *current_report.write().await = Some(report);
+    scheduler.run_once().await.unwrap();
+    scheduler.run_once().await.unwrap();
     scheduler.run_once().await.unwrap();
     let after = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
     let target_jobs = after

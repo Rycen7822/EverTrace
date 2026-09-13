@@ -27,7 +27,14 @@ const MAX_PROPOSAL_EDIT_DOCUMENT: usize = evertrace_protocol::dto::MAX_FRAME_SIZ
 
 impl App {
     pub fn new() -> Self {
-        let mut state = AppState::default();
+        Self::with_language(crate::Language::environment())
+    }
+
+    pub fn with_language(language: crate::Language) -> Self {
+        let mut state = AppState {
+            language,
+            ..AppState::default()
+        };
         state.ui.read_generation = 1;
         Self {
             state,
@@ -69,8 +76,6 @@ impl App {
                 response,
             } => {
                 if generation != self.state.ui.read_generation {
-                    self.state.ui.reading = false;
-                    self.state.ui.read_finished = Some(std::time::Instant::now());
                     return UiCommand::None;
                 }
                 AppEvent::HumanRead {
@@ -185,8 +190,10 @@ impl App {
                 }
                 self.state.write_queued = false;
                 self.state.proposal_edit = None;
-                self.state.detail_message = Some(format!(
+                self.state.detail_message = Some(crate::locale::format!(
+                    self.state.language,
                     "configuration {:?}; pending={}",
+                    "配置结果 {:?}；存在待应用配置={}",
                     result.outcome,
                     result.pending_hash.is_some()
                 ));
@@ -196,8 +203,10 @@ impl App {
                 self.state.write_queued = false;
                 if let Some(edit) = self.state.proposal_edit.as_mut() {
                     edit.error = Some(
-                        "configuration rejected or changed externally; reread before resubmitting"
-                            .into(),
+                        self.state.language.text(
+                            "configuration rejected or changed externally; reread before resubmitting",
+                            "配置被拒绝或已被外部修改；请重新读取后再提交",
+                        ).into(),
                     );
                 }
                 UiCommand::None
@@ -207,20 +216,29 @@ impl App {
                 locator,
                 code,
             } => {
-                if surface == human_surface(self.state.route)
+                if (surface == human_surface(self.state.route)
+                    || (matches!(locator, HumanReadLocator::Related { .. })
+                        && related_locator_matches(&self.state, &locator)))
                     && (!matches!(locator, HumanReadLocator::Detail { .. })
                         || detail_locator_matches(&self.state, &locator))
                     && (!matches!(locator, HumanReadLocator::Related { .. })
                         || related_locator_matches(&self.state, &locator))
                 {
+                    if !matches!(code, crate::app_event::HumanReadFailure::Slow)
+                        && matches!(locator, HumanReadLocator::Detail { .. })
+                        && self.restore_failed_result()
+                    {
+                        return UiCommand::None;
+                    }
                     if !matches!(code, crate::app_event::HumanReadFailure::Slow) {
                         self.state.ui.reading = false;
                         self.state.ui.read_finished = Some(std::time::Instant::now());
                     }
                     self.state.detail_message = Some(match code {
-                        crate::app_event::HumanReadFailure::Rejected(code) => format!("Read failed: {code:?}; previous data retained"),
-                        crate::app_event::HumanReadFailure::Slow => "Read is taking longer than expected; previous data retained; waiting for response".into(),
-                        crate::app_event::HumanReadFailure::TimedOut => "Read timed out after 30 seconds; reconnecting".into(),
+                        crate::app_event::HumanReadFailure::Rejected(code) => crate::locale::format!(self.state.language,
+                            "Read failed: {code:?}; previous data retained", "读取失败：{code:?}；保留上次数据"),
+                        crate::app_event::HumanReadFailure::Slow => self.state.language.text("Read is taking longer than expected; previous data retained; waiting for response", "读取耗时较长；保留上次数据，正在等待响应").into(),
+                        crate::app_event::HumanReadFailure::TimedOut => self.state.language.text("Read timed out after 30 seconds; reconnecting", "读取超过 30 秒；正在重新连接").into(),
                     });
                 }
                 UiCommand::None
@@ -292,12 +310,19 @@ impl App {
                             self.state.ui.state_filter = None;
                         }
                         self.state.ui.related_loaded = true;
+                        if let HumanGovernanceResponse::Snapshot { frontier, .. } = &snapshot
+                            && let Some(context) = &mut self.state.related_context
+                        {
+                            context.expected_frontier = *frontier;
+                        }
                         self.state.ui.focus = crate::state::Focus::List;
                         self.state.selection = next_selection;
                         self.state.human = Some(snapshot);
                         self.state.detail = None;
-                        self.state.detail_message =
-                            (item_count == 0).then(|| "no_current_related_rows".into());
+                        self.state.detail_message = (item_count == 0).then(|| self.state.language.text(
+                            "No readable source/history entries were returned. Esc returns to the original object.",
+                            "未返回可读取的来源／历史项。Esc 返回原对象。",
+                        ).into());
                         self.state.detail_scroll = 0;
                         self.state.proposal_confirmation = None;
                         self.state.competing_candidate_selection = 0;
@@ -326,7 +351,10 @@ impl App {
                             }
                         }
                         self.state.human = Some(snapshot);
-                        self.state.detail_message = changed.then(||"Selected object changed or disappeared; open its current detail before acting".into());
+                        self.state.detail_message = changed.then(|| self.state.language.text(
+                            "Selected object changed or disappeared; open its current detail before acting",
+                            "所选对象已变化或消失；请先打开当前详情再操作",
+                        ).into());
                         self.state.read_conflict = None;
                         let visible = views::visible_indices(&self.state);
                         if !visible.contains(&self.state.selection)
@@ -352,6 +380,18 @@ impl App {
                         },
                     ) => {
                         let first_open = self.state.detail.is_none();
+                        let unreadable =
+                            items.is_empty()
+                                || items.iter().any(|item| {
+                                    item.semantic_detail.as_ref().is_some_and(|detail| {
+                                        matches!(detail.state,
+                                evertrace_protocol::dto::HumanContentState::AccessDenied
+                                | evertrace_protocol::dto::HumanContentState::Missing)
+                                    })
+                                });
+                        if unreadable && self.restore_failed_result() {
+                            return UiCommand::None;
+                        }
                         if self.state.ui.reference_request.take().is_some() {
                             self.state.selection = 0;
                             self.state.human = Some(HumanGovernanceResponse::Snapshot {
@@ -364,6 +404,7 @@ impl App {
                             });
                         }
                         self.state.detail = items.pop();
+                        self.state.detail_frontier = self.state.detail.as_ref().map(|_| frontier);
                         if self.state.detail.as_ref().is_none_or(|i| {
                             i.semantic_detail.as_ref().is_some_and(|d| {
                                 matches!(
@@ -381,11 +422,10 @@ impl App {
                             self.state.ui.detail_view = crate::state::DetailView::Content;
                         }
                         self.state.ui.focus = crate::state::Focus::Detail;
-                        self.state.detail_message = self
-                            .state
-                            .detail
-                            .is_none()
-                            .then(|| "detail_not_found".into());
+                        self.state.detail_message = self.state.detail.is_none().then(|| self.state.language.text(
+                            "The selected object has no readable detail in this view. Return to the list or refresh its current state.",
+                            "所选对象在此视图没有可读详情。可返回列表，或刷新当前状态。",
+                        ).into());
                         self.state.read_conflict = None;
                         UiCommand::None
                     }
@@ -395,14 +435,12 @@ impl App {
                             current_frontier, ..
                         },
                     ) => {
-                        self.state.related_context = None;
-                        self.state.human = None;
-                        self.state.detail = None;
-                        self.state.detail_message = None;
-                        self.state.detail_scroll = 0;
-                        self.state.selection = 0;
                         self.state.read_conflict = Some(current_frontier);
-                        UiCommand::Refresh
+                        self.state.detail_message = Some(self.state.language.text(
+                            "Source/history read conflicted with changed data. Your selection is retained; return and refresh the source before opening it again.",
+                            "来源／历史读取与数据变化冲突。已保留所选对象；请返回并刷新来源后重新打开。",
+                        ).into());
+                        UiCommand::None
                     }
                     (
                         HumanReadLocator::List,
@@ -427,16 +465,21 @@ impl App {
                             current_revision_ref,
                         },
                     ) => {
+                        if self.restore_failed_result() {
+                            return UiCommand::None;
+                        }
                         self.state.detail = None;
                         self.state.detail_scroll = 0;
                         self.state.proposal_confirmation = None;
                         self.state.read_conflict = Some(current_frontier);
                         self.state.detail_message = Some(current_revision_ref.map_or_else(
-                            || format!("detail_conflict frontier {current_frontier}"),
+                            || crate::locale::format!(self.state.language,
+                                "Detail read conflicted with changed data (frontier {current_frontier}); refresh the list and reopen the selected object.",
+                                "详情读取与数据变化冲突（水位 {current_frontier}）；请刷新列表并重新打开所选对象。"),
                             |revision| {
-                                format!(
-                                    "detail_conflict frontier {current_frontier} revision {revision}"
-                                )
+                                crate::locale::format!(self.state.language,
+                                    "The selected revision changed to {revision} (frontier {current_frontier}); refresh and review again before acting.",
+                                    "所选修订已变为 {revision}（水位 {current_frontier}）；请刷新并重新审阅后再操作。")
                             },
                         ));
                         UiCommand::None
@@ -481,7 +524,13 @@ impl App {
                     result.status,
                     HumanActionStatus::Conflict | HumanActionStatus::Unavailable
                 ) {
-                    self.state.ui.pending_edit.take().map(|mut edit|{edit.error=Some("Action not applied; original target and draft retained. Reread before confirming.".into());edit})
+                    self.state.ui.pending_edit.take().map(|mut edit| {
+                        edit.error = Some(self.state.language.text(
+                            "Action not applied; original target and draft retained. Reread before confirming.",
+                            "操作未应用；已保留原目标和草稿。请重新读取后再确认。",
+                        ).into());
+                        edit
+                    })
                 } else {
                     self.state.ui.pending_edit = None;
                     None
@@ -705,6 +754,7 @@ impl App {
                 | UiCommand::DetailView(crate::state::DetailView::History)
         ) {
             self.state.ui.read_generation = self.state.ui.read_generation.wrapping_add(1).max(1);
+            self.state.ui.reading = false;
         }
         if !self.modal_open() {
             self.state.ui.confirmation_selected = false;
@@ -748,7 +798,7 @@ impl App {
         }
         match command {
             UiCommand::Navigate(route) => {
-                self.save_navigation();
+                self.save_navigation(false);
                 self.state.ui.page_cursor = None;
                 self.state.ui.type_filter = None;
                 self.state.ui.scope_filter = None;
@@ -1063,7 +1113,7 @@ impl App {
                 }
             }
             UiCommand::OpenRelated => {
-                self.save_navigation();
+                self.save_navigation(false);
                 self.state.ui.related_loaded = false;
                 self.state.ui.page_cursor = None;
                 self.state.related_context = related_context(&self.state);
@@ -1124,8 +1174,10 @@ impl App {
         self.render_shell(frame);
         if let Some(confirmation) = &self.state.repository_purge_confirmation {
             let area = centered(frame.area(), 76, 11);
-            let (clear, modal) = components::modal(format!(
+            let (clear, modal) = components::modal(crate::locale::format!(
+                self.state.language,
                 "Repository purge\nExpected ID: {}\nRe-enter ID: {}\nPolicy: block_on_cross_scope_dependency\nStrict source erasure: unavailable\nBlockers: {:?}\n{}\nEnter confirms once; Esc cancels",
+                "清除仓库\n预期 ID：{}\n重新输入 ID：{}\n策略：block_on_cross_scope_dependency\n严格擦除来源：不可用\n阻塞原因：{:?}\n{}\nEnter 确认一次；Esc 取消",
                 confirmation.preview.repository_id,
                 confirmation.entered_repository_id,
                 confirmation.preview.blockers,
@@ -1140,6 +1192,7 @@ impl App {
                 frame.area().height.saturating_sub(2).min(18),
             );
             let (clear, modal) = components::modal(proposal_edit_modal_text(
+                self.state.language,
                 edit,
                 area.width.saturating_sub(4) as usize,
                 area.height.saturating_sub(5) as usize,
@@ -1148,13 +1201,16 @@ impl App {
             frame.render_widget(modal, area);
         } else if let Some(operation) = &self.state.future_operation_shell {
             let area = centered(frame.area(), 58, 11);
-            let (clear, modal) = components::modal(future_operation_text(operation));
+            let (clear, modal) =
+                components::modal(future_operation_text(operation, self.state.language));
             frame.render_widget(clear, area);
             frame.render_widget(modal, area);
         } else if let Some(request) = &self.state.recovery_confirmation {
             let area = centered(frame.area(), 72, 6);
-            let (clear, modal) = components::modal(format!(
+            let (clear, modal) = components::modal(crate::locale::format!(
+                self.state.language,
                 "Bundle: {}\nTarget Worktree: {}\nKind: {:?}\nEnter confirms once; Esc cancels",
+                "恢复包：{}\n目标工作树：{}\n类型：{:?}\nEnter 确认一次；Esc 取消",
                 request.recovery_bundle_id,
                 request.target_worktree_instance_id,
                 request.application_kind,
@@ -1168,10 +1224,11 @@ impl App {
                 frame.area().height.saturating_sub(3).min(20),
             );
             let review_tuple = review.as_ref().map_or_else(
-                || "Review: current closed action".into(),
+                || self.state.language.text("Review: current closed action", "审阅：当前既有操作").into(),
                 |review| {
-                    format!(
+                    crate::locale::format!(self.state.language,
                         "Proposal: {}\nRevision: {}\nFingerprint: {}\nFrozen candidate, scope and conditions:\n{}",
+                        "提议：{}\n修订：{}\n指纹：{}\n已锁定的候选、范围与条件：\n{}",
                         review.proposal.proposal_id,
                         review.proposal.proposal_revision_id,
                         evertrace_domain::evidence::hex(&review.proposal.fingerprint),
@@ -1179,9 +1236,11 @@ impl App {
                     )
                 },
             );
-            let (clear, modal) = components::modal(format!(
+            let (clear, modal) = components::modal(crate::locale::format!(
+                self.state.language,
                 "Confirm {} once; Esc cancels\n{review_tuple}",
-                human_action_label(action)
+                "确认一次：{}；Esc 取消\n{review_tuple}",
+                self.state.language.label(human_action_label(action))
             ));
             frame.render_widget(clear, area);
             frame.render_widget(
@@ -1203,25 +1262,44 @@ impl App {
             let confirm = self.state.proposal_confirmation.is_some()
                 || self.state.recovery_confirmation.is_some()
                 || self.state.repository_purge_confirmation.is_some();
+            let cancel = if confirm && !self.state.ui.confirmation_selected {
+                self.state.language.text("[>Cancel] ", "[>取消] ")
+            } else {
+                self.state.language.text("[Cancel] ", "[取消] ")
+            };
+            let accept = if self.state.ui.confirmation_selected {
+                self.state.language.text("[>Confirm once] ", "[>确认一次] ")
+            } else {
+                self.state.language.text("[Confirm once] ", "[确认一次] ")
+            };
+            let cancel_width = ratatui::text::Line::from(cancel).width() as u16;
+            let accept_width = ratatui::text::Line::from(accept).width() as u16;
             frame.render_widget(
-                Paragraph::new(if confirm {
-                    if self.state.ui.confirmation_selected {
-                        "[Cancel] [>Confirm once] Tab changes choice; ↑↓ scroll"
+                Paragraph::new(format!(
+                    "{cancel}{}{}",
+                    if confirm { accept } else { "" },
+                    if confirm {
+                        self.state
+                            .language
+                            .text("Tab changes choice; ↑↓ scroll", "Tab 切换选择；↑↓ 滚动")
                     } else {
-                        "[>Cancel] [Confirm once] Tab changes choice; ↑↓ scroll"
-                    }
-                } else {
-                    "[Cancel] Esc closes"
-                }),
+                        self.state.language.text("Esc closes", "Esc 关闭")
+                    },
+                )),
                 area,
             );
             self.hit_regions.borrow_mut().push((
-                Rect::new(area.x, area.y, area.width.min(9), 1),
+                Rect::new(area.x, area.y, area.width.min(cancel_width), 1),
                 UiCommand::CancelModal,
             ));
-            if confirm && area.width > 9 {
+            if confirm && area.width > cancel_width {
                 self.hit_regions.borrow_mut().push((
-                    Rect::new(area.x + 9, area.y, (area.width - 9).min(15), 1),
+                    Rect::new(
+                        area.x + cancel_width,
+                        area.y,
+                        (area.width - cancel_width).min(accept_width),
+                        1,
+                    ),
                     UiCommand::Detail,
                 ));
             }
@@ -1275,7 +1353,7 @@ fn proposal_edit_state(state: &AppState) -> Result<crate::state::ProposalEditSta
     }
     let cursor = document.len();
     Ok(crate::state::ProposalEditState {
-        frozen_frontier: *frontier,
+        frozen_frontier: action_frontier(state).unwrap_or(*frontier),
         context,
         document,
         cursor,
@@ -1309,7 +1387,7 @@ fn support_deprecate_edit_state(
     }
     let cursor = document.len();
     Ok(crate::state::ProposalEditState {
-        frozen_frontier: *frontier,
+        frozen_frontier: action_frontier(state).unwrap_or(*frontier),
         context: crate::state::ProposalEditContext::SupportDeprecate {
             expected_validation_revision_id: support.validation_revision_id,
             original_payload,
@@ -1571,6 +1649,7 @@ fn move_edit_vertical(edit: &mut crate::state::ProposalEditState, down: bool) {
 }
 
 fn proposal_edit_modal_text(
+    language: crate::Language,
     edit: &crate::state::ProposalEditState,
     width: usize,
     visible_rows: usize,
@@ -1589,18 +1668,21 @@ fn proposal_edit_modal_text(
     let first_line = cursor_line.saturating_sub(visible_rows / 2);
     let mut rendered = String::with_capacity(width.saturating_mul(visible_rows + 4));
     rendered.push_str(match &edit.context {
-        crate::state::ProposalEditContext::Configuration { .. } => {
-            "EDIT CONFIGURATION TOML (optimistic file hash)\n"
+        crate::state::ProposalEditContext::Configuration { .. } => language.text(
+            "EDIT CONFIGURATION TOML (optimistic file hash)\n",
+            "编辑配置 TOML（校验原文件哈希）\n",
+        ),
+        crate::state::ProposalEditContext::Proposal(_) => {
+            language.text("EDIT PROPOSAL DOCUMENT\n", "编辑提议文档\n")
         }
-        crate::state::ProposalEditContext::Proposal(_) => "EDIT PROPOSAL DOCUMENT\n",
         crate::state::ProposalEditContext::SupportReplacement { .. } => {
-            "EDIT SUPPORT REPLACEMENT\n"
+            language.text("EDIT SUPPORT REPLACEMENT\n", "编辑支持替换提议\n")
         }
         crate::state::ProposalEditContext::SupportDeprecate { .. } => {
-            "SUBMIT SUPPORT DEPRECATION\n"
+            language.text("SUBMIT SUPPORT DEPRECATION\n", "提交支持弃用提议\n")
         }
     });
-    rendered.push_str("Ctrl+S submit  Esc cancel\n");
+    rendered.push_str(language.text("Ctrl+S submit  Esc cancel\n", "Ctrl+S 提交  Esc 取消\n"));
     rendered.push_str(&format!(
         "line {} column {}  bytes {}/{}\n",
         cursor_line + 1,
@@ -1631,34 +1713,31 @@ fn proposal_edit_modal_text(
     rendered
 }
 
-fn future_operation_text(operation: &crate::state::FutureOperationShell) -> String {
+fn future_operation_text(
+    operation: &crate::state::FutureOperationShell,
+    language: crate::Language,
+) -> String {
     use crate::state::FutureOperationShell;
     match operation {
-        FutureOperationShell::ForgetAtom(object_ref) => future_forget_text("Atom", object_ref),
+        FutureOperationShell::ForgetAtom(object_ref) => future_forget_text("Atom", object_ref, language),
         FutureOperationShell::ForgetProcedure(object_ref) => {
-            future_forget_text("Procedure", object_ref)
+            future_forget_text("Procedure", object_ref, language)
         }
         FutureOperationShell::ForgetCoreMembership(object_ref) => {
-            future_forget_text("Core membership", object_ref)
+            future_forget_text("Core membership", object_ref, language)
         }
-        FutureOperationShell::Maintenance => [
-            "Maintenance is unavailable in this S31 shell.",
-            "Repository purge needs a future preview.",
-            "Its maintenance flow is also future work.",
-            "Backup/verify belongs to S33.",
-            "Restore is offline-only.",
-            "No restore CLI command is asserted here.",
-            "Orphan GC belongs to S33.",
-            "No command will be sent.",
-            "Esc dismisses.",
-        ]
-        .join("\n"),
+        FutureOperationShell::Maintenance => language.text(
+            "Restore is an offline operation.\nStop the daemon before running:\nevertrace restore BACKUP_PATH\nUse the configuration for the intended data directory.\nBackup, verification and orphan GC are available as jobs in System.\nThis notice sends no command.\nEsc returns.",
+            "恢复是离线操作。\n先停止服务，再运行：\nevertrace restore BACKUP_PATH\n请使用目标数据目录对应的配置。\n备份、验证和孤立文件回收可在系统页提交任务。\n此说明不会发送命令。\nEsc 返回。",
+        ).into(),
     }
 }
 
-fn future_forget_text(kind: &str, object_ref: &str) -> String {
-    format!(
-        "No authoritative daemon Forget preview for this object/state.\nObject kind: {kind}\nObject ID:\n{object_ref}\nObject Forget is not source erasure.\nNo affected counts or closure are available.\nNo space or support estimate is available.\nNo preview hash, token, or job ID exists.\nNo command will be sent."
+fn future_forget_text(kind: &str, object_ref: &str, language: crate::Language) -> String {
+    crate::locale::format!(
+        language,
+        "No authoritative daemon Forget preview for this object/state.\nObject kind: {kind}\nObject ID:\n{object_ref}\nObject Forget is not source erasure.\nNo affected counts or closure are available.\nNo space or support estimate is available.\nNo preview hash, token, or job ID exists.\nNo command will be sent.",
+        "当前对象／状态没有服务端权威遗忘预览。\n对象类型：{kind}\n对象 ID：\n{object_ref}\n遗忘对象不等于擦除来源。\n未提供影响数量或闭包。\n没有空间或支持影响估算。\n不存在预览哈希、令牌或任务 ID。\n不会发送命令。"
     )
 }
 
@@ -1676,7 +1755,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 pub fn headless_render(width: u16, height: u16) -> Result<String, io::Error> {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
-    let app = App::new();
+    let app = App::with_language(crate::Language::English);
     terminal.draw(|frame| app.render(frame))?;
     let buffer = terminal.backend().buffer();
     let mut lines = (0..height)
@@ -1722,6 +1801,7 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             if matches!(command, UiCommand::Navigate(_)) {
                 let _ = ui_commands.try_send(client::ClientCommand::Refresh(
                     human_surface(app.state.route),
+                    system_selection(&app.state),
                     app.state.ui.read_generation,
                 ));
             }
@@ -1739,8 +1819,15 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 if ui_commands.try_send(command).is_err() {
                     app.state.ui.reading = false;
                     app.state.ui.read_finished = Some(std::time::Instant::now());
-                    app.state.detail_message =
-                        Some("Read could not be queued; retry reading".into());
+                    app.state.detail_message = Some(
+                        app.state
+                            .language
+                            .text(
+                                "Read could not be queued; retry reading",
+                                "读取请求未能入队；请重试读取",
+                            )
+                            .into(),
+                    );
                 }
             }
             if command == UiCommand::OpenConfigEditor {
@@ -1845,6 +1932,15 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn system_selection(state: &AppState) -> Option<evertrace_protocol::dto::HumanSystemListSelection> {
+    (state.route == crate::Route::System
+        && matches!(
+            state.ui.system_view,
+            crate::state::SystemView::Overview | crate::state::SystemView::Jobs
+        ))
+    .then_some(evertrace_protocol::dto::HumanSystemListSelection::Jobs)
+}
+
 fn human_surface(route: crate::Route) -> evertrace_protocol::dto::HumanSurface {
     match route {
         crate::Route::Inbox => evertrace_protocol::dto::HumanSurface::Inbox,
@@ -1882,7 +1978,9 @@ fn detail_locator_matches(state: &AppState, locator: &HumanReadLocator) -> bool 
     let Some(item) = selected_item(state) else {
         return false;
     };
-    frontier == expected_frontier
+    (frontier == expected_frontier
+        || (current_detail(state).is_some()
+            && state.detail_frontier.as_ref() == Some(expected_frontier)))
         && item.stable_key == *stable_key
         && item.revision_ref == *expected_revision_ref
 }
@@ -1928,7 +2026,7 @@ fn related_context(state: &AppState) -> Option<crate::state::RelatedContext> {
         relation,
         source_stable_key: detail.stable_key.clone(),
         expected_source_revision_ref: detail.revision_ref.clone()?,
-        expected_frontier: *frontier,
+        expected_frontier: state.detail_frontier.unwrap_or(*frontier),
     })
 }
 
@@ -1970,6 +2068,7 @@ fn human_request(
             };
             Some(HumanGovernanceRequest::Read {
                 request: HumanReadRequest::List {
+                    system_selection: system_selection(state),
                     surface,
                     expected_frontier,
                     after: state.ui.page_cursor.clone(),
@@ -2001,6 +2100,7 @@ fn human_request(
             };
             let request = state.related_context.as_ref().map_or_else(
                 || HumanReadRequest::List {
+                    system_selection: system_selection(state),
                     surface,
                     expected_frontier: Some(*frontier),
                     after: Some(after.clone()),
@@ -2020,6 +2120,7 @@ fn human_request(
         UiCommand::FirstPage => {
             let request = state.related_context.as_ref().map_or_else(
                 || HumanReadRequest::List {
+                    system_selection: system_selection(state),
                     surface,
                     expected_frontier: None,
                     after: None,
@@ -2108,7 +2209,7 @@ fn proposal_action(
         | evertrace_protocol::dto::ProposalHumanDecision::Reject => None,
     };
     Some((
-        *frontier,
+        action_frontier(state).unwrap_or(*frontier),
         HumanActionRequest::Proposal {
             proposal_id: proposal.proposal_id,
             expected_revision_id: proposal.current_revision_id,
@@ -2136,6 +2237,22 @@ fn current_detail(state: &AppState) -> Option<&evertrace_protocol::dto::HumanSna
         return None;
     }
     Some(detail)
+}
+
+/// A detail read may observe a later global frontier than its originating page.
+/// Only actions on that exact selected detail may use it; page cursors remain pinned.
+fn action_frontier(state: &AppState) -> Option<u64> {
+    if current_detail(state).is_some()
+        && let Some(frontier) = state.detail_frontier
+    {
+        return Some(frontier);
+    }
+    match state.human.as_ref()? {
+        evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { frontier, .. } => {
+            Some(*frontier)
+        }
+        _ => None,
+    }
 }
 
 fn future_operation_shell(state: &AppState) -> Option<crate::state::FutureOperationShell> {
@@ -2216,7 +2333,7 @@ fn negative_review_action(
         return None;
     }
     Some((
-        *frontier,
+        action_frontier(state).unwrap_or(*frontier),
         HumanActionRequest::NegativeReview {
             negative_evidence_id: review.negative_evidence_id,
             expected_review_revision_id: review.current_review_revision_id,
@@ -2243,7 +2360,7 @@ fn competing_selected_action(
         .eligible_attempt_ids
         .get(state.competing_candidate_selection)?;
     Some((
-        *frontier,
+        action_frontier(state).unwrap_or(*frontier),
         evertrace_protocol::dto::HumanActionRequest::ResolveCompetingSelected {
             expected_group_revision_id: detail.expected_group_revision_id,
             chosen_attempt_id,
@@ -2272,7 +2389,7 @@ fn mark_new_attempt_action(
     }
     let expected_attempt_revision_id = detail.revision_ref.as_deref()?.parse().ok()?;
     Some((
-        *frontier,
+        action_frontier(state).unwrap_or(*frontier),
         evertrace_protocol::dto::HumanActionRequest::MarkNewAttempt {
             expected_attempt_revision_id,
         },
@@ -2294,7 +2411,7 @@ fn forget_object_action(
     };
     let preview = current_detail(state)?.forget_preview.as_ref()?;
     Some((
-        *frontier,
+        action_frontier(state).unwrap_or(*frontier),
         evertrace_protocol::dto::HumanActionRequest::ForgetObject {
             target: preview.target,
             expected_revision_ids: preview.exact_revision_ids.clone(),
@@ -2314,7 +2431,7 @@ fn repository_purge_confirmation(
     };
     let preview = current_detail(state)?.repository_purge_preview.as_ref()?;
     Some(crate::state::RepositoryPurgeConfirmationState {
-        frozen_frontier: *frontier,
+        frozen_frontier: action_frontier(state).unwrap_or(*frontier),
         preview: preview.as_ref().clone(),
         entered_repository_id: String::new(),
         error: None,
@@ -2334,7 +2451,7 @@ fn create_backup_action(
         return None;
     };
     (state.route == crate::Route::System).then_some((
-        *frontier,
+        action_frontier(state).unwrap_or(*frontier),
         evertrace_protocol::dto::HumanActionRequest::CreateBackup,
         None,
     ))
@@ -2388,7 +2505,7 @@ fn repository_access_action(
         (Some(worktree_id?), inventory_ref)
     };
     Some((
-        *frontier,
+        action_frontier(state).unwrap_or(*frontier),
         HumanActionRequest::RepositoryAccess {
             repository_id,
             expected_repository_revision,
@@ -2420,7 +2537,7 @@ fn verify_backup_action(
         && detail.job_kind == "quiesced_backup_create_v1"
         && detail.state == HumanJobState::Succeeded)
         .then_some((
-            *frontier,
+            action_frontier(state).unwrap_or(*frontier),
             HumanActionRequest::VerifyBackup {
                 backup_job_id: detail.job_id,
             },
@@ -2544,7 +2661,16 @@ fn spawn_input(events: AppEventSender, stop: Arc<AtomicBool>) -> tokio::task::Jo
                             break;
                         }
                     }
-                    Ok(Event::Mouse(mouse)) => {
+                    // Moves, releases and drags have no UI action. Do not queue
+                    // them just to redraw an unchanged frame at mouse-event rate.
+                    Ok(Event::Mouse(mouse))
+                        if matches!(
+                            mouse.kind,
+                            event::MouseEventKind::Down(event::MouseButton::Left)
+                                | event::MouseEventKind::ScrollDown
+                                | event::MouseEventKind::ScrollUp
+                        ) =>
+                    {
                         let _ = events.blocking_send(AppEvent::Mouse(mouse));
                     }
                     Ok(Event::Paste(text)) => {
@@ -2574,7 +2700,7 @@ mod tests {
 
     #[test]
     fn export_disconnect_reports_unknown_and_does_not_retry() {
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.state.route = crate::Route::System;
         app.state
             .export_selections
@@ -2639,14 +2765,14 @@ mod tests {
         HumanJobBudget, HumanJobDetail, HumanJobState, HumanNegativeReviewMetadata,
         HumanObjectFamily, HumanProposalMetadata, HumanProposalReview, HumanRecoveryDetail,
         HumanRelationKind, HumanRepositoryPurgePreview, HumanRowClass, HumanSnapshotItem,
-        HumanSnapshotStatus, HumanSystemDetail, HumanWorktreeDetail, NegativeReviewDecision,
-        PROTOCOL_VERSION, ProposalHumanDecision,
+        HumanSnapshotStatus, HumanSurface, HumanSystemDetail, HumanWorktreeDetail,
+        NegativeReviewDecision, PROTOCOL_VERSION, ProposalHumanDecision,
     };
     use evertrace_protocol::response::HealthResponse;
 
     #[test]
     fn configuration_editor_preserves_conflicted_document_and_uses_file_identity() {
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.state.route = crate::Route::System;
         assert_eq!(
             app.handle(AppEvent::Key(KeyEvent::new(
@@ -2724,7 +2850,7 @@ mod tests {
             downstream_support_revalidation_count: 0,
             dependent_procedure_review_hold_count: 0,
         }));
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
             diagnostics: None,
             frontier: 9,
@@ -2734,6 +2860,7 @@ mod tests {
             next_cursor: None,
         });
         app.state.detail = Some(item);
+        app.state.detail_frontier = None;
         app.dispatch(UiCommand::PrepareRepositoryPurge);
         assert!(app.state.proposal_confirmation.is_none());
         for value in repository_id.to_string().chars() {
@@ -2886,7 +3013,7 @@ mod tests {
                 }),
             }),
         });
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.dispatch(UiCommand::Navigate(crate::Route::System));
         app.handle(AppEvent::Health(HealthResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -2948,6 +3075,7 @@ mod tests {
             )) if id == backup_job_id
         ));
         app.state.detail = selected_item(&app.state).cloned();
+        app.state.detail_frontier = None;
         app.state.ui.detail_view = crate::state::DetailView::Technical;
         let rendered = render_app(&app, 160, 100);
         assert!(rendered.contains("backup verification/frontier: VerifiedBeforePublish / 9"));
@@ -2964,7 +3092,7 @@ mod tests {
         let bundle_two = RecoveryBundleId::new_v7();
         let worktree_one = WorktreeId::new_v7();
         let worktree_two = WorktreeId::new_v7();
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.dispatch(UiCommand::Navigate(crate::Route::Explorer));
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Explorer,
@@ -3040,6 +3168,7 @@ mod tests {
             omission_counts: Vec::new(),
         });
         app.state.detail = Some(bundle_detail.clone());
+        app.state.detail_frontier = None;
         let rendered = render_app(&app, 100, 30);
         assert!(rendered.contains(&bundle_two.to_string()));
         assert!(rendered.contains("source worktree/snapshot"));
@@ -3055,6 +3184,7 @@ mod tests {
             current_snapshot_id: Some(source_snapshot_id),
         });
         app.state.detail = Some(worktree_detail.clone());
+        app.state.detail_frontier = None;
         assert!(render_app(&app, 100, 30).contains("Registered"));
         worktree_detail.recovery_detail = bundle_detail.recovery_detail;
         assert!(
@@ -3101,6 +3231,7 @@ mod tests {
             reasoning_visibility: vec![ReasoningVisibility::Raw],
         });
         app.state.detail = Some(lane_detail.clone());
+        app.state.detail_frontier = None;
         let rendered = render_app(&app, 100, 30);
         assert!(rendered.contains("lane/revision"));
         assert!(rendered.contains(&lane_id.to_string()));
@@ -3170,6 +3301,29 @@ mod tests {
             }),
         });
         app.state.detail = Some(job_detail.clone());
+        app.state.detail_frontier = None;
+        app.state.ui.detail_view = crate::state::DetailView::Content;
+        app.state.language = crate::Language::Chinese;
+        let chinese_job = views::detail_text(&app.state);
+        assert!(chinese_job.contains("任务：重建对象索引\n状态：排队中"));
+        assert!(chinese_job.contains("退避截止：未提供"));
+        assert!(chinese_job.contains("object:target"));
+        assert!(!chinese_job.contains("objects_projection"));
+        let mut occurrence = snapshot_item("host_occurrence", "occ:unchanged".into());
+        occurrence.lifecycle = Some("immutable".into());
+        let chinese_occurrence = views::row_label(&occurrence, crate::Language::Chinese);
+        assert!(chinese_occurrence.contains("宿主事件"));
+        assert!(chinese_occurrence.contains("不可变记录"));
+        assert!(chinese_occurrence.contains("occ:unchanged"));
+        assert_eq!(
+            views::kind_label("semantic_synthesis_v1", crate::Language::Chinese),
+            "生成语义摘要"
+        );
+        assert_eq!(
+            views::status_label("Succeeded", crate::Language::Chinese),
+            "已结束"
+        );
+        app.state.language = crate::Language::English;
         app.state.ui.detail_view = crate::state::DetailView::Technical;
         let rendered = render_app(&app, 100, 30);
         assert!(rendered.contains(&job_id.to_string()));
@@ -3178,6 +3332,113 @@ mod tests {
         assert!(
             views::detail_text(&app.state).contains("External reader exclusion is unverified.")
         );
+        for language in [crate::Language::English, crate::Language::Chinese] {
+            for outcome in 0..4 {
+                let mut jump = App::with_language(language);
+                jump.dispatch(UiCommand::Navigate(crate::Route::System));
+                let mut job = job_detail.clone();
+                if let Some(HumanSystemDetail::Job { detail }) = &mut job.system_detail {
+                    detail.terminal_result_ref = Some("obs:result".into());
+                }
+                jump.state.human = Some(HumanGovernanceResponse::Snapshot {
+                    diagnostics: None,
+                    frontier: 7,
+                    status: HumanSnapshotStatus::Ready,
+                    degraded_reasons: vec![],
+                    items: vec![job.clone(), job.clone()],
+                    next_cursor: Some("runtime:job:next".into()),
+                });
+                jump.state.detail = Some(job);
+                jump.state.selection = 1;
+                jump.state.ui.page_cursor = Some("runtime:job:previous".into());
+                jump.state.ui.list_offset = 1;
+                jump.state.ui.filter = "original job filter".into();
+                jump.state.ui.type_filter = Some("runtime_event".into());
+                jump.state.detail_scroll = 3;
+                let original = jump.state.human.clone();
+                assert_eq!(jump.dispatch(UiCommand::OpenResult), UiCommand::Detail);
+                assert!(jump.state.human.is_none());
+                assert!(jump.state.ui.page_cursor.is_none());
+                assert!(jump.state.ui.filter.is_empty());
+                assert!(jump.state.ui.type_filter.is_none());
+                let locator = HumanReadLocator::View {
+                    generation: jump.state.ui.read_generation,
+                    request: Box::new(HumanReadLocator::Detail {
+                        expected_frontier: 7,
+                        stable_key: "obs:result".into(),
+                        expected_revision_ref: None,
+                    }),
+                };
+                if outcome < 2 {
+                    jump.handle(AppEvent::HumanRead {
+                        surface: HumanSurface::Explorer,
+                        locator,
+                        response: HumanGovernanceResponse::Snapshot {
+                            diagnostics: None,
+                            frontier: 7,
+                            status: HumanSnapshotStatus::Ready,
+                            degraded_reasons: vec![],
+                            next_cursor: None,
+                            items: if outcome == 0 {
+                                vec![snapshot_item("source_observation", "obs:result".into())]
+                            } else {
+                                vec![]
+                            },
+                        },
+                    });
+                    if outcome == 0 {
+                        jump.dispatch(UiCommand::CancelModal);
+                    }
+                } else {
+                    jump.handle(AppEvent::HumanReadFailed {
+                        surface: HumanSurface::Explorer,
+                        locator,
+                        code: if outcome == 2 {
+                            crate::app_event::HumanReadFailure::Rejected(
+                                evertrace_protocol::error::ErrorCode::InvalidInput,
+                            )
+                        } else {
+                            crate::app_event::HumanReadFailure::TimedOut
+                        },
+                    });
+                }
+                assert_eq!(jump.state.route, crate::Route::System);
+                assert_eq!(jump.state.human, original);
+                assert_eq!(jump.state.selection, 1);
+                assert_eq!(jump.state.ui.list_offset, 1);
+                assert_eq!(jump.state.ui.filter, "original job filter");
+                assert_eq!(jump.state.ui.type_filter.as_deref(), Some("runtime_event"));
+                assert_eq!(jump.state.detail_scroll, 3);
+                assert_eq!(
+                    jump.state.ui.page_cursor.as_deref(),
+                    Some("runtime:job:previous")
+                );
+                if outcome != 0 {
+                    assert!(jump.state.detail_message.is_some());
+                }
+                if outcome == 0 {
+                    jump.dispatch(UiCommand::CancelModal);
+                    assert!(jump.state.detail.is_none());
+                    jump.dispatch(UiCommand::Navigate(crate::Route::Explorer));
+                    let host = snapshot_item("host_occurrence", "occ:ordinary".into());
+                    jump.state.human = Some(HumanGovernanceResponse::Snapshot {
+                        diagnostics: None,
+                        frontier: 7,
+                        status: HumanSnapshotStatus::Ready,
+                        degraded_reasons: vec![],
+                        items: vec![host.clone()],
+                        next_cursor: None,
+                    });
+                    jump.state.detail = Some(host);
+                    jump.dispatch(UiCommand::CancelModal);
+                    assert_eq!(jump.state.route, crate::Route::Explorer);
+                    assert!(jump.state.detail.is_none());
+                    jump.dispatch(UiCommand::CancelModal);
+                    assert_eq!(jump.state.route, crate::Route::System);
+                    assert_eq!(jump.state.human, original);
+                }
+            }
+        }
         let mut forged = job_detail.clone();
         forged.stable_key = "runtime:job:forged".into();
         assert!(
@@ -3323,7 +3584,7 @@ mod tests {
             scope_ref: None,
             source_event_seq: 9,
         };
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.dispatch(UiCommand::Navigate(crate::Route::Inbox));
         app.handle(AppEvent::Health(HealthResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -3410,6 +3671,16 @@ mod tests {
         assert!(views::detail_text(&app.state).contains("Repository"));
         assert!(wide.contains("exact base") || wide.contains("no base"));
         assert!(compact.contains("Detail"));
+        let english_request = human_request(&app.state, UiCommand::Detail);
+        app.dispatch(UiCommand::Language(crate::Language::Chinese));
+        let chinese = render_app(&app, 80, 24);
+        assert!(chinese.contains('详') && chinese.contains('情'));
+        assert!(chinese.contains("keep the reviewed invariant"));
+        assert_eq!(
+            human_request(&app.state, UiCommand::Detail),
+            english_request
+        );
+        app.dispatch(UiCommand::Language(crate::Language::English));
         {
             use evertrace_domain::semantic::{
                 CoreMembership, CoreMembershipProposalPayload, CoreScopeIdentity,
@@ -3608,6 +3879,7 @@ mod tests {
             next_cursor: None,
         });
         app.state.detail = Some(support_item.clone());
+        app.state.detail_frontier = None;
         app.state.selection = 0;
         app.dispatch(UiCommand::OpenProposalEditor);
         let support_editor = render_app(&app, 60, 20);
@@ -3670,6 +3942,7 @@ mod tests {
             .unwrap()
             .deprecate_available = false;
         app.state.detail = Some(support_item);
+        app.state.detail_frontier = None;
         app.dispatch(UiCommand::OpenProposalEditor);
         assert!(app.state.proposal_edit.is_none());
         assert!(app.state.proposal_confirmation.is_none());
@@ -3691,6 +3964,7 @@ mod tests {
         );
         app.state.human = proposal_human;
         app.state.detail = proposal_detail;
+        app.state.detail_frontier = None;
         app.state.detail_scroll = 0;
         app.dispatch(UiCommand::PrepareProposal(ProposalHumanDecision::Accept));
         assert!(matches!(
@@ -3756,6 +4030,7 @@ mod tests {
             next_cursor: None,
         });
         app.state.detail = Some(merge_item);
+        app.state.detail_frontier = None;
         app.state.proposal_confirmation = None;
         app.dispatch(UiCommand::PrepareProposal(ProposalHumanDecision::Accept));
         assert!(app.state.proposal_confirmation.is_none());
@@ -3818,6 +4093,52 @@ mod tests {
                 request: evertrace_protocol::dto::HumanReadRequest::Detail { .. }
             })
         ));
+        let mut source = selected_item(&app.state).unwrap().clone();
+        source.evidence_detail = Some(evertrace_protocol::dto::HumanEvidenceDetail {
+            source_kind: evertrace_domain::evidence::EvidenceSourceKind::CodexHook,
+            observation_role: evertrace_domain::evidence::ObservationRole::Message,
+            source_role: evertrace_domain::evidence::SourceRole::Host,
+            content_trust: evertrace_domain::evidence::ContentTrust::Observed,
+            capture_completeness: evertrace_domain::evidence::CaptureCompleteness::Partial,
+            protected_presentation: Some(
+                evertrace_domain::evidence::ProtectedPresentation::Preview {
+                    text: "Keep this source text / 保留原始正文".into(),
+                },
+            ),
+            protected_length: 64,
+            cas_ref: "a".repeat(64),
+        });
+        let source_locator = HumanReadLocator::Detail {
+            expected_frontier: 10,
+            stable_key: source.stable_key.clone(),
+            expected_revision_ref: source.revision_ref.clone(),
+        };
+        app.handle(AppEvent::HumanRead {
+            surface: evertrace_protocol::dto::HumanSurface::Explorer,
+            locator: source_locator,
+            response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
+                frontier: 10,
+                status: HumanSnapshotStatus::Ready,
+                degraded_reasons: vec![],
+                items: vec![source],
+                next_cursor: None,
+            },
+        });
+        for language in [crate::Language::Chinese, crate::Language::English] {
+            app.dispatch(UiCommand::Language(language));
+            assert!(render_app(&app, 80, 24).contains("Keep this source text"));
+        }
+        app.dispatch(UiCommand::CancelModal);
+        assert!(app.state.detail.is_none());
+        assert!(app.state.related_context.is_some());
+        app.dispatch(UiCommand::CancelModal);
+        assert_eq!(app.state.route, crate::Route::Inbox);
+        assert_eq!(
+            app.state.detail.as_ref().unwrap().stable_key,
+            "proposal-row"
+        );
+        assert!(app.state.proposal_confirmation.is_none());
         app.dispatch(UiCommand::Navigate(crate::Route::Explorer));
         assert!(app.state.proposal_confirmation.is_none());
         assert!(app.state.detail.is_none());
@@ -3837,6 +4158,7 @@ mod tests {
             next_cursor: None,
         });
         app.state.detail = Some(atom);
+        app.state.detail_frontier = None;
         app.dispatch(UiCommand::OpenFutureOperationShell);
         assert!(matches!(
             app.state.future_operation_shell.as_ref(),
@@ -3866,11 +4188,10 @@ mod tests {
         app.dispatch(UiCommand::OpenFutureOperationShell);
         assert!(human_request(&app.state, UiCommand::OpenFutureOperationShell).is_none());
         let maintenance = render_app(&app, 60, 20);
-        assert!(maintenance.contains("Repository purge"));
-        assert!(maintenance.contains("Backup/verify"));
-        assert!(maintenance.contains("offline-only"));
-        assert!(maintenance.contains("Orphan GC"));
-        assert!(maintenance.contains("No command will be sent"));
+        assert!(maintenance.contains("offline operation"));
+        assert!(maintenance.contains("evertrace restore BACKUP_PATH"));
+        assert!(maintenance.contains("Backup, verification and orphan GC"));
+        assert!(maintenance.contains("This notice sends no command"));
         assert!(app.state.proposal_confirmation.is_none());
         assert!(app.state.recovery_confirmation.is_none());
         assert_eq!(app.dispatch(UiCommand::Detail), UiCommand::None);
@@ -3880,7 +4201,7 @@ mod tests {
 
     #[test]
     fn stale_surface_read_is_ignored_without_refresh() {
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         let command = app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Explorer,
             locator: HumanReadLocator::List,
@@ -3919,9 +4240,10 @@ mod tests {
             next_cursor: None,
         };
         assert!(snapshot.validate());
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.state.human = Some(snapshot);
         app.state.detail = Some(item);
+        app.state.detail_frontier = None;
 
         assert_eq!(
             app.dispatch(UiCommand::SelectCompetingNext),
@@ -3955,7 +4277,7 @@ mod tests {
             status: ProcedureNegativeReviewStatus::Pending,
             available_decisions: vec![NegativeReviewDecision::DismissAttribution],
         });
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.dispatch(UiCommand::Navigate(crate::Route::Inbox));
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
@@ -4014,7 +4336,7 @@ mod tests {
             downstream_support_revalidation_count: 1,
             dependent_procedure_review_hold_count: 1,
         }));
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.dispatch(UiCommand::Navigate(crate::Route::Explorer));
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Explorer,
@@ -4029,6 +4351,7 @@ mod tests {
             },
         });
         app.state.detail = Some(item);
+        app.state.detail_frontier = None;
         app.dispatch(UiCommand::PrepareForgetObject);
         assert!(matches!(
             app.state.proposal_confirmation,
@@ -4056,7 +4379,7 @@ mod tests {
             stable_key: first.stable_key.clone(),
             expected_revision_ref: first.revision_ref.clone(),
         };
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.dispatch(UiCommand::Navigate(crate::Route::Inbox));
         app.handle(AppEvent::HumanRead {
             surface: evertrace_protocol::dto::HumanSurface::Inbox,
@@ -4089,11 +4412,11 @@ mod tests {
 
     #[test]
     fn disconnected_and_server_stopping_are_not_rendered_as_empty_pages() {
-        let mut disconnected = App::new();
+        let mut disconnected = App::with_language(crate::Language::English);
         disconnected.handle(AppEvent::Disconnected);
         assert!(render_app(&disconnected, 100, 30).contains("Daemon disconnected"));
 
-        let mut stopping = App::new();
+        let mut stopping = App::with_language(crate::Language::English);
         stopping.handle(AppEvent::Notification(
             evertrace_protocol::notification::Notification::ServerStopping,
         ));
@@ -4106,7 +4429,7 @@ mod tests {
             CaptureCompleteness, ContentTrust, EvidenceSourceKind, ObservationRole,
             ProtectedPresentation, SourceRole,
         };
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.state.route = crate::Route::Explorer;
         let mut item = snapshot_item("source_receipt", "receipt-test".into());
         assert!(
@@ -4127,6 +4450,7 @@ mod tests {
             cas_ref: "a".repeat(64),
         });
         app.state.detail = Some(item);
+        app.state.detail_frontier = None;
         let rendered = render_app(&app, 140, 40);
         assert!(rendered.contains("Message / Observed"));
         assert!(rendered.contains("capture: Partial; instruction authority: none"));
@@ -4186,7 +4510,7 @@ mod tests {
 
     #[test]
     fn provisional_work_detail_remains_a_protected_plan() {
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.state.route = crate::Route::Explorer;
         let mut item = snapshot_item("task", "task-test".into());
         assert!(
@@ -4203,6 +4527,7 @@ mod tests {
             acceptance: None,
         });
         app.state.detail = Some(item);
+        app.state.detail_frontier = None;
         let rendered = render_app(&app, 100, 40);
         assert!(
             rendered.contains("Provisional") && rendered.contains("instruction authority: none")

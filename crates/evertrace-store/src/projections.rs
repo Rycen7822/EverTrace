@@ -3391,6 +3391,16 @@ impl ReducerState {
 }
 
 impl JournalAdmissionState {
+    pub(crate) fn queued_gc_jobs(&self) -> Vec<DurableJob> {
+        self.jobs
+            .values()
+            .filter(|job| {
+                job.kind == crate::optimize::GC_ALGORITHM_REVISION && job.state == JobStatus::Queued
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn session_import_context(
         &self,
         frontier: u64,
@@ -13946,6 +13956,17 @@ mod tests {
             lease_until_us: None,
         };
         let mut forged_initial_lease = job.clone();
+        let mut gc_candidates = JournalAdmissionState::default();
+        gc_candidates.jobs.insert(job.job_id, job.clone());
+        assert!(gc_candidates.queued_gc_jobs().is_empty());
+        let mut gc = job.clone();
+        gc.kind = crate::optimize::GC_ALGORITHM_REVISION.into();
+        gc_candidates.jobs.insert(gc.job_id, gc.clone());
+        assert_eq!(gc_candidates.queued_gc_jobs(), vec![gc.clone()]);
+        gc.state = JobStatus::Leased;
+        gc.lease_until_us = Some(100);
+        gc_candidates.jobs.insert(gc.job_id, gc);
+        assert!(gc_candidates.queued_gc_jobs().is_empty());
         let mut waiting = job.clone();
         waiting.backoff_until_us = Some(100);
         assert!(validate_job_successor(&job, &waiting, 10).is_err());

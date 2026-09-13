@@ -35,6 +35,9 @@ enum WriterRequest {
     ReadDiagnostics {
         reply: oneshot::Sender<evertrace_store::NativeDiagnostics>,
     },
+    QueuedGcJobs {
+        reply: oneshot::Sender<Vec<DurableJob>>,
+    },
     MarkGc {
         runtime: Box<evertrace_capture::RuntimeSnapshot>,
         cursor: evertrace_capture::cas::CasGcCursor,
@@ -58,6 +61,7 @@ enum WriterRequest {
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
     Project {
+        indexes: bool,
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
     CommittedCommand {
@@ -356,10 +360,34 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub(crate) async fn queued_gc_jobs(&self) -> Result<Vec<DurableJob>, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::QueuedGcJobs { reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)
+    }
+
+    pub(crate) async fn project_objects(&self) -> Result<ProjectionSnapshot, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::Project {
+                indexes: false,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub async fn project(&self) -> Result<ProjectionSnapshot, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(WriterRequest::Project { reply })
+            .send(WriterRequest::Project {
+                indexes: true,
+                reply,
+            })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -702,6 +730,9 @@ async fn run_writer(
                     }
                 }
                 WriterRequest::ReadDiagnostics { reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let result = writer
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
@@ -709,13 +740,26 @@ async fn run_writer(
                         .await;
                     let _ = reply.send(result);
                 }
-                WriterRequest::Project { reply } => {
-                    let result = writer
-                        .as_ref()
-                        .ok_or(WriterActorError::Stopped)?
-                        .project()
-                        .await
-                        .map_err(map_store_error);
+                WriterRequest::QueuedGcJobs { reply } => {
+                    if !reply.is_closed() {
+                        let jobs = writer
+                            .as_ref()
+                            .ok_or(WriterActorError::Stopped)?
+                            .queued_gc_jobs();
+                        let _ = reply.send(jobs);
+                    }
+                }
+                WriterRequest::Project { indexes, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                    let result = if indexes {
+                        writer.project().await
+                    } else {
+                        writer.project_objects().await
+                    }
+                    .map_err(map_store_error);
                     let fatal = result.is_err();
                     let _ = reply.send(result);
                     if fatal {

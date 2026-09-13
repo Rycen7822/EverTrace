@@ -6,7 +6,7 @@ use evertrace_protocol::{
     command::{Command, CommandEnvelope, RequestRecoveryCommand},
     dto::{
         ClientKind, HUMAN_PAGE_LIMIT, HumanActionResult, HumanActionStatus, HumanGovernanceRequest,
-        HumanGovernanceResponse, HumanReadRequest, HumanSurface,
+        HumanGovernanceResponse, HumanReadRequest, HumanSurface, HumanSystemListSelection,
     },
     response::Response,
 };
@@ -21,7 +21,7 @@ const RECONNECT_DELAYS_MS: [u64; 5] = [250, 500, 1_000, 2_000, 5_000];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClientCommand {
-    Refresh(HumanSurface, u64),
+    Refresh(HumanSurface, Option<HumanSystemListSelection>, u64),
     ReadView {
         request: HumanReadRequest,
         generation: u64,
@@ -272,15 +272,35 @@ async fn flush_human_handoff(
     Ok(())
 }
 
-fn first_page_request(surface: HumanSurface) -> HumanGovernanceRequest {
+fn first_page_request(
+    surface: HumanSurface,
+    system_selection: Option<HumanSystemListSelection>,
+) -> HumanGovernanceRequest {
     HumanGovernanceRequest::Read {
         request: HumanReadRequest::List {
+            system_selection,
             surface,
             expected_frontier: None,
             after: None,
             limit: HUMAN_PAGE_LIMIT,
         },
     }
+}
+
+#[test]
+fn system_first_page_preserves_selected_scope() {
+    assert!(matches!(
+        first_page_request(HumanSurface::System, Some(HumanSystemListSelection::Jobs)),
+        HumanGovernanceRequest::Read {
+            request: HumanReadRequest::List {
+                surface: HumanSurface::System,
+                system_selection: Some(HumanSystemListSelection::Jobs),
+                expected_frontier: None,
+                after: None,
+                ..
+            }
+        }
+    ));
 }
 
 pub(crate) async fn run(
@@ -366,7 +386,7 @@ pub(crate) async fn run(
             tokio::select! {
                 command = commands.recv() => {
                     match command {
-                        Some(ClientCommand::Refresh(surface, generation)) => {
+                        Some(ClientCommand::Refresh(surface, system_selection, generation)) => {
                             view_generation=(generation>0).then_some(generation);
                             if handoff_human(
                                 &mut outgoing,
@@ -374,7 +394,7 @@ pub(crate) async fn run(
                                 &mut queued_action,
                                 &mut latest_read,
                                 &events,
-                                first_page_request(surface),
+                                first_page_request(surface, system_selection),
                             ).await.is_err() {
                                 break;
                             }
@@ -576,7 +596,7 @@ async fn wait_or_shutdown(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Some(ClientCommand::Refresh(_, _) | ClientCommand::ReadView { .. }) => continue,
+                Some(ClientCommand::Refresh(_, _, _) | ClientCommand::ReadView { .. }) => continue,
                 Some(ClientCommand::Human(request @ (HumanGovernanceRequest::Act { .. } | HumanGovernanceRequest::Export { .. }))) => {
                     let _ = events.send(local_human_rejection(&request, "local_transport_unavailable")).await;
                 }
@@ -674,6 +694,7 @@ mod tests {
                 .send(if surface == HumanSurface::System {
                     ClientCommand::ReadView {
                         request: HumanReadRequest::List {
+                            system_selection: None,
                             surface,
                             expected_frontier: None,
                             after: None,
@@ -682,7 +703,7 @@ mod tests {
                         generation: 7,
                     }
                 } else {
-                    ClientCommand::Refresh(surface, 0)
+                    ClientCommand::Refresh(surface, None, 0)
                 })
                 .await
                 .unwrap();
@@ -769,7 +790,7 @@ mod tests {
             assert!(matches!(receiver.recv().await, Some(AppEvent::Health(_))));
             let started = Instant::now();
             commands
-                .send(ClientCommand::Refresh(HumanSurface::Inbox, 0))
+                .send(ClientCommand::Refresh(HumanSurface::Inbox, None, 0))
                 .await
                 .unwrap();
             commands
@@ -800,7 +821,7 @@ mod tests {
             loop {
                 tokio::select! {
                     _ = refresh.tick(), if !disconnected => {
-                        commands.send(ClientCommand::Refresh(HumanSurface::System, 0)).await.unwrap();
+                        commands.send(ClientCommand::Refresh(HumanSurface::System, None, 0)).await.unwrap();
                     }
                     event = receiver.recv() => match event {
                         Some(AppEvent::HumanReadFailed { code: HumanReadFailure::TimedOut, surface: HumanSurface::Inbox, .. }) => {
@@ -894,12 +915,15 @@ mod tests {
                     &pending,
                     &mut queued_action,
                     &mut latest_read,
-                    &first_page_request(surface)
+                    &first_page_request(surface, None)
                 ),
                 HumanHandoff::Queued
             );
         }
-        assert_eq!(latest_read, Some(first_page_request(HumanSurface::System)));
+        assert_eq!(
+            latest_read,
+            Some(first_page_request(HumanSurface::System, None))
+        );
         assert_eq!(pending.len(), pending_count);
     }
 

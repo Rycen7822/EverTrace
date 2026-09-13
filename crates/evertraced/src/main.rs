@@ -658,12 +658,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             HumanGovernanceRequest::Read { request } => match request {
                                 HumanReadRequest::List {
                                     surface,
+                                    system_selection,
                                     expected_frontier,
                                     after,
                                     limit,
                                 } => match if surface == HumanSurface::System {
                                     human_governance.list_system(&config_snapshot, host_canary.current(),
-                                        expected_frontier, after.as_deref(), limit).await
+                                        system_selection.is_some(), expected_frontier, after.as_deref(), limit).await
                                 } else { human_governance.list(
                                         map_human_surface(surface),
                                         expected_frontier,

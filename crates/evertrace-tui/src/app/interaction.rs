@@ -40,9 +40,10 @@ impl App {
             || self.state.repository_purge_confirmation.is_some()
             || self.state.future_operation_shell.is_some()
     }
-    pub(super) fn save_navigation(&mut self) {
+    pub(super) fn save_navigation(&mut self, result_jump: bool) {
         let s = &self.state;
         let frame = NavigationFrame {
+            result_jump,
             page_cursor: s.ui.page_cursor.clone(),
             type_filter: s.ui.type_filter.clone(),
             scope_filter: s.ui.scope_filter.clone(),
@@ -52,6 +53,7 @@ impl App {
             route: s.route,
             human: s.human.clone(),
             detail: s.detail.clone(),
+            detail_frontier: s.detail_frontier,
             selection: s.selection,
             scroll: s.detail_scroll,
             offset: s.ui.list_offset,
@@ -72,11 +74,13 @@ impl App {
         s.route = frame.route;
         s.human = frame.human;
         s.detail = frame.detail;
+        s.detail_frontier = frame.detail_frontier;
         s.selection = frame.selection;
         s.detail_scroll = frame.scroll;
         s.ui.list_offset = frame.offset;
         s.ui.filter = frame.filter;
         s.related_context = frame.related;
+        s.ui.related_loaded = s.related_context.is_some();
         s.ui.detail_view = frame.detail_view;
         s.ui.page_cursor = frame.page_cursor;
         s.ui.type_filter = frame.type_filter;
@@ -93,15 +97,28 @@ impl App {
         };
         true
     }
+    pub(super) fn restore_failed_result(&mut self) -> bool {
+        if self.state.ui.reference_request.is_none() || !self.restore_navigation() {
+            return false;
+        }
+        self.state.ui.read_generation = self.state.ui.read_generation.wrapping_add(1).max(1);
+        self.state.ui.reading = false;
+        self.state.detail_message = Some(self.state.language.text(
+            "Task result could not be opened; returned to the original task. The result may be missing or unavailable.",
+            "无法打开任务结果；已返回原任务。结果可能不存在或暂不可访问。",
+        ).into());
+        true
+    }
     pub(super) fn specs(&self) -> Vec<UiCommandSpec> {
         use UiCommand::*;
         let s = &self.state;
         let mut out = Vec::new();
-        let mut add = |command, name, reason| {
+        let mut add = |command, name, reason: Option<&'static str>| {
             out.push(UiCommandSpec {
                 command,
-                name,
-                reason,
+                name: s.language.label(name),
+                search_name: name,
+                reason: reason.map(|reason| s.language.reason(reason)),
             })
         };
         add(
@@ -280,12 +297,20 @@ impl App {
             add(
                 SelectCompetingPrevious,
                 "Previous competing candidate",
-                Option::None,
+                s.detail
+                    .as_ref()
+                    .and_then(|i| i.competing_detail.as_ref())
+                    .is_none_or(|d| d.eligible_attempt_ids.len() < 2)
+                    .then_some("No other competing candidate"),
             );
             add(
                 SelectCompetingNext,
                 "Next competing candidate",
-                Option::None,
+                s.detail
+                    .as_ref()
+                    .and_then(|i| i.competing_detail.as_ref())
+                    .is_none_or(|d| d.eligible_attempt_ids.len() < 2)
+                    .then_some("No other competing candidate"),
             );
             for (kind, name) in [
                 (
@@ -348,7 +373,13 @@ impl App {
                     .is_none()
                     .then_some("Select a completed backup"),
             );
-            add(PrepareCollectGarbage, "Submit orphan GC", Option::None);
+            add(
+                PrepareCollectGarbage,
+                "Submit orphan GC",
+                create_backup_action(s)
+                    .is_none()
+                    .then_some("Read a current snapshot first"),
+            );
             add(
                 ExportSelection,
                 "Export selected objects",
@@ -385,6 +416,8 @@ impl App {
             }
         }
         for (c, n) in [
+            (Language(crate::Language::Chinese), "中文"),
+            (Language(crate::Language::English), "English"),
             (Filter, "Filter / find loaded content"),
             (ClearFilter, "Clear filter / find"),
             (FindPrevious, "Previous match"),
@@ -423,7 +456,11 @@ impl App {
             .find(|s| s.command == command)
             .and_then(|s| s.reason)
         {
-            self.state.detail_message = Some(format!("Unavailable: {reason}"));
+            self.state.detail_message = Some(crate::locale::format!(
+                self.state.language,
+                "Unavailable: {reason}",
+                "暂不可用：{reason}"
+            ));
             return UiCommand::None;
         }
         self.dispatch(command)
@@ -432,7 +469,11 @@ impl App {
         let q = self.state.ui.query.to_lowercase();
         self.specs()
             .into_iter()
-            .filter(|s| s.name.to_lowercase().contains(&q))
+            .filter(|s| {
+                s.name.to_lowercase().contains(&q)
+                    || s.search_name.to_lowercase().contains(&q)
+                    || crate::Language::Chinese.label(s.search_name).contains(&q)
+            })
             .collect()
     }
     pub(super) fn apply_query(&mut self) {
@@ -486,6 +527,10 @@ impl App {
     }
     pub(super) fn ui_dispatch(&mut self, command: UiCommand) -> Option<UiCommand> {
         match command {
+            UiCommand::Language(language) => {
+                self.state.language = language;
+                return Some(UiCommand::None);
+            }
             UiCommand::Detail
                 if self.state.route == crate::Route::System
                     && self.state.detail.is_none()
@@ -500,7 +545,7 @@ impl App {
                     && self.state.detail.is_none()
                     && self.state.ui.system_view == SystemView::Configuration =>
             {
-                return Some(UiCommand::OpenConfigEditor);
+                return Some(self.dispatch(UiCommand::OpenConfigEditor));
             }
             UiCommand::OpenResult | UiCommand::OpenResultAt(_) => {
                 let item = if let UiCommand::OpenResultAt(index) = command {
@@ -530,7 +575,22 @@ impl App {
                     return Some(UiCommand::None);
                 };
                 let frontier = *frontier;
-                self.save_navigation();
+                self.save_navigation(true);
+                self.state.ui.read_generation =
+                    self.state.ui.read_generation.wrapping_add(1).max(1);
+                self.state.ui.page_cursor = None;
+                self.state.ui.filter.clear();
+                self.state.ui.type_filter = None;
+                self.state.ui.scope_filter = None;
+                self.state.ui.state_filter = None;
+                self.state.related_context = None;
+                self.state.ui.related_loaded = false;
+                self.state.ui.list_offset = 0;
+                self.state.selection = 0;
+                self.state.human = None;
+                self.state.detail_frontier = None;
+                self.state.detail_message = None;
+                self.state.detail_scroll = 0;
                 self.state.ui.reference_request = Some((reference, frontier));
                 self.state.route = crate::Route::Explorer;
                 self.state.detail = None;
@@ -613,10 +673,28 @@ impl App {
             UiCommand::FindPrevious => self.find_match(false),
             UiCommand::Zoom => self.state.ui.zoom = !self.state.ui.zoom,
             UiCommand::SystemView(view) => {
+                let previous_scope = super::system_selection(&self.state);
                 self.state.ui.system_view = view;
                 self.state.detail = None;
                 self.state.ui.focus = Focus::List;
                 self.state.ui.list_offset = 0;
+                if previous_scope != super::system_selection(&self.state) {
+                    self.state.human = None;
+                    self.state.detail_frontier = None;
+                    self.state.detail_message = None;
+                    self.state.ui.page_cursor = None;
+                    self.state.ui.diagnostic_detail = false;
+                    self.state.ui.diagnostic_selection = 0;
+                    self.state.ui.type_filter = None;
+                    self.state.ui.scope_filter = None;
+                    self.state.ui.state_filter = None;
+                    self.state.selection = 0;
+                    self.state.detail_scroll = 0;
+                    self.state.ui.read_generation =
+                        self.state.ui.read_generation.wrapping_add(1).max(1);
+                    self.state.ui.reading = true;
+                    return Some(UiCommand::Refresh);
+                }
                 if let Some(index) = views::visible_indices(&self.state).first() {
                     self.state.selection = *index;
                 }
@@ -626,7 +704,7 @@ impl App {
                     return Some(self.dispatch(UiCommand::OpenRelated));
                 }
                 if view == DetailView::History && self.state.detail.is_some() {
-                    self.save_navigation();
+                    self.save_navigation(false);
                 }
                 self.state.ui.detail_view = view;
                 self.state.detail_scroll = 0;
@@ -644,18 +722,14 @@ impl App {
                     let Some(revision) = item.revision_ref.clone() else {
                         return Some(UiCommand::None);
                     };
-                    let Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
-                        frontier,
-                        ..
-                    }) = &self.state.human
-                    else {
+                    let Some(frontier) = action_frontier(&self.state) else {
                         return Some(UiCommand::None);
                     };
                     self.state.related_context = Some(crate::state::RelatedContext {
                         relation,
                         source_stable_key: item.stable_key.clone(),
                         expected_source_revision_ref: revision,
-                        expected_frontier: *frontier,
+                        expected_frontier: frontier,
                     });
                     return Some(UiCommand::OpenRelated);
                 }
@@ -673,7 +747,15 @@ impl App {
                     self.state.ui.help = false;
                     return Some(UiCommand::None);
                 }
-                if self.state.detail.is_none() && self.restore_navigation() {
+                if (self.state.detail.is_none()
+                    || self
+                        .state
+                        .ui
+                        .history
+                        .last()
+                        .is_some_and(|frame| frame.result_jump))
+                    && self.restore_navigation()
+                {
                     return Some(UiCommand::None);
                 }
                 self.state.ui.focus = Focus::List;
@@ -684,6 +766,7 @@ impl App {
                 if self.state.ui.focus != Focus::Detail {
                     self.state.ui.read_generation =
                         self.state.ui.read_generation.wrapping_add(1).max(1);
+                    self.state.ui.reading = false;
                 }
                 if self.state.route == crate::Route::System
                     && self.state.ui.system_view == SystemView::Diagnostics
@@ -1137,9 +1220,13 @@ impl App {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.state.ui.read_generation =
                     self.state.ui.read_generation.wrapping_add(1).max(1);
+                self.state.ui.reading = false;
                 self.state.ui.focus = Focus::List;
-                let row =
-                    event.row.saturating_sub(l.list.y + 1) as usize + self.state.ui.list_offset;
+                let first_row = l.list.y + 1;
+                if event.row < first_row || event.row >= l.list.bottom().saturating_sub(1) {
+                    return UiCommand::None;
+                }
+                let row = usize::from(event.row - first_row) + self.state.ui.list_offset;
                 if let Some(i) = views::visible_indices(&self.state).get(row) {
                     self.state.selection = *i;
                     self.state.detail = None;
@@ -1168,23 +1255,71 @@ impl App {
     ) {
         let specs = self.specs();
         let mut x = area.x;
-        for (i, c) in commands.iter().enumerate() {
+        // Keep the keyboard-focused action visible even when preceding buttons
+        // consume the entire row on a compact terminal.
+        let start = if matches!(commands.first(), Some(UiCommand::Navigate(_))) {
+            0
+        } else {
+            selected.unwrap_or(0)
+        };
+        for (i, c) in commands.iter().enumerate().skip(start) {
             let label = match c {
-                UiCommand::OpenResultAt(index) => format!("Result {}", index + 1),
-                UiCommand::CycleType => format!(
+                UiCommand::OpenResultAt(index) => {
+                    crate::locale::format!(self.state.language, "Result {}", "结果 {}", index + 1)
+                }
+                UiCommand::CycleType => crate::locale::format!(
+                    self.state.language,
                     "Type: {}",
-                    self.state.ui.type_filter.as_deref().unwrap_or("all")
+                    "类型：{}",
+                    self.state
+                        .ui
+                        .type_filter
+                        .as_deref()
+                        .map(|value| views::kind_label(value, self.state.language))
+                        .unwrap_or(self.state.language.text("all", "全部"))
                 ),
-                UiCommand::CycleScope => format!(
+                UiCommand::CycleScope => crate::locale::format!(
+                    self.state.language,
                     "Scope: {}",
-                    self.state.ui.scope_filter.as_deref().unwrap_or("all")
+                    "范围：{}",
+                    self.state
+                        .ui
+                        .scope_filter
+                        .as_deref()
+                        .unwrap_or(self.state.language.text("all", "全部"))
                 ),
-                UiCommand::CycleState => format!(
+                UiCommand::CycleState => crate::locale::format!(
+                    self.state.language,
                     "State: {}",
-                    self.state.ui.state_filter.as_deref().unwrap_or("all")
+                    "状态：{}",
+                    self.state
+                        .ui
+                        .state_filter
+                        .as_deref()
+                        .map(|value| views::status_label(value, self.state.language))
+                        .unwrap_or(self.state.language.text("all", "全部"))
                 ),
-                UiCommand::DetailView(v) => format!("{v:?}"),
-                UiCommand::SystemView(v) => format!("{v:?}"),
+                UiCommand::DetailView(v) => self
+                    .state
+                    .language
+                    .label(match v {
+                        DetailView::Content => "Content",
+                        DetailView::Sources => "Sources",
+                        DetailView::History => "History",
+                        DetailView::Technical => "Technical",
+                    })
+                    .into(),
+                UiCommand::SystemView(v) => self
+                    .state
+                    .language
+                    .label(match v {
+                        SystemView::Overview => "Overview",
+                        SystemView::Jobs => "Jobs",
+                        SystemView::Diagnostics => "Diagnostics",
+                        SystemView::Configuration => "Configuration",
+                        SystemView::Maintenance => "Maintenance",
+                    })
+                    .into(),
                 _ => specs
                     .iter()
                     .find(|s| s.command == *c)
@@ -1254,17 +1389,38 @@ impl App {
             }),
         );
         let notice = if s.ui.unknown_write {
-            "Request sent; result unconfirmed. Inspect jobs/results before submitting again".into()
+            self.state.language.label("Request sent; result unconfirmed. Inspect jobs/results before submitting again").into()
         } else if let Some(message) = &s.detail_message {
             message.clone()
         } else {
-            format!(
-                "{:?} / {} — loaded page only",
-                s.route,
+            crate::locale::format!(
+                self.state.language,
+                "{} / {} — loaded page only",
+                "{} / {} — 仅当前加载页",
+                s.language.label(match s.route {
+                    crate::Route::Inbox => "Inbox",
+                    crate::Route::Explorer => "Explorer",
+                    crate::Route::System => "System",
+                }),
                 if s.route == crate::Route::System {
-                    format!("{:?}", s.ui.system_view)
+                    s.language
+                        .label(match s.ui.system_view {
+                            SystemView::Overview => "Overview",
+                            SystemView::Jobs => "Jobs",
+                            SystemView::Diagnostics => "Capture and diagnostics",
+                            SystemView::Configuration => "Configuration",
+                            SystemView::Maintenance => "Maintenance",
+                        })
+                        .to_string()
                 } else {
-                    format!("{:?}", s.ui.detail_view)
+                    s.language
+                        .label(match s.ui.detail_view {
+                            DetailView::Content => "Content",
+                            DetailView::Sources => "Sources",
+                            DetailView::History => "Revision history",
+                            DetailView::Technical => "Technical fields",
+                        })
+                        .to_string()
                 }
             )
         };
@@ -1280,9 +1436,12 @@ impl App {
         );
         if let Some(selection) = s.recovery_selection {
             frame.render_widget(
-                Paragraph::new(format!(
+                Paragraph::new(crate::locale::format!(
+                    self.state.language,
                     "Bundle {} {:?}; select target Worktree; Enter continues",
-                    selection.recovery_bundle_id, selection.application_kind
+                    "恢复包 {} {:?}；请选择目标工作树；Enter 继续",
+                    selection.recovery_bundle_id,
+                    selection.application_kind
                 )),
                 shell.nav,
             );
@@ -1295,16 +1454,23 @@ impl App {
             let label = match result.status {
                 HumanActionStatus::Applied => {
                     if s.ui.action_submits_job {
-                        "Task submitted; not yet completed"
+                        self.state
+                            .language
+                            .label("Task submitted; not yet completed")
                     } else {
-                        "Action applied"
+                        self.state.language.label("Action applied")
                     }
                 }
-                HumanActionStatus::NoDelta => "No change needed",
-                HumanActionStatus::Conflict => {
-                    "Object changed; action not applied. Reread before confirming"
+                HumanActionStatus::NoDelta => {
+                    s.language.text("No change needed", "当前状态无需变更")
                 }
-                HumanActionStatus::Unavailable => "Action unavailable",
+                HumanActionStatus::Conflict => s.language.text(
+                    "Object changed; action not applied. Reread before confirming",
+                    "对象已变化，操作未应用；请重新读取后再确认",
+                ),
+                HumanActionStatus::Unavailable => {
+                    s.language.text("Action unavailable", "操作不可用")
+                }
             };
             frame.render_widget(
                 Paragraph::new(format!(
@@ -1320,8 +1486,10 @@ impl App {
             && let Some(result) = &s.recovery_result
         {
             frame.render_widget(
-                Paragraph::new(format!(
+                Paragraph::new(crate::locale::format!(
+                    self.state.language,
                     "Recovery: {}{}",
+                    "恢复: {}{}",
                     result
                         .application_status
                         .map_or_else(|| "unavailable".into(), |status| format!("{status:?}")),
@@ -1339,7 +1507,7 @@ impl App {
             (s.ui.focus == Focus::Tools).then_some(s.ui.tool_selection),
         );
         if frame.area().width < 60 || frame.area().height < 18 {
-            frame.render_widget(Paragraph::new("Terminal too small; enlarge the window. Content and edits are retained. Esc back; : commands; ? help").wrap(Wrap{trim:false}),if shell.list.width>0{shell.list}else{shell.inspector});
+            frame.render_widget(Paragraph::new(self.state.language.label("Terminal too small; enlarge the window. Content and edits are retained. Esc back; : commands; ? help")).wrap(Wrap{trim:false}),if shell.list.width>0{shell.list}else{shell.inspector});
         } else {
             if shell.list.width > 0 {
                 views::render(frame, shell.list, s);
@@ -1351,9 +1519,9 @@ impl App {
                         .block(
                             Block::default()
                                 .title(if s.ui.focus == Focus::Detail {
-                                    "Detail [focused]"
+                                    self.state.language.label("Detail [focused]")
                                 } else {
-                                    "Detail"
+                                    self.state.language.label("Detail")
                                 })
                                 .borders(Borders::ALL),
                         ),
@@ -1386,9 +1554,11 @@ impl App {
                 .collect::<Vec<_>>();
             frame.render_widget(
                 Paragraph::new(if results.is_empty() {
-                    "This page: no task result references"
+                    self.state
+                        .language
+                        .label("This page: no task result references")
                 } else {
-                    "This page results:"
+                    self.state.language.label("This page results:")
                 }),
                 area,
             );
@@ -1418,7 +1588,7 @@ impl App {
             s.ui.read_at
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or_else(
-                    || "not yet read".into(),
+                    || self.state.language.label("not yet read").into(),
                     |d| {
                         format!(
                             "{:02}:{:02}:{:02} UTC",
@@ -1431,16 +1601,28 @@ impl App {
         let loaded = snapshot_item_count(s);
         let matched = views::visible_indices(s).len();
         let page = if s.human.is_some() {
-            format!("{matched}/{loaded} this page")
+            crate::locale::format!(
+                self.state.language,
+                "{matched}/{loaded} this page",
+                "本页 {matched}/{loaded} 项"
+            )
         } else {
-            "page not loaded".into()
+            self.state.language.label("page not loaded").into()
         };
         frame.render_widget(
-            Paragraph::new(format!(
-                "{:?} | Read: {time} | {page}{}",
-                s.shell.connection,
+            Paragraph::new(crate::locale::format!(
+                self.state.language,
+                "{} | Read: {time} | {page}{}",
+                "{} | 读取：{time} | {page}{}",
+                match s.shell.connection {
+                    ConnectionState::Connected => s.language.text("Connected", "已连接"),
+                    ConnectionState::Connecting => s.language.text("Connecting", "连接中"),
+                    ConnectionState::Disconnected => s.language.text("Disconnected", "已断开"),
+                    ConnectionState::ServerStopping =>
+                        s.language.text("ServerStopping", "服务正在停止"),
+                },
                 if s.ui.reading || s.shell.pending > 0 {
-                    " | refreshing"
+                    self.state.language.label(" | refreshing")
                 } else {
                     ""
                 }
@@ -1456,19 +1638,25 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(if s.ui.focus == Focus::Detail {
-                "↑↓ scroll  Esc back  / find  : commands"
+                self.state
+                    .language
+                    .label("↑↓ scroll  Esc back  / find  : commands")
             } else if shell.compact {
-                "↑↓ select  Enter detail  Tab focus  : commands"
+                self.state
+                    .language
+                    .label("↑↓ select  Enter detail  Tab focus  : commands")
             } else {
-                "↑↓ select  Enter detail  Tab/Shift+Tab focus  : commands"
+                self.state
+                    .language
+                    .label("↑↓ select  Enter detail  Tab/Shift+Tab focus  : commands")
             }),
             shell.hints,
         );
         if s.ui.input == Some(false) || (s.detail.is_some() && !s.ui.find.is_empty()) {
             let label = if s.detail.is_some() {
-                "Find in loaded body"
+                self.state.language.label("Find in loaded body")
             } else {
-                "Filter current page"
+                self.state.language.label("Filter current page")
             };
             let matches = if s.detail.is_some() {
                 views::detail_text(s)
@@ -1482,8 +1670,10 @@ impl App {
                 matched
             };
             frame.render_widget(
-                Paragraph::new(format!(
+                Paragraph::new(crate::locale::format!(
+                    self.state.language,
                     "{label}: {} | {matches} matching lines | Esc closes",
+                    "{label}：{} | 匹配 {matches} 行 | Esc 关闭",
                     if s.detail.is_some() {
                         &s.ui.find
                     } else {
@@ -1508,30 +1698,48 @@ impl App {
             let start =
                 s.ui.palette_selection
                     .saturating_sub(visible.saturating_sub(1));
-            let body = format!(
+            let body = crate::locale::format!(
+                self.state.language,
                 "{}\n{}\n↑↓ choose · Enter execute · Esc cancel",
+                "{}\n{}\n↑↓ 选择 · Enter 执行 · Esc 取消",
                 if s.ui.help {
-                    "Help: Tab/Shift+Tab focus; arrows navigate".into()
+                    self.state
+                        .language
+                        .label("Help: Tab/Shift+Tab focus; arrows navigate")
+                        .into()
                 } else {
-                    format!("Commands: {}", s.ui.query)
+                    crate::locale::format!(
+                        self.state.language,
+                        "Commands: {}",
+                        "命令：{}",
+                        s.ui.query
+                    )
                 },
-                entries
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(visible)
-                    .map(|(i, e)| format!(
-                        "{} {}{}",
-                        if i == s.ui.palette_selection {
-                            ">"
-                        } else {
-                            " "
-                        },
-                        e.name,
-                        e.reason.map_or(String::new(), |r| format!(" — {r}"))
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                if entries.is_empty() {
+                    s.language
+                        .text("No matching commands", "没有匹配命令")
+                        .into()
+                } else {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(visible)
+                        .map(|(i, e)| {
+                            format!(
+                                "{} {}{}",
+                                if i == s.ui.palette_selection {
+                                    ">"
+                                } else {
+                                    " "
+                                },
+                                e.name,
+                                e.reason.map_or(String::new(), |r| format!(" — {r}"))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
             );
             let (clear, modal) = components::modal(body);
             frame.render_widget(clear, area);
@@ -1556,7 +1764,10 @@ impl App {
                 area.width.saturating_sub(2),
                 1,
             );
-            frame.render_widget(Paragraph::new("[Back / close] Esc"), close);
+            frame.render_widget(
+                Paragraph::new(self.state.language.label("[Back / close] Esc")),
+                close,
+            );
             self.hit_regions
                 .borrow_mut()
                 .push((close, UiCommand::CancelModal));
@@ -1568,8 +1779,81 @@ impl App {
 mod tests {
     use super::*;
     use evertrace_protocol::dto::{HumanGovernanceResponse, HumanSnapshotStatus, HumanSurface};
+    #[test]
+    fn system_scope_switch_restarts_pagination_and_rejects_previous_response() {
+        let mut app = App::with_language(crate::Language::English);
+        app.dispatch(UiCommand::Navigate(crate::Route::System));
+        let jobs = Some(evertrace_protocol::dto::HumanSystemListSelection::Jobs);
+        assert_eq!(crate::app::system_selection(&app.state), jobs);
+        app.state.ui.page_cursor = Some("runtime:job:previous".into());
+        let generation = app.state.ui.read_generation;
+        app.dispatch(UiCommand::SystemView(SystemView::Jobs));
+        assert_eq!(app.state.ui.read_generation, generation);
+        assert!(app.state.ui.page_cursor.is_some());
+        assert_eq!(
+            app.dispatch(UiCommand::SystemView(SystemView::Diagnostics)),
+            UiCommand::Refresh
+        );
+        assert_eq!(crate::app::system_selection(&app.state), None);
+        assert!(app.state.ui.page_cursor.is_none());
+        assert_ne!(app.state.ui.read_generation, generation);
+        app.handle(AppEvent::HumanRead {
+            surface: HumanSurface::System,
+            locator: HumanReadLocator::View {
+                generation,
+                request: Box::new(HumanReadLocator::List),
+            },
+            response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
+                frontier: 99,
+                status: HumanSnapshotStatus::Ready,
+                degraded_reasons: vec![],
+                items: vec![],
+                next_cursor: Some("old".into()),
+            },
+        });
+        assert!(app.state.human.is_none());
+        assert_eq!(
+            app.dispatch(UiCommand::SystemView(SystemView::Overview)),
+            UiCommand::Refresh
+        );
+        for command in [UiCommand::Refresh, UiCommand::FirstPage] {
+            let request = crate::app::human_request(&app.state, command).unwrap();
+            assert!(matches!(
+                request,
+                evertrace_protocol::dto::HumanGovernanceRequest::Read {
+                    request: evertrace_protocol::dto::HumanReadRequest::List {
+                        system_selection: Some(_),
+                        after: None,
+                        ..
+                    }
+                }
+            ));
+        }
+        app.handle(AppEvent::Disconnected);
+        assert_eq!(crate::app::system_selection(&app.state), jobs);
+        let command = app.handle(AppEvent::Health(
+            evertrace_protocol::response::HealthResponse {
+                protocol_version: evertrace_protocol::dto::PROTOCOL_VERSION,
+                mode: evertrace_protocol::dto::HealthMode::Normal,
+                config_version: 1,
+                effective_config_hash: "0".repeat(64),
+                algorithm_revision: 1,
+                host_canary: None,
+            },
+        ));
+        assert!(matches!(
+            crate::app::human_request(&app.state, command),
+            Some(evertrace_protocol::dto::HumanGovernanceRequest::Read {
+                request: evertrace_protocol::dto::HumanReadRequest::List {
+                    system_selection: Some(_),
+                    ..
+                }
+            })
+        ));
+    }
     fn populated() -> App {
-        let mut app = App::new();
+        let mut app = App::with_language(crate::Language::English);
         app.dispatch(UiCommand::Navigate(crate::Route::Explorer));
         app.state.human = Some(HumanGovernanceResponse::Snapshot {
             diagnostics: None,
@@ -1596,6 +1880,124 @@ mod tests {
             .collect()
     }
     #[test]
+    fn language_search_and_new_detail_frontier_preserve_page_and_navigation() {
+        let mut app = populated();
+        let mut item = selected_item(&app.state).unwrap().clone();
+        item.object_kind = "core_membership".into();
+        let revision = evertrace_domain::revision::RevisionId::new_v7();
+        item.revision_ref = Some(revision.to_string());
+        if let Some(HumanGovernanceResponse::Snapshot { items, .. }) = &mut app.state.human {
+            items[0] = item.clone();
+        }
+        item.semantic_detail = Some(evertrace_protocol::dto::HumanSemanticDetail {
+            object_ref: item.object_ref.clone(),
+            revision_ref: item.revision_ref.clone(),
+            state: evertrace_protocol::dto::HumanContentState::Ready,
+            preview: None,
+            original_bytes: 0,
+            content: Some(
+                evertrace_protocol::dto::HumanSemanticContent::CoreMembership(Box::new(
+                    evertrace_domain::semantic::CoreMembership {
+                        core_membership_id: evertrace_domain::ids::CoreMembershipId::new_v7(),
+                        membership_revision_id: revision,
+                        atom_revision_id: revision,
+                        scope_identity: evertrace_domain::semantic::CoreScopeIdentity::Global,
+                        support_contract_ref: revision,
+                        authorization_revision_refs: vec![revision],
+                        supersedes_membership_revision_id: None,
+                        created_by_acceptance_ref: revision,
+                        active: true,
+                    },
+                )),
+            ),
+        });
+        app.handle(AppEvent::HumanRead {
+            surface: HumanSurface::Explorer,
+            locator: HumanReadLocator::Detail {
+                expected_frontier: 4,
+                stable_key: item.stable_key.clone(),
+                expected_revision_ref: item.revision_ref.clone(),
+            },
+            response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
+                frontier: 9,
+                status: HumanSnapshotStatus::Ready,
+                degraded_reasons: vec![],
+                items: vec![item.clone()],
+                next_cursor: None,
+            },
+        });
+        assert_eq!(action_frontier(&app.state), Some(9));
+        assert!(matches!(
+            &app.state.human,
+            Some(HumanGovernanceResponse::Snapshot {
+                frontier: 4,
+                next_cursor: Some(_),
+                ..
+            })
+        ));
+        for language in [crate::Language::English, crate::Language::Chinese] {
+            app.dispatch(UiCommand::Language(language));
+            assert!(views::detail_text(&app.state).contains(&revision.to_string()));
+            for query in ["Revision history", "修订历史"] {
+                app.state.ui.query = query.into();
+                assert!(
+                    app.palette()
+                        .iter()
+                        .any(|s| s.command == UiCommand::DetailView(DetailView::History))
+                );
+            }
+            draw(&app, 80, 24);
+            assert!(!app.state.write_queued);
+        }
+        app.state.ui.query.clear();
+        app.dispatch(UiCommand::DetailView(DetailView::History));
+        assert_eq!(
+            app.state
+                .related_context
+                .as_ref()
+                .unwrap()
+                .expected_frontier,
+            9
+        );
+        app.handle(AppEvent::HumanRead {
+            surface: HumanSurface::Explorer,
+            locator: HumanReadLocator::Related {
+                relation: evertrace_protocol::dto::HumanRelationKind::ObjectRevisions,
+                source_stable_key: item.stable_key.clone(),
+                expected_source_revision_ref: revision.to_string(),
+                expected_frontier: 9,
+            },
+            response: HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
+                frontier: 12,
+                status: HumanSnapshotStatus::Ready,
+                degraded_reasons: vec![],
+                items: vec![item.clone()],
+                next_cursor: Some("history-next".into()),
+            },
+        });
+        assert_eq!(
+            app.state
+                .related_context
+                .as_ref()
+                .unwrap()
+                .expected_frontier,
+            12
+        );
+        app.dispatch(UiCommand::CancelModal);
+        assert_eq!(
+            app.state.detail.as_ref().unwrap().stable_key,
+            item.stable_key
+        );
+        assert_eq!(app.state.detail_frontier, Some(9));
+        assert!(app.state.related_context.is_none());
+        assert!(matches!(
+            &app.state.human,
+            Some(HumanGovernanceResponse::Snapshot { frontier: 4, .. })
+        ));
+    }
+    #[test]
     fn palette_mouse_tabs_and_empty_jobs_use_visible_context() {
         let mut app = populated();
         app.state.ui.focus = Focus::Tabs;
@@ -1613,6 +2015,31 @@ mod tests {
         app = populated();
         app.state.route = crate::Route::System;
         assert!(draw(&app, 80, 24).contains("No tasks on this page"));
+        assert!(draw(&app, 80, 24).contains("More pages are available"));
+        assert!(
+            app.specs()
+                .iter()
+                .any(|spec| spec.command == UiCommand::NextPage && spec.reason.is_none())
+        );
+        let next = app
+            .hit_regions
+            .borrow()
+            .iter()
+            .find(|(_, c)| *c == UiCommand::NextPage)
+            .unwrap()
+            .0;
+        assert_eq!(
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: next.x,
+                row: next.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::NextPage
+        );
+        assert_eq!(app.state.ui.page_cursor.as_deref(), Some("next"));
+        app = populated();
+        app.state.route = crate::Route::System;
         app.state.ui.filter = "missing".into();
         assert!(draw(&app, 80, 24).contains("No matches on this page (0 loaded)"));
         app.dispatch(UiCommand::Commands);
@@ -1696,7 +2123,10 @@ mod tests {
     }
     #[test]
     fn responsive_mouse_filter_and_input_share_selection_without_quitting() {
-        assert_eq!(App::new().state.route, crate::Route::System);
+        assert_eq!(
+            App::with_language(crate::Language::English).state.route,
+            crate::Route::System
+        );
         let mut app = populated();
         draw(&app, 80, 24);
         let list = app.visible_layout.borrow().list;
@@ -1761,7 +2191,7 @@ mod tests {
         app.state.detail = selected_item(&app.state).cloned();
         app.state.detail_scroll = 6;
         app.state.ui.page_cursor = Some("original".into());
-        app.save_navigation();
+        app.save_navigation(false);
         app.state.detail = None;
         app.state.ui.filter.clear();
         app.state.selection = 0;
@@ -1838,5 +2268,14 @@ mod tests {
             },
         });
         assert_eq!(app.state.human, snapshot);
+        assert!(
+            app.state.ui.reading,
+            "an older response cannot finish the new read"
+        );
+        app.dispatch(UiCommand::CancelModal);
+        assert!(
+            !app.state.ui.reading,
+            "local cancellation does not leave a pending view"
+        );
     }
 }

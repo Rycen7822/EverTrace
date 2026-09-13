@@ -523,6 +523,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     assert!(serde_json::from_value::<HumanGovernanceRequest>(serde_json::json!({"operation":"export","selections":[{"object_ref":"selected-object","expected_revision_ref":null,"cas_ref":"untrusted"}]})).is_err());
     let request = HumanGovernanceRequest::Read {
         request: HumanReadRequest::List {
+            system_selection: None,
             surface: WireSurface::Inbox,
             expected_frontier: Some(7),
             after: Some("object:a".into()),
@@ -530,6 +531,26 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         },
     };
     let json = serde_json::to_string(&request).unwrap();
+    assert!(!json.contains("system_selection"));
+    for surface in [
+        WireSurface::Inbox,
+        WireSurface::Explorer,
+        WireSurface::System,
+    ] {
+        let selected = HumanGovernanceRequest::Read {
+            request: HumanReadRequest::List {
+                surface,
+                system_selection: Some(evertrace_protocol::dto::HumanSystemListSelection::Jobs),
+                expected_frontier: None,
+                after: None,
+                limit: HUMAN_PAGE_LIMIT,
+            },
+        };
+        assert_eq!(selected.validate(), surface == WireSurface::System);
+    }
+    assert!(serde_json::from_str::<HumanGovernanceRequest>(
+        r#"{"operation":"read","request":{"kind":"list","surface":"system","system_selection":"unknown","expected_frontier":null,"after":null,"limit":1}}"#,
+    ).is_err());
     assert_eq!(
         serde_json::from_str::<HumanGovernanceRequest>(&json).unwrap(),
         request
@@ -973,7 +994,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     attempt_item.object_ref = Some(AttemptId::new_v7().to_string());
     attempt_item.revision_ref = Some(RevisionId::new_v7().to_string());
     attempt_item.lifecycle = Some("interrupted".into());
-    let mut app = App::new();
+    let mut app = App::with_language(evertrace_tui::Language::English);
     app.dispatch(evertrace_tui::UiCommand::Navigate(
         evertrace_tui::Route::Inbox,
     ));
@@ -1116,7 +1137,7 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
     ]);
     let command = JournalCommand::new(CommandId::new_v7(), events).unwrap();
     handle.commit(command, 1).await.unwrap();
-    let mut failed_job = job;
+    let mut failed_job = job.clone();
     failed_job.state = JobStatus::Failed;
     failed_job.terminal = Some(Box::new(JobTerminalAudit {
         outcome: JobTerminalOutcome::Failed,
@@ -1152,6 +1173,7 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
         .list_system(
             &evertrace_domain::config::EffectiveConfig::new(diagnostic_config).unwrap(),
             None,
+            false,
             None,
             None,
             HUMAN_PAGE_LIMIT,
@@ -1246,6 +1268,11 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
         .iter()
         .find(|item| item.stable_key == format!("runtime:job:{job_id}"))
         .unwrap();
+    assert!(
+        matches!(&job_item.system_detail,
+        Some(HumanSystemDetail::Job { detail }) if detail.job_id == job_id),
+        "System task filters consume typed list metadata without opening each row"
+    );
     let config_detail = service
         .detail(
             HumanSurface::System,
@@ -1322,6 +1349,74 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
         .unwrap()
         .unwrap();
     assert_eq!(rebuilt_job.items, job_detail.items);
+    // Dirty rows sort before jobs, but the Jobs scope paginates the selected rows.
+    let service = HumanGovernanceService::new(handle.clone(), CONFIG);
+    let config = evertrace_domain::config::EffectiveConfig::default();
+    let jobs_first = service
+        .list_system(&config, None, true, None, None, HUMAN_PAGE_LIMIT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(jobs_first.items.len(), 1);
+    assert_eq!(
+        jobs_first.items[0].stable_key,
+        format!("runtime:job:{job_id}")
+    );
+    let events = (0..65)
+        .map(|index| {
+            let mut next = job.clone();
+            next.job_id = JobId::new_v7();
+            next.idempotency_key = format!("s31-page-job-{index}");
+            JournalEventDraft::runtime(3, CONFIG, "s31-test-v1", JournalPayload::JobState(next))
+        })
+        .collect();
+    handle
+        .commit(JournalCommand::new(CommandId::new_v7(), events).unwrap(), 3)
+        .await
+        .unwrap();
+    handle.project().await.unwrap();
+    let jobs_first = service
+        .list_system(&config, None, true, None, None, HUMAN_PAGE_LIMIT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(jobs_first.items.len(), 64);
+    assert_eq!(
+        jobs_first.next_cursor.as_deref(),
+        Some(jobs_first.items.last().unwrap().stable_key.as_str())
+    );
+    let jobs_second = service
+        .list_system(
+            &config,
+            None,
+            true,
+            Some(jobs_first.frontier),
+            jobs_first.next_cursor.as_deref(),
+            HUMAN_PAGE_LIMIT,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(jobs_second.items.len(), 2);
+    assert!(jobs_second.next_cursor.is_none());
+    let keys: std::collections::BTreeSet<_> = jobs_first
+        .items
+        .iter()
+        .chain(&jobs_second.items)
+        .map(|item| item.stable_key.as_str())
+        .collect();
+    assert_eq!(keys.len(), 66);
+    assert!(keys.iter().all(|key| key.starts_with("runtime:job:")));
+    let all = service
+        .list_system(&config, None, false, None, None, HUMAN_PAGE_LIMIT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        all.items
+            .iter()
+            .any(|item| !item.stable_key.starts_with("runtime:job:"))
+    );
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
 }
@@ -1837,6 +1932,32 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         vec![
             JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
             JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+            JournalPayload::EvidenceSurfaceRecorded(Box::new(
+                evertrace_domain::evidence::EvidenceSurface {
+                    source_observation_revision_ref: observation.source_observation_id,
+                    source_role: observation.source_role,
+                    content_trust: observation.content_trust,
+                    instruction_authority: evertrace_domain::evidence::InstructionAuthority::None,
+                    task_id: Some(task_id),
+                    repository_instance_id: Some(repository_id),
+                    worktree_instance_id: None,
+                    event_time_us: 1,
+                    recorded_at_us: 1,
+                    source_sequence: 1,
+                    capture_completeness: observation.capture_completeness,
+                    canonicalization_version: 1,
+                    span_hash: evertrace_domain::evidence::hex(
+                        &evertrace_domain::evidence::evidence_span_hash(
+                            observation.source_observation_id,
+                            1,
+                            "governance source evidence",
+                        )
+                        .unwrap(),
+                    ),
+                    projection_generation: 1,
+                    protected_text: "governance source evidence".into(),
+                },
+            )),
             JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
                 source_instance_id: receipt.source_instance_id.clone(),
                 source_revision: receipt.source_revision.clone(),
@@ -1872,6 +1993,47 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
     let (handle, writer_task) = spawn_writer(writer, 8).unwrap();
     handle.commit(initial, 1).await.unwrap();
     let proposals = RevisionProposalService;
+
+    let snapshot = handle.project().await.unwrap();
+    let observation_ref = observation.source_observation_id.to_string();
+    let fact = snapshot
+        .rows
+        .iter()
+        .find(|row| {
+            row.object_id.as_deref() == Some(&observation_ref)
+                && row.row_class == Some(evertrace_store::ObjectRowClass::Object)
+        })
+        .unwrap();
+    let projection = snapshot
+        .rows
+        .iter()
+        .find(|row| row.row_id == format!("projection:evidence_surface:{observation_ref}"))
+        .unwrap();
+    let reads = HumanGovernanceService::new(handle.clone(), CONFIG);
+    let by_reference = reads
+        .detail(
+            HumanSurface::Explorer,
+            &observation_ref,
+            snapshot.frontier,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_reference.items.len(), 1);
+    assert_eq!(by_reference.items[0].stable_key, fact.row_id);
+    let by_projection = reads
+        .detail(
+            HumanSurface::Explorer,
+            &projection.row_id,
+            snapshot.frontier,
+            Some(&observation_ref),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_projection.items.len(), 1);
+    assert_eq!(by_projection.items[0].stable_key, projection.row_id);
 
     let view = SemanticCurrentView::from_snapshot(&handle.project().await.unwrap()).unwrap();
     let ProposalResolution::Revision {
@@ -2046,6 +2208,91 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         source_page.items[0].semantic_detail.is_none(),
         "Related list never loads semantic bodies"
     );
+
+    // An unrelated background commit must not make an immutable, readable
+    // revision impossible to open; pagination and writes remain pinned.
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    2,
+                    CONFIG,
+                    "s31-test-v1",
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::ObjectsProjection,
+                        target_id: "unrelated-detail-read".into(),
+                        algorithm_revision: "s31-test-v1".into(),
+                        source_watermark: readable.frontier,
+                    }),
+                )],
+            )
+            .unwrap(),
+            2,
+        )
+        .await
+        .unwrap();
+    let new_frontier = handle.project().await.unwrap().frontier;
+    assert!(new_frontier > readable.frontier);
+    let after_background = service
+        .detail(
+            HumanSurface::Explorer,
+            &readable.items[0].stable_key,
+            readable.frontier,
+            Some(&first_atom.revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_background.frontier, new_frontier);
+    assert!(
+        matches!(&after_background.items[0].semantic_detail.as_ref().unwrap().content,
+        Some(evertrace_engine::HumanSemanticContent::Atom(atom)) if **atom == first_atom)
+    );
+    let related_request = HumanRelatedRequest {
+        relation: evertrace_engine::HumanRelationKind::ObjectSources,
+        source_stable_key: &readable.items[0].stable_key,
+        expected_source_revision_ref: &first_atom.revision_id.to_string(),
+        expected_frontier: readable.frontier,
+        after: None,
+        limit: 1,
+    };
+    assert_eq!(
+        service
+            .related(related_request)
+            .await
+            .unwrap()
+            .unwrap()
+            .frontier,
+        new_frontier
+    );
+    let cursor = source_page
+        .next_cursor
+        .as_deref()
+        .expect("source references have a second page");
+    assert_eq!(
+        service
+            .related(HumanRelatedRequest {
+                relation: evertrace_engine::HumanRelationKind::ObjectSources,
+                source_stable_key: &readable.items[0].stable_key,
+                expected_source_revision_ref: &first_atom.revision_id.to_string(),
+                expected_frontier: readable.frontier,
+                after: Some(cursor),
+                limit: 1,
+            })
+            .await
+            .unwrap()
+            .unwrap_err(),
+        (new_frontier, None)
+    );
+    assert!(matches!(
+        service
+            .create_backup(RequestId::new_v7(), readable.frontier)
+            .await
+            .unwrap(),
+        evertrace_engine::HumanActionOutcome::Conflict { .. }
+    ));
+    assert_eq!(handle.project().await.unwrap().frontier, new_frontier);
 
     fn prove_support_replacement<'a>(
         handle: &'a evertrace_engine::WriterHandle,

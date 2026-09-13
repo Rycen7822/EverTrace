@@ -3,6 +3,7 @@ use evertrace_domain::repository::RecoveryApplicationKind;
 use evertrace_protocol::dto::{NegativeReviewDecision, ProposalHumanDecision};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiCommand {
+    Language(crate::Language),
     Commands,
     Help,
     Filter,
@@ -56,5 +57,6 @@ pub enum UiCommand {
 pub(crate) struct UiCommandSpec {
     pub command: UiCommand,
     pub name: &'static str,
+    pub search_name: &'static str,
     pub reason: Option<&'static str>,
 }

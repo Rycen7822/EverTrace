@@ -16,7 +16,10 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
                 report
                     .and_then(|r| r.checks.iter().find(|c| c.name == name))
                     .and_then(|c| c.count)
-                    .map_or_else(|| "not read".into(), |n| n.to_string())
+                    .map_or_else(
+                        || state.language.label("not read").into(),
+                        |n| n.to_string(),
+                    )
             };
             let capture = report.and_then(|r| r.host.as_ref()).map_or_else(
                 || {
@@ -26,30 +29,46 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
                         .as_ref()
                         .and_then(|h| h.host_canary.as_ref())
                         .map_or_else(
-                            || "Hook: not observed".into(),
+                            || state.language.label("Hook: not observed").into(),
                             |h| {
-                                format!(
+                                crate::locale::format!(
+                                    state.language,
                                     "Last Health: Host canary: {:?}; CaptureReceipt: {}",
-                                    h.status, h.capture_receipt_observed
+                                    "上次健康读取：宿主观测 {:?}；采集凭据 {}",
+                                    h.status,
+                                    h.capture_receipt_observed
                                 )
                             },
                         )
                 },
                 |h| {
-                    format!(
+                    crate::locale::format!(
+                        state.language,
                         "Hook: {:?}; receipt observed: {}",
-                        h.status, h.capture_receipt_observed
+                        "钩子：{:?}；已观测采集凭据：{}",
+                        h.status,
+                        h.capture_receipt_observed
                     )
                 },
             );
             let provider = report
                 .and_then(|r| r.checks.iter().find(|c| c.name == "provider_connectivity"))
-                .map_or_else(|| "not checked".into(), |c| format!("{:?}", c.state));
+                .map_or_else(
+                    || state.language.label("not checked").into(),
+                    |c| format!("{:?}", c.state),
+                );
             let water = report.map_or_else(
-                || "Projection watermarks: not read".into(),
+                || {
+                    state
+                        .language
+                        .label("Projection watermarks: not read")
+                        .into()
+                },
                 |r| {
-                    format!(
+                    crate::locale::format!(
+                        state.language,
                         "Projection checkpoints: {} · metadata only",
+                        "投影检查点：{} · 仅元数据",
                         r.tables
                             .iter()
                             .map(|t| t
@@ -60,8 +79,10 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
                     )
                 },
             );
-            let body = format!(
+            let body = crate::locale::format!(
+                state.language,
                 "{capture}\nQueued {} · Leased {} · Historical failures {}\nModel: {provider} (no probe); recorded calls {}\n{water}",
+                "{capture}\n排队 {} · 已领取 {} · 历史失败 {}\n模型：{provider}（未发起探测）；已记录调用 {}\n{water}",
                 count("jobs_queued"),
                 count("jobs_leased"),
                 count("jobs_failed_history"),
@@ -73,41 +94,53 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
                 f,
                 Rect::new(a.x, a.y + height, a.width, a.height - height),
                 state,
-                "Tasks · current page (leased = claimed)",
+                state
+                    .language
+                    .label("Tasks · current page (leased = claimed)"),
             );
         }
-        SystemView::Jobs => {
-            super::render_list(f, a, state, "Tasks · name / state / target / reason")
-        }
+        SystemView::Jobs => super::render_list(
+            f,
+            a,
+            state,
+            state
+                .language
+                .label("Tasks · name / state / target / reason"),
+        ),
         SystemView::Diagnostics => {
             if state.ui.diagnostic_detail {
-                let body=report.and_then(|r|r.checks.get(state.ui.diagnostic_selection).map(|c|(r,c))).map_or_else(||"Selected diagnostic is no longer available; Esc returns".into(),|(r,c)|format!("Check: {}\nObserved state: {:?}\nRecorded value: {}\nLimit: {}\nSample: {} microseconds since Unix epoch (UTC)\nScope: existing local diagnostic report, non-atomic.\nNotChecked means no check was executed; Historical is not a current failure.\nMetadata does not verify content integrity. This view never starts a provider probe.\nEsc returns to the same diagnostic row.",c.name,c.state,c.count.map_or_else(||"not supplied".into(),|v|v.to_string()),c.limit.map_or_else(||"not supplied".into(),|v|v.to_string()),r.observed_at_us));
+                let body=report.and_then(|r|r.checks.get(state.ui.diagnostic_selection).map(|c|(r,c))).map_or_else(||state.language.label("Selected diagnostic is no longer available; Esc returns").into(),|(r,c)|crate::locale::format!(state.language, "Check: {}\nObserved state: {:?}\nRecorded value: {}\nLimit: {}\nSample: {} microseconds since Unix epoch (UTC)\nScope: existing local diagnostic report, non-atomic.\nNotChecked means no check was executed; Historical is not a current failure.\nMetadata does not verify content integrity. This view never starts a provider probe.\nEsc returns to the same diagnostic row.", "检查：{}\n观测状态：{:?}\n记录值：{}\n限制：{}\n采样：Unix 纪元起 {} 微秒（UTC）\n范围：已有本地诊断报告，非原子快照。\nNotChecked 表示未检查；Historical 表示历史记录，不是当前故障。\n元数据不证明内容完整性；本页不会发起模型探测。\nEsc 返回同一诊断项。",c.name,c.state,c.count.map_or_else(||state.language.label("not supplied").into(),|v|v.to_string()),c.limit.map_or_else(||state.language.label("not supplied").into(),|v|v.to_string()),r.observed_at_us));
                 f.render_widget(
-                    crate::components::table("Diagnostic detail", body)
+                    crate::components::table(state.language.label("Diagnostic detail"), body)
                         .wrap(Wrap { trim: false })
                         .scroll((state.detail_scroll, 0)),
                     a,
                 );
                 return;
             }
-            let body=report.map_or_else(||"Diagnostics not yet read".into(),|r|{
-                let mut lines=vec![format!("Diagnostics sampled at {} microseconds since Unix epoch (UTC); non-atomic",r.observed_at_us),
-                    "Metadata is not content verification; terminal failures are history.".into(),
-                    "Provider NotChecked does not mean healthy; this view never calls the model.".into()];
-                for (index,c) in r.checks.iter().enumerate().filter(|(_,c)|c.name.to_lowercase().contains(&state.ui.filter.to_lowercase())) {lines.push(format!("{} {} | {:?} | recorded {} | limit {}",if index==state.ui.diagnostic_selection{">"}else{" "},c.name,c.state,c.count.map_or_else(||"not supplied".into(),|v|v.to_string()),c.limit.map_or_else(||"not supplied".into(),|v|v.to_string())));}
+            let body=report.map_or_else(||state.language.label("Diagnostics not yet read").into(),|r|{
+                let mut lines=vec![crate::locale::format!(state.language, "Diagnostics sampled at {} microseconds since Unix epoch (UTC); non-atomic", "诊断采样于 Unix 纪元起 {} 微秒（UTC）；非原子快照",r.observed_at_us),
+                    state.language.label("Metadata is not content verification; terminal failures are history.").into(),
+                    state.language.label("Provider NotChecked does not mean healthy; this view never calls the model.").into()];
+                for (index,c) in r.checks.iter().enumerate().filter(|(_,c)|c.name.to_lowercase().contains(&state.ui.filter.to_lowercase())) {lines.push(crate::locale::format!(state.language, "{} {} | {:?} | recorded {} | limit {}", "{} {} | {:?} | 记录 {} | 限制 {}",if index==state.ui.diagnostic_selection{">"}else{" "},c.name,c.state,c.count.map_or_else(||state.language.label("not supplied").into(),|v|v.to_string()),c.limit.map_or_else(||state.language.label("not supplied").into(),|v|v.to_string())));}
                 for (name,t) in ["journal","objects","relations","search"].into_iter().zip(&r.tables){lines.push(format!("{name}: version {:?}; checkpoint {:?}; schema {:?}",t.version,t.checkpoint,t.schema_matches));}
-                if let Some(h)=&r.host {lines.push(format!("Host canary: {:?}; CaptureReceipt: {}; native delivery: {}; MCP consumed: {}",h.status,h.capture_receipt_observed,h.native_delivery_observed,h.mcp_claim_consumed));} else {lines.push("Host canary: not_run".into());}
+                if let Some(h)=&r.host {lines.push(crate::locale::format!(state.language, "Host canary: {:?}; CaptureReceipt: {}; native delivery: {}; MCP consumed: {}", "宿主观测: {:?}; CaptureReceipt: {}; 原生投递: {}; MCP 已消费: {}",h.status,h.capture_receipt_observed,h.native_delivery_observed,h.mcp_claim_consumed));} else {lines.push("Host canary: not_run".into());}
                 lines.join("\n")
             });
             f.render_widget(
-                crate::components::table("Capture / storage / model diagnostics", body)
-                    .scroll((state.detail_scroll, 0))
-                    .wrap(Wrap { trim: false }),
+                crate::components::table(
+                    state
+                        .language
+                        .label("Capture / storage / model diagnostics"),
+                    body,
+                )
+                .scroll((state.detail_scroll, 0))
+                .wrap(Wrap { trim: false }),
                 a,
             );
         }
         SystemView::Configuration => {
-            let mut body="Configuration is read and written through the daemon.\nUse : Edit configuration to read the existing document.\nSaving uses its file hash; failed saves preserve the draft.\nRestartRequired means restart is needed; TUI does not restart the service.".to_string();
+            let mut body=state.language.text("Configuration is read and written through the daemon.\nUse : Edit configuration to read the existing document.\nSaving uses its file hash; failed saves preserve the draft.\nRestartRequired means restart is needed; TUI does not restart the service.", "配置通过服务端读取与保存。\n从命令面板选择编辑配置，读取现有文档。\n保存时校验原文件哈希；失败会保留草稿。\nRestartRequired 表示需要重启；本界面不会重启服务。").to_string();
             if let Some(HumanGovernanceResponse::Snapshot { items, .. }) = &state.human {
                 for i in items {
                     if let Some(HumanSystemDetail::Config {
@@ -116,11 +149,13 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
                         reload,
                     }) = &i.system_detail
                     {
-                        body.push_str(&format!(
+                        body.push_str(&crate::locale::format!(
+                            state.language,
                             "\nConfig version: {config_version}\nEffective hash: {}\nReload: {}",
+                            "\n配置版本: {config_version}\n生效哈希: {}\n重载: {}",
                             super::short(&evertrace_domain::evidence::hex(effective_config_hash)),
                             reload.as_ref().map_or_else(
-                                || "not supplied".into(),
+                                || state.language.label("not supplied").into(),
                                 |r| format!("{:?}", r.outcome)
                             )
                         ));
@@ -128,22 +163,29 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
                 }
             }
             f.render_widget(
-                crate::components::table("Configuration", body).wrap(Wrap { trim: false }),
+                crate::components::table(state.language.label("Configuration"), body)
+                    .wrap(Wrap { trim: false }),
                 a,
             );
         }
         SystemView::Maintenance => {
-            let mut body = format!(
+            let mut body = crate::locale::format!(
+                state.language,
                 "Export selection: {} objects (maximum 64).\nSelect objects in Explorer, then : Export selected objects.\nBackup / verification / GC submit durable jobs.\nRestore requires stopping the service and using the offline CLI.",
+                "导出选择：{} 个对象（最多 64 个）。\n在浏览页选择对象，再从命令面板执行导出。\n备份／验证／回收均提交持久任务。\n恢复需停止服务并使用离线命令行。",
                 state.export_selections.len()
             );
             if let Some(r) = &state.export_result {
-                body.push_str(&format!(
+                body.push_str(&crate::locale::format!(
+                    state.language,
                     "\nExport {:?}: {} objects / {} bytes\n{}\n{}",
+                    "\n导出 {:?}: {} 对象 / {} 字节\n{}\n{}",
                     r.status,
                     r.object_count,
                     r.total_bytes,
-                    r.path.as_deref().unwrap_or("No confirmed published path"),
+                    r.path
+                        .as_deref()
+                        .unwrap_or(state.language.label("No confirmed published path")),
                     r.reason.as_deref().unwrap_or("")
                 ));
             }
@@ -156,7 +198,10 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
                     f,
                     Rect::new(a.x, a.y + 7, a.width, a.height - 7),
                     state,
-                    "Maintenance / repository facts · current page",
+                    state.language.text(
+                        "Maintenance / repository facts · current page",
+                        "维护／仓库事实 · 当前页",
+                    ),
                 );
             }
         }

@@ -27,75 +27,121 @@ pub(crate) fn wrap_content(text: &str, width: u16) -> Vec<String> {
 }
 
 pub(crate) fn detail_text(state: &AppState) -> String {
+    let language = state.language;
     let Some(item) = state.detail.as_ref() else {
-        return "Open an item to read its content".into();
+        return state
+            .language
+            .label("Open an item to read its content")
+            .into();
     };
     if state.ui.detail_view == DetailView::Technical {
         return super::inspector_text(state);
     }
     let mut lines = vec![
-        super::row_label(item),
-        format!(
+        super::row_label(item, state.language),
+        crate::locale::format!(
+            language,
             "Selected revision · scope: {}",
-            item.scope_ref.as_deref().unwrap_or("not supplied")
+            "所选版本 · 范围：{}",
+            item.scope_ref
+                .as_deref()
+                .unwrap_or(state.language.label("not supplied"))
         ),
     ];
     if item.proposal_review.is_some() {
-        lines.extend(proposal_diff(item));
+        lines.extend(proposal_diff(item, language));
         return lines.join("\n");
     }
     if let Some(semantic) = &item.semantic_detail {
-        lines.extend(super::semantic_lines(semantic));
+        lines.extend(super::semantic_lines(semantic, language));
     } else if let Some(HumanSystemDetail::Job { detail: job }) = &item.system_detail {
         lines.extend([
-            format!(
-                "Task: {}\nState: {:?} (leased means claimed, not a model call)",
-                job.job_kind, job.state
+            crate::locale::format!(
+                language,
+                "Task: {}\nState: {} (leased means claimed, not a model call)",
+                "任务：{}\n状态：{}（已领取不等于正在调用模型）",
+                super::kind_label(&job.job_kind, language),
+                super::job_state(job.state, language)
             ),
-            format!("Target: {}\nAttempt: {}", job.target_revision, job.attempt),
-            format!(
+            crate::locale::format!(
+                language,
+                "Target: {}\nAttempt: {}",
+                "目标：{}\n尝试次数：{}",
+                job.target_revision,
+                job.attempt
+            ),
+            crate::locale::format!(
+                language,
                 "End reason: {}",
-                job.terminal_reason
-                    .map_or_else(|| "not supplied".into(), |r| format!("{r:?}"))
+                "结束原因：{}",
+                super::job_reason(job.terminal_reason, language)
             ),
-            format!(
+            crate::locale::format!(
+                language,
                 "Backoff until: {}\nLease until: {}",
-                timestamp(job.backoff_until_us),
-                timestamp(job.lease_until_us)
+                "退避截止：{}\n租约截止：{}",
+                job.backoff_until_us.map_or_else(
+                    || language.label("not supplied").to_owned(),
+                    |value| timestamp(Some(value))
+                ),
+                job.lease_until_us.map_or_else(
+                    || language.label("not supplied").to_owned(),
+                    |value| timestamp(Some(value))
+                )
             ),
-            format!(
+            crate::locale::format!(
+                language,
                 "Result: {}",
+                "结果：{}",
                 job.terminal_result_ref
                     .as_deref()
-                    .unwrap_or("No result reference supplied")
+                    .unwrap_or(state.language.label("No result reference supplied"))
             ),
-            "Start/end times not supplied; duration and ETA are unknown".into(),
+            state
+                .language
+                .label("Start/end times not supplied; duration and ETA are unknown")
+                .into(),
         ]);
         if let Some(backup) = &job.backup_summary {
             lines.extend([
-                format!(
+                crate::locale::format!(
+                    language,
                     "backup verification/frontier: {:?} / {}",
-                    backup.validation_result, backup.frontier
+                    "备份验证／水位: {:?} / {}",
+                    backup.validation_result,
+                    backup.frontier
                 ),
-                format!(
+                crate::locale::format!(
+                    language,
                     "Backup files: {}; bytes: {}",
-                    backup.file_count, backup.total_bytes
+                    "备份文件: {}; 字节: {}",
+                    backup.file_count,
+                    backup.total_bytes
                 ),
             ]);
         }
         if let Some(gc) = &job.gc_summary {
-            lines.push(format!(
+            lines.push(crate::locale::format!(
+                language,
                 "GC deleted: {} files / {} bytes; unknown: {}",
-                gc.deleted_count, gc.deleted_bytes, gc.unknown_count
+                "回收已删除：{} 个文件／{} 字节；未知：{}",
+                gc.deleted_count,
+                gc.deleted_bytes,
+                gc.unknown_count
             ));
         }
     } else {
         // These existing typed presenters preserve the protection/source labels and
         // domain facts. The generic identity preamble belongs to Technical.
-        lines.extend(super::content_lines(
-            item,
-            state.competing_candidate_selection,
-        ));
+        let content = super::content_lines(item, state.competing_candidate_selection, language);
+        if content.is_empty() {
+            lines.push(language.text(
+                "This entry currently provides identity and status only; no typed readable body was supplied. Open Technical fields for the recorded facts; use System for collection and import diagnostics.",
+                "此条目当前仅提供身份与状态，响应未提供可读正文。可在技术字段查看已有事实，或到系统页查看采集与导入诊断。",
+            ).into());
+        } else {
+            lines.extend(content);
+        }
     }
     lines.join("\n")
 }
@@ -145,6 +191,7 @@ pub(crate) fn timestamp(value: Option<i64>) -> String {
     )
 }
 fn changed(
+    language: crate::Language,
     lines: &mut Vec<String>,
     label: &str,
     base: Option<&str>,
@@ -157,80 +204,93 @@ fn changed(
     lines.push(format!(
         "{label}\n  {}\n→ {}",
         if create {
-            "New field (no base)".into()
+            language.label("New field (no base)").into()
         } else {
-            base.map_or_else(|| "Original value unavailable".into(), super::safe_content)
+            base.map_or_else(
+                || language.label("Original value unavailable").into(),
+                super::safe_content,
+            )
         },
         super::safe_content(candidate)
     ));
 }
 
 fn atom_fields(
+    language: crate::Language,
     lines: &mut Vec<String>,
     draft: &evertrace_domain::semantic::AtomDraft,
     base: Option<&evertrace_domain::semantic::Atom>,
     create: bool,
 ) {
     changed(
+        language,
         lines,
-        "Kind",
+        language.label("Kind"),
         base.map(|a| format!("{:?}", a.kind)).as_deref(),
         &format!("{:?}", draft.kind),
         create,
     );
     changed(
+        language,
         lines,
-        "Epistemic status",
+        language.label("Epistemic status"),
         base.map(|a| format!("{:?}", a.epistemic_status)).as_deref(),
         &format!("{:?}", draft.epistemic_status),
         create,
     );
     changed(
+        language,
         lines,
-        "Text",
+        language.label("Text"),
         base.map(|a| a.value.text.as_str()),
         &draft.value.text,
         create,
     );
     changed(
+        language,
         lines,
-        "Subject",
+        language.label("Subject"),
         base.map(|a| a.value.subject.as_str()),
         &draft.value.subject,
         create,
     );
     changed(
+        language,
         lines,
-        "Predicate",
+        language.label("Predicate"),
         base.map(|a| a.value.predicate.as_str()),
         &draft.value.predicate,
         create,
     );
     changed(
+        language,
         lines,
-        "Object",
+        language.label("Object"),
         base.map(|a| a.value.object.as_deref().unwrap_or("not supplied")),
         draft.value.object.as_deref().unwrap_or("not supplied"),
         create,
     );
     changed(
+        language,
         lines,
-        "Scope",
+        language.label("Scope"),
         base.map(|a| format!("{:?}", a.scope)).as_deref(),
         &format!("{:?}", draft.scope),
         create,
     );
     changed(
+        language,
         lines,
-        "Applicability",
+        language.label("Applicability"),
         base.map(|a| format!("{:?}", a.applicability_expr))
             .as_deref(),
         &format!("{:?}", draft.applicability_expr),
         create,
     );
     changed(
+        language,
         lines,
-        "Validity",
+        language.label("Validity"),
         base.map(|a| format!("{:?}", a.validity_interval))
             .as_deref(),
         &format!("{:?}", draft.validity_interval),
@@ -238,114 +298,142 @@ fn atom_fields(
     );
 }
 fn procedure_fields(
+    language: crate::Language,
     lines: &mut Vec<String>,
     draft: &evertrace_domain::procedure::ProcedureDraft,
     base: Option<&evertrace_domain::procedure::ProcedureDraft>,
     create: bool,
 ) {
     changed(
+        language,
         lines,
-        "Scope",
+        language.label("Scope"),
         base.map(|a| format!("{:?}", a.scope)).as_deref(),
         &format!("{:?}", draft.scope),
         create,
     );
     changed(
+        language,
         lines,
-        "Applicability",
+        language.label("Applicability"),
         base.map(|a| format!("{:?}", a.applicability_expr))
             .as_deref(),
         &format!("{:?}", draft.applicability_expr),
         create,
     );
     changed(
+        language,
         lines,
-        "Avoid condition",
+        language.label("Avoid condition"),
         base.map(|a| format!("{:?}", a.avoid_expr)).as_deref(),
         &format!("{:?}", draft.avoid_expr),
         create,
     );
     changed(
+        language,
         lines,
-        "Completion condition",
+        language.label("Completion condition"),
         base.map(|a| format!("{:?}", a.completion_expr)).as_deref(),
         &format!("{:?}", draft.completion_expr),
         create,
     );
     changed(
+        language,
         lines,
-        "Branches",
+        language.label("Branches"),
         base.map(|a| format!("{:?}", a.actions.branches)).as_deref(),
         &format!("{:?}", draft.actions.branches),
         create,
     );
     changed(
+        language,
         lines,
-        "Abort",
+        language.label("Abort"),
         base.map(|a| a.done.abort.join("; ")).as_deref(),
         &draft.done.abort.join("; "),
         create,
     );
     changed(
+        language,
         lines,
-        "Verify",
+        language.label("Verify"),
         base.map(|a| a.done.verify.join("; ")).as_deref(),
         &draft.done.verify.join("; "),
         create,
     );
     changed(
+        language,
         lines,
-        "Title",
+        language.label("Title"),
         base.map(|b| b.title.as_str()),
         &draft.title,
         create,
     );
     changed(
+        language,
         lines,
-        "Summary",
+        language.label("Summary"),
         base.map(|b| b.summary.as_str()),
         &draft.summary,
         create,
     );
     changed(
+        language,
         lines,
-        "When / stage",
+        language.label("When / stage"),
         base.map(|b| b.when.stage.as_str()),
         &draft.when.stage,
         create,
     );
     for (label, old, new) in [
-        ("Goals", base.map(|b| &b.when.goals), &draft.when.goals),
         (
-            "Targets",
+            language.label("Goals"),
+            base.map(|b| &b.when.goals),
+            &draft.when.goals,
+        ),
+        (
+            language.label("Targets"),
             base.map(|b| &b.when.targets),
             &draft.when.targets,
         ),
         (
-            "Signals",
+            language.label("Signals"),
             base.map(|b| &b.when.signals),
             &draft.when.signals,
         ),
         (
-            "Requires",
+            language.label("Requires"),
             base.map(|b| &b.when.requires),
             &draft.when.requires,
         ),
         (
-            "Excludes",
+            language.label("Excludes"),
             base.map(|b| &b.when.excludes),
             &draft.when.excludes,
         ),
-        ("Do", base.map(|b| &b.actions.stages), &draft.actions.stages),
         (
-            "Avoid",
+            language.label("Do"),
+            base.map(|b| &b.actions.stages),
+            &draft.actions.stages,
+        ),
+        (
+            language.label("Avoid"),
             base.map(|b| &b.actions.avoid),
             &draft.actions.avoid,
         ),
-        ("Done", base.map(|b| &b.done.success), &draft.done.success),
-        ("Pitfalls", base.map(|b| &b.pitfalls), &draft.pitfalls),
+        (
+            language.label("Done"),
+            base.map(|b| &b.done.success),
+            &draft.done.success,
+        ),
+        (
+            language.label("Pitfalls"),
+            base.map(|b| &b.pitfalls),
+            &draft.pitfalls,
+        ),
     ] {
         changed(
+            language,
             lines,
             label,
             old.map(|v| v.join("; ")).as_deref(),
@@ -354,30 +442,37 @@ fn procedure_fields(
         );
     }
 }
-fn proposal_diff(item: &HumanSnapshotItem) -> Vec<String> {
+fn proposal_diff(item: &HumanSnapshotItem, language: crate::Language) -> Vec<String> {
     use evertrace_domain::semantic::{AtomProposalPayload, ProposalPayload};
     let review = item.proposal_review.as_ref().expect("proposal checked");
     let proposal = &review.proposal;
     let create = proposal.operation == evertrace_domain::semantic::ProposalOperation::Create;
     let base = item.proposal_base.as_ref().and_then(|b| b.content.as_ref());
     let mut lines = vec![
-        format!(
+        crate::locale::format!(
+            language,
             "Why here: {:?} proposal requires review ({:?})",
-            proposal.operation, proposal.status
+            "待处理原因：{:?} 提议需要复核（{:?}）",
+            proposal.operation,
+            proposal.status
         ),
         if create {
-            "Change: Create — new object, no base".into()
+            language
+                .label("Change: Create — new object, no base")
+                .into()
         } else if base.is_none() {
-            "Original revision could not be read; comparison is incomplete. Existing actions remain governed by the daemon.".into()
+            language.label("Original revision could not be read; comparison is incomplete. Existing actions remain governed by the daemon.").into()
         } else {
-            "Change: exact base → candidate; unchanged fields omitted".into()
+            language
+                .label("Change: exact base → candidate; unchanged fields omitted")
+                .into()
         },
     ];
     if !create
         && base.is_none()
         && let Some(b) = &item.proposal_base
     {
-        lines.extend(super::semantic_lines(b));
+        lines.extend(super::semantic_lines(b, language));
     }
     match &proposal.payload {
         ProposalPayload::Atom(payload) => {
@@ -390,16 +485,23 @@ fn proposal_diff(item: &HumanSnapshotItem) -> Vec<String> {
                 | AtomProposalPayload::Replace { draft }
                 | AtomProposalPayload::Reclassify { draft }
                 | AtomProposalPayload::Merge { draft, .. } => {
-                    atom_fields(&mut lines, draft, old, create)
+                    atom_fields(language, &mut lines, draft, old, create)
                 }
                 AtomProposalPayload::Split { drafts } => {
                     for (i, draft) in drafts.iter().enumerate() {
-                        lines.push(format!("Candidate {}", i + 1));
-                        atom_fields(&mut lines, draft, old, create);
+                        lines.push(crate::locale::format!(
+                            language,
+                            "Candidate {}",
+                            "候选 {}",
+                            i + 1
+                        ));
+                        atom_fields(language, &mut lines, draft, old, create);
                     }
                 }
-                AtomProposalPayload::Deprecate { reason } => lines.push(format!(
+                AtomProposalPayload::Deprecate { reason } => lines.push(crate::locale::format!(
+                    language,
                     "Remove from active use\nReason: {}",
+                    "从当前使用中移除\n原因：{}",
                     super::safe_content(reason)
                 )),
             }
@@ -409,7 +511,7 @@ fn proposal_diff(item: &HumanSnapshotItem) -> Vec<String> {
                 Some(HumanSemanticContent::Procedure(p)) => Some(&p.draft),
                 _ => None,
             };
-            procedure_fields(&mut lines, payload.draft(), old, create);
+            procedure_fields(language, &mut lines, payload.draft(), old, create);
         }
         ProposalPayload::CoreMembership(payload) => {
             use evertrace_domain::semantic::CoreMembershipProposalPayload;
@@ -425,8 +527,9 @@ fn proposal_diff(item: &HumanSnapshotItem) -> Vec<String> {
                     scope_identity,
                 } => {
                     changed(
+                        language,
                         &mut lines,
-                        "Atom revision",
+                        language.label("Atom revision"),
                         old_atom.as_deref(),
                         &atom_revision_id.to_string(),
                         create,
@@ -439,26 +542,29 @@ fn proposal_diff(item: &HumanSnapshotItem) -> Vec<String> {
                     scope_identity,
                 } => {
                     changed(
+                        language,
                         &mut lines,
-                        "Conflict left atom revision",
+                        language.label("Conflict left atom revision"),
                         old_atom.as_deref(),
                         &left_atom_revision_id.to_string(),
                         create,
                     );
                     changed(
+                        language,
                         &mut lines,
-                        "Conflict right atom revision",
+                        language.label("Conflict right atom revision"),
                         old_atom.as_deref(),
                         &right_atom_revision_id.to_string(),
                         create,
                     );
-                    lines.push("Conflict pair is the requested resolution input, not an inferred winning revision".into());
+                    lines.push(language.label("Conflict pair is the requested resolution input, not an inferred winning revision").into());
                     scope_identity
                 }
             };
             changed(
+                language,
                 &mut lines,
-                "Scope identity",
+                language.label("Scope identity"),
                 old_scope.as_deref(),
                 &format!("{scope:?}"),
                 create,
@@ -467,11 +573,11 @@ fn proposal_diff(item: &HumanSnapshotItem) -> Vec<String> {
         ProposalPayload::ReservedTarget { summary, .. } => lines.push(super::safe_content(summary)),
     }
     lines.push(
-        "Known impact: a new revision if applied; impact counts not provided, not estimated".into(),
+        language.label("Known impact: a new revision if applied; impact counts not provided, not estimated").into(),
     );
-    lines.push(format!("Conditions\nEligibility: {:?}\nAccept: {}\nMerge: {}\nEvidence references: {} (open sources to inspect)",proposal.eligibility,
-        if review.plain_accept_eligible{"allowed by current daemon review"}else{"blocked by existing eligibility conditions"},
-        if review.merge_and_accept_eligible{"allowed by current daemon review"}else{"not eligible"},proposal.evidence_refs.len()));
+    lines.push(crate::locale::format!(language, "Conditions\nEligibility: {:?}\nAccept: {}\nMerge: {}\nEvidence references: {} (open sources to inspect)", "条件\n资格：{:?}\n接受：{}\n合并：{}\n证据引用：{}（打开来源查看）",proposal.eligibility,
+        if review.plain_accept_eligible{language.label("allowed by current daemon review")}else{language.label("blocked by existing eligibility conditions")},
+        if review.merge_and_accept_eligible{language.label("allowed by current daemon review")}else{language.label("not eligible")},proposal.evidence_refs.len()));
     lines
 }
 

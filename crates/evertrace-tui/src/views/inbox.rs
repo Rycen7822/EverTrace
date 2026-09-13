@@ -1,5 +1,12 @@
 use crate::AppState;
 use ratatui::{Frame, layout::Rect};
 pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
-    super::render_list(f, a, state, "Inbox · item / state / scope");
+    super::render_list(
+        f,
+        a,
+        state,
+        state
+            .language
+            .text("Inbox · item / state / scope", "待处理 · 事项／状态／范围"),
+    );
 }

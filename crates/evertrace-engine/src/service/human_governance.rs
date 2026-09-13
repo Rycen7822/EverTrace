@@ -1210,14 +1210,14 @@ impl HumanGovernanceService {
                 .ok_or(HumanGovernanceError::Store)?
         } else {
             self.writer
-                .project()
+                .project_objects()
                 .await
                 .map_err(|_| HumanGovernanceError::Store)?
         };
         if expected_frontier.is_some_and(|frontier| frontier != snapshot.frontier) {
             return Ok(Err(snapshot.frontier));
         }
-        let mut result = page(&snapshot, surface, after, usize::from(limit))?;
+        let mut result = page(&snapshot, surface, after, usize::from(limit), false)?;
         if surface == HumanSurface::Explorer {
             self.restrict_import_evidence(&snapshot, &mut result.items)
                 .await?;
@@ -1229,6 +1229,7 @@ impl HumanGovernanceService {
         &self,
         config: &evertrace_domain::config::EffectiveConfig,
         host: Option<crate::HostCanaryDiagnostic>,
+        jobs_only: bool,
         expected_frontier: Option<u64>,
         after: Option<&str>,
         limit: u16,
@@ -1247,9 +1248,32 @@ impl HumanGovernanceService {
             .ok_or(HumanGovernanceError::Store)?;
         let mut diagnostic =
             diagnostics::compile(config, self.runtime_snapshot.as_ref(), &native, host);
-        let current_page = native.objects.as_ref().and_then(|snapshot| {
-            page(snapshot, HumanSurface::System, after, usize::from(limit)).ok()
-        });
+        let current_page = if jobs_only {
+            native
+                .objects
+                .as_ref()
+                .map(|snapshot| {
+                    page(
+                        snapshot,
+                        HumanSurface::System,
+                        after,
+                        usize::from(limit),
+                        true,
+                    )
+                })
+                .transpose()?
+        } else {
+            native.objects.as_ref().and_then(|snapshot| {
+                page(
+                    snapshot,
+                    HumanSurface::System,
+                    after,
+                    usize::from(limit),
+                    false,
+                )
+                .ok()
+            })
+        };
         if current_page.is_none()
             && let Some(check) = diagnostic
                 .checks
@@ -1288,10 +1312,12 @@ impl HumanGovernanceService {
         }
         let snapshot = self
             .writer
-            .project()
+            .project_objects()
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
-        if snapshot.frontier != expected_frontier {
+        // An unrelated journal append must not invalidate an exact revision read.
+        // Resolve against current access rules, but never claim a future frontier.
+        if snapshot.frontier < expected_frontier {
             return Ok(Err((snapshot.frontier, None)));
         }
         let mut matching = surface_rows(&snapshot, surface)?
@@ -1302,6 +1328,19 @@ impl HumanGovernanceService {
                     || row.current_revision_id.as_deref() == Some(object_ref)
             })
             .collect::<Vec<_>>();
+        // Stable row locators are exact. A logical fact reference must not be
+        // made ambiguous by derived projections carrying the same revision.
+        if matching.iter().any(|row| row.row_id == object_ref) {
+            matching.retain(|row| row.row_id == object_ref);
+        } else if matching.iter().any(|row| {
+            row.row_class == Some(ObjectRowClass::Object)
+                && row.object_id.as_deref() == Some(object_ref)
+        }) {
+            matching.retain(|row| {
+                row.row_class == Some(ObjectRowClass::Object)
+                    && row.object_id.as_deref() == Some(object_ref)
+            });
+        }
         if let Some(expected) = expected_revision_ref {
             if matching
                 .iter()
@@ -1459,10 +1498,14 @@ impl HumanGovernanceService {
         }
         let snapshot = self
             .writer
-            .project()
+            .project_objects()
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
-        if snapshot.frontier != request.expected_frontier {
+        // Start an exact-source read at the current frontier. Once pagination has
+        // started, keep its frontier fixed so a cursor cannot mix snapshots.
+        if snapshot.frontier < request.expected_frontier
+            || (request.after.is_some() && snapshot.frontier != request.expected_frontier)
+        {
             return Ok(Err((snapshot.frontier, None)));
         }
         let source = snapshot
@@ -4001,6 +4044,7 @@ fn page(
     surface: HumanSurface,
     after: Option<&str>,
     limit: usize,
+    jobs_only: bool,
 ) -> Result<HumanPage, HumanGovernanceError> {
     let (status, degraded_reasons) = snapshot_status(snapshot)?;
     let semantic_view =
@@ -4008,6 +4052,29 @@ fn page(
     let usage_view = ProcedureUsageCurrentView::from_snapshot(snapshot)
         .map_err(|_| HumanGovernanceError::Store)?;
     let mut rows = surface_rows(snapshot, surface)?;
+    if jobs_only {
+        let mut jobs = Vec::new();
+        for row in rows {
+            if !row.row_id.starts_with("runtime:job:") {
+                continue;
+            }
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(HumanGovernanceError::Store)?,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?;
+            match payload {
+                JournalPayload::JobState(job)
+                    if row.row_id == format!("runtime:job:{}", job.job_id) =>
+                {
+                    jobs.push(row)
+                }
+                _ => return Err(HumanGovernanceError::Store),
+            }
+        }
+        rows = jobs;
+    }
     rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
     let mut selected = rows
         .into_iter()
@@ -4832,7 +4899,7 @@ fn summary(
         None
     };
     let (recovery_detail, worktree_detail, execution_integrity_detail, system_detail) =
-        if include_detail {
+        if include_detail || row.row_id.starts_with("runtime:job:") {
             typed_current_detail(row)?
         } else {
             (None, None, None, None)
@@ -6845,6 +6912,22 @@ fn valid_ref(value: &str) -> bool {
 mod tests {
     use super::*;
     use evertrace_domain::work::ExecutionLane;
+
+    #[test]
+    fn jobs_selection_rejects_corrupt_job_payload() {
+        let mut row = object_row("runtime:job:corrupt", 1);
+        row.row_class = Some(ObjectRowClass::Runtime);
+        row.object_family = None;
+        row.object_kind = Some("job_state".into());
+        for payload in [None, Some("not-json".into()), Some("{}".into())] {
+            row.payload_json = payload;
+            let snapshot = ProjectionSnapshot {
+                frontier: 1,
+                rows: vec![row.clone()],
+            };
+            assert!(page(&snapshot, HumanSurface::System, None, 64, true).is_err());
+        }
+    }
 
     #[test]
     fn recovery_reason_codes_are_stably_sorted() {

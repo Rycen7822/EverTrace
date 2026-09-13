@@ -73,10 +73,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -1416,6 +1413,37 @@ pub enum BackgroundSchedulerError {
     Writer,
 }
 
+#[derive(Default)]
+struct CaptureScan {
+    after: Option<String>,
+    rescan_pending: bool,
+}
+
+impl CaptureScan {
+    fn notified(&mut self) {
+        // Finish the current round before revisiting changed earlier targets.
+        self.rescan_pending |= self.after.is_some();
+    }
+
+    fn page(&mut self, candidates: impl Iterator<Item = String>) -> (Vec<String>, bool) {
+        if self.after.is_none() {
+            self.rescan_pending = false;
+        }
+        let mut page: Vec<_> = candidates
+            .filter(|target| self.after.as_ref().is_none_or(|after| target > after))
+            .take(CAPTURE_PROBE_LIMIT + 1)
+            .collect();
+        let more = page.len() > CAPTURE_PROBE_LIMIT;
+        page.truncate(CAPTURE_PROBE_LIMIT);
+        self.after = more.then(|| page.last().unwrap().clone());
+        let retryable = more || self.rescan_pending;
+        if !more {
+            self.rescan_pending = false;
+        }
+        (page, retryable)
+    }
+}
+
 #[derive(Clone)]
 pub struct BackgroundScheduler {
     writer: WriterHandle,
@@ -1426,7 +1454,7 @@ pub struct BackgroundScheduler {
     runtime: RuntimeSnapshot,
     synthesis: SynthesisPlanner,
     dreaming: DreamingConfig,
-    capture_cursor: Arc<AtomicUsize>,
+    capture_cursor: Arc<tokio::sync::Mutex<CaptureScan>>,
     artifact_scan: Arc<tokio::sync::Mutex<(tokio::time::Instant, u64, bool)>>,
     dispatch: Option<Arc<RwLock<()>>>,
     repository_purge_plans: Arc<std::sync::Mutex<BTreeMap<JobId, Vec<String>>>>,
@@ -1457,7 +1485,7 @@ impl BackgroundScheduler {
             runtime,
             synthesis,
             dreaming,
-            capture_cursor: Arc::new(AtomicUsize::new(0)),
+            capture_cursor: Arc::new(tokio::sync::Mutex::new(CaptureScan::default())),
             artifact_scan: Arc::new(tokio::sync::Mutex::new((
                 tokio::time::Instant::now(),
                 0,
@@ -1938,21 +1966,21 @@ impl BackgroundScheduler {
             })
             .map(|dirty| {
                 SourceObservationId::from_str(&dirty.target_id)
-                    .map_err(|_| BackgroundSchedulerError::Store)
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
+                Ok(dirty.target_id)
+            })
+            .collect::<Result<Vec<_>, BackgroundSchedulerError>>()?;
+        let (probed, capture_page_incomplete) = self
+            .capture_cursor
+            .lock()
+            .await
+            .page(capture_candidates.into_iter());
+        let probed = probed
+            .iter()
+            .map(|target| {
+                SourceObservationId::from_str(target).map_err(|_| BackgroundSchedulerError::Store)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut probed = Vec::new();
-        let capture_page_incomplete = capture_candidates.len() > CAPTURE_PROBE_LIMIT;
-        if !capture_candidates.is_empty() {
-            let start = self
-                .capture_cursor
-                .fetch_add(CAPTURE_PROBE_LIMIT, Ordering::Relaxed)
-                % capture_candidates.len();
-            probed.extend(
-                (0..capture_candidates.len().min(CAPTURE_PROBE_LIMIT))
-                    .map(|offset| capture_candidates[(start + offset) % capture_candidates.len()]),
-            );
-        }
         retryable |= capture_page_incomplete;
         let mut capture_items = BTreeMap::new();
         for chunk in probed.chunks(16) {
@@ -2083,7 +2111,10 @@ impl BackgroundScheduler {
                     view = RuntimeSchedulerView::from_snapshot(&snapshot)
                         .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
-                Err(WriterActorError::StaleFrontier) => retryable = true,
+                Err(WriterActorError::StaleFrontier) => {
+                    self.capture_cursor.lock().await.rescan_pending = true;
+                    retryable = true;
+                }
                 Err(error) => return Err(map_writer(error)),
             }
         }
@@ -2761,21 +2792,12 @@ impl BackgroundScheduler {
     }
 
     async fn run_gc_round(&self) -> Result<usize, BackgroundSchedulerError> {
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
-            .map_err(|_| BackgroundSchedulerError::Store)?;
-        let Some(job) = view.jobs.iter().find(|job| {
-            job.kind == evertrace_store::optimize::GC_ALGORITHM_REVISION
-                && job.state == JobStatus::Queued
-        }) else {
+        let jobs = self.writer.queued_gc_jobs().await.map_err(map_writer)?;
+        let Some(job) = jobs.first() else {
             return Ok(0);
         };
         let mut rounds = self.gc_rounds.lock().await;
-        rounds.retain(|id, _| {
-            view.jobs
-                .iter()
-                .any(|job| job.job_id == *id && job.state == JobStatus::Queued)
-        });
+        rounds.retain(|id, _| jobs.iter().any(|job| job.job_id == *id));
         let data_dir = self
             .runtime
             .data_dir()
@@ -3019,12 +3041,14 @@ impl BackgroundScheduler {
                     if changed.is_err() {
                         return Ok(());
                     }
+                    self.capture_cursor.lock().await.notified();
                     run_at = tokio::time::Instant::now();
                 }
                 changed = durable.changed() => {
                     if changed.is_err() {
                         return Ok(());
                     }
+                    self.capture_cursor.lock().await.notified();
                     run_at = tokio::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until(run_at) => {
@@ -3032,8 +3056,11 @@ impl BackgroundScheduler {
                         result = self.run_once() => result?,
                         _ = wait_for_shutdown(&mut shutdown) => return Ok(()),
                     };
-                    run_at = tokio::time::Instant::now()
-                        + self.next_wake_after(progress.retryable).await?;
+                    let delay = tokio::select! {
+                        result = self.next_wake_after(progress.retryable) => result?,
+                        _ = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                    };
+                    run_at = tokio::time::Instant::now() + delay;
                     tokio::task::yield_now().await;
                 }
             }
@@ -4927,6 +4954,49 @@ fn map_writer(error: WriterActorError) -> BackgroundSchedulerError {
 mod idle_tests {
     use super::*;
     use evertrace_domain::{ids::*, revision::RevisionId, work::*};
+
+    #[test]
+    fn capture_scan_is_finite_and_rescans_notifications_without_starvation() {
+        let candidates = || (0..81).map(|index| format!("target-{index:03}"));
+        let mut scan = CaptureScan::default();
+        let (first, retry) = scan.page(candidates());
+        assert!(retry);
+        assert_eq!(first.len(), 40);
+        scan.notified();
+        scan.notified();
+        // Earlier targets becoming covered or disappearing cannot shift the cursor.
+        let (second, retry) = scan.page(candidates().skip(40));
+        assert!(retry);
+        assert_eq!(second.first().unwrap(), "target-040");
+        assert_eq!(second.last().unwrap(), "target-079");
+        let (last, retry) = scan.page(candidates().skip(80));
+        assert_eq!(last, vec!["target-080"]);
+        assert!(retry, "a mid-round notification schedules one full rescan");
+        assert!(scan.after.is_none());
+        assert!(!scan.rescan_pending);
+        let (rescan, retry) = scan.page(std::iter::once("target--new".into()).chain(candidates()));
+        assert!(retry);
+        assert_eq!(rescan[0], "target--new");
+        assert!(scan.page(candidates()).1);
+        assert!(!scan.page(candidates()).1);
+        assert!(scan.after.is_none());
+    }
+
+    #[test]
+    fn capture_scan_conflict_revisits_failed_earlier_page() {
+        let candidates = || (0..81).map(|index| format!("target-{index:03}"));
+        let mut scan = CaptureScan::default();
+        scan.page(candidates());
+        // Same state transition used by capture seeding's StaleFrontier branch.
+        scan.rescan_pending = true;
+        assert_eq!(scan.page(candidates()).0[0], "target-040");
+        assert!(scan.page(candidates()).1);
+        assert_eq!(scan.page(candidates()).0[0], "target-000");
+        scan.page(candidates());
+        scan.page(candidates());
+        scan.rescan_pending = true; // Conflict on the last page also starts at the head.
+        assert_eq!(scan.page(candidates()).0[0], "target-000");
+    }
 
     #[tokio::test]
     async fn exhausted_llm_budget_preserves_the_job_and_resumes_after_reopen_next_day() {

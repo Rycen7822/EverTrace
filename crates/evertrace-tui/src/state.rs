@@ -76,11 +76,13 @@ pub struct ShellSnapshot {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppState {
+    pub language: crate::Language,
     pub(crate) ui: UiState,
     pub route: Route,
     pub shell: ShellSnapshot,
     pub human: Option<HumanGovernanceResponse>,
     pub detail: Option<HumanSnapshotItem>,
+    pub(crate) detail_frontier: Option<u64>,
     pub detail_message: Option<String>,
     pub detail_scroll: u16,
     pub selection: usize,
@@ -104,6 +106,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            language: crate::Language::English,
             route: Route::System,
             ui: UiState::default(),
             shell: ShellSnapshot {
@@ -113,6 +116,7 @@ impl Default for AppState {
             },
             human: None,
             detail: None,
+            detail_frontier: None,
             detail_message: None,
             detail_scroll: 0,
             selection: 0,
@@ -164,6 +168,7 @@ pub(crate) enum Focus {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NavigationFrame {
+    pub result_jump: bool,
     pub page_cursor: Option<String>,
     pub type_filter: Option<String>,
     pub scope_filter: Option<String>,
@@ -173,6 +178,7 @@ pub(crate) struct NavigationFrame {
     pub route: Route,
     pub human: Option<HumanGovernanceResponse>,
     pub detail: Option<HumanSnapshotItem>,
+    pub detail_frontier: Option<u64>,
     pub selection: usize,
     pub scroll: u16,
     pub offset: usize,

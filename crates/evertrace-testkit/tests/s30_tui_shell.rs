@@ -26,7 +26,7 @@ async fn bounded_bus_processes_every_event_and_render_remains_responsive() {
         }
     });
     let consumer = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
-        let mut app = App::new();
+        let mut app = App::with_language(evertrace_tui::Language::English);
         for _ in 0..1_000 {
             app.handle(receiver.recv().await.unwrap());
             let frame = evertrace_tui::headless_render(60, 20).unwrap();
