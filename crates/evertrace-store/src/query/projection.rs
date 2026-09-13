@@ -108,8 +108,10 @@ impl L0002ProjectionWorker {
         objects: &ProjectionSnapshot,
     ) -> Result<(), StoreError> {
         let expected = derive_l0002_projections(objects)?;
-        commit_relation_rows(&self.relations, &expected.relations, false).await?;
-        commit_search_rows(&self.search, &expected.search, false).await?;
+        let relations = read_relation_rows(&self.relations).await?;
+        let search = read_search_rows(&self.search).await?;
+        commit_relation_rows(&self.relations, &relations, &expected.relations, false).await?;
+        commit_search_rows(&self.search, &search, &expected.search, false).await?;
         if read_relation_rows(&self.relations).await? != expected.relations
             || read_search_rows(&self.search).await? != expected.search
         {
@@ -149,7 +151,7 @@ impl L0002ProjectionWorker {
         {
             return Err(StoreError::StoreCorrupt);
         }
-        for checkpoint in [relation_frontier, search_frontier] {
+        for checkpoint in BTreeSet::from([relation_frontier, search_frontier]) {
             let delta = read_journal_after(&self.journal, checkpoint).await?;
             validate_delta(checkpoint, journal_frontier, &delta)?;
         }
@@ -161,8 +163,14 @@ impl L0002ProjectionWorker {
             });
         }
         let expected = derive_l0002_projections(objects)?;
-        commit_relation_rows(&self.relations, &expected.relations, fail_relation_commit).await?;
-        commit_search_rows(&self.search, &expected.search, fail_search_commit).await?;
+        commit_relation_rows(
+            &self.relations,
+            &relations,
+            &expected.relations,
+            fail_relation_commit,
+        )
+        .await?;
+        commit_search_rows(&self.search, &search, &expected.search, fail_search_commit).await?;
         let persisted = L0002ProjectionSnapshot {
             frontier: expected.frontier,
             relations: read_relation_rows(&self.relations).await?,
@@ -743,10 +751,15 @@ pub fn derive_l0002_projections(
     relations.insert(RelationProjectionRow::checkpoint(objects.frontier));
 
     let mut search = exact_rows.into_values().collect::<BTreeSet<_>>();
+    let mut receipts_by_observation = BTreeMap::new();
+    for (receipt, _) in receipts.values() {
+        receipts_by_observation
+            .entry(receipt.source_observation_id)
+            .or_insert(receipt);
+    }
     for (observation_id, (surface, seq)) in surfaces {
-        let receipt = receipts
-            .values()
-            .find_map(|(value, _)| (value.source_observation_id == observation_id).then_some(value))
+        let receipt = receipts_by_observation
+            .get(&observation_id)
             .ok_or(StoreError::StoreCorrupt)?;
         search.insert(surface_row(&surface, receipt, seq)?);
     }
@@ -770,24 +783,51 @@ fn all_values<K, V: Clone>(map: &BTreeMap<K, (V, u64)>) -> Vec<V> {
     values(map)
 }
 
+// The merge source contains only changed rows. Deletion must name only rows
+// absent from the complete expected projection, never unchanged target rows.
+fn deleted_row_predicate(removed: &[&str]) -> String {
+    let ids = removed
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect::<Vec<_>>();
+    format!("row_id IN ({})", ids.join(","))
+}
+
 async fn commit_relation_rows(
     table: &Table,
+    current: &[RelationProjectionRow],
     rows: &[RelationProjectionRow],
     fail_before_execute: bool,
 ) -> Result<(), StoreError> {
-    let current = read_relation_rows(table).await?;
     if current == rows {
         return Ok(());
     }
+    let previous = current
+        .iter()
+        .map(|row| (&row.row_id, row))
+        .collect::<BTreeMap<_, _>>();
+    let expected = rows.iter().map(|row| &row.row_id).collect::<BTreeSet<_>>();
+    let changed = rows
+        .iter()
+        .filter(|row| previous.get(&row.row_id).copied() != Some(*row))
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = current
+        .iter()
+        .filter(|row| !expected.contains(&row.row_id))
+        .map(|row| row.row_id.as_str())
+        .collect::<Vec<_>>();
     let reader = Box::new(RecordBatchIterator::new(
-        vec![Ok(relations_batch(rows)?)],
+        vec![Ok(relations_batch(&changed)?)],
         crate::relations::relations_schema(),
     ));
     let mut merge = table.merge_insert(&["row_id"]);
     merge
         .when_matched_update_all(None)
-        .when_not_matched_insert_all()
-        .when_not_matched_by_source_delete(None);
+        .when_not_matched_insert_all();
+    if !removed.is_empty() {
+        merge.when_not_matched_by_source_delete(Some(deleted_row_predicate(&removed)));
+    }
     if fail_before_execute {
         return Err(StoreError::Projection);
     }
@@ -799,22 +839,39 @@ async fn commit_relation_rows(
 }
 async fn commit_search_rows(
     table: &Table,
+    current: &[SearchProjectionRow],
     rows: &[SearchProjectionRow],
     fail_before_execute: bool,
 ) -> Result<(), StoreError> {
-    let current = read_search_rows(table).await?;
     if current == rows {
         return Ok(());
     }
+    let previous = current
+        .iter()
+        .map(|row| (&row.row_id, row))
+        .collect::<BTreeMap<_, _>>();
+    let expected = rows.iter().map(|row| &row.row_id).collect::<BTreeSet<_>>();
+    let changed = rows
+        .iter()
+        .filter(|row| previous.get(&row.row_id).copied() != Some(*row))
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = current
+        .iter()
+        .filter(|row| !expected.contains(&row.row_id))
+        .map(|row| row.row_id.as_str())
+        .collect::<Vec<_>>();
     let reader = Box::new(RecordBatchIterator::new(
-        vec![Ok(search_batch(rows)?)],
+        vec![Ok(search_batch(&changed)?)],
         crate::search::search_schema(),
     ));
     let mut merge = table.merge_insert(&["row_id"]);
     merge
         .when_matched_update_all(None)
-        .when_not_matched_insert_all()
-        .when_not_matched_by_source_delete(None);
+        .when_not_matched_insert_all();
+    if !removed.is_empty() {
+        merge.when_not_matched_by_source_delete(Some(deleted_row_predicate(&removed)));
+    }
     if fail_before_execute {
         return Err(StoreError::Projection);
     }

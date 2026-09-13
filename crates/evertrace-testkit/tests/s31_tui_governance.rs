@@ -523,6 +523,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     assert!(serde_json::from_value::<HumanGovernanceRequest>(serde_json::json!({"operation":"export","selections":[{"object_ref":"selected-object","expected_revision_ref":null,"cas_ref":"untrusted"}]})).is_err());
     let request = HumanGovernanceRequest::Read {
         request: HumanReadRequest::List {
+            explorer_selection: None,
             system_selection: None,
             surface: WireSurface::Inbox,
             expected_frontier: Some(7),
@@ -532,6 +533,26 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     };
     let json = serde_json::to_string(&request).unwrap();
     assert!(!json.contains("system_selection"));
+    assert!(!json.contains("explorer_selection"));
+    for surface in [
+        WireSurface::Inbox,
+        WireSurface::Explorer,
+        WireSurface::System,
+    ] {
+        let selected = HumanGovernanceRequest::Read {
+            request: HumanReadRequest::List {
+                surface,
+                system_selection: None,
+                explorer_selection: Some(
+                    evertrace_protocol::dto::HumanExplorerListSelection::Memories,
+                ),
+                expected_frontier: None,
+                after: None,
+                limit: HUMAN_PAGE_LIMIT,
+            },
+        };
+        assert_eq!(selected.validate(), surface == WireSurface::Explorer);
+    }
     for surface in [
         WireSurface::Inbox,
         WireSurface::Explorer,
@@ -541,6 +562,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
             request: HumanReadRequest::List {
                 surface,
                 system_selection: Some(evertrace_protocol::dto::HumanSystemListSelection::Jobs),
+                explorer_selection: None,
                 expected_frontier: None,
                 after: None,
                 limit: HUMAN_PAGE_LIMIT,
@@ -738,6 +760,7 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
         status: ProposalStatus::Pending,
     };
     let proposal_item = HumanSnapshotItem {
+        source_context: None,
         semantic_detail: None,
         proposal_base: None,
         evidence_detail: None,
@@ -5355,6 +5378,29 @@ async fn protected_archive_export(
         expected_revision_ref: archived.current_revision_id.clone(),
     }];
     std::fs::remove_file(transcript).unwrap();
+    let readable = import_service
+        .detail(
+            HumanSurface::Explorer,
+            &archived.row_id,
+            imported.frontier,
+            archived.current_revision_id.as_deref(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let context = readable.items[0]
+        .source_context
+        .as_ref()
+        .expect("archived source context");
+    assert_eq!(context.session, session);
+    assert_eq!(context.directory.as_deref(), root.to_str());
+    let JournalPayload::SourceReceiptRecorded(receipt) =
+        serde_json::from_str(archived.payload_json.as_deref().unwrap()).unwrap()
+    else {
+        panic!("receipt")
+    };
+    assert_eq!(context.recorded_at_us, receipt.recorded_at_us);
+    assert_eq!(context.event_time_us, receipt.event_time_us);
     let archived_export = import_service.export(selection.clone()).await;
     assert_eq!(
         archived_export.status,
@@ -5380,6 +5426,18 @@ async fn protected_archive_export(
         "{revoked_export:?}"
     );
     assert!(revoked_export.path.is_none());
+    let denied = import_service
+        .detail(
+            HumanSurface::Explorer,
+            &archived.row_id,
+            import_handle.project().await.unwrap().frontier,
+            archived.current_revision_id.as_deref(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(denied.items[0].source_context.is_none());
+    assert!(denied.items[0].evidence_detail.is_none());
     import_handle.shutdown().await.unwrap();
     import_task.await.unwrap().unwrap();
 }

@@ -659,17 +659,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 HumanReadRequest::List {
                                     surface,
                                     system_selection,
+                                    explorer_selection,
                                     expected_frontier,
                                     after,
                                     limit,
                                 } => match if surface == HumanSurface::System {
                                     human_governance.list_system(&config_snapshot, host_canary.current(),
                                         system_selection.is_some(), expected_frontier, after.as_deref(), limit).await
-                                } else { human_governance.list(
+                                } else { human_governance.list_selected(
                                         map_human_surface(surface),
                                         expected_frontier,
                                         after.as_deref(),
                                         limit,
+                                        explorer_selection.map(|value| match value {
+                                            evertrace_protocol::dto::HumanExplorerListSelection::Memories => evertrace_engine::HumanExplorerListSelection::Memories,
+                                            evertrace_protocol::dto::HumanExplorerListSelection::Capture => evertrace_engine::HumanExplorerListSelection::Capture,
+                                        }),
                                     ).await }
                                     .map_err(map_human_error)?
                                 {
@@ -1293,6 +1298,7 @@ fn map_semantic_detail(
             evertrace_engine::HumanContentState::Unavailable => State::Unavailable,
         },
         content: detail.content.map(|content| match content {
+            evertrace_engine::HumanSemanticContent::Digest(value) => Content::Digest(value),
             evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),
             evertrace_engine::HumanSemanticContent::Procedure(value) => Content::Procedure(value),
             evertrace_engine::HumanSemanticContent::CoreMembership(value) => {
@@ -1323,6 +1329,10 @@ fn map_human_page(page: evertrace_engine::HumanPage) -> HumanGovernanceResponse 
             .items
             .into_iter()
             .map(|item| HumanSnapshotItem {
+                source_context: item.source_context.map(|value| evertrace_protocol::dto::HumanSourceContext {
+                    directory: value.directory, session: value.session,
+                    event_time_us: value.event_time_us, recorded_at_us: value.recorded_at_us,
+                }),
                 semantic_detail: item.semantic_detail.map(map_semantic_detail),
                 proposal_base: item.proposal_base.map(map_semantic_detail),
                 work_detail: item.work_detail.map(|detail| evertrace_protocol::dto::HumanWorkDetail {

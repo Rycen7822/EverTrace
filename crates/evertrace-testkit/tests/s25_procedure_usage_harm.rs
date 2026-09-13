@@ -6411,6 +6411,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
                         RequestId::new_v7(),
                         Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                             request: HumanReadRequest::List {
+                                explorer_selection: None,
                                 system_selection: None,
                                 surface: HumanSurface::System,
                                 expected_frontier: None,

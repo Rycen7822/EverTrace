@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, DirBuilder, File, OpenOptions},
     io,
@@ -12,7 +13,7 @@ use lancedb::{Connection, Table};
 use crate::{
     command::{CommitOutcome, JournalCommand, JournalPayload, StoreError, prepare_command},
     journal::{
-        JOURNAL_TABLE, append_rows, read_all_journal_rows, read_command_rows,
+        JOURNAL_TABLE, append_rows, read_all_journal_rows, read_command_rows, read_commands_rows,
         read_journal_frontier, replay_outcome, rows_for_append, validate_complete_command,
         validate_journal_table,
     },
@@ -85,6 +86,24 @@ pub struct CommittedCommand {
     pub command_id: evertrace_domain::ids::CommandId,
     pub event_ids: Vec<String>,
     pub payloads: Vec<JournalPayload>,
+}
+
+/// A transient replay read bound, not a persistent journal index.
+pub const MAX_COMMITTED_COMMAND_READ: usize = 64;
+
+fn decode_committed_command(
+    mut rows: Vec<crate::JournalRow>,
+) -> Result<CommittedCommand, StoreError> {
+    validate_complete_command(&rows)?;
+    rows.sort_by_key(|row| row.ordinal);
+    Ok(CommittedCommand {
+        command_id: rows[0].command_id,
+        event_ids: rows.iter().map(|row| row.event_id.clone()).collect(),
+        payloads: rows
+            .iter()
+            .map(|row| row.payload())
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 #[derive(Debug)]
@@ -211,6 +230,9 @@ pub struct JournalWriter {
     search: Table,
     next_seq: u64,
     admission_state: JournalAdmissionState,
+    // Negative lookups only, derived from the journal already validated at open.
+    // A changed table version or uncertain append falls back to the journal.
+    command_ids: Option<(u64, BTreeSet<evertrace_domain::ids::CommandId>)>,
     migration_outcome: MigrationOutcome,
 }
 
@@ -385,6 +407,10 @@ impl JournalWriter {
         validate_objects_table(&objects).await?;
         let journal_rows = read_all_journal_rows(&journal).await?;
         let admission_state = JournalAdmissionState::from_journal_rows(&journal_rows)?;
+        let command_ids = Some((
+            journal.version().await.map_err(|_| StoreError::LanceDb)?,
+            journal_rows.iter().map(|row| row.command_id).collect(),
+        ));
         let next_seq = journal_rows
             .iter()
             .map(|row| row.seq)
@@ -401,6 +427,7 @@ impl JournalWriter {
             search,
             next_seq,
             admission_state,
+            command_ids,
             migration_outcome,
         })
     }
@@ -508,6 +535,7 @@ impl JournalWriter {
             search,
             next_seq,
             admission_state,
+            command_ids,
             migration_outcome,
         } = self;
         drop((
@@ -518,6 +546,7 @@ impl JournalWriter {
             search,
             next_seq,
             admission_state,
+            command_ids,
             migration_outcome,
         ));
         ClosedJournalWriter { lock }
@@ -567,6 +596,7 @@ impl JournalWriter {
                 .apply_row_batch(&rows.iter().collect::<Vec<_>>())?;
             self.validate_restore_lock()?;
             reserve_range(&mut self.next_seq, prepared.event_count)?;
+            self.command_ids = None;
             append_rows(&self.journal, &rows).await?;
             self.admission_state = admission;
         }
@@ -595,22 +625,61 @@ impl JournalWriter {
         &self,
         command_id: evertrace_domain::ids::CommandId,
     ) -> Result<Option<CommittedCommand>, StoreError> {
-        let mut rows = read_command_rows(&self.journal, command_id).await?;
+        let rows = self.existing_command_rows(command_id).await?;
         if rows.is_empty() {
             return Ok(None);
         }
-        validate_complete_command(&rows)?;
-        rows.sort_by_key(|row| row.ordinal);
-        let event_ids = rows.iter().map(|row| row.event_id.clone()).collect();
-        let payloads = rows
-            .iter()
-            .map(|row| row.payload())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(CommittedCommand {
-            command_id,
-            event_ids,
-            payloads,
-        }))
+        decode_committed_command(rows).map(Some)
+    }
+
+    pub async fn committed_commands(
+        &self,
+        command_ids: &[evertrace_domain::ids::CommandId],
+    ) -> Result<BTreeMap<evertrace_domain::ids::CommandId, CommittedCommand>, StoreError> {
+        if command_ids.len() > MAX_COMMITTED_COMMAND_READ {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let mut ids = command_ids.iter().copied().collect::<BTreeSet<_>>();
+        if let Some((version, known)) = &self.command_ids
+            && self
+                .journal
+                .version()
+                .await
+                .map_err(|_| StoreError::LanceDb)?
+                == *version
+        {
+            ids.retain(|id| known.contains(id));
+        }
+        let rows =
+            read_commands_rows(&self.journal, &ids.iter().copied().collect::<Vec<_>>()).await?;
+        let mut grouped = BTreeMap::<_, Vec<_>>::new();
+        for row in rows {
+            grouped.entry(row.command_id).or_default().push(row);
+        }
+        grouped
+            .into_iter()
+            .map(|(id, rows)| Ok((id, decode_committed_command(rows)?)))
+            .collect()
+    }
+
+    async fn existing_command_rows(
+        &self,
+        command_id: evertrace_domain::ids::CommandId,
+    ) -> Result<Vec<crate::JournalRow>, StoreError> {
+        if let Some((version, ids)) = &self.command_ids
+            && !ids.contains(&command_id)
+            && self
+                .journal
+                .version()
+                .await
+                .map_err(|_| StoreError::LanceDb)?
+                == *version
+        {
+            return Ok(Vec::new());
+        }
+        // Positive/replay reads still validate actual persisted rows, not a
+        // cached payload or acknowledgement.
+        read_command_rows(&self.journal, command_id).await
     }
 
     async fn commit_inner(
@@ -628,7 +697,7 @@ impl JournalWriter {
             return Err(StoreError::InvalidInput);
         }
         let prepared = prepare_command(command)?;
-        let existing = read_command_rows(&self.journal, prepared.command_id).await?;
+        let existing = self.existing_command_rows(prepared.command_id).await?;
         if let Some(outcome) = replay_outcome(&existing, &prepared)? {
             return Ok(outcome);
         }
@@ -640,8 +709,26 @@ impl JournalWriter {
         let next_admission_state = self.admission_state.apply_command(command, self.next_seq)?;
         let first_seq = reserve_range(&mut self.next_seq, prepared.event_count)?;
         let rows = rows_for_append(&prepared, first_seq, ingested_at_us)?;
+        let version = self
+            .journal
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let known = self
+            .command_ids
+            .take()
+            .filter(|(known, _)| *known == version);
         append_rows(&self.journal, &rows).await?;
         self.admission_state = next_admission_state;
+        if let Some((_, mut ids)) = known {
+            ids.insert(prepared.command_id);
+            self.command_ids = self
+                .journal
+                .version()
+                .await
+                .ok()
+                .map(|version| (version, ids));
+        }
         Ok(CommitOutcome {
             command_id: prepared.command_id,
             first_seq,
@@ -1314,11 +1401,27 @@ mod tests {
         .unwrap();
         let prepared = prepare_command(&command).unwrap();
 
+        assert!(
+            writer
+                .committed_command(command.command_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
         let abandoned = reserve_range(&mut writer.next_seq, prepared.event_count).unwrap();
         let first_seq = reserve_range(&mut writer.next_seq, prepared.event_count).unwrap();
         assert_eq!(first_seq, abandoned + u64::from(prepared.event_count));
         let rows = rows_for_append(&prepared, first_seq, 2).unwrap();
         append_rows(&writer.journal, &rows).await.unwrap();
+        // The command was absent from the startup set. A changed journal
+        // version must bypass that negative hint and read the actual commit.
+        assert!(
+            writer
+                .committed_command(command.command_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
         drop(writer);
 
         let mut reopened = JournalWriter::open(&root).await.unwrap();
@@ -1335,6 +1438,28 @@ mod tests {
         assert_eq!(inspected.event_ids, replay.event_ids);
         assert_eq!(inspected.payloads.len(), 1);
         assert_eq!(reopened.journal_rows().await.unwrap().len(), 3);
+        let absent = CommandId::new_v7();
+        let batch = reopened
+            .committed_commands(&[absent, command.command_id(), command.command_id()])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[&command.command_id()], inspected);
+        // A batch is not merely an existence hint: duplicate/partial command
+        // corruption must fail exactly as the original single read does.
+        append_rows(&reopened.journal, &rows).await.unwrap();
+        assert!(
+            reopened
+                .committed_commands(&[command.command_id()])
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .committed_command(command.command_id())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

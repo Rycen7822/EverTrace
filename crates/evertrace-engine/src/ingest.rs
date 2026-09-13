@@ -18,6 +18,7 @@ use evertrace_store::{
     SourceRevisionRecorded,
 };
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::{WriterActorError, WriterHandle, capture::verify_capture_frame_presented};
 
@@ -95,7 +96,7 @@ impl EvidenceIngestor {
             if *shutdown.borrow() {
                 return Ok(());
             }
-            let result = self.drain_page(&mut cursor).await;
+            let result = self.drain_page(&mut cursor, &shutdown).await;
             drop(guard);
             match result {
                 Ok(_) => recovering = false,
@@ -118,6 +119,7 @@ impl EvidenceIngestor {
     async fn drain_page(
         &self,
         cursor: &mut Option<evertrace_capture::spool::SpoolReadCursor>,
+        shutdown: &watch::Receiver<bool>,
     ) -> Result<DrainProgress, IngestError> {
         let mut spool = DurableSpool::open_read_only(
             self.snapshot.spool_dir.clone(),
@@ -155,7 +157,12 @@ impl EvidenceIngestor {
             };
         }
         let next = segments[0].continuation().map_err(map_spool)?;
-        let result = self.drain_segments(&spool, segments, None, true).await?;
+        let result = self
+            .drain_segments(&spool, segments, None, true, Some(shutdown))
+            .await?;
+        if *shutdown.borrow() {
+            return Ok(result);
+        }
         *cursor = next;
         if recovering {
             Err(IngestError::Recovering)
@@ -237,7 +244,8 @@ impl EvidenceIngestor {
         let segments = spool
             .sealed_segments(segment_limit)
             .map_err(|_| IngestError::Spool)?;
-        self.drain_segments(&spool, segments, selected, false).await
+        self.drain_segments(&spool, segments, selected, false, None)
+            .await
     }
 
     async fn verify_namespace_support(
@@ -410,6 +418,7 @@ impl EvidenceIngestor {
         segments: Vec<SealedSegment>,
         selected: Option<&BTreeSet<String>>,
         bounded: bool,
+        shutdown: Option<&watch::Receiver<bool>>,
     ) -> Result<DrainProgress, IngestError> {
         if segments.is_empty() {
             return Ok(DrainProgress::default());
@@ -436,13 +445,46 @@ impl EvidenceIngestor {
             (u64::MAX, u64::MAX)
         };
         for segment in segments {
-            let purge_snapshot = self.writer.project().await.map_err(map_writer_error)?;
+            let purge_snapshot = self
+                .writer
+                .project_objects()
+                .await
+                .map_err(map_writer_error)?;
             let purge_view = ScopePurgeCurrentView::from_snapshot(&purge_snapshot)
                 .map_err(|_| IngestError::StoreCorrupt)?;
             let mut committed = 0_usize;
             let mut terminal = Vec::new();
             let mut shared_maintenance = None;
-            for frame in segment.frames() {
+            let mut replay_batch = BTreeMap::new();
+            for (frame_index, frame) in segment.frames().iter().enumerate() {
+                // Finish an admitted journal command before observing shutdown.
+                // A partial page is never acknowledged: restart replays its
+                // original command IDs, including any already committed frame.
+                if shutdown.is_some_and(|signal| *signal.borrow()) {
+                    return Ok(progress);
+                }
+                if frame_index % evertrace_store::MAX_COMMITTED_COMMAND_READ == 0 {
+                    // Only retain this bounded chunk. A missing entry still uses
+                    // the single lookup below, including same-page duplicates
+                    // committed after prefetch. No payload is trusted from CAS
+                    // or spool in place of the validated journal command.
+                    let ids = segment.frames()[frame_index..]
+                        .iter()
+                        .take(evertrace_store::MAX_COMMITTED_COMMAND_READ)
+                        .filter(|frame| {
+                            selected
+                                .is_none_or(|ids| ids.contains(&frame.record.source_observation_id))
+                        })
+                        .map_while(|frame| canonical_body(&frame.record).ok())
+                        .filter(|body| !capture_is_purged(body, &purge_view))
+                        .map(|body| body.command_id)
+                        .collect();
+                    replay_batch = self
+                        .writer
+                        .committed_commands(ids)
+                        .await
+                        .map_err(map_writer_error)?;
+                }
                 if selected.is_some_and(|ids| !ids.contains(&frame.record.source_observation_id)) {
                     continue;
                 }
@@ -484,8 +526,12 @@ impl EvidenceIngestor {
                     );
                     if !prefix_states.contains_key(&key) {
                         if prefix_projection.is_none() {
-                            prefix_projection =
-                                Some(self.writer.project().await.map_err(map_writer_error)?);
+                            prefix_projection = Some(
+                                self.writer
+                                    .project_objects()
+                                    .await
+                                    .map_err(map_writer_error)?,
+                            );
                         }
                         let projected = projected_confirmed_prefix(
                             prefix_projection
@@ -550,12 +596,15 @@ impl EvidenceIngestor {
                 // The journal validates the original whole command before
                 // returning it. Preserve its first presentation across lost ack
                 // and reload; verify every payload against this same frame/CAS.
-                if let Some(committed_command) = self
-                    .writer
-                    .committed_command(verified.body.command_id)
-                    .await
-                    .map_err(map_writer_error)?
-                {
+                let committed_command = match replay_batch.get(&verified.body.command_id) {
+                    Some(command) => Some(command.clone()),
+                    None => self
+                        .writer
+                        .committed_command(verified.body.command_id)
+                        .await
+                        .map_err(map_writer_error)?,
+                };
+                if let Some(committed_command) = committed_command {
                     let receipt = committed_command
                         .payloads
                         .iter()
@@ -640,6 +689,9 @@ impl EvidenceIngestor {
                 progress.committed_frames += 1;
                 progress.replayed_frames += usize::from(outcome.replayed);
                 progress.projected_surfaces += surface_count;
+            }
+            if shutdown.is_some_and(|signal| *signal.borrow()) {
+                return Ok(progress);
             }
             if committed != 0 {
                 self.writer.project().await.map_err(map_writer_error)?;

@@ -97,6 +97,20 @@ pub(crate) fn row_label(
         .filter(|goal| !goal.trim().is_empty())
         .map(|goal| goal.chars().take(60).collect::<String>())
         .unwrap_or_else(|| short(item.object_ref.as_deref().unwrap_or(&item.stable_key)));
+    let title = item.source_context.as_ref().map_or(title, |source| {
+        format!(
+            "{} · {} · {}",
+            safe_content(
+                source
+                    .directory
+                    .as_deref()
+                    .unwrap_or(language.text("directory unknown", "目录未知"))
+            )
+            .replace(['\n', '\t'], " "),
+            safe_content(&source.session).replace(['\n', '\t'], " "),
+            detail::timestamp(Some(source.recorded_at_us))
+        )
+    });
     let kind = kind_label(&item.object_kind, language);
     let kind = if kind == item.object_kind {
         format!("{} ({kind})", language.label(category_label(item.category)))
@@ -180,7 +194,9 @@ pub(crate) fn kind_label(kind: &str, language: crate::Language) -> &str {
         "atom_revision" => ("Memory statement", "记忆条目"),
         "procedure_revision" => ("Reusable procedure", "可复用步骤"),
         "core_membership" => ("Core memory membership", "核心记忆成员"),
-        "revision_proposal" => ("Memory change proposal", "记忆变更提议"),
+        "revision_proposal" | "revision_proposal_revision" => {
+            ("Candidate memory proposal", "候选记忆提议")
+        }
         "task" => ("Task plan", "任务计划"),
         "workstream" => ("Workstream plan", "工作流计划"),
         "work_episode" => ("Work episode", "工作片段"),
@@ -229,6 +245,13 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
     if let Some(HumanGovernanceResponse::Snapshot { items, .. }) = &state.human {
         let indices = visible_indices(state);
         if !indices.is_empty() {
+            let source_table = state.route == Route::Explorer
+                && indices.iter().all(|index| {
+                    matches!(
+                        items[*index].object_kind.as_str(),
+                        "source_receipt" | "source_observation" | "host_occurrence"
+                    )
+                });
             use ratatui::{
                 layout::Constraint,
                 style::Style,
@@ -248,7 +271,62 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
                     ),
                     fields.get(1).cloned().unwrap_or_default(),
                 ];
-                if a.width >= 85 {
+                if source_table {
+                    columns = match &item.source_context {
+                        Some(source) => {
+                            let directory = source
+                                .directory
+                                .as_deref()
+                                .map(|path| {
+                                    let mut parts = path
+                                        .rsplit('/')
+                                        .filter(|part| !part.is_empty())
+                                        .take(2)
+                                        .collect::<Vec<_>>();
+                                    parts.reverse();
+                                    if parts.is_empty() {
+                                        "/".into()
+                                    } else {
+                                        safe_content(&parts.join("/"))
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    state.language.text("unknown directory", "目录未知").into()
+                                });
+                            let session = source
+                                .session
+                                .chars()
+                                .rev()
+                                .take(10)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<String>();
+                            let timestamp = detail::timestamp(Some(source.recorded_at_us));
+                            vec![
+                                format!(
+                                    "{} {}",
+                                    if i == state.selection { ">" } else { " " },
+                                    directory
+                                ),
+                                safe_content(&session),
+                                timestamp
+                                    .strip_suffix(" UTC")
+                                    .and_then(|value| value.get(5..16))
+                                    .unwrap_or("—")
+                                    .to_owned(),
+                            ]
+                        }
+                        None => vec![
+                            state
+                                .language
+                                .text("Source unavailable", "来源不可用")
+                                .into(),
+                            "—".into(),
+                            "—".into(),
+                        ],
+                    };
+                } else if a.width >= 85 {
                     columns.push(
                         fields
                             .iter()
@@ -264,7 +342,13 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
                     crate::theme::EVER_OS.ink
                 }))
             });
-            let widths = if a.width >= 85 {
+            let widths = if source_table {
+                vec![
+                    Constraint::Percentage(45),
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(30),
+                ]
+            } else if a.width >= 85 {
                 vec![
                     Constraint::Percentage(40),
                     Constraint::Percentage(20),
@@ -276,7 +360,14 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
             f.render_widget(
                 Table::new(rows, widths).block(
                     Block::default()
-                        .title(title)
+                        .title(if source_table {
+                            state.language.text(
+                                "Directory · Session (suffix) · Recorded (UTC)",
+                                "目录 · 会话尾号 · 记录时间 (UTC)",
+                            )
+                        } else {
+                            title
+                        })
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(
                             if state.ui.focus == crate::state::Focus::List {
@@ -320,9 +411,20 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
                         Route::Inbox => state
                             .language
                             .label("No pending items in the visible scope"),
-                        Route::Explorer => state.language.label(
-                            "No objects in the visible scope; check capture/import in System",
-                        ),
+                        Route::Explorer => match state.ui.explorer_selection {
+                            Some(evertrace_protocol::dto::HumanExplorerListSelection::Memories) => {
+                                language.text(
+                                    "No generated summaries or memory results yet",
+                                    "尚无生成的摘要／记忆结果",
+                                )
+                            }
+                            Some(evertrace_protocol::dto::HumanExplorerListSelection::Capture) => {
+                                language.text("No capture records yet", "尚无采集记录")
+                            }
+                            None => language.label(
+                                "No objects in the visible scope; check capture/import in System",
+                            ),
+                        },
                         Route::System => state.language.label("No tasks on this page"),
                     };
                     if next_cursor.is_some() {
@@ -403,6 +505,88 @@ fn semantic_lines(
         }];
     };
     match content {
+        HumanSemanticContent::Digest(digest) => {
+            use evertrace_domain::semantic::{SemanticCompleteness, SemanticDigestStatus};
+            let mut lines = vec![crate::locale::format!(
+                language,
+                "Generated summary · created at: {}",
+                "生成的摘要 · 创建时间：{}",
+                detail::timestamp(Some(digest.created_at_us))
+            )];
+            let status = match digest.status {
+                SemanticDigestStatus::DeterministicOnly => {
+                    language.text("Rule-based summary", "规则摘要")
+                }
+                SemanticDigestStatus::LlmEnriched => {
+                    language.text("Model-enriched summary", "模型补充摘要")
+                }
+                SemanticDigestStatus::RejectedInvalid => language.text(
+                    "Rejected: validation failed; not usable memory",
+                    "已拒绝：校验失败，不能作为可用记忆",
+                ),
+            };
+            let completeness = match digest.application.completeness {
+                SemanticCompleteness::Complete => language.text("complete", "完整"),
+                SemanticCompleteness::Partial => language.text("partial", "部分"),
+                SemanticCompleteness::Unknown => language.text("unknown", "未知"),
+            };
+            lines.push(crate::locale::format!(
+                language,
+                "Status: {} · Completeness: {}",
+                "状态：{} · 完整性：{}",
+                status,
+                completeness
+            ));
+            for (en, zh, values) in [
+                ("Progress", "进展", &digest.application.progress_delta),
+                ("Decisions", "决策", &digest.application.decision_delta),
+                (
+                    "Failed routes",
+                    "失败尝试",
+                    &digest.application.failed_routes,
+                ),
+                ("Resolved", "已解决", &digest.application.resolved_items),
+                ("Open loops", "待处理", &digest.application.open_loops),
+                ("Outcomes", "结果", &digest.application.outcome_delta),
+            ] {
+                if values.is_empty() {
+                    continue;
+                }
+                lines.push(crate::locale::format!(
+                    language,
+                    "{}:",
+                    "{}：",
+                    if language == crate::locale::Language::English {
+                        en
+                    } else {
+                        zh
+                    }
+                ));
+                lines.extend(values.iter().map(|delta| {
+                    format!(
+                        "{}: {}",
+                        safe_content(&delta.label),
+                        safe_content(&delta.value)
+                    )
+                }));
+            }
+            for omitted in &digest.application.omissions {
+                lines.push(crate::locale::format!(
+                    language,
+                    "Omitted {}: {}",
+                    "省略 {}：{}",
+                    safe_content(&omitted.category),
+                    safe_content(&omitted.reason)
+                ));
+            }
+            lines.push(crate::locale::format!(
+                language,
+                "Source references: {}",
+                "来源引用：{}",
+                digest.selected_direct_refs.join(", ")
+            ));
+            lines
+        }
         HumanSemanticContent::Atom(atom) => vec![
             safe_content(&atom.value.text),
             crate::locale::format!(
@@ -1651,5 +1835,80 @@ fn category_label(category: evertrace_protocol::dto::HumanItemCategory) -> &'sta
         Category::Projection => "derived projection",
         Category::SessionImport => "session import",
         Category::SemanticDerivation => "semantic derivation",
+    }
+}
+
+#[cfg(test)]
+mod readable_summary_tests {
+    use super::*;
+
+    #[test]
+    fn digest_body_is_readable_in_both_languages() {
+        use evertrace_domain::semantic::*;
+        let delta = SemanticStructuredDelta {
+            label: "real label".into(),
+            value: "actual generated memory".into(),
+            direct_refs: vec!["source:a".into()],
+        };
+        let mut digest = SemanticDigest {
+            semantic_digest_id: "sdig:019d0000-0000-7000-8000-000000000029".parse().unwrap(),
+            episode_id: Some("ep:019d0000-0000-7000-8000-000000000026".parse().unwrap()),
+            episode_revision_id: Some("019d0000-0000-7000-8000-000000000027".parse().unwrap()),
+            task_id: Some("task:019d0000-0000-7000-8000-000000000030".parse().unwrap()),
+            repository_id: None,
+            worktree_id: None,
+            from_watermark: 1,
+            to_watermark: 2,
+            episode_source_watermark: Some(2),
+            episode_confirmation_watermark: Some(0),
+            trigger: SemanticDigestTrigger::AdoptedDecision,
+            selected_direct_refs: vec!["source:a".into()],
+            application: SemanticDigestApplication {
+                progress_delta: vec![delta.clone()],
+                decision_delta: vec![delta.clone()],
+                failed_routes: vec![delta.clone()],
+                resolved_items: vec![delta.clone()],
+                open_loops: vec![delta.clone()],
+                outcome_delta: vec![delta],
+                omissions: vec![SemanticOmission {
+                    category: "missing".into(),
+                    reason: "not observed".into(),
+                    direct_refs: vec![],
+                }],
+                candidates: vec![],
+                completeness: SemanticCompleteness::Partial,
+            },
+            model_id: "fixture".into(),
+            prompt_hash: [1; 32],
+            schema_version: 1,
+            algorithm_revision: "semantic_synthesis_v1".into(),
+            effective_config_hash: [2; 32],
+            job_fingerprint: [3; 32],
+            status: SemanticDigestStatus::LlmEnriched,
+            created_at_us: 0,
+            source_target: None,
+        };
+        digest.job_fingerprint = digest.recompute_job_fingerprint().unwrap();
+        digest.validate().unwrap();
+        let reference = digest.semantic_digest_id.to_string();
+        let content = evertrace_protocol::dto::HumanSemanticContent::Digest(Box::new(digest));
+        let value = evertrace_protocol::dto::HumanSemanticDetail {
+            object_ref: Some(reference.clone()),
+            revision_ref: Some(reference),
+            state: evertrace_protocol::dto::HumanContentState::Ready,
+            preview: None,
+            original_bytes: evertrace_protocol::frame::canonical_json(&content)
+                .unwrap()
+                .len() as u64,
+            content: Some(content),
+        };
+        for language in [crate::Language::English, crate::Language::Chinese] {
+            let text = semantic_lines(&value, language).join("\n");
+            assert_eq!(text.matches("actual generated memory").count(), 6);
+            assert!(text.contains("not observed"));
+            assert!(text.contains("source:a"));
+            assert!(text.contains("1970-01-01"));
+            assert!(text.contains(language.text("Generated summary", "生成的摘要")));
+        }
     }
 }

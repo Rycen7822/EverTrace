@@ -37,6 +37,7 @@ pub async fn run(
             RequestId::new_v7(),
             Command::HumanGovernance(HumanGovernanceRequest::Read {
                 request: HumanReadRequest::List {
+                    explorer_selection: None,
                     system_selection: None,
                     surface: HumanSurface::System,
                     expected_frontier: None,

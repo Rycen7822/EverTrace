@@ -231,6 +231,7 @@ pub enum HumanItemCategory {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanSummary {
+    pub source_context: Option<HumanSourceContext>,
     pub semantic_detail: Option<HumanSemanticDetail>,
     pub proposal_base: Option<HumanSemanticDetail>,
     pub evidence_detail: Option<HumanEvidenceDetail>,
@@ -260,6 +261,14 @@ pub struct HumanSummary {
     pub support_state: Option<String>,
     pub scope_ref: Option<String>,
     pub source_event_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct HumanSourceContext {
+    pub directory: Option<String>,
+    pub session: String,
+    pub event_time_us: i64,
+    pub recorded_at_us: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -958,6 +967,7 @@ impl HumanGovernanceService {
         for item in items {
             if blocked.contains(&item.stable_key) {
                 item.evidence_detail = None;
+                item.source_context = None;
                 item.work_detail = None;
                 item.proposal_review = None;
                 item.semantic_detail = None;
@@ -1198,6 +1208,21 @@ impl HumanGovernanceService {
         after: Option<&str>,
         limit: u16,
     ) -> Result<Result<HumanPage, u64>, HumanGovernanceError> {
+        self.list_selected(surface, expected_frontier, after, limit, None)
+            .await
+    }
+
+    pub async fn list_selected(
+        &self,
+        surface: HumanSurface,
+        expected_frontier: Option<u64>,
+        after: Option<&str>,
+        limit: u16,
+        selection: Option<HumanExplorerListSelection>,
+    ) -> Result<Result<HumanPage, u64>, HumanGovernanceError> {
+        if selection.is_some() && surface != HumanSurface::Explorer {
+            return Err(HumanGovernanceError::InvalidInput);
+        }
         if limit == 0 || limit > MAX_PAGE || after.is_some_and(|value| !valid_ref(value)) {
             return Err(HumanGovernanceError::InvalidInput);
         }
@@ -1217,10 +1242,18 @@ impl HumanGovernanceService {
         if expected_frontier.is_some_and(|frontier| frontier != snapshot.frontier) {
             return Ok(Err(snapshot.frontier));
         }
-        let mut result = page(&snapshot, surface, after, usize::from(limit), false)?;
+        let mut result = page_selected(
+            &snapshot,
+            surface,
+            after,
+            usize::from(limit),
+            false,
+            selection,
+        )?;
         if surface == HumanSurface::Explorer {
             self.restrict_import_evidence(&snapshot, &mut result.items)
                 .await?;
+            self.source_contexts(&snapshot, &mut result.items).await?;
         }
         Ok(Ok(result))
     }
@@ -1405,6 +1438,7 @@ impl HumanGovernanceService {
             self.restrict_import_evidence(&snapshot, &mut items).await?;
         }
         self.semantic_details(&snapshot, &mut items).await?;
+        self.source_contexts(&snapshot, &mut items).await?;
         self.inventory_detail(&snapshot, &mut items).await?;
         if let Some((index, backup_job_id, validation_result)) =
             items.iter().enumerate().find_map(|(index, item)| {
@@ -4046,12 +4080,45 @@ fn page(
     limit: usize,
     jobs_only: bool,
 ) -> Result<HumanPage, HumanGovernanceError> {
+    page_selected(snapshot, surface, after, limit, jobs_only, None)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HumanExplorerListSelection {
+    Memories,
+    Capture,
+}
+
+fn page_selected(
+    snapshot: &ProjectionSnapshot,
+    surface: HumanSurface,
+    after: Option<&str>,
+    limit: usize,
+    jobs_only: bool,
+    selection: Option<HumanExplorerListSelection>,
+) -> Result<HumanPage, HumanGovernanceError> {
     let (status, degraded_reasons) = snapshot_status(snapshot)?;
     let semantic_view =
         SemanticCurrentView::from_snapshot(snapshot).map_err(|_| HumanGovernanceError::Store)?;
     let usage_view = ProcedureUsageCurrentView::from_snapshot(snapshot)
         .map_err(|_| HumanGovernanceError::Store)?;
     let mut rows = surface_rows(snapshot, surface)?;
+    rows.retain(|row| match selection {
+        None => true,
+        Some(HumanExplorerListSelection::Memories) => matches!(
+            row.object_kind.as_deref(),
+            Some(
+                "semantic_digest"
+                    | "atom_revision"
+                    | "procedure_revision"
+                    | "core_membership"
+                    | "revision_proposal_revision"
+            )
+        ),
+        Some(HumanExplorerListSelection::Capture) => {
+            row.object_kind.as_deref() == Some("source_observation")
+        }
+    });
     if jobs_only {
         let mut jobs = Vec::new();
         for row in rows {
@@ -4905,6 +4972,7 @@ fn summary(
             (None, None, None, None)
         };
     Ok(HumanSummary {
+        source_context: None,
         semantic_detail: None,
         proposal_base: None,
         evidence_detail,
@@ -6912,6 +6980,66 @@ fn valid_ref(value: &str) -> bool {
 mod tests {
     use super::*;
     use evertrace_domain::work::ExecutionLane;
+
+    #[test]
+    fn explorer_selection_filters_before_keyset_pagination() {
+        let mut rows = (0..70)
+            .map(|number| {
+                let mut row = object_row(&format!("a-surface-{number:03}"), 1);
+                row.object_kind = Some("evidence_surface".into());
+                row
+            })
+            .collect::<Vec<_>>();
+        for (id, kind) in [
+            ("z-memory-1", "semantic_digest"),
+            ("z-memory-2", "semantic_digest"),
+        ] {
+            let mut row = object_row(id, 1);
+            row.object_kind = Some(kind.into());
+            rows.push(row);
+        }
+        let snapshot = ProjectionSnapshot { frontier: 1, rows };
+        let first = page_selected(
+            &snapshot,
+            HumanSurface::Explorer,
+            None,
+            1,
+            false,
+            Some(HumanExplorerListSelection::Memories),
+        )
+        .unwrap();
+        assert_eq!(first.items[0].stable_key, "z-memory-1");
+        assert_eq!(first.next_cursor.as_deref(), Some("z-memory-1"));
+        let next = page_selected(
+            &snapshot,
+            HumanSurface::Explorer,
+            first.next_cursor.as_deref(),
+            1,
+            false,
+            Some(HumanExplorerListSelection::Memories),
+        )
+        .unwrap();
+        assert_eq!(next.items[0].stable_key, "z-memory-2");
+        assert!(next.next_cursor.is_none());
+        let capture = page_selected(
+            &snapshot,
+            HumanSurface::Explorer,
+            None,
+            64,
+            false,
+            Some(HumanExplorerListSelection::Capture),
+        )
+        .unwrap();
+        assert!(capture.items.is_empty());
+        assert!(capture.next_cursor.is_none());
+        assert_eq!(
+            page(&snapshot, HumanSurface::Explorer, None, 64, false)
+                .unwrap()
+                .items
+                .len(),
+            64
+        );
+    }
 
     #[test]
     fn jobs_selection_rejects_corrupt_job_payload() {

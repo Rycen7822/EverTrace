@@ -203,26 +203,23 @@ impl HumanGovernanceService {
         row: &ObjectRow,
         deadline: Instant,
     ) -> Result<(), Failure> {
-        let mut index = BTreeMap::<&str, Vec<&ObjectRow>>::new();
-        for candidate in snapshot.data_rows() {
-            check_deadline(deadline)?;
-            for key in [
-                Some(candidate.row_id.as_str()),
-                candidate.object_id.as_deref(),
-                candidate.current_revision_id.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<BTreeSet<_>>()
-            {
-                index.entry(key).or_default().push(candidate);
-            }
-        }
+        let index = presentation_index(snapshot, deadline)?;
+        self.readable_indexed_row(snapshot, row, &index, deadline)
+            .await
+    }
+
+    pub(super) async fn readable_indexed_row(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        row: &ObjectRow,
+        index: &BTreeMap<&str, Vec<&ObjectRow>>,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
         let mut charged = BTreeSet::new();
         let mut remaining = MAX_METADATA_BYTES;
         charge_metadata(row, &mut charged, &mut remaining, deadline)?;
         let dependencies = collect_dependencies(
-            &index,
+            index,
             dependencies_for(row, &decode(row)?),
             &mut charged,
             &mut remaining,
@@ -238,6 +235,28 @@ impl HumanGovernanceService {
         )
         .await
     }
+}
+
+pub(super) fn presentation_index(
+    snapshot: &ProjectionSnapshot,
+    deadline: Instant,
+) -> ExportResult<BTreeMap<&str, Vec<&ObjectRow>>> {
+    let mut index = BTreeMap::<&str, Vec<&ObjectRow>>::new();
+    for candidate in snapshot.data_rows() {
+        check_deadline(deadline)?;
+        for key in [
+            Some(candidate.row_id.as_str()),
+            candidate.object_id.as_deref(),
+            candidate.current_revision_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        {
+            index.entry(key).or_default().push(candidate);
+        }
+    }
+    Ok(index)
 }
 
 fn check_deadline(deadline: Instant) -> ExportResult<()> {

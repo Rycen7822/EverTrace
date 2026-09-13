@@ -43,6 +43,7 @@ impl App {
     pub(super) fn save_navigation(&mut self, result_jump: bool) {
         let s = &self.state;
         let frame = NavigationFrame {
+            explorer_selection: s.ui.explorer_selection,
             result_jump,
             page_cursor: s.ui.page_cursor.clone(),
             type_filter: s.ui.type_filter.clone(),
@@ -87,6 +88,7 @@ impl App {
         s.ui.scope_filter = frame.scope_filter;
         s.ui.state_filter = frame.state_filter;
         s.ui.system_view = frame.system_view;
+        s.ui.explorer_selection = frame.explorer_selection;
         s.ui.read_at = frame.read_at;
         s.ui.reference_request = None;
         s.detail_message = None;
@@ -415,6 +417,20 @@ impl App {
                 );
             }
         }
+        if s.route == crate::Route::Explorer && s.detail.is_none() {
+            use evertrace_protocol::dto::HumanExplorerListSelection::{Capture, Memories};
+            for (selection, en, zh) in [
+                (Some(Memories), "Memory results", "记忆结果"),
+                (Some(Capture), "Capture records", "采集记录"),
+                (Option::None, "All records", "全部"),
+            ] {
+                add(
+                    ExplorerSelection(selection),
+                    s.language.text(en, zh),
+                    Option::None,
+                );
+            }
+        }
         for (c, n) in [
             (Language(crate::Language::Chinese), "中文"),
             (Language(crate::Language::English), "English"),
@@ -576,6 +592,7 @@ impl App {
                 };
                 let frontier = *frontier;
                 self.save_navigation(true);
+                self.state.ui.explorer_selection = None;
                 self.state.ui.read_generation =
                     self.state.ui.read_generation.wrapping_add(1).max(1);
                 self.state.ui.page_cursor = None;
@@ -668,6 +685,32 @@ impl App {
                 self.state.ui.type_filter = None;
                 self.state.ui.scope_filter = None;
                 self.state.ui.state_filter = None;
+            }
+            UiCommand::ExplorerSelection(selection) => {
+                if self.state.route != crate::Route::Explorer {
+                    return None;
+                }
+                self.state.ui.explorer_selection = selection;
+                self.state.human = None;
+                self.state.detail = None;
+                self.state.detail_frontier = None;
+                self.state.detail_message = None;
+                self.state.related_context = None;
+                self.state.ui.related_loaded = false;
+                self.state.ui.reference_request = None;
+                self.state.ui.page_cursor = None;
+                self.state.ui.type_filter = None;
+                self.state.ui.scope_filter = None;
+                self.state.ui.state_filter = None;
+                self.state.ui.filter.clear();
+                self.state.selection = 0;
+                self.state.ui.list_offset = 0;
+                self.state.detail_scroll = 0;
+                self.state.ui.focus = Focus::List;
+                self.state.ui.read_generation =
+                    self.state.ui.read_generation.wrapping_add(1).max(1);
+                self.state.ui.reading = true;
+                return Some(UiCommand::Refresh);
             }
             UiCommand::FindNext => self.find_match(true),
             UiCommand::FindPrevious => self.find_match(false),
@@ -1061,6 +1104,14 @@ impl App {
                 UiCommand::SystemView(SystemView::Diagnostics),
                 UiCommand::SystemView(SystemView::Configuration),
                 UiCommand::SystemView(SystemView::Maintenance),
+            ]
+        } else if self.state.route == crate::Route::Explorer {
+            use evertrace_protocol::dto::HumanExplorerListSelection::{Capture, Memories};
+            vec![
+                UiCommand::ExplorerSelection(Some(Memories)),
+                UiCommand::ExplorerSelection(Some(Capture)),
+                UiCommand::ExplorerSelection(None),
+                UiCommand::Filter,
             ]
         } else {
             vec![
@@ -1867,6 +1918,61 @@ mod tests {
             next_cursor: Some("next".into()),
         });
         app
+    }
+
+    #[test]
+    fn explorer_category_switch_clears_cursor_and_navigation_restores_category() {
+        use evertrace_protocol::dto::HumanExplorerListSelection::{Capture, Memories};
+        let mut app = populated();
+        app.state.ui.page_cursor = Some("old-page".into());
+        app.state.ui.type_filter = Some("host_occurrence".into());
+        assert_eq!(
+            app.dispatch(UiCommand::ExplorerSelection(Some(Memories))),
+            UiCommand::Refresh
+        );
+        assert_eq!(app.state.ui.explorer_selection, Some(Memories));
+        assert!(app.state.ui.page_cursor.is_none());
+        assert!(app.state.ui.type_filter.is_none());
+        assert!(app.state.human.is_none());
+        assert!(matches!(
+            super::super::human_request(&app.state, UiCommand::Refresh),
+            Some(evertrace_protocol::dto::HumanGovernanceRequest::Read {
+                request: evertrace_protocol::dto::HumanReadRequest::List {
+                    explorer_selection: Some(Memories),
+                    after: None,
+                    ..
+                }
+            })
+        ));
+        app.save_navigation(false);
+        app.dispatch(UiCommand::ExplorerSelection(Some(Capture)));
+        assert!(app.restore_navigation());
+        assert_eq!(app.state.ui.explorer_selection, Some(Memories));
+        for language in [crate::Language::English, crate::Language::Chinese] {
+            app.state.language = language;
+            app.state.ui.reading = false;
+            app.state.human = Some(HumanGovernanceResponse::Snapshot {
+                diagnostics: None,
+                frontier: 4,
+                status: HumanSnapshotStatus::Ready,
+                degraded_reasons: vec![],
+                items: vec![],
+                next_cursor: None,
+            });
+            let rendered = draw(&app, 120, 30);
+            // TestBackend retains a padding cell after each wide character.
+            assert!(
+                rendered.split_whitespace().collect::<String>().contains(
+                    &language
+                        .text(
+                            "No generated summaries or memory results yet",
+                            "尚无生成的摘要／记忆结果"
+                        )
+                        .replace(' ', "")
+                ),
+                "{language:?}\n{rendered}"
+            );
+        }
     }
     fn draw(app: &App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();

@@ -1,6 +1,6 @@
 use crate::{
-    AppEvent, AppEventSender, AppState, ConnectionState, UiCommand, app_event::HumanReadLocator,
-    client, components, keymap, layout, views,
+    AppEvent, AppEventSender, AppState, ConnectionState, Route, UiCommand,
+    app_event::HumanReadLocator, client, components, keymap, layout, views,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -1802,6 +1802,11 @@ pub async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = ui_commands.try_send(client::ClientCommand::Refresh(
                     human_surface(app.state.route),
                     system_selection(&app.state),
+                    if app.state.route == Route::Explorer {
+                        app.state.ui.explorer_selection
+                    } else {
+                        None
+                    },
                     app.state.ui.read_generation,
                 ));
             }
@@ -2068,6 +2073,9 @@ fn human_request(
             };
             Some(HumanGovernanceRequest::Read {
                 request: HumanReadRequest::List {
+                    explorer_selection: (state.route == Route::Explorer)
+                        .then_some(state.ui.explorer_selection)
+                        .flatten(),
                     system_selection: system_selection(state),
                     surface,
                     expected_frontier,
@@ -2100,6 +2108,9 @@ fn human_request(
             };
             let request = state.related_context.as_ref().map_or_else(
                 || HumanReadRequest::List {
+                    explorer_selection: (state.route == Route::Explorer)
+                        .then_some(state.ui.explorer_selection)
+                        .flatten(),
                     system_selection: system_selection(state),
                     surface,
                     expected_frontier: Some(*frontier),
@@ -2120,6 +2131,9 @@ fn human_request(
         UiCommand::FirstPage => {
             let request = state.related_context.as_ref().map_or_else(
                 || HumanReadRequest::List {
+                    explorer_selection: (state.route == Route::Explorer)
+                        .then_some(state.ui.explorer_selection)
+                        .flatten(),
                     system_selection: system_selection(state),
                     surface,
                     expected_frontier: None,
@@ -3542,6 +3556,7 @@ mod tests {
         reviewed.fingerprint = reviewed.recompute_fingerprint().unwrap();
         assert!(reviewed.validate().is_ok());
         let item = HumanSnapshotItem {
+            source_context: None,
             semantic_detail: None,
             proposal_base: None,
             evidence_detail: None,
@@ -4544,6 +4559,7 @@ mod tests {
             _ => (HumanItemCategory::Work, HumanObjectFamily::Work),
         };
         HumanSnapshotItem {
+            source_context: None,
             semantic_detail: None,
             proposal_base: None,
             evidence_detail: None,

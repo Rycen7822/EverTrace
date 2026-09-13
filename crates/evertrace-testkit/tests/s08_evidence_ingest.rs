@@ -351,6 +351,53 @@ fn observation_identity_is_source_local_and_synthesized_fallback_never_becomes_c
 }
 
 #[tokio::test]
+async fn shutdown_between_frames_retains_the_page_for_idempotent_restart() {
+    let temp = TempDir::new().unwrap();
+    let (snapshot, mut runtime) = prepare(temp.path());
+    for index in 0..16 {
+        runtime
+            .capture(input(&format!("shutdown-{index}"), b"captured result"))
+            .unwrap();
+    }
+    drop(runtime);
+    let writer = open_writer(&temp.path().join("store")).await.unwrap();
+    let (handle, writer_task) = spawn_writer(writer, 8).unwrap();
+    let mut durable = handle.subscribe_background_frontier();
+    let ingestor = EvidenceIngestor::new(snapshot, handle.clone(), [7; 32], "s08-v1").unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let consumer = tokio::spawn(
+        ingestor
+            .clone()
+            .run(std::sync::Arc::new(tokio::sync::RwLock::new(())), receiver),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), durable.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), consumer)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let before = handle.project().await.unwrap();
+    let committed = object_kind_count(&before.rows, "source_receipt");
+    assert!(
+        (1..16).contains(&committed),
+        "shutdown must stop before finishing the entire page"
+    );
+    let resumed = ingestor.drain_once().await.unwrap();
+    assert_eq!(resumed.committed_frames, 16);
+    assert_eq!(resumed.replayed_frames, committed);
+    assert_eq!(resumed.sealed_segments, 1);
+    let after = handle.project().await.unwrap();
+    assert_eq!(object_kind_count(&after.rows, "source_receipt"), 16);
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 0);
+    handle.shutdown().await.unwrap();
+    writer_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn replay_after_lost_ack_is_idempotent_and_same_payload_distinct_records_remain_distinct() {
     let temp = TempDir::new().unwrap();
     let (snapshot, mut runtime) = prepare(temp.path());
@@ -367,6 +414,11 @@ async fn replay_after_lost_ack_is_idempotent_and_same_payload_distinct_records_r
         a, b,
         "CAS may physically deduplicate equal protected payloads"
     );
+    for index in 2..300 {
+        runtime
+            .capture(input(&format!("record-{index}"), b"same payload"))
+            .unwrap();
+    }
     let replay_bytes = fs::read(runtime.spool().active_path()).unwrap();
     drop(runtime);
 
@@ -376,16 +428,45 @@ async fn replay_after_lost_ack_is_idempotent_and_same_payload_distinct_records_r
     let ingestor =
         EvidenceIngestor::new(snapshot.clone(), handle.clone(), [7; 32], "s08-v1").unwrap();
     let first_progress = ingestor.drain_once().await.unwrap();
-    assert_eq!(first_progress.committed_frames, 2);
+    assert_eq!(first_progress.committed_frames, 300);
     assert_eq!(first_progress.replayed_frames, 0);
 
     let replay_path = snapshot.spool_dir.join("main/segment-replay.sealed");
     fs::write(&replay_path, &replay_bytes).unwrap();
     fs::set_permissions(&replay_path, fs::Permissions::from_mode(0o600)).unwrap();
     let replay_progress = ingestor.drain_once().await.unwrap();
-    assert_eq!(replay_progress.committed_frames, 2);
-    assert_eq!(replay_progress.replayed_frames, 2);
+    assert_eq!(replay_progress.committed_frames, 300);
+    assert_eq!(replay_progress.replayed_frames, 300);
     assert!(!replay_path.exists());
+
+    // Cross both the 64-command read chunk and the 256-frame daemon page.
+    // A long already-committed prefix must advance its cursor and ack only
+    // after the final page, without adding objects or rewriting presentation.
+    fs::write(&replay_path, &replay_bytes).unwrap();
+    fs::set_permissions(&replay_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let consumer = tokio::spawn(
+        ingestor
+            .clone()
+            .run(std::sync::Arc::new(tokio::sync::RwLock::new(())), receiver),
+    );
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while replay_path.exists() {
+            if consumer.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let _ = stop.send(true);
+    consumer.await.unwrap().unwrap();
+    finished.unwrap();
+    assert!(!replay_path.exists());
+    assert_eq!(
+        object_kind_count(&handle.project().await.unwrap().rows, "source_receipt"),
+        300
+    );
 
     let mut frames = scan_frames(&replay_bytes).unwrap().frames;
     let mut record = frames.remove(0).record;
@@ -405,15 +486,15 @@ async fn replay_after_lost_ack_is_idempotent_and_same_payload_distinct_records_r
     task.await.unwrap().unwrap();
     let writer = JournalWriter::open(&store_dir).await.unwrap();
     let rows = writer.object_rows().await.unwrap();
-    assert_eq!(object_kind_count(&rows, "source_receipt"), 2);
-    assert_eq!(object_kind_count(&rows, "source_observation"), 2);
-    assert_eq!(object_kind_count(&rows, "evidence_surface"), 2);
+    assert_eq!(object_kind_count(&rows, "source_receipt"), 300);
+    assert_eq!(object_kind_count(&rows, "source_observation"), 300);
+    assert_eq!(object_kind_count(&rows, "evidence_surface"), 300);
     let observations = rows
         .iter()
         .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
         .map(|row| row.object_id.clone().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(observations.len(), 2);
+    assert_eq!(observations.len(), 300);
 }
 
 #[tokio::test]

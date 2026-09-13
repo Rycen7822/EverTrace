@@ -3068,7 +3068,7 @@ impl BackgroundScheduler {
     }
 
     async fn next_wake_after(&self, retryable: bool) -> Result<Duration, BackgroundSchedulerError> {
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
+        let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
         let view = RuntimeSchedulerView::from_snapshot(&snapshot)
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let now = now_us()?;
@@ -3901,7 +3901,7 @@ impl BackgroundScheduler {
         } else {
             None
         };
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
+        let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
         let view = RuntimeSchedulerView::from_snapshot(&snapshot)
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let Some(current) = view.jobs.iter().find(|job| job.job_id == selected.job_id) else {
@@ -4055,7 +4055,7 @@ impl BackgroundScheduler {
             .await
         {
             Ok(_) => {
-                let snapshot = self.writer.project().await.map_err(map_writer)?;
+                let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
                 let view = RuntimeSchedulerView::from_snapshot(&snapshot)
                     .map_err(|_| BackgroundSchedulerError::Store)?;
                 let job = view

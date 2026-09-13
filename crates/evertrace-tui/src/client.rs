@@ -21,7 +21,12 @@ const RECONNECT_DELAYS_MS: [u64; 5] = [250, 500, 1_000, 2_000, 5_000];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClientCommand {
-    Refresh(HumanSurface, Option<HumanSystemListSelection>, u64),
+    Refresh(
+        HumanSurface,
+        Option<HumanSystemListSelection>,
+        Option<evertrace_protocol::dto::HumanExplorerListSelection>,
+        u64,
+    ),
     ReadView {
         request: HumanReadRequest,
         generation: u64,
@@ -275,10 +280,12 @@ async fn flush_human_handoff(
 fn first_page_request(
     surface: HumanSurface,
     system_selection: Option<HumanSystemListSelection>,
+    explorer_selection: Option<evertrace_protocol::dto::HumanExplorerListSelection>,
 ) -> HumanGovernanceRequest {
     HumanGovernanceRequest::Read {
         request: HumanReadRequest::List {
             system_selection,
+            explorer_selection,
             surface,
             expected_frontier: None,
             after: None,
@@ -290,7 +297,11 @@ fn first_page_request(
 #[test]
 fn system_first_page_preserves_selected_scope() {
     assert!(matches!(
-        first_page_request(HumanSurface::System, Some(HumanSystemListSelection::Jobs)),
+        first_page_request(
+            HumanSurface::System,
+            Some(HumanSystemListSelection::Jobs),
+            None
+        ),
         HumanGovernanceRequest::Read {
             request: HumanReadRequest::List {
                 surface: HumanSurface::System,
@@ -301,6 +312,33 @@ fn system_first_page_preserves_selected_scope() {
             }
         }
     ));
+}
+
+#[test]
+fn explorer_first_page_preserves_selected_category() {
+    use evertrace_protocol::dto::HumanExplorerListSelection;
+    for selection in [
+        None,
+        Some(HumanExplorerListSelection::Memories),
+        Some(HumanExplorerListSelection::Capture),
+    ] {
+        let request = first_page_request(HumanSurface::Explorer, None, selection);
+        assert!(request.validate());
+        let HumanGovernanceRequest::Read {
+            request:
+                HumanReadRequest::List {
+                    explorer_selection,
+                    after,
+                    expected_frontier,
+                    ..
+                },
+        } = request
+        else {
+            panic!("list")
+        };
+        assert_eq!(explorer_selection, selection);
+        assert!(after.is_none() && expected_frontier.is_none());
+    }
 }
 
 pub(crate) async fn run(
@@ -386,7 +424,7 @@ pub(crate) async fn run(
             tokio::select! {
                 command = commands.recv() => {
                     match command {
-                        Some(ClientCommand::Refresh(surface, system_selection, generation)) => {
+                        Some(ClientCommand::Refresh(surface, system_selection, explorer_selection, generation)) => {
                             view_generation=(generation>0).then_some(generation);
                             if handoff_human(
                                 &mut outgoing,
@@ -394,7 +432,7 @@ pub(crate) async fn run(
                                 &mut queued_action,
                                 &mut latest_read,
                                 &events,
-                                first_page_request(surface, system_selection),
+                                first_page_request(surface, system_selection, explorer_selection),
                             ).await.is_err() {
                                 break;
                             }
@@ -596,7 +634,7 @@ async fn wait_or_shutdown(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Some(ClientCommand::Refresh(_, _, _) | ClientCommand::ReadView { .. }) => continue,
+                Some(ClientCommand::Refresh(_, _, _, _) | ClientCommand::ReadView { .. }) => continue,
                 Some(ClientCommand::Human(request @ (HumanGovernanceRequest::Act { .. } | HumanGovernanceRequest::Export { .. }))) => {
                     let _ = events.send(local_human_rejection(&request, "local_transport_unavailable")).await;
                 }
@@ -694,6 +732,7 @@ mod tests {
                 .send(if surface == HumanSurface::System {
                     ClientCommand::ReadView {
                         request: HumanReadRequest::List {
+                            explorer_selection: None,
                             system_selection: None,
                             surface,
                             expected_frontier: None,
@@ -703,7 +742,7 @@ mod tests {
                         generation: 7,
                     }
                 } else {
-                    ClientCommand::Refresh(surface, None, 0)
+                    ClientCommand::Refresh(surface, None, None, 0)
                 })
                 .await
                 .unwrap();
@@ -790,7 +829,7 @@ mod tests {
             assert!(matches!(receiver.recv().await, Some(AppEvent::Health(_))));
             let started = Instant::now();
             commands
-                .send(ClientCommand::Refresh(HumanSurface::Inbox, None, 0))
+                .send(ClientCommand::Refresh(HumanSurface::Inbox, None, None, 0))
                 .await
                 .unwrap();
             commands
@@ -821,7 +860,7 @@ mod tests {
             loop {
                 tokio::select! {
                     _ = refresh.tick(), if !disconnected => {
-                        commands.send(ClientCommand::Refresh(HumanSurface::System, None, 0)).await.unwrap();
+                        commands.send(ClientCommand::Refresh(HumanSurface::System, None, None, 0)).await.unwrap();
                     }
                     event = receiver.recv() => match event {
                         Some(AppEvent::HumanReadFailed { code: HumanReadFailure::TimedOut, surface: HumanSurface::Inbox, .. }) => {
@@ -915,14 +954,14 @@ mod tests {
                     &pending,
                     &mut queued_action,
                     &mut latest_read,
-                    &first_page_request(surface, None)
+                    &first_page_request(surface, None, None)
                 ),
                 HumanHandoff::Queued
             );
         }
         assert_eq!(
             latest_read,
-            Some(first_page_request(HumanSurface::System, None))
+            Some(first_page_request(HumanSurface::System, None, None))
         );
         assert_eq!(pending.len(), pending_count);
     }

@@ -222,6 +222,21 @@ pub(crate) async fn read_command_rows(
     .await
 }
 
+pub(crate) async fn read_commands_rows(
+    table: &Table,
+    command_ids: &[CommandId],
+) -> Result<Vec<JournalRow>, StoreError> {
+    if command_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = command_ids
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    read_query(table.query().only_if(format!("command_id IN ({ids})"))).await
+}
+
 async fn read_query(query: lancedb::query::Query) -> Result<Vec<JournalRow>, StoreError> {
     let batches = collect_batches(&query)
         .await

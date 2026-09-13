@@ -8,6 +8,7 @@ pub enum UiCommand {
     Help,
     Filter,
     ClearFilter,
+    ExplorerSelection(Option<evertrace_protocol::dto::HumanExplorerListSelection>),
     FindNext,
     FindPrevious,
     Zoom,

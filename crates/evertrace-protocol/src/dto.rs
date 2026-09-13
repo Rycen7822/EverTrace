@@ -105,6 +105,8 @@ pub enum HumanReadRequest {
         surface: HumanSurface,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_selection: Option<HumanSystemListSelection>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explorer_selection: Option<HumanExplorerListSelection>,
         expected_frontier: Option<u64>,
         after: Option<String>,
         limit: u16,
@@ -129,6 +131,13 @@ pub enum HumanReadRequest {
 #[serde(rename_all = "snake_case")]
 pub enum HumanSystemListSelection {
     Jobs,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanExplorerListSelection {
+    Memories,
+    Capture,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -440,6 +449,8 @@ pub struct HumanRepositoryPurgePreview {
 #[serde(deny_unknown_fields)]
 pub struct HumanSnapshotItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context: Option<HumanSourceContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_detail: Option<HumanSemanticDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_base: Option<HumanSemanticDetail>,
@@ -475,6 +486,15 @@ pub struct HumanSnapshotItem {
     pub support_state: Option<String>,
     pub scope_ref: Option<String>,
     pub source_event_seq: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanSourceContext {
+    pub directory: Option<String>,
+    pub session: String,
+    pub event_time_us: i64,
+    pub recorded_at_us: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -914,11 +934,13 @@ impl HumanReadRequest {
             Self::List {
                 surface,
                 system_selection,
+                explorer_selection,
                 after,
                 limit,
                 ..
             } => {
                 (system_selection.is_none() || *surface == HumanSurface::System)
+                    && (explorer_selection.is_none() || *surface == HumanSurface::Explorer)
                     && (1..=HUMAN_PAGE_LIMIT).contains(limit)
                     && after.as_deref().is_none_or(valid_ref)
             }
@@ -1182,6 +1204,7 @@ impl HumanGovernanceResponse {
     deny_unknown_fields
 )]
 pub enum HumanSemanticContent {
+    Digest(Box<evertrace_domain::semantic::SemanticDigest>),
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
@@ -1235,6 +1258,12 @@ impl HumanSemanticDetail {
             return false;
         }
         let valid_identity = match content {
+            HumanSemanticContent::Digest(value) => {
+                value.validate().is_ok()
+                    && self.object_ref.as_deref()
+                        == Some(value.semantic_digest_id.to_string().as_str())
+                    && self.revision_ref == self.object_ref
+            }
             HumanSemanticContent::Atom(value) => {
                 value.validate().is_ok()
                     && self.object_ref.as_deref() == Some(value.atom_id.to_string().as_str())
@@ -1262,7 +1291,14 @@ impl HumanSemanticDetail {
 
 impl HumanSnapshotItem {
     fn validate(&self) -> bool {
-        self.semantic_detail.as_ref().is_none_or(|detail| {
+        self.source_context.as_ref().is_none_or(|context| {
+            !context.session.is_empty()
+                && context.session.len() <= 4096
+                && context
+                    .directory
+                    .as_ref()
+                    .is_none_or(|value| !value.is_empty() && value.len() <= 4096)
+        }) && self.semantic_detail.as_ref().is_none_or(|detail| {
             detail.validate()
                 && detail.object_ref == self.object_ref
                 && detail.revision_ref == self.revision_ref

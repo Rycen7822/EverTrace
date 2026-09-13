@@ -6,6 +6,10 @@ Description=EverTrace local daemon
 Type=simple
 ExecStart=@DAEMON@ --config @CONFIG@
 UMask=0077
+# Backlog processing is a desktop background workload, not an all-core batch job.
+CPUQuota=200%
+CPUWeight=20
+Nice=10
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s

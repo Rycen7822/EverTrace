@@ -68,6 +68,15 @@ enum WriterRequest {
         command_id: evertrace_domain::ids::CommandId,
         reply: oneshot::Sender<Result<Option<CommittedCommand>, WriterActorError>>,
     },
+    CommittedCommands {
+        command_ids: Vec<evertrace_domain::ids::CommandId>,
+        reply: oneshot::Sender<
+            Result<
+                std::collections::BTreeMap<evertrace_domain::ids::CommandId, CommittedCommand>,
+                WriterActorError,
+            >,
+        >,
+    },
     RecallCurrentContexts {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<RecallCurrentContext>, WriterActorError>>,
@@ -400,6 +409,21 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::CommittedCommand { command_id, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn committed_commands(
+        &self,
+        command_ids: Vec<evertrace_domain::ids::CommandId>,
+    ) -> Result<
+        std::collections::BTreeMap<evertrace_domain::ids::CommandId, CommittedCommand>,
+        WriterActorError,
+    > {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CommittedCommands { command_ids, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -771,6 +795,19 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .committed_command(command_id)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::CommittedCommands { command_ids, reply } => {
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .committed_commands(&command_ids)
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();

@@ -69,6 +69,6 @@ pub use search::{
 };
 pub use session_import::*;
 pub use writer::{
-    ClosedJournalWriter, CommittedCommand, JournalWriter, NativeDiagnosticTable, NativeDiagnostics,
-    SiblingWriterLock,
+    ClosedJournalWriter, CommittedCommand, JournalWriter, MAX_COMMITTED_COMMAND_READ,
+    NativeDiagnosticTable, NativeDiagnostics, SiblingWriterLock,
 };

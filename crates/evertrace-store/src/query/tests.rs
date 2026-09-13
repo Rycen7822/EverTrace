@@ -4,8 +4,8 @@ mod tests {
 
     use evertrace_domain::ids::CommandId;
 
-    use super::*;
     use super::super::projection::{checkpoint_relation, checkpoint_search};
+    use super::*;
     use crate::{
         JournalCommand, JournalEventDraft, JournalPayload, MigrationApplied, ProjectionWorker,
     };
@@ -91,6 +91,53 @@ mod tests {
             worker.catch_up(&snapshot).await.unwrap().frontier,
             snapshot.frontier
         );
+    }
+
+    #[tokio::test]
+    async fn changed_row_merge_keeps_untouched_rows_and_deletes_only_removed_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let _writer = crate::JournalWriter::open(&root).await.unwrap();
+        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let table = connection
+            .open_table(crate::RELATIONS_TABLE)
+            .execute()
+            .await
+            .unwrap();
+        let keep = RelationProjectionRow::edge(
+            "repository_to_worktree",
+            1,
+            "repository-a".into(),
+            "worktree-a".into(),
+        );
+        let remove = RelationProjectionRow::edge(
+            "repository_to_worktree",
+            1,
+            "repository-a".into(),
+            "worktree-b".into(),
+        );
+        let mut initial = vec![RelationProjectionRow::checkpoint(1), keep.clone(), remove];
+        initial.sort();
+        let current = read_relation_rows(&table).await.unwrap();
+        commit_relation_rows(&table, &current, &initial, false)
+            .await
+            .unwrap();
+        // Only the checkpoint is in the merge source. The unchanged edge must
+        // survive while the explicitly absent edge is deleted atomically.
+        let mut expected = vec![RelationProjectionRow::checkpoint(2), keep];
+        expected.sort();
+        commit_relation_rows(&table, &initial, &expected, false)
+            .await
+            .unwrap();
+        assert_eq!(read_relation_rows(&table).await.unwrap(), expected);
+        let version = table.version().await.unwrap();
+        commit_relation_rows(&table, &expected, &expected, false)
+            .await
+            .unwrap();
+        assert_eq!(table.version().await.unwrap(), version);
     }
 
     #[test]
@@ -259,9 +306,14 @@ mod tests {
             .find(|row| row.row_id == crate::RELATIONS_CHECKPOINT_ID)
             .unwrap()
             .source_event_seq = snapshot.frontier - 1;
-        commit_relation_rows(&relations, &relation_rows, false)
-            .await
-            .unwrap();
+        commit_relation_rows(
+            &relations,
+            &read_relation_rows(&relations).await.unwrap(),
+            &relation_rows,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             worker.catch_up(&snapshot).await,
             Err(StoreError::StoreCorrupt)
@@ -272,9 +324,14 @@ mod tests {
             .find(|row| row.row_id == crate::RELATIONS_CHECKPOINT_ID)
             .unwrap()
             .source_event_seq = snapshot.frontier + 1;
-        commit_relation_rows(&relations, &relation_rows, false)
-            .await
-            .unwrap();
+        commit_relation_rows(
+            &relations,
+            &read_relation_rows(&relations).await.unwrap(),
+            &relation_rows,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             worker.catch_up(&snapshot).await,
             Err(StoreError::StoreCorrupt)
@@ -285,9 +342,14 @@ mod tests {
             .find(|row| row.row_id == crate::RELATIONS_CHECKPOINT_ID)
             .unwrap()
             .source_event_seq = snapshot.frontier;
-        commit_relation_rows(&relations, &relation_rows, false)
-            .await
-            .unwrap();
+        commit_relation_rows(
+            &relations,
+            &read_relation_rows(&relations).await.unwrap(),
+            &relation_rows,
+            false,
+        )
+        .await
+        .unwrap();
         worker.catch_up(&snapshot).await.unwrap();
         let relation_version = relations.version().await.unwrap();
         let search_version = search.version().await.unwrap();
@@ -387,7 +449,13 @@ mod tests {
         });
         search_rows.sort();
         assert_eq!(
-            commit_search_rows(&search, &search_rows, false).await,
+            commit_search_rows(
+                &search,
+                &read_search_rows(&search).await.unwrap(),
+                &search_rows,
+                false
+            )
+            .await,
             Err(StoreError::StoreCorrupt)
         );
     }

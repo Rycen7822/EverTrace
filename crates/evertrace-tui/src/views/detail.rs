@@ -48,6 +48,33 @@ pub(crate) fn detail_text(state: &AppState) -> String {
                 .unwrap_or(state.language.label("not supplied"))
         ),
     ];
+    if let Some(source) = &item.source_context {
+        lines.push(crate::locale::format!(
+            language,
+            "Source directory (recorded hint): {}\nSession: {}\nSource event: {}\nRecorded at: {}",
+            "来源目录（记录中的提示）：{}\n会话：{}\n来源事件时间：{}\n记录时间：{}",
+            source
+                .directory
+                .as_deref()
+                .map(super::safe_content)
+                .unwrap_or_else(|| language.text("unknown", "未知").into()),
+            super::safe_content(&source.session),
+            timestamp(Some(source.event_time_us)),
+            timestamp(Some(source.recorded_at_us))
+        ));
+    } else if matches!(
+        item.object_kind.as_str(),
+        "source_receipt" | "source_observation" | "host_occurrence"
+    ) {
+        lines.push(
+            language
+                .text(
+                    "Source directory / session / time: unavailable",
+                    "来源目录／会话／时间：不可用",
+                )
+                .into(),
+        );
+    }
     if item.proposal_review.is_some() {
         lines.extend(proposal_diff(item, language));
         return lines.join("\n");

@@ -168,6 +168,7 @@ pub(crate) enum Focus {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NavigationFrame {
+    pub explorer_selection: Option<evertrace_protocol::dto::HumanExplorerListSelection>,
     pub result_jump: bool,
     pub page_cursor: Option<String>,
     pub type_filter: Option<String>,
@@ -188,6 +189,7 @@ pub(crate) struct NavigationFrame {
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct UiState {
+    pub explorer_selection: Option<evertrace_protocol::dto::HumanExplorerListSelection>,
     pub read_generation: u64,
     pub diagnostic_selection: usize,
     pub diagnostic_detail: bool,

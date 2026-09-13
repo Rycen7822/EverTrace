@@ -274,6 +274,7 @@ async fn cli_backup_queues_real_daemon_jobs_and_reports_completion_separately() 
                     RequestId::new_v7(),
                     Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                         request: HumanReadRequest::List {
+                            explorer_selection: None,
                             system_selection: None,
                             surface: HumanSurface::System,
                             expected_frontier: None,
@@ -429,6 +430,7 @@ async fn protected_export_cli_and_system_publish_complete_cas() {
                 RequestId::new_v7(),
                 Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                     request: HumanReadRequest::List {
+                        explorer_selection: None,
                         system_selection: None,
                         surface: HumanSurface::Explorer,
                         expected_frontier: None,
@@ -1428,6 +1430,7 @@ async fn ordinary_daemon_keeps_explorer_and_doctor_readable_with_unowned_spool_f
                 RequestId::new_v7(),
                 Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                     request: HumanReadRequest::List {
+                        explorer_selection: None,
                         system_selection: None,
                         surface: HumanSurface::Explorer,
                         expected_frontier: None,
@@ -1516,6 +1519,7 @@ async fn ordinary_daemon_keeps_explorer_and_doctor_readable_with_unowned_spool_f
                     RequestId::new_v7(),
                     Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                         request: HumanReadRequest::List {
+                            explorer_selection: None,
                             system_selection: None,
                             surface: HumanSurface::Explorer,
                             expected_frontier: None,
@@ -1782,6 +1786,7 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
                         evertrace_domain::ids::RequestId::new_v7(),
                         Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                             request: HumanReadRequest::List {
+                                explorer_selection: None,
                                 system_selection: None,
                                 surface: HumanSurface::System,
                                 expected_frontier: None,
@@ -2102,6 +2107,7 @@ async fn submitted_inputs_are_weak_independent_and_visible_after_automatic_inges
                                 RequestId::new_v7(),
                                 Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                                     request: HumanReadRequest::List {
+                                        explorer_selection: None,
                                         system_selection: None,
                                         surface: HumanSurface::Explorer,
                                         expected_frontier: None,
@@ -2998,6 +3004,7 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
                 RequestId::new_v7(),
                 Rpc::HumanGovernance(HumanGovernanceRequest::Read {
                     request: HumanReadRequest::List {
+                        explorer_selection: None,
                         system_selection: None,
                         surface: HumanSurface::Explorer,
                         expected_frontier: None,
@@ -3783,6 +3790,7 @@ async fn doctor_reads_current_state_and_only_cli_refresh_runs_the_selected_host(
             evertrace_domain::ids::RequestId::new_v7(),
             Rpc::HumanGovernance(evertrace_protocol::dto::HumanGovernanceRequest::Read {
                 request: evertrace_protocol::dto::HumanReadRequest::List {
+                    explorer_selection: None,
                     system_selection: None,
                     surface: evertrace_protocol::dto::HumanSurface::System,
                     expected_frontier: None,

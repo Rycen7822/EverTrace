@@ -281,6 +281,7 @@ mod tests {
             HumanSystemDetail,
         };
         let item = HumanSnapshotItem {
+            source_context: None,
             semantic_detail: None,
             proposal_base: None,
             evidence_detail: None,
