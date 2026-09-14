@@ -222,13 +222,18 @@ pub struct ClosedJournalWriter {
     pub(crate) lock: SiblingWriterLock,
 }
 
-#[derive(Clone, Copy)]
+const MAX_PROJECTION_HANDOFF_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone)]
 struct ProjectionValidation {
     // These versions bind the checkpoint/generation and full rows validated by
-    // the existing workers; no rows or reducer state are retained here.
+    // the existing workers. No full current-row set or reducer state is retained.
     versions: [u64; 4],
     frontier: u64,
     has_failed_job: bool,
+    // At most one small, immutable batch from a confirmed direct-successor
+    // journal append. The next validation/append/restore replaces this stamp.
+    appended_batch: Option<arrow_array::RecordBatch>,
 }
 
 pub struct JournalWriter {
@@ -813,18 +818,25 @@ impl JournalWriter {
             .projection_validation
             .get_mut()
             .map_err(|_| StoreError::StoreCorrupt)?;
-        let validated_input = stamps[0].filter(|stamp| {
-            known.is_some()
-                && stamp.versions[0] == version
-                && stamp.frontier == self.admission_state.committed_frontier()
-        });
+        let validated_input = stamps[0]
+            .as_ref()
+            .filter(|stamp| {
+                known.is_some()
+                    && stamp.versions[0] == version
+                    && stamp.frontier == self.admission_state.committed_frontier()
+            })
+            .cloned();
         // Clear before the await, including uncertain append failures. Only a
         // confirmed direct successor may retain proof of the unchanged OLD
         // objects input, never of the new frontier or synchronized indexes.
         *stamps = [None, None];
-        let committed_version = append_rows(&self.journal, &rows).await?;
-        if version.checked_add(1) == Some(committed_version) {
-            stamps[0] = validated_input;
+        let (committed_version, batch) = append_rows(&self.journal, &rows).await?;
+        if version.checked_add(1) == Some(committed_version)
+            && let Some(mut stamp) = validated_input
+        {
+            stamp.appended_batch =
+                (batch.get_array_memory_size() <= MAX_PROJECTION_HANDOFF_BYTES).then_some(batch);
+            stamps[0] = Some(stamp);
         }
         self.admission_state = next_admission_state;
         if let Some((_, mut ids)) = known {
@@ -919,6 +931,7 @@ impl JournalWriter {
                 .projection_validation
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?[0]
+                .clone()
                 .ok_or(StoreError::StoreCorrupt)?;
             if self.command_ids.as_ref().map(|(version, _)| *version) != Some(stamp.versions[0])
                 || self.admission_state.committed_frontier() != stamp.frontier
@@ -999,29 +1012,31 @@ impl JournalWriter {
     ) -> Result<(u64, Option<ProjectionSnapshot>), StoreError> {
         let result = async {
             let before = self.projection_versions(indexes).await?;
-            let stamps = *self
+            let stamps = self
                 .projection_validation
                 .lock()
-                .map_err(|_| StoreError::StoreCorrupt)?;
-            let objects = stamps[0].filter(|stamp| stamp.versions[..2] == before[..2]);
-            let validated_current = stamps[0]
-                .filter(|stamp| {
-                    stamp.versions[0].checked_add(1) == Some(before[0])
-                        && stamp.versions[1] == before[1]
-                        && self
-                            .command_ids
-                            .as_ref()
-                            .is_some_and(|(version, _)| *version == before[0])
-                })
-                .map(|stamp| {
-                    (
-                        stamp.versions[1],
-                        stamp.frontier,
-                        self.admission_state.committed_frontier(),
-                    )
-                });
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .clone();
+            let objects = stamps[0]
+                .as_ref()
+                .filter(|stamp| stamp.versions[..2] == before[..2]);
+            let validated_input = stamps[0].as_ref().filter(|stamp| {
+                stamp.versions[0].checked_add(1) == Some(before[0])
+                    && stamp.versions[1] == before[1]
+                    && self
+                        .command_ids
+                        .as_ref()
+                        .is_some_and(|(version, _)| *version == before[0])
+            });
+            let validated_current = validated_input.map(|stamp| {
+                (
+                    stamp.versions[1],
+                    stamp.frontier,
+                    self.admission_state.committed_frontier(),
+                )
+            });
             let all = indexes
-                .then_some(stamps[1])
+                .then_some(stamps[1].as_ref())
                 .flatten()
                 .filter(|stamp| stamp.versions == before);
             let hit = if indexes { all } else { objects };
@@ -1045,7 +1060,10 @@ impl JournalWriter {
                 } else {
                     let (snapshot, version) = self
                         .projection_worker()
-                        .catch_up_validated(validated_current)
+                        .catch_up_validated(
+                            validated_current,
+                            validated_input.and_then(|stamp| stamp.appended_batch.as_ref()),
+                        )
                         .await?;
                     validated_versions[1] = version;
                     snapshot
@@ -1084,15 +1102,19 @@ impl JournalWriter {
                     versions: validated_versions,
                     frontier,
                     has_failed_job,
+                    appended_batch: None,
                 });
                 let mut stamps = self
                     .projection_validation
                     .lock()
                     .map_err(|_| StoreError::StoreCorrupt)?;
-                stamps[0] = stamp;
+                stamps[0] = stamp.clone();
                 if indexes {
                     stamps[1] = stamp;
-                } else if stamps[1].is_some_and(|stamp| stamp.versions[..2] != after[..2]) {
+                } else if stamps[1]
+                    .as_ref()
+                    .is_some_and(|stamp| stamp.versions[..2] != after[..2])
+                {
                     stamps[1] = None;
                 }
             }
@@ -1877,6 +1899,7 @@ mod tests {
         append_rows(&writer.journal, &rows).await.unwrap();
         // A direct native successor is not proof of an append by this writer.
         let old_version = writer.projection_validation.lock().unwrap()[0]
+            .as_ref()
             .unwrap()
             .versions[0];
         assert_eq!(writer.journal.version().await.unwrap(), old_version + 1);
@@ -1885,6 +1908,7 @@ mod tests {
         // The first catch-up validates its own committed version immediately.
         assert_eq!(
             writer.projection_validation.lock().unwrap()[0]
+                .as_ref()
                 .unwrap()
                 .frontier,
             first_seq
@@ -1971,7 +1995,9 @@ mod tests {
         let root = temp.path().join("store");
         let mut writer = JournalWriter::open(&root).await.unwrap();
         let initial_frontier = writer.project().await.unwrap().frontier;
-        let initial = writer.projection_validation.lock().unwrap()[0].unwrap();
+        let initial = writer.projection_validation.lock().unwrap()[0]
+            .clone()
+            .unwrap();
         let first = JournalCommand::new(
             CommandId::from_str("01890f47-6a4a-7cc1-98b9-01890f476a7b").unwrap(),
             vec![JournalEventDraft::runtime(
@@ -2011,14 +2037,26 @@ mod tests {
         let (version, ids) = writer.command_ids.as_ref().unwrap();
         assert_eq!(*version, writer.journal.version().await.unwrap());
         assert!(ids.contains(&first.command_id()));
-        let stamps = *writer.projection_validation.lock().unwrap();
-        let old_input = stamps[0].unwrap();
+        let stamps = writer.projection_validation.lock().unwrap().clone();
+        let old_input = stamps[0].as_ref().unwrap();
         assert_eq!(old_input.versions, initial.versions);
         assert_eq!(old_input.frontier, initial_frontier);
         assert_ne!(old_input.frontier, committed.last_seq);
         assert!(stamps[1].is_none());
+        let batch = old_input.appended_batch.as_ref().unwrap();
+        assert!(batch.get_array_memory_size() <= MAX_PROJECTION_HANDOFF_BYTES);
+        assert_eq!(
+            crate::journal::rows_from_batch(batch).unwrap(),
+            read_command_rows(&writer.journal, first.command_id())
+                .await
+                .unwrap()
+        );
+        assert!(writer.commit(&first, 1).await.unwrap().replayed);
         assert_eq!(writer.sync_frontier().await.unwrap(), committed.last_seq);
-        let validated = writer.projection_validation.lock().unwrap()[1].unwrap();
+        let validated = writer.projection_validation.lock().unwrap()[1]
+            .clone()
+            .unwrap();
+        assert!(validated.appended_batch.is_none());
         assert_eq!(
             validated.versions,
             writer.projection_versions(true).await.unwrap()
@@ -2034,6 +2072,7 @@ mod tests {
         );
         assert_eq!(
             writer.projection_validation.lock().unwrap()[1]
+                .as_ref()
                 .unwrap()
                 .versions,
             validated.versions
@@ -2046,6 +2085,7 @@ mod tests {
         assert_eq!(replayed.first_seq, committed.first_seq);
         assert_eq!(
             writer.projection_validation.lock().unwrap()[1]
+                .as_ref()
                 .unwrap()
                 .versions,
             validated.versions
@@ -2058,6 +2098,7 @@ mod tests {
         );
         assert_eq!(
             writer.projection_validation.lock().unwrap()[1]
+                .as_ref()
                 .unwrap()
                 .versions,
             validated.versions
@@ -2146,6 +2187,48 @@ mod tests {
             writer.capture_current_context(None, None, 8).await,
             Err(StoreError::StoreCorrupt)
         ));
+    }
+
+    #[tokio::test]
+    async fn large_committed_batch_is_not_retained_for_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        writer.sync_objects_frontier().await.unwrap();
+        let command = JournalCommand::new(
+            CommandId::new_v7(),
+            (1..=4096)
+                .map(|value| {
+                    JournalEventDraft::runtime(
+                        1,
+                        [1; 32],
+                        "objects-v1",
+                        JournalPayload::WatermarkAdvanced(crate::WatermarkAdvanced {
+                            kind: crate::WatermarkKind::RuntimeJobs,
+                            value,
+                        }),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let committed = writer.commit(&command, 2).await.unwrap();
+        assert_eq!(committed.event_ids.len(), 4096);
+        assert!(
+            writer.projection_validation.lock().unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .appended_batch
+                .is_none()
+        );
+        assert_eq!(
+            writer.sync_objects_frontier().await.unwrap(),
+            committed.last_seq
+        );
+        assert_eq!(
+            writer.project_objects().await.unwrap(),
+            writer.full_projection().await.unwrap()
+        );
     }
 
     #[tokio::test]

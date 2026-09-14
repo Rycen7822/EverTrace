@@ -1297,7 +1297,7 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
     )
     .await
     .unwrap()
-    .with_session_report(report);
+    .with_session_report(report.clone());
     let exact_source = read_service
         .handle(
             "s32-exact-get",
@@ -1599,6 +1599,24 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
         },
     );
     let reauthorization_frontier = handle.project().await.unwrap().frontier;
+    // Reopening the writer does not grant the new Human service Host trust.
+    // Without its current report, the candidate body must remain unavailable.
+    let denied = restarted_service
+        .detail(
+            HumanSurface::Inbox,
+            &reauthorization_proposal.proposal_id.to_string(),
+            reauthorization_frontier,
+            Some(&reauthorization_proposal.proposal_revision_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(denied.items[0].proposal_review.is_none());
+    assert_eq!(
+        denied.items[0].semantic_detail.as_ref().unwrap().state,
+        evertrace_engine::HumanContentState::AccessDenied
+    );
+    let restarted_service = restarted_service.with_session_report(report);
     let detail = restarted_service
         .detail(
             HumanSurface::Inbox,

@@ -488,16 +488,21 @@ pub(crate) fn rows_for_append(
         .collect()
 }
 
-pub(crate) async fn append_rows(table: &Table, rows: &[JournalRow]) -> Result<u64, StoreError> {
+pub(crate) async fn append_rows(
+    table: &Table,
+    rows: &[JournalRow],
+) -> Result<(u64, RecordBatch), StoreError> {
     if rows.is_empty() {
         return Err(StoreError::InvalidInput);
     }
-    table
-        .add(journal_batch(rows)?)
+    let batch = journal_batch(rows)?;
+    let version = table
+        .add(batch.clone())
         .execute()
         .await
         .map(|result| result.version)
-        .map_err(|_| StoreError::LanceDb)
+        .map_err(|_| StoreError::LanceDb)?;
+    Ok((version, batch))
 }
 
 fn row_from_prepared(
@@ -615,7 +620,7 @@ fn journal_batch(rows: &[JournalRow]) -> Result<RecordBatch, StoreError> {
     RecordBatch::try_new(journal_schema(), columns).map_err(|_| StoreError::Arrow)
 }
 
-fn rows_from_batch(batch: &RecordBatch) -> Result<Vec<JournalRow>, StoreError> {
+pub(crate) fn rows_from_batch(batch: &RecordBatch) -> Result<Vec<JournalRow>, StoreError> {
     if batch.schema().as_ref() != journal_schema().as_ref() {
         return Err(StoreError::StoreCorrupt);
     }

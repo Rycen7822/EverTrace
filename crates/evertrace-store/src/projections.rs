@@ -14232,15 +14232,17 @@ impl ProjectionWorker {
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(false, None).await?.0)
+        Ok(self.catch_up_inner(false, None, None).await?.0)
     }
 
     pub(crate) async fn catch_up_validated(
         &self,
         // Old objects version/checkpoint and the confirmed committed journal frontier.
         validated_current: Option<(u64, u64, u64)>,
+        appended_batch: Option<&arrow_array::RecordBatch>,
     ) -> Result<(ProjectionSnapshot, u64), StoreError> {
-        self.catch_up_inner(false, validated_current).await
+        self.catch_up_inner(false, validated_current, appended_batch)
+            .await
     }
 
     pub async fn reconciliation_frontier(
@@ -14264,6 +14266,7 @@ impl ProjectionWorker {
         &self,
         inject_before_commit_failure: bool,
         validated_current: Option<(u64, u64, u64)>,
+        appended_batch: Option<&arrow_array::RecordBatch>,
     ) -> Result<(ProjectionSnapshot, u64), StoreError> {
         self.objects
             .checkout_latest()
@@ -14341,7 +14344,13 @@ impl ProjectionWorker {
         } else {
             ReducerState::from_current_rows(&current, checkpoint_frontier)?
         };
-        let delta = read_journal_after(&self.journal, checkpoint_frontier).await?;
+        let delta = if let Some(batch) = appended_batch.filter(|_| validated_frontier.is_some()) {
+            // Decode the exact immutable batch acknowledged by the native
+            // journal append, through the same decoder as a persisted read.
+            crate::journal::rows_from_batch(batch)?
+        } else {
+            read_journal_after(&self.journal, checkpoint_frontier).await?
+        };
         validate_delta(checkpoint_frontier, journal_frontier, &delta)?;
         if delta.is_empty() {
             return Ok((
@@ -14477,7 +14486,7 @@ impl ProjectionWorker {
 
     #[cfg(test)]
     async fn catch_up_with_commit_fault(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(true, None).await?.0)
+        Ok(self.catch_up_inner(true, None, None).await?.0)
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
@@ -16390,17 +16399,26 @@ mod tests {
         assert_eq!(writer.sync_frontier().await.unwrap(), frontier);
         assert_eq!(writer.project_objects().await.unwrap().frontier, frontier);
         assert_eq!(objects.version().await.unwrap(), before_version);
+        let empty_delta = arrow_array::RecordBatch::new_empty(crate::journal::journal_schema());
         assert!(matches!(
             worker
-                .catch_up_validated(Some((before_version, frontier, frontier + 1)))
+                .catch_up_validated(
+                    Some((before_version, frontier, frontier + 1)),
+                    Some(&empty_delta),
+                )
                 .await,
             Err(StoreError::StoreCorrupt)
         ));
         assert_eq!(objects.version().await.unwrap(), before_version);
-        // A mismatched old checkpoint cannot supply a frontier shortcut.
+        // A mismatched old checkpoint cannot supply a frontier or batch shortcut.
+        let invalid_batch =
+            arrow_array::RecordBatch::new_empty(std::sync::Arc::new(arrow_schema::Schema::empty()));
         assert_eq!(
             worker
-                .catch_up_validated(Some((before_version, frontier + 1, frontier + 1)))
+                .catch_up_validated(
+                    Some((before_version, frontier + 1, frontier + 1)),
+                    Some(&invalid_batch),
+                )
                 .await
                 .unwrap()
                 .0
@@ -16429,7 +16447,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             worker
-                .catch_up_validated(Some((before_version, frontier, frontier)))
+                .catch_up_validated(Some((before_version, frontier, frontier)), None)
                 .await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
