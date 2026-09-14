@@ -14237,7 +14237,8 @@ impl ProjectionWorker {
 
     pub(crate) async fn catch_up_validated(
         &self,
-        validated_current: Option<(u64, u64)>,
+        // Old objects version/checkpoint and the confirmed committed journal frontier.
+        validated_current: Option<(u64, u64, u64)>,
     ) -> Result<(ProjectionSnapshot, u64), StoreError> {
         self.catch_up_inner(false, validated_current).await
     }
@@ -14262,7 +14263,7 @@ impl ProjectionWorker {
     async fn catch_up_inner(
         &self,
         inject_before_commit_failure: bool,
-        validated_current: Option<(u64, u64)>,
+        validated_current: Option<(u64, u64, u64)>,
     ) -> Result<(ProjectionSnapshot, u64), StoreError> {
         self.objects
             .checkout_latest()
@@ -14288,7 +14289,19 @@ impl ProjectionWorker {
             .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
             .ok_or(StoreError::StoreCorrupt)?;
         let checkpoint_frontier = checkpoint.source_event_seq;
-        let journal_frontier = read_journal_frontier(&self.journal).await?;
+        let validated_frontier = validated_current
+            .filter(|(version, checkpoint, _)| {
+                *version == current_version && *checkpoint == checkpoint_frontier
+            })
+            .map(|(_, _, frontier)| frontier);
+        let journal_frontier = if let Some(frontier) = validated_frontier {
+            // The writer bound its published admission state to this native
+            // append version. The complete delta below must end at this exact
+            // frontier; reserved sequence numbers are not used as evidence.
+            frontier
+        } else {
+            read_journal_frontier(&self.journal).await?
+        };
         if checkpoint.source_event_seq > journal_frontier {
             return Err(StoreError::StoreCorrupt);
         }
@@ -14320,7 +14333,7 @@ impl ProjectionWorker {
             }
             return Ok((expected, version));
         }
-        let mut state = if validated_current == Some((current_version, checkpoint_frontier)) {
+        let mut state = if validated_frontier.is_some() {
             // The writer already validated this exact old input before its
             // append. Decode it fully, but do not regenerate the same old rows.
             // Delta admission and the resulting snapshot are still validated.
@@ -16377,6 +16390,23 @@ mod tests {
         assert_eq!(writer.sync_frontier().await.unwrap(), frontier);
         assert_eq!(writer.project_objects().await.unwrap().frontier, frontier);
         assert_eq!(objects.version().await.unwrap(), before_version);
+        assert!(matches!(
+            worker
+                .catch_up_validated(Some((before_version, frontier, frontier + 1)))
+                .await,
+            Err(StoreError::StoreCorrupt)
+        ));
+        assert_eq!(objects.version().await.unwrap(), before_version);
+        // A mismatched old checkpoint cannot supply a frontier shortcut.
+        assert_eq!(
+            worker
+                .catch_up_validated(Some((before_version, frontier + 1, frontier + 1)))
+                .await
+                .unwrap()
+                .0
+                .frontier,
+            frontier
+        );
 
         let mut migration = read_object_rows(&objects)
             .await
@@ -16399,7 +16429,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             worker
-                .catch_up_validated(Some((before_version, frontier)))
+                .catch_up_validated(Some((before_version, frontier, frontier)))
                 .await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));

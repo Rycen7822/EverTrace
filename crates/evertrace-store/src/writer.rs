@@ -1013,7 +1013,13 @@ impl JournalWriter {
                             .as_ref()
                             .is_some_and(|(version, _)| *version == before[0])
                 })
-                .map(|stamp| (stamp.versions[1], stamp.frontier));
+                .map(|stamp| {
+                    (
+                        stamp.versions[1],
+                        stamp.frontier,
+                        self.admission_state.committed_frontier(),
+                    )
+                });
             let all = indexes
                 .then_some(stamps[1])
                 .flatten()
@@ -2094,6 +2100,17 @@ mod tests {
         assert_eq!(
             writer.projection_versions(true).await.unwrap(),
             validated.versions
+        );
+        let appended = writer.commit(&second, 3).await.unwrap();
+        reserve_range(&mut writer.next_seq, 2).unwrap();
+        assert!(writer.frontier() > appended.last_seq);
+        assert_eq!(
+            writer.sync_objects_frontier().await.unwrap(),
+            appended.last_seq
+        );
+        assert_eq!(
+            writer.project_objects().await.unwrap(),
+            writer.full_projection().await.unwrap()
         );
         let proof = writer.command_ids.take();
         assert!(matches!(
