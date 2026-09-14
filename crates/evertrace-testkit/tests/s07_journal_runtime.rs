@@ -456,7 +456,7 @@ async fn job_lease_recovery_watermark_config_and_stale_audit_rebuild() {
         evertrace_store::connection::native_root(&root).join("evertrace_objects.lance"),
     )
     .unwrap();
-    let rebuilt = JournalWriter::open(&root).await.unwrap();
+    let mut rebuilt = JournalWriter::open(&root).await.unwrap();
     assert_eq!(
         rebuilt.migration_outcome(),
         MigrationOutcome::RebuiltObjects
@@ -465,6 +465,45 @@ async fn job_lease_recovery_watermark_config_and_stale_audit_rebuild() {
     let recovered = expired_leases(&after_stale.rows, 60, after_stale.frontier).unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].next_attempt, 3);
+    assert!(
+        !rebuilt
+            .capture_current_context(None, None, 1)
+            .await
+            .unwrap()
+            .has_failed_job
+    );
+    let JournalPayload::JobState(mut failed) = serde_json::from_str(
+        after_stale
+            .row(&job_row_id)
+            .unwrap()
+            .payload_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap() else {
+        panic!("expected projected job");
+    };
+    failed.state = JobStatus::Failed;
+    failed.lease_until_us = None;
+    failed.terminal = Some(Box::new(evertrace_store::JobTerminalAudit {
+        outcome: evertrace_store::JobTerminalOutcome::Failed,
+        reason: evertrace_store::JobTerminalReason::SourceUnavailable,
+        result_ref: None,
+    }));
+    let committed = rebuilt
+        .commit(&command(0xb3, vec![JournalPayload::JobState(failed)]), 61)
+        .await
+        .unwrap();
+    let current = rebuilt
+        .capture_current_context(None, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(current.frontier, committed.last_seq);
+    assert!(current.has_failed_job);
+    assert_eq!(
+        rebuilt.project_objects().await.unwrap(),
+        rebuilt.full_projection().await.unwrap()
+    );
 }
 
 #[tokio::test]

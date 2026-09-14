@@ -809,13 +809,23 @@ impl JournalWriter {
             .command_ids
             .take()
             .filter(|(known, _)| *known == version);
-        // Only the append boundary can make a previously validated projection
-        // stale. Clear before awaiting it, including uncertain append failures.
-        *self
+        let stamps = self
             .projection_validation
-            .lock()
-            .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
+            .get_mut()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let validated_input = stamps[0].filter(|stamp| {
+            known.is_some()
+                && stamp.versions[0] == version
+                && stamp.frontier == self.admission_state.committed_frontier()
+        });
+        // Clear before the await, including uncertain append failures. Only a
+        // confirmed direct successor may retain proof of the unchanged OLD
+        // objects input, never of the new frontier or synchronized indexes.
+        *stamps = [None, None];
         let committed_version = append_rows(&self.journal, &rows).await?;
+        if version.checked_add(1) == Some(committed_version) {
+            stamps[0] = validated_input;
+        }
         self.admission_state = next_admission_state;
         if let Some((_, mut ids)) = known {
             ids.insert(prepared.command_id);
@@ -994,6 +1004,16 @@ impl JournalWriter {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?;
             let objects = stamps[0].filter(|stamp| stamp.versions[..2] == before[..2]);
+            let validated_current = stamps[0]
+                .filter(|stamp| {
+                    stamp.versions[0].checked_add(1) == Some(before[0])
+                        && stamp.versions[1] == before[1]
+                        && self
+                            .command_ids
+                            .as_ref()
+                            .is_some_and(|(version, _)| *version == before[0])
+                })
+                .map(|stamp| (stamp.versions[1], stamp.frontier));
             let all = indexes
                 .then_some(stamps[1])
                 .flatten()
@@ -1017,7 +1037,10 @@ impl JournalWriter {
                         rows: read_object_rows(&self.objects).await?,
                     }
                 } else {
-                    let (snapshot, version) = self.projection_worker().catch_up_validated().await?;
+                    let (snapshot, version) = self
+                        .projection_worker()
+                        .catch_up_validated(validated_current)
+                        .await?;
                     validated_versions[1] = version;
                     snapshot
                 };
@@ -1846,6 +1869,12 @@ mod tests {
         assert_eq!(first_seq, abandoned + u64::from(prepared.event_count));
         let rows = rows_for_append(&prepared, first_seq, 2).unwrap();
         append_rows(&writer.journal, &rows).await.unwrap();
+        // A direct native successor is not proof of an append by this writer.
+        let old_version = writer.projection_validation.lock().unwrap()[0]
+            .unwrap()
+            .versions[0];
+        assert_eq!(writer.journal.version().await.unwrap(), old_version + 1);
+        assert_eq!(writer.command_ids.as_ref().unwrap().0, old_version);
         assert_eq!(writer.sync_objects_frontier().await.unwrap(), first_seq);
         // The first catch-up validates its own committed version immediately.
         assert_eq!(
@@ -1936,6 +1965,7 @@ mod tests {
         let root = temp.path().join("store");
         let mut writer = JournalWriter::open(&root).await.unwrap();
         let initial_frontier = writer.project().await.unwrap().frontier;
+        let initial = writer.projection_validation.lock().unwrap()[0].unwrap();
         let first = JournalCommand::new(
             CommandId::from_str("01890f47-6a4a-7cc1-98b9-01890f476a7b").unwrap(),
             vec![JournalEventDraft::runtime(
@@ -1975,14 +2005,12 @@ mod tests {
         let (version, ids) = writer.command_ids.as_ref().unwrap();
         assert_eq!(*version, writer.journal.version().await.unwrap());
         assert!(ids.contains(&first.command_id()));
-        assert!(
-            writer
-                .projection_validation
-                .lock()
-                .unwrap()
-                .iter()
-                .all(Option::is_none)
-        );
+        let stamps = *writer.projection_validation.lock().unwrap();
+        let old_input = stamps[0].unwrap();
+        assert_eq!(old_input.versions, initial.versions);
+        assert_eq!(old_input.frontier, initial_frontier);
+        assert_ne!(old_input.frontier, committed.last_seq);
+        assert!(stamps[1].is_none());
         assert_eq!(writer.sync_frontier().await.unwrap(), committed.last_seq);
         let validated = writer.projection_validation.lock().unwrap()[1].unwrap();
         assert_eq!(
@@ -1990,6 +2018,10 @@ mod tests {
             writer.projection_versions(true).await.unwrap()
         );
         assert_eq!(validated.frontier, committed.last_seq);
+        assert_eq!(
+            writer.project_objects().await.unwrap(),
+            writer.full_projection().await.unwrap()
+        );
         assert_eq!(
             writer.commit(&second, -1).await,
             Err(StoreError::InvalidInput)

@@ -11921,6 +11921,18 @@ impl ReducerState {
     }
 
     fn from_current_rows(rows: &[ObjectRow], checkpoint_frontier: u64) -> Result<Self, StoreError> {
+        let state = Self::decode_current_rows(rows, checkpoint_frontier)?;
+        let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
+        if canonical.rows != rows {
+            return Err(StoreError::Projection);
+        }
+        Ok(state)
+    }
+
+    fn decode_current_rows(
+        rows: &[ObjectRow],
+        checkpoint_frontier: u64,
+    ) -> Result<Self, StoreError> {
         let checkpoints = rows
             .iter()
             .filter(|row| row.row_kind == ObjectRowKind::Checkpoint)
@@ -11997,10 +12009,6 @@ impl ReducerState {
         }
         state.scope_purges.validate_restored()?;
         state.rebuild_revision_currents()?;
-        let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
-        if canonical.rows != rows {
-            return Err(StoreError::Projection);
-        }
         Ok(state)
     }
 
@@ -14224,11 +14232,14 @@ impl ProjectionWorker {
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(false).await?.0)
+        Ok(self.catch_up_inner(false, None).await?.0)
     }
 
-    pub(crate) async fn catch_up_validated(&self) -> Result<(ProjectionSnapshot, u64), StoreError> {
-        self.catch_up_inner(false).await
+    pub(crate) async fn catch_up_validated(
+        &self,
+        validated_current: Option<(u64, u64)>,
+    ) -> Result<(ProjectionSnapshot, u64), StoreError> {
+        self.catch_up_inner(false, validated_current).await
     }
 
     pub async fn reconciliation_frontier(
@@ -14251,6 +14262,7 @@ impl ProjectionWorker {
     async fn catch_up_inner(
         &self,
         inject_before_commit_failure: bool,
+        validated_current: Option<(u64, u64)>,
     ) -> Result<(ProjectionSnapshot, u64), StoreError> {
         self.objects
             .checkout_latest()
@@ -14308,7 +14320,14 @@ impl ProjectionWorker {
             }
             return Ok((expected, version));
         }
-        let mut state = ReducerState::from_current_rows(&current, checkpoint_frontier)?;
+        let mut state = if validated_current == Some((current_version, checkpoint_frontier)) {
+            // The writer already validated this exact old input before its
+            // append. Decode it fully, but do not regenerate the same old rows.
+            // Delta admission and the resulting snapshot are still validated.
+            ReducerState::decode_current_rows(&current, checkpoint_frontier)?
+        } else {
+            ReducerState::from_current_rows(&current, checkpoint_frontier)?
+        };
         let delta = read_journal_after(&self.journal, checkpoint_frontier).await?;
         validate_delta(checkpoint_frontier, journal_frontier, &delta)?;
         if delta.is_empty() {
@@ -14445,7 +14464,7 @@ impl ProjectionWorker {
 
     #[cfg(test)]
     async fn catch_up_with_commit_fault(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(true).await?.0)
+        Ok(self.catch_up_inner(true, None).await?.0)
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
@@ -16378,6 +16397,12 @@ mod tests {
             .commit_rows(&[migration], false, false, false, false, false)
             .await
             .unwrap();
+        assert!(matches!(
+            worker
+                .catch_up_validated(Some((before_version, frontier)))
+                .await,
+            Err(StoreError::StoreCorrupt | StoreError::Projection)
+        ));
         assert!(matches!(
             worker.catch_up().await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
