@@ -81,13 +81,14 @@ impl McpActionService {
                 follow_ups_remaining: 0,
             },
         };
-        let procedure_view =
-            crate::procedure::ProcedureUsageCurrentView::from_snapshot(&scope.snapshot)
-                .map_err(|_| McpServiceError::Store)?;
         let include_probationary = self.operation_config.as_ref().map_or_else(
             || evertrace_domain::config::ProcedureConfig::default().include_probationary,
             |config| config.config().procedure.include_probationary,
         );
+        let searchable_procedure_revisions =
+            crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&scope.snapshot)
+                .map_err(|_| McpServiceError::Store)?
+                .searchable_procedure_revisions(include_probationary);
         let report = match &self.session_report {
             Some(report) => report.read().await.clone(),
             None => None,
@@ -111,9 +112,7 @@ impl McpActionService {
         .map_err(|_| McpServiceError::Store)?;
         let found = ProductionSearch::new(self.search_index.clone())
             .with_method_proposals(methods)
-            .with_procedure_revisions(
-                procedure_view.searchable_procedure_revisions(include_probationary),
-            )
+            .with_procedure_revisions(searchable_procedure_revisions)
             .search(context.clone())
             .await
             .map_err(|_| McpServiceError::Store)?;
@@ -260,93 +259,100 @@ impl McpActionService {
                 }
             }
         }
-        let routed = procedure_view
-            .route_search(
-                &scope.snapshot,
-                &scope.anchor,
-                &context,
-                &procedure_revisions,
-            )
-            .map_err(|_| McpServiceError::Store)?;
-        classification_omitted.extend(procedure_revisions);
-        let command_id =
-            CommandId::from_uuid(request_id.as_uuid()).map_err(|_| McpServiceError::Store)?;
-        let mut route_events = Vec::new();
-        for item in routed.items {
-            let (Some(workstream), Some(episode)) =
-                (scope.anchor.workstream_id, scope.anchor.episode_revision_id)
-            else {
-                continue;
-            };
-            let route_context = ProposalCommandContext {
-                command_id,
-                occurred_at_us: now,
-                effective_config_hash: self.runtime_snapshot.effective_config_hash,
-                algorithm_revision: "s34-mcp-procedure-route-v1".into(),
-            };
-            let resolution = crate::procedure::begin_procedure_usage(
-                &procedure_view,
-                route_context.clone(),
-                &item,
-                workstream,
-                episode,
-            )
-            .map_err(|_| McpServiceError::Store)?;
-            match resolution {
-                crate::procedure::ProcedureUsageResolution::Command { command, .. } => {
-                    route_events.extend_from_slice(command.events())
-                }
-                crate::procedure::ProcedureUsageResolution::NoDelta(usage)
-                    if usage.stage == evertrace_domain::procedure::ProcedureUsageStage::Routed =>
-                {
-                    let command = procedure_view
-                        .reroute_pending_usage(route_context, &usage)
-                        .map_err(|_| McpServiceError::Store)?;
-                    route_events.extend_from_slice(command.events());
-                }
-                crate::procedure::ProcedureUsageResolution::NoDelta(_)
-                | crate::procedure::ProcedureUsageResolution::HistoricalRouteMismatch
-                | crate::procedure::ProcedureUsageResolution::UnprovenContext => {}
-            }
-            let apply = item.decision == crate::procedure::ProcedureDecision::Apply;
-            let mut presentation = serde_json::json!({
-                "decision": if apply { "APPLY" } else { "DEFER" },
-                "reason": item.reason,
-                "guardrail_only": item.mode == crate::procedure::ProcedureGuidanceMode::GuardrailOnly,
-                "avoid": item.avoid,
-                "excludes": item.excludes,
-                "pitfalls": item.pitfalls,
-            });
-            if apply && item.mode == crate::procedure::ProcedureGuidanceMode::Normal {
-                presentation["actions"] =
-                    serde_json::to_value(&item.actions).map_err(|_| McpServiceError::Store)?;
-                presentation["done"] =
-                    serde_json::to_value(&item.done).map_err(|_| McpServiceError::Store)?;
-            }
-            let text = serde_json::to_string(&presentation).map_err(|_| McpServiceError::Store)?;
-            classification_omitted.remove(&item.revision_id.to_string());
-            classified.push(McpServiceItem {
-                partition: McpItemPartition::Procedure,
-                kind: "procedure_revision".into(),
-                object_ref: Some(item.procedure_id.to_string()),
-                object_revision_ref: Some(item.revision_id.to_string()),
-                source_revision_ref: None,
-                scope: Some(scope_label(&scope)),
-                applicability: Some(if apply { "apply" } else { "defer" }.into()),
-                authority: Some("none".into()),
-                content_trust: ContentTrust::UntrustedSourceContent,
-                capture_completeness: None,
-                instruction_authority: InstructionAuthority::None,
-                text: Some(text),
-            });
-        }
-        if !route_events.is_empty() {
-            let command = JournalCommand::new(command_id, route_events)
+        if !procedure_revisions.is_empty() {
+            let procedure_view =
+                crate::procedure::ProcedureUsageCurrentView::from_snapshot(&scope.snapshot)
+                    .map_err(|_| McpServiceError::Store)?;
+            let routed = procedure_view
+                .route_search(
+                    &scope.snapshot,
+                    &scope.anchor,
+                    &context,
+                    &procedure_revisions,
+                )
                 .map_err(|_| McpServiceError::Store)?;
-            self.writer
-                .commit_if_frontier(command, now, scope.snapshot.frontier)
-                .await
+            classification_omitted.extend(procedure_revisions);
+            let command_id =
+                CommandId::from_uuid(request_id.as_uuid()).map_err(|_| McpServiceError::Store)?;
+            let mut route_events = Vec::new();
+            for item in routed.items {
+                let (Some(workstream), Some(episode)) =
+                    (scope.anchor.workstream_id, scope.anchor.episode_revision_id)
+                else {
+                    continue;
+                };
+                let route_context = ProposalCommandContext {
+                    command_id,
+                    occurred_at_us: now,
+                    effective_config_hash: self.runtime_snapshot.effective_config_hash,
+                    algorithm_revision: "s34-mcp-procedure-route-v1".into(),
+                };
+                let resolution = crate::procedure::begin_procedure_usage(
+                    &procedure_view,
+                    route_context.clone(),
+                    &item,
+                    workstream,
+                    episode,
+                )
                 .map_err(|_| McpServiceError::Store)?;
+                match resolution {
+                    crate::procedure::ProcedureUsageResolution::Command { command, .. } => {
+                        route_events.extend_from_slice(command.events())
+                    }
+                    crate::procedure::ProcedureUsageResolution::NoDelta(usage)
+                        if usage.stage
+                            == evertrace_domain::procedure::ProcedureUsageStage::Routed =>
+                    {
+                        let command = procedure_view
+                            .reroute_pending_usage(route_context, &usage)
+                            .map_err(|_| McpServiceError::Store)?;
+                        route_events.extend_from_slice(command.events());
+                    }
+                    crate::procedure::ProcedureUsageResolution::NoDelta(_)
+                    | crate::procedure::ProcedureUsageResolution::HistoricalRouteMismatch
+                    | crate::procedure::ProcedureUsageResolution::UnprovenContext => {}
+                }
+                let apply = item.decision == crate::procedure::ProcedureDecision::Apply;
+                let mut presentation = serde_json::json!({
+                    "decision": if apply { "APPLY" } else { "DEFER" },
+                    "reason": item.reason,
+                    "guardrail_only": item.mode == crate::procedure::ProcedureGuidanceMode::GuardrailOnly,
+                    "avoid": item.avoid,
+                    "excludes": item.excludes,
+                    "pitfalls": item.pitfalls,
+                });
+                if apply && item.mode == crate::procedure::ProcedureGuidanceMode::Normal {
+                    presentation["actions"] =
+                        serde_json::to_value(&item.actions).map_err(|_| McpServiceError::Store)?;
+                    presentation["done"] =
+                        serde_json::to_value(&item.done).map_err(|_| McpServiceError::Store)?;
+                }
+                let text =
+                    serde_json::to_string(&presentation).map_err(|_| McpServiceError::Store)?;
+                classification_omitted.remove(&item.revision_id.to_string());
+                classified.push(McpServiceItem {
+                    partition: McpItemPartition::Procedure,
+                    kind: "procedure_revision".into(),
+                    object_ref: Some(item.procedure_id.to_string()),
+                    object_revision_ref: Some(item.revision_id.to_string()),
+                    source_revision_ref: None,
+                    scope: Some(scope_label(&scope)),
+                    applicability: Some(if apply { "apply" } else { "defer" }.into()),
+                    authority: Some("none".into()),
+                    content_trust: ContentTrust::UntrustedSourceContent,
+                    capture_completeness: None,
+                    instruction_authority: InstructionAuthority::None,
+                    text: Some(text),
+                });
+            }
+            if !route_events.is_empty() {
+                let command = JournalCommand::new(command_id, route_events)
+                    .map_err(|_| McpServiceError::Store)?;
+                self.writer
+                    .commit_if_frontier(command, now, scope.snapshot.frontier)
+                    .await
+                    .map_err(|_| McpServiceError::Store)?;
+            }
         }
         let mut omitted_refs = found.omitted_refs;
         omitted_refs.extend(classification_omitted);
