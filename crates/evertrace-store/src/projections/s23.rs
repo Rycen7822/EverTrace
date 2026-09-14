@@ -31,6 +31,37 @@ pub(super) struct S23State {
 }
 
 impl S23State {
+    pub(super) fn validation_entries(
+        &self,
+    ) -> impl Iterator<Item = (&GlobalSupportValidationEvent, u64)> {
+        self.validations.values().map(|(value, seq)| (value, *seq))
+    }
+
+    pub(super) fn validation_row(
+        &self,
+        revision: RevisionId,
+        generation: u64,
+    ) -> Result<ObjectRow, StoreError> {
+        let (value, seq) = self
+            .validations
+            .get(&revision)
+            .ok_or(StoreError::StoreCorrupt)?;
+        object_row(
+            format!("object:atom:global_support_validation:{revision}"),
+            ObjectFamily::Atom,
+            "global_support_validation",
+            value.support_contract_ref.to_string(),
+            revision.to_string(),
+            support_state(value.state),
+            None,
+            None,
+            None,
+            &JournalPayload::GlobalSupportValidationRecorded(Box::new(value.clone())),
+            *seq,
+            generation,
+        )
+    }
+
     pub(super) fn forget(
         &mut self,
         revision_ids: &BTreeSet<RevisionId>,
@@ -1013,21 +1044,8 @@ impl S23State {
                 generation,
             )?);
         }
-        for (revision, (value, seq)) in &self.validations {
-            rows.push(object_row(
-                format!("object:atom:global_support_validation:{revision}"),
-                ObjectFamily::Atom,
-                "global_support_validation",
-                value.support_contract_ref.to_string(),
-                revision.to_string(),
-                support_state(value.state),
-                None,
-                None,
-                None,
-                &JournalPayload::GlobalSupportValidationRecorded(Box::new(value.clone())),
-                *seq,
-                generation,
-            )?);
+        for revision in self.validations.keys() {
+            rows.push(self.validation_row(*revision, generation)?);
         }
         rows.extend(self.core_rows(atoms, generation)?);
         Ok(rows)

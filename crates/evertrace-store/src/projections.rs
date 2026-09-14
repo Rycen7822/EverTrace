@@ -2433,6 +2433,340 @@ enum MemoriesCandidate {
     Proposal(RevisionId),
     Digest(SemanticDigestId),
 }
+pub(crate) struct ProductDeletionIds {
+    pub(crate) revision_ids: BTreeSet<RevisionId>,
+    pub(crate) atom_ids: BTreeSet<AtomId>,
+    pub(crate) procedure_ids: BTreeSet<ProcedureId>,
+    pub(crate) membership_ids: BTreeSet<evertrace_domain::ids::CoreMembershipId>,
+}
+
+pub(crate) fn product_deletion_ids(deletions: &ObjectDeletionState) -> ProductDeletionIds {
+    let mut revision_ids = BTreeSet::new();
+    let mut atom_ids = BTreeSet::new();
+    let mut procedure_ids = BTreeSet::new();
+    let mut membership_ids = BTreeSet::new();
+    for event in deletions.events() {
+        revision_ids.extend(event.exact_revision_ids.iter().copied());
+        match event.target {
+            ObjectDeletionTarget::Atom { atom_id } => {
+                atom_ids.insert(atom_id);
+            }
+            ObjectDeletionTarget::Procedure { procedure_id } => {
+                procedure_ids.insert(procedure_id);
+            }
+            ObjectDeletionTarget::CoreMembership { core_membership_id } => {
+                membership_ids.insert(core_membership_id);
+            }
+        }
+    }
+    ProductDeletionIds {
+        revision_ids,
+        atom_ids,
+        procedure_ids,
+        membership_ids,
+    }
+}
+
+/// One Inbox page and only the proof facts consumed by its negative summaries.
+#[derive(Debug)]
+pub struct InboxCurrentContext {
+    pub frontier: u64,
+    pub has_failed_job: bool,
+    pub items: Vec<ObjectRow>,
+    pub negative_reviews: BTreeMap<ProcedureNegativeEvidenceId, InboxNegativeReviewFacts>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct InboxNegativeReviewFacts {
+    pub negatives: BTreeMap<
+        ProcedureNegativeEvidenceId,
+        evertrace_domain::procedure::ProcedureNegativeEvidence,
+    >,
+    pub negative_seqs: BTreeMap<ProcedureNegativeEvidenceId, u64>,
+    pub negative_reviews: BTreeMap<
+        ProcedureNegativeEvidenceId,
+        evertrace_domain::procedure::ProcedureNegativeReviewEvent,
+    >,
+    pub negative_review_seqs: BTreeMap<ProcedureNegativeEvidenceId, u64>,
+    pub usages: BTreeMap<ProcedureUsageId, ProcedureUsageRevision>,
+    pub current_procedure: Option<RevisionId>,
+    pub publication: Option<evertrace_domain::procedure::ProcedurePublicationState>,
+    pub attempts: BTreeMap<AttemptId, Attempt>,
+    pub runs: BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
+    pub results: BTreeMap<RevisionId, ResultEvidence>,
+    pub result_seqs: BTreeMap<RevisionId, u64>,
+    pub current_result_ids: Vec<RevisionId>,
+}
+
+/// Shared by the complete negative-review selector and its bounded evidence read.
+pub fn negative_review_result_matches(
+    seq: u64,
+    proof_after: u64,
+    run_attempt: Option<AttemptId>,
+    attempts: &[AttemptId],
+) -> bool {
+    seq > proof_after && run_attempt.is_some_and(|id| attempts.contains(&id))
+}
+
+pub fn negative_review_current_result_heads<'a>(
+    results: impl Iterator<Item = &'a ResultEvidence> + Clone,
+) -> Result<Vec<&'a ResultEvidence>, StoreError> {
+    let predecessors = results
+        .clone()
+        .filter_map(|value| value.parent_revision_id)
+        .collect::<BTreeSet<_>>();
+    let mut heads = BTreeMap::new();
+    for value in results.filter(|value| !predecessors.contains(&value.revision_id)) {
+        if heads.insert(value.result_evidence_id, value).is_some() {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    Ok(heads.into_values().collect())
+}
+
+pub fn inbox_current_replaces(
+    current: Option<(u64, &str)>,
+    rank: u64,
+    row_id: &str,
+) -> Result<bool, StoreError> {
+    match current {
+        Some((current_rank, current_row)) if current_rank == rank && current_row != row_id => {
+            Err(StoreError::StoreCorrupt)
+        }
+        Some((current_rank, _)) if current_rank > rank => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InboxCandidate<'a> {
+    Proposal(&'a RevisionProposal),
+    Support(&'a evertrace_domain::semantic::GlobalSupportValidationEvent),
+    Negative(&'a evertrace_domain::procedure::ProcedureNegativeReviewEvent),
+    Publication(&'a evertrace_domain::procedure::ProcedureStateEvent),
+    Episode(&'a WorkEpisode),
+    Binding(&'a WorkBindingRevision),
+    Competing(&'a CompetingAttemptGroup),
+    Attempt(&'a Attempt),
+    Lane(&'a ExecutionLane),
+    Receipt(&'a CaptureReceipt),
+    Transition(&'a WorktreeTransition),
+    Recovery(&'a RecoveryCaptureRequest),
+}
+
+struct InboxDeletedProducts {
+    ids: ProductDeletionIds,
+    negatives: BTreeSet<ProcedureNegativeEvidenceId>,
+    contracts: BTreeSet<RevisionId>,
+    proposals: BTreeSet<RevisionProposalId>,
+}
+
+fn proposal_ids_for_deletion<'a>(
+    proposals: impl Iterator<Item = &'a RevisionProposal>,
+    ids: &ProductDeletionIds,
+) -> BTreeSet<RevisionProposalId> {
+    if ids.revision_ids.is_empty() {
+        return BTreeSet::new();
+    }
+    proposals
+        .filter(|value| {
+            proposal_targets_deleted(
+                value,
+                &ids.atom_ids,
+                &ids.procedure_ids,
+                &ids.membership_ids,
+            )
+        })
+        .map(|value| value.proposal_id)
+        .collect()
+}
+
+fn procedure_repository(value: &ProcedureRevision) -> Option<RepositoryId> {
+    match value.draft.scope {
+        ProcedureScope::Repository { repository_id }
+        | ProcedureScope::Worktree { repository_id, .. } => Some(repository_id),
+        _ => None,
+    }
+}
+
+pub fn inbox_payload_actionable(payload: &JournalPayload) -> bool {
+    InboxCandidate::from_payload(payload).is_some_and(|value| value.actionable())
+}
+
+pub fn inbox_boundary_actionable(status: evertrace_domain::work::BoundaryStatus) -> bool {
+    status == evertrace_domain::work::BoundaryStatus::Candidate
+}
+
+impl<'a> InboxCandidate<'a> {
+    fn from_payload(payload: &'a JournalPayload) -> Option<Self> {
+        Some(match payload {
+            JournalPayload::RevisionProposalRecorded(v) => Self::Proposal(v),
+            JournalPayload::GlobalSupportValidationRecorded(v) => Self::Support(v),
+            JournalPayload::ProcedureNegativeReviewRecorded(v) => Self::Negative(v),
+            JournalPayload::ProcedureStateRecorded(v) => Self::Publication(v),
+            JournalPayload::WorkEpisodeRecorded(v) => Self::Episode(v),
+            JournalPayload::WorkBindingRecorded(v) => Self::Binding(v),
+            JournalPayload::CompetingAttemptGroupRecorded(v) => Self::Competing(v),
+            JournalPayload::AttemptRecorded(v) => Self::Attempt(v),
+            JournalPayload::ExecutionLaneRecorded(v) => Self::Lane(v),
+            JournalPayload::CaptureReceiptRecorded(v) => Self::Receipt(v),
+            JournalPayload::WorktreeTransitionRecorded(v) => Self::Transition(v),
+            JournalPayload::RecoveryCaptureRequestRecorded(v) => Self::Recovery(v),
+            _ => return None,
+        })
+    }
+
+    fn actionable(self) -> bool {
+        use evertrace_domain::{
+            procedure::{ProcedureNegativeReviewStatus, ProcedurePublicationState},
+            repository::RecoveryRequestStatus,
+            semantic::GlobalSupportState,
+            work::{
+                AdmissionFailureObservability, CoverageLevel, LivenessState, OrderingIntegrity,
+                PairingIntegrity, PayloadIntegrity,
+            },
+        };
+        match self {
+            Self::Proposal(v) => matches!(
+                v.status,
+                ProposalStatus::Pending | ProposalStatus::Validating | ProposalStatus::Deferred
+            ),
+            Self::Support(v) => matches!(
+                v.state,
+                GlobalSupportState::RevalidationPending
+                    | GlobalSupportState::Insufficient
+                    | GlobalSupportState::Invalidated
+            ),
+            Self::Negative(v) => matches!(
+                v.status,
+                ProcedureNegativeReviewStatus::Pending | ProcedureNegativeReviewStatus::Upheld
+            ),
+            Self::Publication(v) => v.to_state == ProcedurePublicationState::ReviewHold,
+            Self::Episode(v) => inbox_boundary_actionable(v.boundary_status),
+            Self::Binding(v) => v.assignment_status != AssignmentStatus::Resolved,
+            Self::Competing(v) => matches!(
+                v.resolution_status,
+                CompetingResolutionStatus::Open | CompetingResolutionStatus::Unresolved
+            ),
+            Self::Attempt(v) => {
+                v.lifecycle_status == AttemptLifecycleStatus::Active
+                    && v.execution_status == AttemptExecutionStatus::Interrupted
+            }
+            Self::Lane(v) => {
+                matches!(
+                    v.status,
+                    LaneStatus::Unresolved | LaneStatus::InterruptedUnconfirmed
+                ) || v.liveness_state == LivenessState::Unknown
+                    || v.coverage_level != CoverageLevel::Full
+                    || matches!(
+                        v.source_coverage,
+                        SourceCoverage::Partial | SourceCoverage::Unavailable
+                    )
+                    || v.pairing_integrity != PairingIntegrity::Complete
+                    || v.payload_integrity != PayloadIntegrity::Complete
+                    || v.ordering_integrity != OrderingIntegrity::Complete
+            }
+            Self::Receipt(v) => {
+                v.coverage_level != CoverageLevel::Full
+                    || matches!(
+                        v.source_coverage,
+                        SourceCoverage::Partial | SourceCoverage::Unavailable
+                    )
+                    || v.pairing_integrity != PairingIntegrity::Complete
+                    || v.payload_integrity != PayloadIntegrity::Complete
+                    || v.ordering_integrity != OrderingIntegrity::Complete
+                    || matches!(
+                        v.admission_failure_observability,
+                        AdmissionFailureObservability::BestEffort
+                            | AdmissionFailureObservability::Unavailable
+                    )
+            }
+            Self::Transition(v) => v.lineage_assessment != LineageAssessment::Proven,
+            Self::Recovery(v) => matches!(
+                v.request_status,
+                RecoveryRequestStatus::Pending | RecoveryRequestStatus::Partial
+            ),
+        }
+    }
+
+    fn identity(self, seq: u64) -> (String, u64, String) {
+        match self {
+            Self::Proposal(v) => (
+                format!("proposal:{}", v.proposal_id),
+                seq,
+                format!(
+                    "object:revision_proposal:revision_proposal_revision:{}",
+                    v.proposal_revision_id
+                ),
+            ),
+            Self::Support(v) => (
+                format!("support:{}", v.support_contract_ref),
+                seq,
+                format!(
+                    "object:atom:global_support_validation:{}",
+                    v.validation_revision_id
+                ),
+            ),
+            Self::Negative(v) => (
+                format!("negative:{}", v.negative_evidence_id),
+                u64::from(v.review_generation),
+                format!("object:procedure_negative_review:{}", v.review_event_id),
+            ),
+            Self::Publication(v) => (
+                format!("publication:{}", v.procedure_revision_id),
+                seq,
+                format!("object:procedure_state:{}", v.state_event_id),
+            ),
+            Self::Episode(v) => (
+                format!("episode:{}", v.episode_id),
+                v.revision_generation,
+                format!("object:work:work_episode:{}", v.revision_id),
+            ),
+            Self::Binding(v) => (
+                format!("binding:{}", v.operation_id),
+                v.revision_generation,
+                format!("object:work:work_binding:{}", v.work_binding_revision_id),
+            ),
+            Self::Competing(v) => (
+                format!("competing:{}", v.competing_group_id),
+                v.revision_generation,
+                format!("object:work:competing_attempt_group:{}", v.revision_id),
+            ),
+            Self::Attempt(v) => (
+                format!("attempt:{}", v.attempt_id),
+                v.revision_generation,
+                format!("object:work:attempt:{}", v.revision_id),
+            ),
+            Self::Lane(v) => (
+                format!("lane:{}", v.execution_lane_id),
+                u64::from(v.lane_revision),
+                format!("object:work:execution_lane:{}", v.execution_lane_id),
+            ),
+            Self::Receipt(v) => (
+                format!("receipt:{}", v.execution_lane_id),
+                seq,
+                format!("object:evidence:capture_receipt:{}", v.execution_lane_id),
+            ),
+            Self::Transition(v) => (
+                format!("worktree-transition:{}", v.worktree_transition_id),
+                u64::from(v.transition_revision),
+                format!(
+                    "object:work:worktree_transition:{}",
+                    v.worktree_transition_id
+                ),
+            ),
+            Self::Recovery(v) => (
+                format!("recovery:{}", v.recovery_capture_request_id),
+                seq,
+                format!(
+                    "object:work:recovery_capture_request_revision:{}",
+                    v.request_revision_id
+                ),
+            ),
+        }
+    }
+}
 
 /// The facts needed to resolve one caller's active chain and explicit shard.
 /// This is request-local input, not a projection snapshot.
@@ -3903,6 +4237,486 @@ impl JournalAdmissionState {
             _ => physical_object_row(ObjectFamily::Work, kind, id, revision, payload, seq)?,
         };
         Ok(!self.capture_product_rows(vec![row])?.is_empty())
+    }
+
+    fn inbox_candidates(&self) -> impl Iterator<Item = (InboxCandidate<'_>, u64)> {
+        self.proposals
+            .values()
+            .map(|(v, s)| (InboxCandidate::Proposal(v), *s))
+            .chain(
+                self.s23
+                    .validation_entries()
+                    .map(|(v, s)| (InboxCandidate::Support(v), s)),
+            )
+            .chain(
+                self.procedure
+                    .negative_review_entries()
+                    .map(|(v, s)| (InboxCandidate::Negative(v), s)),
+            )
+            .chain(
+                self.procedure
+                    .state_event_entries()
+                    .map(|(v, s)| (InboxCandidate::Publication(v), s)),
+            )
+            .chain(
+                self.episode_revisions
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Episode(v), *s)),
+            )
+            .chain(
+                self.work_bindings
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Binding(v), *s)),
+            )
+            .chain(
+                self.competing_group_revisions
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Competing(v), *s)),
+            )
+            .chain(
+                self.attempt_revisions
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Attempt(v), *s)),
+            )
+            .chain(
+                self.execution_lanes
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Lane(v), *s)),
+            )
+            .chain(
+                self.capture_receipts
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Receipt(v), *s)),
+            )
+            .chain(
+                self.worktree_transitions
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Transition(v), *s)),
+            )
+            .chain(
+                self.recovery_request_revisions
+                    .values()
+                    .map(|(v, s)| (InboxCandidate::Recovery(v), *s)),
+            )
+    }
+
+    fn inbox_scope_visible(
+        &self,
+        repository: Option<RepositoryId>,
+        references: impl Fn(&RepositoryClosureKeys) -> bool,
+    ) -> bool {
+        if self.scope_purges.events().next().is_none() {
+            return true;
+        }
+        !repository.is_some_and(|id| {
+            self.scope_purges
+                .events()
+                .any(|event| event.target.repository_id() == id)
+        }) && !self.repository_closures.values().any(references)
+    }
+
+    fn inbox_visible(
+        &self,
+        value: InboxCandidate<'_>,
+        deleted: &InboxDeletedProducts,
+    ) -> Result<bool, StoreError> {
+        let revisions = &deleted.ids.revision_ids;
+        let visible = match value {
+            InboxCandidate::Proposal(v) => {
+                !deleted.proposals.contains(&v.proposal_id)
+                    && !revisions.contains(&v.proposal_revision_id)
+                    && self.inbox_scope_visible(None, |c| c.references_proposal(v))
+            }
+            InboxCandidate::Support(v) => {
+                !revisions.contains(&v.validation_revision_id)
+                    && !deleted.contracts.contains(&v.support_contract_ref)
+                    && self.inbox_scope_visible(None, |c| c.references_support_validation(v))
+            }
+            InboxCandidate::Negative(v) => {
+                let (negative, _) = self
+                    .procedure
+                    .negative_entry(v.negative_evidence_id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                !revisions.contains(&v.review_event_id)
+                    && !deleted.negatives.contains(&v.negative_evidence_id)
+                    && self.inbox_scope_visible(
+                        negative
+                            .local_context
+                            .as_ref()
+                            .and_then(|c| c.repository_id),
+                        |_| false,
+                    )
+            }
+            InboxCandidate::Publication(v) => {
+                let revision = self
+                    .procedure
+                    .current_revision_by_id(v.procedure_revision_id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                !revisions.contains(&v.state_event_id)
+                    && !revisions.contains(&v.procedure_revision_id)
+                    && self.inbox_scope_visible(procedure_repository(revision), |c| {
+                        c.references_publication(v)
+                    })
+            }
+            InboxCandidate::Episode(v) => {
+                !revisions.contains(&v.revision_id)
+                    && self
+                        .inbox_scope_visible(v.repository_instance_id, |c| c.references_episode(v))
+            }
+            InboxCandidate::Binding(v) => {
+                !v.work_binding_revision_id
+                    .to_string()
+                    .parse::<RevisionId>()
+                    .is_ok_and(|id| revisions.contains(&id))
+                    && self.inbox_scope_visible(None, |c| c.references_binding(v))
+            }
+            InboxCandidate::Competing(v) => {
+                !revisions.contains(&v.revision_id)
+                    && self.inbox_scope_visible(None, |c| c.references_competing(v))
+            }
+            InboxCandidate::Attempt(v) => {
+                !revisions.contains(&v.revision_id)
+                    && self
+                        .inbox_scope_visible(v.repository_instance_id, |c| c.references_attempt(v))
+            }
+            InboxCandidate::Lane(v) => self.inbox_scope_visible(None, |c| c.references_lane(v)),
+            InboxCandidate::Receipt(v) => {
+                !v.capture_receipt_revision_id
+                    .to_string()
+                    .parse::<RevisionId>()
+                    .is_ok_and(|id| revisions.contains(&id))
+                    && self.inbox_scope_visible(None, |c| c.references_capture_receipt(v))
+            }
+            InboxCandidate::Transition(v) => {
+                self.inbox_scope_visible(None, |c| c.references_transition(v))
+            }
+            InboxCandidate::Recovery(v) => {
+                !revisions.contains(&v.request_revision_id)
+                    && self.inbox_scope_visible(None, |c| c.references_recovery_request(v))
+            }
+        };
+        Ok(visible)
+    }
+
+    fn inbox_row(&self, value: InboxCandidate<'_>, seq: u64) -> Result<ObjectRow, StoreError> {
+        match value {
+            InboxCandidate::Proposal(v) => semantic_proposal_row(
+                v,
+                &JournalPayload::RevisionProposalRecorded(Box::new(v.clone())),
+                seq,
+            ),
+            InboxCandidate::Support(v) => self
+                .s23
+                .validation_row(v.validation_revision_id, PROJECTION_GENERATION),
+            InboxCandidate::Negative(v) => self
+                .procedure
+                .negative_review_row(v.review_event_id, PROJECTION_GENERATION),
+            InboxCandidate::Publication(v) => self
+                .procedure
+                .publication_row(v.state_event_id, PROJECTION_GENERATION),
+            InboxCandidate::Recovery(v) => recovery::revision_rows(
+                BTreeMap::from([(v.request_revision_id, (v.clone(), seq))]),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )?
+            .pop()
+            .ok_or(StoreError::StoreCorrupt),
+            other => {
+                let payload = match other {
+                    InboxCandidate::Episode(v) => {
+                        JournalPayload::WorkEpisodeRecorded(Box::new(v.clone()))
+                    }
+                    InboxCandidate::Binding(v) => {
+                        JournalPayload::WorkBindingRecorded(Box::new(v.clone()))
+                    }
+                    InboxCandidate::Competing(v) => {
+                        JournalPayload::CompetingAttemptGroupRecorded(Box::new(v.clone()))
+                    }
+                    InboxCandidate::Attempt(v) => {
+                        JournalPayload::AttemptRecorded(Box::new(v.clone()))
+                    }
+                    InboxCandidate::Lane(v) => {
+                        JournalPayload::ExecutionLaneRecorded(Box::new(v.clone()))
+                    }
+                    InboxCandidate::Receipt(v) => {
+                        JournalPayload::CaptureReceiptRecorded(Box::new(v.clone()))
+                    }
+                    InboxCandidate::Transition(v) => {
+                        JournalPayload::WorktreeTransitionRecorded(Box::new(v.clone()))
+                    }
+                    _ => return Err(StoreError::StoreCorrupt),
+                };
+                inbox_work_row(&payload, seq)
+            }
+        }
+    }
+
+    fn inbox_runs(
+        &self,
+        deleted: &InboxDeletedProducts,
+    ) -> BTreeMap<ExperimentRunId, (&ExperimentRun, u64)> {
+        let mut runs = BTreeMap::new();
+        for (value, seq) in self.experiment_run_revisions.values() {
+            if !deleted.ids.revision_ids.contains(&value.revision_id)
+                && self.inbox_scope_visible(None, |c| c.references_run(value))
+                && runs.get(&value.run_id).is_none_or(
+                    |(prior, prior_seq): &(&ExperimentRun, u64)| {
+                        (prior.created_at_us, *prior_seq) < (value.created_at_us, *seq)
+                    },
+                )
+            {
+                runs.insert(value.run_id, (value, *seq));
+            }
+        }
+        runs
+    }
+
+    fn inbox_result_visible(&self, value: &ResultEvidence, deleted: &InboxDeletedProducts) -> bool {
+        !deleted.ids.revision_ids.contains(&value.revision_id)
+            && self.inbox_scope_visible(None, |c| c.references_result(value))
+    }
+
+    fn inbox_negative_facts(
+        &self,
+        review: &evertrace_domain::procedure::ProcedureNegativeReviewEvent,
+        review_seq: u64,
+        deleted: &InboxDeletedProducts,
+        proof_limit: usize,
+    ) -> Result<InboxNegativeReviewFacts, StoreError> {
+        let id = review.negative_evidence_id;
+        let (negative, negative_seq) = self
+            .procedure
+            .negative_entry(id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if deleted.negatives.contains(&id)
+            || !self.inbox_scope_visible(
+                negative
+                    .local_context
+                    .as_ref()
+                    .and_then(|v| v.repository_id),
+                |c| c.references_negative(negative),
+            )
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let mut facts = InboxNegativeReviewFacts::default();
+        facts.negatives.insert(id, negative.clone());
+        facts.negative_seqs.insert(id, negative_seq);
+        facts.negative_reviews.insert(id, review.clone());
+        facts.negative_review_seqs.insert(id, review_seq);
+        if review.status != evertrace_domain::procedure::ProcedureNegativeReviewStatus::Pending {
+            return Ok(facts);
+        }
+        let usage = self
+            .procedure
+            .usage_revision_entries()
+            .filter(|(v, _)| {
+                v.procedure_usage_id == negative.procedure_usage_id
+                    && !deleted.ids.revision_ids.contains(&v.usage_revision_id)
+                    && !deleted.ids.revision_ids.contains(&v.procedure_revision_id)
+                    && self.inbox_scope_visible(v.local_context.repository_id, |c| {
+                        c.references_usage(v)
+                    })
+            })
+            .max_by_key(|(v, _)| v.revision_generation)
+            .map(|(v, _)| v)
+            .ok_or(StoreError::StoreCorrupt)?;
+        facts.usages.insert(usage.procedure_usage_id, usage.clone());
+        let visible_procedure = |v: &&ProcedureRevision| {
+            !deleted.ids.procedure_ids.contains(&v.procedure_id)
+                && !deleted.ids.revision_ids.contains(&v.revision_id)
+                && self.inbox_scope_visible(procedure_repository(v), |c| c.references_procedure(v))
+        };
+        if let Some(procedure) = self
+            .procedure
+            .current_revision_by_id(negative.procedure_revision_id)
+            .filter(visible_procedure)
+            && let Some(current) = self
+                .procedure
+                .all_revisions()
+                .filter(|v| v.procedure_id == procedure.procedure_id)
+                .filter(visible_procedure)
+                .max_by_key(|v| v.revision_generation)
+        {
+            facts.current_procedure = Some(current.revision_id);
+        }
+        let mut publication = None;
+        for (event, seq) in self.procedure.state_event_entries() {
+            if event.procedure_revision_id == negative.procedure_revision_id
+                && self.inbox_visible(InboxCandidate::Publication(event), deleted)?
+                && publication.is_none_or(|(_, previous)| previous < seq)
+            {
+                publication = Some((event, seq));
+            }
+        }
+        if let Some((event, _)) = publication {
+            facts.publication = Some(event.to_state);
+        }
+        if let [attempt_id] = usage.attempt_ids.as_slice() {
+            let mut attempt = None;
+            for (value, _) in self.attempt_revisions.values() {
+                if value.attempt_id == *attempt_id
+                    && self.inbox_visible(InboxCandidate::Attempt(value), deleted)?
+                    && attempt.is_none_or(|prior: &Attempt| {
+                        prior.revision_generation < value.revision_generation
+                    })
+                {
+                    attempt = Some(value);
+                }
+            }
+            if let Some(attempt) = attempt {
+                facts.attempts.insert(*attempt_id, attempt.clone());
+            }
+        }
+        let proof_after = negative_seq.max(review_seq);
+        let runs = self.inbox_runs(deleted);
+        let mut replay = BTreeMap::new();
+        let heads = negative_review_current_result_heads(
+            self.result_evidence_revisions
+                .values()
+                .map(|(value, _)| value)
+                .filter(|value| self.inbox_result_visible(value, deleted)),
+        )?;
+        for value in heads {
+            let seq = self
+                .result_evidence_revisions
+                .get(&value.revision_id)
+                .ok_or(StoreError::StoreCorrupt)?
+                .1;
+            let run = runs.get(&value.experiment_run_id).copied();
+            if negative_review_result_matches(
+                seq,
+                proof_after,
+                run.and_then(|(v, _)| v.attempt_id),
+                &usage.attempt_ids,
+            ) {
+                replay.insert(value.result_evidence_id, (value, seq));
+                if replay.len() > proof_limit + 1 {
+                    replay.pop_last();
+                }
+            }
+        }
+        facts.current_result_ids = replay.values().map(|(v, _)| v.revision_id).collect();
+        let mut results = replay
+            .into_values()
+            .map(|(v, seq)| (v.revision_id, (v, seq)))
+            .collect::<BTreeMap<_, _>>();
+        if negative.evidence_refs.len() <= proof_limit {
+            for reference in &negative.evidence_refs {
+                if let Ok(revision) = reference.parse::<RevisionId>()
+                    && let Some((value, seq)) = self.result_evidence_revisions.get(&revision)
+                    && self.inbox_result_visible(value, deleted)
+                {
+                    results.insert(revision, (value, *seq));
+                }
+            }
+        }
+        for (revision, (value, seq)) in results {
+            if let Some((run, run_seq)) = runs.get(&value.experiment_run_id).copied() {
+                facts
+                    .runs
+                    .entry(run.run_id)
+                    .or_insert_with(|| (run.clone(), run_seq));
+            }
+            facts.results.insert(revision, value.clone());
+            facts.result_seqs.insert(revision, seq);
+        }
+        Ok(facts)
+    }
+
+    pub(crate) fn inbox_current_context(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        proof_limit: usize,
+        has_failed_job: bool,
+    ) -> Result<InboxCurrentContext, StoreError> {
+        if limit == 0 || limit > 64 || proof_limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let ids = product_deletion_ids(&self.deletions);
+        let deleted = InboxDeletedProducts {
+            negatives: self.procedure.deleted_negative_ids(&ids.revision_ids),
+            contracts: if ids.revision_ids.is_empty() {
+                BTreeSet::new()
+            } else {
+                self.s23
+                    .deletion_owned_contracts(&ids.revision_ids, &ids.membership_ids)
+            },
+            proposals: proposal_ids_for_deletion(
+                self.proposal_revisions.values().map(|(v, _)| v),
+                &ids,
+            ),
+            ids,
+        };
+        // The request retains borrowed current identities, never their payloads.
+        // This is O(current identities) temporary metadata and one history scan;
+        // the returned context and serialized bodies are limited to this page.
+        let mut current = BTreeMap::<String, (u64, String, InboxCandidate<'_>, u64)>::new();
+        let mut resumed_sources = BTreeSet::new();
+        for (value, seq) in self.inbox_candidates() {
+            if !self.inbox_visible(value, &deleted)? {
+                continue;
+            }
+            if let InboxCandidate::Attempt(child) = value
+                && child.revision_generation == 1
+                && child.predecessor_revision_id.is_none()
+                && let Some(source) = child.resumes_from_attempt_id
+            {
+                resumed_sources.insert(source);
+            }
+            let (key, rank, row_id) = value.identity(seq);
+            if inbox_current_replaces(
+                current
+                    .get(&key)
+                    .map(|(rank, row, _, _)| (*rank, row.as_str())),
+                rank,
+                &row_id,
+            )? {
+                current.insert(key, (rank, row_id, value, seq));
+            }
+        }
+        let mut candidates = BTreeMap::new();
+        for (_, row_id, value, seq) in current.into_values() {
+            if !value.actionable()
+                || matches!(value, InboxCandidate::Attempt(v) if resumed_sources.contains(&v.attempt_id))
+                || after.is_some_and(|after| row_id.as_str() <= after)
+            {
+                continue;
+            }
+            candidates.insert(row_id, (value, seq));
+            if candidates.len() > limit + 1 {
+                candidates.pop_last();
+            }
+        }
+        let mut selected = candidates
+            .into_iter()
+            .map(|(row_id, (value, seq))| (value, seq, row_id))
+            .collect::<Vec<_>>();
+        let next_cursor = (selected.len() > limit).then(|| selected[limit - 1].2.clone());
+        selected.truncate(limit);
+        let mut items = Vec::with_capacity(selected.len());
+        let mut negative_reviews = BTreeMap::new();
+        for (value, seq, row_id) in selected {
+            let row = self.inbox_row(value, seq)?;
+            if row.row_id != row_id {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if let InboxCandidate::Negative(review) = value {
+                negative_reviews.insert(
+                    review.negative_evidence_id,
+                    self.inbox_negative_facts(review, seq, &deleted, proof_limit)?,
+                );
+            }
+            items.push(row);
+        }
+        Ok(InboxCurrentContext {
+            frontier: self.frontier,
+            has_failed_job,
+            items,
+            negative_reviews,
+            next_cursor,
+        })
     }
 
     pub(crate) fn memories_current_context(
@@ -6084,6 +6898,208 @@ fn job_targets_repository(
 }
 
 impl RepositoryClosureKeys {
+    fn references_lane(&self, value: &ExecutionLane) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.execution_lane_ids.contains(&value.execution_lane_id)
+            || value
+                .operation_ids
+                .iter()
+                .any(|id| self.operation_ids.contains(id))
+    }
+
+    fn references_capture_receipt(&self, value: &CaptureReceipt) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.execution_lane_ids.contains(&value.execution_lane_id)
+    }
+
+    fn references_transition(&self, value: &WorktreeTransition) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.worktree_ids.contains(&value.from_worktree_instance_id)
+            || self.worktree_ids.contains(&value.to_worktree_instance_id)
+    }
+
+    fn references_binding(&self, value: &WorkBindingRevision) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        value
+            .primary_binding
+            .task_id
+            .is_some_and(|id| self.task_ids.contains(&id))
+            || value
+                .primary_binding
+                .workstream_id
+                .is_some_and(|id| self.workstream_ids.contains(&id))
+            || value
+                .primary_binding
+                .episode_id
+                .is_some_and(|id| self.episode_ids.contains(&id))
+    }
+
+    fn references_attempt(&self, value: &Attempt) -> bool {
+        let Some(repository_id) = self.repository_id else {
+            return false;
+        };
+        self.attempt_ids.contains(&value.attempt_id)
+            || value.repository_instance_id == Some(repository_id)
+            || self.workstream_ids.contains(&value.workstream_id)
+    }
+
+    fn references_competing(&self, value: &CompetingAttemptGroup) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.competing_group_ids.contains(&value.competing_group_id)
+            || self.task_ids.contains(&value.task_id)
+            || value
+                .member_workstream_ids
+                .iter()
+                .any(|id| self.workstream_ids.contains(id))
+            || value
+                .member_attempt_ids
+                .iter()
+                .any(|id| self.attempt_ids.contains(id))
+    }
+
+    fn references_episode(&self, value: &WorkEpisode) -> bool {
+        let Some(repository_id) = self.repository_id else {
+            return false;
+        };
+        self.episode_ids.contains(&value.episode_id)
+            || value.repository_instance_id == Some(repository_id)
+            || self.workstream_ids.contains(&value.workstream_id)
+    }
+
+    fn references_recovery_request(&self, value: &RecoveryCaptureRequest) -> bool {
+        let Some(repository_id) = self.repository_id else {
+            return false;
+        };
+        self.recovery_request_ids
+            .contains(&value.recovery_capture_request_id)
+            || value.repository_instance_id == repository_id
+            || self.worktree_ids.contains(&value.worktree_instance_id)
+    }
+
+    fn references_run(&self, value: &ExperimentRun) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.run_ids.contains(&value.run_id)
+            || self.workstream_ids.contains(&value.workstream_id)
+            || value
+                .attempt_id
+                .is_some_and(|id| self.attempt_ids.contains(&id))
+            || self.snapshot_ids.contains(&value.code_snapshot_id)
+            || value
+                .source_receipt_refs
+                .iter()
+                .any(|id| self.source_receipt_ids.contains(id))
+            || value
+                .work_artifact_refs
+                .iter()
+                .any(|id| self.artifact_ids.contains(id))
+    }
+
+    fn references_result(&self, value: &ResultEvidence) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.result_ids.contains(&value.result_evidence_id)
+            || self.run_ids.contains(&value.experiment_run_id)
+            || value
+                .raw_artifact_refs
+                .iter()
+                .any(|id| self.artifact_ids.contains(id))
+    }
+
+    fn references_proposal(&self, value: &RevisionProposal) -> bool {
+        let Some(repository_id) = self.repository_id else {
+            return false;
+        };
+        self.proposal_ids.contains(&value.proposal_id)
+            || self
+                .proposal_revision_ids
+                .contains(&value.proposal_revision_id)
+            || proposal_references_repository_closure(
+                value,
+                repository_id,
+                &self.task_ids,
+                &self.source_observation_ids,
+                &self.source_receipt_ids,
+                &self.revision_ids,
+                &self.atom_ids,
+                &self.procedure_ids,
+                &self.membership_ids,
+            )
+    }
+
+    fn references_procedure(&self, value: &ProcedureRevision) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.procedure_ids.contains(&value.procedure_id)
+            || self.revision_ids.contains(&value.revision_id)
+            || value.draft.evidence_refs.iter().any(|reference| {
+                typed_text_references_target(
+                    reference,
+                    &self.source_observation_ids,
+                    &self.source_receipt_ids,
+                    &self.revision_ids,
+                )
+            })
+            || value
+                .draft
+                .support_revision_refs
+                .iter()
+                .any(|id| self.revision_ids.contains(id))
+            || value
+                .parent_revision_id
+                .is_some_and(|id| self.revision_ids.contains(&id))
+    }
+
+    fn references_publication(
+        &self,
+        value: &evertrace_domain::procedure::ProcedureStateEvent,
+    ) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.revision_ids.contains(&value.procedure_revision_id)
+    }
+
+    fn references_usage(&self, value: &ProcedureUsageRevision) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.revision_ids.contains(&value.procedure_revision_id)
+    }
+
+    fn references_negative(
+        &self,
+        value: &evertrace_domain::procedure::ProcedureNegativeEvidence,
+    ) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.revision_ids.contains(&value.procedure_revision_id)
+    }
+
+    fn references_support_validation(
+        &self,
+        value: &evertrace_domain::semantic::GlobalSupportValidationEvent,
+    ) -> bool {
+        if self.repository_id.is_none() {
+            return false;
+        }
+        self.revision_ids.contains(&value.support_contract_ref)
+    }
+
     fn references_source_receipt(&self, value: &SourceReceipt) -> bool {
         self.repository_id.is_some_and(|repository_id| {
             self.imports_source(&value.source_instance_id)
@@ -6278,16 +7294,8 @@ impl RepositoryClosureKeys {
                         .is_some_and(|id| self.worktree_ids.contains(&id))
                     || self.operation_ids.contains(&value.operation_id)
             }
-            JournalPayload::ExecutionLaneRecorded(value) => {
-                self.execution_lane_ids.contains(&value.execution_lane_id)
-                    || value
-                        .operation_ids
-                        .iter()
-                        .any(|id| self.operation_ids.contains(id))
-            }
-            JournalPayload::CaptureReceiptRecorded(value) => {
-                self.execution_lane_ids.contains(&value.execution_lane_id)
-            }
+            JournalPayload::ExecutionLaneRecorded(value) => self.references_lane(value),
+            JournalPayload::CaptureReceiptRecorded(value) => self.references_capture_receipt(value),
             JournalPayload::SourceCloseReconciliation(value) => {
                 self.execution_lane_ids.contains(&value.execution_lane_id)
                     || value.sources.iter().any(|source| {
@@ -6334,10 +7342,7 @@ impl RepositoryClosureKeys {
                 self.snapshot_ids.contains(&value.worktree_snapshot_id)
                     || self.worktree_ids.contains(&value.worktree_instance_id)
             }
-            JournalPayload::WorktreeTransitionRecorded(value) => {
-                self.worktree_ids.contains(&value.from_worktree_instance_id)
-                    || self.worktree_ids.contains(&value.to_worktree_instance_id)
-            }
+            JournalPayload::WorktreeTransitionRecorded(value) => self.references_transition(value),
             JournalPayload::IntegrationEventRecorded(value) => {
                 value.repository_instance_id == repository_id
                     || self
@@ -6363,36 +7368,10 @@ impl RepositoryClosureKeys {
                         .iter()
                         .any(|id| self.workstream_ids.contains(id))
             }
-            JournalPayload::WorkBindingRecorded(value) => {
-                value
-                    .primary_binding
-                    .task_id
-                    .is_some_and(|id| self.task_ids.contains(&id))
-                    || value
-                        .primary_binding
-                        .workstream_id
-                        .is_some_and(|id| self.workstream_ids.contains(&id))
-                    || value
-                        .primary_binding
-                        .episode_id
-                        .is_some_and(|id| self.episode_ids.contains(&id))
-            }
-            JournalPayload::AttemptRecorded(value) => {
-                self.attempt_ids.contains(&value.attempt_id)
-                    || value.repository_instance_id == Some(repository_id)
-                    || self.workstream_ids.contains(&value.workstream_id)
-            }
+            JournalPayload::WorkBindingRecorded(value) => self.references_binding(value),
+            JournalPayload::AttemptRecorded(value) => self.references_attempt(value),
             JournalPayload::CompetingAttemptGroupRecorded(value) => {
-                self.competing_group_ids.contains(&value.competing_group_id)
-                    || self.task_ids.contains(&value.task_id)
-                    || value
-                        .member_workstream_ids
-                        .iter()
-                        .any(|id| self.workstream_ids.contains(id))
-                    || value
-                        .member_attempt_ids
-                        .iter()
-                        .any(|id| self.attempt_ids.contains(id))
+                self.references_competing(value)
             }
             JournalPayload::OperationBurstRecorded(value) => {
                 value
@@ -6411,11 +7390,7 @@ impl RepositoryClosureKeys {
                         .experiment_run_id
                         .is_some_and(|id| self.run_ids.contains(&id))
             }
-            JournalPayload::WorkEpisodeRecorded(value) => {
-                self.episode_ids.contains(&value.episode_id)
-                    || value.repository_instance_id == Some(repository_id)
-                    || self.workstream_ids.contains(&value.workstream_id)
-            }
+            JournalPayload::WorkEpisodeRecorded(value) => self.references_episode(value),
             JournalPayload::WorkCheckpointRecorded(value) => {
                 self.episode_ids.contains(&value.episode_id)
             }
@@ -6425,10 +7400,7 @@ impl RepositoryClosureKeys {
                 .chain(&value.replacement_episode_ids)
                 .any(|id| self.episode_ids.contains(id)),
             JournalPayload::RecoveryCaptureRequestRecorded(value) => {
-                self.recovery_request_ids
-                    .contains(&value.recovery_capture_request_id)
-                    || value.repository_instance_id == repository_id
-                    || self.worktree_ids.contains(&value.worktree_instance_id)
+                self.references_recovery_request(value)
             }
             JournalPayload::RecoveryBundleRecorded(value) => {
                 self.recovery_bundle_ids.contains(&value.recovery_bundle_id)
@@ -6448,30 +7420,8 @@ impl RepositoryClosureKeys {
                         .contains(&value.target_worktree_instance_id)
                     || self.recovery_bundle_ids.contains(&value.recovery_bundle_id)
             }
-            JournalPayload::ExperimentRunRecorded(value) => {
-                self.run_ids.contains(&value.run_id)
-                    || self.workstream_ids.contains(&value.workstream_id)
-                    || value
-                        .attempt_id
-                        .is_some_and(|id| self.attempt_ids.contains(&id))
-                    || self.snapshot_ids.contains(&value.code_snapshot_id)
-                    || value
-                        .source_receipt_refs
-                        .iter()
-                        .any(|id| self.source_receipt_ids.contains(id))
-                    || value
-                        .work_artifact_refs
-                        .iter()
-                        .any(|id| self.artifact_ids.contains(id))
-            }
-            JournalPayload::ResultEvidenceRecorded(value) => {
-                self.result_ids.contains(&value.result_evidence_id)
-                    || self.run_ids.contains(&value.experiment_run_id)
-                    || value
-                        .raw_artifact_refs
-                        .iter()
-                        .any(|id| self.artifact_ids.contains(id))
-            }
+            JournalPayload::ExperimentRunRecorded(value) => self.references_run(value),
+            JournalPayload::ResultEvidenceRecorded(value) => self.references_result(value),
             JournalPayload::WorkArtifactRecorded(value) => {
                 self.artifact_ids.contains(&value.work_artifact_id)
                     || value.revision.scope.repository_id() == Some(repository_id)
@@ -6512,51 +7462,12 @@ impl RepositoryClosureKeys {
                         .accepted_proposal_revision_id
                         .is_some_and(|id| self.proposal_revision_ids.contains(&id))
             }
-            JournalPayload::RevisionProposalRecorded(value) => {
-                self.proposal_ids.contains(&value.proposal_id)
-                    || self
-                        .proposal_revision_ids
-                        .contains(&value.proposal_revision_id)
-                    || proposal_references_repository_closure(
-                        value,
-                        repository_id,
-                        &self.task_ids,
-                        &self.source_observation_ids,
-                        &self.source_receipt_ids,
-                        &self.revision_ids,
-                        &self.atom_ids,
-                        &self.procedure_ids,
-                        &self.membership_ids,
-                    )
-            }
-            JournalPayload::ProcedureRevisionRecorded(value) => {
-                self.procedure_ids.contains(&value.procedure_id)
-                    || self.revision_ids.contains(&value.revision_id)
-                    || value.draft.evidence_refs.iter().any(|reference| {
-                        typed_text_references_target(
-                            reference,
-                            &self.source_observation_ids,
-                            &self.source_receipt_ids,
-                            &self.revision_ids,
-                        )
-                    })
-                    || value
-                        .draft
-                        .support_revision_refs
-                        .iter()
-                        .any(|id| self.revision_ids.contains(id))
-                    || value
-                        .parent_revision_id
-                        .is_some_and(|id| self.revision_ids.contains(&id))
-            }
-            JournalPayload::ProcedureStateRecorded(value) => {
-                self.revision_ids.contains(&value.procedure_revision_id)
-            }
-            JournalPayload::ProcedureUsageRecorded(value) => {
-                self.revision_ids.contains(&value.procedure_revision_id)
-            }
+            JournalPayload::RevisionProposalRecorded(value) => self.references_proposal(value),
+            JournalPayload::ProcedureRevisionRecorded(value) => self.references_procedure(value),
+            JournalPayload::ProcedureStateRecorded(value) => self.references_publication(value),
+            JournalPayload::ProcedureUsageRecorded(value) => self.references_usage(value),
             JournalPayload::ProcedureNegativeEvidenceRecorded(value) => {
-                self.revision_ids.contains(&value.procedure_revision_id)
+                self.references_negative(value)
             }
             JournalPayload::ProcedureNegativeReviewRecorded(_) => false,
             JournalPayload::ScenarioRecorded(value) => {
@@ -6613,7 +7524,7 @@ impl RepositoryClosureKeys {
                         .any(|id| self.revision_ids.contains(id))
             }
             JournalPayload::GlobalSupportValidationRecorded(value) => {
-                self.revision_ids.contains(&value.support_contract_ref)
+                self.references_support_validation(value)
             }
             JournalPayload::SemanticDigestRecorded(value) => self.references_digest(value),
             JournalPayload::SemanticDerivationRunRecorded(value) => {
@@ -12080,12 +12991,8 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.execution_lanes {
-            rows.push(physical_object_row(
-                ObjectFamily::Work,
-                "execution_lane",
-                id.to_string(),
-                format!("{}@{}", id, value.lane_revision),
+        for (value, seq) in self.execution_lanes.into_values() {
+            rows.push(inbox_work_row(
                 &JournalPayload::ExecutionLaneRecorded(Box::new(value)),
                 seq,
             )?);
@@ -12095,12 +13002,8 @@ impl ReducerState {
             .values()
             .map(|(value, _)| value.capture_receipt_revision_id)
             .collect::<BTreeSet<_>>();
-        for (lane_id, (value, seq)) in self.capture_receipts {
-            rows.push(physical_object_row(
-                ObjectFamily::Evidence,
-                "capture_receipt",
-                lane_id.to_string(),
-                value.capture_receipt_revision_id.to_string(),
+        for (value, seq) in self.capture_receipts.into_values() {
+            rows.push(inbox_work_row(
                 &JournalPayload::CaptureReceiptRecorded(Box::new(value)),
                 seq,
             )?);
@@ -12177,12 +13080,8 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.worktree_transitions {
-            rows.push(physical_object_row(
-                ObjectFamily::Work,
-                "worktree_transition",
-                id.to_string(),
-                format!("{}@{}", id, value.transition_revision),
+        for (value, seq) in self.worktree_transitions.into_values() {
+            rows.push(inbox_work_row(
                 &JournalPayload::WorktreeTransitionRecorded(Box::new(value)),
                 seq,
             )?);
@@ -12225,61 +13124,23 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.work_bindings {
-            rows.push(work_identity_row(
-                "work_binding",
-                id.to_string(),
-                id.to_string(),
-                value.assignment_status.as_str(),
-                value.primary_binding.task_id.map(|id| id.to_string()),
-                value.primary_binding.workstream_id.map(|id| id.to_string()),
-                None,
-                None,
+        for (value, seq) in self.work_bindings.into_values() {
+            rows.push(inbox_work_row(
                 &JournalPayload::WorkBindingRecorded(Box::new(value)),
                 seq,
             )?);
         }
-        for (_revision_id, (value, seq)) in self.attempt_revisions {
-            let mut row = work_identity_row(
-                "attempt",
-                value.attempt_id.to_string(),
-                value.revision_id.to_string(),
-                value.lifecycle_status.as_str(),
-                Some(value.task_id.to_string()),
-                Some(value.workstream_id.to_string()),
-                value.repository_instance_id.map(|id| id.to_string()),
-                value.worktree_instance_ids.first().map(ToString::to_string),
+        for (value, seq) in self.attempt_revisions.into_values() {
+            rows.push(inbox_work_row(
                 &JournalPayload::AttemptRecorded(Box::new(value)),
                 seq,
-            )?;
-            row.row_id = format!(
-                "object:work:attempt:{}",
-                row.current_revision_id
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?
-            );
-            rows.push(row);
+            )?);
         }
-        for (_revision_id, (value, seq)) in self.competing_group_revisions {
-            let mut row = work_identity_row(
-                "competing_attempt_group",
-                value.competing_group_id.to_string(),
-                value.revision_id.to_string(),
-                value.resolution_status.as_str(),
-                Some(value.task_id.to_string()),
-                value.origin_workstream_id.map(|id| id.to_string()),
-                None,
-                None,
+        for (value, seq) in self.competing_group_revisions.into_values() {
+            rows.push(inbox_work_row(
                 &JournalPayload::CompetingAttemptGroupRecorded(Box::new(value)),
                 seq,
-            )?;
-            row.row_id = format!(
-                "object:work:competing_attempt_group:{}",
-                row.current_revision_id
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?
-            );
-            rows.push(row);
+            )?);
         }
         for (_revision_id, (value, seq)) in self.operation_burst_revisions {
             let mut row = work_identity_row(
@@ -12302,26 +13163,11 @@ impl ReducerState {
             );
             rows.push(row);
         }
-        for (_revision_id, (value, seq)) in self.episode_revisions {
-            let mut row = work_identity_row(
-                "work_episode",
-                value.episode_id.to_string(),
-                value.revision_id.to_string(),
-                value.lifecycle_status.as_str(),
-                Some(value.task_id.to_string()),
-                Some(value.workstream_id.to_string()),
-                value.repository_instance_id.map(|id| id.to_string()),
-                value.worktree_instance_id.map(|id| id.to_string()),
+        for (value, seq) in self.episode_revisions.into_values() {
+            rows.push(inbox_work_row(
                 &JournalPayload::WorkEpisodeRecorded(Box::new(value)),
                 seq,
-            )?;
-            row.row_id = format!(
-                "object:work:work_episode:{}",
-                row.current_revision_id
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?
-            );
-            rows.push(row);
+            )?);
         }
         for (key, (value, seq)) in self.checkpoints {
             rows.push(work_identity_row(
@@ -12453,24 +13299,17 @@ impl ReducerState {
     }
 
     fn close_deleted_product_state(&mut self) {
-        let mut revision_ids = BTreeSet::new();
-        let mut atom_ids = BTreeSet::new();
-        let mut procedure_ids = BTreeSet::new();
-        let mut membership_ids = BTreeSet::new();
-        for event in self.deletions.events() {
-            revision_ids.extend(event.exact_revision_ids.iter().copied());
-            match event.target {
-                ObjectDeletionTarget::Atom { atom_id } => {
-                    atom_ids.insert(atom_id);
-                }
-                ObjectDeletionTarget::Procedure { procedure_id } => {
-                    procedure_ids.insert(procedure_id);
-                }
-                ObjectDeletionTarget::CoreMembership { core_membership_id } => {
-                    membership_ids.insert(core_membership_id);
-                }
-            }
-        }
+        let deleted = product_deletion_ids(&self.deletions);
+        let deleted_proposal_ids = proposal_ids_for_deletion(
+            self.proposal_revisions.values().map(|(value, _)| value),
+            &deleted,
+        );
+        let ProductDeletionIds {
+            revision_ids,
+            atom_ids,
+            procedure_ids,
+            membership_ids,
+        } = deleted;
         if revision_ids.is_empty() {
             return;
         }
@@ -12507,14 +13346,6 @@ impl ReducerState {
             .retain(|_, (job, _)| !owned_outbox_ids.contains(&job.idempotency_key));
         self.s23.forget(&revision_ids, &membership_ids);
 
-        let deleted_proposal_ids = self
-            .proposal_revisions
-            .values()
-            .filter_map(|(proposal, _)| {
-                proposal_targets_deleted(proposal, &atom_ids, &procedure_ids, &membership_ids)
-                    .then_some(proposal.proposal_id)
-            })
-            .collect::<BTreeSet<_>>();
         self.proposals
             .retain(|id, _| !deleted_proposal_ids.contains(id));
         self.proposal_revisions
@@ -13103,6 +13934,100 @@ fn physical_object_row(
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
+}
+
+fn inbox_work_row(payload: &JournalPayload, seq: u64) -> Result<ObjectRow, StoreError> {
+    let mut row = match payload {
+        JournalPayload::ExecutionLaneRecorded(v) => {
+            return physical_object_row(
+                ObjectFamily::Work,
+                "execution_lane",
+                v.execution_lane_id.to_string(),
+                format!("{}@{}", v.execution_lane_id, v.lane_revision),
+                payload,
+                seq,
+            );
+        }
+        JournalPayload::CaptureReceiptRecorded(v) => {
+            return physical_object_row(
+                ObjectFamily::Evidence,
+                "capture_receipt",
+                v.execution_lane_id.to_string(),
+                v.capture_receipt_revision_id.to_string(),
+                payload,
+                seq,
+            );
+        }
+        JournalPayload::WorktreeTransitionRecorded(v) => {
+            return physical_object_row(
+                ObjectFamily::Work,
+                "worktree_transition",
+                v.worktree_transition_id.to_string(),
+                format!("{}@{}", v.worktree_transition_id, v.transition_revision),
+                payload,
+                seq,
+            );
+        }
+        JournalPayload::WorkBindingRecorded(v) => {
+            return work_identity_row(
+                "work_binding",
+                v.work_binding_revision_id.to_string(),
+                v.work_binding_revision_id.to_string(),
+                v.assignment_status.as_str(),
+                v.primary_binding.task_id.map(|id| id.to_string()),
+                v.primary_binding.workstream_id.map(|id| id.to_string()),
+                None,
+                None,
+                payload,
+                seq,
+            );
+        }
+        JournalPayload::AttemptRecorded(v) => work_identity_row(
+            "attempt",
+            v.attempt_id.to_string(),
+            v.revision_id.to_string(),
+            v.lifecycle_status.as_str(),
+            Some(v.task_id.to_string()),
+            Some(v.workstream_id.to_string()),
+            v.repository_instance_id.map(|id| id.to_string()),
+            v.worktree_instance_ids.first().map(ToString::to_string),
+            payload,
+            seq,
+        )?,
+        JournalPayload::CompetingAttemptGroupRecorded(v) => work_identity_row(
+            "competing_attempt_group",
+            v.competing_group_id.to_string(),
+            v.revision_id.to_string(),
+            v.resolution_status.as_str(),
+            Some(v.task_id.to_string()),
+            v.origin_workstream_id.map(|id| id.to_string()),
+            None,
+            None,
+            payload,
+            seq,
+        )?,
+        JournalPayload::WorkEpisodeRecorded(v) => work_identity_row(
+            "work_episode",
+            v.episode_id.to_string(),
+            v.revision_id.to_string(),
+            v.lifecycle_status.as_str(),
+            Some(v.task_id.to_string()),
+            Some(v.workstream_id.to_string()),
+            v.repository_instance_id.map(|id| id.to_string()),
+            v.worktree_instance_id.map(|id| id.to_string()),
+            payload,
+            seq,
+        )?,
+        _ => return Err(StoreError::StoreCorrupt),
+    };
+    row.row_id = format!(
+        "object:work:{}:{}",
+        row.object_kind.as_deref().ok_or(StoreError::StoreCorrupt)?,
+        row.current_revision_id
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?
+    );
+    Ok(row)
 }
 
 fn semantic_atom_row(

@@ -55,5 +55,5 @@ pub use service::{
     HumanWorkDetail, McpActionService, McpBindingAuthority, McpBindingError, McpBindingGrant,
     McpBindingIssue, McpItemPartition, McpResolvedScope, McpScopeMechanism, McpServiceAction,
     McpServiceError, McpServiceItem, McpServiceRequest, McpServiceResult, McpServiceStatus,
-    RuntimeMode,
+    RuntimeMode, summarize_inbox_snapshot,
 };

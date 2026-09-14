@@ -2755,6 +2755,28 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
                 .is_some_and(|review| review.negative_evidence_id == localized_id)
         })
         .unwrap();
+    let full_snapshot = handle.project().await.unwrap();
+    for (after, limit) in [
+        (None, 64_u16),
+        (Some("object:procedure_negative_review:"), 1),
+    ] {
+        let expected =
+            evertrace_engine::summarize_inbox_snapshot(&full_snapshot, after, limit).unwrap();
+        let actual = service
+            .list(
+                evertrace_engine::HumanSurface::Inbox,
+                Some(full_snapshot.frontier),
+                after,
+                limit,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.items, expected.items);
+        assert_eq!(actual.next_cursor, expected.next_cursor);
+        assert_eq!(actual.status, expected.status);
+        assert_eq!(actual.degraded_reasons, expected.degraded_reasons);
+    }
     assert_eq!(
         item.negative_review
             .as_ref()

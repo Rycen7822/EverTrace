@@ -1093,6 +1093,45 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     app.dispatch(evertrace_tui::UiCommand::CancelModal);
 }
 
+async fn assert_inbox_matches_snapshot(
+    service: &HumanGovernanceService,
+    snapshot: &evertrace_store::ProjectionSnapshot,
+) {
+    for limit in [1_u16, 64] {
+        for start in [
+            None,
+            Some("object:procedure:"),
+            Some("object:work:attempt:nonstandard"),
+        ] {
+            let mut cursor = start.map(str::to_owned);
+            loop {
+                let expected =
+                    evertrace_engine::summarize_inbox_snapshot(snapshot, cursor.as_deref(), limit)
+                        .unwrap();
+                let actual = service
+                    .list(
+                        HumanSurface::Inbox,
+                        Some(snapshot.frontier),
+                        cursor.as_deref(),
+                        limit,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(actual.items, expected.items);
+                assert_eq!(actual.frontier, expected.frontier);
+                assert_eq!(actual.status, expected.status);
+                assert_eq!(actual.degraded_reasons, expected.degraded_reasons);
+                assert_eq!(actual.next_cursor, expected.next_cursor);
+                cursor = actual.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn assert_memories_match_explorer(service: &HumanGovernanceService) {
     let mut all = Vec::new();
     let mut cursor = None;
@@ -1328,6 +1367,7 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
     assert_eq!(empty_capture.status, first.status);
     assert_eq!(empty_capture.degraded_reasons, first.degraded_reasons);
     assert_memories_match_explorer(&service).await;
+    assert_inbox_matches_snapshot(&service, &handle.project().await.unwrap()).await;
     let cursor = first.next_cursor.clone().unwrap();
     assert!(first.items.iter().all(|item| item.category
         == evertrace_engine::HumanItemCategory::Runtime
@@ -1628,6 +1668,7 @@ async fn mark_new_attempt_creates_one_unknown_child_and_replays_after_reopen() {
             .any(|item| item.object_ref.as_deref() == Some(source_ref.as_str()))
     );
 
+    assert_inbox_matches_snapshot(&service, &handle.project().await.unwrap()).await;
     let mut forged_child = new_attempt(
         task_id,
         workstream_id,
@@ -1713,6 +1754,7 @@ async fn mark_new_attempt_creates_one_unknown_child_and_replays_after_reopen() {
             .iter()
             .all(|item| item.object_ref.as_deref() != Some(source_ref.as_str()))
     );
+    assert_inbox_matches_snapshot(&service, &handle.project().await.unwrap()).await;
     assert_eq!(
         service
             .mark_new_attempt(request_id, action_frontier, source_attempt.revision_id,)
@@ -2205,6 +2247,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         })
         .unwrap();
     assert!(atom_item.proposal_review.is_none());
+    assert_inbox_matches_snapshot(&service, &handle.project().await.unwrap()).await;
     let atom_detail = service
         .detail(
             HumanSurface::Inbox,
@@ -3875,6 +3918,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
     assert!(revisions.items.len() >= 2);
     assert!(revisions.items.iter().all(|item| item.object_ref.as_deref() == Some(first_atom.atom_id.to_string().as_str())));
     assert_memories_match_explorer(&service).await;
+    assert_inbox_matches_snapshot(&service, &handle.project().await.unwrap()).await;
 
     let mut invalid_draft = atom_draft(repository_id, &receipt, &observation);
     invalid_draft.value.text = "invalid merge".into();
@@ -5464,6 +5508,8 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             .collect::<Vec<_>>()
     );
     assert_memories_match_explorer(&reopened_service).await;
+    assert_inbox_matches_snapshot(&reopened_service, &reopened_handle.project().await.unwrap())
+        .await;
     reopened_handle.shutdown().await.unwrap();
     reopened_task.await.unwrap().unwrap();
 }

@@ -39,11 +39,10 @@ use evertrace_domain::{
         ObjectReauthorizationRef, RepositoryPurgeBlocker,
     },
     repository::{
-        DestructiveClass, GitRegistrationState, LineageAssessment,
-        OrderingIntegrity as RecoveryOrderingIntegrity, RecoveryApplicationKind,
-        RecoveryApplicationStatus, RecoveryCaptureStatus, RecoveryInputDeliveryState,
-        RecoveryOmissionReason, RecoveryReasonCode, RecoveryRequestStatus, UntrackedCaptureScope,
-        WorktreeKind, WorktreeLifecycle,
+        DestructiveClass, GitRegistrationState, OrderingIntegrity as RecoveryOrderingIntegrity,
+        RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryCaptureStatus,
+        RecoveryInputDeliveryState, RecoveryOmissionReason, RecoveryReasonCode,
+        RecoveryRequestStatus, UntrackedCaptureScope, WorktreeKind, WorktreeLifecycle,
     },
     revision::RevisionId,
     semantic::{
@@ -54,8 +53,7 @@ use evertrace_domain::{
         SupportThresholdSnapshot, TUI_ACCEPTANCE_EVENT_MANIFEST_REF, tui_acceptance_event_payload,
     },
     work::{
-        AdmissionFailureObservability, AssignmentStatus, AttemptExecutionStatus,
-        AttemptLifecycleStatus, BoundaryStatus, CompetingResolutionStatus, CoverageLevel,
+        AdmissionFailureObservability, BoundaryStatus, CompetingResolutionStatus, CoverageLevel,
         LaneStatus, LivenessState, OrderingIntegrity, PairingIntegrity, PayloadIntegrity,
         ReasoningVisibility, SourceCoverage, TerminalKind,
     },
@@ -1225,6 +1223,17 @@ impl HumanGovernanceService {
         }
         if limit == 0 || limit > MAX_PAGE || after.is_some_and(|value| !valid_ref(value)) {
             return Err(HumanGovernanceError::InvalidInput);
+        }
+        if surface == HumanSurface::Inbox {
+            let context = self
+                .writer
+                .inbox_current_context(after.map(str::to_owned), usize::from(limit))
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if expected_frontier.is_some_and(|frontier| frontier != context.frontier) {
+                return Ok(Err(context.frontier));
+            }
+            return Ok(Ok(inbox_page(context)?));
         }
         if selection == Some(HumanExplorerListSelection::Capture) {
             let context = self
@@ -4158,6 +4167,60 @@ pub enum HumanExplorerListSelection {
     Capture,
 }
 
+fn inbox_page(
+    context: evertrace_store::projections::InboxCurrentContext,
+) -> Result<HumanPage, HumanGovernanceError> {
+    let (status, degraded_reasons) = failed_job_status(context.has_failed_job);
+    let mut items = Vec::with_capacity(context.items.len());
+    for row in &context.items {
+        let mut item = summary_fields(row, HumanSurface::Inbox);
+        if matches!(
+            row.object_kind.as_deref(),
+            Some("revision_proposal_revision" | "procedure_negative_review")
+        ) {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(HumanGovernanceError::Store)?,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?;
+            match payload {
+                JournalPayload::RevisionProposalRecorded(proposal) => {
+                    item.proposal = Some(proposal_summary(&proposal))
+                }
+                JournalPayload::ProcedureNegativeReviewRecorded(review) => {
+                    let facts = context
+                        .negative_reviews
+                        .get(&review.negative_evidence_id)
+                        .ok_or(HumanGovernanceError::Store)?;
+                    let selection = crate::procedure::select_inbox_negative_review(
+                        facts,
+                        review.negative_evidence_id,
+                    )
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                    if selection.review_revision_id != review.review_event_id {
+                        return Err(HumanGovernanceError::Store);
+                    }
+                    item.negative_review = Some(negative_review_summary(
+                        review.negative_evidence_id,
+                        selection,
+                    ));
+                }
+                _ => return Err(HumanGovernanceError::Store),
+            }
+        }
+        items.push(item);
+    }
+    Ok(HumanPage {
+        diagnostics: None,
+        frontier: context.frontier,
+        status,
+        degraded_reasons,
+        items,
+        next_cursor: context.next_cursor,
+    })
+}
+
 fn memories_page(
     context: evertrace_store::MemoriesCurrentContext,
 ) -> Result<HumanPage, HumanGovernanceError> {
@@ -4198,6 +4261,26 @@ fn memories_page(
         items,
         next_cursor: context.next_cursor,
     })
+}
+
+/// Summarize an already validated complete snapshot. This performs no read;
+/// ordinary Inbox requests use the writer's bounded context instead.
+pub fn summarize_inbox_snapshot(
+    snapshot: &ProjectionSnapshot,
+    after: Option<&str>,
+    limit: u16,
+) -> Result<HumanPage, HumanGovernanceError> {
+    if limit == 0 || limit > MAX_PAGE || after.is_some_and(|value| !valid_ref(value)) {
+        return Err(HumanGovernanceError::InvalidInput);
+    }
+    page_selected(
+        snapshot,
+        HumanSurface::Inbox,
+        after,
+        usize::from(limit),
+        false,
+        None,
+    )
 }
 
 fn page_selected(
@@ -4394,17 +4477,12 @@ fn actionable_inbox_rows(
         payload
             .validate()
             .map_err(|_| HumanGovernanceError::Store)?;
+        let actionable = evertrace_store::projections::inbox_payload_actionable(&payload);
         match payload {
             JournalPayload::RevisionProposalRecorded(value) => {
                 let current = proposals.get(&value.proposal_id);
                 if current.is_some_and(|proposal| {
-                    proposal.proposal_revision_id == value.proposal_revision_id
-                        && matches!(
-                            proposal.status,
-                            ProposalStatus::Pending
-                                | ProposalStatus::Validating
-                                | ProposalStatus::Deferred
-                        )
+                    proposal.proposal_revision_id == value.proposal_revision_id && actionable
                 }) {
                     direct.insert(row.row_id.clone());
                 }
@@ -4414,12 +4492,7 @@ fn actionable_inbox_rows(
                 format!("support:{}", value.support_contract_ref),
                 row.source_event_seq,
                 row,
-                matches!(
-                    value.state,
-                    GlobalSupportState::RevalidationPending
-                        | GlobalSupportState::Insufficient
-                        | GlobalSupportState::Invalidated
-                ),
+                actionable,
             )?,
             JournalPayload::ProcedureNegativeEvidenceRecorded(_) => {}
             JournalPayload::ProcedureNegativeReviewRecorded(value) => select_current(
@@ -4427,17 +4500,14 @@ fn actionable_inbox_rows(
                 format!("negative:{}", value.negative_evidence_id),
                 u64::from(value.review_generation),
                 row,
-                matches!(
-                    value.status,
-                    ProcedureNegativeReviewStatus::Pending | ProcedureNegativeReviewStatus::Upheld
-                ),
+                actionable,
             )?,
             JournalPayload::ProcedureStateRecorded(value) => select_current(
                 &mut selected,
                 format!("publication:{}", value.procedure_revision_id),
                 row.source_event_seq,
                 row,
-                value.to_state == ProcedurePublicationState::ReviewHold,
+                actionable,
             )?,
             JournalPayload::WorkEpisodeRecorded(value) => select_current(
                 &mut selected,
@@ -4451,17 +4521,14 @@ fn actionable_inbox_rows(
                 format!("binding:{}", value.operation_id),
                 value.revision_generation,
                 row,
-                value.assignment_status != AssignmentStatus::Resolved,
+                actionable,
             )?,
             JournalPayload::CompetingAttemptGroupRecorded(value) => select_current(
                 &mut selected,
                 format!("competing:{}", value.competing_group_id),
                 value.revision_generation,
                 row,
-                matches!(
-                    value.resolution_status,
-                    CompetingResolutionStatus::Open | CompetingResolutionStatus::Unresolved
-                ),
+                actionable,
             )?,
             JournalPayload::AttemptRecorded(value) => {
                 if value.revision_generation == 1
@@ -4475,8 +4542,7 @@ fn actionable_inbox_rows(
                     format!("attempt:{}", value.attempt_id),
                     value.revision_generation,
                     row,
-                    value.lifecycle_status == AttemptLifecycleStatus::Active
-                        && value.execution_status == AttemptExecutionStatus::Interrupted,
+                    actionable,
                 )?;
             }
             JournalPayload::ExecutionLaneRecorded(value) => select_current(
@@ -4484,7 +4550,7 @@ fn actionable_inbox_rows(
                 format!("lane:{}", value.execution_lane_id),
                 u64::from(value.lane_revision),
                 row,
-                lane_needs_review(&value),
+                actionable,
             )?,
             JournalPayload::CaptureReceiptRecorded(value) if kind == "capture_receipt" => {
                 select_current(
@@ -4492,7 +4558,7 @@ fn actionable_inbox_rows(
                     format!("receipt:{}", value.execution_lane_id),
                     row.source_event_seq,
                     row,
-                    receipt_needs_review(&value),
+                    actionable,
                 )?;
             }
             JournalPayload::WorktreeTransitionRecorded(value) => select_current(
@@ -4500,17 +4566,14 @@ fn actionable_inbox_rows(
                 format!("worktree-transition:{}", value.worktree_transition_id),
                 u64::from(value.transition_revision),
                 row,
-                value.lineage_assessment != LineageAssessment::Proven,
+                actionable,
             )?,
             JournalPayload::RecoveryCaptureRequestRecorded(value) => select_current(
                 &mut selected,
                 format!("recovery:{}", value.recovery_capture_request_id),
                 row.source_event_seq,
                 row,
-                matches!(
-                    value.request_status,
-                    RecoveryRequestStatus::Pending | RecoveryRequestStatus::Partial
-                ),
+                actionable,
             )?,
             _ => return Err(HumanGovernanceError::Store),
         }
@@ -4535,51 +4598,23 @@ fn select_current(
     row: &ObjectRow,
     actionable: bool,
 ) -> Result<(), HumanGovernanceError> {
-    match selected.get(&key) {
-        Some((current_rank, current_row, _))
-            if *current_rank == rank && current_row != &row.row_id =>
-        {
-            return Err(HumanGovernanceError::Store);
-        }
-        Some((current_rank, _, _)) if *current_rank > rank => return Ok(()),
-        _ => {}
+    if !evertrace_store::projections::inbox_current_replaces(
+        selected
+            .get(&key)
+            .map(|(rank, row, _)| (*rank, row.as_str())),
+        rank,
+        &row.row_id,
+    )
+    .map_err(|_| HumanGovernanceError::Store)?
+    {
+        return Ok(());
     }
     selected.insert(key, (rank, row.row_id.clone(), actionable));
     Ok(())
 }
 
 fn boundary_candidate_actionable(status: BoundaryStatus) -> bool {
-    status == BoundaryStatus::Candidate
-}
-
-fn lane_needs_review(lane: &evertrace_domain::work::ExecutionLane) -> bool {
-    matches!(
-        lane.status,
-        LaneStatus::Unresolved | LaneStatus::InterruptedUnconfirmed
-    ) || lane.liveness_state == LivenessState::Unknown
-        || lane.coverage_level != CoverageLevel::Full
-        || matches!(
-            lane.source_coverage,
-            SourceCoverage::Partial | SourceCoverage::Unavailable
-        )
-        || lane.pairing_integrity != PairingIntegrity::Complete
-        || lane.payload_integrity != PayloadIntegrity::Complete
-        || lane.ordering_integrity != OrderingIntegrity::Complete
-}
-
-fn receipt_needs_review(receipt: &evertrace_domain::work::CaptureReceipt) -> bool {
-    receipt.coverage_level != CoverageLevel::Full
-        || matches!(
-            receipt.source_coverage,
-            SourceCoverage::Partial | SourceCoverage::Unavailable
-        )
-        || receipt.pairing_integrity != PairingIntegrity::Complete
-        || receipt.payload_integrity != PayloadIntegrity::Complete
-        || receipt.ordering_integrity != OrderingIntegrity::Complete
-        || matches!(
-            receipt.admission_failure_observability,
-            AdmissionFailureObservability::BestEffort | AdmissionFailureObservability::Unavailable
-        )
+    evertrace_store::projections::inbox_boundary_actionable(status)
 }
 
 fn support_validation(
@@ -5058,29 +5093,10 @@ fn summary(
         if selection.review_revision_id != review.review_event_id {
             return Err(HumanGovernanceError::Store);
         }
-        Some(HumanNegativeReviewSummary {
-            negative_evidence_id: review.negative_evidence_id,
-            current_review_revision_id: selection.review_revision_id,
-            status: selection.review_status,
-            available_decisions: selection
-                .available_decisions
-                .into_iter()
-                .map(|decision| match decision {
-                    ProcedureNegativeReviewDecision::ResolveAsIneffective => {
-                        HumanNegativeDecision::ResolveAsIneffective
-                    }
-                    ProcedureNegativeReviewDecision::DismissAttribution => {
-                        HumanNegativeDecision::DismissAttribution
-                    }
-                    ProcedureNegativeReviewDecision::ConfirmHarm => {
-                        HumanNegativeDecision::ConfirmHarm
-                    }
-                    ProcedureNegativeReviewDecision::RequestRevision => {
-                        HumanNegativeDecision::RequestRevision
-                    }
-                })
-                .collect(),
-        })
+        Some(negative_review_summary(
+            review.negative_evidence_id,
+            selection,
+        ))
     } else {
         None
     };
@@ -5109,6 +5125,33 @@ fn summary(
         system_detail,
         ..summary_fields(row, surface)
     })
+}
+
+fn negative_review_summary(
+    negative_evidence_id: ProcedureNegativeEvidenceId,
+    selection: crate::procedure::ProcedureNegativeReviewSelection,
+) -> HumanNegativeReviewSummary {
+    HumanNegativeReviewSummary {
+        negative_evidence_id,
+        current_review_revision_id: selection.review_revision_id,
+        status: selection.review_status,
+        available_decisions: selection
+            .available_decisions
+            .into_iter()
+            .map(|decision| match decision {
+                ProcedureNegativeReviewDecision::ResolveAsIneffective => {
+                    HumanNegativeDecision::ResolveAsIneffective
+                }
+                ProcedureNegativeReviewDecision::DismissAttribution => {
+                    HumanNegativeDecision::DismissAttribution
+                }
+                ProcedureNegativeReviewDecision::ConfirmHarm => HumanNegativeDecision::ConfirmHarm,
+                ProcedureNegativeReviewDecision::RequestRevision => {
+                    HumanNegativeDecision::RequestRevision
+                }
+            })
+            .collect(),
+    }
 }
 
 fn proposal_summary(value: &RevisionProposal) -> HumanProposalSummary {
@@ -7485,6 +7528,16 @@ mod tests {
         assert_eq!(
             selected.get("episode:one"),
             Some(&(2, "episode-r2".into(), false))
+        );
+        assert!(
+            select_current(
+                &mut selected,
+                "episode:one".into(),
+                2,
+                &object_row("conflicting-r2", 3),
+                true
+            )
+            .is_err()
         );
 
         let mut current_candidate = BTreeMap::new();

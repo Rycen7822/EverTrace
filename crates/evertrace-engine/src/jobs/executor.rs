@@ -69,6 +69,13 @@ enum WriterRequest {
         reply:
             oneshot::Sender<Result<evertrace_store::PassiveSourceCurrentContext, WriterActorError>>,
     },
+    InboxCurrent {
+        after: Option<String>,
+        limit: usize,
+        reply: oneshot::Sender<
+            Result<evertrace_store::projections::InboxCurrentContext, WriterActorError>,
+        >,
+    },
     MemoriesCurrent {
         after: Option<String>,
         limit: usize,
@@ -420,6 +427,23 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::PassiveSourceCurrent { selection, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn inbox_current_context(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<evertrace_store::projections::InboxCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::InboxCurrent {
+                after,
+                limit,
+                reply,
+            })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -911,6 +935,30 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .capture_current_context(after.as_deref(), exact.as_deref(), limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::InboxCurrent {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .inbox_current_context(
+                            after.as_deref(),
+                            limit,
+                            crate::procedure::inbox_negative_proof_limit(),
+                        )
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();

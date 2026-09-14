@@ -872,24 +872,12 @@ fn filter_object_product_rows(
     if deletions.events.is_empty() {
         return Ok(rows);
     }
-    let mut revision_ids = BTreeSet::new();
-    let mut atom_ids = BTreeSet::new();
-    let mut procedure_ids = BTreeSet::new();
-    let mut membership_ids = BTreeSet::new();
-    for event in deletions.events() {
-        revision_ids.extend(event.exact_revision_ids.iter().copied());
-        match event.target {
-            ObjectDeletionTarget::Atom { atom_id } => {
-                atom_ids.insert(atom_id);
-            }
-            ObjectDeletionTarget::Procedure { procedure_id } => {
-                procedure_ids.insert(procedure_id);
-            }
-            ObjectDeletionTarget::CoreMembership { core_membership_id } => {
-                membership_ids.insert(core_membership_id);
-            }
-        }
-    }
+    let crate::projections::ProductDeletionIds {
+        revision_ids,
+        atom_ids,
+        procedure_ids,
+        membership_ids,
+    } = crate::projections::product_deletion_ids(deletions);
     let mut negative_ids = BTreeSet::<ProcedureNegativeEvidenceId>::new();
     let mut support_contracts = BTreeSet::<RevisionId>::new();
     let mut outboxes = Vec::new();

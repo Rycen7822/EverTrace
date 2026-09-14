@@ -1,5 +1,9 @@
 use super::*;
 
+pub(crate) const fn inbox_negative_proof_limit() -> usize {
+    MAX_CANDIDATES
+}
+
 struct CompiledRelativeContext {
     phase: Option<ProcedurePhase>,
     // Outer None is unknown; Some(None) is a verified current absence.
@@ -1350,7 +1354,122 @@ impl ProcedureNegativeReviewSelection {
     }
 }
 
+// The negative selector consumes these proof facts only; it does not require a
+// complete usage view or any physical execution/source history.
+struct NegativeReviewInputs<'a> {
+    negatives: &'a std::collections::BTreeMap<
+        evertrace_domain::ids::ProcedureNegativeEvidenceId,
+        evertrace_domain::procedure::ProcedureNegativeEvidence,
+    >,
+    negative_seqs:
+        &'a std::collections::BTreeMap<evertrace_domain::ids::ProcedureNegativeEvidenceId, u64>,
+    negative_reviews: &'a std::collections::BTreeMap<
+        evertrace_domain::ids::ProcedureNegativeEvidenceId,
+        evertrace_domain::procedure::ProcedureNegativeReviewEvent,
+    >,
+    negative_review_seqs:
+        &'a std::collections::BTreeMap<evertrace_domain::ids::ProcedureNegativeEvidenceId, u64>,
+    usages: &'a std::collections::BTreeMap<
+        evertrace_domain::ids::ProcedureUsageId,
+        evertrace_domain::procedure::ProcedureUsageRevision,
+    >,
+    current_procedure: Option<RevisionId>,
+    publication: Option<ProcedurePublicationState>,
+    attempts: &'a std::collections::BTreeMap<
+        evertrace_domain::ids::AttemptId,
+        evertrace_domain::work::Attempt,
+    >,
+    runs: &'a std::collections::BTreeMap<
+        evertrace_domain::ids::ExperimentRunId,
+        (evertrace_domain::work::ExperimentRun, u64),
+    >,
+    results: &'a std::collections::BTreeMap<RevisionId, evertrace_domain::semantic::ResultEvidence>,
+    result_seqs: &'a std::collections::BTreeMap<RevisionId, u64>,
+    current_result_ids: Option<&'a [RevisionId]>,
+}
+
 impl ProcedureUsageCurrentView {
+    fn negative_review_inputs(&self, revision: RevisionId) -> NegativeReviewInputs<'_> {
+        NegativeReviewInputs {
+            negatives: &self.negatives,
+            negative_seqs: &self.negative_seqs,
+            negative_reviews: &self.negative_reviews,
+            negative_review_seqs: &self.negative_review_seqs,
+            usages: &self.usages,
+            current_procedure: self
+                .procedures
+                .get(&revision)
+                .and_then(|v| self.current_procedures.get(&v.procedure_id))
+                .copied(),
+            publication: self.publications.get(&revision).map(|(v, _)| v.to_state),
+            attempts: &self.attempts,
+            runs: &self.runs,
+            results: &self.results,
+            result_seqs: &self.result_seqs,
+            current_result_ids: None,
+        }
+    }
+
+    pub fn select_negative_review(
+        &self,
+        id: evertrace_domain::ids::ProcedureNegativeEvidenceId,
+    ) -> Result<ProcedureNegativeReviewSelection, SemanticServiceError> {
+        let revision = self
+            .negatives
+            .get(&id)
+            .ok_or(SemanticServiceError::InvalidInput)?
+            .procedure_revision_id;
+        self.negative_review_inputs(revision)
+            .select_negative_review(id)
+    }
+    fn ineffective_proof(
+        &self,
+        negative: &evertrace_domain::procedure::ProcedureNegativeEvidence,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> Option<ProcedureNegativeReviewProof> {
+        self.negative_review_inputs(negative.procedure_revision_id)
+            .ineffective_proof(negative, usage)
+    }
+    fn revision_request_ready(
+        &self,
+        negative: &evertrace_domain::procedure::ProcedureNegativeEvidence,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> bool {
+        self.negative_review_inputs(negative.procedure_revision_id)
+            .revision_request_ready(negative, usage)
+    }
+    fn negative_result_revisions(
+        &self,
+        negative: &evertrace_domain::procedure::ProcedureNegativeEvidence,
+        usage: &evertrace_domain::procedure::ProcedureUsageRevision,
+    ) -> Option<Vec<RevisionId>> {
+        self.negative_review_inputs(negative.procedure_revision_id)
+            .negative_result_revisions(negative, usage)
+    }
+}
+
+pub(crate) fn select_inbox_negative_review(
+    facts: &evertrace_store::projections::InboxNegativeReviewFacts,
+    id: evertrace_domain::ids::ProcedureNegativeEvidenceId,
+) -> Result<ProcedureNegativeReviewSelection, SemanticServiceError> {
+    NegativeReviewInputs {
+        negatives: &facts.negatives,
+        negative_seqs: &facts.negative_seqs,
+        negative_reviews: &facts.negative_reviews,
+        negative_review_seqs: &facts.negative_review_seqs,
+        usages: &facts.usages,
+        current_procedure: facts.current_procedure,
+        publication: facts.publication,
+        attempts: &facts.attempts,
+        runs: &facts.runs,
+        results: &facts.results,
+        result_seqs: &facts.result_seqs,
+        current_result_ids: Some(&facts.current_result_ids),
+    }
+    .select_negative_review(id)
+}
+
+impl NegativeReviewInputs<'_> {
     pub fn select_negative_review(
         &self,
         negative_evidence_id: evertrace_domain::ids::ProcedureNegativeEvidenceId,
@@ -1420,10 +1539,7 @@ impl ProcedureUsageCurrentView {
                 == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
             && negative.local_context.is_none()
             && self.uniform_mismatch(&result_ids)
-            && self
-                .publications
-                .get(&negative.procedure_revision_id)
-                .is_some_and(|(state, _)| state.to_state == ProcedurePublicationState::ReviewHold))
+            && self.publication == Some(ProcedurePublicationState::ReviewHold))
         .then(|| ProcedureNegativeReviewProof::ReplayUpheld {
             result_revision_ids: result_ids.clone(),
         });
@@ -1489,12 +1605,7 @@ impl ProcedureUsageCurrentView {
         negative: &evertrace_domain::procedure::ProcedureNegativeEvidence,
         usage: &evertrace_domain::procedure::ProcedureUsageRevision,
     ) -> bool {
-        self.procedures
-            .get(&negative.procedure_revision_id)
-            .is_some_and(|procedure| {
-                self.current_procedures.get(&procedure.procedure_id)
-                    == Some(&negative.procedure_revision_id)
-            })
+        self.current_procedure == Some(negative.procedure_revision_id)
             && self.negative_result_revisions(negative, usage).is_some()
     }
 
@@ -1528,22 +1639,18 @@ impl ProcedureUsageCurrentView {
     fn current_result_heads(
         &self,
     ) -> Result<Vec<&evertrace_domain::semantic::ResultEvidence>, SemanticServiceError> {
-        let predecessors = self
-            .results
-            .values()
-            .filter_map(|result| result.parent_revision_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut heads = std::collections::BTreeMap::new();
-        for result in self
-            .results
-            .values()
-            .filter(|result| !predecessors.contains(&result.revision_id))
-        {
-            if heads.insert(result.result_evidence_id, result).is_some() {
-                return Err(SemanticServiceError::InvalidInput);
-            }
+        if let Some(ids) = self.current_result_ids {
+            return ids
+                .iter()
+                .map(|id| {
+                    self.results
+                        .get(id)
+                        .ok_or(SemanticServiceError::InvalidInput)
+                })
+                .collect();
         }
-        Ok(heads.into_values().collect())
+        evertrace_store::projections::negative_review_current_result_heads(self.results.values())
+            .map_err(|_| SemanticServiceError::InvalidInput)
     }
 
     fn results_for_usage(
@@ -1557,12 +1664,16 @@ impl ProcedureUsageCurrentView {
             .filter(|result| {
                 self.result_seqs
                     .get(&result.revision_id)
-                    .is_some_and(|seq| *seq > proof_after)
-                    && self
-                        .runs
-                        .get(&result.experiment_run_id)
-                        .and_then(|(run, _)| run.attempt_id)
-                        .is_some_and(|attempt| usage.attempt_ids.contains(&attempt))
+                    .is_some_and(|seq| {
+                        evertrace_store::projections::negative_review_result_matches(
+                            *seq,
+                            proof_after,
+                            self.runs
+                                .get(&result.experiment_run_id)
+                                .and_then(|(run, _)| run.attempt_id),
+                            &usage.attempt_ids,
+                        )
+                    })
             })
             .map(|result| result.revision_id)
             .take(MAX_CANDIDATES + 1)
