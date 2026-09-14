@@ -1,4 +1,5 @@
 #[path = "../src/provider.rs"]
+#[allow(dead_code)]
 mod provider_stub;
 
 use evertrace_domain::{
@@ -1536,6 +1537,296 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
     );
 }
 
+fn scheduler_runtime(root: &std::path::Path) -> evertrace_capture::RuntimeSnapshot {
+    evertrace_capture::RuntimeSnapshot {
+        snapshot_version: evertrace_capture::RUNTIME_SNAPSHOT_VERSION,
+        generation: 1,
+        device_key_dir: root.join("keys"),
+        cas_dir: root.join("cas"),
+        spool_dir: root.join("spool"),
+        main_high_watermark_bytes: 2 * 1024 * 1024,
+        main_low_watermark_bytes: 64 * 1024,
+        max_main_files: 16,
+        emergency_slots: 2,
+        recovery_gate: evertrace_capture::RecoveryGateMode::Disabled,
+        recovery_socket_path: root.join("runtime/evertraced-v1.sock"),
+        recovery_preflight_timeout_ms: 250,
+        effective_config_hash: CONFIG,
+        recovery_adapter_manifest_id: None,
+        recovery_classifier_revision: 1,
+        recovery_max_bundle_bytes: 4 << 20,
+        recovery_max_untracked_file_bytes: 1 << 20,
+        recovery_max_untracked_total_bytes: 2 << 20,
+        recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
+        recall_cue_adapter_manifest_id: None,
+        recall_cues: vec![],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_discards_episode_result_when_base_changes_inflight() {
+    use evertrace_domain::evidence::{
+        CorrelationStrength, EvidenceSurface, HostOccurrence, InstructionAuthority,
+        NormalizationState, Operation, OperationKind, PairingState,
+    };
+    use evertrace_domain::ids::{OperationId, WorkBindingRevisionId};
+    use evertrace_domain::work::{
+        AssignmentStatus, PendingSemanticInterval, PrimaryWorkBinding, WorkBindingRevision,
+    };
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    use tokio::sync::RwLock;
+    let temp = TempDir::new().unwrap();
+    let mut seed = seed_store(&temp.path().join("store")).await;
+    let text = "Preserve the frozen Episode input while waiting for its bounded summary.";
+    let (receipt, source_observation) = source(
+        "episode-inflight",
+        text,
+        seed.task.task_id,
+        seed.repository.repository_id,
+        seed.worktree.worktree_instance_id,
+    );
+    let observation = source_observation.source_observation_id;
+    let occurrence_id = evertrace_domain::evidence::host_occurrence_id_for_nonexact(
+        observation,
+        CorrelationStrength::Unavailable,
+    )
+    .unwrap();
+    let operation_id = OperationId::new_v7();
+    let occurrence = HostOccurrence {
+        host_occurrence_id: occurrence_id,
+        exact_key: None,
+        host_instance_id: None,
+        host_trace_lineage_id: None,
+        host_lane_key: None,
+        canonical_event_family: None,
+        native_request_id: None,
+        physical_execution_ordinal: None,
+        correlation_strength: CorrelationStrength::Unavailable,
+        source_observation_refs: vec![observation],
+        field_provenance: vec![],
+        normalization_state: NormalizationState::SingleSource,
+        pairing_state: PairingState::UnmatchedIntent,
+        possible_duplicate_group_id: None,
+        correlation_resolver_version: 1,
+        normalization_revision: 1,
+        previous_normalization_revision: None,
+    };
+    let operation = Operation {
+        source_local_pairing: None,
+        operation_id,
+        host_occurrence_id: occurrence_id,
+        execution_lane_id: None,
+        operation_kind: OperationKind::Observe,
+        input_source_observation_refs: vec![observation],
+        result_source_observation_refs: vec![],
+        pairing_state: PairingState::UnmatchedIntent,
+        scope_effect_ids: vec![],
+        artifact_refs: vec![],
+        operation_resolver_version: 1,
+        operation_revision: 1,
+        previous_operation_revision: None,
+    };
+    let binding = WorkBindingRevision {
+        work_binding_revision_id: WorkBindingRevisionId::new_v7(),
+        operation_id,
+        revision_generation: 1,
+        predecessor_revision_id: None,
+        primary_binding: PrimaryWorkBinding {
+            task_id: Some(seed.task.task_id),
+            workstream_id: Some(seed.episode.workstream_id),
+            episode_id: Some(seed.episode.episode_id),
+            ..Default::default()
+        },
+        secondary_bindings: vec![],
+        scope_effect_refs: vec![],
+        assignment_status: AssignmentStatus::Resolved,
+        evidence_refs: vec![observation.to_string()],
+        resolver_version: 1,
+    };
+    let surface = EvidenceSurface {
+        source_observation_revision_ref: observation,
+        source_role: seed.observation.source_role,
+        content_trust: seed.observation.content_trust,
+        instruction_authority: InstructionAuthority::None,
+        task_id: Some(seed.task.task_id),
+        repository_instance_id: Some(seed.repository.repository_id),
+        worktree_instance_id: Some(seed.worktree.worktree_instance_id),
+        event_time_us: 1,
+        recorded_at_us: 1,
+        source_sequence: 1,
+        capture_completeness: CaptureCompleteness::Complete,
+        canonicalization_version: 1,
+        span_hash: evertrace_domain::evidence::hex(
+            &evertrace_domain::evidence::evidence_span_hash(observation, 1, text).unwrap(),
+        ),
+        projection_generation: 1,
+        protected_text: text.into(),
+    };
+    let mut episode = seed.episode.clone();
+    episode.revision_id = RevisionId::new_v7();
+    episode.predecessor_revision_id = Some(seed.episode.revision_id);
+    episode.revision_generation += 1;
+    episode.source_watermark = seed.snapshot.frontier + 11;
+    episode.pending_semantic_delta = Some(PendingSemanticInterval {
+        after_watermark: episode.semantic_watermark,
+        through_watermark: episode.source_watermark,
+    });
+    episode.pending_delta_stats.selected_token_count = 1024;
+    for (phase, payloads) in [
+        (
+            "evidence",
+            vec![
+                JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                JournalPayload::SourceObservationRecorded(Box::new(source_observation)),
+                JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                    source_instance_id: receipt.source_instance_id,
+                    source_revision: receipt.source_revision,
+                    source_sequence: receipt.source_sequence,
+                    confirmed_prefix_digest: None,
+                }),
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::EvidenceSurface,
+                    target_id: observation.to_string(),
+                    algorithm_revision: "s26-v1".into(),
+                    source_watermark: 1,
+                }),
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::PhysicalNormalization,
+                    target_id: observation.to_string(),
+                    algorithm_revision: "s26-v1".into(),
+                    source_watermark: 1,
+                }),
+                JournalPayload::EvidenceSurfaceRecorded(Box::new(surface)),
+            ],
+        ),
+        (
+            "normalization",
+            vec![
+                JournalPayload::HostOccurrenceNormalized(Box::new(occurrence)),
+                JournalPayload::OperationDerived(Box::new(operation)),
+                JournalPayload::NormalizationWatermark(evertrace_store::NormalizationWatermark {
+                    source_observation_id: observation,
+                    resolver_version: 1,
+                }),
+            ],
+        ),
+        (
+            "binding",
+            vec![JournalPayload::WorkBindingRecorded(Box::new(binding))],
+        ),
+        (
+            "episode",
+            vec![JournalPayload::WorkEpisodeRecorded(Box::new(
+                episode.clone(),
+            ))],
+        ),
+    ] {
+        seed.writer
+            .commit(&command(3, payloads), 3)
+            .await
+            .unwrap_or_else(|error| panic!("{phase}: {error:?}"));
+    }
+    drop(seed.snapshot);
+    let runtime = scheduler_runtime(temp.path());
+    evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    evertrace_capture::CaptureRuntime::open(runtime.clone()).unwrap();
+    let adapter = temp.path().join("host");
+    let dated = adapter.join("sessions/2026/09/11");
+    std::fs::create_dir_all(&dated).unwrap();
+    std::fs::create_dir_all(&seed.repository.current_path).unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = 'trusted'\n",
+            serde_json::to_string(&seed.repository.current_path).unwrap()
+        ),
+    )
+    .unwrap();
+    let session = "019d0000-0000-7000-8000-000000000026";
+    let transcript = dated.join(format!("rollout-2026-09-11T00-00-00-{session}.jsonl"));
+    std::fs::write(&transcript, format!("{}\n", serde_json::json!({"timestamp":"2026-09-11T00:00:00Z","type":"session_meta","payload":{"id":session,"session_id":session,"cwd":seed.repository.current_path}}))).unwrap();
+    let report = Arc::new(RwLock::new(Some(
+        evertrace_engine::repository::observe_session_catalog_report(
+            transcript.to_str(),
+            session,
+            "episode-inflight",
+            None,
+        )
+        .unwrap(),
+    )));
+    let mut output = application();
+    output.progress_delta.push(SemanticStructuredDelta {
+        label: "progress".into(),
+        value: text.into(),
+        direct_refs: vec![observation.to_string()],
+    });
+    let (stub, release) =
+        ProviderStub::once_paused(200, response(serde_json::to_value(output).unwrap())).await;
+    let (writer, actor) = evertrace_engine::spawn_writer(seed.writer, 16).unwrap();
+    let scheduler = evertrace_engine::BackgroundScheduler::new(
+        writer.clone(),
+        evertrace_engine::session_import::SessionCatalogService::new(writer.clone(), CONFIG),
+        evertrace_engine::SessionImportWorker::new(
+            writer.clone(),
+            runtime.clone(),
+            Arc::clone(&report),
+        )
+        .unwrap(),
+        report,
+        runtime,
+        SynthesisPlanner::new(config(&stub.base_url)),
+        evertrace_domain::config::DreamingConfig::default(),
+    );
+    let mut running = Box::pin(scheduler.run_once());
+    tokio::select! {
+        _ = stub.wait_received() => {},
+        result = &mut running => panic!("Episode did not reach provider: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => panic!("Episode provider wait timed out"),
+    }
+    let prior_revision = episode.revision_id;
+    episode.revision_id = RevisionId::new_v7();
+    episode.predecessor_revision_id = Some(prior_revision);
+    episode.revision_generation += 1;
+    writer
+        .commit(
+            command(
+                4,
+                vec![JournalPayload::WorkEpisodeRecorded(Box::new(
+                    episode.clone(),
+                ))],
+            ),
+            4,
+        )
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    running.await.unwrap();
+    let request = stub.finish().await;
+    assert!(String::from_utf8_lossy(&request).contains(&prior_revision.to_string()));
+    let current = writer.project().await.unwrap();
+    assert!(
+        !current
+            .data_rows()
+            .any(|row| row.object_kind.as_deref() == Some("semantic_digest"))
+    );
+    assert!(
+        evertrace_store::RuntimeSchedulerView::from_snapshot(&current)
+            .unwrap()
+            .jobs
+            .iter()
+            .any(|job| job.target_revision == prior_revision.to_string()
+                && job.terminal.as_ref().is_some_and(|terminal| terminal.reason
+                    == evertrace_store::JobTerminalReason::StaleGeneration))
+    );
+    drop(current);
+    drop(scheduler);
+    writer.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     let temp = TempDir::new().unwrap();
@@ -1610,29 +1901,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     // This is the existing legal Episode/provider fixture, not a native Work
     // bootstrap. The real inventory resolver is attached with no observed Host:
     // unknown coverage must preserve a manual proposal, never mint authority.
-    let runtime = evertrace_capture::RuntimeSnapshot {
-        snapshot_version: evertrace_capture::RUNTIME_SNAPSHOT_VERSION,
-        generation: 1,
-        device_key_dir: temp.path().join("keys"),
-        cas_dir: temp.path().join("cas"),
-        spool_dir: temp.path().join("spool"),
-        main_high_watermark_bytes: 2 * 1024 * 1024,
-        main_low_watermark_bytes: 64 * 1024,
-        max_main_files: 16,
-        emergency_slots: 2,
-        recovery_gate: evertrace_capture::RecoveryGateMode::Disabled,
-        recovery_socket_path: temp.path().join("runtime/evertraced-v1.sock"),
-        recovery_preflight_timeout_ms: 250,
-        effective_config_hash: CONFIG,
-        recovery_adapter_manifest_id: None,
-        recovery_classifier_revision: 1,
-        recovery_max_bundle_bytes: 4 << 20,
-        recovery_max_untracked_file_bytes: 1 << 20,
-        recovery_max_untracked_total_bytes: 2 << 20,
-        recall_cue_gate: evertrace_capture::RecallCueGateMode::Disabled,
-        recall_cue_adapter_manifest_id: None,
-        recall_cues: vec![],
-    };
+    let runtime = scheduler_runtime(temp.path());
     runtime.validate().unwrap();
     let key = evertrace_capture::DeviceKeyStore::new(runtime.device_key_dir.clone())
         .load_or_create()
@@ -1752,6 +2021,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         .commit_if_frontier(&procedure_command, 3, seed.snapshot.frontier)
         .await
         .unwrap();
+    drop(seed.snapshot);
     assert_eq!(
         SemanticCurrentView::from_snapshot(&seed.writer.project().await.unwrap())
             .unwrap()
@@ -1822,6 +2092,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
         .into_values()
         .next()
         .unwrap();
+    drop(snapshot);
     scheduler.run_once().await.unwrap();
     assert_eq!(
         evertrace_store::RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
@@ -1922,11 +2193,9 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     reviewed
         .pitfalls
         .push("A failed restoration must retain the old journal.".into());
-    let stub = ProviderStub::methods(
-        response(serde_json::json!({"operation":"no_op"})),
+    let (stub, release) = ProviderStub::once_paused(
+        200,
         response(serde_json::json!({"operation":"revise","content":reviewed})),
-        response(serde_json::json!({"operation":"no_op"})),
-        1,
     )
     .await;
     let mut disabled = config(&stub.base_url);
@@ -1964,6 +2233,11 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     let scheduler = make_scheduler(config(&stub.base_url));
     let mut activity = handle.subscribe_background_frontier();
     let mut running = Box::pin(scheduler.run_once());
+    tokio::select! {
+        _ = stub.wait_received() => {},
+        result = &mut running => panic!("review finished before provider gate: {result:?}"),
+    }
+    release.send(()).unwrap();
     let mut committed = false;
     // Stop polling after the writer commits, leaving the actual completion
     // acknowledgement unread. Ordinary idle/reopen must recover this result.
@@ -2002,6 +2276,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     let _ = stub.finish().await;
     let snapshot = handle.project().await.unwrap();
     let after = SemanticCurrentView::from_snapshot(&snapshot).unwrap();
+    drop(snapshot);
     assert_eq!(after.proposals.len(), 1);
     let reviewed = after.proposals.get(&original.proposal_id).unwrap();
     assert_eq!(

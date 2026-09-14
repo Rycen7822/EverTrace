@@ -39,6 +39,20 @@ pub struct HumanSemanticDetail {
 const MAX_CONTENT_BYTES: usize = 32 * 1024;
 const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 
+fn source_context_fields(
+    receipt: &evertrace_domain::evidence::SourceReceipt,
+    directory: Option<String>,
+) -> HumanSourceContext {
+    HumanSourceContext {
+        directory: directory
+            .or_else(|| native_directory_hint(receipt))
+            .filter(|value| !value.is_empty() && value.len() <= 4096),
+        session: receipt.source_session_ref.clone(),
+        event_time_us: receipt.event_time_us,
+        recorded_at_us: receipt.recorded_at_us,
+    }
+}
+
 fn native_directory_hint(receipt: &evertrace_domain::evidence::SourceReceipt) -> Option<String> {
     use evertrace_domain::evidence::{EvidenceSourceKind, ProtectedPresentation};
     if receipt.source_kind != EvidenceSourceKind::CodexHook || receipt.validate().is_err() {
@@ -75,6 +89,159 @@ fn native_inline_directory_hint(text: &str, source_session_ref: &str) -> Option<
 }
 
 impl HumanGovernanceService {
+    pub(super) async fn capture_page(
+        &self,
+        context: evertrace_store::CaptureCurrentContext,
+        detail: bool,
+    ) -> Result<HumanPage, HumanGovernanceError> {
+        let deadline = std::time::Instant::now() + READ_DEADLINE;
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        let mut items = Vec::with_capacity(context.items.len());
+        for current in context.items {
+            let mut item = summary_fields(&current.selected, HumanSurface::Explorer);
+            if detail {
+                item.evidence_detail = source_evidence_detail_from_rows(&current.selected, |id| {
+                    current.source_rows.iter().find(|row| row.row_id == id)
+                })?;
+            }
+            let mut sources = BTreeMap::new();
+            let mut receipt = None;
+            let mut observation = None;
+            for row in &current.source_rows {
+                let payload: JournalPayload = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(HumanGovernanceError::Store)?,
+                )
+                .map_err(|_| HumanGovernanceError::Store)?;
+                match payload {
+                    JournalPayload::SourceReceiptRecorded(value) => {
+                        sources.insert(
+                            row.row_id.clone(),
+                            value.source_instance_id.as_str().to_owned(),
+                        );
+                        receipt = Some(value);
+                    }
+                    JournalPayload::SourceObservationRecorded(value) => {
+                        sources.insert(
+                            row.row_id.clone(),
+                            value.source_instance_id.as_str().to_owned(),
+                        );
+                        observation = Some(value);
+                    }
+                    JournalPayload::EvidenceSurfaceRecorded(_) => {}
+                    _ => return Err(HumanGovernanceError::Store),
+                }
+            }
+            if let Some(observation) = &observation {
+                for row in current
+                    .source_rows
+                    .iter()
+                    .filter(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+                {
+                    sources.insert(
+                        row.row_id.clone(),
+                        observation.source_instance_id.as_str().to_owned(),
+                    );
+                }
+            }
+            let blocked = crate::session_import::blocked_source_instances(
+                &self.writer,
+                report.as_ref(),
+                sources
+                    .get(&current.selected.row_id)
+                    .map(|source| (current.selected.row_id.clone(), source.clone()))
+                    .into_iter()
+                    .collect(),
+                self.effective_config_hash,
+                None,
+            )
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+            let rows = current.source_rows.iter().collect::<Vec<_>>();
+            let selected_rows = [&current.selected];
+            let selected_scopes = crate::repository::row_repository_contexts_from_scopes(
+                current.scope_rows.iter(),
+                &selected_rows,
+            )
+            .map_err(|_| HumanGovernanceError::Store)?;
+            let selected_repositories = crate::repository::blocked_repositories(
+                &self.writer,
+                selected_scopes.values().flatten().copied().collect(),
+                report.as_ref(),
+                self.effective_config_hash,
+            )
+            .await
+            .map_err(|_| HumanGovernanceError::Store)?;
+            if blocked.contains(&current.selected.row_id) || !selected_repositories.is_empty() {
+                item.evidence_detail = None;
+            }
+            let paired =
+                receipt
+                    .as_ref()
+                    .zip(observation.as_ref())
+                    .filter(|(receipt, observation)| {
+                        receipt.source_receipt_id == observation.source_receipt_ref
+                            && receipt.source_observation_id == observation.source_observation_id
+                    });
+            if let Some((receipt, _)) = paired
+                && export::source_metadata_budget(&rows, deadline).is_ok()
+            {
+                let report = match &self.session_report {
+                    Some(report) => report.read().await.clone(),
+                    None => None,
+                };
+                let blocked = crate::session_import::blocked_source_instances(
+                    &self.writer,
+                    report.as_ref(),
+                    sources,
+                    self.effective_config_hash,
+                    None,
+                )
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+                if !blocked.is_empty() {
+                    items.push(item);
+                    continue;
+                }
+                // Keep the direct-cohort gate separate from selected-row body
+                // access, including its per-cohort repository cardinality.
+                let scopes = crate::repository::row_repository_contexts_from_scopes(
+                    current.scope_rows.iter(),
+                    &rows,
+                )
+                .map_err(|_| HumanGovernanceError::Store)?;
+                let repositories = crate::repository::blocked_repositories(
+                    &self.writer,
+                    scopes.values().flatten().copied().collect(),
+                    report.as_ref(),
+                    self.effective_config_hash,
+                )
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+                if repositories.is_empty()
+                    && !current.suppressed
+                    && export::check_deadline(deadline).is_ok()
+                {
+                    item.source_context = Some(source_context_fields(receipt, current.directory));
+                }
+            }
+            items.push(item);
+        }
+        let (status, degraded_reasons) = failed_job_status(context.has_failed_job);
+        Ok(HumanPage {
+            diagnostics: None,
+            frontier: context.frontier,
+            status,
+            degraded_reasons,
+            items,
+            next_cursor: context.next_cursor,
+        })
+    }
+
     pub(super) async fn source_contexts(
         &self,
         snapshot: &ProjectionSnapshot,
@@ -110,17 +277,7 @@ impl HumanGovernanceService {
             let Some(row) = snapshot.row(&item.stable_key) else {
                 continue;
             };
-            match self
-                .readable_indexed_row(snapshot, row, &index, deadline)
-                .await
-            {
-                Ok(()) => {}
-                Err(export::Failure::Corrupt) => return Err(HumanGovernanceError::Store),
-                Err(_) => {
-                    item.source_context = None;
-                    continue;
-                }
-            }
+            item.source_context = None;
             let decode = |row: &ObjectRow| -> Result<JournalPayload, HumanGovernanceError> {
                 let value: JournalPayload = serde_json::from_str(
                     row.payload_json
@@ -135,58 +292,79 @@ impl HumanGovernanceService {
                 let rows = index.get(reference)?;
                 (rows.len() == 1).then(|| rows[0])
             };
-            let payload = match decode(row)? {
+            let (observation_id, selected_receipt_id) = match decode(row)? {
                 JournalPayload::HostOccurrenceNormalized(value)
                     if value.source_observation_refs.len() == 1 =>
                 {
-                    let Some(source) = exact(&value.source_observation_refs[0].to_string()) else {
-                        continue;
-                    };
-                    decode(source)?
+                    (value.source_observation_refs[0], None)
                 }
-                value => value,
-            };
-            let receipt = match payload {
-                JournalPayload::SourceReceiptRecorded(value) => value,
+                JournalPayload::SourceReceiptRecorded(value) => {
+                    (value.source_observation_id, Some(value.source_receipt_id))
+                }
                 JournalPayload::SourceObservationRecorded(value) => {
-                    let Some(source) = exact(&value.source_receipt_ref.to_string()) else {
-                        continue;
-                    };
-                    let JournalPayload::SourceReceiptRecorded(receipt) = decode(source)? else {
-                        continue;
-                    };
-                    if receipt.source_observation_id != value.source_observation_id {
-                        continue;
-                    }
-                    receipt
+                    (value.source_observation_id, None)
                 }
                 _ => continue,
             };
-            // Host occurrence permissions alone do not authorize its source body.
-            let Some(receipt_row) = exact(&receipt.source_receipt_id.to_string()) else {
+            // Use exact fact rows: a surface shares its observation's revision
+            // alias, but is a separate member of the direct permission cohort.
+            let Some(observation_row) = exact(&format!(
+                "object:evidence:source_observation:{observation_id}"
+            )) else {
                 continue;
             };
-            match self
-                .readable_indexed_row(snapshot, receipt_row, &index, deadline)
-                .await
+            let JournalPayload::SourceObservationRecorded(observation) = decode(observation_row)?
+            else {
+                continue;
+            };
+            let Some(receipt_row) = exact(&format!(
+                "object:evidence:source_receipt:{}",
+                observation.source_receipt_ref
+            )) else {
+                continue;
+            };
+            let JournalPayload::SourceReceiptRecorded(receipt) = decode(receipt_row)? else {
+                continue;
+            };
+            if observation.source_observation_id != observation_id
+                || receipt.source_observation_id != observation_id
+                || receipt.source_receipt_id != observation.source_receipt_ref
+                || selected_receipt_id.is_some_and(|id| id != receipt.source_receipt_id)
             {
+                continue;
+            }
+            let mut direct = vec![row, observation_row, receipt_row];
+            if let Some(surfaces) =
+                index.get(format!("projection:evidence_surface:{observation_id}").as_str())
+            {
+                if surfaces.len() != 1 {
+                    continue;
+                }
+                let surface_row = surfaces[0];
+                let JournalPayload::EvidenceSurfaceRecorded(surface) = decode(surface_row)? else {
+                    continue;
+                };
+                if surface.source_observation_revision_ref != observation_id {
+                    continue;
+                }
+                direct.push(surface_row);
+            }
+            direct.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+            direct.dedup_by(|left, right| left.row_id == right.row_id);
+            // Task and Worktree resolve these rows' actual scopes; their
+            // unrelated evidence links are not authority for source hints.
+            match self.readable_source_rows(snapshot, &direct, deadline).await {
                 Ok(()) => {}
                 Err(export::Failure::Corrupt) => return Err(HumanGovernanceError::Store),
                 Err(_) => continue,
-            }
+            };
             let directory = sources
                 .get(receipt.source_instance_id.as_str())
                 .filter(|matches| matches.len() == 1)
                 .map(|matches| matches[0])
                 .filter(|session| session.metadata.source_revision == receipt.source_revision)
-                .and_then(|session| session.metadata.workspace_hint.clone())
-                .or_else(|| native_directory_hint(&receipt));
-            item.source_context = Some(HumanSourceContext {
-                directory: directory.filter(|value| !value.is_empty() && value.len() <= 4096),
-                session: receipt.source_session_ref.clone(),
-                event_time_us: receipt.event_time_us,
-                recorded_at_us: receipt.recorded_at_us,
-            });
+                .and_then(|session| session.metadata.workspace_hint.clone());
+            item.source_context = Some(source_context_fields(&receipt, directory));
         }
         Ok(())
     }

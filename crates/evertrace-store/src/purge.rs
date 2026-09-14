@@ -855,11 +855,11 @@ impl ScopePurgeState {
     }
 }
 
-pub(crate) fn filter_product_rows(
+pub(crate) fn filter_product_rows<'a>(
     rows: Vec<ObjectRow>,
     deletions: &ObjectDeletionState,
     scope_purges: &ScopePurgeState,
-    repository_closures: &[crate::projections::RepositoryClosureKeys],
+    repository_closures: impl Iterator<Item = &'a crate::projections::RepositoryClosureKeys> + Clone,
 ) -> Result<Vec<ObjectRow>, StoreError> {
     let rows = filter_object_product_rows(rows, deletions)?;
     filter_repository_product_rows(rows, scope_purges, repository_closures)
@@ -965,10 +965,10 @@ fn filter_object_product_rows(
     Ok(retained)
 }
 
-fn filter_repository_product_rows(
+fn filter_repository_product_rows<'a>(
     rows: Vec<ObjectRow>,
     scope_purges: &ScopePurgeState,
-    repository_closures: &[crate::projections::RepositoryClosureKeys],
+    repository_closures: impl Iterator<Item = &'a crate::projections::RepositoryClosureKeys> + Clone,
 ) -> Result<Vec<ObjectRow>, StoreError> {
     let repository_ids = scope_purges
         .events()
@@ -994,11 +994,11 @@ fn filter_repository_product_rows(
         }
         let deleted = match journal_payload(&row)? {
             Some(payload) => repository_closures
-                .iter()
+                .clone()
                 .any(|closure| closure.references_payload(&payload)),
             None => {
                 let mut deleted = false;
-                for closure in repository_closures {
+                for closure in repository_closures.clone() {
                     if closure.references_non_journal_row(&row)? {
                         deleted = true;
                         break;

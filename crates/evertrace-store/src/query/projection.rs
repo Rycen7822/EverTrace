@@ -131,7 +131,27 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
+        Ok(self.catch_up_inner(objects, false, false).await?.0)
+    }
+
+    pub(crate) async fn catch_up_validated(
+        &self,
+        objects: &ProjectionSnapshot,
+    ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
         self.catch_up_inner(objects, false, false).await
+    }
+
+    async fn versions(&self) -> Result<[u64; 2], StoreError> {
+        Ok([
+            self.relations
+                .version()
+                .await
+                .map_err(|_| StoreError::LanceDb)?,
+            self.search
+                .version()
+                .await
+                .map_err(|_| StoreError::LanceDb)?,
+        ])
     }
 
     async fn catch_up_inner(
@@ -139,9 +159,21 @@ impl L0002ProjectionWorker {
         objects: &ProjectionSnapshot,
         fail_relation_commit: bool,
         fail_search_commit: bool,
-    ) -> Result<L0002ProjectionSnapshot, StoreError> {
+    ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
+        self.relations
+            .checkout_latest()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        self.search
+            .checkout_latest()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let current_versions = self.versions().await?;
         let relations = read_relation_rows(&self.relations).await?;
         let search = read_search_rows(&self.search).await?;
+        if self.versions().await? != current_versions {
+            return Err(StoreError::StoreCorrupt);
+        }
         let relation_frontier = checkpoint_relation(&relations)?;
         let search_frontier = checkpoint_search(&search)?;
         let journal_frontier = read_journal_frontier(&self.journal).await?;
@@ -156,11 +188,14 @@ impl L0002ProjectionWorker {
             validate_delta(checkpoint, journal_frontier, &delta)?;
         }
         if relation_frontier == journal_frontier && search_frontier == journal_frontier {
-            return Ok(L0002ProjectionSnapshot {
-                frontier: journal_frontier,
-                relations,
-                search,
-            });
+            return Ok((
+                L0002ProjectionSnapshot {
+                    frontier: journal_frontier,
+                    relations,
+                    search,
+                },
+                current_versions,
+            ));
         }
         let expected = derive_l0002_projections(objects)?;
         commit_relation_rows(
@@ -171,15 +206,16 @@ impl L0002ProjectionWorker {
         )
         .await?;
         commit_search_rows(&self.search, &search, &expected.search, fail_search_commit).await?;
+        let versions = self.versions().await?;
         let persisted = L0002ProjectionSnapshot {
             frontier: expected.frontier,
             relations: read_relation_rows(&self.relations).await?,
             search: read_search_rows(&self.search).await?,
         };
-        if persisted != expected {
+        if persisted != expected || self.versions().await? != versions {
             return Err(StoreError::Projection);
         }
-        Ok(persisted)
+        Ok((persisted, versions))
     }
 
     #[cfg(test)]
@@ -189,8 +225,10 @@ impl L0002ProjectionWorker {
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
-        self.catch_up_inner(objects, fail_relation_commit, fail_search_commit)
-            .await
+        Ok(self
+            .catch_up_inner(objects, fail_relation_commit, fail_search_commit)
+            .await?
+            .0)
     }
 
     pub async fn current(&self) -> Result<L0002ProjectionSnapshot, StoreError> {

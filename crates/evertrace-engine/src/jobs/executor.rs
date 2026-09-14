@@ -60,9 +60,18 @@ enum WriterRequest {
         expected_frontier: u64,
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
+    CaptureCurrent {
+        after: Option<String>,
+        exact: Option<String>,
+        limit: usize,
+        reply: oneshot::Sender<Result<evertrace_store::CaptureCurrentContext, WriterActorError>>,
+    },
     Project {
         indexes: bool,
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
+    },
+    SyncFrontier {
+        reply: oneshot::Sender<Result<u64, WriterActorError>>,
     },
     CommittedCommand {
         command_id: evertrace_domain::ids::CommandId,
@@ -378,6 +387,25 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)
     }
 
+    pub(crate) async fn capture_current_context(
+        &self,
+        after: Option<String>,
+        exact: Option<String>,
+        limit: usize,
+    ) -> Result<evertrace_store::CaptureCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::CaptureCurrent {
+                after,
+                exact,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub(crate) async fn project_objects(&self) -> Result<ProjectionSnapshot, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -397,6 +425,16 @@ impl WriterHandle {
                 indexes: true,
                 reply,
             })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    /// Complete the projection barrier without transferring a full snapshot.
+    pub async fn sync_frontier(&self) -> Result<u64, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SyncFrontier { reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -773,6 +811,27 @@ async fn run_writer(
                         let _ = reply.send(jobs);
                     }
                 }
+                WriterRequest::CaptureCurrent {
+                    after,
+                    exact,
+                    limit,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .capture_current_context(after.as_deref(), exact.as_deref(), limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
                 WriterRequest::Project { indexes, reply } => {
                     if reply.is_closed() {
                         continue;
@@ -784,6 +843,22 @@ async fn run_writer(
                         writer.project_objects().await
                     }
                     .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::SyncFrontier { reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .sync_frontier()
+                        .await
+                        .map_err(map_store_error);
                     let fatal = result.is_err();
                     let _ = reply.send(result);
                     if fatal {
@@ -1474,7 +1549,7 @@ async fn confirm_procedure_return(
             }) {
                 return Err(map_store_error(error));
             }
-            writer.project().await.map_err(map_store_error)?.frontier
+            writer.sync_frontier().await.map_err(map_store_error)?
         }
     };
     Ok(Some((command, frontier)))

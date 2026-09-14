@@ -1865,6 +1865,17 @@ pub(crate) async fn blocked_source_rows_before(
     {
         return Err(SessionImportServiceError::Corrupt);
     }
+    blocked.extend(blocked_source_instances(writer, report, sources, config_hash, deadline).await?);
+    Ok(blocked)
+}
+
+pub(crate) async fn blocked_source_instances(
+    writer: &WriterHandle,
+    report: Option<&HostProbeReport>,
+    sources: BTreeMap<String, String>,
+    config_hash: [u8; 32],
+    deadline: Option<Instant>,
+) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
     let mut contexts = BTreeMap::new();
     for source in sources
         .values()
@@ -1907,12 +1918,10 @@ pub(crate) async fn blocked_source_rows_before(
     crate::repository::record_trust_revocations(writer, revoked, config_hash)
         .await
         .map_err(map_writer)?;
-    blocked.extend(
-        sources
-            .into_iter()
-            .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row)),
-    );
-    Ok(blocked)
+    Ok(sources
+        .into_iter()
+        .filter_map(|(row, source)| (permissions.get(&source) == Some(&false)).then_some(row))
+        .collect())
 }
 
 fn resolve_workspace(

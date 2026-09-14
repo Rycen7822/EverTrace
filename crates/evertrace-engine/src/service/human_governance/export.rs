@@ -142,6 +142,27 @@ impl HumanGovernanceService {
         rows.extend(selection.dependencies.values().flatten());
         rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
         rows.dedup_by(|left, right| left.row_id == right.row_id);
+        self.resolved_rows_access(snapshot, &rows, deadline).await
+    }
+
+    /// Source presentation checks its exact source cohort, not the export graph.
+    /// Apply the same metadata budget and current permissions to those rows.
+    pub(super) async fn readable_source_rows(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        rows: &[&ObjectRow],
+        deadline: Instant,
+    ) -> ExportResult<()> {
+        source_metadata_budget(rows, deadline)?;
+        self.resolved_rows_access(snapshot, rows, deadline).await
+    }
+
+    async fn resolved_rows_access(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        rows: &[&ObjectRow],
+        deadline: Instant,
+    ) -> ExportResult<()> {
         let report = match &self.session_report {
             Some(report) => report.read().await.clone(),
             None => None,
@@ -162,7 +183,7 @@ impl HumanGovernanceService {
                 return Err(Failure::Denied);
             }
         }
-        let scopes = crate::repository::row_repository_contexts(snapshot, &rows)
+        let scopes = crate::repository::row_repository_contexts(snapshot, rows)
             .map_err(|_| Failure::Corrupt)?;
         if !crate::repository::blocked_repositories(
             &self.writer,
@@ -259,7 +280,7 @@ pub(super) fn presentation_index(
     Ok(index)
 }
 
-fn check_deadline(deadline: Instant) -> ExportResult<()> {
+pub(super) fn check_deadline(deadline: Instant) -> ExportResult<()> {
     if Instant::now() >= deadline {
         Err(Failure::Limit)
     } else {
@@ -471,6 +492,15 @@ fn collect_dependencies(
         dependencies.insert(reference, referenced.into_iter().cloned().collect());
     }
     Ok(dependencies)
+}
+
+pub(super) fn source_metadata_budget(rows: &[&ObjectRow], deadline: Instant) -> ExportResult<()> {
+    let mut charged = BTreeSet::new();
+    let mut remaining = MAX_METADATA_BYTES;
+    for row in rows {
+        charge_metadata(row, &mut charged, &mut remaining, deadline)?;
+    }
+    Ok(())
 }
 
 fn charge_metadata(

@@ -5,6 +5,7 @@ use std::{
     io,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
 
 use fs2::FileExt;
@@ -13,9 +14,9 @@ use lancedb::{Connection, Table};
 use crate::{
     command::{CommitOutcome, JournalCommand, JournalPayload, StoreError, prepare_command},
     journal::{
-        JOURNAL_TABLE, append_rows, read_all_journal_rows, read_command_rows, read_commands_rows,
-        read_journal_frontier, replay_outcome, rows_for_append, validate_complete_command,
-        validate_journal_table,
+        JOURNAL_TABLE, StartupJournal, append_rows, read_all_journal_rows, read_command_rows,
+        read_commands_rows, read_journal_frontier, replay_outcome, rows_for_append,
+        validate_complete_command,
     },
     migrations::{L0002, MigrationOutcome},
     objects::{OBJECTS_TABLE, read_object_checkpoint, read_object_rows, validate_objects_table},
@@ -221,6 +222,15 @@ pub struct ClosedJournalWriter {
     pub(crate) lock: SiblingWriterLock,
 }
 
+#[derive(Clone, Copy)]
+struct ProjectionValidation {
+    // These versions bind the checkpoint/generation and full rows validated by
+    // the existing workers; no rows or reducer state are retained here.
+    versions: [u64; 4],
+    frontier: u64,
+    has_failed_job: bool,
+}
+
 pub struct JournalWriter {
     _lock: SiblingWriterLock,
     connection: Connection,
@@ -234,6 +244,10 @@ pub struct JournalWriter {
     // A changed table version or uncertain append falls back to the journal.
     command_ids: Option<(u64, BTreeSet<evertrace_domain::ids::CommandId>)>,
     migration_outcome: MigrationOutcome,
+    // Keep directory inodes alive so replacement cannot reuse their identity.
+    projection_directories: Vec<(PathBuf, File)>,
+    // Objects and all mandatory projections have separate successful stamps.
+    projection_validation: Mutex<[Option<ProjectionValidation>; 2]>,
 }
 
 impl JournalWriter {
@@ -326,37 +340,69 @@ impl JournalWriter {
             .map_err(|_| StoreError::UpgradeRequired)?;
         crate::connection::prepare_native_root(&data_dir)?;
         let native = crate::connection::native_root(&data_dir);
-        if Self::existing_profile(&native).await? == Some("L0001") {
+        lock.validate_held()?;
+        let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
+            .session(crate::connection::native_session())
+            .execute()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let mut startup = Self::read_existing_journal(&connection, &native).await?;
+        if let Some(journal) = &mut startup
+            && Self::journal_profile(journal)? == Some("L0001")
+        {
             return Err(StoreError::UpgradeRequired);
         }
-        Self::open_at_with_lock(lock, &native).await
+        Self::open_on_connection(lock, &native, connection, startup).await
     }
 
     pub(crate) async fn existing_profile(
         data_dir: &Path,
     ) -> Result<Option<&'static str>, StoreError> {
-        let path = data_dir.join(format!("{JOURNAL_TABLE}.lance"));
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(StoreError::Io),
-            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
-                return Err(StoreError::StoreCorrupt);
-            }
-            Ok(_) => {}
+        if !Self::journal_exists(data_dir)? {
+            return Ok(None);
         }
         let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
             .session(crate::connection::native_session())
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
+        match Self::read_existing_journal(&connection, data_dir).await? {
+            Some(mut journal) => Self::journal_profile(&mut journal),
+            None => Ok(None),
+        }
+    }
+
+    async fn read_existing_journal(
+        connection: &Connection,
+        data_dir: &Path,
+    ) -> Result<Option<StartupJournal>, StoreError> {
+        if !Self::journal_exists(data_dir)? {
+            return Ok(None);
+        }
         let journal = connection
             .open_table(JOURNAL_TABLE)
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        validate_journal_table(&journal).await?;
-        let rows = read_all_journal_rows(&journal).await?;
-        JournalAdmissionState::from_journal_rows(&rows)?;
+        Ok(Some(StartupJournal::read(journal).await?))
+    }
+
+    fn journal_exists(data_dir: &Path) -> Result<bool, StoreError> {
+        let path = data_dir.join(format!("{JOURNAL_TABLE}.lance"));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(StoreError::Io),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                Err(StoreError::StoreCorrupt)
+            }
+            Ok(_) => Ok(true),
+        }
+    }
+
+    fn journal_profile(journal: &mut StartupJournal) -> Result<Option<&'static str>, StoreError> {
+        let rows = &journal.rows;
+        drop(JournalAdmissionState::from_journal_rows(rows)?);
+        journal.requires_admission_validation = true;
         let populated = !rows.is_empty();
         let mut profile = None;
         for row in rows {
@@ -384,12 +430,36 @@ impl JournalWriter {
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        let migration_outcome = L0002::apply(&connection).await?;
-        let journal = connection
-            .open_table(JOURNAL_TABLE)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
+        Self::open_on_connection(lock, native_dir, connection, None).await
+    }
+
+    async fn open_on_connection(
+        lock: SiblingWriterLock,
+        native_dir: &Path,
+        connection: Connection,
+        mut startup: Option<StartupJournal>,
+    ) -> Result<Self, StoreError> {
+        lock.validate_held()?;
+        let migration_outcome = L0002::apply_with_journal(&connection, &mut startup).await?;
+        let mut projection_directories = Vec::with_capacity(5);
+        for path in std::iter::once(native_dir.to_owned()).chain(
+            [JOURNAL_TABLE, OBJECTS_TABLE, RELATIONS_TABLE, SEARCH_TABLE]
+                .map(|table| native_dir.join(format!("{table}.lance"))),
+        ) {
+            let located = fs::symlink_metadata(&path).map_err(|_| StoreError::StoreCorrupt)?;
+            let file = File::open(&path).map_err(|_| StoreError::StoreCorrupt)?;
+            let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
+            if !located.is_dir()
+                || located.file_type().is_symlink()
+                || (located.dev(), located.ino()) != (held.dev(), held.ino())
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            projection_directories.push((path, file));
+        }
+        let mut startup = startup.ok_or(StoreError::StoreCorrupt)?;
+        startup.refresh().await?;
+        let journal = startup.table.clone();
         let objects = connection
             .open_table(OBJECTS_TABLE)
             .execute()
@@ -405,12 +475,11 @@ impl JournalWriter {
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        validate_journal_table(&journal).await?;
         validate_objects_table(&objects).await?;
-        let journal_rows = read_all_journal_rows(&journal).await?;
-        let admission_state = JournalAdmissionState::from_journal_rows(&journal_rows)?;
+        let admission_state = JournalAdmissionState::from_journal_rows(&startup.rows)?;
+        let journal_rows = &startup.rows;
         let command_ids = Some((
-            journal.version().await.map_err(|_| StoreError::LanceDb)?,
+            startup.version,
             journal_rows.iter().map(|row| row.command_id).collect(),
         ));
         let next_seq = journal_rows
@@ -420,7 +489,9 @@ impl JournalWriter {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(StoreError::StoreCorrupt)?;
-        Ok(Self {
+        let journal_version = startup.version;
+        drop(startup);
+        let writer = Self {
             _lock: lock,
             connection,
             journal,
@@ -431,7 +502,13 @@ impl JournalWriter {
             admission_state,
             command_ids,
             migration_outcome,
-        })
+            projection_directories,
+            projection_validation: Mutex::new([None, None]),
+        };
+        if writer.projection_versions(true).await?[0] != journal_version {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(writer)
     }
 
     pub async fn read_diagnostics(&self) -> NativeDiagnostics {
@@ -539,6 +616,8 @@ impl JournalWriter {
             admission_state,
             command_ids,
             migration_outcome,
+            projection_directories,
+            projection_validation,
         } = self;
         drop((
             connection,
@@ -550,6 +629,8 @@ impl JournalWriter {
             admission_state,
             command_ids,
             migration_outcome,
+            projection_directories,
+            projection_validation,
         ));
         ClosedJournalWriter { lock }
     }
@@ -571,6 +652,10 @@ impl JournalWriter {
     }
 
     pub(crate) async fn rebuild_restore_projections(&self) -> Result<(), StoreError> {
+        *self
+            .projection_validation
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
         self.validate_restore_lock()?;
         let objects = self.projection_worker().rebuild_for_restore().await?;
         crate::query::L0002ProjectionWorker::new(
@@ -589,6 +674,10 @@ impl JournalWriter {
         occurred_at_us: i64,
         config_hash: [u8; 32],
     ) -> Result<(), StoreError> {
+        *self
+            .projection_validation
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
         for command in current.commands(self, occurred_at_us, config_hash)? {
             let command = command?;
             let prepared = prepare_command(&command)?;
@@ -720,16 +809,19 @@ impl JournalWriter {
             .command_ids
             .take()
             .filter(|(known, _)| *known == version);
-        append_rows(&self.journal, &rows).await?;
+        // Only the append boundary can make a previously validated projection
+        // stale. Clear before awaiting it, including uncertain append failures.
+        *self
+            .projection_validation
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
+        let committed_version = append_rows(&self.journal, &rows).await?;
         self.admission_state = next_admission_state;
         if let Some((_, mut ids)) = known {
             ids.insert(prepared.command_id);
-            self.command_ids = self
-                .journal
-                .version()
-                .await
-                .ok()
-                .map(|version| (version, ids));
+            // The native append already reports its committed version. A
+            // second, fallible read must not discard this successful proof.
+            self.command_ids = Some((committed_version, ids));
         }
         Ok(CommitOutcome {
             command_id: prepared.command_id,
@@ -742,21 +834,202 @@ impl JournalWriter {
 
     /// Restore and validate current objects without driving unrelated indexes.
     pub async fn project_objects(&self) -> Result<ProjectionSnapshot, StoreError> {
-        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
-            .catch_up()
-            .await
+        self.project_validated(false, true)
+            .await?
+            .1
+            .ok_or(StoreError::StoreCorrupt)
+    }
+
+    /// Synchronize objects without returning their rows to the caller.
+    pub async fn sync_objects_frontier(&self) -> Result<u64, StoreError> {
+        Ok(self.project_validated(false, false).await?.0)
+    }
+
+    pub async fn capture_current_context(
+        &self,
+        after: Option<&str>,
+        exact: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::projections::CaptureCurrentContext, StoreError> {
+        self.project_validated(false, false).await?;
+        let result = async {
+            let stamp = self
+                .projection_validation
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?[0]
+                .ok_or(StoreError::StoreCorrupt)?;
+            if self.command_ids.as_ref().map(|(version, _)| *version) != Some(stamp.versions[0])
+                || self.admission_state.committed_frontier() != stamp.frontier
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let context = self.admission_state.capture_current_context(
+                after,
+                exact,
+                limit,
+                stamp.has_failed_job,
+            )?;
+            if self.projection_versions(false).await? != stamp.versions {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok(context)
+        }
+        .await;
+        if result.is_err() {
+            *self
+                .projection_validation
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
+        }
+        result
+    }
+
+    /// Synchronize all mandatory projections to the actual committed journal.
+    /// Reserved sequence numbers are not a committed frontier. All projection
+    /// validation and per-table commits must succeed before this returns.
+    pub async fn sync_frontier(&self) -> Result<u64, StoreError> {
+        Ok(self.project_validated(true, false).await?.0)
     }
 
     pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
-        let snapshot = self.project_objects().await?;
-        L0002ProjectionWorker::new(
-            self.journal.clone(),
-            self.relations.clone(),
-            self.search.clone(),
-        )
-        .catch_up(&snapshot)
-        .await?;
-        Ok(snapshot)
+        self.project_validated(true, true)
+            .await?
+            .1
+            .ok_or(StoreError::StoreCorrupt)
+    }
+
+    fn validate_projection_directories(&self, indexes: bool) -> Result<(), StoreError> {
+        self._lock.validate_held()?;
+        for (path, file) in self
+            .projection_directories
+            .iter()
+            .take(if indexes { 5 } else { 3 })
+        {
+            let located = fs::symlink_metadata(path).map_err(|_| StoreError::StoreCorrupt)?;
+            let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
+            if !located.is_dir()
+                || located.file_type().is_symlink()
+                || (located.dev(), located.ino()) != (held.dev(), held.ino())
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(())
+    }
+
+    async fn projection_versions(&self, indexes: bool) -> Result<[u64; 4], StoreError> {
+        self.validate_projection_directories(indexes)?;
+        let mut versions = [0; 4];
+        for (index, table) in [&self.journal, &self.objects, &self.relations, &self.search]
+            .into_iter()
+            .take(if indexes { 4 } else { 2 })
+            .enumerate()
+        {
+            table
+                .checkout_latest()
+                .await
+                .map_err(|_| StoreError::LanceDb)?;
+            versions[index] = table.version().await.map_err(|_| StoreError::LanceDb)?;
+        }
+        self.validate_projection_directories(indexes)?;
+        Ok(versions)
+    }
+
+    async fn project_validated(
+        &self,
+        indexes: bool,
+        return_rows: bool,
+    ) -> Result<(u64, Option<ProjectionSnapshot>), StoreError> {
+        let result = async {
+            let before = self.projection_versions(indexes).await?;
+            let stamps = *self
+                .projection_validation
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let objects = stamps[0].filter(|stamp| stamp.versions[..2] == before[..2]);
+            let all = indexes
+                .then_some(stamps[1])
+                .flatten()
+                .filter(|stamp| stamp.versions == before);
+            let hit = if indexes { all } else { objects };
+            let mut validated_versions = before;
+            let (frontier, snapshot, has_failed_job) = if let Some(stamp) = hit {
+                let snapshot = if return_rows {
+                    Some(ProjectionSnapshot {
+                        frontier: stamp.frontier,
+                        rows: read_object_rows(&self.objects).await?,
+                    })
+                } else {
+                    None
+                };
+                (stamp.frontier, snapshot, stamp.has_failed_job)
+            } else {
+                let snapshot = if let Some(stamp) = objects {
+                    ProjectionSnapshot {
+                        frontier: stamp.frontier,
+                        rows: read_object_rows(&self.objects).await?,
+                    }
+                } else {
+                    let (snapshot, version) = self.projection_worker().catch_up_validated().await?;
+                    validated_versions[1] = version;
+                    snapshot
+                };
+                if indexes {
+                    let (_, versions) = L0002ProjectionWorker::new(
+                        self.journal.clone(),
+                        self.relations.clone(),
+                        self.search.clone(),
+                    )
+                    .catch_up_validated(&snapshot)
+                    .await?;
+                    validated_versions[2..].copy_from_slice(&versions);
+                }
+                let has_failed_job =
+                    crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
+                        .jobs
+                        .iter()
+                        .any(|job| job.state == crate::JobStatus::Failed);
+                (
+                    snapshot.frontier,
+                    return_rows.then_some(snapshot),
+                    has_failed_job,
+                )
+            };
+            let after = self.projection_versions(indexes).await?;
+            if validated_versions != after {
+                return Err(StoreError::StoreCorrupt);
+            }
+            // Workers bind validated rows to a full readback version or an
+            // ordinary objects upsert's verified native commit version.
+            // The journal must remain at the version used on entry;
+            // latest versions and held directory identities are checked above.
+            {
+                let stamp = Some(ProjectionValidation {
+                    versions: validated_versions,
+                    frontier,
+                    has_failed_job,
+                });
+                let mut stamps = self
+                    .projection_validation
+                    .lock()
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                stamps[0] = stamp;
+                if indexes {
+                    stamps[1] = stamp;
+                } else if stamps[1].is_some_and(|stamp| stamp.versions[..2] != after[..2]) {
+                    stamps[1] = None;
+                }
+            }
+            Ok((frontier, snapshot))
+        }
+        .await;
+        if result.is_err() {
+            *self
+                .projection_validation
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
+        }
+        result
     }
 
     pub async fn reconciliation_frontier(
@@ -1221,6 +1494,85 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn startup_admission_failure_precedes_missing_objects_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let writer = JournalWriter::open(&root).await.unwrap();
+        let mut startup = StartupJournal::read(writer.journal.clone()).await.unwrap();
+        assert_eq!(
+            JournalWriter::journal_profile(&mut startup),
+            Ok(Some("L0002"))
+        );
+        let (lane, _) = capture_pair(
+            ExecutionLaneId::new_v7(),
+            CaptureReceiptId::new_v7(),
+            1,
+            None,
+        );
+        let command = capture_command("01890f47-6a4a-7cc1-98b9-01890f476a82", lane, None);
+        let rows =
+            rows_for_append(&prepare_command(&command).unwrap(), writer.next_seq, 0).unwrap();
+        // This command is structurally complete, but its required receipt is
+        // missing. Only admission replay detects the corruption.
+        crate::journal::validate_journal_rows(&rows).unwrap();
+        append_rows(&writer.journal, &rows).await.unwrap();
+        // Revalidation must still reject semantic corruption after the
+        // precheck's temporary admission state has been released.
+        assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
+        drop(startup);
+        drop(writer);
+        let objects = crate::connection::native_root(&root).join(format!("{OBJECTS_TABLE}.lance"));
+        fs::rename(&objects, temp.path().join("saved-objects")).unwrap();
+        assert!(matches!(
+            JournalWriter::open(&root).await,
+            Err(StoreError::StoreCorrupt)
+        ));
+        assert!(
+            !objects.exists(),
+            "admission must fail before migration writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_stamp_rejects_replaced_native_directory_with_same_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let writer = JournalWriter::open(&root).await.unwrap();
+        let mut startup = StartupJournal::read(writer.journal.clone()).await.unwrap();
+        writer.sync_frontier().await.unwrap();
+        assert!(writer.projection_validation.lock().unwrap()[1].is_some());
+        let versions = writer.projection_versions(true).await.unwrap();
+        let native = crate::connection::native_root(&root);
+        let moved = root.join("previous-store");
+        fs::rename(&native, &moved).unwrap();
+        DirBuilder::new().mode(0o700).create(&native).unwrap();
+        // Reuse the very same table directories/versions under a new native root.
+        for table in [JOURNAL_TABLE, OBJECTS_TABLE, RELATIONS_TABLE, SEARCH_TABLE] {
+            let name = format!("{table}.lance");
+            fs::rename(moved.join(&name), native.join(name)).unwrap();
+        }
+        assert_eq!(writer.objects.version().await.unwrap(), versions[1]);
+        assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
+        assert_eq!(writer.sync_frontier().await, Err(StoreError::StoreCorrupt));
+        assert!(matches!(
+            writer.capture_current_context(None, None, 8).await,
+            Err(StoreError::StoreCorrupt)
+        ));
+        assert!(
+            writer
+                .projection_validation
+                .lock()
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(
+            writer.project_objects().await,
+            Err(StoreError::StoreCorrupt)
+        );
+    }
+
+    #[tokio::test]
     async fn diagnostics_read_existing_tables_without_repair() {
         let temp = tempfile::tempdir().unwrap();
         let writer = JournalWriter::open(&temp.path().join("data"))
@@ -1236,6 +1588,8 @@ mod tests {
         assert_eq!(read.fts_index_present, Some(true));
         assert!(read.objects.is_some());
         assert_eq!(writer.backup_table_states().await.unwrap(), before);
+        writer.sync_frontier().await.unwrap();
+        assert!(writer.projection_validation.lock().unwrap()[1].is_some());
         let index = writer.search.list_indices().await.unwrap().remove(0);
         writer.search.drop_index(&index.name).await.unwrap();
         assert_eq!(
@@ -1244,6 +1598,15 @@ mod tests {
         );
         // Corrupt only this disposable derived checkpoint; diagnostics must not rebuild it.
         writer.search.delete("true").await.unwrap();
+        assert!(writer.sync_frontier().await.is_err());
+        assert!(
+            writer
+                .projection_validation
+                .lock()
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
         let version = writer.search.version().await.unwrap();
         let read = writer.read_diagnostics().await;
         assert_eq!(read.tables[3].checkpoint, None);
@@ -1411,10 +1774,52 @@ mod tests {
                 .is_none()
         );
         let abandoned = reserve_range(&mut writer.next_seq, prepared.event_count).unwrap();
+        let committed_frontier = read_journal_frontier(&writer.journal).await.unwrap();
+        assert!(writer.frontier() > committed_frontier);
+        assert_eq!(
+            writer.sync_objects_frontier().await.unwrap(),
+            committed_frontier
+        );
+        assert_eq!(writer.sync_frontier().await.unwrap(), committed_frontier);
         let first_seq = reserve_range(&mut writer.next_seq, prepared.event_count).unwrap();
         assert_eq!(first_seq, abandoned + u64::from(prepared.event_count));
         let rows = rows_for_append(&prepared, first_seq, 2).unwrap();
         append_rows(&writer.journal, &rows).await.unwrap();
+        assert_eq!(writer.sync_objects_frontier().await.unwrap(), first_seq);
+        // The first catch-up validates its own committed version immediately.
+        assert_eq!(
+            writer.projection_validation.lock().unwrap()[0]
+                .unwrap()
+                .frontier,
+            first_seq
+        );
+        assert!(writer.projection_validation.lock().unwrap()[1].is_none());
+        assert_eq!(writer.sync_objects_frontier().await.unwrap(), first_seq);
+        assert!(writer.projection_validation.lock().unwrap()[0].is_some());
+        assert!(writer.projection_validation.lock().unwrap()[1].is_none());
+        let stale_indexes = L0002ProjectionWorker::new(
+            writer.journal.clone(),
+            writer.relations.clone(),
+            writer.search.clone(),
+        )
+        .current()
+        .await
+        .unwrap();
+        assert!(stale_indexes.frontier < first_seq);
+        assert_eq!(writer.sync_frontier().await.unwrap(), first_seq);
+        let indexes = L0002ProjectionWorker::new(
+            writer.journal.clone(),
+            writer.relations.clone(),
+            writer.search.clone(),
+        )
+        .current()
+        .await
+        .unwrap();
+        assert_eq!(indexes.frontier, first_seq);
+        assert_eq!(
+            writer.project_objects().await.unwrap(),
+            writer.full_projection().await.unwrap()
+        );
         // The command was absent from the startup set. A changed journal
         // version must bypass that negative hint and read the actual commit.
         assert!(
@@ -1506,6 +1911,34 @@ mod tests {
             .await
             .unwrap();
         assert!(!committed.replayed);
+        let (version, ids) = writer.command_ids.as_ref().unwrap();
+        assert_eq!(*version, writer.journal.version().await.unwrap());
+        assert!(ids.contains(&first.command_id()));
+        assert!(
+            writer
+                .projection_validation
+                .lock()
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(writer.sync_frontier().await.unwrap(), committed.last_seq);
+        let validated = writer.projection_validation.lock().unwrap()[1].unwrap();
+        assert_eq!(
+            validated.versions,
+            writer.projection_versions(true).await.unwrap()
+        );
+        assert_eq!(validated.frontier, committed.last_seq);
+        assert_eq!(
+            writer.commit(&second, -1).await,
+            Err(StoreError::InvalidInput)
+        );
+        assert_eq!(
+            writer.projection_validation.lock().unwrap()[1]
+                .unwrap()
+                .versions,
+            validated.versions
+        );
         let replayed = writer
             .commit_if_frontier(&first, 2, initial_frontier)
             .await
@@ -1513,12 +1946,50 @@ mod tests {
         assert!(replayed.replayed);
         assert_eq!(replayed.first_seq, committed.first_seq);
         assert_eq!(
+            writer.projection_validation.lock().unwrap()[1]
+                .unwrap()
+                .versions,
+            validated.versions
+        );
+        assert_eq!(
             writer
                 .commit_if_frontier(&second, 2, initial_frontier)
                 .await,
             Err(StoreError::StaleFrontier)
         );
+        assert_eq!(
+            writer.projection_validation.lock().unwrap()[1]
+                .unwrap()
+                .versions,
+            validated.versions
+        );
+        assert_eq!(writer.sync_frontier().await.unwrap(), committed.last_seq);
+        assert_eq!(
+            writer.projection_versions(true).await.unwrap(),
+            validated.versions
+        );
         assert_eq!(writer.journal_rows().await.unwrap().len(), 3);
+        reserve_range(&mut writer.next_seq, 2).unwrap();
+        assert!(writer.frontier() > committed.last_seq);
+        let capture = writer.capture_current_context(None, None, 8).await.unwrap();
+        assert_eq!(capture.frontier, committed.last_seq);
+        assert!(capture.items.is_empty());
+        assert_eq!(
+            writer.projection_versions(true).await.unwrap(),
+            validated.versions
+        );
+        let proof = writer.command_ids.take();
+        assert!(matches!(
+            writer.capture_current_context(None, None, 8).await,
+            Err(StoreError::StoreCorrupt)
+        ));
+        writer.command_ids = proof;
+        assert!(writer.capture_current_context(None, None, 8).await.is_ok());
+        writer.command_ids.as_mut().unwrap().0 += 1;
+        assert!(matches!(
+            writer.capture_current_context(None, None, 8).await,
+            Err(StoreError::StoreCorrupt)
+        ));
     }
 
     #[tokio::test]

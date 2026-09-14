@@ -69,12 +69,42 @@ async fn imported_method_terminal_status_excludes_stale_references() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_method_inflight_source_revocation_discards_result() {
-    Box::pin(imported_messages_scenario(true, false, Some(false), false)).await;
+    Box::pin(imported_messages_scenario(
+        true,
+        false,
+        Some(InflightInterruption::Revoke),
+        false,
+    ))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_method_inflight_repository_purge_discards_result() {
-    Box::pin(imported_messages_scenario(true, false, Some(true), false)).await;
+    Box::pin(imported_messages_scenario(
+        true,
+        false,
+        Some(InflightInterruption::Purge),
+        false,
+    ))
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_method_inflight_shutdown_drains_without_success() {
+    Box::pin(imported_messages_scenario(
+        true,
+        false,
+        Some(InflightInterruption::Shutdown),
+        false,
+    ))
+    .await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InflightInterruption {
+    Revoke,
+    Purge,
+    Shutdown,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -85,7 +115,7 @@ async fn imported_method_independent_append_remains_live_after_first_proposal() 
 async fn imported_messages_scenario(
     method: bool,
     terminal: bool,
-    interruption: Option<bool>,
+    interruption: Option<InflightInterruption>,
     independent: bool,
 ) {
     async fn read(
@@ -398,6 +428,7 @@ async fn imported_messages_scenario(
         })
         .next()
         .unwrap();
+    drop(snapshot);
     if method {
         Box::pin(async move {
         let content = serde_json::json!({"title":"Marigold journal acknowledgement recovery","summary":"A reusable hypothesis for recovering ambiguous journal acknowledgements; effectiveness remains unverified.","procedure_kind":"diagnostic",
@@ -419,12 +450,34 @@ async fn imported_messages_scenario(
             runtime(temp.path()), SynthesisPlanner::new(llm.clone()), dreaming.clone());
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Some(release) = release {
+            if interruption == Some(InflightInterruption::Shutdown) {
+                // Shutdown drives scheduler.run, a separate lifecycle from run_once.
+                Box::pin(async move {
+                let (_wake, wake) = tokio::sync::watch::channel(0);
+                let (stop, stopping) = tokio::sync::watch::channel(false);
+                let running = tokio::spawn(scheduler.clone().run(wake, stopping));
+                tokio::time::timeout(Duration::from_secs(10), stub.wait_received()).await.unwrap();
+                stop.send(true).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), running).await.unwrap().unwrap().unwrap();
+                release.send(()).unwrap();
+                stub.finish().await;
+                let current = writer.project().await.unwrap();
+                assert!(SemanticCurrentView::from_snapshot(&current).unwrap().proposals.is_empty());
+                assert!(evertrace_store::RuntimeSchedulerView::from_snapshot(&current).unwrap().jobs.iter()
+                    .any(|job| job.kind == "procedure_review_v1" && job.state == JobStatus::Leased && job.terminal.is_none()));
+                drop(current);
+                drop(scheduler); drop(worker); drop(admin); drop(catalog);
+                writer.shutdown().await.unwrap();
+                task.await.unwrap().unwrap();
+                }).await;
+                return;
+            }
             let mut running = Box::pin(scheduler.run_once());
             tokio::select! {
                 _ = stub.wait_received() => {},
                 result = &mut running => panic!("producer finished before provider gate: {result:?}"),
             }
-            if interruption == Some(true) {
+            if interruption == Some(InflightInterruption::Purge) {
                 let claimed = writer.project().await.unwrap();
                 let current = evertrace_store::repository::RepositoryCurrentView::from_snapshot(&claimed).unwrap();
                 let preview = evertrace_store::projections::repository_scope_purge_preview(&claimed, repository, current.repositories[&repository].repository_revision).unwrap();
@@ -700,6 +753,7 @@ async fn imported_messages_scenario(
             .data_rows()
             .any(|row| row.object_kind.as_deref() == Some("semantic_digest"))
     );
+    drop(failed_snapshot);
     Box::pin(scheduler.run_once()).await.unwrap();
     assert_eq!(
         evertrace_store::RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
@@ -765,6 +819,7 @@ async fn imported_messages_scenario(
             "task" | "work_episode" | "execution_lane" | "binding_resolution" | "revision_proposal"
         )
     )));
+    drop(snapshot);
     let mut requests = stub.finish_all().await;
     assert!(requests.iter().any(|request| {
         String::from_utf8_lossy(request).contains("Extract at most one nontrivial reusable method")
@@ -883,6 +938,7 @@ async fn imported_messages_scenario(
         1
     );
     let old_id = digest.semantic_digest_id.to_string();
+    drop(final_snapshot);
     // Normal append keeps the logical revision and advances only the new
     // imported message interval. Disabling the LLM does not hide old memory.
     let body = fs::read_to_string(&transcript).unwrap();
@@ -926,6 +982,7 @@ async fn imported_messages_scenario(
         .next()
         .unwrap();
     assert_eq!(second.source_revision, receipt.source_revision);
+    drop(appended);
     let disabled = BackgroundScheduler::new(
         writer.clone(),
         catalog.clone(),
@@ -989,9 +1046,10 @@ async fn imported_messages_scenario(
     tokio::time::timeout(Duration::from_secs(5), second_stub.wait_received())
         .await
         .unwrap();
-    // Append while the provider owns a frozen interval; this non-message is
-    // not another LLM trigger and does not invalidate archived input.
+    // A real new message during the provider wait must neither enter the
+    // already-sent interval nor invalidate it; its later delta stays live.
     let body = fs::read_to_string(&transcript).unwrap();
+    let new_message = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"marigold next independent message"}});
     let non_messages = [
         serde_json::json!({"type":"response_item","metadata":null,"payload":{"type":"function_call","name":"example","arguments":"{}","call_id":"call-1"}}),
         serde_json::json!({"type":"response_item","metadata":{"client_authored":false},"payload":{"type":"function_call_output","call_id":"call-1","output":"archived tool output"}}),
@@ -1004,7 +1062,7 @@ async fn imported_messages_scenario(
     fs::write(
         &transcript,
         format!(
-            "{body}{}\n",
+            "{body}{new_message}\n{}\n",
             non_messages
                 .iter()
                 .map(ToString::to_string)
@@ -1070,6 +1128,7 @@ async fn imported_messages_scenario(
         second_input["source_refs"],
         serde_json::json!([second.source_observation_id.to_string()])
     );
+    assert_eq!(second_input["to_watermark"], second.source_sequence);
     assert_eq!(
         writer
             .project()
@@ -1080,6 +1139,35 @@ async fn imported_messages_scenario(
             .count(),
         2
     );
+    // Keep this added lifecycle phase off the shared scenario's debug poll stack.
+    Box::pin(async {
+    let third = writer.project().await.unwrap().data_rows().filter_map(|row| {
+        match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+            JournalPayload::SourceReceiptRecorded(value) if value.observation_role == ObservationRole::Message
+                && value.source_sequence > second.source_sequence => Some(value),
+            _ => None,
+        }
+    }).next().unwrap();
+    let mut third_application = application.clone();
+    third_application.progress_delta[0].direct_refs = vec![third.source_observation_id.to_string()];
+    third_application.progress_delta[0].value = "marigold next independent message".into();
+    let third_stub = ProviderStub::once(200, serde_json::to_vec(&serde_json::json!({"choices":[{"message":{"content":serde_json::to_string(&third_application).unwrap()}}],"usage":{"prompt_tokens":17,"completion_tokens":5}})).unwrap()).await;
+    let third_scheduler = BackgroundScheduler::new(writer.clone(), catalog.clone(), worker.clone(), Arc::clone(&report), runtime(temp.path()),
+        SynthesisPlanner::new(LlmConfig { base_url: ValidatedBaseUrl::parse(&third_stub.base_url).unwrap(), ..llm.clone() }), dreaming.clone());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Box::pin(third_scheduler.run_once()).await.unwrap();
+    third_stub.finish().await;
+    let successful = writer.project().await.unwrap().data_rows().filter_map(|row| {
+        match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+            JournalPayload::SemanticDigestRecorded(value) => Some(value),
+            _ => None,
+        }
+    }).collect::<Vec<_>>();
+    assert_eq!(successful.len(), 3);
+    assert_eq!(successful.iter().filter(|value| value.to_watermark == second.source_sequence).count(), 1);
+    assert!(successful.iter().any(|value| value.selected_direct_refs == vec![third.source_observation_id.to_string()]));
+    drop(third_scheduler);
+    }).await;
     drop((disabled, second_scheduler, catalog, worker));
     drop((scheduler, mcp));
     writer.shutdown().await.unwrap();
@@ -1143,7 +1231,7 @@ async fn imported_messages_scenario(
             .data_rows()
             .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
             .count(),
-        2
+        3
     );
     // Keep the lifecycle's independent negative phase off the positive
     // phase's debug-build poll stack; do not enlarge thread/resource limits.
@@ -1300,7 +1388,7 @@ async fn imported_messages_scenario(
             .data_rows()
             .filter(|row| row.object_kind.as_deref() == Some("semantic_digest"))
             .count(),
-        2
+        3
     );
     for (action, input) in [
         (evertrace_engine::McpServiceAction::Get, old_id.clone()),

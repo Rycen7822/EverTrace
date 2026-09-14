@@ -3176,6 +3176,7 @@ mod controlled_projection_proof {
      {
         use evertrace_domain::work::AttemptAdoptionStatus;
         use evertrace_engine::work::attempt::{AttemptResolution, revise_adoption};
+        // Poll setup independently of this test's large synchronous poll frame.
         let ControlledSetup {
             temp,
             runtime,
@@ -3188,7 +3189,7 @@ mod controlled_projection_proof {
             snapshot_id,
             initial_usage,
             ..
-        } = Box::pin(controlled_setup(true)).await;
+        } = tokio::spawn(controlled_setup(true)).await.unwrap();
         let report = consumer_report(temp.path());
         let first = consumer_round(&runtime, &store_root, &report).await;
         assert_eq!(

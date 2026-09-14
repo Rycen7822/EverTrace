@@ -330,7 +330,13 @@ async fn dirty_outbox_projection_is_incremental_and_full_rebuild_is_identical() 
             .len(),
         1
     );
-    assert_eq!(incremental, writer.full_projection().await.unwrap());
+    let persisted = evertrace_store::objects::read_object_rows(&objects)
+        .await
+        .unwrap();
+    let full = writer.full_projection().await.unwrap();
+    assert_eq!(persisted, incremental.rows);
+    assert_eq!(persisted, full.rows);
+    assert_eq!(incremental, full);
     drop(writer);
 
     fs::remove_dir_all(
@@ -479,6 +485,9 @@ async fn daemon_writer_assembly_holds_lock_commits_drains_and_releases() {
         .await
         .unwrap();
     assert!(!outcome.replayed);
+    let frontier = handle.sync_frontier().await.unwrap();
+    assert!(frontier >= outcome.last_seq);
+    assert_eq!(handle.sync_frontier().await.unwrap(), frontier);
     assert!(handle.project().await.unwrap().frontier >= outcome.last_seq);
     handle.shutdown().await.unwrap();
     assert_eq!(task.await.unwrap(), Ok(()));

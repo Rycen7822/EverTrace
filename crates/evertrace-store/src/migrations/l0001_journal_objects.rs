@@ -8,10 +8,7 @@ use crate::{
         JournalCommand, JournalEventDraft, JournalPayload, MigrationApplied, StoreError,
         prepare_command,
     },
-    journal::{
-        JOURNAL_TABLE, append_rows, journal_schema, read_all_journal_rows, rows_for_append,
-        validate_journal_table,
-    },
+    journal::{JOURNAL_TABLE, StartupJournal, append_rows, journal_schema, rows_for_append},
     objects::{OBJECTS_TABLE, ObjectRow, objects_batch, objects_schema, validate_objects_table},
     projections::ProjectionWorker,
 };
@@ -32,18 +29,13 @@ pub struct L0001;
 
 impl L0001 {
     pub async fn apply(connection: &Connection) -> Result<MigrationOutcome, StoreError> {
-        Self::apply_inner(connection, false).await
+        Self::apply_inner(connection, false, &mut None).await
     }
 
-    pub(crate) async fn reconcile_for_l0002(
-        connection: &Connection,
-    ) -> Result<MigrationOutcome, StoreError> {
-        Self::apply_inner(connection, true).await
-    }
-
-    async fn apply_inner(
+    pub(crate) async fn apply_inner(
         connection: &Connection,
         l0002_tables_present: bool,
+        startup: &mut Option<StartupJournal>,
     ) -> Result<MigrationOutcome, StoreError> {
         let names = connection
             .table_names()
@@ -79,25 +71,31 @@ impl L0001 {
             validate_empty_objects_schema(&objects).await?;
         }
 
-        let journal = if journal_exists {
-            let table = connection
-                .open_table(JOURNAL_TABLE)
-                .execute()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            validate_journal_table(&table).await?;
-            table
-        } else {
-            connection
-                .create_empty_table(JOURNAL_TABLE, journal_schema())
-                .execute()
-                .await
-                .map_err(|_| StoreError::Migration)?
-        };
+        if startup.is_some() && !journal_exists {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if startup.is_none() {
+            let table = if journal_exists {
+                connection
+                    .open_table(JOURNAL_TABLE)
+                    .execute()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?
+            } else {
+                connection
+                    .create_empty_table(JOURNAL_TABLE, journal_schema())
+                    .execute()
+                    .await
+                    .map_err(|_| StoreError::Migration)?
+            };
+            *startup = Some(StartupJournal::read(table).await?);
+        }
+        let startup = startup.as_mut().ok_or(StoreError::StoreCorrupt)?;
+        startup.refresh().await?;
+        let journal = startup.table.clone();
 
         if l0002_tables_present {
-            let rows = read_all_journal_rows(&journal).await?;
-            validate_migration_marker(&rows, true)?;
+            validate_migration_marker(&startup.rows, true)?;
         }
 
         let mut rebuilt_objects = false;
@@ -130,12 +128,11 @@ impl L0001 {
             table
         };
 
-        validate_journal_table(&journal).await?;
+        startup.refresh().await?;
         validate_objects_table(&objects).await?;
-        let before_rows = read_all_journal_rows(&journal).await?;
-        let appended_event = !validate_migration_marker(&before_rows, l0002_tables_present)?;
+        let appended_event = !validate_migration_marker(&startup.rows, l0002_tables_present)?;
         if appended_event {
-            append_migration_event(&journal, &before_rows).await?;
+            append_migration_event(&journal, &startup.rows).await?;
         }
 
         let projection = ProjectionWorker::new(journal.clone(), objects);
@@ -152,6 +149,9 @@ impl L0001 {
         })
     }
 }
+
+#[cfg(test)]
+use crate::journal::read_all_journal_rows;
 
 fn validate_migration_marker(
     rows: &[crate::journal::JournalRow],
@@ -216,7 +216,9 @@ async fn append_migration_event(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(StoreError::Migration)?;
-    append_rows(journal, &rows_for_append(&prepared, first_seq, 0)?).await
+    append_rows(journal, &rows_for_append(&prepared, first_seq, 0)?)
+        .await
+        .map(|_| ())
 }
 
 fn migration_command() -> Result<JournalCommand, StoreError> {

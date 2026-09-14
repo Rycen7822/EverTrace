@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{future::poll_fn, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lancedb::{Table, query::QueryBase};
+use lancedb::{
+    Table,
+    query::{ExecutableQuery, QueryBase},
+};
 
 use crate::{
     collect_batches,
@@ -214,12 +217,14 @@ pub async fn read_object_rows(table: &Table) -> Result<Vec<ObjectRow>, StoreErro
         .checkout_latest()
         .await
         .map_err(|_| StoreError::LanceDb)?;
-    let batches = collect_batches(&table.query())
+    let mut stream = table
+        .query()
+        .execute()
         .await
         .map_err(|_| StoreError::LanceDb)?;
     let mut rows = Vec::new();
-    for batch in &batches {
-        rows.extend(rows_from_batch(batch)?);
+    while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context)).await {
+        rows.extend(rows_from_batch(&batch.map_err(|_| StoreError::LanceDb)?)?);
     }
     rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
     Ok(rows)

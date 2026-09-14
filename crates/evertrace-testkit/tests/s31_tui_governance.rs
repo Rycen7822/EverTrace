@@ -1248,6 +1248,20 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
         vec![evertrace_engine::HumanDegradedReason::CurrentJobFailed]
     );
     assert_eq!(first.items.len(), usize::from(HUMAN_PAGE_LIMIT));
+    let empty_capture = service
+        .list_selected(
+            HumanSurface::Explorer,
+            Some(first.frontier),
+            None,
+            64,
+            Some(evertrace_engine::HumanExplorerListSelection::Capture),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(empty_capture.items.is_empty());
+    assert_eq!(empty_capture.status, first.status);
+    assert_eq!(empty_capture.degraded_reasons, first.degraded_reasons);
     let cursor = first.next_cursor.clone().unwrap();
     assert!(first.items.iter().all(|item| item.category
         == evertrace_engine::HumanItemCategory::Runtime
@@ -5200,6 +5214,78 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         global_read.items[0].semantic_detail.as_ref().unwrap().state,
         evertrace_engine::HumanContentState::Ready
     );
+    // This source's only repository scope is on its EvidenceSurface.
+    let (mut surface_receipt, surface_observation) =
+        self::source("surface-context-scope", task_id, repository_id);
+    surface_receipt.task_id = None;
+    surface_receipt.repository_instance_id = None;
+    let surface_ref = surface_observation.source_observation_id.to_string();
+    let surface_fact = evertrace_domain::evidence::EvidenceSurface {
+        source_observation_revision_ref: surface_observation.source_observation_id,
+        source_role: surface_observation.source_role,
+        content_trust: surface_observation.content_trust,
+        instruction_authority: evertrace_domain::evidence::InstructionAuthority::None,
+        task_id: None,
+        repository_instance_id: Some(repository_id),
+        worktree_instance_id: None,
+        event_time_us: 1,
+        recorded_at_us: 1,
+        source_sequence: 1,
+        capture_completeness: surface_observation.capture_completeness,
+        canonicalization_version: 1,
+        span_hash: evertrace_domain::evidence::hex(
+            &evertrace_domain::evidence::evidence_span_hash(
+                surface_observation.source_observation_id,
+                1,
+                "reviewed evidence",
+            )
+            .unwrap(),
+        ),
+        projection_generation: 1,
+        protected_text: "reviewed evidence".into(),
+    };
+    reopened_handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![
+                    JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                        source_instance_id: surface_receipt.source_instance_id.clone(),
+                        source_revision: surface_receipt.source_revision.clone(),
+                        source_sequence: 1,
+                        confirmed_prefix_digest: None,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::EvidenceSurface,
+                        target_id: surface_ref.clone(),
+                        algorithm_revision: "s31-test-v1".into(),
+                        source_watermark: 1,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::PhysicalNormalization,
+                        target_id: surface_ref.clone(),
+                        algorithm_revision: "s31-test-v1".into(),
+                        source_watermark: 1,
+                    }),
+                    JournalPayload::SourceReceiptRecorded(Box::new(surface_receipt)),
+                    JournalPayload::SourceObservationRecorded(Box::new(surface_observation)),
+                    JournalPayload::EvidenceSurfaceRecorded(Box::new(surface_fact)),
+                ]
+                .into_iter()
+                .map(|payload| JournalEventDraft::runtime(1, CONFIG, "s31-test-v1", payload))
+                .collect(),
+            )
+            .unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    let surface_allowed = reopened_service
+        .detail(HumanSurface::Explorer, &surface_ref, 0, Some(&surface_ref))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(surface_allowed.items[0].source_context.is_some());
     // Trust revocation is durable; exercise it after the acceptance scenario.
     std::fs::write(
         adapter.join("config.toml"),
@@ -5243,6 +5329,17 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             .state,
         evertrace_engine::HumanContentState::AccessDenied
     );
+    for reference in [&observation_ref, &surface_ref] {
+        let source_denied = reopened_service
+            .detail(HumanSurface::Explorer, reference, 0, Some(reference))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            source_denied.items[0].source_context.is_none(),
+            "direct receipt or surface scope must remain enforced"
+        );
+    }
     let snapshot = reopened_handle.project().await.unwrap();
     let target = evertrace_domain::purge::ObjectDeletionTarget::Procedure { procedure_id };
     let preview = evertrace_store::object_deletion_preview(&snapshot, target).unwrap();
@@ -5274,6 +5371,31 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         "{forgotten:?}"
     );
     assert!(forgotten.path.is_none());
+    let source_start = "object:evidence:source_observation:";
+    let full_after_forget =
+        Box::pin(reopened_service.list(HumanSurface::Explorer, None, Some(source_start), 64))
+            .await
+            .unwrap()
+            .unwrap();
+    let finite_after_forget = Box::pin(reopened_service.list_selected(
+        HumanSurface::Explorer,
+        Some(full_after_forget.frontier),
+        Some(source_start),
+        64,
+        Some(evertrace_engine::HumanExplorerListSelection::Capture),
+    ))
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(finite_after_forget.status, full_after_forget.status);
+    assert_eq!(
+        finite_after_forget.items,
+        full_after_forget
+            .items
+            .into_iter()
+            .filter(|item| item.object_kind == "source_observation")
+            .collect::<Vec<_>>()
+    );
     reopened_handle.shutdown().await.unwrap();
     reopened_task.await.unwrap().unwrap();
 }
@@ -5401,12 +5523,252 @@ async fn protected_archive_export(
     };
     assert_eq!(context.recorded_at_us, receipt.recorded_at_us);
     assert_eq!(context.event_time_us, receipt.event_time_us);
+    let legacy_page = import_service
+        .list(HumanSurface::Explorer, None, None, 64)
+        .await
+        .unwrap()
+        .unwrap();
+    let legacy_capture = legacy_page
+        .items
+        .iter()
+        .filter(|item| item.object_kind == "source_observation")
+        .cloned()
+        .collect::<Vec<_>>();
+    let capture = import_service
+        .list_selected(
+            HumanSurface::Explorer,
+            None,
+            None,
+            64,
+            Some(evertrace_engine::HumanExplorerListSelection::Capture),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(capture.items.len(), 16);
+    assert!(
+        capture
+            .items
+            .iter()
+            .all(|item| item.source_context.is_some())
+    );
+    assert_eq!(capture.items, legacy_capture);
+    let mut cursor = None;
+    for expected in legacy_capture.chunks(8) {
+        let page = import_service
+            .list_selected(
+                HumanSurface::Explorer,
+                Some(capture.frontier),
+                cursor.as_deref(),
+                8,
+                Some(evertrace_engine::HumanExplorerListSelection::Capture),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.items, expected);
+        assert_eq!(page.status, capture.status);
+        cursor = page.next_cursor;
+        for item in &page.items {
+            let selected = imported.row(&item.stable_key).unwrap();
+            let JournalPayload::SourceObservationRecorded(observation) =
+                serde_json::from_str(selected.payload_json.as_deref().unwrap()).unwrap()
+            else {
+                panic!("observation")
+            };
+            let receipt_row = imported
+                .row(&format!(
+                    "object:evidence:source_receipt:{}",
+                    observation.source_receipt_ref
+                ))
+                .unwrap();
+            let JournalPayload::SourceReceiptRecorded(receipt) =
+                serde_json::from_str(receipt_row.payload_json.as_deref().unwrap()).unwrap()
+            else {
+                panic!("receipt")
+            };
+            let expected_evidence = evertrace_engine::HumanEvidenceDetail {
+                source_kind: receipt.source_kind,
+                observation_role: observation.observation_role,
+                source_role: observation.source_role,
+                content_trust: observation.content_trust,
+                capture_completeness: receipt.capture_completeness,
+                protected_presentation: receipt.protected_presentation.clone(),
+                protected_length: receipt.protected_length,
+                cas_ref: receipt.cas_ref.clone(),
+            };
+            let detail = import_service
+                .detail(
+                    HumanSurface::Explorer,
+                    &item.stable_key,
+                    capture.frontier,
+                    item.revision_ref.as_deref(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected_detail = item.clone();
+            expected_detail.evidence_detail = Some(expected_evidence.clone());
+            assert_eq!(detail.items, vec![expected_detail]);
+            let receipt_detail = import_service
+                .detail(
+                    HumanSurface::Explorer,
+                    receipt_row.object_id.as_deref().unwrap(),
+                    capture.frontier,
+                    receipt_row.current_revision_id.as_deref(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipt_detail.items[0].evidence_detail,
+                Some(expected_evidence.clone())
+            );
+            let mut expected_receipt = legacy_page
+                .items
+                .iter()
+                .find(|item| item.stable_key == receipt_row.row_id)
+                .unwrap()
+                .clone();
+            expected_receipt.evidence_detail = Some(expected_evidence);
+            assert_eq!(receipt_detail.items, vec![expected_receipt]);
+            assert_eq!(receipt_detail.items[0].source_context, item.source_context);
+            assert_eq!(
+                receipt_detail.items[0].source_event_seq,
+                receipt_row.source_event_seq
+            );
+        }
+    }
+    assert!(cursor.is_none());
+    assert!(
+        capture
+            .items
+            .iter()
+            .any(|item| item.source_context.as_ref() == Some(context))
+    );
+    let last = capture.items.last().unwrap().stable_key.clone();
+    let empty = import_service
+        .list_selected(
+            HumanSurface::Explorer,
+            Some(capture.frontier),
+            Some(&last),
+            1,
+            Some(evertrace_engine::HumanExplorerListSelection::Capture),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(empty.items.is_empty());
+    assert!(empty.next_cursor.is_none());
+    let quoted = import_service
+        .list_selected(
+            HumanSurface::Explorer,
+            None,
+            Some("' OR true OR row_id = '"),
+            64,
+            Some(evertrace_engine::HumanExplorerListSelection::Capture),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(quoted.items, capture.items);
     let archived_export = import_service.export(selection.clone()).await;
     assert_eq!(
         archived_export.status,
         evertrace_engine::HumanExportStatus::Published,
         "{archived_export:?}"
     );
+    // A Task can mention another source without making that source authority
+    // for the directly selected source's directory/session/time presentation.
+    let independent_task_id = TaskId::new_v7();
+    let independent_task = Task {
+        task_id: independent_task_id,
+        revision_id: RevisionId::new_v7(),
+        predecessor_revision_id: None,
+        request_root_refs: vec![receipt.source_observation_id.to_string()],
+        canonical_goal: "compare independently authorized sources".into(),
+        scope_memberships: vec![TaskScopeMembership {
+            repository_instance_id: None,
+            worktree_instance_ids: Vec::new(),
+        }],
+        identity_confidence: TaskIdentityConfidence::Explicit,
+        lifecycle: TaskLifecycle::Active,
+        continuation_of_task_id: None,
+        split_from_task_id: None,
+        split_into_task_ids: Vec::new(),
+        merged_from_task_ids: Vec::new(),
+        merged_into_task_id: None,
+        created_at_us: 1,
+        closed_at_us: None,
+        source_watermark: 1,
+    };
+    let (mut independent_receipt, independent_observation) = self::source(
+        "independent-context",
+        independent_task_id,
+        RepositoryId::new_v7(),
+    );
+    independent_receipt.repository_instance_id = None;
+    independent_receipt.protected_presentation =
+        Some(evertrace_domain::evidence::ProtectedPresentation::Inline {
+            text: "reviewed evidence".into(),
+        });
+    let independent_receipt_ref = independent_receipt.source_receipt_id.to_string();
+    let independent_ref = independent_observation.source_observation_id.to_string();
+    import_handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![
+                    JournalPayload::TaskRecorded(Box::new(independent_task)),
+                    JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                        source_instance_id: independent_receipt.source_instance_id.clone(),
+                        source_revision: independent_receipt.source_revision.clone(),
+                        source_sequence: 1,
+                        confirmed_prefix_digest: None,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::EvidenceSurface,
+                        target_id: independent_ref.clone(),
+                        algorithm_revision: "s31-test-v1".into(),
+                        source_watermark: 1,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::PhysicalNormalization,
+                        target_id: independent_ref.clone(),
+                        algorithm_revision: "s31-test-v1".into(),
+                        source_watermark: 1,
+                    }),
+                    JournalPayload::SourceReceiptRecorded(Box::new(independent_receipt)),
+                    JournalPayload::SourceObservationRecorded(Box::new(independent_observation)),
+                ]
+                .into_iter()
+                .map(|payload| JournalEventDraft::runtime(1, CONFIG, "s31-test-v1", payload))
+                .collect(),
+            )
+            .unwrap(),
+            100,
+        )
+        .await
+        .unwrap();
+    let independent_before = import_service
+        .detail(
+            HumanSurface::Explorer,
+            &independent_ref,
+            imported.frontier,
+            Some(&independent_ref),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(independent_before.items[0].source_context.is_some());
+    assert!(matches!(
+        independent_before.items[0]
+            .evidence_detail
+            .as_ref()
+            .unwrap()
+            .protected_presentation,
+        Some(evertrace_domain::evidence::ProtectedPresentation::Inline { .. })
+    ));
     assert_eq!(
         admin
             .handle(
@@ -5438,6 +5800,86 @@ async fn protected_archive_export(
         .unwrap();
     assert!(denied.items[0].source_context.is_none());
     assert!(denied.items[0].evidence_detail.is_none());
+    let independent_after = import_service
+        .detail(
+            HumanSurface::Explorer,
+            &independent_ref,
+            imported.frontier,
+            Some(&independent_ref),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        independent_after.items[0].evidence_detail,
+        independent_before.items[0].evidence_detail
+    );
+    assert_eq!(
+        independent_after.items[0].source_context, independent_before.items[0].source_context,
+        "unrelated revoked Task request root must not hide the selected source context"
+    );
+    let independent_receipt_after = import_service
+        .detail(
+            HumanSurface::Explorer,
+            &independent_receipt_ref,
+            imported.frontier,
+            Some(&independent_receipt_ref),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        independent_receipt_after.items[0].source_context,
+        independent_after.items[0].source_context
+    );
+    let independent_export = import_service
+        .export(vec![evertrace_engine::HumanExportSelection {
+            object_ref: independent_ref.clone(),
+            expected_revision_ref: Some(independent_ref.clone()),
+        }])
+        .await;
+    assert_eq!(
+        independent_export.status,
+        evertrace_engine::HumanExportStatus::Denied
+    );
+    let stale = import_service
+        .list_selected(
+            HumanSurface::Explorer,
+            Some(capture.frontier),
+            None,
+            64,
+            Some(evertrace_engine::HumanExplorerListSelection::Capture),
+        )
+        .await
+        .unwrap();
+    assert!(stale.is_err());
+    let revoked_capture = import_service
+        .list_selected(
+            HumanSurface::Explorer,
+            None,
+            None,
+            64,
+            Some(evertrace_engine::HumanExplorerListSelection::Capture),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        revoked_capture
+            .items
+            .iter()
+            .filter(|item| item.object_ref.as_deref() != Some(independent_ref.as_str()))
+            .all(|item| item.source_context.is_none())
+    );
+    assert_eq!(
+        revoked_capture
+            .items
+            .iter()
+            .find(|item| item.object_ref.as_deref() == Some(independent_ref.as_str()))
+            .unwrap()
+            .source_context,
+        independent_before.items[0].source_context
+    );
     import_handle.shutdown().await.unwrap();
     import_task.await.unwrap().unwrap();
 }
@@ -5455,8 +5897,14 @@ async fn protected_source_export_survives_deleted_original_and_rejects_revocatio
     let session = "019d0000-0000-7000-8000-000000000032";
     let transcript = dated.join(format!("rollout-2026-09-09T00-00-00-{session}.jsonl"));
     let header = serde_json::json!({"timestamp":"2026-09-09T00:00:00Z", "type":"session_meta", "payload":{"id":session,"session_id":session,"cwd":root.path()}});
-    let message = serde_json::json!({"timestamp":"2026-09-09T00:00:01Z", "type":"event_msg", "payload":{"type":"user_message","message":"original removed, archive retained"}});
-    std::fs::write(&transcript, format!("{header}\n{message}\n")).unwrap();
+    let mut records = format!("{header}\n");
+    // Session metadata is itself an imported observation: fifteen messages
+    // produce a full sixteen-row Capture page with real receipt cycles.
+    for index in 1..=15 {
+        let message = serde_json::json!({"timestamp":format!("2026-09-09T00:00:{index:02}Z"), "type":"event_msg", "payload":{"type":"user_message","message":format!("original removed, archive retained {index}")}});
+        records.push_str(&format!("{message}\n"));
+    }
+    std::fs::write(&transcript, records).unwrap();
     let report = evertrace_engine::repository::observe_session_catalog_report(
         transcript.to_str(),
         session,

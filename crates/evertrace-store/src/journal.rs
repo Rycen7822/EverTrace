@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    future::poll_fn,
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray, RecordBatch, StringArray,
@@ -8,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use evertrace_domain::ids::CommandId;
 use lancedb::{
     Table,
-    query::{ColumnOrdering, QueryBase, Select},
+    query::{ColumnOrdering, ExecutableQuery, QueryBase, Select},
 };
 
 use crate::{
@@ -122,11 +129,117 @@ pub fn journal_schema() -> SchemaRef {
 }
 
 pub(crate) async fn validate_journal_table(table: &Table) -> Result<(), StoreError> {
+    read_validated_journal_rows(table).await.map(|_| ())
+}
+
+async fn read_validated_journal_rows(table: &Table) -> Result<Vec<JournalRow>, StoreError> {
     let actual = table.schema().await.map_err(|_| StoreError::LanceDb)?;
     if actual.as_ref() != journal_schema().as_ref() {
         return Err(StoreError::StoreCorrupt);
     }
-    validate_journal_rows(&read_all_journal_rows(table).await?)
+    let rows = read_all_journal_rows(table).await?;
+    validate_journal_rows(&rows)?;
+    Ok(rows)
+}
+
+/// One open's validated input, tied to this exact native handle. Migration
+/// callers clone this handle rather than reopening a table with the same name.
+pub(crate) struct StartupJournal {
+    pub(crate) table: Table,
+    pub(crate) rows: Vec<JournalRow>,
+    pub(crate) version: u64,
+    // This path requires semantic validation on changed input, but never
+    // retains the temporary admission state across migration work.
+    pub(crate) requires_admission_validation: bool,
+    source_directories: Vec<(PathBuf, File)>,
+}
+
+impl StartupJournal {
+    pub(crate) async fn read(table: Table) -> Result<Self, StoreError> {
+        let dataset = table
+            .dataset()
+            .ok_or(StoreError::StoreCorrupt)?
+            .get()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let path = PathBuf::from(dataset.uri());
+        let mut source_directories = Vec::with_capacity(2);
+        for path in [
+            path.parent().ok_or(StoreError::StoreCorrupt)?.to_owned(),
+            path,
+        ] {
+            let file = File::open(&path).map_err(|_| StoreError::StoreCorrupt)?;
+            source_directories.push((path, file));
+        }
+        drop(dataset);
+        Self::validate_source(&source_directories)?;
+        table
+            .checkout_latest()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let version = table.version().await.map_err(|_| StoreError::LanceDb)?;
+        let rows = read_validated_journal_rows(&table).await?;
+        if table.version().await.map_err(|_| StoreError::LanceDb)? != version {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Self::validate_source(&source_directories)?;
+        Ok(Self {
+            table,
+            rows,
+            version,
+            requires_admission_validation: false,
+            source_directories,
+        })
+    }
+
+    pub(crate) async fn refresh(&mut self) -> Result<(), StoreError> {
+        Self::validate_source(&self.source_directories)?;
+        self.table
+            .checkout_latest()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let version = self
+            .table
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        if version != self.version {
+            // A real append (including a marker) must be read and validated
+            // afresh. Release the old rows before allocating their replacement.
+            self.rows = Vec::new();
+            let rows = read_validated_journal_rows(&self.table).await?;
+            if self
+                .table
+                .version()
+                .await
+                .map_err(|_| StoreError::LanceDb)?
+                != version
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Self::validate_source(&self.source_directories)?;
+            if self.requires_admission_validation {
+                drop(crate::projections::JournalAdmissionState::from_journal_rows(&rows)?);
+            }
+            self.rows = rows;
+            self.version = version;
+        }
+        Self::validate_source(&self.source_directories)
+    }
+
+    fn validate_source(directories: &[(PathBuf, File)]) -> Result<(), StoreError> {
+        for (path, file) in directories {
+            let located = fs::symlink_metadata(path).map_err(|_| StoreError::StoreCorrupt)?;
+            let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
+            if !located.is_dir()
+                || located.file_type().is_symlink()
+                || (located.dev(), located.ino()) != (held.dev(), held.ino())
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(())
+    }
 }
 
 pub async fn read_all_journal_rows(table: &Table) -> Result<Vec<JournalRow>, StoreError> {
@@ -238,12 +351,10 @@ pub(crate) async fn read_commands_rows(
 }
 
 async fn read_query(query: lancedb::query::Query) -> Result<Vec<JournalRow>, StoreError> {
-    let batches = collect_batches(&query)
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
+    let mut stream = query.execute().await.map_err(|_| StoreError::LanceDb)?;
     let mut rows = Vec::new();
-    for batch in &batches {
-        rows.extend(rows_from_batch(batch)?);
+    while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context)).await {
+        rows.extend(rows_from_batch(&batch.map_err(|_| StoreError::LanceDb)?)?);
     }
     Ok(rows)
 }
@@ -377,7 +488,7 @@ pub(crate) fn rows_for_append(
         .collect()
 }
 
-pub(crate) async fn append_rows(table: &Table, rows: &[JournalRow]) -> Result<(), StoreError> {
+pub(crate) async fn append_rows(table: &Table, rows: &[JournalRow]) -> Result<u64, StoreError> {
     if rows.is_empty() {
         return Err(StoreError::InvalidInput);
     }
@@ -385,7 +496,7 @@ pub(crate) async fn append_rows(table: &Table, rows: &[JournalRow]) -> Result<()
         .add(journal_batch(rows)?)
         .execute()
         .await
-        .map(|_| ())
+        .map(|result| result.version)
         .map_err(|_| StoreError::LanceDb)
 }
 
@@ -723,6 +834,36 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn startup_input_revalidates_external_commits_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection = lancedb::connect(temp.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let table = connection
+            .create_empty_table(JOURNAL_TABLE, journal_schema())
+            .execute()
+            .await
+            .unwrap();
+        let mut startup = StartupJournal::read(table).await.unwrap();
+        let external = connection
+            .open_table(JOURNAL_TABLE)
+            .execute()
+            .await
+            .unwrap();
+        let rows = valid_rows();
+        append_rows(&external, &rows).await.unwrap();
+        startup.refresh().await.unwrap();
+        assert_eq!(startup.rows, rows);
+        assert_eq!(startup.version, external.version().await.unwrap());
+
+        // A second physical copy of the command is corruption, even if the
+        // previously validated native handle has not observed that commit yet.
+        append_rows(&external, &rows).await.unwrap();
+        assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
     }
 
     #[tokio::test]

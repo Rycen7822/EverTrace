@@ -27,13 +27,20 @@ pub(crate) fn row_repository_contexts<'a>(
     snapshot: &evertrace_store::ProjectionSnapshot,
     rows: &[&'a evertrace_store::ObjectRow],
 ) -> Result<std::collections::BTreeMap<&'a str, BTreeSet<RepositoryId>>, crate::WriterActorError> {
+    row_repository_contexts_from_scopes(snapshot.data_rows(), rows)
+}
+
+pub(crate) fn row_repository_contexts_from_scopes<'a, 'b>(
+    scope_rows: impl Iterator<Item = &'b evertrace_store::ObjectRow>,
+    rows: &[&'a evertrace_store::ObjectRow],
+) -> Result<std::collections::BTreeMap<&'a str, BTreeSet<RepositoryId>>, crate::WriterActorError> {
     let requested = rows
         .iter()
         .flat_map(|row| [row.task_id.as_deref(), row.worktree_id.as_deref()])
         .flatten()
         .collect::<BTreeSet<_>>();
     let mut scopes = std::collections::BTreeMap::<&str, BTreeSet<RepositoryId>>::new();
-    for row in snapshot.data_rows().filter(|row| {
+    for row in scope_rows.filter(|row| {
         matches!(row.object_kind.as_deref(), Some("task" | "worktree"))
             && row
                 .object_id

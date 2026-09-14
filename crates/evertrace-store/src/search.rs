@@ -12,7 +12,7 @@ use std::{
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::{
-    Table,
+    Connection, Table,
     index::scalar::FullTextSearchQuery,
     query::{QueryBase, Select},
 };
@@ -92,10 +92,11 @@ impl SearchIndex {
     }
 
     pub async fn snapshot(&self) -> Result<SearchSnapshot, StoreError> {
+        let connection = crate::connection::connect_native(&self.data_dir).await?;
         for attempt in 0..2 {
-            let before = self.authoritative_frontier().await?;
-            let snapshot = self.pinned_snapshot().await?;
-            let after = self.authoritative_frontier().await?;
+            let before = self.authoritative_frontier(&connection).await?;
+            let snapshot = self.pinned_snapshot(&connection).await?;
+            let after = self.authoritative_frontier(&connection).await?;
             if before == after || attempt == 1 {
                 if snapshot.frontier > after {
                     return Err(StoreError::StoreCorrupt);
@@ -109,8 +110,11 @@ impl SearchIndex {
         unreachable!("bounded snapshot loop always returns")
     }
 
-    async fn pinned_snapshot(&self) -> Result<SearchSnapshot, StoreError> {
-        let connection = crate::connection::connect_native(&self.data_dir).await?;
+    async fn pinned_snapshot(&self, connection: &Connection) -> Result<SearchSnapshot, StoreError> {
+        evertrace_capture::ConfinedRoot::open_owned_private(&crate::connection::native_root(
+            &self.data_dir,
+        ))
+        .map_err(|_| StoreError::StoreCorrupt)?;
         let table = connection
             .open_table(SEARCH_TABLE)
             .execute()
@@ -149,8 +153,11 @@ impl SearchIndex {
         })
     }
 
-    async fn authoritative_frontier(&self) -> Result<u64, StoreError> {
-        let connection = crate::connection::connect_native(&self.data_dir).await?;
+    async fn authoritative_frontier(&self, connection: &Connection) -> Result<u64, StoreError> {
+        evertrace_capture::ConfinedRoot::open_owned_private(&crate::connection::native_root(
+            &self.data_dir,
+        ))
+        .map_err(|_| StoreError::StoreCorrupt)?;
         let table = connection
             .open_table(JOURNAL_TABLE)
             .execute()

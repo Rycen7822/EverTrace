@@ -1226,6 +1226,17 @@ impl HumanGovernanceService {
         if limit == 0 || limit > MAX_PAGE || after.is_some_and(|value| !valid_ref(value)) {
             return Err(HumanGovernanceError::InvalidInput);
         }
+        if selection == Some(HumanExplorerListSelection::Capture) {
+            let context = self
+                .writer
+                .capture_current_context(after.map(str::to_owned), None, usize::from(limit))
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if expected_frontier.is_some_and(|frontier| frontier != context.frontier) {
+                return Ok(Err(context.frontier));
+            }
+            return Ok(Ok(Box::pin(self.capture_page(context, false)).await?));
+        }
         let snapshot = if surface == HumanSurface::System {
             self.writer
                 .read_diagnostics()
@@ -1343,6 +1354,37 @@ impl HumanGovernanceService {
         if !valid_ref(object_ref) || expected_revision_ref.is_some_and(|value| !valid_ref(value)) {
             return Err(HumanGovernanceError::InvalidInput);
         }
+        let source_ref = object_ref
+            .strip_prefix("object:evidence:source_observation:")
+            .or_else(|| object_ref.strip_prefix("object:evidence:source_receipt:"))
+            .unwrap_or(object_ref);
+        if surface == HumanSurface::Explorer
+            && (source_ref
+                .parse::<evertrace_domain::ids::SourceObservationId>()
+                .is_ok()
+                || source_ref
+                    .parse::<evertrace_domain::ids::SourceReceiptId>()
+                    .is_ok())
+        {
+            let context = self
+                .writer
+                .capture_current_context(None, Some(object_ref.to_owned()), 1)
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if context.frontier < expected_frontier {
+                return Ok(Err((context.frontier, None)));
+            }
+            if let Some(expected) = expected_revision_ref
+                && let Some(current) = context
+                    .items
+                    .first()
+                    .and_then(|item| item.selected.current_revision_id.as_ref())
+                && current != expected
+            {
+                return Ok(Err((context.frontier, Some(current.clone()))));
+            }
+            return Ok(Ok(Box::pin(self.capture_page(context, true)).await?));
+        }
         let snapshot = self
             .writer
             .project_objects()
@@ -1416,9 +1458,17 @@ impl HumanGovernanceService {
         if matching.len() > 1 {
             return Err(HumanGovernanceError::InvalidInput);
         }
-        let semantic_view = SemanticCurrentView::from_snapshot(&snapshot)
+        let semantic_view = matching
+            .iter()
+            .any(|row| row.object_kind.as_deref() == Some("revision_proposal_revision"))
+            .then(|| SemanticCurrentView::from_snapshot(&snapshot))
+            .transpose()
             .map_err(|_| HumanGovernanceError::Store)?;
-        let usage_view = ProcedureUsageCurrentView::from_snapshot(&snapshot)
+        let usage_view = matching
+            .iter()
+            .any(|row| row.object_kind.as_deref() == Some("procedure_negative_review"))
+            .then(|| ProcedureUsageCurrentView::from_snapshot(&snapshot))
+            .transpose()
             .map_err(|_| HumanGovernanceError::Store)?;
         let mut items = matching
             .into_iter()
@@ -1426,8 +1476,8 @@ impl HumanGovernanceService {
                 summary(
                     &snapshot,
                     row,
-                    &semantic_view,
-                    &usage_view,
+                    semantic_view.as_ref(),
+                    usage_view.as_ref(),
                     self.runtime_snapshot.as_ref(),
                     surface,
                     true,
@@ -1640,9 +1690,13 @@ impl HumanGovernanceService {
             }
         };
         let rows = related_rows(&snapshot, refs, request.after, usize::from(request.limit))?;
-        let usage_view = ProcedureUsageCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| HumanGovernanceError::Store)?;
         let (selected, next_cursor) = rows;
+        let usage_view = selected
+            .iter()
+            .any(|row| row.object_kind.as_deref() == Some("procedure_negative_review"))
+            .then(|| ProcedureUsageCurrentView::from_snapshot(&snapshot))
+            .transpose()
+            .map_err(|_| HumanGovernanceError::Store)?;
         let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
             diagnostics: None,
@@ -1655,8 +1709,8 @@ impl HumanGovernanceService {
                     summary(
                         &snapshot,
                         row,
-                        &semantic_view,
-                        &usage_view,
+                        Some(&semantic_view),
+                        usage_view.as_ref(),
                         None,
                         HumanSurface::Explorer,
                         false,
@@ -4098,10 +4152,6 @@ fn page_selected(
     selection: Option<HumanExplorerListSelection>,
 ) -> Result<HumanPage, HumanGovernanceError> {
     let (status, degraded_reasons) = snapshot_status(snapshot)?;
-    let semantic_view =
-        SemanticCurrentView::from_snapshot(snapshot).map_err(|_| HumanGovernanceError::Store)?;
-    let usage_view = ProcedureUsageCurrentView::from_snapshot(snapshot)
-        .map_err(|_| HumanGovernanceError::Store)?;
     let mut rows = surface_rows(snapshot, surface)?;
     rows.retain(|row| match selection {
         None => true,
@@ -4150,6 +4200,20 @@ fn page_selected(
         .collect::<Vec<_>>();
     let next_cursor = (selected.len() > limit).then(|| selected[limit - 1].row_id.clone());
     selected.truncate(limit);
+    // Only materialize the contexts consumed by this page's summaries. These
+    // views otherwise decode unrelated source history even for Capture/Jobs.
+    let semantic_view = selected
+        .iter()
+        .any(|row| row.object_kind.as_deref() == Some("revision_proposal_revision"))
+        .then(|| SemanticCurrentView::from_snapshot(snapshot))
+        .transpose()
+        .map_err(|_| HumanGovernanceError::Store)?;
+    let usage_view = selected
+        .iter()
+        .any(|row| row.object_kind.as_deref() == Some("procedure_negative_review"))
+        .then(|| ProcedureUsageCurrentView::from_snapshot(snapshot))
+        .transpose()
+        .map_err(|_| HumanGovernanceError::Store)?;
     Ok(HumanPage {
         diagnostics: None,
         frontier: snapshot.frontier,
@@ -4161,8 +4225,8 @@ fn page_selected(
                 summary(
                     snapshot,
                     row,
-                    &semantic_view,
-                    &usage_view,
+                    semantic_view.as_ref(),
+                    usage_view.as_ref(),
                     None,
                     surface,
                     false,
@@ -4181,14 +4245,18 @@ fn snapshot_status(
         .jobs
         .iter()
         .any(|job| job.state == JobStatus::Failed);
-    Ok(if degraded {
+    Ok(failed_job_status(degraded))
+}
+
+fn failed_job_status(degraded: bool) -> (HumanSnapshotStatus, Vec<HumanDegradedReason>) {
+    if degraded {
         (
             HumanSnapshotStatus::Degraded,
             vec![HumanDegradedReason::CurrentJobFailed],
         )
     } else {
         (HumanSnapshotStatus::Ready, Vec::new())
-    })
+    }
 }
 
 fn surface_rows(
@@ -4671,8 +4739,8 @@ fn support_dependency_refs(
 fn summary(
     snapshot: &ProjectionSnapshot,
     row: &ObjectRow,
-    semantic_view: &SemanticCurrentView,
-    usage_view: &ProcedureUsageCurrentView,
+    semantic_view: Option<&SemanticCurrentView>,
+    usage_view: Option<&ProcedureUsageCurrentView>,
     runtime_snapshot: Option<&RuntimeSnapshot>,
     surface: HumanSurface,
     include_detail: bool,
@@ -4691,10 +4759,13 @@ fn summary(
         .then(|| ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot))
         .transpose()
         .map_err(|_| HumanGovernanceError::Store)?;
+    if row.object_kind.as_deref() == Some("revision_proposal_revision") && semantic_view.is_none() {
+        return Err(HumanGovernanceError::Store);
+    }
     let proposal = (row.object_kind.as_deref() == Some("revision_proposal_revision"))
         .then_some(())
         .and_then(|()| row.object_id.as_deref()?.parse().ok())
-        .and_then(|id| semantic_view.proposals.get(&id))
+        .and_then(|id| semantic_view?.proposals.get(&id))
         .filter(|value| {
             row.object_id
                 .as_deref()
@@ -4719,8 +4790,9 @@ fn summary(
     let proposal_review = if include_detail {
         proposal
             .as_ref()
-            .and_then(|summary| semantic_view.proposals.get(&summary.proposal_id))
+            .and_then(|summary| semantic_view?.proposals.get(&summary.proposal_id))
             .map(|value| {
+                let semantic_view = semantic_view.ok_or(HumanGovernanceError::Store)?;
                 let (plain_accept_eligible, merge_and_accept_eligible) =
                     proposal_acceptance_eligibility(semantic_view, value);
                 let reauthorization =
@@ -4934,6 +5006,7 @@ fn summary(
             return Err(HumanGovernanceError::Store);
         };
         let selection = usage_view
+            .ok_or(HumanGovernanceError::Store)?
             .select_negative_review(review.negative_evidence_id)
             .map_err(|_| HumanGovernanceError::Store)?;
         if selection.review_revision_id != review.review_event_id {
@@ -4988,6 +5061,28 @@ fn summary(
         worktree_detail,
         execution_integrity_detail,
         system_detail,
+        ..summary_fields(row, surface)
+    })
+}
+
+fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {
+    HumanSummary {
+        source_context: None,
+        semantic_detail: None,
+        proposal_base: None,
+        evidence_detail: None,
+        work_detail: None,
+        proposal: None,
+        proposal_review: None,
+        support_detail: None,
+        competing_detail: None,
+        forget_preview: None,
+        repository_purge_preview: None,
+        negative_review: None,
+        recovery_detail: None,
+        worktree_detail: None,
+        execution_integrity_detail: None,
+        system_detail: None,
         stable_key: row.row_id.clone(),
         row_class: human_row_class(row),
         family: human_object_family(row),
@@ -5011,7 +5106,7 @@ fn summary(
             .or_else(|| row.project_id.clone())
             .or_else(|| row.session_id.clone()),
         source_event_seq: row.source_event_seq,
-    })
+    }
 }
 
 pub(crate) fn work_evidence_detail(
@@ -5056,6 +5151,13 @@ fn source_evidence_detail(
     snapshot: &ProjectionSnapshot,
     row: &ObjectRow,
 ) -> Result<Option<HumanEvidenceDetail>, HumanGovernanceError> {
+    source_evidence_detail_from_rows(row, |id| snapshot.row(id))
+}
+
+fn source_evidence_detail_from_rows<'a>(
+    row: &ObjectRow,
+    lookup: impl Fn(&str) -> Option<&'a ObjectRow>,
+) -> Result<Option<HumanEvidenceDetail>, HumanGovernanceError> {
     if !matches!(
         row.object_kind.as_deref(),
         Some("source_receipt" | "source_observation")
@@ -5072,24 +5174,22 @@ fn source_evidence_detail(
     };
     let (receipt, observation) = match decode(row)? {
         JournalPayload::SourceReceiptRecorded(receipt) => {
-            let other = snapshot
-                .row(&format!(
-                    "object:evidence:source_observation:{}",
-                    receipt.source_observation_id
-                ))
-                .ok_or(HumanGovernanceError::Store)?;
+            let other = lookup(&format!(
+                "object:evidence:source_observation:{}",
+                receipt.source_observation_id
+            ))
+            .ok_or(HumanGovernanceError::Store)?;
             let JournalPayload::SourceObservationRecorded(observation) = decode(other)? else {
                 return Err(HumanGovernanceError::Store);
             };
             (receipt, observation)
         }
         JournalPayload::SourceObservationRecorded(observation) => {
-            let other = snapshot
-                .row(&format!(
-                    "object:evidence:source_receipt:{}",
-                    observation.source_receipt_ref
-                ))
-                .ok_or(HumanGovernanceError::Store)?;
+            let other = lookup(&format!(
+                "object:evidence:source_receipt:{}",
+                observation.source_receipt_ref
+            ))
+            .ok_or(HumanGovernanceError::Store)?;
             let JournalPayload::SourceReceiptRecorded(receipt) = decode(other)? else {
                 return Err(HumanGovernanceError::Store);
             };

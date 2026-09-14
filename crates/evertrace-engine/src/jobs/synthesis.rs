@@ -118,6 +118,27 @@ pub struct SynthesisRequest<'a> {
     pub effective_config_hash: [u8; 32],
 }
 
+// Only this bounded, owned context crosses the provider wait in production.
+pub(crate) struct PreparedSynthesis {
+    input: ProtectedSemanticInput,
+    fingerprint: [u8; 32],
+    prompt_hash: [u8; 32],
+    daily: DerivationQuotaUsage,
+    evidence_refs: Vec<String>,
+    input_omission: Option<evertrace_domain::semantic::SemanticOmission>,
+    target: SynthesisTarget,
+    trigger: SemanticDigestTrigger,
+    command_id: CommandId,
+    occurred_at_us: i64,
+    algorithm_revision: String,
+    effective_config_hash: [u8; 32],
+}
+
+// Preparation either finishes the durable job immediately or leaves a scoped
+// synthesis step (provider input or an already-resolved audit/no-delta result).
+type EpisodeJobPreparation =
+    Result<(Result<PreparedSynthesis, SynthesisResolution>, EventScope), JournalCommand>;
+
 impl SynthesisRequest<'_> {
     fn source_target(&self) -> Option<&evertrace_domain::semantic::SemanticSourceTarget> {
         match &self.target {
@@ -300,6 +321,37 @@ impl SynthesisPlanner {
         occurred_at_us: i64,
         max_wall_time: std::time::Duration,
     ) -> Result<JournalCommand, crate::semantic::SemanticServiceError> {
+        let prepared = self.prepare_episode_job(
+            snapshot,
+            job,
+            effective_config_hash,
+            occurred_at_us,
+            max_wall_time,
+        )?;
+        let (prepared, scope) = match prepared {
+            Ok(value) => value,
+            Err(command) => return Ok(command),
+        };
+        let resolution = match prepared {
+            Ok(prepared) => {
+                let started = std::time::Instant::now();
+                let derived = self.derive_prepared(&prepared, || async { Ok(()) }).await;
+                self.finish_prepared(prepared, snapshot, derived, started.elapsed())
+                    .await?
+            }
+            Err(resolution) => resolution,
+        };
+        durable_resolution(job, resolution, occurred_at_us, scope)
+    }
+
+    fn prepare_episode_job(
+        &self,
+        snapshot: &ProjectionSnapshot,
+        job: &DurableJob,
+        effective_config_hash: [u8; 32],
+        occurred_at_us: i64,
+        max_wall_time: std::time::Duration,
+    ) -> Result<EpisodeJobPreparation, crate::semantic::SemanticServiceError> {
         let expected_budget = self.durable_budget(max_wall_time)?;
         if job.state != JobStatus::Leased
             || !self.job_is_current(job, effective_config_hash, &expected_budget)
@@ -334,10 +386,11 @@ impl SynthesisPlanner {
                     payload: JournalPayload::JobState(terminal),
                 }],
             )
+            .map(Err)
             .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let resolution = self
-            .execute(SynthesisRequest {
+        let resolution = self.prepare(
+            SynthesisRequest {
                 snapshot,
                 target: SynthesisTarget::Episode(episode.revision_id),
                 trigger,
@@ -347,18 +400,60 @@ impl SynthesisPlanner {
                 occurred_at_us,
                 algorithm_revision: job.algorithm_revision.clone(),
                 effective_config_hash: job.config_hash,
-            })
-            .await?;
-        durable_resolution(
-            job,
+            },
+            None,
+        )?;
+        Ok(Ok((
             resolution,
-            occurred_at_us,
             EventScope {
                 task_id: Some(episode.task_id.to_string()),
                 workstream_id: Some(episode.workstream_id.to_string()),
                 ..EventScope::default()
             },
-        )
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_owned_episode_job<F, Fut>(
+        &self,
+        snapshot: ProjectionSnapshot,
+        job: &DurableJob,
+        occurred_at_us: i64,
+        max_wall_time: std::time::Duration,
+        writer: &crate::WriterHandle,
+        admission: F,
+    ) -> Result<JournalCommand, crate::semantic::SemanticServiceError>
+    where
+        F: Fn() -> Fut + Sync,
+        Fut: std::future::Future<Output = Result<(), ProviderError>> + Send,
+    {
+        let preparation = self.prepare_episode_job(
+            &snapshot,
+            job,
+            job.config_hash,
+            occurred_at_us,
+            max_wall_time,
+        )?;
+        drop(snapshot);
+        let (prepared, scope) = match preparation {
+            Ok(value) => value,
+            Err(command) => return Ok(command),
+        };
+        let resolution = match prepared {
+            Ok(prepared) => {
+                let started = std::time::Instant::now();
+                let derived = self.derive_prepared(&prepared, admission).await;
+                let elapsed = started.elapsed();
+                let current = writer
+                    .project()
+                    .await
+                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+                self.finish_prepared(prepared, &current, derived, elapsed)
+                    .await?
+            }
+            Err(resolution) => resolution,
+        };
+        durable_resolution(job, resolution, occurred_at_us, scope)
     }
 
     pub(crate) fn job_identity_is_current(
@@ -413,13 +508,30 @@ impl SynthesisPlanner {
 
     async fn execute_admitted<F, Fut>(
         &self,
-        mut request: SynthesisRequest<'_>,
+        request: SynthesisRequest<'_>,
         admission: F,
         input_omission: Option<evertrace_domain::semantic::SemanticOmission>,
     ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError>
     where
         F: Fn() -> Fut + Sync,
         Fut: std::future::Future<Output = Result<(), ProviderError>> + Send,
+    {
+        let snapshot = request.snapshot;
+        let prepared = match self.prepare(request, input_omission)? {
+            Ok(prepared) => prepared,
+            Err(resolution) => return Ok(resolution),
+        };
+        let started = std::time::Instant::now();
+        let derived = self.derive_prepared(&prepared, admission).await;
+        self.finish_prepared(prepared, snapshot, derived, started.elapsed())
+            .await
+    }
+
+    fn prepare(
+        &self,
+        mut request: SynthesisRequest<'_>,
+        input_omission: Option<evertrace_domain::semantic::SemanticOmission>,
+    ) -> Result<Result<PreparedSynthesis, SynthesisResolution>, crate::semantic::SemanticServiceError>
     {
         let original_ref_count = request.selected_direct_refs.len();
         request.selected_direct_refs.sort();
@@ -545,7 +657,7 @@ impl SynthesisPlanner {
                             && from_watermark < run.to_watermark
                     }))
         }) {
-            return Ok(SynthesisResolution::NoDelta);
+            return Ok(Err(SynthesisResolution::NoDelta));
         }
         let daily = daily_usage(&prior, request.occurred_at_us);
         let episode_successes = prior
@@ -605,10 +717,11 @@ impl SynthesisPlanner {
                 fingerprint,
                 DerivationRunStatus::BudgetExhausted,
                 DerivationQuotaUsage::default(),
-            );
+            )
+            .map(Err);
         }
-        let provider = match &self.provider {
-            Some(provider) => provider,
+        match &self.provider {
+            Some(_) => {}
             None => {
                 return audit_resolution(
                     self,
@@ -617,11 +730,89 @@ impl SynthesisPlanner {
                     fingerprint,
                     DerivationRunStatus::ProviderUnavailable,
                     DerivationQuotaUsage::default(),
-                );
+                )
+                .map(Err);
             }
         };
-        let started = std::time::Instant::now();
-        let derived = match provider.derive_admitted(&input, &admission).await {
+        let evidence_refs = request
+            .selected_direct_refs
+            .iter()
+            .filter(|reference| ref_index.proposal_evidence(reference))
+            .cloned()
+            .collect();
+        Ok(Ok(PreparedSynthesis {
+            input,
+            fingerprint,
+            prompt_hash,
+            daily,
+            evidence_refs,
+            input_omission,
+            target: request.target,
+            trigger: request.trigger,
+            command_id: request.command_id,
+            occurred_at_us: request.occurred_at_us,
+            algorithm_revision: request.algorithm_revision,
+            effective_config_hash: request.effective_config_hash,
+        }))
+    }
+
+    async fn derive_prepared<F, Fut>(
+        &self,
+        prepared: &PreparedSynthesis,
+        admission: F,
+    ) -> Result<crate::provider::ProviderDerivation, ProviderError>
+    where
+        F: Fn() -> Fut + Sync,
+        Fut: std::future::Future<Output = Result<(), ProviderError>> + Send,
+    {
+        self.provider
+            .as_ref()
+            .ok_or(ProviderError::Disabled)?
+            .derive_admitted(&prepared.input, &admission)
+            .await
+    }
+
+    async fn finish_prepared(
+        &self,
+        prepared: PreparedSynthesis,
+        snapshot: &ProjectionSnapshot,
+        derived: Result<crate::provider::ProviderDerivation, ProviderError>,
+        elapsed: std::time::Duration,
+    ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError> {
+        let PreparedSynthesis {
+            input,
+            fingerprint,
+            prompt_hash,
+            daily,
+            evidence_refs,
+            input_omission,
+            target,
+            trigger,
+            command_id,
+            occurred_at_us,
+            algorithm_revision,
+            effective_config_hash,
+        } = prepared;
+        let request = SynthesisRequest {
+            snapshot,
+            target,
+            trigger,
+            direct_delta: Vec::new(),
+            selected_direct_refs: input.source_refs.clone(),
+            command_id,
+            occurred_at_us,
+            algorithm_revision,
+            effective_config_hash,
+        };
+        // The revision is immutable. Require that exact claimed base to remain
+        // current before using its skeleton for candidates and the successor.
+        let episode = match &request.target {
+            SynthesisTarget::Episode(revision) => Some(current_episode(snapshot, *revision)?),
+            SynthesisTarget::Source { .. } => None,
+        };
+        let from_watermark = input.from_watermark;
+        let to_watermark = input.to_watermark;
+        let derived = match derived {
             Ok(value) => value,
             Err(error) => {
                 let status = if error == ProviderError::Schema {
@@ -648,8 +839,7 @@ impl SynthesisPlanner {
                     status,
                     DerivationQuotaUsage {
                         calls,
-                        wall_time_us: u64::try_from(started.elapsed().as_micros())
-                            .unwrap_or(u64::MAX),
+                        wall_time_us: u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
                         ..DerivationQuotaUsage::default()
                     },
                 );
@@ -681,12 +871,6 @@ impl SynthesisPlanner {
                 },
             );
         }
-        let evidence_refs = request
-            .selected_direct_refs
-            .iter()
-            .filter(|reference| ref_index.proposal_evidence(reference))
-            .cloned()
-            .collect::<Vec<_>>();
         let mut application = match materialize_application(
             derived.application,
             episode.as_ref(),

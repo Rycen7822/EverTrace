@@ -9,7 +9,7 @@ use lancedb::{
 use crate::{
     JournalCommand, JournalEventDraft, JournalPayload, MigrationApplied, ProjectionWorker,
     StoreError,
-    journal::{append_rows, read_all_journal_rows, rows_for_append, validate_journal_table},
+    journal::{StartupJournal, append_rows, rows_for_append},
     migrations::{L0001, MigrationOutcome},
     objects::{OBJECTS_TABLE, validate_objects_table},
     query::L0002ProjectionWorker,
@@ -24,19 +24,27 @@ pub struct L0002;
 
 impl L0002 {
     pub async fn apply(connection: &Connection) -> Result<MigrationOutcome, StoreError> {
-        Self::apply_inner(connection, false).await
+        Self::apply_inner(connection, false, &mut None).await
+    }
+
+    pub(crate) async fn apply_with_journal(
+        connection: &Connection,
+        startup: &mut Option<StartupJournal>,
+    ) -> Result<MigrationOutcome, StoreError> {
+        Self::apply_inner(connection, false, startup).await
     }
 
     #[cfg(test)]
     async fn apply_crash_before_marker(
         connection: &Connection,
     ) -> Result<MigrationOutcome, StoreError> {
-        Self::apply_inner(connection, true).await
+        Self::apply_inner(connection, true, &mut None).await
     }
 
     async fn apply_inner(
         connection: &Connection,
         crash_before_marker: bool,
+        startup: &mut Option<StartupJournal>,
     ) -> Result<MigrationOutcome, StoreError> {
         let initial_names = connection
             .table_names()
@@ -45,28 +53,23 @@ impl L0002 {
             .map_err(|_| StoreError::LanceDb)?;
         let has_relation = initial_names.iter().any(|name| name == RELATIONS_TABLE);
         let has_search = initial_names.iter().any(|name| name == SEARCH_TABLE);
-        let base_outcome = if has_relation || has_search {
-            L0001::reconcile_for_l0002(connection).await?
-        } else {
-            L0001::apply(connection).await?
-        };
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
+        let base_outcome =
+            L0001::apply_inner(connection, has_relation || has_search, startup).await?;
+        let startup = startup.as_mut().ok_or(StoreError::StoreCorrupt)?;
+        startup.refresh().await?;
+        let journal = startup.table.clone();
         let objects = connection
             .open_table(OBJECTS_TABLE)
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        validate_journal_table(&journal).await?;
         validate_objects_table(&objects).await?;
 
         let relations = open_or_create_relations(connection, has_relation).await?;
         let search = open_or_create_search(connection, has_search).await?;
 
-        let before = read_all_journal_rows(&journal).await?;
+        startup.refresh().await?;
+        let before = &startup.rows;
         let expected = crate::prepare_command(&migration_command()?)?;
         let matches = before
             .iter()
@@ -108,7 +111,7 @@ impl L0002 {
             if crash_before_marker {
                 return Err(StoreError::Migration);
             }
-            append_migration(&journal, &before).await?;
+            append_migration(&journal, before).await?;
         }
 
         // The marker itself advances the authoritative frontier. Independently
@@ -128,6 +131,9 @@ impl L0002 {
         })
     }
 }
+
+#[cfg(test)]
+use crate::journal::read_all_journal_rows;
 
 async fn open_or_create_relations(
     connection: &Connection,
@@ -244,7 +250,9 @@ async fn append_migration(journal: &Table, rows: &[crate::JournalRow]) -> Result
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(StoreError::Migration)?;
-    append_rows(journal, &rows_for_append(&prepared, first_seq, 0)?).await
+    append_rows(journal, &rows_for_append(&prepared, first_seq, 0)?)
+        .await
+        .map(|_| ())
 }
 
 fn migration_command() -> Result<JournalCommand, StoreError> {
@@ -276,6 +284,45 @@ mod tests {
             .await
             .unwrap();
         (temp, connection)
+    }
+
+    #[tokio::test]
+    async fn startup_input_survives_noop_and_refreshes_after_real_marker() {
+        let (_temp, connection) = test_connection().await;
+        L0001::apply(&connection).await.unwrap();
+        let journal = connection
+            .open_table(crate::JOURNAL_TABLE)
+            .execute()
+            .await
+            .unwrap();
+        let mut input = StartupJournal::read(journal).await.unwrap();
+        drop(crate::projections::JournalAdmissionState::from_journal_rows(&input.rows).unwrap());
+        input.requires_admission_validation = true;
+        let l0001_version = input.version;
+        let mut startup = Some(input);
+        L0002::apply_with_journal(&connection, &mut startup)
+            .await
+            .unwrap();
+        let input = startup.as_mut().unwrap();
+        input.refresh().await.unwrap();
+        assert!(input.version > l0001_version);
+        assert_eq!(
+            input.rows,
+            read_all_journal_rows(&input.table).await.unwrap()
+        );
+        assert_eq!(input.rows.len(), 2);
+        assert!(input.requires_admission_validation);
+        let version = input.version;
+        let rows_address = input.rows.as_ptr();
+        assert_eq!(
+            L0002::apply_with_journal(&connection, &mut startup).await,
+            Ok(MigrationOutcome::Noop)
+        );
+        let input = startup.as_mut().unwrap();
+        input.refresh().await.unwrap();
+        assert_eq!(input.version, version);
+        assert_eq!(input.rows.as_ptr(), rows_address);
+        assert!(input.requires_admission_validation);
     }
 
     #[tokio::test]

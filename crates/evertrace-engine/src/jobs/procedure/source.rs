@@ -327,6 +327,27 @@ pub(super) async fn allowed(
         }
         Err(error) => return Err(error),
     };
+    allowed_input(writer, snapshot, job, &input, report).await
+}
+
+async fn allowed_input(
+    writer: &crate::WriterHandle,
+    snapshot: &ProjectionSnapshot,
+    job: &DurableJob,
+    input: &SourceInput,
+    report: Option<&evertrace_codex::HostProbeReport>,
+) -> Result<bool, SemanticServiceError> {
+    if crate::session_import::source_summary_receipts(
+        snapshot,
+        &input.source,
+        input.after,
+        input.through,
+        &input.refs,
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
     let rows = snapshot
         .data_rows()
         .filter(|row| {
@@ -361,18 +382,18 @@ pub(super) async fn allowed(
 pub(super) async fn execute(
     writer: &crate::WriterHandle,
     planner: &super::super::SynthesisPlanner,
-    snapshot: &ProjectionSnapshot,
+    snapshot: ProjectionSnapshot,
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
     at: i64,
     runtime: &evertrace_capture::RuntimeSnapshot,
 ) -> Result<JournalCommand, SemanticServiceError> {
-    let input = input(snapshot, job)?;
-    if !allowed(writer, snapshot, job, report).await? {
+    let input = input(&snapshot, job)?;
+    if !allowed_input(writer, &snapshot, job, &input, report).await? {
         return Err(SemanticServiceError::BaseConflict);
     }
     let receipts = crate::session_import::source_summary_receipts(
-        snapshot,
+        &snapshot,
         &input.source,
         input.after,
         input.through,
@@ -408,6 +429,9 @@ pub(super) async fn execute(
         &serde_json::json!({"evidence": evidence, "effectiveness": "unverified"}),
     )
     .map_err(|_| SemanticServiceError::InvalidInput)?;
+    drop(snapshot);
+    drop(cas);
+    drop(evidence);
     let mut payloads = Vec::new();
     let mut reason = JobTerminalReason::Completed;
     if (json.len() + crate::provider::source_method_prompt().len()) as u64
@@ -421,7 +445,7 @@ pub(super) async fn execute(
                     .project()
                     .await
                     .map_err(|_| crate::provider::ProviderError::Transport)?;
-                if allowed(writer, &current, job, report)
+                if allowed_input(writer, &current, job, &input, report)
                     .await
                     .unwrap_or(false)
                 {
@@ -431,6 +455,14 @@ pub(super) async fn execute(
                 }
             })
             .await;
+        let current = writer
+            .project()
+            .await
+            .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+        if !allowed_input(writer, &current, job, &input, report).await? {
+            return Err(SemanticServiceError::BaseConflict);
+        }
+        let snapshot = &current;
         match response {
             Ok((Some((content, mut refs)), used_input, used_output))
                 if used_input <= job.budget.max_input_tokens.unwrap_or(0)

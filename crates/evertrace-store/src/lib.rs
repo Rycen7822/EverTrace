@@ -34,16 +34,16 @@ pub use objects::{
     OBJECTS_CHECKPOINT_ID, OBJECTS_TABLE, ObjectRow, ObjectRowClass, ObjectRowKind, objects_schema,
 };
 pub use projections::{
-    AttemptCurrentView, AutoresearchCurrentView, CompetingResolutionEvidenceView,
-    EpisodeCurrentView, InventoryCurrentContext, NamedCurrentDependency,
-    ObjectDeletionCandidateAdmissionView, OperationBurstCurrentView, ProjectionSnapshot,
-    ProjectionWorker, RecallCurrentAtom, RecallCurrentContext, ReconciliationArtifactContext,
-    ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationArtifactKind,
-    ReconciliationArtifactOwnership, ReconciliationFrontier, ReconciliationWorkItem,
-    RecoveryEvidenceCurrentView, RepositoryReadContext, RuntimeSchedulerView,
-    SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView,
-    WorkIdentityCurrentView, object_deletion_preview, reduce_journal,
-    repository_scope_purge_preview,
+    AttemptCurrentView, AutoresearchCurrentView, CaptureCurrentContext, CaptureCurrentItem,
+    CompetingResolutionEvidenceView, EpisodeCurrentView, InventoryCurrentContext,
+    NamedCurrentDependency, ObjectDeletionCandidateAdmissionView, OperationBurstCurrentView,
+    ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom, RecallCurrentContext,
+    ReconciliationArtifactContext, ReconciliationArtifactDescriptor,
+    ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
+    ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
+    RepositoryReadContext, RuntimeSchedulerView, SegmentationCurrentState, SegmentationCurrentView,
+    SemanticCurrentView, WorkBindingCurrentView, WorkIdentityCurrentView, object_deletion_preview,
+    reduce_journal, repository_scope_purge_preview,
 };
 pub use purge::{
     OBJECT_DELETION_ALGORITHM_REVISION, ObjectDeletionCandidateAdmission,

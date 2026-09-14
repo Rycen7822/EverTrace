@@ -603,7 +603,28 @@ pub(crate) fn current(
     {
         return Err(SemanticServiceError::BaseConflict);
     }
-    if existing.is_none()
+    validate_frozen_target(snapshot, &view, &usage, &input)?;
+    Ok(input)
+}
+
+fn validate_frozen_target(
+    snapshot: &ProjectionSnapshot,
+    view: &SemanticCurrentView,
+    usage: &crate::procedure::ProcedureUsageCurrentView,
+    input: &Input,
+) -> Result<(), SemanticServiceError> {
+    let proposal = &input.proposal;
+    if let Some(existing) = &input.existing {
+        if usage.current_procedure_by_revision(existing.revision_id) != Some(existing) {
+            return Err(SemanticServiceError::BaseConflict);
+        }
+        if accepted(view, existing)? != proposal {
+            return Err(SemanticServiceError::BaseConflict);
+        }
+    } else if !view.proposals.values().any(|current| current == proposal) {
+        return Err(SemanticServiceError::BaseConflict);
+    }
+    if input.existing.is_none()
         && let Some(evertrace_domain::semantic::ProposalTargetId::Procedure(id)) =
             proposal.target_id
         && proposal.base_revision_id.is_none_or(|revision| {
@@ -621,7 +642,7 @@ pub(crate) fn current(
     ) {
         return Err(SemanticServiceError::BaseConflict);
     }
-    Ok(input)
+    Ok(())
 }
 
 pub(crate) async fn allowed(
@@ -643,13 +664,25 @@ pub(crate) async fn allowed(
     allowed_input(writer, snapshot, job, &input, report).await
 }
 
-async fn allowed_input(
+pub(crate) async fn allowed_input(
     writer: &crate::WriterHandle,
     snapshot: &ProjectionSnapshot,
     job: &DurableJob,
     input: &Input,
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<bool, SemanticServiceError> {
+    let validation = {
+        let view = SemanticCurrentView::from_snapshot(snapshot)?;
+        let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(snapshot)?;
+        validate_frozen_target(snapshot, &view, &usage, input)
+    };
+    match validation {
+        Ok(()) => {}
+        Err(SemanticServiceError::BaseConflict | SemanticServiceError::InvalidInput) => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    }
     let ProposalPayload::Procedure(payload) = &input.proposal.payload else {
         unreachable!()
     };
@@ -928,22 +961,24 @@ fn content(draft: &ProcedureDraft) -> ProviderProcedureContent {
 pub(crate) async fn execute(
     writer: &crate::WriterHandle,
     planner: &super::SynthesisPlanner,
-    snapshot: &ProjectionSnapshot,
+    snapshot: ProjectionSnapshot,
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
     at: i64,
     runtime: &evertrace_capture::RuntimeSnapshot,
-) -> Result<JournalCommand, SemanticServiceError> {
+) -> Result<(JournalCommand, Option<Input>), SemanticServiceError> {
     if source::is_source(job) {
         return Box::pin(source::execute(
             writer, planner, snapshot, job, report, at, runtime,
         ))
-        .await;
+        .await
+        .map(|command| (command, None));
     }
-    let input = current(snapshot, job)?;
-    if !allowed_input(writer, snapshot, job, &input, report).await? {
+    let input = current(&snapshot, job)?;
+    if !allowed_input(writer, &snapshot, job, &input, report).await? {
         return Err(SemanticServiceError::BaseConflict);
     }
+    drop(snapshot);
     let mut payloads = Vec::new();
     let mut reason = JobTerminalReason::Completed;
     if needs_model(&input) && job.model_id.is_some() {
@@ -966,7 +1001,7 @@ pub(crate) async fn execute(
                         .project()
                         .await
                         .map_err(|_| crate::provider::ProviderError::Transport)?;
-                    if allowed(writer, &snapshot, job, report)
+                    if allowed_input(writer, &snapshot, job, &input, report)
                         .await
                         .unwrap_or(false)
                     {
@@ -976,6 +1011,14 @@ pub(crate) async fn execute(
                     }
                 })
                 .await;
+            let current = writer
+                .project()
+                .await
+                .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+            if !allowed_input(writer, &current, job, &input, report).await? {
+                return Err(SemanticServiceError::BaseConflict);
+            }
+            let snapshot = &current;
             match response {
                 Ok((Some(value), input_tokens, output_tokens))
                     if input_tokens <= job.budget.max_input_tokens.unwrap_or(0)
@@ -1087,7 +1130,7 @@ pub(crate) async fn execute(
             reason = JobTerminalReason::SourceUnavailable;
         }
     }
-    finish(job, payloads, reason, at)
+    Ok((finish(job, payloads, reason, at)?, Some(input)))
 }
 
 fn finish(

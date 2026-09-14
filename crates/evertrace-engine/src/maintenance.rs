@@ -2476,7 +2476,7 @@ impl BackgroundScheduler {
                     .await?
                 {
                     // Permission revalidation may itself record a revocation.
-                    let frontier = self.writer.project().await.map_err(map_writer)?.frontier;
+                    let frontier = self.writer.sync_frontier().await.map_err(map_writer)?;
                     self.fail_stale(&claimed.job, frontier).await?;
                     completed += 1;
                     continue;
@@ -2492,13 +2492,20 @@ impl BackgroundScheduler {
                     ),
                     Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. })
                 );
+                let ClaimedJob {
+                    snapshot,
+                    job,
+                    report: claim_report,
+                } = claimed;
+                drop(claim_report);
+                let claim_frontier = snapshot.frontier;
                 let execution_future = async {
                     if source_job {
                         let report = self.report.read().await.clone();
                         self.synthesis
                             .execute_source_job(
-                                &claimed.snapshot,
-                                &claimed.job,
+                                snapshot,
+                                &job,
                                 self.runtime.effective_config_hash,
                                 occurred_at_us,
                                 max_synthesis_wall_time,
@@ -2509,12 +2516,28 @@ impl BackgroundScheduler {
                             .await
                     } else {
                         self.synthesis
-                            .execute_durable_job(
-                                &claimed.snapshot,
-                                &claimed.job,
-                                self.runtime.effective_config_hash,
+                            .execute_owned_episode_job(
+                                snapshot,
+                                &job,
                                 occurred_at_us,
                                 max_synthesis_wall_time,
+                                &self.writer,
+                                || async {
+                                    let current =
+                                        self.writer.project().await.map_err(|_| {
+                                            crate::provider::ProviderError::Transport
+                                        })?;
+                                    if current.frontier == claim_frontier
+                                        && self
+                                            .synthesis_repository_allowed(&current, &job)
+                                            .await
+                                            .unwrap_or(false)
+                                    {
+                                        Ok(())
+                                    } else {
+                                        Err(crate::provider::ProviderError::Disabled)
+                                    }
+                                },
                             )
                             .await
                     }
@@ -2535,23 +2558,20 @@ impl BackgroundScheduler {
                     }
                     Ok(Ok(command)) => {
                         if source_job {
-                            let result = self.commit_source_synthesis(&claimed, command).await?;
+                            let result = self.commit_source_synthesis(&job, command).await?;
                             completed += result.completed;
                             retryable |= result.retryable;
                             continue;
                         }
-                        if !self
-                            .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
-                            .await?
-                        {
-                            self.fail_stale(&claimed.job, claimed.snapshot.frontier)
-                                .await?;
+                        let current = self.writer.project().await.map_err(map_writer)?;
+                        if !self.synthesis_repository_allowed(&current, &job).await? {
+                            self.fail_stale(&job, current.frontier).await?;
                             completed += 1;
                             continue;
                         }
                         match self
                             .writer
-                            .commit_if_frontier(command, now_us()?, claimed.snapshot.frontier)
+                            .commit_if_frontier(command, now_us()?, claim_frontier)
                             .await
                         {
                             Ok(outcome) => completed += usize::from(!outcome.replayed),
@@ -2560,8 +2580,16 @@ impl BackgroundScheduler {
                         }
                     }
                     Ok(Err(_)) => {
-                        self.fail_stale(&claimed.job, claimed.snapshot.frontier)
-                            .await?;
+                        let current = self.writer.project().await.map_err(map_writer)?;
+                        if !RuntimeSchedulerView::from_snapshot(&current)
+                            .map_err(|_| BackgroundSchedulerError::Store)?
+                            .jobs
+                            .iter()
+                            .any(|current| current == &job)
+                        {
+                            continue;
+                        }
+                        self.fail_stale(&job, current.frontier).await?;
                         completed += 1;
                     }
                 }
@@ -2578,33 +2606,57 @@ impl BackgroundScheduler {
         claimed: ClaimedJob,
         remaining: Duration,
     ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        let ClaimedJob {
+            snapshot,
+            job,
+            report: claim_report,
+        } = claimed;
+        drop(claim_report);
         let report = self.report.read().await.clone();
         let at = now_us()?;
         let result = tokio::time::timeout(
-            remaining.min(Duration::from_millis(claimed.job.budget.max_wall_time_ms)),
+            remaining.min(Duration::from_millis(job.budget.max_wall_time_ms)),
             crate::jobs::procedure::execute(
                 &self.writer,
                 &self.synthesis,
-                &claimed.snapshot,
-                &claimed.job,
+                snapshot,
+                &job,
                 report.as_ref(),
                 at,
                 &self.runtime,
             ),
         )
         .await;
-        let command = match result {
+        let (command, input) = match result {
             Ok(Ok(command)) => command,
             Ok(Err(crate::semantic::SemanticServiceError::Store(_))) => {
                 return Err(BackgroundSchedulerError::Store);
             }
-            _ => {
+            failure => {
+                let current = self.writer.project().await.map_err(map_writer)?;
+                if !RuntimeSchedulerView::from_snapshot(&current)
+                    .map_err(|_| BackgroundSchedulerError::Store)?
+                    .jobs
+                    .iter()
+                    .any(|current| current == &job)
+                {
+                    return Ok(BackgroundProgress::default());
+                }
+                let reason = if matches!(
+                    failure,
+                    Ok(Err(crate::semantic::SemanticServiceError::BaseConflict
+                        | crate::semantic::SemanticServiceError::InvalidInput))
+                ) {
+                    JobTerminalReason::StaleGeneration
+                } else {
+                    JobTerminalReason::SourceUnavailable
+                };
                 return self
                     .finish_job(
-                        &claimed.job,
-                        self.writer.project().await.map_err(map_writer)?.frontier,
+                        &job,
+                        self.writer.sync_frontier().await.map_err(map_writer)?,
                         JobTerminalOutcome::Failed,
-                        JobTerminalReason::SourceUnavailable,
+                        reason,
                     )
                     .await;
             }
@@ -2630,23 +2682,28 @@ impl BackgroundScheduler {
             let snapshot = self.writer.project().await.map_err(map_writer)?;
             let view = RuntimeSchedulerView::from_snapshot(&snapshot)
                 .map_err(|_| BackgroundSchedulerError::Store)?;
-            if !view.jobs.iter().any(|job| job == &claimed.job) {
+            if !view.jobs.iter().any(|current| current == &job) {
                 return Ok(BackgroundProgress::default());
             }
-            if now_us()? >= claimed.job.lease_until_us.unwrap_or(0)
-                || !crate::jobs::procedure::allowed(
+            let allowed = if let Some(input) = &input {
+                crate::jobs::procedure::allowed_input(
                     &self.writer,
                     &snapshot,
-                    &claimed.job,
+                    &job,
+                    input,
                     report.as_ref(),
                 )
                 .await
-                .map_err(|_| BackgroundSchedulerError::Store)?
-            {
-                let frontier = self.writer.project().await.map_err(map_writer)?.frontier;
+            } else {
+                crate::jobs::procedure::allowed(&self.writer, &snapshot, &job, report.as_ref())
+                    .await
+            }
+            .map_err(|_| BackgroundSchedulerError::Store)?;
+            if now_us()? >= job.lease_until_us.unwrap_or(0) || !allowed {
+                let frontier = self.writer.sync_frontier().await.map_err(map_writer)?;
                 return self
                     .finish_job(
-                        &claimed.job,
+                        &job,
                         frontier,
                         JobTerminalOutcome::Failed,
                         JobTerminalReason::StaleGeneration,
@@ -2690,7 +2747,7 @@ impl BackgroundScheduler {
 
     async fn commit_source_synthesis(
         &self,
-        claimed: &ClaimedJob,
+        job: &DurableJob,
         command: JournalCommand,
     ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
         let id = command.command_id();
@@ -2700,18 +2757,27 @@ impl BackgroundScheduler {
             .map(|event| event.payload.clone())
             .collect::<Vec<_>>();
         for _ in 0..3 {
+            if self
+                .writer
+                .committed_command(id)
+                .await
+                .map_err(map_writer)?
+                .is_some_and(|committed| committed.payloads == expected)
+            {
+                return Ok(BackgroundProgress {
+                    completed: 1,
+                    retryable: false,
+                });
+            }
             let snapshot = self.writer.project().await.map_err(map_writer)?;
             let jobs = RuntimeSchedulerView::from_snapshot(&snapshot)
                 .map_err(|_| BackgroundSchedulerError::Store)?;
-            if !jobs.jobs.iter().any(|job| job == &claimed.job) {
+            if !jobs.jobs.iter().any(|current| current == job) {
                 return Ok(BackgroundProgress::default());
             }
-            if !self
-                .synthesis_repository_allowed(&snapshot, &claimed.job)
-                .await?
-            {
+            if !self.synthesis_repository_allowed(&snapshot, job).await? {
                 let frontier = self.writer.project().await.map_err(map_writer)?.frontier;
-                self.fail_stale(&claimed.job, frontier).await?;
+                self.fail_stale(job, frontier).await?;
                 return Ok(BackgroundProgress {
                     completed: 1,
                     retryable: false,
@@ -3057,8 +3123,25 @@ impl BackgroundScheduler {
                         _ = wait_for_shutdown(&mut shutdown) => return Ok(()),
                     };
                     let delay = tokio::select! {
-                        result = self.next_wake_after(progress.retryable) => result?,
+                        // A pending notification already requires another round; avoid
+                        // reading a sleep snapshot that would immediately be discarded.
+                        biased;
                         _ = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                        changed = wakeup.changed() => {
+                            if changed.is_err() {
+                                return Ok(());
+                            }
+                            self.capture_cursor.lock().await.notified();
+                            Duration::ZERO
+                        }
+                        changed = durable.changed() => {
+                            if changed.is_err() {
+                                return Ok(());
+                            }
+                            self.capture_cursor.lock().await.notified();
+                            Duration::ZERO
+                        }
+                        result = self.next_wake_after(progress.retryable) => result?,
                     };
                     run_at = tokio::time::Instant::now() + delay;
                     tokio::task::yield_now().await;
@@ -4055,6 +4138,8 @@ impl BackgroundScheduler {
             .await
         {
             Ok(_) => {
+                drop(view);
+                drop(snapshot);
                 let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
                 let view = RuntimeSchedulerView::from_snapshot(&snapshot)
                     .map_err(|_| BackgroundSchedulerError::Store)?;

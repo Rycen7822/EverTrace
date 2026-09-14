@@ -21,7 +21,7 @@ pub(crate) use access::read_inventory_snapshot;
 pub(crate) use access::{
     blocked_repositories, blocked_repositories_before, read_inventory, read_inventory_before,
     read_procedure_historical_inventory, record_trust_revocations, repository_read_gate,
-    row_repository_contexts,
+    row_repository_contexts, row_repository_contexts_from_scopes,
 };
 pub(crate) use host_context::NativeHostContext;
 pub use host_context::NativeHostPeer;

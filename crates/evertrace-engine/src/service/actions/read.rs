@@ -205,11 +205,6 @@ impl McpActionService {
                 .difference(&reviewed_candidates)
                 .map(|reference| (*reference).to_owned()),
         );
-        let fresh = self
-            .writer
-            .project()
-            .await
-            .map_err(|_| McpServiceError::Store)?;
         let method_hits = found
             .candidates
             .iter()
@@ -218,22 +213,31 @@ impl McpActionService {
                 candidate.object_kind.as_deref() == Some("revision_proposal_revision")
             })
             .map(|candidate| candidate.candidate_id.clone())
-            .collect();
-        let methods = crate::jobs::procedure::readable_revisions(
-            &self.writer,
-            &fresh,
-            scope
-                .binding
-                .repository_report
-                .as_deref()
-                .or(report.as_ref()),
-            self.runtime_snapshot.effective_config_hash,
-            (scope.anchor.repository_id, scope.anchor.worktree_id),
-            Some(&method_hits),
-            method_deadline,
-        )
-        .await
-        .map_err(|_| McpServiceError::Store)?;
+            .collect::<BTreeSet<_>>();
+        let methods = if method_hits.is_empty() {
+            BTreeSet::new()
+        } else {
+            let fresh = self
+                .writer
+                .project()
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            crate::jobs::procedure::readable_revisions(
+                &self.writer,
+                &fresh,
+                scope
+                    .binding
+                    .repository_report
+                    .as_deref()
+                    .or(report.as_ref()),
+                self.runtime_snapshot.effective_config_hash,
+                (scope.anchor.repository_id, scope.anchor.worktree_id),
+                Some(&method_hits),
+                method_deadline,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?
+        };
         let now = unix_time_us_for_mcp();
         let mut procedure_revisions = Vec::new();
         for candidate in found.candidates.into_iter().take(3) {

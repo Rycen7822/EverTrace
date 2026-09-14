@@ -2741,6 +2741,38 @@ async fn local_harm_quarantines_new_apply_and_delays_promotion_until_next_succes
     let expected_review_revision = selection.review_revision_id;
     let (handle, writer_task) = spawn_writer(writer, 8).unwrap();
     let service = HumanGovernanceService::new(handle.clone(), CONFIG);
+    let page = service
+        .list(evertrace_engine::HumanSurface::Inbox, None, None, 64)
+        .await
+        .unwrap()
+        .unwrap();
+    let item = page
+        .items
+        .iter()
+        .find(|item| {
+            item.negative_review
+                .as_ref()
+                .is_some_and(|review| review.negative_evidence_id == localized_id)
+        })
+        .unwrap();
+    assert_eq!(
+        item.negative_review
+            .as_ref()
+            .unwrap()
+            .current_review_revision_id,
+        expected_review_revision
+    );
+    let detail = service
+        .detail(
+            evertrace_engine::HumanSurface::Inbox,
+            &item.stable_key,
+            page.frontier,
+            item.revision_ref.as_deref(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.items[0].negative_review, item.negative_review);
     let request_id = RequestId::new_v7();
     assert!(matches!(
         service

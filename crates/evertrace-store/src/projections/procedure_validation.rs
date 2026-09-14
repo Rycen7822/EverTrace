@@ -1,6 +1,66 @@
 use super::procedure::NegativeReviewActionReason;
 use super::*;
 
+/// Borrow only the state consumed by Procedure history and relation validation.
+struct ProcedureRelationInputs<'a> {
+    procedure: &'a procedure::ProcedureState,
+    work_bindings: &'a BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
+    attempt_revisions: &'a BTreeMap<RevisionId, (Attempt, u64)>,
+    operation_revisions: &'a BTreeMap<(OperationId, u32), (Operation, u64)>,
+    host_occurrence_revisions: &'a BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
+    episode_revisions: &'a BTreeMap<RevisionId, (WorkEpisode, u64)>,
+    experiment_run_revisions: &'a BTreeMap<RevisionId, (ExperimentRun, u64)>,
+    result_evidence_revisions: &'a BTreeMap<RevisionId, (ResultEvidence, u64)>,
+    scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
+    source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    tasks: &'a BTreeMap<TaskId, (Task, u64)>,
+}
+
+impl<'a> From<&'a JournalAdmissionState> for ProcedureRelationInputs<'a> {
+    fn from(state: &'a JournalAdmissionState) -> Self {
+        Self {
+            procedure: &state.procedure,
+            work_bindings: &state.work_bindings,
+            attempt_revisions: &state.attempt_revisions,
+            operation_revisions: &state.operation_revisions,
+            host_occurrence_revisions: &state.host_occurrence_revisions,
+            episode_revisions: &state.episode_revisions,
+            experiment_run_revisions: &state.experiment_run_revisions,
+            result_evidence_revisions: &state.result_evidence_revisions,
+            scope_effects: &state.scope_effects,
+            source_observations: &state.source_observations,
+            source_receipts: &state.source_receipts,
+            tasks: &state.tasks,
+        }
+    }
+}
+
+impl<'a> From<&'a ReducerState> for ProcedureRelationInputs<'a> {
+    fn from(state: &'a ReducerState) -> Self {
+        Self {
+            procedure: &state.procedure,
+            work_bindings: &state.work_bindings,
+            attempt_revisions: &state.attempt_revisions,
+            operation_revisions: &state.operation_revisions,
+            host_occurrence_revisions: &state.host_occurrence_revisions,
+            episode_revisions: &state.episode_revisions,
+            experiment_run_revisions: &state.experiment_run_revisions,
+            result_evidence_revisions: &state.result_evidence_revisions,
+            scope_effects: &state.scope_effects,
+            source_observations: &state.source_observations,
+            source_receipts: &state.source_receipts,
+            tasks: &state.tasks,
+        }
+    }
+}
+
+impl ReducerState {
+    pub(super) fn validate_procedure_relations(&self) -> Result<(), StoreError> {
+        ProcedureRelationInputs::from(self).validate_procedure_relations()
+    }
+}
+
 fn procedure_usage_scope_matches(
     scope: &evertrace_domain::procedure::ProcedureScope,
     usage: &evertrace_domain::procedure::ProcedureUsageRevision,
@@ -61,7 +121,7 @@ struct ProcedureHistoryIndex<'a> {
 }
 
 impl<'a> ProcedureHistoryIndex<'a> {
-    fn new(state: &'a JournalAdmissionState) -> Result<Self, StoreError> {
+    fn new(state: &ProcedureRelationInputs<'a>) -> Result<Self, StoreError> {
         current_binding_lineage(state.work_bindings.values().map(|(value, _)| value))?;
         let mut index = Self {
             bindings: BTreeMap::new(),
@@ -251,6 +311,10 @@ impl<'a> ProcedureHistoryIndex<'a> {
 }
 
 impl JournalAdmissionState {
+    pub(super) fn validate_procedure_relations(&self) -> Result<(), StoreError> {
+        ProcedureRelationInputs::from(self).validate_procedure_relations()
+    }
+
     pub(super) fn validate_procedure_usage_command<'a>(
         &self,
         payloads: impl IntoIterator<Item = &'a JournalPayload>,
@@ -266,7 +330,8 @@ impl JournalAdmissionState {
         }) {
             return Ok(());
         }
-        let history = ProcedureHistoryIndex::new(self)?;
+        let inputs = ProcedureRelationInputs::from(self);
+        let history = ProcedureHistoryIndex::new(&inputs)?;
         for usage in payloads.iter().filter_map(|payload| match payload {
             JournalPayload::ProcedureUsageRecorded(value) => Some(value.as_ref()),
             _ => None,
@@ -378,7 +443,7 @@ impl JournalAdmissionState {
             if usage.action_aligned == evertrace_domain::procedure::ProcedureTruth::True
                 || usage.outcome_supported == evertrace_domain::procedure::ProcedureTruth::True
             {
-                self.validate_procedure_physical_usage(usage, u64::MAX, &history)?;
+                inputs.validate_procedure_physical_usage(usage, u64::MAX, &history)?;
             }
         }
         for negative in payloads.iter().filter_map(|payload| match payload {
@@ -409,7 +474,12 @@ impl JournalAdmissionState {
                         .as_ref()
                         .is_none_or(|context| !context.compatible(&target_usage.local_context))
             });
-            self.validate_procedure_negative(negative, u64::MAX, cross_context_repeated, &history)?;
+            inputs.validate_procedure_negative(
+                negative,
+                u64::MAX,
+                cross_context_repeated,
+                &history,
+            )?;
         }
         for review in payloads.iter().filter_map(|payload| match payload {
             JournalPayload::ProcedureNegativeReviewRecorded(value)
@@ -419,11 +489,13 @@ impl JournalAdmissionState {
             }
             _ => None,
         }) {
-            self.validate_procedure_review(review, u64::MAX, &history)?;
+            inputs.validate_procedure_review(review, u64::MAX, &history)?;
         }
         Ok(())
     }
+}
 
+impl ProcedureRelationInputs<'_> {
     fn validate_procedure_physical_usage(
         &self,
         usage: &evertrace_domain::procedure::ProcedureUsageRevision,
@@ -990,7 +1062,7 @@ impl JournalAdmissionState {
                             prior.task_id != negative.task_id
                             && prior.level
                                 == evertrace_domain::procedure::ProcedureNegativeLevel::SuspectedHarm
-                            && independent_task_ids(&self.tasks, prior.task_id, negative.task_id)
+                            && independent_task_ids(self.tasks, prior.task_id, negative.task_id)
                             && prior.local_context.as_ref().is_none_or(|context| {
                                 !context.compatible(&usage.local_context)
                             })
@@ -1061,7 +1133,7 @@ impl JournalAdmissionState {
                     }
                     for (index, usage) in successes.iter().enumerate() {
                         if successes[..index].iter().any(|other| {
-                            !independent_task_ids(&self.tasks, other.task_id, usage.task_id)
+                            !independent_task_ids(self.tasks, other.task_id, usage.task_id)
                         }) {
                             return Err(StoreError::StoreCorrupt);
                         }

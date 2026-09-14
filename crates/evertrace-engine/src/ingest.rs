@@ -694,7 +694,10 @@ impl EvidenceIngestor {
                 return Ok(progress);
             }
             if committed != 0 {
-                self.writer.project().await.map_err(map_writer_error)?;
+                self.writer
+                    .sync_frontier()
+                    .await
+                    .map_err(map_writer_error)?;
             }
             let consumed = committed
                 .checked_add(terminal.len())

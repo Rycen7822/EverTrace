@@ -608,7 +608,7 @@ impl SynthesisPlanner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_source_job(
         &self,
-        snapshot: &ProjectionSnapshot,
+        snapshot: ProjectionSnapshot,
         job: &DurableJob,
         effective_config_hash: [u8; 32],
         occurred_at_us: i64,
@@ -626,7 +626,7 @@ impl SynthesisPlanner {
         {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let input = input(snapshot, job)?;
+        let mut input = input(&snapshot, job)?;
         let cas = evertrace_capture::CasStore::open(runtime.cas_dir.clone())
             .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
         let mut direct_delta = Vec::new();
@@ -666,40 +666,59 @@ impl SynthesisPlanner {
                     .into(),
             direct_refs: truncated,
         });
-        let resolution = self
-            .execute_admitted(
-                SynthesisRequest {
-                    snapshot,
-                    target: SynthesisTarget::Source {
-                        source: input.source.clone(),
-                        after_sequence: input.after_sequence,
-                        through_sequence: input.through_sequence,
-                    },
-                    trigger: SemanticDigestTrigger::SourceMessages,
-                    direct_delta,
-                    selected_direct_refs: input.refs.clone(),
-                    command_id: CommandId::new_v7(),
-                    occurred_at_us,
-                    algorithm_revision: job.algorithm_revision.clone(),
-                    effective_config_hash: job.config_hash,
+        let prepared = self.prepare(
+            SynthesisRequest {
+                snapshot: &snapshot,
+                target: SynthesisTarget::Source {
+                    source: input.source.clone(),
+                    after_sequence: input.after_sequence,
+                    through_sequence: input.through_sequence,
                 },
-                || async {
-                    let current = writer
-                        .project()
-                        .await
-                        .map_err(|_| ProviderError::Disabled)?;
-                    if allowed(writer, report, &current, &input, job.config_hash)
-                        .await
-                        .map_err(|_| ProviderError::Disabled)?
-                    {
-                        Ok(())
-                    } else {
-                        Err(ProviderError::Disabled)
-                    }
-                },
-                omission,
-            )
-            .await?;
+                trigger: SemanticDigestTrigger::SourceMessages,
+                direct_delta,
+                selected_direct_refs: input.refs.clone(),
+                command_id: CommandId::new_v7(),
+                occurred_at_us,
+                algorithm_revision: job.algorithm_revision.clone(),
+                effective_config_hash: job.config_hash,
+            },
+            omission,
+        )?;
+        drop(snapshot);
+        drop(cas);
+        input.receipts.clear();
+        let resolution = match prepared {
+            Err(resolution) => resolution,
+            Ok(prepared) => {
+                let started = std::time::Instant::now();
+                let derived = self
+                    .derive_prepared(&prepared, || async {
+                        let current = writer
+                            .project()
+                            .await
+                            .map_err(|_| ProviderError::Disabled)?;
+                        if allowed(writer, report, &current, &input, job.config_hash)
+                            .await
+                            .map_err(|_| ProviderError::Disabled)?
+                        {
+                            Ok(())
+                        } else {
+                            Err(ProviderError::Disabled)
+                        }
+                    })
+                    .await;
+                let elapsed = started.elapsed();
+                let current = writer
+                    .project()
+                    .await
+                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+                if !allowed(writer, report, &current, &input, job.config_hash).await? {
+                    return Err(crate::semantic::SemanticServiceError::BaseConflict);
+                }
+                self.finish_prepared(prepared, &current, derived, elapsed)
+                    .await?
+            }
+        };
         durable_resolution(job, resolution, occurred_at_us, EventScope::default())
     }
 }
