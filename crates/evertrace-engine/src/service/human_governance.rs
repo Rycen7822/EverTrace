@@ -1495,6 +1495,10 @@ impl HumanGovernanceService {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Summaries own their selected data; these full temporary views have
+        // no consumers in the subsequent asynchronous detail enrichment.
+        drop(semantic_view);
+        drop(usage_view);
         if surface == HumanSurface::Explorer {
             self.restrict_import_evidence(&snapshot, &mut items).await?;
         }
