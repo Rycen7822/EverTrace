@@ -307,6 +307,55 @@ impl McpActionService {
             self.bindings
                 .retain_inventory_report(connection_id, &binding);
         }
+        if matches!(action, McpServiceAction::Search | McpServiceAction::Get)
+            && input != "@due"
+            && !work::has_work_refs(action, &input, &refs)
+        {
+            let mut request = evertrace_store::ScopeCurrentRequest {
+                session: binding
+                    .anchor
+                    .as_ref()
+                    .map(|anchor| anchor.session_id.clone()),
+                agent: binding
+                    .anchor
+                    .as_ref()
+                    .and_then(|anchor| anchor.agent_id.clone()),
+                paths: vec![client_cwd.clone()],
+                ..Default::default()
+            };
+            match &binding.workspace {
+                evertrace_codex::binding::PublicWorkspace::Repository(id) => {
+                    request.repository = Some(*id)
+                }
+                evertrace_codex::binding::PublicWorkspace::Worktree(id) => {
+                    request.worktree = Some(*id)
+                }
+                evertrace_codex::binding::PublicWorkspace::PathHint(path) => {
+                    request.paths.push(path.clone())
+                }
+                evertrace_codex::binding::PublicWorkspace::Active => {}
+            }
+            let facts = self
+                .writer
+                .scope_current_context(request)
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            let anchor = super::scope::resolve_current_anchor(&facts, &binding, &client_cwd);
+            if anchor.is_none()
+                || (anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.task_id.is_none())
+                    && binding.anchor.is_some()
+                    && !refs.is_empty())
+            {
+                return Box::pin(
+                    self.passive_source_read(request_id, action, binding, input, refs),
+                )
+                .await;
+            }
+        }
+        // Full consumers resolve again from their own complete snapshot. Do
+        // not combine a previously selected chain with a newer projection.
         let snapshot = self
             .writer
             .project()
@@ -318,13 +367,15 @@ impl McpActionService {
                 .await;
         }
         let anchor = resolve_query_anchor(&snapshot, &binding, &client_cwd);
-        if anchor.is_none() || work::has_work_refs(action, &input, &refs) {
+        if work::has_work_refs(action, &input, &refs) {
             return self
                 .passive_work_read(request_id, action, binding, snapshot, input, refs)
                 .await;
         }
         let Some(anchor) = anchor else {
-            return Ok(scope_unresolved(request_id));
+            drop(snapshot);
+            return Box::pin(self.passive_source_read(request_id, action, binding, input, refs))
+                .await;
         };
         if anchor.task_id.is_none()
             && binding.anchor.is_some()
@@ -332,8 +383,8 @@ impl McpActionService {
                 || !matches!(action, McpServiceAction::Search | McpServiceAction::Get)
                 || input == "@due")
         {
-            return self
-                .passive_work_read(request_id, action, binding, snapshot, input, refs)
+            drop(snapshot);
+            return Box::pin(self.passive_source_read(request_id, action, binding, input, refs))
                 .await;
         }
         let scope = McpRequestScope {

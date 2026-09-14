@@ -60,6 +60,15 @@ enum WriterRequest {
         expected_frontier: u64,
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
+    ScopeCurrent {
+        request: evertrace_store::ScopeCurrentRequest,
+        reply: oneshot::Sender<Result<evertrace_store::ScopeCurrentContext, WriterActorError>>,
+    },
+    PassiveSourceCurrent {
+        selection: evertrace_store::PassiveSourceSelection,
+        reply:
+            oneshot::Sender<Result<evertrace_store::PassiveSourceCurrentContext, WriterActorError>>,
+    },
     CaptureCurrent {
         after: Option<String>,
         exact: Option<String>,
@@ -385,6 +394,30 @@ impl WriterHandle {
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)
+    }
+
+    pub(crate) async fn scope_current_context(
+        &self,
+        request: evertrace_store::ScopeCurrentRequest,
+    ) -> Result<evertrace_store::ScopeCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ScopeCurrent { request, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn passive_source_current_context(
+        &self,
+        selection: evertrace_store::PassiveSourceSelection,
+    ) -> Result<evertrace_store::PassiveSourceCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::PassiveSourceCurrent { selection, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
     pub(crate) async fn capture_current_context(
@@ -809,6 +842,38 @@ async fn run_writer(
                             .ok_or(WriterActorError::Stopped)?
                             .queued_gc_jobs();
                         let _ = reply.send(jobs);
+                    }
+                }
+                WriterRequest::ScopeCurrent { request, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .scope_current_context(&request)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::PassiveSourceCurrent { selection, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .passive_source_current_context(&selection)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
                     }
                 }
                 WriterRequest::CaptureCurrent {

@@ -27,7 +27,7 @@ pub(crate) use host_context::NativeHostContext;
 pub use host_context::NativeHostPeer;
 pub(crate) use session_catalog::{
     SESSION_ROOT_PROBE_BUDGET, freeze_native_namespace, read_report_path_trust_before,
-    read_report_repository_trust_before,
+    read_report_worktree_trust_before,
 };
 
 pub(crate) use git_probe::with_probe_deadline;

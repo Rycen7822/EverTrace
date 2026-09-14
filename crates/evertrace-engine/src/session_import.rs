@@ -1716,13 +1716,50 @@ pub(crate) fn source_summary_receipts(
         else {
             return Err(SessionImportServiceError::Corrupt);
         };
+        receipts.push(*receipt);
+    }
+    let suppressed =
+        evertrace_store::ObjectDeletionCandidateAdmissionView::for_source_refs(snapshot, refs)
+            .and_then(|view| view.source_refs_suppressed(refs))
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+    validate_source_summary_receipts(
+        source,
+        after_sequence,
+        through_sequence,
+        refs,
+        observations,
+        receipts,
+        suppressed,
+    )
+}
+
+pub(crate) fn validate_source_summary_receipts(
+    source: &evertrace_domain::semantic::SemanticSourceTarget,
+    after_sequence: u64,
+    through_sequence: u64,
+    refs: &[String],
+    observations: BTreeMap<String, Box<evertrace_domain::evidence::SourceObservation>>,
+    mut receipts: Vec<evertrace_domain::evidence::SourceReceipt>,
+    suppressed: bool,
+) -> Result<Vec<evertrace_domain::evidence::SourceReceipt>, SessionImportServiceError> {
+    if refs.is_empty()
+        || refs.len() > 64
+        || !refs.windows(2).all(|pair| pair[0] < pair[1])
+        || !evertrace_store::is_session_import_source(source.source_instance_id.as_str())
+    {
+        return Err(SessionImportServiceError::Corrupt);
+    }
+    for receipt in &receipts {
         let observation = observations
             .get(&receipt.source_receipt_id.to_string())
             .ok_or(SessionImportServiceError::Corrupt)?;
-        if !source.contains_message(&receipt, observation, after_sequence, through_sequence) {
+        if refs
+            .binary_search(&observation.source_observation_id.to_string())
+            .is_err()
+            || !source.contains_message(receipt, observation, after_sequence, through_sequence)
+        {
             return Err(SessionImportServiceError::Corrupt);
         }
-        receipts.push(*receipt);
     }
     receipts.sort_by_key(|receipt| receipt.source_sequence);
     if receipts.len() != refs.len()
@@ -1733,10 +1770,7 @@ pub(crate) fn source_summary_receipts(
     {
         return Err(SessionImportServiceError::Corrupt);
     }
-    if evertrace_store::ObjectDeletionCandidateAdmissionView::for_source_refs(snapshot, refs)
-        .and_then(|view| view.source_refs_suppressed(refs))
-        .map_err(|_| SessionImportServiceError::Corrupt)?
-    {
+    if suppressed {
         return Err(SessionImportServiceError::Unavailable);
     }
     Ok(receipts)

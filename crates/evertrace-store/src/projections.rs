@@ -2416,6 +2416,43 @@ pub struct CaptureCurrentItem {
     pub suppressed: bool,
 }
 
+/// The facts needed to resolve one caller's active chain and explicit shard.
+/// This is request-local input, not a projection snapshot.
+#[derive(Debug, Default)]
+pub struct ScopeCurrentContext {
+    pub facts: Vec<JournalPayload>,
+}
+
+#[derive(Debug, Default)]
+pub struct ScopeCurrentRequest {
+    pub session: Option<String>,
+    pub agent: Option<String>,
+    pub paths: Vec<String>,
+    pub repository: Option<RepositoryId>,
+    pub worktree: Option<WorktreeId>,
+}
+
+#[derive(Debug)]
+pub enum PassiveSourceSelection {
+    Session(String),
+    References(Vec<String>),
+}
+
+#[derive(Debug)]
+pub struct PassiveSourceCurrentContext {
+    pub items: Vec<PassiveSourceCurrentItem>,
+    pub scope_rows: Vec<ObjectRow>,
+    pub repositories: BTreeMap<RepositoryId, RepositoryInstance>,
+    pub worktrees: BTreeMap<WorktreeId, WorktreeInstance>,
+    pub truncated: bool,
+}
+
+#[derive(Debug)]
+pub struct PassiveSourceCurrentItem {
+    pub selected: ObjectRow,
+    pub sources: Vec<CaptureCurrentItem>,
+}
+
 #[derive(Clone)]
 struct SourceWatermarks {
     highest_revision: evertrace_domain::evidence::SourceRevision,
@@ -3420,6 +3457,436 @@ impl JournalAdmissionState {
         self.frontier
     }
 
+    pub(crate) fn passive_source_current_context(
+        &self,
+        selection: &PassiveSourceSelection,
+    ) -> Result<PassiveSourceCurrentContext, StoreError> {
+        let mut refs = Vec::new();
+        let mut truncated = false;
+        match selection {
+            PassiveSourceSelection::References(requested) => {
+                if requested.len() > 32 {
+                    return Err(StoreError::InvalidInput);
+                }
+                refs.extend(requested.iter().cloned());
+            }
+            PassiveSourceSelection::Session(session) => {
+                let mut recent = BTreeMap::new();
+                for (id, (receipt, seq)) in &self.source_receipts {
+                    if receipt.source_session_ref != *session
+                        || !(receipt.source_kind
+                            == evertrace_domain::evidence::EvidenceSourceKind::CodexSessionJsonl
+                            || (receipt.source_kind
+                                == evertrace_domain::evidence::EvidenceSourceKind::CodexHook
+                                && receipt.observation_role
+                                    == evertrace_domain::evidence::ObservationRole::Message))
+                        || self
+                            .repository_closures
+                            .values()
+                            .any(|closure| closure.references_source_receipt(receipt))
+                    {
+                        continue;
+                    }
+                    recent.insert(
+                        (*seq, format!("object:evidence:source_receipt:{id}")),
+                        id.to_string(),
+                    );
+                    if recent.len() > 32 {
+                        recent.pop_first();
+                        truncated = true;
+                    }
+                }
+                let sources = self
+                    .session_imports
+                    .values()
+                    .filter(|current| current.session_id == *session)
+                    .map(|current| current.source_instance())
+                    .collect::<BTreeSet<_>>();
+                for (id, (digest, seq)) in &self.synthesis.digests {
+                    if digest.task_id.is_some()
+                        || digest.repository_id.is_none()
+                        || digest.worktree_id.is_none()
+                        || !digest.source_target.as_ref().is_some_and(|source| {
+                            sources.contains(source.source_instance_id.as_str())
+                        })
+                        || self
+                            .repository_closures
+                            .values()
+                            .any(|closure| closure.references_digest(digest))
+                        || digest
+                            .selected_direct_refs
+                            .iter()
+                            .filter_map(|reference| reference.parse::<RevisionId>().ok())
+                            .any(|revision| {
+                                self.deletions
+                                    .events()
+                                    .any(|event| event.exact_revision_ids.contains(&revision))
+                            })
+                    {
+                        continue;
+                    }
+                    recent.insert(
+                        (*seq, format!("object:work:semantic_digest:{id}")),
+                        id.to_string(),
+                    );
+                    if recent.len() > 32 {
+                        recent.pop_first();
+                        truncated = true;
+                    }
+                }
+                refs.extend(recent.into_values().rev());
+            }
+        }
+        let mut items = Vec::new();
+        for reference in refs {
+            // MCP object/revision refs deliberately do not accept Capture row aliases.
+            let selected = if let Ok(id) = reference.parse::<SourceReceiptId>() {
+                self.source_receipts
+                    .get(&id)
+                    .map(|(v, seq)| source_receipt_row(v.clone(), *seq))
+                    .transpose()?
+            } else if let Ok(id) = reference.parse::<SourceObservationId>() {
+                self.source_observations
+                    .get(&id)
+                    .map(|(v, seq)| source_observation_row(v.clone(), *seq))
+                    .transpose()?
+            } else if let Ok(id) = reference.parse::<evertrace_domain::ids::SemanticDigestId>() {
+                self.synthesis
+                    .digests
+                    .get(&id)
+                    .filter(|(v, _)| v.source_target.is_some())
+                    .map(|(v, seq)| synthesis::digest_row(id, v.clone(), *seq))
+                    .transpose()?
+            } else {
+                None
+            };
+            let Some(selected) = selected else {
+                continue;
+            };
+            let Some(selected) = self.capture_product_rows(vec![selected])?.pop() else {
+                continue;
+            };
+            let payload: JournalPayload = serde_json::from_str(
+                selected
+                    .payload_json
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+            let mut paired = Vec::new();
+            let ids = match payload {
+                JournalPayload::SourceReceiptRecorded(v) => {
+                    paired.push((selected.clone(), v.source_observation_id));
+                    Vec::new()
+                }
+                JournalPayload::SourceObservationRecorded(v) => {
+                    paired.push((selected.clone(), v.source_observation_id));
+                    Vec::new()
+                }
+                JournalPayload::SemanticDigestRecorded(v) => v
+                    .selected_direct_refs
+                    .iter()
+                    .filter_map(|reference| reference.parse().ok())
+                    .collect(),
+                _ => return Err(StoreError::StoreCorrupt),
+            };
+            for id in ids {
+                if let Some((value, seq)) = self.source_observations.get(&id) {
+                    let rows = self
+                        .capture_product_rows(vec![source_observation_row(value.clone(), *seq)?])?;
+                    paired.extend(rows.into_iter().map(|row| (row, id)));
+                }
+            }
+            let sources = self.capture_selected_items(paired, false)?;
+            items.push(PassiveSourceCurrentItem { selected, sources });
+        }
+        let mut scope_rows = BTreeMap::new();
+        let mut repository_ids = BTreeSet::new();
+        let mut worktree_ids = BTreeSet::new();
+        for item in &items {
+            for row in std::iter::once(&item.selected)
+                .chain(item.sources.iter().flat_map(|source| &source.source_rows))
+            {
+                repository_ids.extend(
+                    row.repository_id
+                        .as_deref()
+                        .and_then(|id| id.parse::<RepositoryId>().ok()),
+                );
+                worktree_ids.extend(
+                    row.worktree_id
+                        .as_deref()
+                        .and_then(|id| id.parse::<WorktreeId>().ok()),
+                );
+            }
+            for row in item.sources.iter().flat_map(|source| &source.scope_rows) {
+                scope_rows.insert(row.row_id.clone(), row.clone());
+            }
+        }
+        let mut repositories = BTreeMap::new();
+        let mut worktrees = BTreeMap::new();
+        for id in &worktree_ids {
+            if let Some((tree, _)) = self.worktrees.get(id) {
+                repository_ids.insert(tree.repository_instance_id);
+            }
+        }
+        for id in repository_ids {
+            if let Some((repo, seq)) = self.repositories.get(&id)
+                && self.scope_fact_visible(
+                    &JournalPayload::RepositoryInstanceRecorded(Box::new(repo.clone())),
+                    *seq,
+                )?
+            {
+                // Two matching roots preserve the repository-only ambiguity gate.
+                let mut roots = 0;
+                for (tree, seq) in self.worktrees.values().filter(|(tree, _)| {
+                    tree.repository_instance_id == id
+                        && tree.current_path.as_deref() == Some(repo.current_path.as_str())
+                }) {
+                    if self.scope_fact_visible(
+                        &JournalPayload::WorktreeInstanceRecorded(Box::new(tree.clone())),
+                        *seq,
+                    )? {
+                        worktree_ids.insert(tree.worktree_instance_id);
+                        roots += 1;
+                        if roots == 2 {
+                            break;
+                        }
+                    }
+                }
+                repositories.insert(id, repo.clone());
+            }
+        }
+        for id in worktree_ids {
+            if let Some((tree, seq)) = self.worktrees.get(&id)
+                && self.scope_fact_visible(
+                    &JournalPayload::WorktreeInstanceRecorded(Box::new(tree.clone())),
+                    *seq,
+                )?
+            {
+                let row = physical_object_row(
+                    ObjectFamily::Work,
+                    "worktree",
+                    id.to_string(),
+                    format!("{id}@{}", tree.worktree_revision),
+                    &JournalPayload::WorktreeInstanceRecorded(Box::new(tree.clone())),
+                    *seq,
+                )?;
+                scope_rows.entry(row.row_id.clone()).or_insert(row);
+                worktrees.insert(id, tree.clone());
+            }
+        }
+        Ok(PassiveSourceCurrentContext {
+            items,
+            scope_rows: scope_rows.into_values().collect(),
+            repositories,
+            worktrees,
+            truncated,
+        })
+    }
+
+    pub(crate) fn scope_current_context(
+        &self,
+        request: &ScopeCurrentRequest,
+    ) -> Result<ScopeCurrentContext, StoreError> {
+        if request.paths.len() > 2 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut facts = Vec::new();
+        let mut repositories = BTreeSet::new();
+        let mut worktrees = BTreeSet::new();
+        repositories.extend(request.repository);
+        worktrees.extend(request.worktree);
+        if let Some(session) = request.session.as_deref() {
+            let mut lanes = Vec::new();
+            for (lane, seq) in self.execution_lanes.values().filter(|(lane, _)| {
+                lane.host_session_id == session
+                    && request
+                        .agent
+                        .as_deref()
+                        .is_none_or(|agent| lane.agent_id == agent)
+                    && lane.status == LaneStatus::Active
+            }) {
+                let payload = JournalPayload::ExecutionLaneRecorded(Box::new(lane.clone()));
+                if self.scope_fact_visible(&payload, *seq)? {
+                    lanes.push(lane);
+                    facts.push(payload);
+                    if lanes.len() == 2 {
+                        break;
+                    }
+                }
+            }
+            if let [lane] = lanes.as_slice() {
+                let mut streams = Vec::new();
+                for (stream, seq) in self.workstreams.values().filter(|(stream, _)| {
+                    stream.status == evertrace_domain::work::WorkstreamStatus::Active
+                        && stream.execution_lane_ids.contains(&lane.execution_lane_id)
+                }) {
+                    let payload = JournalPayload::WorkstreamRecorded(Box::new(stream.clone()));
+                    if self.scope_fact_visible(&payload, *seq)? {
+                        streams.push(stream);
+                        facts.push(payload);
+                        if streams.len() == 2 {
+                            break;
+                        }
+                    }
+                }
+                if let [stream] = streams.as_slice() {
+                    if let Some((task, seq)) = self.tasks.get(&stream.task_id) {
+                        let payload = JournalPayload::TaskRecorded(Box::new(task.clone()));
+                        if self.scope_fact_visible(&payload, *seq)? {
+                            facts.push(payload);
+                        }
+                    }
+                    if let Some((episode, seq)) = stream
+                        .active_episode_id
+                        .and_then(|id| self.episodes.get(&id))
+                    {
+                        let payload =
+                            JournalPayload::WorkEpisodeRecorded(Box::new(episode.clone()));
+                        if self.scope_fact_visible(&payload, *seq)? {
+                            facts.push(payload);
+                        }
+                    }
+                    repositories.extend(stream.repository_instance_id);
+                    worktrees.extend(stream.active_worktree_instance_id);
+                }
+            }
+        }
+        for path in &request.paths {
+            let path = std::path::Path::new(path);
+            let mut matched = 0;
+            for (tree, seq) in self.worktrees.values().filter(|(tree, _)| {
+                tree.lifecycle == evertrace_domain::repository::WorktreeLifecycle::Active
+                    && tree
+                        .current_path
+                        .as_deref()
+                        .is_some_and(|root| path.starts_with(root))
+            }) {
+                let payload = JournalPayload::WorktreeInstanceRecorded(Box::new(tree.clone()));
+                if self.scope_fact_visible(&payload, *seq)? {
+                    worktrees.insert(tree.worktree_instance_id);
+                    matched += 1;
+                    if matched == 2 {
+                        break;
+                    }
+                }
+            }
+            if matched == 0 {
+                for (repo, seq) in self
+                    .repositories
+                    .values()
+                    .filter(|(repo, _)| path.starts_with(&repo.current_path))
+                {
+                    let payload =
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repo.clone()));
+                    if self.scope_fact_visible(&payload, *seq)? {
+                        repositories.insert(repo.repository_id);
+                        matched += 1;
+                        if matched == 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for id in worktrees {
+            if let Some((tree, seq)) = self.worktrees.get(&id) {
+                let payload = JournalPayload::WorktreeInstanceRecorded(Box::new(tree.clone()));
+                if self.scope_fact_visible(&payload, *seq)? {
+                    repositories.insert(tree.repository_instance_id);
+                    facts.push(payload);
+                }
+            }
+        }
+        for id in repositories {
+            if let Some((repo, seq)) = self.repositories.get(&id) {
+                let payload = JournalPayload::RepositoryInstanceRecorded(Box::new(repo.clone()));
+                if self.scope_fact_visible(&payload, *seq)? {
+                    facts.push(payload);
+                }
+            }
+        }
+        Ok(ScopeCurrentContext { facts })
+    }
+
+    fn scope_fact_visible(&self, payload: &JournalPayload, seq: u64) -> Result<bool, StoreError> {
+        let (kind, id, revision) = match payload {
+            JournalPayload::ExecutionLaneRecorded(v) => (
+                "execution_lane",
+                v.execution_lane_id.to_string(),
+                format!("{}@{}", v.execution_lane_id, v.lane_revision),
+            ),
+            JournalPayload::RepositoryInstanceRecorded(v) => (
+                "repository",
+                v.repository_id.to_string(),
+                format!("{}@{}", v.repository_id, v.repository_revision),
+            ),
+            JournalPayload::WorktreeInstanceRecorded(v) => (
+                "worktree",
+                v.worktree_instance_id.to_string(),
+                format!("{}@{}", v.worktree_instance_id, v.worktree_revision),
+            ),
+            JournalPayload::TaskRecorded(v) => {
+                ("task", v.task_id.to_string(), v.revision_id.to_string())
+            }
+            JournalPayload::WorkstreamRecorded(v) => (
+                "workstream",
+                v.workstream_id.to_string(),
+                v.revision_id.to_string(),
+            ),
+            JournalPayload::WorkEpisodeRecorded(v) => (
+                "work_episode",
+                v.episode_id.to_string(),
+                v.revision_id.to_string(),
+            ),
+            _ => return Err(StoreError::InvalidInput),
+        };
+        let row = match payload {
+            JournalPayload::TaskRecorded(v) => work_identity_row(
+                kind,
+                id.clone(),
+                revision,
+                v.lifecycle.as_str(),
+                Some(id),
+                None,
+                None,
+                None,
+                payload,
+                seq,
+            )?,
+            JournalPayload::WorkstreamRecorded(v) => work_identity_row(
+                kind,
+                id.clone(),
+                revision,
+                v.status.as_str(),
+                Some(v.task_id.to_string()),
+                Some(id),
+                v.repository_instance_id.map(|id| id.to_string()),
+                v.active_worktree_instance_id.map(|id| id.to_string()),
+                payload,
+                seq,
+            )?,
+            JournalPayload::WorkEpisodeRecorded(v) => {
+                let mut row = work_identity_row(
+                    kind,
+                    id,
+                    revision.clone(),
+                    v.lifecycle_status.as_str(),
+                    Some(v.task_id.to_string()),
+                    Some(v.workstream_id.to_string()),
+                    v.repository_instance_id.map(|id| id.to_string()),
+                    v.worktree_instance_id.map(|id| id.to_string()),
+                    payload,
+                    seq,
+                )?;
+                row.row_id = format!("object:work:work_episode:{revision}");
+                row
+            }
+            _ => physical_object_row(ObjectFamily::Work, kind, id, revision, payload, seq)?,
+        };
+        Ok(!self.capture_product_rows(vec![row])?.is_empty())
+    }
+
     pub(crate) fn capture_current_context(
         &self,
         after: Option<&str>,
@@ -3495,6 +3962,19 @@ impl JournalAdmissionState {
         }
         let next_cursor = (selected.len() > limit).then(|| selected[limit - 1].0.row_id.clone());
         selected.truncate(limit);
+        Ok(CaptureCurrentContext {
+            frontier: self.frontier,
+            has_failed_job,
+            items: self.capture_selected_items(selected, true)?,
+            next_cursor,
+        })
+    }
+
+    fn capture_selected_items(
+        &self,
+        selected: Vec<(ObjectRow, SourceObservationId)>,
+        with_directory: bool,
+    ) -> Result<Vec<CaptureCurrentItem>, StoreError> {
         let mut items = Vec::with_capacity(selected.len());
         for (selected, id) in selected {
             let observation = self.source_observations.get(&id);
@@ -3559,7 +4039,7 @@ impl JournalAdmissionState {
             }
             let scope_rows = self.capture_product_rows(scope_rows)?;
             let mut directory = None;
-            if let Some((receipt, _)) = receipt {
+            if with_directory && let Some((receipt, _)) = receipt {
                 let mut matched = 0;
                 for current in self.session_imports.values().filter(|current| {
                     current.source_instance_id.as_deref()
@@ -3608,12 +4088,7 @@ impl JournalAdmissionState {
                 suppressed,
             });
         }
-        Ok(CaptureCurrentContext {
-            frontier: self.frontier,
-            has_failed_job,
-            items,
-            next_cursor,
-        })
+        Ok(items)
     }
 
     fn capture_product_rows(&self, rows: Vec<ObjectRow>) -> Result<Vec<ObjectRow>, StoreError> {
@@ -5407,6 +5882,37 @@ fn job_targets_repository(
 }
 
 impl RepositoryClosureKeys {
+    fn references_source_receipt(&self, value: &SourceReceipt) -> bool {
+        self.repository_id.is_some_and(|repository_id| {
+            self.imports_source(&value.source_instance_id)
+                || self.source_receipt_ids.contains(&value.source_receipt_id)
+                || self
+                    .source_observation_ids
+                    .contains(&value.source_observation_id)
+                || value.repository_instance_id == Some(repository_id)
+                || value
+                    .worktree_instance_id
+                    .is_some_and(|id| self.worktree_ids.contains(&id))
+        })
+    }
+
+    fn references_digest(&self, value: &evertrace_domain::semantic::SemanticDigest) -> bool {
+        self.repository_id.is_some_and(|repository_id| {
+            value.repository_id == Some(repository_id)
+                || value
+                    .episode_id
+                    .is_some_and(|id| self.episode_ids.contains(&id))
+                || value.selected_direct_refs.iter().any(|reference| {
+                    typed_text_references_target(
+                        reference,
+                        &self.source_observation_ids,
+                        &self.source_receipt_ids,
+                        &self.revision_ids,
+                    )
+                })
+        })
+    }
+
     fn references_source_observation(&self, value: &SourceObservation) -> bool {
         self.repository_id.is_some()
             && (self.imports_source(&value.source_instance_id)
@@ -5531,17 +6037,7 @@ impl RepositoryClosureKeys {
                         value.source_revision.clone(),
                     ))
             }
-            JournalPayload::SourceReceiptRecorded(value) => {
-                self.imports_source(&value.source_instance_id)
-                    || self.source_receipt_ids.contains(&value.source_receipt_id)
-                    || self
-                        .source_observation_ids
-                        .contains(&value.source_observation_id)
-                    || value.repository_instance_id == Some(repository_id)
-                    || value
-                        .worktree_instance_id
-                        .is_some_and(|id| self.worktree_ids.contains(&id))
-            }
+            JournalPayload::SourceReceiptRecorded(value) => self.references_source_receipt(value),
             JournalPayload::SourceObservationRecorded(value) => {
                 self.references_source_observation(value)
             }
@@ -5917,20 +6413,7 @@ impl RepositoryClosureKeys {
             JournalPayload::GlobalSupportValidationRecorded(value) => {
                 self.revision_ids.contains(&value.support_contract_ref)
             }
-            JournalPayload::SemanticDigestRecorded(value) => {
-                value.repository_id == Some(repository_id)
-                    || value
-                        .episode_id
-                        .is_some_and(|id| self.episode_ids.contains(&id))
-                    || value.selected_direct_refs.iter().any(|reference| {
-                        typed_text_references_target(
-                            reference,
-                            &self.source_observation_ids,
-                            &self.source_receipt_ids,
-                            &self.revision_ids,
-                        )
-                    })
-            }
+            JournalPayload::SemanticDigestRecorded(value) => self.references_digest(value),
             JournalPayload::SemanticDerivationRunRecorded(value) => {
                 value
                     .episode_id
@@ -13210,6 +13693,26 @@ mod tests {
                 confirmed_prefix_digest: indexed.then(|| "1".repeat(64)),
             };
             let mut incremental = JournalAdmissionState::default();
+            if source == "ordinary-source" {
+                let mut window = JournalAdmissionState::default();
+                for index in 1..=33u8 {
+                    let mut value = receipt.clone();
+                    value.source_receipt_id = SourceReceiptId::from_digest([index; 32]);
+                    value.observation_role = evertrace_domain::evidence::ObservationRole::Message;
+                    window
+                        .source_receipts
+                        .insert(value.source_receipt_id, (value, u64::from(index)));
+                }
+                let context = window
+                    .passive_source_current_context(&PassiveSourceSelection::Session(
+                        "session-a".into(),
+                    ))
+                    .unwrap();
+                assert!(context.truncated);
+                assert_eq!(context.items.len(), 32);
+                assert_eq!(context.items.first().unwrap().selected.source_event_seq, 33);
+                assert_eq!(context.items.last().unwrap().selected.source_event_seq, 2);
+            }
             incremental
                 .apply_payload(
                     JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
@@ -13237,6 +13740,34 @@ mod tests {
                 source_revision_ref(&receipt.source_instance_id, &receipt.source_revision);
             for admission in [&incremental, &rebuilt] {
                 assert_eq!(admission.source_receipts.len(), 1);
+                let selected = admission
+                    .passive_source_current_context(&PassiveSourceSelection::References(vec![
+                        receipt.source_receipt_id.to_string(),
+                    ]))
+                    .unwrap();
+                assert_eq!(selected.items.len(), 1);
+                assert_eq!(
+                    selected.items[0].selected,
+                    source_receipt_row(receipt.clone(), 1).unwrap()
+                );
+                assert!(
+                    admission
+                        .passive_source_current_context(&PassiveSourceSelection::References(vec![
+                            selected.items[0].selected.row_id.clone()
+                        ]))
+                        .unwrap()
+                        .items
+                        .is_empty()
+                );
+                assert!(
+                    admission
+                        .passive_source_current_context(&PassiveSourceSelection::Session(
+                            "other-session".into()
+                        ))
+                        .unwrap()
+                        .items
+                        .is_empty()
+                );
                 assert_eq!(admission.source_watermarks.contains_key(source), indexed);
                 let range = &admission.source_ranges[&source_ref];
                 assert_eq!(

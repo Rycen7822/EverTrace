@@ -201,6 +201,36 @@ fn source_pair(
     Ok(Some((*receipt, *observation)))
 }
 
+fn current_source_pair(
+    source: &evertrace_store::CaptureCurrentItem,
+) -> Result<
+    Option<(
+        evertrace_domain::evidence::SourceReceipt,
+        evertrace_domain::evidence::SourceObservation,
+    )>,
+    McpServiceError,
+> {
+    if source.suppressed {
+        return Ok(None);
+    }
+    let mut observation = None;
+    let mut receipt = None;
+    for row in &source.source_rows {
+        let payload: JournalPayload =
+            serde_json::from_str(row.payload_json.as_deref().ok_or(McpServiceError::Store)?)
+                .map_err(|_| McpServiceError::Store)?;
+        match payload {
+            JournalPayload::SourceObservationRecorded(value) => observation = Some(*value),
+            JournalPayload::SourceReceiptRecorded(value) => receipt = Some(*value),
+            _ => {}
+        }
+    }
+    Ok(receipt.zip(observation).filter(|(receipt, observation)| {
+        receipt.source_observation_id == observation.source_observation_id
+            && observation.source_receipt_ref == receipt.source_receipt_id
+    }))
+}
+
 fn submitted(
     receipt: &evertrace_domain::evidence::SourceReceipt,
     observation: &evertrace_domain::evidence::SourceObservation,
@@ -242,19 +272,43 @@ fn repository_visible(
     {
         return Ok(false);
     }
+    let current = evertrace_store::repository::RepositoryCurrentView::from_snapshot(snapshot)
+        .map_err(|_| McpServiceError::Store)?;
+    repository_visible_current(
+        &current.repositories,
+        &current.worktrees,
+        binding,
+        repository,
+        worktrees,
+        budget,
+    )
+}
+
+fn repository_visible_current(
+    repositories: &BTreeMap<
+        evertrace_domain::ids::RepositoryId,
+        evertrace_domain::repository::RepositoryInstance,
+    >,
+    worktree_facts: &BTreeMap<
+        evertrace_domain::ids::WorktreeId,
+        evertrace_domain::repository::WorktreeInstance,
+    >,
+    binding: &McpResolvedScope,
+    repository: evertrace_domain::ids::RepositoryId,
+    worktrees: &[evertrace_domain::ids::WorktreeId],
+    budget: &mut Duration,
+) -> Result<bool, McpServiceError> {
     let Some(report) = binding.repository_report.as_deref() else {
         return Ok(false);
     };
-    let current = evertrace_store::repository::RepositoryCurrentView::from_snapshot(snapshot)
-        .map_err(|_| McpServiceError::Store)?;
     // A repository-only target may use its exact current root worktree, not
     // a caller cwd or an arbitrary sibling checkout.
     let root_worktree;
     let worktrees = if worktrees.is_empty() {
-        let Some(repo) = current.repositories.get(&repository) else {
+        let Some(repo) = repositories.get(&repository) else {
             return Ok(false);
         };
-        let mut roots = current.worktrees.values().filter(|value| {
+        let mut roots = worktree_facts.values().filter(|value| {
             value.repository_instance_id == repository
                 && value.current_path.as_deref() == Some(repo.current_path.as_str())
         });
@@ -270,18 +324,16 @@ fn repository_visible(
         worktrees
     };
     for id in worktrees {
-        if current
-            .worktrees
+        if worktree_facts
             .get(id)
             .is_none_or(|worktree| worktree.repository_instance_id != repository)
         {
             return Ok(false);
         }
         let start = Instant::now();
-        let result = crate::repository::read_report_repository_trust_before(
+        let result = crate::repository::read_report_worktree_trust_before(
             report,
-            &current,
-            *id,
+            worktree_facts.get(id),
             start + *budget,
         );
         *budget = budget.saturating_sub(start.elapsed());
@@ -839,6 +891,270 @@ impl McpActionService {
         )
     }
 
+    async fn passive_source_blocked(
+        &self,
+        context: &evertrace_store::PassiveSourceCurrentContext,
+        report: Option<&evertrace_codex::HostProbeReport>,
+    ) -> Result<BTreeSet<String>, McpServiceError> {
+        let mut sources = BTreeMap::new();
+        let mut blocked = BTreeSet::new();
+        for item in &context.items {
+            let row = &item.selected;
+            if let Some(digest) = source_digest(row)? {
+                let mut observations = BTreeMap::new();
+                let mut receipts = Vec::new();
+                for source in &item.sources {
+                    if let Some((receipt, observation)) = current_source_pair(source)? {
+                        observations
+                            .insert(receipt.source_receipt_id.to_string(), Box::new(observation));
+                        receipts.push(receipt);
+                    }
+                }
+                let source = digest.source_target.as_ref().unwrap();
+                if crate::session_import::validate_source_summary_receipts(
+                    source,
+                    digest.from_watermark,
+                    digest.to_watermark,
+                    &digest.selected_direct_refs,
+                    observations,
+                    receipts,
+                    item.sources.iter().any(|source| source.suppressed),
+                )
+                .is_err()
+                {
+                    blocked.insert(row.row_id.clone());
+                    continue;
+                }
+                sources.insert(
+                    row.row_id.clone(),
+                    source.source_instance_id.as_str().to_owned(),
+                );
+            } else if let Some(source) = item.sources.first()
+                && let Some((receipt, _)) = current_source_pair(source)?
+            {
+                sources.insert(
+                    row.row_id.clone(),
+                    receipt.source_instance_id.as_str().to_owned(),
+                );
+            } else {
+                blocked.insert(row.row_id.clone());
+            }
+        }
+        blocked.extend(
+            crate::session_import::blocked_source_instances(
+                &self.writer,
+                report,
+                sources,
+                self.runtime_snapshot.effective_config_hash,
+                None,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?,
+        );
+        let rows = context
+            .items
+            .iter()
+            .map(|item| &item.selected)
+            .collect::<Vec<_>>();
+        let scopes = crate::repository::row_repository_contexts_from_scopes(
+            context.scope_rows.iter(),
+            &rows,
+        )
+        .map_err(|_| McpServiceError::Store)?;
+        let repositories = crate::repository::blocked_repositories(
+            &self.writer,
+            scopes.values().flatten().copied().collect(),
+            report,
+            self.runtime_snapshot.effective_config_hash,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
+        blocked.extend(
+            scopes
+                .into_iter()
+                .filter(|(_, ids)| !ids.is_disjoint(&repositories))
+                .map(|(row, _)| row.to_owned()),
+        );
+        Ok(blocked)
+    }
+
+    pub(super) async fn passive_source_read(
+        &self,
+        request_id: RequestId,
+        action: McpServiceAction,
+        binding: McpResolvedScope,
+        input: String,
+        refs: Vec<String>,
+    ) -> Result<McpServiceResult, McpServiceError> {
+        if !matches!(action, McpServiceAction::Search | McpServiceAction::Get) || input == "@due" {
+            return Ok(scope_unresolved(request_id));
+        }
+        let Some(session) = verified_session(&binding) else {
+            return Ok(scope_unresolved(request_id));
+        };
+        let requested = if action == McpServiceAction::Get {
+            vec![input.clone()]
+        } else {
+            refs
+        };
+        let window = requested.is_empty();
+        let selection = if window {
+            evertrace_store::PassiveSourceSelection::Session(session.to_owned())
+        } else {
+            evertrace_store::PassiveSourceSelection::References(
+                requested.into_iter().take(3).collect(),
+            )
+        };
+        let mut current = self
+            .writer
+            .passive_source_current_context(selection)
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        let report = binding.repository_report.as_deref().or(report.as_ref());
+        let mut blocked = self.passive_source_blocked(&current, report).await?;
+        let digest_refs = if window {
+            current
+                .items
+                .iter()
+                .filter(|item| {
+                    item.selected.object_kind.as_deref() == Some("semantic_digest")
+                        && !blocked.contains(&item.selected.row_id)
+                })
+                .filter_map(|item| item.selected.object_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut digest_text = BTreeMap::new();
+        let truncated = current.truncated;
+        if !digest_refs.is_empty() {
+            // Raw source reads do not drive relations or search. A Digest FTS
+            // consumer still synchronizes the index before its single lookup.
+            self.writer
+                .sync_frontier()
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            digest_text = self
+                .search_index
+                .snapshot()
+                .await
+                .map_err(|_| McpServiceError::Store)?
+                .fts_selected(&input, &digest_refs, 32)
+                .await
+                .map_err(|_| McpServiceError::Store)?
+                .into_iter()
+                .filter_map(|row| row.candidate_id.map(|id| (id, row.text)))
+                .collect();
+            let refs = current
+                .items
+                .iter()
+                .filter_map(|item| item.selected.object_id.clone())
+                .collect();
+            current = self
+                .writer
+                .passive_source_current_context(
+                    evertrace_store::PassiveSourceSelection::References(refs),
+                )
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            blocked.extend(self.passive_source_blocked(&current, report).await?);
+        }
+        let mut items = Vec::new();
+        let mut remaining = 8 * 1024 * 1024usize;
+        let mut next_refs = Vec::new();
+        let mut truncated = truncated;
+        let mut trust_budget = crate::repository::SESSION_ROOT_PROBE_BUDGET;
+        for item in &current.items {
+            let row = &item.selected;
+            if blocked.contains(&row.row_id) {
+                continue;
+            }
+            let Some(reference) = &row.object_id else {
+                continue;
+            };
+            if window {
+                let bytes = row.payload_json.as_ref().map_or(0, String::len);
+                if bytes > remaining {
+                    truncated = true;
+                    next_refs.push(reference.clone());
+                    break;
+                }
+                remaining -= bytes;
+            }
+            if let Some(digest) = source_digest(row)? {
+                let source = digest.source_target.as_ref().unwrap();
+                let text = if window {
+                    let Some(text) = digest_text.remove(reference) else {
+                        continue;
+                    };
+                    Some(text)
+                } else {
+                    row.payload_json.clone().filter(|text| text.len() <= 8192)
+                };
+                if !repository_visible_current(
+                    &current.repositories,
+                    &current.worktrees,
+                    &binding,
+                    source.repository_id,
+                    &[source.worktree_id],
+                    &mut trust_budget,
+                )? {
+                    continue;
+                }
+                items.push(classify_object_row(row, text, true, unix_time_us_for_mcp()));
+            } else if let Some(source) = item.sources.first()
+                && let Some((receipt, observation)) = current_source_pair(source)?
+            {
+                if !submitted(&receipt, &observation, session)
+                    && !(archived_claim(&receipt, &observation, session)
+                        && (!window
+                            || (receipt.unsupported_record_classification.is_none()
+                                && receipt.observation_role != ObservationRole::StateProbe)))
+                {
+                    continue;
+                }
+                if let Some(repository) = receipt.repository_instance_id
+                    && !repository_visible_current(
+                        &current.repositories,
+                        &current.worktrees,
+                        &binding,
+                        repository,
+                        receipt.worktree_instance_id.as_slice(),
+                        &mut trust_budget,
+                    )?
+                {
+                    continue;
+                }
+                let text = presentation_text(&receipt);
+                if window && !text.to_lowercase().contains(&input.to_lowercase()) {
+                    continue;
+                }
+                items.push(evidence_item(row, text, observation.content_trust));
+            }
+            if window && items.len() == 3 {
+                truncated = true;
+                break;
+            }
+        }
+        let mut result = passive_result(
+            request_id,
+            items,
+            vec!["evidence_only_no_active_work_binding".into()],
+        );
+        result.truncated = truncated;
+        result.next_refs = next_refs;
+        if truncated {
+            result
+                .warnings
+                .push("bounded_session_submission_window".into());
+        }
+        Ok(result)
+    }
+
     pub(super) async fn passive_work_read(
         &self,
         request_id: RequestId,
@@ -866,175 +1182,95 @@ impl McpActionService {
             refs
         };
         let mut items = vec![];
-        let mut truncated = false;
-        let mut next_refs = vec![];
         let report = match &self.session_report {
             Some(report) => report.read().await.clone(),
             None => None,
         };
         if requested.is_empty() {
-            // Current rows already contain canonical, validated payloads. This
-            // lexical prefilter only avoids decoding unrelated sessions; typed
-            // membership below is the authority check. Keep only a bounded
-            // recent window, without retaining every historical body.
-            let needle = format!(
-                "\"source_session_ref\":{}",
-                serde_json::to_string(session).map_err(|_| McpServiceError::Store)?
-            );
-            let mut recent = BTreeMap::new();
-            for row in snapshot.data_rows().filter(|row| {
-                row.object_kind.as_deref() == Some("source_receipt")
-                    && row.payload_json.as_deref().is_some_and(|json| {
-                        json.contains(&needle)
-                            && ((json.contains("\"source_kind\":\"codex_hook\"")
-                                && json.contains("\"observation_role\":\"message\""))
-                                || json.contains("\"source_kind\":\"codex_session_jsonl\""))
-                    })
-            }) {
-                recent.insert((row.source_event_seq, row.row_id.as_str()), row);
-                if recent.len() > 32 {
-                    recent.pop_first();
-                    truncated = true;
-                }
-            }
-            let sessions = evertrace_store::SessionImportCurrentView::from_snapshot(&snapshot)
-                .map_err(|_| McpServiceError::Store)?;
-            let sources = sessions
-                .sessions
-                .values()
-                .filter(|current| current.session_id == session)
-                .map(|current| current.source_instance())
-                .collect::<BTreeSet<_>>();
-            for row in snapshot.data_rows().filter(|row| {
-                row.object_kind.as_deref() == Some("semantic_digest")
-                    && row.task_id.is_none()
-                    && row.repository_id.is_some()
-                    && row.worktree_id.is_some()
-            }) {
-                let Some(source) = source_digest_target(row)? else {
-                    continue;
-                };
-                if !sources.contains(source.source_instance_id.as_str()) {
-                    continue;
-                }
-                recent.insert((row.source_event_seq, row.row_id.as_str()), row);
-                if recent.len() > 32 {
-                    recent.pop_first();
-                    truncated = true;
-                }
-            }
-            let selected = recent.values().copied().collect::<Vec<_>>();
-            let mut blocked = self
-                .blocked_read_rows(
-                    binding.repository_report.as_deref().or(report.as_ref()),
-                    &snapshot,
-                    &selected,
-                    None,
-                )
-                .await
-                .map_err(|_| McpServiceError::Store)?;
-            let digest_refs = selected
-                .iter()
-                .filter(|row| {
-                    row.object_kind.as_deref() == Some("semantic_digest")
-                        && !blocked.contains(&row.row_id)
-                })
-                .filter_map(|row| row.object_id.clone())
-                .collect::<Vec<_>>();
-            let mut digest_text = if digest_refs.is_empty() {
-                BTreeMap::new()
-            } else {
-                self.search_index
-                    .snapshot()
-                    .await
-                    .map_err(|_| McpServiceError::Store)?
-                    .fts_selected(&input, &digest_refs, 32)
-                    .await
-                    .map_err(|_| McpServiceError::Store)?
-                    .into_iter()
-                    .filter_map(|row| row.candidate_id.map(|id| (id, row.text)))
-                    .collect::<BTreeMap<_, _>>()
+            return Ok(scope_unresolved(request_id));
+        }
+        let selected = requested
+            .iter()
+            .take(3)
+            .filter_map(|reference| {
+                select_object_row(&snapshot, reference)
+                    .ok()
+                    .flatten()
+                    .map(|(row, _)| row)
+            })
+            .collect::<Vec<_>>();
+        let blocked = self
+            .blocked_read_rows(
+                binding.repository_report.as_deref().or(report.as_ref()),
+                &snapshot,
+                &selected,
+                None,
+            )
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        for reference in requested.iter().take(3) {
+            let Some((row, true)) = select_object_row(&snapshot, reference).ok().flatten() else {
+                continue;
             };
-            if !digest_refs.is_empty() {
-                // FTS awaited after the first gate. Revalidate suppression,
-                // purge and source access at the output boundary as well.
-                let current = self
-                    .writer
-                    .project()
-                    .await
-                    .map_err(|_| McpServiceError::Store)?;
-                let current_rows = selected
-                    .iter()
-                    .filter_map(|row| {
-                        let found = current.row(&row.row_id);
-                        if found.is_none() {
-                            blocked.insert(row.row_id.clone());
-                        }
-                        found
-                    })
-                    .collect::<Vec<_>>();
-                blocked.extend(
-                    self.blocked_read_rows(
-                        binding.repository_report.as_deref().or(report.as_ref()),
-                        &current,
-                        &current_rows,
-                        None,
-                    )
-                    .await
-                    .map_err(|_| McpServiceError::Store)?,
-                );
+            if blocked.contains(&row.row_id) {
+                continue;
             }
-            let mut remaining = 8 * 1024 * 1024usize;
-            for (_, row) in recent.into_iter().rev() {
-                if blocked.contains(&row.row_id) {
+            let task = reference
+                .parse::<TaskId>()
+                .ok()
+                .and_then(|id| view.tasks.get(&id))
+                .or_else(|| {
+                    reference
+                        .parse::<WorkstreamId>()
+                        .ok()
+                        .and_then(|id| view.workstreams.get(&id))
+                        .and_then(|stream| view.tasks.get(&stream.task_id))
+                });
+            if let Some(task) = task {
+                if !work_visible(&snapshot, &binding, task, &mut trust_budget)? {
                     continue;
                 }
-                let Some(reference) = &row.object_id else {
-                    continue;
-                };
-                let bytes = row.payload_json.as_ref().map_or(0, String::len);
-                if bytes > remaining {
-                    truncated = true;
-                    next_refs.push(reference.clone());
-                    break;
-                }
-                remaining -= bytes;
-                if let Some(digest) = source_digest(row)? {
-                    let source = digest.source_target.as_ref().unwrap();
-                    let Some(text) = digest_text.remove(reference) else {
-                        continue;
-                    };
-                    if !repository_visible(
+                if let Some(stream) = reference
+                    .parse::<WorkstreamId>()
+                    .ok()
+                    .and_then(|id| view.workstreams.get(&id))
+                    && let Some(repository) = stream.repository_instance_id
+                    && !repository_visible(
                         &snapshot,
                         &binding,
-                        source.repository_id,
-                        &[source.worktree_id],
+                        repository,
+                        &stream.worktree_instance_ids,
                         &mut trust_budget,
-                    )? {
-                        continue;
-                    }
-                    items.push(classify_object_row(
-                        row,
-                        Some(text),
-                        true,
-                        unix_time_us_for_mcp(),
-                    ));
-                    if items.len() == 3 {
-                        truncated = true;
-                        break;
-                    }
-                    continue;
-                }
-                let Some((receipt, observation)) = source_pair(&snapshot, reference)? else {
-                    continue;
-                };
-                if !submitted(&receipt, &observation, session)
-                    && !(archived_claim(&receipt, &observation, session)
-                        && receipt.unsupported_record_classification.is_none()
-                        && receipt.observation_role != ObservationRole::StateProbe)
+                    )?
                 {
                     continue;
                 }
+                if let Some(detail) =
+                    super::super::human_governance::work_evidence_detail(&snapshot, row)
+                        .map_err(|_| McpServiceError::Store)?
+                {
+                    items.push(evidence_item(
+                        row,
+                        serde_json::to_string(&detail).map_err(|_| McpServiceError::Store)?,
+                        ContentTrust::AgentClaim,
+                    ));
+                }
+            } else if let Some(digest) = source_digest(row)? {
+                let source = digest.source_target.as_ref().unwrap();
+                if repository_visible(
+                    &snapshot,
+                    &binding,
+                    source.repository_id,
+                    &[source.worktree_id],
+                    &mut trust_budget,
+                )? {
+                    let text = row.payload_json.clone().filter(|text| text.len() <= 8192);
+                    items.push(classify_object_row(row, text, true, unix_time_us_for_mcp()));
+                }
+            } else if let Some((receipt, observation)) = source_pair(&snapshot, reference)?
+                && (submitted(&receipt, &observation, session)
+                    || archived_claim(&receipt, &observation, session))
+            {
                 if let Some(repository) = receipt.repository_instance_id
                     && !repository_visible(
                         &snapshot,
@@ -1046,172 +1282,19 @@ impl McpActionService {
                 {
                     continue;
                 }
-                let text = presentation_text(&receipt);
-                if !text.to_lowercase().contains(&input.to_lowercase()) {
-                    continue;
-                }
-                items.push(evidence_item(row, text, observation.content_trust));
-                if items.len() == 3 {
-                    truncated = true;
-                    break;
-                }
-            }
-        } else {
-            let selected = requested
-                .iter()
-                .take(3)
-                .filter_map(|reference| {
-                    select_object_row(&snapshot, reference)
-                        .ok()
-                        .flatten()
-                        .map(|(row, _)| row)
-                })
-                .collect::<Vec<_>>();
-            let blocked = self
-                .blocked_read_rows(
-                    binding.repository_report.as_deref().or(report.as_ref()),
-                    &snapshot,
-                    &selected,
-                    None,
-                )
-                .await
-                .map_err(|_| McpServiceError::Store)?;
-            for reference in requested.iter().take(3) {
-                let Some((row, true)) = select_object_row(&snapshot, reference).ok().flatten()
-                else {
-                    continue;
-                };
-                if blocked.contains(&row.row_id) {
-                    continue;
-                }
-                let task = reference
-                    .parse::<TaskId>()
-                    .ok()
-                    .and_then(|id| view.tasks.get(&id))
-                    .or_else(|| {
-                        reference
-                            .parse::<WorkstreamId>()
-                            .ok()
-                            .and_then(|id| view.workstreams.get(&id))
-                            .and_then(|stream| view.tasks.get(&stream.task_id))
-                    });
-                if let Some(task) = task {
-                    if !work_visible(&snapshot, &binding, task, &mut trust_budget)? {
-                        continue;
-                    }
-                    if let Some(stream) = reference
-                        .parse::<WorkstreamId>()
-                        .ok()
-                        .and_then(|id| view.workstreams.get(&id))
-                        && let Some(repository) = stream.repository_instance_id
-                        && !repository_visible(
-                            &snapshot,
-                            &binding,
-                            repository,
-                            &stream.worktree_instance_ids,
-                            &mut trust_budget,
-                        )?
-                    {
-                        continue;
-                    }
-                    if let Some(detail) =
-                        super::super::human_governance::work_evidence_detail(&snapshot, row)
-                            .map_err(|_| McpServiceError::Store)?
-                    {
-                        items.push(evidence_item(
-                            row,
-                            serde_json::to_string(&detail).map_err(|_| McpServiceError::Store)?,
-                            ContentTrust::AgentClaim,
-                        ));
-                    }
-                } else if let Some(digest) = source_digest(row)? {
-                    let source = digest.source_target.as_ref().unwrap();
-                    if repository_visible(
-                        &snapshot,
-                        &binding,
-                        source.repository_id,
-                        &[source.worktree_id],
-                        &mut trust_budget,
-                    )? {
-                        let text = row.payload_json.clone().filter(|text| text.len() <= 8192);
-                        items.push(classify_object_row(row, text, true, unix_time_us_for_mcp()));
-                    }
-                } else if let Some((receipt, observation)) = source_pair(&snapshot, reference)?
-                    && (submitted(&receipt, &observation, session)
-                        || archived_claim(&receipt, &observation, session))
-                {
-                    if let Some(repository) = receipt.repository_instance_id
-                        && !repository_visible(
-                            &snapshot,
-                            &binding,
-                            repository,
-                            receipt.worktree_instance_id.as_slice(),
-                            &mut trust_budget,
-                        )?
-                    {
-                        continue;
-                    }
-                    items.push(evidence_item(
-                        row,
-                        presentation_text(&receipt),
-                        observation.content_trust,
-                    ));
-                }
+                items.push(evidence_item(
+                    row,
+                    presentation_text(&receipt),
+                    observation.content_trust,
+                ));
             }
         }
-        let mut result = passive_result(
+        Ok(passive_result(
             request_id,
             items,
             vec!["evidence_only_no_active_work_binding".into()],
-        );
-        result.truncated = truncated;
-        result.next_refs = next_refs;
-        if truncated {
-            result
-                .warnings
-                .push("bounded_session_submission_window".into());
-        }
-        Ok(result)
+        ))
     }
-}
-
-// Candidate metadata only: serde skips the six summary groups before allocation.
-// The selected bounded window still goes through full typed validation below.
-fn source_digest_target(
-    row: &ObjectRow,
-) -> Result<Option<evertrace_domain::semantic::SemanticSourceTarget>, McpServiceError> {
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-    enum Projection {
-        SemanticDigestRecorded(Target),
-    }
-    #[derive(serde::Deserialize)]
-    struct Target {
-        source_target: Option<evertrace_domain::semantic::SemanticSourceTarget>,
-    }
-    let Projection::SemanticDigestRecorded(target) =
-        serde_json::from_str(row.payload_json.as_deref().ok_or(McpServiceError::Store)?)
-            .map_err(|_| McpServiceError::Store)?;
-    Ok(target.source_target)
-}
-
-#[cfg(test)]
-#[test]
-fn source_digest_candidate_metadata_does_not_decode_summary_body() {
-    let source = evertrace_domain::semantic::SemanticSourceTarget {
-        source_instance_id: evertrace_domain::evidence::SourceInstanceId::parse(
-            "session-rollout:test:one",
-        )
-        .unwrap(),
-        source_revision: evertrace_domain::evidence::SourceRevision::parse("revision-one").unwrap(),
-        repository_id: evertrace_domain::ids::RepositoryId::new_v7(),
-        worktree_id: evertrace_domain::ids::WorktreeId::new_v7(),
-    };
-    let mut row = ObjectRow::checkpoint(1, 1);
-    row.object_kind = Some("semantic_digest".into());
-    row.payload_json = Some(serde_json::json!({"kind":"semantic_digest_recorded","value":{"source_target":source,"application":"not a decoded summary"}}).to_string());
-    assert_eq!(source_digest_target(&row).unwrap(), Some(source));
-    assert!(source_digest(&row).is_err()); // Full validation still guards actual output.
 }
 
 fn source_digest(

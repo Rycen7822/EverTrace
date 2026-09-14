@@ -23,7 +23,7 @@ pub(super) const WIKI_PROJECTION_KIND: &str = "wiki_projection";
 
 #[derive(Clone, Default)]
 pub(super) struct SynthesisState {
-    digests: BTreeMap<SemanticDigestId, (SemanticDigest, u64)>,
+    pub(super) digests: BTreeMap<SemanticDigestId, (SemanticDigest, u64)>,
     runs: BTreeMap<SemanticDerivationRunId, (SemanticDerivationRun, u64)>,
     successful_fingerprints: BTreeMap<[u8; 32], SemanticDerivationRunId>,
 }
@@ -921,17 +921,7 @@ impl SynthesisState {
     pub(super) fn rows(self) -> Result<Vec<ObjectRow>, StoreError> {
         let mut rows = Vec::with_capacity(self.digests.len() + self.runs.len());
         for (id, (value, seq)) in self.digests {
-            let task_id = value.task_id.map(|id| id.to_string());
-            let repository_id = value.repository_id.map(|id| id.to_string());
-            let worktree_id = value.worktree_id.map(|id| id.to_string());
-            rows.push(row(
-                format!("object:work:semantic_digest:{id}"),
-                "semantic_digest",
-                id.to_string(),
-                &JournalPayload::SemanticDigestRecorded(Box::new(value)),
-                seq,
-                Some((task_id, repository_id, worktree_id)),
-            )?);
+            rows.push(digest_row(id, value, seq)?);
         }
         for (id, (value, seq)) in self.runs {
             let scope = value.source_target.as_ref().map(|source| {
@@ -981,6 +971,26 @@ fn candidate_matches(
                 && proposal.payload == ProposalPayload::Procedure(payload.clone())
         }
     }
+}
+
+pub(super) fn digest_row(
+    id: SemanticDigestId,
+    value: SemanticDigest,
+    seq: u64,
+) -> Result<ObjectRow, StoreError> {
+    let scope = (
+        value.task_id.map(|id| id.to_string()),
+        value.repository_id.map(|id| id.to_string()),
+        value.worktree_id.map(|id| id.to_string()),
+    );
+    row(
+        format!("object:work:semantic_digest:{id}"),
+        "semantic_digest",
+        id.to_string(),
+        &JournalPayload::SemanticDigestRecorded(Box::new(value)),
+        seq,
+        Some(scope),
+    )
 }
 
 fn row(

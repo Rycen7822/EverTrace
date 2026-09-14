@@ -851,6 +851,35 @@ impl JournalWriter {
         exact: Option<&str>,
         limit: usize,
     ) -> Result<crate::projections::CaptureCurrentContext, StoreError> {
+        self.validated_current_read(|state, stamp| {
+            state.capture_current_context(after, exact, limit, stamp.has_failed_job)
+        })
+        .await
+    }
+
+    pub async fn scope_current_context(
+        &self,
+        request: &crate::projections::ScopeCurrentRequest,
+    ) -> Result<crate::projections::ScopeCurrentContext, StoreError> {
+        self.validated_current_read(|state, _| state.scope_current_context(request))
+            .await
+    }
+
+    pub async fn passive_source_current_context(
+        &self,
+        selection: &crate::projections::PassiveSourceSelection,
+    ) -> Result<crate::projections::PassiveSourceCurrentContext, StoreError> {
+        self.validated_current_read(|state, _| state.passive_source_current_context(selection))
+            .await
+    }
+
+    async fn validated_current_read<T>(
+        &self,
+        read: impl FnOnce(
+            &crate::projections::JournalAdmissionState,
+            &ProjectionValidation,
+        ) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
         self.project_validated(false, false).await?;
         let result = async {
             let stamp = self
@@ -863,12 +892,7 @@ impl JournalWriter {
             {
                 return Err(StoreError::StoreCorrupt);
             }
-            let context = self.admission_state.capture_current_context(
-                after,
-                exact,
-                limit,
-                stamp.has_failed_job,
-            )?;
+            let context = read(&self.admission_state, &stamp)?;
             if self.projection_versions(false).await? != stamp.versions {
                 return Err(StoreError::StoreCorrupt);
             }
@@ -1560,6 +1584,20 @@ mod tests {
         ));
         assert!(
             writer
+                .scope_current_context(&Default::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            writer
+                .passive_source_current_context(&crate::PassiveSourceSelection::Session(
+                    "missing".into()
+                ))
+                .await
+                .is_err()
+        );
+        assert!(
+            writer
                 .projection_validation
                 .lock()
                 .unwrap()
@@ -1974,11 +2012,43 @@ mod tests {
         let capture = writer.capture_current_context(None, None, 8).await.unwrap();
         assert_eq!(capture.frontier, committed.last_seq);
         assert!(capture.items.is_empty());
+        assert!(
+            writer
+                .scope_current_context(&Default::default())
+                .await
+                .unwrap()
+                .facts
+                .is_empty()
+        );
+        assert!(
+            writer
+                .passive_source_current_context(&crate::PassiveSourceSelection::Session(
+                    "missing".into()
+                ))
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
         assert_eq!(
             writer.projection_versions(true).await.unwrap(),
             validated.versions
         );
         let proof = writer.command_ids.take();
+        assert!(
+            writer
+                .scope_current_context(&Default::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            writer
+                .passive_source_current_context(&crate::PassiveSourceSelection::Session(
+                    "missing".into()
+                ))
+                .await
+                .is_err()
+        );
         assert!(matches!(
             writer.capture_current_context(None, None, 8).await,
             Err(StoreError::StoreCorrupt)

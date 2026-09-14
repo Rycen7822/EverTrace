@@ -30,6 +30,27 @@ pub fn resolve_query_anchor(
     binding: &McpResolvedScope,
     client_cwd: &str,
 ) -> Option<McpQueryAnchor> {
+    resolve_anchor(&ScopeFacts::Snapshot(snapshot), binding, client_cwd)
+}
+
+pub(super) fn resolve_current_anchor(
+    context: &evertrace_store::ScopeCurrentContext,
+    binding: &McpResolvedScope,
+    client_cwd: &str,
+) -> Option<McpQueryAnchor> {
+    resolve_anchor(&ScopeFacts::Current(context), binding, client_cwd)
+}
+
+enum ScopeFacts<'a> {
+    Snapshot(&'a ProjectionSnapshot),
+    Current(&'a evertrace_store::ScopeCurrentContext),
+}
+
+fn resolve_anchor(
+    snapshot: &ScopeFacts<'_>,
+    binding: &McpResolvedScope,
+    client_cwd: &str,
+) -> Option<McpQueryAnchor> {
     if !valid_lexical_absolute_path(client_cwd) {
         return None;
     }
@@ -82,7 +103,7 @@ pub fn resolve_query_anchor(
 }
 
 fn select_workspace(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &ScopeFacts<'_>,
     mut active: McpQueryAnchor,
     workspace: &PublicWorkspace,
 ) -> Option<McpQueryAnchor> {
@@ -111,7 +132,7 @@ fn select_workspace(
 }
 
 fn exact_anchor(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &ScopeFacts<'_>,
     anchor: &BindingAnchor,
     mechanism: McpScopeMechanism,
 ) -> Option<McpQueryAnchor> {
@@ -184,7 +205,7 @@ fn exact_anchor(
 }
 
 fn current_episode(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &ScopeFacts<'_>,
     episode_id: evertrace_domain::ids::WorkEpisodeId,
 ) -> Option<WorkEpisode> {
     let mut current: Option<WorkEpisode> = None;
@@ -205,7 +226,7 @@ fn current_episode(
     current
 }
 
-fn cwd_anchor(snapshot: &ProjectionSnapshot, cwd: &str) -> Option<McpQueryAnchor> {
+fn cwd_anchor(snapshot: &ScopeFacts<'_>, cwd: &str) -> Option<McpQueryAnchor> {
     let cwd = Path::new(cwd);
     let mut worktrees = payloads(snapshot, "worktree").filter_map(|payload| match payload {
         JournalPayload::WorktreeInstanceRecorded(value)
@@ -261,10 +282,7 @@ fn cwd_anchor(snapshot: &ProjectionSnapshot, cwd: &str) -> Option<McpQueryAnchor
     })
 }
 
-fn unique_repository(
-    snapshot: &ProjectionSnapshot,
-    id: RepositoryId,
-) -> Option<RepositoryInstance> {
+fn unique_repository(snapshot: &ScopeFacts<'_>, id: RepositoryId) -> Option<RepositoryInstance> {
     exactly_one(
         payloads(snapshot, "repository").filter_map(|payload| match payload {
             JournalPayload::RepositoryInstanceRecorded(value) if value.repository_id == id => {
@@ -275,7 +293,7 @@ fn unique_repository(
     )
 }
 
-fn unique_worktree(snapshot: &ProjectionSnapshot, id: WorktreeId) -> Option<WorktreeInstance> {
+fn unique_worktree(snapshot: &ScopeFacts<'_>, id: WorktreeId) -> Option<WorktreeInstance> {
     exactly_one(
         payloads(snapshot, "worktree").filter_map(|payload| match payload {
             JournalPayload::WorktreeInstanceRecorded(value)
@@ -290,16 +308,38 @@ fn unique_worktree(snapshot: &ProjectionSnapshot, id: WorktreeId) -> Option<Work
 }
 
 fn payloads<'a>(
-    snapshot: &'a ProjectionSnapshot,
+    snapshot: &'a ScopeFacts<'_>,
     object_kind: &'a str,
-) -> impl Iterator<Item = JournalPayload> + 'a {
-    snapshot.rows.iter().filter_map(|row| {
+) -> Box<dyn Iterator<Item = JournalPayload> + 'a> {
+    let ScopeFacts::Snapshot(snapshot) = snapshot else {
+        let ScopeFacts::Current(context) = snapshot else {
+            unreachable!()
+        };
+        return Box::new(
+            context
+                .facts
+                .iter()
+                .filter(move |payload| {
+                    matches!(
+                        (object_kind, payload),
+                        ("execution_lane", JournalPayload::ExecutionLaneRecorded(_))
+                            | ("workstream", JournalPayload::WorkstreamRecorded(_))
+                            | ("task", JournalPayload::TaskRecorded(_))
+                            | ("work_episode", JournalPayload::WorkEpisodeRecorded(_))
+                            | ("repository", JournalPayload::RepositoryInstanceRecorded(_))
+                            | ("worktree", JournalPayload::WorktreeInstanceRecorded(_))
+                    )
+                })
+                .cloned(),
+        );
+    };
+    Box::new(snapshot.rows.iter().filter_map(|row| {
         (row.row_kind == ObjectRowKind::Data
             && row.row_class == Some(evertrace_store::ObjectRowClass::Object)
             && row.object_kind.as_deref() == Some(object_kind))
         .then_some(row.payload_json.as_deref()?)
         .and_then(|payload| serde_json::from_str(payload).ok())
-    })
+    }))
 }
 
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {

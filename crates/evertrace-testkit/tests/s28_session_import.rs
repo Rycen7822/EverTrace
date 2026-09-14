@@ -148,19 +148,22 @@ async fn imported_messages_scenario(
                 Some(Arc::new(report.clone())),
             )
             .unwrap();
-        Box::pin(mcp.handle(
-            "source-summary-read",
-            evertrace_engine::McpServiceRequest {
-                request_id: RequestId::new_v7(),
-                action,
-                workspace: grant.bound_workspace,
-                input,
-                refs: vec![],
-                client_cwd: workspace.to_str().unwrap().into(),
-            },
-        ))
-        .await
-        .unwrap()
+        let mcp = mcp.clone();
+        let connection = format!("source-summary-read:{}", workspace.display());
+        let request = evertrace_engine::McpServiceRequest {
+            request_id: RequestId::new_v7(),
+            action,
+            workspace: grant.bound_workspace,
+            input,
+            refs: vec![],
+            client_cwd: workspace.to_str().unwrap().into(),
+        };
+        // Poll request dispatch outside the large scenario's nested debug
+        // future frames, as the daemon does for a request task.
+        tokio::spawn(async move { mcp.handle(&connection, request).await })
+            .await
+            .unwrap()
+            .unwrap()
     }
     async fn read_methods(
         mcp: &evertrace_engine::McpActionService,
@@ -872,28 +875,33 @@ async fn imported_messages_scenario(
             digest.semantic_digest_id.to_string(),
         ),
     ] {
-        let result = read(
-            &mcp,
-            &bindings,
-            &report_value,
-            &workspace,
-            session,
-            action,
-            input,
-        )
-        .await;
-        let item = result
-            .items
-            .iter()
-            .find(|item| item.object_ref == Some(digest.semantic_digest_id.to_string()))
-            .unwrap_or_else(|| panic!("MCP must return the digest: {action:?} {result:?}"));
-        assert_eq!(item.content_trust, ContentTrust::AgentClaim);
-        assert_eq!(item.authority.as_deref(), Some("agent_inferred"));
-        assert_eq!(
-            item.instruction_authority,
-            evertrace_domain::evidence::InstructionAuthority::None
-        );
-        assert!(item.text.as_ref().unwrap().contains("marigold"));
+        for caller_cwd in [workspace.as_path(), temp.path()] {
+            let result = read(
+                &mcp,
+                &bindings,
+                &report_value,
+                caller_cwd,
+                session,
+                action,
+                input.clone(),
+            )
+            .await;
+            if caller_cwd == temp.path() {
+                assert_eq!(result.scope, "explicit_work_evidence");
+            }
+            let item = result
+                .items
+                .iter()
+                .find(|item| item.object_ref == Some(digest.semantic_digest_id.to_string()))
+                .unwrap_or_else(|| panic!("MCP must return the digest: {action:?} {result:?}"));
+            assert_eq!(item.content_trust, ContentTrust::AgentClaim);
+            assert_eq!(item.authority.as_deref(), Some("agent_inferred"));
+            assert_eq!(
+                item.instruction_authority,
+                evertrace_domain::evidence::InstructionAuthority::None
+            );
+            assert!(item.text.as_ref().unwrap().contains("marigold"));
+        }
     }
     let other_workspace = temp.path().join("other-workspace");
     fs::create_dir(&other_workspace).unwrap();
@@ -1304,6 +1312,12 @@ async fn imported_messages_scenario(
         .iter()
         .any(|item| item.object_ref.as_deref() == Some(&old_id))
     );
+    // The finite passive consumer must retain the same lawful old archive
+    // after source replacement; current catalog revision is not an access gate.
+    let passive_old = read(&mcp, &bindings, &report_value, temp.path(), session,
+        evertrace_engine::McpServiceAction::Get, old_id.clone()).await;
+    assert_eq!(passive_old.scope, "explicit_work_evidence");
+    assert!(passive_old.items.iter().any(|item| item.object_ref.as_deref() == Some(&old_id)));
     let target = evertrace_domain::semantic::SemanticSourceTarget {
         source_instance_id: replacement.source_instance_id.clone(),
         source_revision: replacement.source_revision.clone(),
@@ -1397,20 +1411,22 @@ async fn imported_messages_scenario(
             "marigold".into(),
         ),
     ] {
+        for caller_cwd in [workspace.as_path(), temp.path()] {
         assert!(
             read(
                 &mcp,
                 &bindings,
                 &report_value,
-                &workspace,
+                caller_cwd,
                 session,
                 action,
-                input
+                input.clone()
             )
             .await
             .items
             .is_empty()
         );
+        }
     }
     drop((revoking, catalog, worker, admin, mcp));
     writer.shutdown().await.unwrap();
