@@ -1959,17 +1959,120 @@ impl BackgroundScheduler {
                 capture_candidates.insert(dirty.target_id.clone(), dirty.clone());
             }
         }
-        let capture_candidates = capture_candidates
-            .into_values()
-            .filter(|dirty| {
-                !capture_target_covered(&view, dirty, self.runtime.effective_config_hash)
-            })
-            .map(|dirty| {
-                SourceObservationId::from_str(&dirty.target_id)
-                    .map_err(|_| BackgroundSchedulerError::Store)?;
-                Ok(dirty.target_id)
-            })
-            .collect::<Result<Vec<_>, BackgroundSchedulerError>>()?;
+        let report = self.report.read().await.clone();
+        let capture_candidates = {
+            let current_manifest = report
+                .as_ref()
+                .filter(|report| report.manifest().validate().is_ok())
+                .map(|report| report.manifest().adapter_manifest_id.as_str());
+            // The representative dirty kind is not the complete set: reconciliation
+            // may already be covered while physical normalization still needs work.
+            let physical_targets = view
+                .dirty
+                .iter()
+                .filter(|dirty| dirty.target_kind == DirtyTargetKind::PhysicalNormalization)
+                .map(|dirty| dirty.target_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut retained_manifests = None;
+            let load_retained_manifests = || {
+                self.runtime
+                    .data_dir()
+                    .ok()
+                    .and_then(|data| {
+                        evertrace_codex::install::StableLauncher::retained_native_reports(data).ok()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|report| report.manifest().validate().is_ok())
+                    .map(|report| report.manifest().adapter_manifest_id.clone())
+                    .collect::<BTreeSet<_>>()
+            };
+            let active_capture_targets = view
+                .jobs
+                .iter()
+                .filter(|job| {
+                    is_capture_job(job)
+                        && matches!(job.state, JobStatus::Queued | JobStatus::Leased)
+                })
+                .map(|job| job.target_revision.as_str())
+                .collect::<BTreeSet<_>>();
+            let capture_rows = snapshot
+                .data_rows()
+                .filter(|row| {
+                    matches!(
+                        row.object_kind.as_deref(),
+                        Some("source_observation" | "source_receipt")
+                    )
+                })
+                .map(|row| (row.row_id.as_str(), row))
+                .collect::<BTreeMap<_, _>>();
+            capture_candidates
+                .into_values()
+                .filter(|dirty| {
+                    !capture_target_covered(&view, dirty, self.runtime.effective_config_hash)
+                })
+                .map(|dirty| {
+                    SourceObservationId::from_str(&dirty.target_id)
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    // Retirement of an existing active tuple must not depend on
+                    // having a report that can admit a replacement job.
+                    if active_capture_targets.contains(dirty.target_id.as_str()) {
+                        return Ok(Some(dirty.target_id));
+                    }
+                    let physical = physical_targets.contains(dirty.target_id.as_str());
+                    if current_manifest.is_none()
+                        && (!physical
+                            || retained_manifests
+                                .get_or_insert_with(&load_retained_manifests)
+                                .is_empty())
+                    {
+                        return Ok(None);
+                    }
+                    let read_payload = |id: &str| {
+                        let row = capture_rows
+                            .get(id)
+                            .ok_or(BackgroundSchedulerError::Store)?;
+                        serde_json::from_str::<JournalPayload>(
+                            row.payload_json
+                                .as_deref()
+                                .ok_or(BackgroundSchedulerError::Store)?,
+                        )
+                        .map_err(|_| BackgroundSchedulerError::Store)
+                    };
+                    let JournalPayload::SourceObservationRecorded(observation) = read_payload(
+                        &format!("object:evidence:source_observation:{}", dirty.target_id),
+                    )?
+                    else {
+                        return Err(BackgroundSchedulerError::Store);
+                    };
+                    observation
+                        .validate()
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    let JournalPayload::SourceReceiptRecorded(receipt) = read_payload(&format!(
+                        "object:evidence:source_receipt:{}",
+                        observation.source_receipt_ref,
+                    ))?
+                    else {
+                        return Err(BackgroundSchedulerError::Store);
+                    };
+                    receipt
+                        .validate()
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    // The primary receipt is only a necessary admission condition;
+                    // the complete dependency manifest check below remains authoritative.
+                    let manifest = receipt.adapter_manifest_ref.as_str();
+                    Ok((current_manifest == Some(manifest)
+                        || (physical
+                            && retained_manifests
+                                .get_or_insert_with(&load_retained_manifests)
+                                .contains(manifest)))
+                    .then_some(dirty.target_id))
+                })
+                .collect::<Result<Vec<_>, BackgroundSchedulerError>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
         let (probed, capture_page_incomplete) = self
             .capture_cursor
             .lock()
@@ -1999,7 +2102,6 @@ impl BackgroundScheduler {
                 }
             }
         }
-        let report = self.report.read().await.clone();
         let occurred_at_us = now_us()?;
         let mut capture_jobs = Vec::new();
         for item in capture_items.into_values() {

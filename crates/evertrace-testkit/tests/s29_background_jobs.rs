@@ -1576,9 +1576,37 @@ async fn capture_scan_finishes_unadmittable_pages_and_reaches_later_targets() {
         .unwrap();
     let runtime = runtime(temp.path());
     let report = synthetic_report();
+    let later_report = HostProbeReport::evaluate(
+        &ProbeContext {
+            adapter_kind: AdapterKind::CodexHook,
+            adapter_revision: "s29-later-hook-v1".into(),
+            observed_host_version_range: "s29-test".into(),
+            eligible_event_manifest_ref: "s29-capture-events-v1".into(),
+            evidence_source: ProbeEvidenceSourceKind::SyntheticFixture,
+        },
+        &ProbeEvidence::empty(),
+    )
+    .unwrap();
+    let later_index = (0..81_u64)
+        .max_by_key(|index| {
+            use evertrace_domain::evidence::{
+                SourceInstanceId, SourceRecordIdentity, SourceRevision, source_observation_id,
+            };
+            source_observation_id(
+                &SourceInstanceId::parse(format!("s29-fair-source-{index}")).unwrap(),
+                &SourceRevision::parse(format!("s29-fair-revision-{index}")).unwrap(),
+                &SourceRecordIdentity::parse(format!("s29-fair-record-{index}")).unwrap(),
+            )
+            .unwrap()
+        })
+        .unwrap();
     let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
     for index in 0..81_u64 {
-        let mut input = capture_input(&report);
+        let mut input = capture_input(if index == later_index {
+            &later_report
+        } else {
+            &report
+        });
         input.spool_record_id = Some(format!("s29-fair-capture-{index}"));
         input.source_instance_id = format!("s29-fair-source-{index}");
         input.source_revision = format!("s29-fair-revision-{index}");
@@ -1612,7 +1640,12 @@ async fn capture_scan_finishes_unadmittable_pages_and_reaches_later_targets() {
         .filter(|item| item.target_kind == DirtyTargetKind::PhysicalNormalization)
         .collect::<Vec<_>>();
     assert_eq!(physical.len(), 81);
-    let target = physical[80].target_id.clone();
+    let target = physical
+        .iter()
+        .map(|item| &item.target_id)
+        .max()
+        .unwrap()
+        .clone();
     let mut filler = capture_input(&report);
     filler.spool_record_id = Some("s29-fair-pressure-filler".into());
     filler.source_instance_id = "s29-fair-pressure-source".into();
@@ -1632,9 +1665,9 @@ async fn capture_scan_finishes_unadmittable_pages_and_reaches_later_targets() {
         scheduler_runtime,
         Arc::clone(&current_report),
     );
-    assert!(scheduler.run_once().await.unwrap().retryable);
-    assert!(scheduler.run_once().await.unwrap().retryable);
-    assert!(!scheduler.run_once().await.unwrap().retryable);
+    let unavailable = scheduler.run_once().await.unwrap();
+    assert_eq!(unavailable.completed, 0);
+    assert!(!unavailable.retryable);
     let first_page = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
     assert_eq!(
         first_page
@@ -1650,9 +1683,9 @@ async fn capture_scan_finishes_unadmittable_pages_and_reaches_later_targets() {
             .iter()
             .all(|job| job.target_revision != target)
     );
-    *current_report.write().await = Some(report);
-    scheduler.run_once().await.unwrap();
-    scheduler.run_once().await.unwrap();
+    // Eighty earlier targets with a different manifest cannot consume the
+    // finite probe slots needed by the now-admittable final target.
+    *current_report.write().await = Some(later_report);
     scheduler.run_once().await.unwrap();
     let after = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
     let target_jobs = after
@@ -1667,6 +1700,124 @@ async fn capture_scan_finishes_unadmittable_pages_and_reaches_later_targets() {
         (target_job.state, target_job.attempt),
         (JobStatus::Queued, 1)
     );
+    assert_eq!(
+        after
+            .jobs
+            .iter()
+            .filter(|job| job.kind == "physical_normalization")
+            .count(),
+        1
+    );
+    // An unavailable report is never remembered as a permanent negative.
+    *current_report.write().await = Some(report);
+    assert!(scheduler.run_once().await.unwrap().retryable);
+    scheduler.run_once().await.unwrap();
+    let resumed = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    assert_eq!(
+        resumed
+            .jobs
+            .iter()
+            .filter(|job| job.kind == "physical_normalization")
+            .count(),
+        81
+    );
+    assert_eq!(
+        resumed
+            .dirty
+            .iter()
+            .filter(|dirty| dirty.target_kind == DirtyTargetKind::PhysicalNormalization)
+            .count(),
+        81
+    );
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn capture_scan_retained_report_does_not_hide_coexisting_physical_dirty() {
+    use evertrace_codex::{
+        hook_input::native_generation_report,
+        install::{HookGeneration, StableLauncher},
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let runtime = runtime(temp.path());
+    let launcher = StableLauncher::open(temp.path()).unwrap();
+    let directory = temp.path().join("hooks/generations/1");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = directory.join("evertrace-hook");
+    let runtime_snapshot = directory.join("hook-runtime-v1.json");
+    // Only retained generation identity is read; this test never executes a Hook.
+    fs::write(&executable, b"s29 retained generation").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&runtime_snapshot, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    fs::set_permissions(&runtime_snapshot, fs::Permissions::from_mode(0o600)).unwrap();
+    launcher
+        .publish_generation(HookGeneration {
+            generation: 1,
+            protocol_version: 1,
+            executable,
+            runtime_snapshot,
+            compatible: true,
+        })
+        .unwrap();
+    let report = native_generation_report(1).unwrap();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    for index in 0..41 {
+        let mut input = capture_input(&report);
+        input.spool_record_id = Some(format!("s29-retained-{index}"));
+        input.source_instance_id = format!("s29-retained-source-{index}");
+        input.source_record_identity = Some(format!("s29-retained-record-{index}"));
+        input.source_ref = format!("source:s29-retained-{index}");
+        input.session_ref = format!("session-s29-retained-{index}");
+        input.lifecycle.as_mut().unwrap().host_session_id = input.session_ref.clone();
+        capture.capture(input).unwrap();
+    }
+    capture.seal_active().unwrap();
+    let (handle, task) =
+        spawn_writer(open_writer(&temp.path().join("store")).await.unwrap(), 64).unwrap();
+    let ingestor = EvidenceIngestor::new(
+        runtime.clone(),
+        handle.clone(),
+        CONFIG,
+        "s29-retained-ingest",
+    )
+    .unwrap();
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 41);
+    let before = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    for kind in [
+        DirtyTargetKind::PhysicalNormalization,
+        DirtyTargetKind::CaptureReconciliation,
+    ] {
+        assert_eq!(
+            before
+                .dirty
+                .iter()
+                .filter(|dirty| dirty.target_kind == kind)
+                .count(),
+            41
+        );
+    }
+    let scheduler = make_scheduler(handle.clone(), runtime, Arc::new(RwLock::new(None)));
+    // Coalescing picks reconciliation as representative, but the physical dirty
+    // still warrants the retained report's necessary-condition probe slots.
+    let first = scheduler.run_once().await.unwrap();
+    assert!(first.retryable);
+    assert_eq!(first.completed, 0);
+    assert!(!scheduler.run_once().await.unwrap().retryable);
+    let after = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap()).unwrap();
+    // The final resolver still refuses reconciliation without a current report.
+    assert!(after.jobs.iter().all(|job| !matches!(
+        job.kind.as_str(),
+        "physical_normalization" | "capture_reconciliation"
+    )));
+    assert_eq!(before.dirty, after.dirty);
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
 }
