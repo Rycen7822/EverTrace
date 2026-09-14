@@ -541,9 +541,38 @@ impl S23State {
     }
 
     pub(super) fn atom_support_state(&self, revision_id: RevisionId) -> Option<&'static str> {
+        self.atom_support_state_excluding(revision_id, &BTreeSet::new())
+    }
+
+    pub(super) fn atom_support_state_excluding(
+        &self,
+        revision_id: RevisionId,
+        removed_contracts: &BTreeSet<RevisionId>,
+    ) -> Option<&'static str> {
         self.atom_support_validations(revision_id)
             .into_iter()
+            .filter(|validation| !removed_contracts.contains(&validation.support_contract_ref))
             .map(|validation| support_state(validation.state))
+            .max_by_key(|state| support_state_rank(state))
+    }
+
+    pub(super) fn successor_support_state_excluding(
+        &self,
+        revision_id: RevisionId,
+        removed_contracts: &BTreeSet<RevisionId>,
+    ) -> Option<&'static str> {
+        let reference = revision_id.to_string();
+        self.contracts
+            .values()
+            .filter(|(contract, _)| contract.successor_revision_or_membership_ref == reference)
+            .filter(|(contract, _)| {
+                !removed_contracts.contains(&contract.support_contract_revision_id)
+            })
+            .filter_map(|(contract, _)| {
+                self.current_validations
+                    .get(&contract.support_contract_revision_id)
+            })
+            .map(|(validation, _)| support_state(validation.state))
             .max_by_key(|state| support_state_rank(state))
     }
 
@@ -909,6 +938,39 @@ impl S23State {
         Ok(())
     }
 
+    pub(super) fn membership_row(
+        &self,
+        revision: RevisionId,
+        generation: u64,
+    ) -> Result<ObjectRow, StoreError> {
+        let (value, seq) = self
+            .membership_revisions
+            .get(&revision)
+            .ok_or(StoreError::StoreCorrupt)?;
+        let current = self
+            .memberships
+            .get(&value.core_membership_id)
+            .map(|v| &v.0);
+        object_row(
+            format!("object:atom:core_membership:{revision}"),
+            ObjectFamily::Atom,
+            "core_membership",
+            value.core_membership_id.to_string(),
+            revision.to_string(),
+            if current == Some(value) && value.active {
+                "active"
+            } else {
+                "inactive"
+            },
+            None,
+            scope_repository(&value.scope_identity),
+            None,
+            &JournalPayload::CoreMembershipRecorded(Box::new(value.clone())),
+            *seq,
+            generation,
+        )
+    }
+
     pub(super) fn rows(
         &self,
         atoms: &BTreeMap<RevisionId, (Atom, u64)>,
@@ -932,29 +994,8 @@ impl S23State {
                 generation,
             )?);
         }
-        for (revision, (value, seq)) in &self.membership_revisions {
-            let current = self
-                .memberships
-                .get(&value.core_membership_id)
-                .map(|v| &v.0);
-            rows.push(object_row(
-                format!("object:atom:core_membership:{revision}"),
-                ObjectFamily::Atom,
-                "core_membership",
-                value.core_membership_id.to_string(),
-                revision.to_string(),
-                if current == Some(value) && value.active {
-                    "active"
-                } else {
-                    "inactive"
-                },
-                None,
-                scope_repository(&value.scope_identity),
-                None,
-                &JournalPayload::CoreMembershipRecorded(Box::new(value.clone())),
-                *seq,
-                generation,
-            )?);
+        for revision in self.membership_revisions.keys() {
+            rows.push(self.membership_row(*revision, generation)?);
         }
         for (revision, (value, seq)) in &self.contracts {
             rows.push(object_row(

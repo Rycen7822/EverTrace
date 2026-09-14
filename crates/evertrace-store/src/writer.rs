@@ -845,6 +845,17 @@ impl JournalWriter {
         Ok(self.project_validated(false, false).await?.0)
     }
 
+    pub async fn memories_current_context(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::projections::MemoriesCurrentContext, StoreError> {
+        self.validated_current_read(|state, stamp| {
+            state.memories_current_context(after, limit, stamp.has_failed_job)
+        })
+        .await
+    }
+
     pub async fn capture_current_context(
         &self,
         after: Option<&str>,
@@ -2012,6 +2023,9 @@ mod tests {
         let capture = writer.capture_current_context(None, None, 8).await.unwrap();
         assert_eq!(capture.frontier, committed.last_seq);
         assert!(capture.items.is_empty());
+        let memories = writer.memories_current_context(None, 8).await.unwrap();
+        assert_eq!(memories.frontier, committed.last_seq);
+        assert!(memories.items.is_empty());
         assert!(
             writer
                 .scope_current_context(&Default::default())
@@ -2035,6 +2049,10 @@ mod tests {
             validated.versions
         );
         let proof = writer.command_ids.take();
+        assert!(matches!(
+            writer.memories_current_context(None, 8).await,
+            Err(StoreError::StoreCorrupt)
+        ));
         assert!(
             writer
                 .scope_current_context(&Default::default())

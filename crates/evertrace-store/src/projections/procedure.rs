@@ -1445,6 +1445,46 @@ impl ProcedureState {
         Ok(true)
     }
 
+    pub(super) fn revision_row(
+        &self,
+        revision_id: RevisionId,
+        generation: u64,
+        support_state: Option<&str>,
+    ) -> Result<ObjectRow, StoreError> {
+        let (value, seq) = self
+            .revisions
+            .get(&revision_id)
+            .ok_or(StoreError::StoreCorrupt)?;
+        let payload = JournalPayload::ProcedureRevisionRecorded(Box::new(value.clone()));
+        let (repository_id, worktree_id) = scope_columns(value.draft.scope);
+        Ok(ObjectRow {
+            row_id: format!("object:procedure:{}:{revision_id}", value.procedure_id),
+            row_kind: ObjectRowKind::Data,
+            row_class: Some(ObjectRowClass::Object),
+            object_family: Some(ObjectFamily::Procedure),
+            object_kind: Some("procedure_revision".into()),
+            object_id: Some(value.procedure_id.to_string()),
+            current_revision_id: Some(revision_id.to_string()),
+            lifecycle: Some("active".into()),
+            epistemic: None,
+            authority: None,
+            publication_state: self
+                .current_publication
+                .get(&revision_id)
+                .map(|entry| publication(entry.0.to_state).into()),
+            support_state: support_state.map(str::to_owned),
+            project_id: None,
+            repository_id,
+            worktree_id,
+            task_id: None,
+            workstream_id: None,
+            session_id: None,
+            payload_json: Some(payload.canonical_json()?),
+            source_event_seq: *seq,
+            projection_generation: generation,
+        })
+    }
+
     pub(super) fn rows(
         &self,
         generation: u64,
@@ -1452,37 +1492,12 @@ impl ProcedureState {
     ) -> Result<Vec<ObjectRow>, StoreError> {
         let mut rows = Vec::new();
         let support_states = support.successor_support_states();
-        for (revision_id, (value, seq)) in &self.revisions {
-            let payload = JournalPayload::ProcedureRevisionRecorded(Box::new(value.clone()));
-            let (repository_id, worktree_id) = scope_columns(value.draft.scope);
-            rows.push(ObjectRow {
-                row_id: format!("object:procedure:{}:{revision_id}", value.procedure_id),
-                row_kind: ObjectRowKind::Data,
-                row_class: Some(ObjectRowClass::Object),
-                object_family: Some(ObjectFamily::Procedure),
-                object_kind: Some("procedure_revision".into()),
-                object_id: Some(value.procedure_id.to_string()),
-                current_revision_id: Some(revision_id.to_string()),
-                lifecycle: Some("active".into()),
-                epistemic: None,
-                authority: None,
-                publication_state: self
-                    .current_publication
-                    .get(revision_id)
-                    .map(|entry| publication(entry.0.to_state).into()),
-                support_state: support_states
-                    .get(&revision_id.to_string())
-                    .map(|state| (*state).to_owned()),
-                project_id: None,
-                repository_id,
-                worktree_id,
-                task_id: None,
-                workstream_id: None,
-                session_id: None,
-                payload_json: Some(payload.canonical_json()?),
-                source_event_seq: *seq,
-                projection_generation: generation,
-            });
+        for revision_id in self.revisions.keys() {
+            rows.push(self.revision_row(
+                *revision_id,
+                generation,
+                support_states.get(&revision_id.to_string()).copied(),
+            )?);
         }
         for (event_id, (event, seq)) in &self.events {
             let revision = self

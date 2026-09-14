@@ -1237,6 +1237,17 @@ impl HumanGovernanceService {
             }
             return Ok(Ok(Box::pin(self.capture_page(context, false)).await?));
         }
+        if selection == Some(HumanExplorerListSelection::Memories) {
+            let context = self
+                .writer
+                .memories_current_context(after.map(str::to_owned), usize::from(limit))
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if expected_frontier.is_some_and(|frontier| frontier != context.frontier) {
+                return Ok(Err(context.frontier));
+            }
+            return Ok(Ok(memories_page(context)?));
+        }
         let snapshot = if surface == HumanSurface::System {
             self.writer
                 .read_diagnostics()
@@ -4143,6 +4154,48 @@ pub enum HumanExplorerListSelection {
     Capture,
 }
 
+fn memories_page(
+    context: evertrace_store::MemoriesCurrentContext,
+) -> Result<HumanPage, HumanGovernanceError> {
+    let (status, degraded_reasons) = failed_job_status(context.has_failed_job);
+    let items = context
+        .items
+        .iter()
+        .map(|row| {
+            let mut result = summary_fields(row, HumanSurface::Explorer);
+            if row.object_kind.as_deref() == Some("revision_proposal_revision") {
+                let revision = row
+                    .current_revision_id
+                    .as_deref()
+                    .ok_or(HumanGovernanceError::Store)?
+                    .parse::<RevisionId>()
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                if context.current_proposal_revisions.contains(&revision) {
+                    let payload: JournalPayload = serde_json::from_str(
+                        row.payload_json
+                            .as_deref()
+                            .ok_or(HumanGovernanceError::Store)?,
+                    )
+                    .map_err(|_| HumanGovernanceError::Store)?;
+                    let JournalPayload::RevisionProposalRecorded(value) = payload else {
+                        return Err(HumanGovernanceError::Store);
+                    };
+                    result.proposal = Some(proposal_summary(&value));
+                }
+            }
+            Ok(result)
+        })
+        .collect::<Result<Vec<_>, HumanGovernanceError>>()?;
+    Ok(HumanPage {
+        diagnostics: None,
+        frontier: context.frontier,
+        status,
+        degraded_reasons,
+        items,
+        next_cursor: context.next_cursor,
+    })
+}
+
 fn page_selected(
     snapshot: &ProjectionSnapshot,
     surface: HumanSurface,
@@ -4775,18 +4828,7 @@ fn summary(
                     .as_deref()
                     .is_some_and(|id| id == value.proposal_revision_id.to_string())
         })
-        .map(|value| HumanProposalSummary {
-            proposal_id: value.proposal_id,
-            current_revision_id: value.proposal_revision_id,
-            fingerprint: hex(&value.fingerprint),
-            target_kind: value.target_kind,
-            target_id: value.target_id,
-            operation: value.operation,
-            base_revision_id: value.base_revision_id,
-            source_cohort_refs: value.source_cohort_refs.clone(),
-            eligibility: value.eligibility,
-            status: value.status,
-        });
+        .map(proposal_summary);
     let proposal_review = if include_detail {
         proposal
             .as_ref()
@@ -5063,6 +5105,21 @@ fn summary(
         system_detail,
         ..summary_fields(row, surface)
     })
+}
+
+fn proposal_summary(value: &RevisionProposal) -> HumanProposalSummary {
+    HumanProposalSummary {
+        proposal_id: value.proposal_id,
+        current_revision_id: value.proposal_revision_id,
+        fingerprint: hex(&value.fingerprint),
+        target_kind: value.target_kind,
+        target_id: value.target_id,
+        operation: value.operation,
+        base_revision_id: value.base_revision_id,
+        source_cohort_refs: value.source_cohort_refs.clone(),
+        eligibility: value.eligibility,
+        status: value.status,
+    }
 }
 
 fn summary_fields(row: &ObjectRow, surface: HumanSurface) -> HumanSummary {

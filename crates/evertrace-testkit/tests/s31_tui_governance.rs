@@ -1093,6 +1093,71 @@ fn human_wire_is_closed_and_tui_renders_daemon_snapshot() {
     app.dispatch(evertrace_tui::UiCommand::CancelModal);
 }
 
+async fn assert_memories_match_explorer(service: &HumanGovernanceService) {
+    let mut all = Vec::new();
+    let mut cursor = None;
+    let (frontier, status, degraded_reasons) = loop {
+        let page = service
+            .list(HumanSurface::Explorer, None, cursor.as_deref(), 64)
+            .await
+            .unwrap()
+            .unwrap();
+        all.extend(page.items.into_iter().filter(|item| {
+            matches!(
+                item.object_kind.as_str(),
+                "semantic_digest"
+                    | "atom_revision"
+                    | "procedure_revision"
+                    | "core_membership"
+                    | "revision_proposal_revision"
+            )
+        }));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break (page.frontier, page.status, page.degraded_reasons);
+        }
+    };
+    for after in [
+        None,
+        Some("object:atom:"),
+        Some("object:procedure:nonstandard"),
+    ] {
+        for limit in [1_u16, 64] {
+            let page = service
+                .list_selected(
+                    HumanSurface::Explorer,
+                    Some(frontier),
+                    after,
+                    limit,
+                    Some(evertrace_engine::HumanExplorerListSelection::Memories),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = all
+                .iter()
+                .filter(|item| after.is_none_or(|cursor| item.stable_key.as_str() > cursor))
+                .take(usize::from(limit) + 1)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                page.next_cursor,
+                (expected.len() > usize::from(limit))
+                    .then(|| expected[usize::from(limit) - 1].stable_key.clone())
+            );
+            assert_eq!(
+                page.items,
+                expected
+                    .into_iter()
+                    .take(usize::from(limit))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(page.status, status);
+            assert_eq!(page.degraded_reasons, degraded_reasons);
+        }
+    }
+}
+
 #[tokio::test]
 async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() {
     let root = TempDir::new().unwrap();
@@ -1262,6 +1327,7 @@ async fn bounded_system_pages_are_frontier_consistent_and_restart_rebuildable() 
     assert!(empty_capture.items.is_empty());
     assert_eq!(empty_capture.status, first.status);
     assert_eq!(empty_capture.degraded_reasons, first.degraded_reasons);
+    assert_memories_match_explorer(&service).await;
     let cursor = first.next_cursor.clone().unwrap();
     assert!(first.items.iter().all(|item| item.category
         == evertrace_engine::HumanItemCategory::Runtime
@@ -3808,6 +3874,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
         .unwrap();
     assert!(revisions.items.len() >= 2);
     assert!(revisions.items.iter().all(|item| item.object_ref.as_deref() == Some(first_atom.atom_id.to_string().as_str())));
+    assert_memories_match_explorer(&service).await;
 
     let mut invalid_draft = atom_draft(repository_id, &receipt, &observation);
     invalid_draft.value.text = "invalid merge".into();
@@ -5396,6 +5463,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             .filter(|item| item.object_kind == "source_observation")
             .collect::<Vec<_>>()
     );
+    assert_memories_match_explorer(&reopened_service).await;
     reopened_handle.shutdown().await.unwrap();
     reopened_task.await.unwrap().unwrap();
 }

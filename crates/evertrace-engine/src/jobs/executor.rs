@@ -69,6 +69,11 @@ enum WriterRequest {
         reply:
             oneshot::Sender<Result<evertrace_store::PassiveSourceCurrentContext, WriterActorError>>,
     },
+    MemoriesCurrent {
+        after: Option<String>,
+        limit: usize,
+        reply: oneshot::Sender<Result<evertrace_store::MemoriesCurrentContext, WriterActorError>>,
+    },
     CaptureCurrent {
         after: Option<String>,
         exact: Option<String>,
@@ -415,6 +420,23 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::PassiveSourceCurrent { selection, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn memories_current_context(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<evertrace_store::MemoriesCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::MemoriesCurrent {
+                after,
+                limit,
+                reply,
+            })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -889,6 +911,26 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .capture_current_context(after.as_deref(), exact.as_deref(), limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::MemoriesCurrent {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .memories_current_context(after.as_deref(), limit)
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();

@@ -851,6 +851,26 @@ async fn imported_messages_scenario(
         input["source_target"]["source_revision"],
         receipt.source_revision.as_str()
     );
+    let human = evertrace_engine::HumanGovernanceService::new(writer.clone(), CONFIG)
+        .with_session_report(Arc::clone(&report));
+    let memories = human
+        .list_selected(
+            evertrace_engine::HumanSurface::Explorer,
+            None,
+            None,
+            64,
+            Some(evertrace_engine::HumanExplorerListSelection::Memories),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        memories
+            .items
+            .iter()
+            .any(|item| item.object_kind == "semantic_digest"
+                && item.object_ref == Some(digest.semantic_digest_id.to_string()))
+    );
     let bindings = evertrace_engine::McpBindingAuthority::new(
         DeviceKeyStore::new(temp.path().join("keys"))
             .load_or_create()
@@ -1601,6 +1621,27 @@ async fn imported_messages_scenario(
         .unwrap();
     let pending = writer.project().await.expect("purge pending projection");
     evertrace_store::RuntimeSchedulerView::from_snapshot(&pending).expect("purge pending jobs");
+    let human = evertrace_engine::HumanGovernanceService::new(writer.clone(), CONFIG)
+        .with_session_report(Arc::clone(&report));
+    let mut expected = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = human.list(evertrace_engine::HumanSurface::Explorer, Some(pending.frontier), cursor.as_deref(), 64)
+            .await.unwrap().unwrap();
+        expected.extend(page.items.into_iter().filter(|item| matches!(item.object_kind.as_str(),
+            "semantic_digest" | "atom_revision" | "procedure_revision" | "core_membership" | "revision_proposal_revision")));
+        cursor = page.next_cursor;
+        if cursor.is_none() { break; }
+    }
+    let mut actual = Vec::new();
+    loop {
+        let page = human.list_selected(evertrace_engine::HumanSurface::Explorer, Some(pending.frontier), cursor.as_deref(), 64,
+            Some(evertrace_engine::HumanExplorerListSelection::Memories)).await.unwrap().unwrap();
+        actual.extend(page.items);
+        cursor = page.next_cursor;
+        if cursor.is_none() { break; }
+    }
+    assert_eq!(actual, expected);
     release.send(()).unwrap();
     running.await.unwrap().unwrap();
     purged_stub.finish().await;

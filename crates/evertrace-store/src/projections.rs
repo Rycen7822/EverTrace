@@ -13,9 +13,9 @@ use evertrace_domain::{
         ExecutionLaneId, ExperimentRunId, HostOccurrenceId, IntegrationEventId, JobId,
         OperationBurstId, OperationId, ProcedureId, ProcedureNegativeEvidenceId, ProcedureUsageId,
         RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId, RepositoryId,
-        ResultEvidenceId, RevisionProposalId, ScopeEffectId, SourceObservationId, SourceReceiptId,
-        TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
-        WorktreeSnapshotId, WorktreeTransitionId,
+        ResultEvidenceId, RevisionProposalId, ScopeEffectId, SemanticDigestId, SourceObservationId,
+        SourceReceiptId, TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId,
+        WorkstreamId, WorktreeId, WorktreeSnapshotId, WorktreeTransitionId,
     },
     procedure::{ProcedureRevision, ProcedureScope, ProcedureUsageRevision},
     purge::{
@@ -2416,6 +2416,24 @@ pub struct CaptureCurrentItem {
     pub suppressed: bool,
 }
 
+/// Facts for one Memories list page; never a complete projection snapshot.
+#[derive(Debug)]
+pub struct MemoriesCurrentContext {
+    pub frontier: u64,
+    pub has_failed_job: bool,
+    pub items: Vec<ObjectRow>,
+    pub current_proposal_revisions: BTreeSet<RevisionId>,
+    pub next_cursor: Option<String>,
+}
+
+enum MemoriesCandidate {
+    Atom(RevisionId),
+    Membership(RevisionId),
+    Procedure(RevisionId),
+    Proposal(RevisionId),
+    Digest(SemanticDigestId),
+}
+
 /// The facts needed to resolve one caller's active chain and explicit shard.
 /// This is request-local input, not a projection snapshot.
 #[derive(Debug, Default)]
@@ -3885,6 +3903,190 @@ impl JournalAdmissionState {
             _ => physical_object_row(ObjectFamily::Work, kind, id, revision, payload, seq)?,
         };
         Ok(!self.capture_product_rows(vec![row])?.is_empty())
+    }
+
+    pub(crate) fn memories_current_context(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        has_failed_job: bool,
+    ) -> Result<MemoriesCurrentContext, StoreError> {
+        if limit == 0 || limit > 64 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut revision_ids = BTreeSet::new();
+        let mut atom_ids = BTreeSet::new();
+        let mut procedure_ids = BTreeSet::new();
+        let mut membership_ids = BTreeSet::new();
+        for event in self.deletions.events() {
+            revision_ids.extend(event.exact_revision_ids.iter().copied());
+            match event.target {
+                ObjectDeletionTarget::Atom { atom_id } => {
+                    atom_ids.insert(atom_id);
+                }
+                ObjectDeletionTarget::Procedure { procedure_id } => {
+                    procedure_ids.insert(procedure_id);
+                }
+                ObjectDeletionTarget::CoreMembership { core_membership_id } => {
+                    membership_ids.insert(core_membership_id);
+                }
+            }
+        }
+        let removed_contracts = if revision_ids.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.s23
+                .deletion_owned_contracts(&revision_ids, &membership_ids)
+        };
+        let mut items = Vec::with_capacity(limit + 1);
+        let mut cursor = after.map(str::to_owned);
+        while items.len() <= limit {
+            // Retain only the next bounded group of identities. No candidate
+            // payload is cloned or serialized while enumerating history.
+            let capacity = limit + 1 - items.len();
+            let mut candidates = BTreeMap::new();
+            let mut offer = |key: String, candidate| {
+                if cursor.as_deref().is_some_and(|after| key.as_str() <= after) {
+                    return;
+                }
+                candidates.insert(key, candidate);
+                if candidates.len() > capacity {
+                    candidates.pop_last();
+                }
+            };
+            for id in self.atom_revisions.keys() {
+                offer(
+                    format!("object:atom:atom_revision:{id}"),
+                    MemoriesCandidate::Atom(*id),
+                );
+            }
+            for value in self.s23.all_membership_revisions() {
+                offer(
+                    format!(
+                        "object:atom:core_membership:{}",
+                        value.membership_revision_id
+                    ),
+                    MemoriesCandidate::Membership(value.membership_revision_id),
+                );
+            }
+            for value in self.procedure.all_revisions() {
+                offer(
+                    format!(
+                        "object:procedure:{}:{}",
+                        value.procedure_id, value.revision_id
+                    ),
+                    MemoriesCandidate::Procedure(value.revision_id),
+                );
+            }
+            for id in self.proposal_revisions.keys() {
+                offer(
+                    format!("object:revision_proposal:revision_proposal_revision:{id}"),
+                    MemoriesCandidate::Proposal(*id),
+                );
+            }
+            for id in self.synthesis.digests.keys() {
+                offer(
+                    format!("object:work:semantic_digest:{id}"),
+                    MemoriesCandidate::Digest(*id),
+                );
+            }
+            if candidates.is_empty() {
+                break;
+            }
+            for (key, candidate) in candidates {
+                cursor = Some(key);
+                let row = match candidate {
+                    MemoriesCandidate::Atom(id) => {
+                        let (value, seq) = self
+                            .atom_revisions
+                            .get(&id)
+                            .ok_or(StoreError::StoreCorrupt)?;
+                        let mut row = semantic_atom_row(
+                            value,
+                            &JournalPayload::AtomRecorded(Box::new(value.clone())),
+                            *seq,
+                        )?;
+                        row.support_state = self
+                            .s23
+                            .atom_support_state_excluding(id, &removed_contracts)
+                            .map(str::to_owned);
+                        row
+                    }
+                    MemoriesCandidate::Membership(id) => {
+                        self.s23.membership_row(id, PROJECTION_GENERATION)?
+                    }
+                    MemoriesCandidate::Procedure(id) => self.procedure.revision_row(
+                        id,
+                        PROJECTION_GENERATION,
+                        self.s23
+                            .successor_support_state_excluding(id, &removed_contracts),
+                    )?,
+                    MemoriesCandidate::Proposal(id) => {
+                        let (value, seq) = self
+                            .proposal_revisions
+                            .get(&id)
+                            .ok_or(StoreError::StoreCorrupt)?;
+                        // Full projection closes deletion over the logical
+                        // proposal before rendering any of its revisions.
+                        if !revision_ids.is_empty()
+                            && self.proposal_revisions.values().any(|(candidate, _)| {
+                                candidate.proposal_id == value.proposal_id
+                                    && proposal_targets_deleted(
+                                        candidate,
+                                        &atom_ids,
+                                        &procedure_ids,
+                                        &membership_ids,
+                                    )
+                            })
+                        {
+                            continue;
+                        }
+                        semantic_proposal_row(
+                            value,
+                            &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
+                            *seq,
+                        )?
+                    }
+                    MemoriesCandidate::Digest(id) => {
+                        let (value, seq) = self
+                            .synthesis
+                            .digests
+                            .get(&id)
+                            .ok_or(StoreError::StoreCorrupt)?;
+                        synthesis::digest_row(id, value.clone(), *seq)?
+                    }
+                };
+                items.extend(filter_product_rows(
+                    vec![row],
+                    &self.deletions,
+                    &self.scope_purges,
+                    self.repository_closures.values(),
+                )?);
+            }
+        }
+        let next_cursor = (items.len() > limit).then(|| items[limit - 1].row_id.clone());
+        items.truncate(limit);
+        // Deletion closure removes complete proposal identities, including
+        // accepted creates whose older revisions had no direct target. The
+        // repository closure likewise records logical proposal IDs. A retained
+        // chain therefore has the same current revision as validated admission.
+        let current_proposal_revisions = items
+            .iter()
+            .filter(|row| row.object_kind.as_deref() == Some("revision_proposal_revision"))
+            .filter_map(|row| row.object_id.as_deref()?.parse::<RevisionProposalId>().ok())
+            .filter_map(|id| {
+                self.proposals
+                    .get(&id)
+                    .map(|(value, _)| value.proposal_revision_id)
+            })
+            .collect();
+        Ok(MemoriesCurrentContext {
+            frontier: self.frontier,
+            has_failed_job,
+            items,
+            current_proposal_revisions,
+            next_cursor,
+        })
     }
 
     pub(crate) fn capture_current_context(
