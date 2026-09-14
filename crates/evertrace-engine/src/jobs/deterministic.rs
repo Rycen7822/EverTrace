@@ -3,8 +3,8 @@ use evertrace_domain::{
     semantic::{GlobalSuccessorSupportContract, GlobalSupportState, GlobalSupportValidationEvent},
 };
 use evertrace_store::{
-    DirtyTarget, DurableJob, JobStatus, JournalPayload, ObjectRow, ObjectRowKind, OutboxEntry,
-    StaleGenerationAudit, StoreError,
+    DirtyTarget, DurableJob, JobStatus, JournalPayload, ObjectRow, ObjectRowClass, ObjectRowKind,
+    OutboxEntry, StaleGenerationAudit, StoreError,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +111,10 @@ pub fn expired_leases(
     let mut actions = Vec::new();
     for row in data_rows_at_frontier(rows, journal_frontier) {
         if evertrace_store::session_import::restore_current(row)?.is_some() {
+            continue;
+        }
+        // Lease recovery consumes runtime facts, not non-runtime derived payloads.
+        if row.row_class != Some(ObjectRowClass::Runtime) {
             continue;
         }
         let Some(payload) = row.payload_json.as_deref() else {
@@ -224,7 +228,7 @@ mod tests {
         ids::JobId,
         semantic::{GlobalSupportState, SupportThresholdSnapshot},
     };
-    use evertrace_store::{JobBudget, ObjectRowClass};
+    use evertrace_store::JobBudget;
 
     use super::*;
 
@@ -281,8 +285,19 @@ mod tests {
             terminal: None,
             lease_until_us: Some(50),
         };
+        let mut non_runtime_job = runtime_row(
+            "projection:job:test",
+            JournalPayload::JobState(job.clone()),
+            10,
+        );
+        non_runtime_job.row_class = Some(ObjectRowClass::Projection);
+        let mut derived = non_runtime_job.clone();
+        derived.row_id = "projection:derived:test".into();
+        derived.payload_json = Some(r#"{"derived":true}"#.into());
         let rows = vec![
             ObjectRow::checkpoint(10, 1),
+            non_runtime_job,
+            derived,
             runtime_row(
                 "runtime:job:test",
                 JournalPayload::JobState(job.clone()),
@@ -290,7 +305,13 @@ mod tests {
             ),
         ];
         assert!(expired_leases(&rows, 49, 10).unwrap().is_empty());
-        assert_eq!(expired_leases(&rows, 50, 10).unwrap()[0].next_attempt, 3);
+        assert_eq!(
+            expired_leases(&rows, 50, 10).unwrap(),
+            vec![RecoveryAction {
+                job: job.clone(),
+                next_attempt: 3,
+            }]
+        );
         assert_eq!(classify_job_result(&job, 7), JobResultDisposition::Apply);
         assert_eq!(
             classify_job_result(&job, 8),

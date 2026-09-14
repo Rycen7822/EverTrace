@@ -1614,18 +1614,7 @@ impl BackgroundScheduler {
             }
         }
         let recovery_now_us = now_us()?;
-        // Lease recovery consumes runtime journal facts, not derived payloads
-        // such as ProcedureContextEffectProjection produced by successful usage.
-        let lease_rows = snapshot
-            .rows
-            .iter()
-            .filter(|row| {
-                row.row_kind == evertrace_store::ObjectRowKind::Checkpoint
-                    || row.row_class == Some(evertrace_store::ObjectRowClass::Runtime)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let recovery = expired_leases(&lease_rows, recovery_now_us, snapshot.frontier)
+        let recovery = expired_leases(&snapshot.rows, recovery_now_us, snapshot.frontier)
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if !recovery.is_empty() {
             let events = recovery
