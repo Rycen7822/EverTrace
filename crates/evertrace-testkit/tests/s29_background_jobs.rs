@@ -725,13 +725,95 @@ fn unsupported_work_is_not_selected_or_silently_consumed() {
 }
 
 #[tokio::test]
+async fn capture_backlog_selection_keeps_indexes_for_ingest_barrier() {
+    let temp = TempDir::new().unwrap();
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let runtime = runtime(temp.path());
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    let mut input = capture_input(&synthetic_report());
+    input.lifecycle = None;
+    capture.capture(input).unwrap();
+    capture.seal_active().unwrap();
+    let spool = evertrace_capture::DurableSpool::open_read_only(
+        runtime.spool_dir.clone(),
+        runtime.spool_limits().unwrap(),
+    )
+    .unwrap();
+    assert!(spool.below_low_watermark().unwrap());
+    assert!(spool.pending_gap_markers().unwrap().is_empty());
+    assert!(spool.has_ordinary_backlog().unwrap());
+    let (handle, task) =
+        spawn_writer(open_writer(&temp.path().join("store")).await.unwrap(), 16).unwrap();
+    handle.sync_frontier().await.unwrap();
+    let before = handle.read_diagnostics().await.unwrap();
+    // An existing capture dirty signal needs current objects for selection but
+    // does not itself request a projection rebuild or executable capture job.
+    let committed = handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    10,
+                    CONFIG,
+                    "s29-ingest",
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::EvidenceSurface,
+                        target_id: "s29-capture-source".into(),
+                        algorithm_revision: "s29-ingest".into(),
+                        source_watermark: 1,
+                    }),
+                )],
+            )
+            .unwrap(),
+            10,
+        )
+        .await
+        .unwrap();
+    let scheduler = make_scheduler(handle.clone(), runtime.clone(), Arc::new(RwLock::new(None)));
+    assert_eq!(scheduler.run_once().await.unwrap().completed, 0);
+    let after = handle.read_diagnostics().await.unwrap();
+    assert_eq!(after.tables[1].checkpoint, Some(committed.last_seq));
+    for index in 2..4 {
+        assert_eq!(
+            after.tables[index].checkpoint,
+            before.tables[index].checkpoint
+        );
+        assert_eq!(after.tables[index].version, before.tables[index].version);
+        assert!(after.tables[index].checkpoint.unwrap() < committed.last_seq);
+    }
+    assert!(spool.has_ordinary_backlog().unwrap());
+    let ingestor = EvidenceIngestor::new(runtime, handle.clone(), CONFIG, "s29-ingest").unwrap();
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 1);
+    let ingested = handle.read_diagnostics().await.unwrap();
+    let frontier = ingested.tables[1].checkpoint.unwrap();
+    assert!(frontier > committed.last_seq);
+    assert_eq!(ingested.tables[2].checkpoint, Some(frontier));
+    assert_eq!(ingested.tables[3].checkpoint, Some(frontier));
+    assert!(!spool.has_ordinary_backlog().unwrap());
+    drop(scheduler);
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn real_scheduler_completes_objects_projection_once_across_restart() {
     let temp = TempDir::new().unwrap();
     DeviceKeyStore::new(temp.path().join("keys"))
         .load_or_create()
         .unwrap();
     let runtime = runtime(temp.path());
-    CaptureRuntime::open(runtime.clone()).unwrap();
+    let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
+    capture.capture(capture_input(&synthetic_report())).unwrap();
+    capture.seal_active().unwrap();
+    let spool = evertrace_capture::DurableSpool::open_read_only(
+        runtime.spool_dir.clone(),
+        runtime.spool_limits().unwrap(),
+    )
+    .unwrap();
+    assert!(spool.below_low_watermark().unwrap());
+    assert!(spool.has_ordinary_backlog().unwrap());
     let store = temp.path().join("store");
     let writer = open_writer(&store).await.unwrap();
     let (handle, task) = spawn_writer(writer, 16).unwrap();
@@ -780,6 +862,12 @@ async fn real_scheduler_completes_objects_projection_once_across_restart() {
     let report = Arc::new(RwLock::new(None));
     let scheduler = make_scheduler(handle.clone(), runtime.clone(), report);
     assert_eq!(scheduler.run_once().await.unwrap().completed, 1);
+    let diagnostics = handle.read_diagnostics().await.unwrap();
+    for table in &diagnostics.tables[2..] {
+        assert!(table.checkpoint.unwrap() >= target_watermark);
+    }
+    // Check the job's index guarantee before refreshing its terminal object:
+    // the terminal journal append itself occurs after the projection barrier.
     let projected = handle.project().await.unwrap();
     let jobs = RuntimeSchedulerView::from_snapshot(&projected)
         .unwrap()

@@ -1602,7 +1602,13 @@ impl BackgroundScheduler {
             }
         }
 
-        let mut snapshot = self.writer.project().await.map_err(map_writer)?;
+        // Capture-backlog selection consumes current objects; ingest owns its
+        // acknowledgement barrier and executable projection jobs sync below.
+        let mut snapshot = if capture_state == CaptureAdmissionState::Normal && ordinary_pending {
+            self.writer.project_objects().await.map_err(map_writer)?
+        } else {
+            self.writer.project().await.map_err(map_writer)?
+        };
         if optional_allowed && let Some(inventory) = &self.inventory {
             match inventory.enqueue_observed(&snapshot).await {
                 Ok(true) => snapshot = self.writer.project().await.map_err(map_writer)?,
@@ -2412,6 +2418,9 @@ impl BackgroundScheduler {
                     retryable = true;
                     continue;
                 }
+                // A completed projection job also promises the derived tables
+                // have caught up, unlike the objects-only selection snapshot.
+                self.writer.sync_frontier().await.map_err(map_writer)?;
                 let mut terminal = claimed.job;
                 terminal.state = JobStatus::Succeeded;
                 terminal.lease_until_us = None;
