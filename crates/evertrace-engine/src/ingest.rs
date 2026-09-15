@@ -10,7 +10,7 @@ use evertrace_capture::{
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{SourceInstanceId, SourceRevision, SourceRevisionMode, SourceRole},
-    ids::SourceObservationId,
+    ids::{RepositoryId, SourceObservationId},
 };
 use evertrace_store::{
     DirtyTarget, DirtyTargetKind, EventScope, JournalCommand, JournalEventDraft, JournalPayload,
@@ -445,13 +445,39 @@ impl EvidenceIngestor {
             (u64::MAX, u64::MAX)
         };
         for segment in segments {
-            let purge_snapshot = self
+            // Keep the original validation barrier even for source-local input
+            // without repository IDs. The predicate needs only scoped purge
+            // membership, not a transferred full objects snapshot.
+            let purge_frontier = self
                 .writer
-                .project_objects()
+                .sync_objects_frontier()
                 .await
                 .map_err(map_writer_error)?;
-            let purge_view = ScopePurgeCurrentView::from_snapshot(&purge_snapshot)
-                .map_err(|_| IngestError::StoreCorrupt)?;
+            let repository_ids = segment
+                .frames()
+                .iter()
+                .filter(|frame| {
+                    selected.is_none_or(|ids| ids.contains(&frame.record.source_observation_id))
+                })
+                // Leave malformed input to its original per-frame error path.
+                .map_while(|frame| canonical_body(&frame.record).ok())
+                .filter_map(|body| body.repository_instance_id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut purged = BTreeSet::new();
+            // RepositoryReadContext has a fixed 64-repository request bound.
+            for ids in repository_ids.chunks(64) {
+                let context = self
+                    .writer
+                    .repository_read_context(ids.iter().copied().collect())
+                    .await
+                    .map_err(map_writer_error)?;
+                if context.frontier < purge_frontier {
+                    return Err(IngestError::StoreCorrupt);
+                }
+                purged.extend(context.purged);
+            }
             let mut committed = 0_usize;
             let mut terminal = Vec::new();
             let mut shared_maintenance = None;
@@ -476,7 +502,7 @@ impl EvidenceIngestor {
                                 .is_none_or(|ids| ids.contains(&frame.record.source_observation_id))
                         })
                         .map_while(|frame| canonical_body(&frame.record).ok())
-                        .filter(|body| !capture_is_purged(body, &purge_view))
+                        .filter(|body| !capture_is_purged(body, &purged))
                         .map(|body| body.command_id)
                         .collect();
                     replay_batch = self
@@ -489,7 +515,7 @@ impl EvidenceIngestor {
                     continue;
                 }
                 let body = canonical_body(&frame.record)?;
-                if capture_is_purged(&body, &purge_view) {
+                if capture_is_purged(&body, &purged) {
                     terminal.push(body);
                     continue;
                 }
@@ -738,7 +764,10 @@ impl EvidenceIngestor {
         let guard = fence.exclusive().map_err(|_| IngestError::Cas)?;
         let snapshot = self.writer.project().await.map_err(map_writer_error)?;
         let purges = ScopePurgeCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| IngestError::StoreCorrupt)?;
+            .map_err(|_| IngestError::StoreCorrupt)?
+            .events
+            .into_keys()
+            .collect();
         if terminal_segments
             .iter()
             .flat_map(|(_, _, terminal)| terminal)
@@ -797,9 +826,9 @@ fn canonical_body(record: &SpoolRecord) -> Result<CaptureRecordBody, IngestError
         })
 }
 
-fn capture_is_purged(body: &CaptureRecordBody, purges: &ScopePurgeCurrentView) -> bool {
+fn capture_is_purged(body: &CaptureRecordBody, purged: &BTreeSet<RepositoryId>) -> bool {
     body.repository_instance_id
-        .is_some_and(|repository_id| purges.events.contains_key(&repository_id))
+        .is_some_and(|repository_id| purged.contains(&repository_id))
 }
 
 pub(crate) fn capture_event_drafts(

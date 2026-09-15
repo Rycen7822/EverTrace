@@ -92,6 +92,7 @@ enum WriterRequest {
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
     SyncFrontier {
+        indexes: bool,
         reply: oneshot::Sender<Result<u64, WriterActorError>>,
     },
     CommittedCommand {
@@ -511,9 +512,17 @@ impl WriterHandle {
 
     /// Complete the projection barrier without transferring a full snapshot.
     pub async fn sync_frontier(&self) -> Result<u64, WriterActorError> {
+        self.sync_projection_frontier(true).await
+    }
+
+    pub(crate) async fn sync_objects_frontier(&self) -> Result<u64, WriterActorError> {
+        self.sync_projection_frontier(false).await
+    }
+
+    async fn sync_projection_frontier(&self, indexes: bool) -> Result<u64, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(WriterRequest::SyncFrontier { reply })
+            .send(WriterRequest::SyncFrontier { indexes, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -1004,16 +1013,17 @@ async fn run_writer(
                         return Err(WriterActorError::Store);
                     }
                 }
-                WriterRequest::SyncFrontier { reply } => {
+                WriterRequest::SyncFrontier { indexes, reply } => {
                     if reply.is_closed() {
                         continue;
                     }
-                    let result = writer
-                        .as_ref()
-                        .ok_or(WriterActorError::Stopped)?
-                        .sync_frontier()
-                        .await
-                        .map_err(map_store_error);
+                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                    let result = if indexes {
+                        writer.sync_frontier().await
+                    } else {
+                        writer.sync_objects_frontier().await
+                    }
+                    .map_err(map_store_error);
                     let fatal = result.is_err();
                     let _ = reply.send(result);
                     if fatal {

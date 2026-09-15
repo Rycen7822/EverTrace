@@ -924,6 +924,69 @@ async fn identity_cas_and_metadata_failures_preserve_segment_and_do_not_advance_
 }
 
 #[tokio::test]
+async fn source_local_capture_keeps_projection_validation_before_commit() {
+    let temp = TempDir::new().unwrap();
+    let (snapshot, mut runtime) = prepare(temp.path());
+    runtime.capture(input("record-a", b"payload")).unwrap();
+    let frame = runtime.spool().read_active().unwrap().remove(0);
+    assert!(
+        decode_record_body(&frame.record.record_body)
+            .unwrap()
+            .repository_instance_id
+            .is_none()
+    );
+    drop(runtime);
+
+    let store_dir = temp.path().join("store");
+    let writer = open_writer(&store_dir).await.unwrap();
+    let before = writer.journal_rows().await.unwrap();
+    let store = evertrace_store::CompatibilityStore::connect_local(
+        &evertrace_store::connection::native_root(&store_dir),
+    )
+    .await
+    .unwrap();
+    let objects = store
+        .connection()
+        .open_table(evertrace_store::OBJECTS_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    let (handle, task) = spawn_writer(writer, 8).unwrap();
+    // Finish actor startup before injecting damage so the ingest barrier,
+    // not startup reconciliation, is the operation being checked.
+    handle.sync_frontier().await.unwrap();
+    objects
+        .update()
+        .only_if(format!(
+            "row_id = '{}'",
+            evertrace_store::objects::OBJECTS_CHECKPOINT_ID
+        ))
+        .column("source_event_seq", "source_event_seq + 1")
+        .execute()
+        .await
+        .unwrap();
+    let ingestor = EvidenceIngestor::new(snapshot.clone(), handle, [0; 32], "s08-v1").unwrap();
+    assert_eq!(ingestor.drain_once().await, Err(IngestError::StoreCorrupt));
+    assert_eq!(
+        task.await.unwrap(),
+        Err(evertrace_engine::jobs::WriterActorError::Store)
+    );
+    assert_eq!(sealed_count(&snapshot.spool_dir.join("main")), 1);
+    let journal = store
+        .connection()
+        .open_table(evertrace_store::JOURNAL_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        evertrace_store::journal::read_all_journal_rows(&journal)
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn corrupt_frame_is_quarantined_without_journal_progress_or_acknowledgement() {
     let temp = TempDir::new().unwrap();
     let (snapshot, mut runtime) = prepare(temp.path());
