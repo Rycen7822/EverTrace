@@ -1213,6 +1213,37 @@ impl JournalPayload {
     pub fn canonical_json(&self) -> Result<String, StoreError> {
         serde_json::to_string(self).map_err(|_| StoreError::Serialization)
     }
+
+    pub(crate) fn matches_canonical_json(&self, expected: &str) -> Result<bool, StoreError> {
+        // Use the same serializer as canonical_json, but compare its output
+        // directly instead of allocating another full payload String.
+        struct Comparison<'a> {
+            remaining: &'a [u8],
+            matched: bool,
+        }
+        impl std::io::Write for Comparison<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.matched {
+                    if let Some(remaining) = self.remaining.strip_prefix(bytes) {
+                        self.remaining = remaining;
+                    } else {
+                        self.matched = false;
+                    }
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut comparison = Comparison {
+            remaining: expected.as_bytes(),
+            matched: true,
+        };
+        serde_json::to_writer(&mut comparison, self).map_err(|_| StoreError::Serialization)?;
+        Ok(comparison.matched && comparison.remaining.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2578,6 +2609,30 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_json_comparison_requires_the_exact_complete_bytes() {
+        let payload = super::JournalPayload::ConfigAudit(super::ConfigAudit {
+            config_version: 1,
+            effective_config_hash: [7; 32],
+            reload: None,
+        });
+        let canonical = payload.canonical_json().unwrap();
+        assert!(payload.matches_canonical_json(&canonical).unwrap());
+        assert!(
+            !payload
+                .matches_canonical_json(&canonical[..canonical.len() - 1])
+                .unwrap()
+        );
+        assert!(
+            !payload
+                .matches_canonical_json(&format!("{canonical}\n"))
+                .unwrap()
+        );
+        let changed = canonical.replacen("\"config_version\":1", "\"config_version\":2", 1);
+        assert_ne!(changed, canonical);
+        assert!(!payload.matches_canonical_json(&changed).unwrap());
+    }
+
     #[test]
     fn legacy_config_audit_keeps_its_original_json_and_canonical_shape() {
         use super::*;

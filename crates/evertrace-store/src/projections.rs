@@ -11988,10 +11988,9 @@ impl ReducerState {
             let payload: JournalPayload =
                 serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
             payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
-            if payload
-                .canonical_json()
+            if !payload
+                .matches_canonical_json(payload_json)
                 .map_err(|_| StoreError::StoreCorrupt)?
-                != payload_json
             {
                 return Err(StoreError::StoreCorrupt);
             }
