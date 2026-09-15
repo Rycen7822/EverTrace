@@ -179,7 +179,30 @@ impl L0002ProjectionWorker {
         }
         let relation_frontier = checkpoint_relation(&relations)?;
         let search_frontier = checkpoint_search(&search)?;
-        let journal_frontier = read_journal_frontier(&self.journal).await?;
+        let journal_delta = if let Some(delta) = journal_delta {
+            self.journal
+                .checkout_latest()
+                .await
+                .map_err(|_| StoreError::LanceDb)?;
+            delta.at_version(
+                self.journal
+                    .version()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?,
+            )
+        } else {
+            None
+        };
+        let journal_frontier = if let Some(frontier) = journal_delta
+            .as_ref()
+            .and_then(ProjectionJournalDelta::frontier)
+        {
+            // The preceding objects catch-up validated the actual delta's end
+            // against this exact native journal version, not a reserved seq.
+            frontier
+        } else {
+            read_journal_frontier(&self.journal).await?
+        };
         if objects.frontier != journal_frontier
             || relation_frontier > journal_frontier
             || search_frontier > journal_frontier
@@ -197,8 +220,8 @@ impl L0002ProjectionWorker {
                 persisted_delta = read_journal_after(&self.journal, checkpoint).await?;
                 persisted_delta.as_slice()
             };
-            // Reuse bytes, not a validation verdict. Each distinct checkpoint
-            // still validates its full command delta against the live frontier.
+            // Each distinct checkpoint still validates the complete command
+            // delta against the frontier of the current native journal version.
             validate_delta(checkpoint, journal_frontier, delta)?;
         }
         // No downstream derivation needs journal payloads. Release the handoff

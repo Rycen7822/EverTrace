@@ -14224,11 +14224,20 @@ fn source_revision_key(value: &SourceRevisionRecorded) -> String {
 // the same writer call; this is never retained in the writer or a cache.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct ProjectionJournalDelta {
+    journal_version: u64,
     checkpoint: u64,
     rows: Vec<JournalRow>,
 }
 
 impl ProjectionJournalDelta {
+    pub(crate) fn at_version(self, journal_version: u64) -> Option<Self> {
+        (self.journal_version == journal_version).then_some(self)
+    }
+
+    pub(crate) fn frontier(&self) -> Option<u64> {
+        self.rows.last().map(|row| row.seq)
+    }
+
     pub(crate) fn rows_after(&self, checkpoint: u64) -> Option<&[JournalRow]> {
         (checkpoint == self.checkpoint).then_some(self.rows.as_slice())
     }
@@ -14282,6 +14291,11 @@ impl ProjectionWorker {
         validated_current: Option<(u64, u64, u64)>,
         appended_batch: Option<&arrow_array::RecordBatch>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
+        let journal_version = self
+            .journal
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
         self.objects
             .checkout_latest()
             .await
@@ -14478,6 +14492,7 @@ impl ProjectionWorker {
                 expected,
                 committed_version,
                 Some(ProjectionJournalDelta {
+                    journal_version,
                     checkpoint: checkpoint_frontier,
                     rows: delta,
                 }),
@@ -14507,6 +14522,7 @@ impl ProjectionWorker {
             persisted_snapshot,
             version,
             Some(ProjectionJournalDelta {
+                journal_version,
                 checkpoint: checkpoint_frontier,
                 rows: delta,
             }),

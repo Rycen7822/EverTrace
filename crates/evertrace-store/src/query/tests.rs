@@ -59,12 +59,22 @@ mod tests {
             .await
             .unwrap();
         let delta = delta.unwrap();
+        let journal_version = journal.version().await.unwrap();
+        assert!(delta.clone().at_version(journal_version).is_some());
+        assert!(delta.clone().at_version(journal_version + 1).is_none());
         let worker = L0002ProjectionWorker::new(journal, relations.clone(), search.clone());
         let before_relations =
             checkpoint_relation(&read_relation_rows(&relations).await.unwrap()).unwrap();
         let before_search = checkpoint_search(&read_search_rows(&search).await.unwrap()).unwrap();
         assert!(delta.rows_after(before_relations).is_some());
         assert!(delta.rows_after(snapshot.frontier).is_none());
+
+        let mut ahead = snapshot.clone();
+        ahead.frontier += 1;
+        assert_eq!(
+            worker.catch_up_validated(&ahead, Some(delta.clone())).await,
+            Err(StoreError::StoreCorrupt)
+        );
 
         assert_eq!(
             worker.catch_up_with_fault(&snapshot, Some(delta.clone()), true, false).await,
@@ -92,9 +102,35 @@ mod tests {
             before_search
         );
         assert_eq!(
-            worker.catch_up_validated(&snapshot, Some(delta)).await.unwrap().0.frontier,
+            worker.catch_up_validated(&snapshot, Some(delta.clone())).await.unwrap().0.frontier,
             snapshot.frontier
         );
+
+        // A later journal commit invalidates the handoff even when the
+        // previously completed projections still have matching checkpoints.
+        let later = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                0,
+                [0; 32],
+                "projection-later-commit",
+                JournalPayload::MigrationApplied(MigrationApplied {
+                    migration_id: "projection-later-commit".into(),
+                }),
+            )],
+        )
+        .unwrap();
+        let versions = [relations.version().await.unwrap(), search.version().await.unwrap()];
+        writer.commit(&later, 2).await.unwrap();
+        assert_eq!(
+            worker.catch_up_validated(&snapshot, Some(delta)).await,
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(
+            [relations.version().await.unwrap(), search.version().await.unwrap()],
+            versions
+        );
+        assert_eq!(writer.project().await.unwrap().frontier, snapshot.frontier + 1);
     }
 
     #[tokio::test]
