@@ -1882,13 +1882,19 @@ fn collect_normalization_dependencies(
             SourceLocalEvidence::NativeCall(call) => call,
             SourceLocalEvidence::NamespaceWitness { supported_call, .. } => supported_call,
         };
+        let call_needles = [
+            json_field_fragment("session_id", &call.session_id)?,
+            json_field_fragment("request_id", &call.request_id)?,
+        ];
         let mut ids = BTreeSet::from([selected.source_observation_id]);
+        // Canonical current rows allow a cheap prefilter for both call shapes.
+        // Only the typed comparison below admits a dependency.
         for row in snapshot.data_rows().filter(|row| {
             row.object_kind.as_deref() == Some("source_observation")
-                && row
-                    .payload_json
-                    .as_deref()
-                    .is_some_and(|json| json.contains("\"source_local_evidence\""))
+                && row.payload_json.as_deref().is_some_and(|json| {
+                    json.contains("\"source_local_evidence\"")
+                        && call_needles.iter().all(|needle| json.contains(needle))
+                })
         }) {
             let dependency = current_payload(row)?;
             let JournalPayload::SourceObservationRecorded(value) = &dependency.payload else {

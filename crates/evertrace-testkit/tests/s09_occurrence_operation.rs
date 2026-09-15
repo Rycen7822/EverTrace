@@ -901,6 +901,124 @@ async fn separately_selected_pair_members_close_watermarks_without_new_objects()
 }
 
 #[tokio::test]
+async fn source_local_dependencies_select_calls_and_late_witness_by_session_and_request() {
+    use evertrace_domain::evidence::{
+        SourceLocalEvidence, SourceLocalNamespace, SourceLocalNamespaceWitness,
+        SourceLocalNativeCall, SourceLocalProfile,
+    };
+    let temp = TempDir::new().unwrap();
+    let mut writer = JournalWriter::open(&temp.path().join("data"))
+        .await
+        .unwrap();
+    let session = "01a083a5-79c1-7343-821a-a8e571f9ad26";
+    // Escapes must be identical to canonical row encoding, not raw text needles.
+    let request = "call-\\-\"";
+    let call = SourceLocalNativeCall {
+        session_id: session.into(),
+        agent_id: None,
+        transcript_path: Some("/private/rollout.jsonl".into()),
+        request_id: request.into(),
+        turn_id: "before".into(),
+        tool_name: "Bash".into(),
+        namespace_witness: None,
+    };
+    let mut matching = Vec::new();
+    for (record, role, mut current) in [
+        ("local-intent", ObservationRole::Intent, call.clone()),
+        ("local-result", ObservationRole::Result, call.clone()),
+        (
+            "other-request",
+            ObservationRole::Result,
+            SourceLocalNativeCall {
+                request_id: "another-request".into(),
+                ..call.clone()
+            },
+        ),
+        (
+            "other-session",
+            ObservationRole::Result,
+            SourceLocalNativeCall {
+                session_id: "another-session".into(),
+                ..call.clone()
+            },
+        ),
+    ] {
+        if role == ObservationRole::Result {
+            current.turn_id = "later".into();
+        }
+        let (mut receipt, mut value) = observation(
+            record,
+            role,
+            nonexact_correlation(record, CorrelationAdmission::Unavailable),
+            vec![],
+        );
+        receipt.identity_domain = "native-hook-delivery-v1".into();
+        receipt.source_session_ref = current.session_id.clone();
+        value.correlation.native_request_id = Some(current.request_id.clone());
+        if current.session_id == session && current.request_id == request {
+            matching.push(value.source_observation_id);
+        }
+        value.source_local_evidence = Some(SourceLocalEvidence::NativeCall(current));
+        writer
+            .commit(&evidence_command(CommandId::new_v7(), receipt, value), 1)
+            .await
+            .unwrap();
+    }
+    let (mut receipt, mut proof) = observation(
+        "local-witness",
+        ObservationRole::StateProbe,
+        nonexact_correlation("local-witness", CorrelationAdmission::Unavailable),
+        vec![],
+    );
+    receipt.identity_domain = "native-hook-delivery-v1".into();
+    receipt.source_session_ref = session.into();
+    proof.source_local_evidence = Some(SourceLocalEvidence::NamespaceWitness {
+        witness: SourceLocalNamespaceWitness {
+            namespace: SourceLocalNamespace {
+                profile: SourceLocalProfile::NativeHookV1,
+                root_session: session.into(),
+                thread: session.into(),
+                rollout: session.into(),
+            },
+            transcript_path: call.transcript_path.clone().unwrap(),
+            filesystem_device: 1,
+            filesystem_inode: 2,
+            observed_file_length: 101,
+            metadata_length: 100,
+        },
+        supported_call: call,
+        supported_observation_refs: vec![matching[0]],
+    });
+    matching.push(proof.source_observation_id);
+    writer
+        .commit(&evidence_command(CommandId::new_v7(), receipt, proof), 1)
+        .await
+        .unwrap();
+    let snapshot = writer.project_objects().await.unwrap();
+    for selected in &matching {
+        let frontier = snapshot
+            .reconciliation_frontier_for_observations(&[*selected])
+            .unwrap();
+        assert_eq!(frontier.items.len(), 1);
+        let mut actual = frontier.items[0]
+            .dependencies
+            .iter()
+            .filter_map(|dependency| match &dependency.payload {
+                JournalPayload::SourceObservationRecorded(value) => {
+                    Some(value.source_observation_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = matching.clone();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+    assert_eq!(snapshot, writer.full_projection().await.unwrap());
+}
+
+#[tokio::test]
 async fn journal_projection_replay_relations_and_no_delta_are_closed() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("store");
