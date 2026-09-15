@@ -1139,9 +1139,7 @@ impl JournalWriter {
         &self,
         limit: usize,
     ) -> Result<ReconciliationFrontier, StoreError> {
-        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
-            .reconciliation_frontier(limit)
-            .await
+        self.project_objects().await?.reconciliation_frontier(limit)
     }
 
     pub async fn reconciliation_artifact_context(
@@ -1149,9 +1147,9 @@ impl JournalWriter {
         descriptors: &[ReconciliationArtifactDescriptor],
         limit: usize,
     ) -> Result<ReconciliationArtifactFrontier, StoreError> {
-        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
+        self.project_objects()
+            .await?
             .reconciliation_artifact_context(descriptors, limit)
-            .await
     }
 
     pub async fn full_projection(&self) -> Result<ProjectionSnapshot, StoreError> {
@@ -1656,6 +1654,14 @@ mod tests {
         }
         assert_eq!(writer.objects.version().await.unwrap(), versions[1]);
         assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
+        assert!(matches!(
+            writer.reconciliation_frontier(8).await,
+            Err(StoreError::StoreCorrupt)
+        ));
+        assert!(matches!(
+            writer.reconciliation_artifact_context(&[], 8).await,
+            Err(StoreError::StoreCorrupt)
+        ));
         assert_eq!(writer.sync_frontier().await, Err(StoreError::StoreCorrupt));
         assert!(matches!(
             writer.capture_current_context(None, None, 8).await,
