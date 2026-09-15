@@ -14219,6 +14219,21 @@ fn source_revision_key(value: &SourceRevisionRecorded) -> String {
     )
 }
 
+// Actual journal rows read and validated by one successful objects catch-up.
+// The next mandatory projection worker may borrow the identical range during
+// the same writer call; this is never retained in the writer or a cache.
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct ProjectionJournalDelta {
+    checkpoint: u64,
+    rows: Vec<JournalRow>,
+}
+
+impl ProjectionJournalDelta {
+    pub(crate) fn rows_after(&self, checkpoint: u64) -> Option<&[JournalRow]> {
+        (checkpoint == self.checkpoint).then_some(self.rows.as_slice())
+    }
+}
+
 #[derive(Clone)]
 pub struct ProjectionWorker {
     journal: Table,
@@ -14239,7 +14254,7 @@ impl ProjectionWorker {
         // Old objects version/checkpoint and the confirmed committed journal frontier.
         validated_current: Option<(u64, u64, u64)>,
         appended_batch: Option<&arrow_array::RecordBatch>,
-    ) -> Result<(ProjectionSnapshot, u64), StoreError> {
+    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
         self.catch_up_inner(false, validated_current, appended_batch)
             .await
     }
@@ -14266,7 +14281,7 @@ impl ProjectionWorker {
         inject_before_commit_failure: bool,
         validated_current: Option<(u64, u64, u64)>,
         appended_batch: Option<&arrow_array::RecordBatch>,
-    ) -> Result<(ProjectionSnapshot, u64), StoreError> {
+    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
         self.objects
             .checkout_latest()
             .await
@@ -14333,7 +14348,7 @@ impl ProjectionWorker {
             {
                 return Err(StoreError::Projection);
             }
-            return Ok((expected, version));
+            return Ok((expected, version, None));
         }
         let mut state = if validated_frontier.is_some() {
             // The writer already validated this exact old input before its
@@ -14358,6 +14373,7 @@ impl ProjectionWorker {
                     rows: current,
                 },
                 current_version,
+                None,
             ));
         }
         let reconcile_core = delta.iter().any(|row| {
@@ -14458,7 +14474,14 @@ impl ProjectionWorker {
             // The validated current rows are retained or replaced by changed rows;
             // the same native commit writes those rows and the checkpoint. Its
             // direct-successor version excludes a concurrent refresh/rebase.
-            return Ok((expected, committed_version));
+            return Ok((
+                expected,
+                committed_version,
+                Some(ProjectionJournalDelta {
+                    checkpoint: checkpoint_frontier,
+                    rows: delta,
+                }),
+            ));
         }
         let version = self
             .objects
@@ -14480,7 +14503,14 @@ impl ProjectionWorker {
         {
             return Err(StoreError::Projection);
         }
-        Ok((persisted_snapshot, version))
+        Ok((
+            persisted_snapshot,
+            version,
+            Some(ProjectionJournalDelta {
+                checkpoint: checkpoint_frontier,
+                rows: delta,
+            }),
+        ))
     }
 
     #[cfg(test)]

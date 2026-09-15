@@ -15,6 +15,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
         let mut writer = crate::JournalWriter::open(&root).await.unwrap();
+        writer.project().await.unwrap();
         let command = JournalCommand::new(
             CommandId::from_str("01890f47-6a4a-7cc1-98b9-01890f476aff").unwrap(),
             vec![JournalEventDraft::runtime(
@@ -53,17 +54,20 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        let snapshot = ProjectionWorker::new(journal.clone(), objects)
-            .catch_up()
+        let (snapshot, _, delta) = ProjectionWorker::new(journal.clone(), objects)
+            .catch_up_validated(None, None)
             .await
             .unwrap();
+        let delta = delta.unwrap();
         let worker = L0002ProjectionWorker::new(journal, relations.clone(), search.clone());
         let before_relations =
             checkpoint_relation(&read_relation_rows(&relations).await.unwrap()).unwrap();
         let before_search = checkpoint_search(&read_search_rows(&search).await.unwrap()).unwrap();
+        assert!(delta.rows_after(before_relations).is_some());
+        assert!(delta.rows_after(snapshot.frontier).is_none());
 
         assert_eq!(
-            worker.catch_up_with_fault(&snapshot, true, false).await,
+            worker.catch_up_with_fault(&snapshot, Some(delta.clone()), true, false).await,
             Err(StoreError::Projection)
         );
         assert_eq!(
@@ -76,7 +80,7 @@ mod tests {
         );
 
         assert_eq!(
-            worker.catch_up_with_fault(&snapshot, false, true).await,
+            worker.catch_up_with_fault(&snapshot, Some(delta.clone()), false, true).await,
             Err(StoreError::Projection)
         );
         assert_eq!(
@@ -88,7 +92,7 @@ mod tests {
             before_search
         );
         assert_eq!(
-            worker.catch_up(&snapshot).await.unwrap().frontier,
+            worker.catch_up_validated(&snapshot, Some(delta)).await.unwrap().0.frontier,
             snapshot.frontier
         );
     }

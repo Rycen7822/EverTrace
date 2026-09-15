@@ -14,8 +14,8 @@ use crate::{
     JournalPayload, ObjectRowKind, ProjectionSnapshot, StoreError,
     journal::{read_journal_after, read_journal_frontier},
     projections::{
-        l3_core_projection, procedure_context_effect, recall_need, recall_trigger_contract,
-        synthesis::wiki_render_identity, validate_delta, wiki_projection,
+        ProjectionJournalDelta, l3_core_projection, procedure_context_effect, recall_need,
+        recall_trigger_contract, synthesis::wiki_render_identity, validate_delta, wiki_projection,
     },
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
@@ -131,14 +131,16 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(objects, false, false).await?.0)
+        Ok(self.catch_up_inner(objects, None, false, false).await?.0)
     }
 
     pub(crate) async fn catch_up_validated(
         &self,
         objects: &ProjectionSnapshot,
+        journal_delta: Option<ProjectionJournalDelta>,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
-        self.catch_up_inner(objects, false, false).await
+        self.catch_up_inner(objects, journal_delta, false, false)
+            .await
     }
 
     async fn versions(&self) -> Result<[u64; 2], StoreError> {
@@ -157,6 +159,7 @@ impl L0002ProjectionWorker {
     async fn catch_up_inner(
         &self,
         objects: &ProjectionSnapshot,
+        journal_delta: Option<ProjectionJournalDelta>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
@@ -184,9 +187,23 @@ impl L0002ProjectionWorker {
             return Err(StoreError::StoreCorrupt);
         }
         for checkpoint in BTreeSet::from([relation_frontier, search_frontier]) {
-            let delta = read_journal_after(&self.journal, checkpoint).await?;
-            validate_delta(checkpoint, journal_frontier, &delta)?;
+            let persisted_delta;
+            let delta = if let Some(rows) = journal_delta
+                .as_ref()
+                .and_then(|delta| delta.rows_after(checkpoint))
+            {
+                rows
+            } else {
+                persisted_delta = read_journal_after(&self.journal, checkpoint).await?;
+                persisted_delta.as_slice()
+            };
+            // Reuse bytes, not a validation verdict. Each distinct checkpoint
+            // still validates its full command delta against the live frontier.
+            validate_delta(checkpoint, journal_frontier, delta)?;
         }
+        // No downstream derivation needs journal payloads. Release the handoff
+        // before constructing the relation/search state, including large deltas.
+        drop(journal_delta);
         if relation_frontier == journal_frontier && search_frontier == journal_frontier {
             return Ok((
                 L0002ProjectionSnapshot {
@@ -222,11 +239,17 @@ impl L0002ProjectionWorker {
     async fn catch_up_with_fault(
         &self,
         objects: &ProjectionSnapshot,
+        journal_delta: Option<ProjectionJournalDelta>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
         Ok(self
-            .catch_up_inner(objects, fail_relation_commit, fail_search_commit)
+            .catch_up_inner(
+                objects,
+                journal_delta,
+                fail_relation_commit,
+                fail_search_commit,
+            )
             .await?
             .0)
     }

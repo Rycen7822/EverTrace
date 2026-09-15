@@ -1052,13 +1052,16 @@ impl JournalWriter {
                 };
                 (stamp.frontier, snapshot, stamp.has_failed_job)
             } else {
-                let snapshot = if let Some(stamp) = objects {
-                    ProjectionSnapshot {
-                        frontier: stamp.frontier,
-                        rows: read_object_rows(&self.objects).await?,
-                    }
+                let (snapshot, delta) = if let Some(stamp) = objects {
+                    (
+                        ProjectionSnapshot {
+                            frontier: stamp.frontier,
+                            rows: read_object_rows(&self.objects).await?,
+                        },
+                        None,
+                    )
                 } else {
-                    let (snapshot, version) = self
+                    let (snapshot, version, delta) = self
                         .projection_worker()
                         .catch_up_validated(
                             validated_current,
@@ -1066,7 +1069,7 @@ impl JournalWriter {
                         )
                         .await?;
                     validated_versions[1] = version;
-                    snapshot
+                    (snapshot, delta)
                 };
                 if indexes {
                     let (_, versions) = L0002ProjectionWorker::new(
@@ -1074,9 +1077,11 @@ impl JournalWriter {
                         self.relations.clone(),
                         self.search.clone(),
                     )
-                    .catch_up_validated(&snapshot)
+                    .catch_up_validated(&snapshot, delta)
                     .await?;
                     validated_versions[2..].copy_from_slice(&versions);
+                } else {
+                    drop(delta);
                 }
                 let has_failed_job =
                     crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
