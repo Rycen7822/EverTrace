@@ -231,8 +231,11 @@ struct ProjectionValidation {
     versions: [u64; 4],
     frontier: u64,
     has_failed_job: bool,
-    // At most one small, immutable batch from a confirmed direct-successor
-    // journal append. The next validation/append/restore replaces this stamp.
+    // Last confirmed append, not a claim that the old objects or indexes have
+    // advanced. Each retained successor is bound to its committed frontier.
+    appended_through: Option<(u64, u64)>,
+    // At most one small immutable batch. Multiple appends use the ordinary
+    // journal delta read without retaining or concatenating their batches.
     appended_batch: Option<arrow_array::RecordBatch>,
 }
 
@@ -821,9 +824,12 @@ impl JournalWriter {
         let validated_input = stamps[0]
             .as_ref()
             .filter(|stamp| {
+                let (input_version, input_frontier) = stamp
+                    .appended_through
+                    .unwrap_or((stamp.versions[0], stamp.frontier));
                 known.is_some()
-                    && stamp.versions[0] == version
-                    && stamp.frontier == self.admission_state.committed_frontier()
+                    && input_version == version
+                    && input_frontier == self.admission_state.committed_frontier()
             })
             .cloned();
         // Clear before the await, including uncertain append failures. Only a
@@ -834,8 +840,11 @@ impl JournalWriter {
         if version.checked_add(1) == Some(committed_version)
             && let Some(mut stamp) = validated_input
         {
-            stamp.appended_batch =
-                (batch.get_array_memory_size() <= MAX_PROJECTION_HANDOFF_BYTES).then_some(batch);
+            stamp.appended_batch = (stamp.appended_through.is_none()
+                && batch.get_array_memory_size() <= MAX_PROJECTION_HANDOFF_BYTES)
+                .then_some(batch);
+            stamp.appended_through =
+                Some((committed_version, next_admission_state.committed_frontier()));
             stamps[0] = Some(stamp);
         }
         self.admission_state = next_admission_state;
@@ -1021,7 +1030,8 @@ impl JournalWriter {
                 .as_ref()
                 .filter(|stamp| stamp.versions[..2] == before[..2]);
             let validated_input = stamps[0].as_ref().filter(|stamp| {
-                stamp.versions[0].checked_add(1) == Some(before[0])
+                stamp.appended_through
+                    == Some((before[0], self.admission_state.committed_frontier()))
                     && stamp.versions[1] == before[1]
                     && self
                         .command_ids
@@ -1107,6 +1117,7 @@ impl JournalWriter {
                     versions: validated_versions,
                     frontier,
                     has_failed_job,
+                    appended_through: None,
                     appended_batch: None,
                 });
                 let mut stamps = self
@@ -2198,6 +2209,62 @@ mod tests {
             writer.capture_current_context(None, None, 8).await,
             Err(StoreError::StoreCorrupt)
         ));
+    }
+
+    #[tokio::test]
+    async fn consecutive_commits_reuse_only_the_validated_old_projection_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let mut last_seq = writer.sync_frontier().await.unwrap();
+        let initial = writer.projection_validation.lock().unwrap()[0]
+            .clone()
+            .unwrap();
+        for ordinal in 1..=3 {
+            let command = JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    1,
+                    [1; 32],
+                    "objects-v1",
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::ObjectsProjection,
+                        target_id: format!("consecutive-{ordinal}"),
+                        algorithm_revision: "objects-v1".into(),
+                        source_watermark: last_seq,
+                    }),
+                )],
+            )
+            .unwrap();
+            let committed = writer.commit(&command, 2).await.unwrap();
+            last_seq = committed.last_seq;
+            let version = writer.journal.version().await.unwrap();
+            assert_eq!(version, initial.versions[0] + ordinal);
+            assert_eq!(writer.objects.version().await.unwrap(), initial.versions[1]);
+            let stamps = writer.projection_validation.lock().unwrap().clone();
+            let input = stamps[0].as_ref().unwrap();
+            assert_eq!(input.versions, initial.versions);
+            assert_eq!(input.frontier, initial.frontier);
+            assert_eq!(input.appended_through, Some((version, last_seq)));
+            assert_eq!(input.appended_batch.is_some(), ordinal == 1);
+            assert!(stamps[1].is_none());
+            assert!(writer.commit(&command, 3).await.unwrap().replayed);
+            if ordinal == 1 {
+                // Reserved gaps are not a committed frontier.
+                reserve_range(&mut writer.next_seq, 2).unwrap();
+            }
+        }
+        let projected = writer.project().await.unwrap();
+        assert_eq!(projected.frontier, last_seq);
+        assert_eq!(projected, writer.full_projection().await.unwrap());
+        let versions = writer.projection_versions(true).await.unwrap();
+        for stamp in writer.projection_validation.lock().unwrap().iter() {
+            let stamp = stamp.as_ref().unwrap();
+            assert_eq!(stamp.versions, versions);
+            assert_eq!(stamp.frontier, last_seq);
+            assert!(stamp.appended_through.is_none());
+            assert!(stamp.appended_batch.is_none());
+        }
     }
 
     #[tokio::test]

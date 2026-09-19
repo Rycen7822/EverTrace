@@ -1059,8 +1059,7 @@ mod tests {
         })).unwrap();
         receipt.validate().unwrap();
         let source_seq = with_history.inventory.completed[&fact.job_id].1 + 1;
-        with_history
-            .source_receipts
+        std::sync::Arc::make_mut(&mut with_history.source_receipts)
             .insert(receipt_id, (receipt.clone(), source_seq));
         let scope = evertrace_domain::procedure::ProcedureScope::Repository {
             repository_id: repository.repository_id,
@@ -1082,11 +1081,13 @@ mod tests {
         assert!(validate(&with_history, &[fact.job_id]).is_err());
         assert!(validate(&with_history, &[fact_c.job_id]).is_ok());
         let mut future = with_history.clone();
-        future.source_receipts.get_mut(&receipt_id).unwrap().1 = source_seq - 2;
+        std::sync::Arc::make_mut(&mut future.source_receipts)
+            .get_mut(&receipt_id)
+            .unwrap()
+            .1 = source_seq - 2;
         assert!(validate(&future, &inventory_refs).is_err());
         let mut late_import = with_history.clone();
-        late_import
-            .source_receipts
+        std::sync::Arc::make_mut(&mut late_import.source_receipts)
             .get_mut(&receipt_id)
             .unwrap()
             .0
@@ -1096,16 +1097,17 @@ mod tests {
             "later ingestion cannot backfill an installation into the source's original time"
         );
         let mut wrong_source = with_history.clone();
-        wrong_source
-            .source_receipts
+        std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
             .get_mut(&receipt_id)
             .unwrap()
             .0
             .source_session_ref = "other".into();
         assert!(validate(&wrong_source, &inventory_refs).is_err());
-        wrong_source.source_receipts.get_mut(&receipt_id).unwrap().0 = receipt;
-        wrong_source
-            .source_receipts
+        std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
+            .get_mut(&receipt_id)
+            .unwrap()
+            .0 = receipt;
+        std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
             .get_mut(&receipt_id)
             .unwrap()
             .0

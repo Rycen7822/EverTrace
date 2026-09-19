@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
@@ -2340,9 +2343,12 @@ pub(crate) struct JournalAdmissionState {
     source_watermarks: BTreeMap<String, SourceWatermarks>,
     frontier: u64,
     source_ranges: BTreeMap<String, KnownSourceRange>,
-    source_observations: BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    source_receipts: BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    evidence_surfaces: BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    // Live command admission clones the state before append. Capture commands
+    // still detach these maps at their existing mutation points, while small
+    // unrelated commands keep their verified source state shared.
+    source_observations: Arc<BTreeMap<SourceObservationId, (SourceObservation, u64)>>,
+    source_receipts: Arc<BTreeMap<SourceReceiptId, (SourceReceipt, u64)>>,
+    evidence_surfaces: Arc<BTreeMap<SourceObservationId, (EvidenceSurface, u64)>>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
@@ -3830,7 +3836,7 @@ impl JournalAdmissionState {
             }
             PassiveSourceSelection::Session(session) => {
                 let mut recent = BTreeMap::new();
-                for (id, (receipt, seq)) in &self.source_receipts {
+                for (id, (receipt, seq)) in self.source_receipts.iter() {
                     if receipt.source_session_ref != *session
                         || !(receipt.source_kind
                             == evertrace_domain::evidence::EvidenceSourceKind::CodexSessionJsonl
@@ -9417,8 +9423,7 @@ impl JournalAdmissionState {
             }
             JournalPayload::SourceReceiptRecorded(value) => {
                 record_known_source(&mut self.source_ranges, &value)?;
-                if self
-                    .source_receipts
+                if Arc::make_mut(&mut self.source_receipts)
                     .insert(value.source_receipt_id, (*value, seq))
                     .is_some()
                 {
@@ -9429,8 +9434,7 @@ impl JournalAdmissionState {
                 record_source_watermark(&mut self.source_watermarks, value);
             }
             JournalPayload::SourceObservationRecorded(value) => {
-                if self
-                    .source_observations
+                if Arc::make_mut(&mut self.source_observations)
                     .insert(value.source_observation_id, (*value, seq))
                     .is_some()
                 {
@@ -9438,8 +9442,7 @@ impl JournalAdmissionState {
                 }
             }
             JournalPayload::EvidenceSurfaceRecorded(value) => {
-                if self
-                    .evidence_surfaces
+                if Arc::make_mut(&mut self.evidence_surfaces)
                     .insert(value.source_observation_revision_ref, (*value, seq))
                     .is_some()
                 {
@@ -13596,9 +13599,9 @@ impl ReducerState {
             source_watermarks,
             frontier,
             source_ranges: current_source_ranges(&self.source_receipts)?,
-            source_observations: self.source_observations.clone(),
-            source_receipts: self.source_receipts.clone(),
-            evidence_surfaces: self.evidence_surfaces.clone(),
+            source_observations: Arc::new(self.source_observations.clone()),
+            source_receipts: Arc::new(self.source_receipts.clone()),
+            evidence_surfaces: Arc::new(self.evidence_surfaces.clone()),
             host_occurrences: self.host_occurrences.clone(),
             host_occurrence_revisions: self.host_occurrence_revisions.clone(),
             operations: self.operations.clone(),
@@ -14918,8 +14921,7 @@ mod tests {
                     let mut value = receipt.clone();
                     value.source_receipt_id = SourceReceiptId::from_digest([index; 32]);
                     value.observation_role = evertrace_domain::evidence::ObservationRole::Message;
-                    window
-                        .source_receipts
+                    Arc::make_mut(&mut window.source_receipts)
                         .insert(value.source_receipt_id, (value, u64::from(index)));
                 }
                 let context = window
