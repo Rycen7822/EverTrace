@@ -93,10 +93,41 @@ impl SearchIndex {
 
     pub async fn snapshot(&self) -> Result<SearchSnapshot, StoreError> {
         let connection = crate::connection::connect_native(&self.data_dir).await?;
+        self.snapshot_validated(&connection).await
+    }
+
+    /// Use a frontier freshly validated by the caller's current projection.
+    ///
+    /// The post-pin journal read remains authoritative. A mismatch falls back
+    /// to the ordinary bounded before/pin/after validation rather than trusting
+    /// the supplied value as a cache.
+    pub async fn snapshot_after_validated_frontier(
+        &self,
+        validated_frontier: u64,
+    ) -> Result<SearchSnapshot, StoreError> {
+        let connection = crate::connection::connect_native(&self.data_dir).await?;
+        let snapshot = self.pinned_snapshot(&connection).await?;
+        let after = self.authoritative_frontier(&connection).await?;
+        if after != validated_frontier {
+            return self.snapshot_validated(&connection).await;
+        }
+        if snapshot.frontier > after {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(SearchSnapshot {
+            authoritative_frontier: after,
+            ..snapshot
+        })
+    }
+
+    async fn snapshot_validated(
+        &self,
+        connection: &Connection,
+    ) -> Result<SearchSnapshot, StoreError> {
         for attempt in 0..2 {
-            let before = self.authoritative_frontier(&connection).await?;
-            let snapshot = self.pinned_snapshot(&connection).await?;
-            let after = self.authoritative_frontier(&connection).await?;
+            let before = self.authoritative_frontier(connection).await?;
+            let snapshot = self.pinned_snapshot(connection).await?;
+            let after = self.authoritative_frontier(connection).await?;
             if before == after || attempt == 1 {
                 if snapshot.frontier > after {
                     return Err(StoreError::StoreCorrupt);
@@ -1026,7 +1057,12 @@ fn canonicalize_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use evertrace_domain::ids::CommandId;
+
     use super::*;
+    use crate::{DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload};
 
     fn object_row() -> SearchProjectionRow {
         SearchProjectionRow {
@@ -1087,5 +1123,61 @@ mod tests {
             exact_checkpoint_frontier(&[checkpoint.clone(), checkpoint]),
             Err(StoreError::StoreCorrupt)
         );
+    }
+
+    #[tokio::test]
+    async fn validated_frontier_snapshot_keeps_post_pin_authority_and_falls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mut writer = crate::JournalWriter::open(&data).await.unwrap();
+        let projection = writer.project().await.unwrap();
+        let index = SearchIndex::open(&data).await.unwrap();
+
+        let shortcut = index
+            .snapshot_after_validated_frontier(projection.frontier)
+            .await
+            .unwrap();
+        assert_eq!(shortcut.frontier(), projection.frontier);
+        assert_eq!(shortcut.authoritative_frontier(), projection.frontier);
+
+        let fallback = index
+            .snapshot_after_validated_frontier(projection.frontier.saturating_add(1))
+            .await
+            .unwrap();
+        assert_eq!(fallback.frontier(), projection.frontier);
+        assert_eq!(fallback.authoritative_frontier(), projection.frontier);
+
+        let command = JournalCommand::new(
+            CommandId::from_str("01890f47-6a4a-7cc1-98b9-01890f476a7a").unwrap(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [1; 32],
+                "objects-v1",
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::ObjectsProjection,
+                    target_id: "search-frontier-test".into(),
+                    algorithm_revision: "objects-v1".into(),
+                    source_watermark: 1,
+                }),
+            )],
+        )
+        .unwrap();
+        let appended = writer.commit(&command, 1).await.unwrap();
+        assert!(appended.last_seq > projection.frontier);
+
+        let stale = index
+            .snapshot_after_validated_frontier(projection.frontier)
+            .await
+            .unwrap();
+        assert_eq!(stale.authoritative_frontier(), appended.last_seq);
+        assert_eq!(stale.frontier(), projection.frontier);
+
+        let refreshed_projection = writer.project().await.unwrap();
+        let refreshed = index
+            .snapshot_after_validated_frontier(refreshed_projection.frontier)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.frontier(), appended.last_seq);
+        assert_eq!(refreshed.authoritative_frontier(), appended.last_seq);
     }
 }

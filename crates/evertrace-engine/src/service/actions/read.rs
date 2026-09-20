@@ -111,6 +111,7 @@ impl McpActionService {
         .await
         .map_err(|_| McpServiceError::Store)?;
         let found = ProductionSearch::new(self.search_index.clone())
+            .with_validated_frontier(scope.snapshot.frontier)
             .with_method_proposals(methods)
             .with_procedure_revisions(searchable_procedure_revisions)
             .search(context.clone())

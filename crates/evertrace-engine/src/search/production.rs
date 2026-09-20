@@ -18,6 +18,7 @@ pub struct ProductionSearch {
     index: SearchIndex,
     procedure_revisions: Option<BTreeSet<String>>,
     method_proposal_revisions: BTreeSet<String>,
+    validated_frontier: Option<u64>,
 }
 
 impl ProductionSearch {
@@ -26,6 +27,7 @@ impl ProductionSearch {
             index,
             procedure_revisions: None,
             method_proposal_revisions: BTreeSet::new(),
+            validated_frontier: None,
         }
     }
 
@@ -36,6 +38,13 @@ impl ProductionSearch {
 
     pub(crate) fn with_method_proposals(mut self, revisions: BTreeSet<String>) -> Self {
         self.method_proposal_revisions = revisions;
+        self
+    }
+
+    /// A current `WriterHandle::project` result can avoid a duplicate
+    /// pre-pin frontier scan while the store still validates after pinning.
+    pub(crate) fn with_validated_frontier(mut self, frontier: u64) -> Self {
+        self.validated_frontier = Some(frontier);
         self
     }
 
@@ -85,7 +94,16 @@ impl ProductionSearch {
             });
         }
         let deadline = RequestDeadline::new(started, context.budget.latency_us_remaining);
-        let snapshot = match deadline.run(self.index.snapshot()).await {
+        let snapshot = match deadline
+            .run(async {
+                if let Some(frontier) = self.validated_frontier {
+                    self.index.snapshot_after_validated_frontier(frontier).await
+                } else {
+                    self.index.snapshot().await
+                }
+            })
+            .await
+        {
             Ok(Ok(snapshot)) => snapshot,
             Ok(Err(error)) => return Err(error.into()),
             Err(()) => {
