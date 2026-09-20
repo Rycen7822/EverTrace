@@ -1769,6 +1769,8 @@ fn background_relevant(command: &JournalCommand) -> bool {
                 | evertrace_store::JournalPayload::GlobalSupportValidationRecorded(_)
                 | evertrace_store::JournalPayload::ObjectDeletionLedgerRecorded(_)
                 | evertrace_store::JournalPayload::TaskRecorded(_)
+                | evertrace_store::JournalPayload::OperationDerived(_)
+                | evertrace_store::JournalPayload::WorkBindingRecorded(_)
                 | evertrace_store::JournalPayload::ConfigAudit(_)
         )
     })
@@ -1916,5 +1918,53 @@ mod tests {
         )
         .unwrap();
         assert!(background_relevant(&command));
+    }
+
+    #[test]
+    fn normalization_and_binding_commits_wake_background_scheduler() {
+        let operation_id = evertrace_domain::ids::OperationId::new_v7();
+        let operation = evertrace_domain::evidence::Operation {
+            source_local_pairing: None,
+            operation_id,
+            host_occurrence_id: evertrace_domain::ids::HostOccurrenceId::from_digest([0x2a; 32]),
+            execution_lane_id: None,
+            operation_kind: evertrace_domain::evidence::OperationKind::Observe,
+            input_source_observation_refs: Vec::new(),
+            result_source_observation_refs: Vec::new(),
+            pairing_state: evertrace_domain::evidence::PairingState::NotApplicable,
+            scope_effect_ids: Vec::new(),
+            artifact_refs: Vec::new(),
+            operation_resolver_version: 1,
+            operation_revision: 1,
+            previous_operation_revision: None,
+        };
+        let binding = evertrace_domain::work::WorkBindingRevision {
+            work_binding_revision_id: evertrace_domain::ids::WorkBindingRevisionId::new_v7(),
+            operation_id,
+            revision_generation: 1,
+            predecessor_revision_id: None,
+            primary_binding: evertrace_domain::work::PrimaryWorkBinding::default(),
+            secondary_bindings: Vec::new(),
+            scope_effect_refs: Vec::new(),
+            assignment_status: evertrace_domain::work::AssignmentStatus::Unresolved,
+            evidence_refs: Vec::new(),
+            resolver_version: 1,
+        };
+        for payload in [
+            evertrace_store::JournalPayload::OperationDerived(Box::new(operation)),
+            evertrace_store::JournalPayload::WorkBindingRecorded(Box::new(binding)),
+        ] {
+            let command = JournalCommand::new(
+                evertrace_domain::ids::CommandId::new_v7(),
+                vec![evertrace_store::JournalEventDraft::runtime(
+                    1,
+                    [0x2a; 32],
+                    "s29-background-notify-v1",
+                    payload,
+                )],
+            )
+            .unwrap();
+            assert!(background_relevant(&command));
+        }
     }
 }

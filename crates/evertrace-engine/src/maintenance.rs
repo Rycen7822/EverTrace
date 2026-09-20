@@ -1380,6 +1380,12 @@ pub struct BackgroundProgress {
     pub retryable: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RunOnceOutcome {
+    progress: BackgroundProgress,
+    next_wake_at: Option<tokio::time::Instant>,
+}
+
 pub struct QuiescedBackupRequest {
     backup_job_id: JobId,
     reply: oneshot::Sender<Result<BackupSummary, BackupError>>,
@@ -1526,6 +1532,12 @@ impl BackgroundScheduler {
     }
 
     pub async fn run_once(&self) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+        self.run_once_with_wake()
+            .await
+            .map(|outcome| outcome.progress)
+    }
+
+    async fn run_once_with_wake(&self) -> Result<RunOnceOutcome, BackgroundSchedulerError> {
         let mut operation = self.clone();
         if let Some(config) = &self.config {
             let config = config
@@ -1558,7 +1570,7 @@ impl BackgroundScheduler {
         operation.run_once_inner().await
     }
 
-    async fn run_once_inner(&self) -> Result<BackgroundProgress, BackgroundSchedulerError> {
+    async fn run_once_inner(&self) -> Result<RunOnceOutcome, BackgroundSchedulerError> {
         let (capture_state, ordinary_pending) = self
             .runtime
             .spool_limits()
@@ -1656,9 +1668,12 @@ impl BackgroundScheduler {
                     snapshot = self.writer.project().await.map_err(map_writer)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
-                    return Ok(BackgroundProgress {
-                        completed,
-                        retryable: true,
+                    return Ok(RunOnceOutcome {
+                        progress: BackgroundProgress {
+                            completed,
+                            retryable: true,
+                        },
+                        next_wake_at: None,
                     });
                 }
                 Err(error) => return Err(map_writer(error)),
@@ -1761,9 +1776,12 @@ impl BackgroundScheduler {
                         .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
-                    return Ok(BackgroundProgress {
-                        completed,
-                        retryable: true,
+                    return Ok(RunOnceOutcome {
+                        progress: BackgroundProgress {
+                            completed,
+                            retryable: true,
+                        },
+                        next_wake_at: None,
                     });
                 }
                 Err(error) => return Err(map_writer(error)),
@@ -2361,6 +2379,26 @@ impl BackgroundScheduler {
                         | evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND
                 )
         });
+        retryable |= self.dreaming.max_llm_tasks_per_run != 0
+            && selected
+                .iter()
+                .any(|selected| selected.lane == BackgroundLane::Synthesis);
+        retryable |= !optional_allowed && paused_optional_pending;
+        // An empty selection cannot claim or execute work after this point, so
+        // this round's current view and idle facts remain valid for its sleep.
+        // Appends that change these runtime or idle facts notify `durable`,
+        // which `run` observes before this deadline can be used.
+        let next_wake_at = if selected.is_empty() {
+            let dreaming = self.dreaming_for_wake().await?;
+            let wake_at = tokio::time::Instant::now();
+            let wake_now = now_us()?;
+            Some(
+                self.next_wake_from_current(&view, &idle, &dreaming, retryable, wake_at, wake_now)
+                    .await?,
+            )
+        } else {
+            None
+        };
         drop(snapshot);
         drop(view);
         for selected_job in selected
@@ -2496,11 +2534,6 @@ impl BackgroundScheduler {
                 retryable = true;
             }
         }
-        retryable |= self.dreaming.max_llm_tasks_per_run != 0
-            && selected
-                .iter()
-                .any(|selected| selected.lane == BackgroundLane::Synthesis);
-        retryable |= !optional_allowed && paused_optional_pending;
         if optional_allowed
             && selected
                 .iter()
@@ -2695,9 +2728,12 @@ impl BackgroundScheduler {
                 }
             }
         }
-        Ok(BackgroundProgress {
-            completed,
-            retryable,
+        Ok(RunOnceOutcome {
+            progress: BackgroundProgress {
+                completed,
+                retryable,
+            },
+            next_wake_at,
         })
     }
 
@@ -3218,11 +3254,13 @@ impl BackgroundScheduler {
                     run_at = tokio::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until(run_at) => {
-                    let progress = tokio::select! {
-                        result = self.run_once() => result?,
+                    let outcome = tokio::select! {
+                        result = self.run_once_with_wake() => result?,
                         _ = wait_for_shutdown(&mut shutdown) => return Ok(()),
                     };
-                    let delay = tokio::select! {
+                    let progress = outcome.progress;
+                    let next_wake_at = outcome.next_wake_at;
+                    let next_run_at = tokio::select! {
                         // A pending notification already requires another round; avoid
                         // reading a sleep snapshot that would immediately be discarded.
                         biased;
@@ -3232,81 +3270,130 @@ impl BackgroundScheduler {
                                 return Ok(());
                             }
                             self.capture_cursor.lock().await.notified();
-                            Duration::ZERO
+                            tokio::time::Instant::now()
                         }
                         changed = durable.changed() => {
                             if changed.is_err() {
                                 return Ok(());
                             }
                             self.capture_cursor.lock().await.notified();
-                            Duration::ZERO
+                            tokio::time::Instant::now()
                         }
-                        result = self.next_wake_after(progress.retryable) => result?,
+                        result = async {
+                            if let Some(wake_at) = next_wake_at {
+                                Ok::<_, BackgroundSchedulerError>(wake_at)
+                            } else {
+                                self.next_wake_after(progress.retryable).await
+                            }
+                        } => result?,
                     };
-                    run_at = tokio::time::Instant::now() + delay;
+                    run_at = next_run_at;
                     tokio::task::yield_now().await;
                 }
             }
         }
     }
 
-    async fn next_wake_after(&self, retryable: bool) -> Result<Duration, BackgroundSchedulerError> {
+    async fn next_wake_after(
+        &self,
+        retryable: bool,
+    ) -> Result<tokio::time::Instant, BackgroundSchedulerError> {
         let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
         let view = RuntimeSchedulerView::from_snapshot(&snapshot)
             .map_err(|_| BackgroundSchedulerError::Store)?;
-        let now = now_us()?;
-        let lease_delay = view
-            .jobs
-            .iter()
-            .filter(|job| job.state == JobStatus::Leased)
-            .filter_map(|job| job.lease_until_us)
-            .map(|deadline| {
-                Duration::from_micros(u64::try_from(deadline.saturating_sub(now)).unwrap_or(0))
-            })
-            .min();
-        let dreaming = if let Some(config) = &self.config {
-            config
+        let dreaming = self.dreaming_for_wake().await?;
+        let wake_at = tokio::time::Instant::now();
+        let wake_now = now_us()?;
+        let mut idle = SynthesisIdle::default();
+        idle.refresh(&snapshot, &view)?;
+        self.next_wake_from_current(&view, &idle, &dreaming, retryable, wake_at, wake_now)
+            .await
+    }
+
+    async fn dreaming_for_wake(&self) -> Result<DreamingConfig, BackgroundSchedulerError> {
+        if let Some(config) = &self.config {
+            Ok(config
                 .admit()
                 .await
                 .map_err(|_| BackgroundSchedulerError::Writer)?
                 .config()
                 .dreaming
-                .clone()
+                .clone())
         } else {
-            self.dreaming.clone()
-        };
-        let mut delay = Duration::from_secs(dreaming.integrity_sweep_interval.seconds());
-        {
-            let scan = self.artifact_scan.lock().await;
-            if scan.2 {
-                delay = delay.min(
-                    scan.0
-                        .saturating_duration_since(tokio::time::Instant::now()),
-                );
-            }
+            Ok(self.dreaming.clone())
         }
-        let mut idle = SynthesisIdle::default();
-        idle.refresh(&snapshot, &view)?;
+    }
+
+    async fn next_wake_from_current(
+        &self,
+        view: &RuntimeSchedulerView,
+        idle: &SynthesisIdle,
+        dreaming: &DreamingConfig,
+        retryable: bool,
+        wake_at: tokio::time::Instant,
+        now: i64,
+    ) -> Result<tokio::time::Instant, BackgroundSchedulerError> {
+        let artifact_wake_at = {
+            let scan = self.artifact_scan.lock().await;
+            scan.2.then_some(scan.0)
+        };
+        Ok(Self::next_wake_at_from_current(
+            view,
+            idle,
+            dreaming,
+            retryable,
+            wake_at,
+            now,
+            artifact_wake_at,
+        ))
+    }
+
+    fn next_wake_at_from_current(
+        view: &RuntimeSchedulerView,
+        idle: &SynthesisIdle,
+        dreaming: &DreamingConfig,
+        retryable: bool,
+        wake_at: tokio::time::Instant,
+        now: i64,
+        artifact_wake_at: Option<tokio::time::Instant>,
+    ) -> tokio::time::Instant {
+        let lease_at = view
+            .jobs
+            .iter()
+            .filter(|job| job.state == JobStatus::Leased)
+            .filter_map(|job| job.lease_until_us)
+            .map(|deadline| {
+                wake_at
+                    + Duration::from_micros(
+                        u64::try_from(deadline.saturating_sub(now)).unwrap_or(0),
+                    )
+            })
+            .min();
+        let mut next_wake_at =
+            wake_at + Duration::from_secs(dreaming.integrity_sweep_interval.seconds());
+        if let Some(artifact_wake_at) = artifact_wake_at {
+            next_wake_at = next_wake_at.min(artifact_wake_at);
+        }
         if let Some(idle_delay) = idle
             .episodes
             .values()
             .filter(|episode| crate::jobs::synthesis::synthesis_trigger(episode).is_some())
-            .filter_map(|episode| idle.delay(episode, &dreaming, now))
+            .filter_map(|episode| idle.delay(episode, dreaming, now))
             .filter(|delay| !delay.is_zero())
             .min()
         {
-            delay = delay.min(idle_delay);
+            next_wake_at = next_wake_at.min(wake_at + idle_delay);
         }
         if let Some(source_delay) = idle
             .source_scopes
             .iter()
             .filter_map(|(repository, worktree)| {
-                idle.source_delay(*repository, *worktree, &dreaming, now)
+                idle.source_delay(*repository, *worktree, dreaming, now)
             })
             .filter(|delay| !delay.is_zero())
             .min()
         {
-            delay = delay.min(source_delay);
+            next_wake_at = next_wake_at.min(wake_at + source_delay);
         }
         if let Some(backoff) = view
             .jobs
@@ -3322,15 +3409,15 @@ impl BackgroundScheduler {
             .map(|due| Duration::from_micros((due - now) as u64))
             .min()
         {
-            delay = delay.min(backoff);
+            next_wake_at = next_wake_at.min(wake_at + backoff);
         }
         if retryable {
-            delay = delay.min(RETRY_DELAY);
+            next_wake_at = next_wake_at.min(wake_at + RETRY_DELAY);
         }
-        if let Some(lease_delay) = lease_delay {
-            delay = delay.min(lease_delay);
+        if let Some(lease_at) = lease_at {
+            next_wake_at = next_wake_at.min(lease_at);
         }
-        Ok(delay)
+        next_wake_at
     }
 
     async fn run_support_closure(
@@ -5181,6 +5268,29 @@ mod idle_tests {
         scan.page(candidates());
         scan.rescan_pending = true; // Conflict on the last page also starts at the head.
         assert_eq!(scan.page(candidates()).0[0], "target-000");
+    }
+
+    #[tokio::test]
+    async fn cached_wake_deadline_is_not_reanchored_after_calculation_elapsed() {
+        let wake_at = tokio::time::Instant::now();
+        let view = RuntimeSchedulerView {
+            frontier: 0,
+            jobs: Vec::new(),
+            dirty: Vec::new(),
+            outbox: Vec::new(),
+        };
+        let deadline = BackgroundScheduler::next_wake_at_from_current(
+            &view,
+            &SynthesisIdle::default(),
+            &DreamingConfig::default(),
+            true,
+            wake_at,
+            0,
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(deadline, wake_at + RETRY_DELAY);
+        assert!(deadline.saturating_duration_since(tokio::time::Instant::now()) < RETRY_DELAY);
     }
 
     #[tokio::test]
