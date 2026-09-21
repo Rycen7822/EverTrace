@@ -230,6 +230,37 @@ pub async fn read_object_rows(table: &Table) -> Result<Vec<ObjectRow>, StoreErro
     Ok(rows)
 }
 
+/// Read a deliberately selected subset of the already validated objects
+/// projection.  Callers bind this to a `ProjectionValidation` stamp before
+/// and after the read; this helper therefore validates the table shape and
+/// selected rows without turning a request-local selection into a second full
+/// projection scan.
+pub(crate) async fn read_object_rows_filtered(
+    table: &Table,
+    predicate: String,
+) -> Result<Vec<ObjectRow>, StoreError> {
+    table
+        .checkout_latest()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let actual = table.schema().await.map_err(|_| StoreError::LanceDb)?;
+    if actual.as_ref() != objects_schema().as_ref() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let mut stream = table
+        .query()
+        .only_if(predicate)
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let mut rows = Vec::new();
+    while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context)).await {
+        rows.extend(rows_from_batch(&batch.map_err(|_| StoreError::LanceDb)?)?);
+    }
+    rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+    Ok(rows)
+}
+
 pub(crate) async fn read_object_checkpoint(table: &Table) -> Result<u64, StoreError> {
     table
         .checkout_latest()

@@ -43,9 +43,9 @@ pub use projections::{
     ReconciliationArtifactFrontier, ReconciliationArtifactKind, ReconciliationArtifactOwnership,
     ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
     RepositoryReadContext, RuntimeSchedulerView, ScopeCurrentContext, ScopeCurrentRequest,
-    SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView, WorkBindingCurrentView,
-    WorkIdentityCurrentView, object_deletion_preview, reduce_journal,
-    repository_scope_purge_preview,
+    SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView,
+    SessionCatalogCurrentContext, WorkBindingCurrentView, WorkIdentityCurrentView,
+    object_deletion_preview, reduce_journal, repository_scope_purge_preview,
 };
 pub use purge::{
     OBJECT_DELETION_ALGORITHM_REVISION, ObjectDeletionCandidateAdmission,
@@ -72,5 +72,6 @@ pub use search::{
 pub use session_import::*;
 pub use writer::{
     ClosedJournalWriter, CommittedCommand, JournalWriter, MAX_COMMITTED_COMMAND_READ,
-    NativeDiagnosticTable, NativeDiagnostics, SiblingWriterLock,
+    NativeDiagnosticTable, NativeDiagnostics, NormalSearchCandidateRequest,
+    NormalSearchReadContext, SiblingWriterLock,
 };

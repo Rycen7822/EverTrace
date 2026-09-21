@@ -43,7 +43,14 @@ impl StageTrace {
         snapshot: &ProjectionSnapshot,
         target: &WorkEpisode,
     ) -> Result<Self, SemanticServiceError> {
-        Self::compile_with_attempt(snapshot, target, None)
+        Self::compile_rows(&snapshot.rows, target)
+    }
+
+    pub(crate) fn compile_rows(
+        rows: &[evertrace_store::ObjectRow],
+        target: &WorkEpisode,
+    ) -> Result<Self, SemanticServiceError> {
+        Self::compile_rows_with_attempt(rows, target, None)
     }
 
     pub(crate) fn compile_for_attempt(
@@ -51,11 +58,11 @@ impl StageTrace {
         target: &WorkEpisode,
         attempt: evertrace_domain::ids::AttemptId,
     ) -> Result<Self, SemanticServiceError> {
-        Self::compile_with_attempt(snapshot, target, Some(attempt))
+        Self::compile_rows_with_attempt(&snapshot.rows, target, Some(attempt))
     }
 
-    fn compile_with_attempt(
-        snapshot: &ProjectionSnapshot,
+    fn compile_rows_with_attempt(
+        rows: &[evertrace_store::ObjectRow],
         target: &WorkEpisode,
         target_attempt: Option<evertrace_domain::ids::AttemptId>,
     ) -> Result<Self, SemanticServiceError> {
@@ -64,8 +71,9 @@ impl StageTrace {
                 .map_err(|_| SemanticServiceError::InvalidInput)
         };
         // A target revision, not the live frontier, freezes generation input.
-        let boundary = snapshot
-            .data_rows()
+        let boundary = rows
+            .iter()
+            .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
             .find_map(|row| {
                 (row.current_revision_id.as_deref() == Some(&target.revision_id.to_string()))
                     .then_some(row.source_event_seq)
@@ -77,8 +85,9 @@ impl StageTrace {
         let mut holders = std::collections::BTreeMap::new();
         let mut attempts = std::collections::BTreeMap::new();
         let mut runs = std::collections::BTreeMap::<&str, Vec<&evertrace_store::ObjectRow>>::new();
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
             .filter(|row| row.source_event_seq <= boundary)
         {
             match row.object_kind.as_deref() {
@@ -95,7 +104,7 @@ impl StageTrace {
                 _ => {}
             }
         }
-        for row in snapshot.data_rows().filter(|row| {
+        for row in rows.iter().filter(|row| {
             row.object_kind.as_deref() == Some("work_episode") && row.source_event_seq <= boundary
         }) {
             let Some(json) = row.payload_json.as_deref() else {
@@ -120,8 +129,9 @@ impl StageTrace {
             }
         }
         let mut checkpoints = Vec::<(WorkCheckpoint, u64, WorkEpisode)>::new();
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
             .filter(|row| row.object_kind.as_deref() == Some("work_checkpoint"))
         {
             let Some(json) = row.payload_json.as_deref() else {

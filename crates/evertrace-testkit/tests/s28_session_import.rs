@@ -2786,7 +2786,18 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let (handle, task) = spawn_writer(writer, 32).unwrap();
     let catalog = SessionCatalogService::new(handle.clone(), CONFIG);
     assert_eq!(catalog.refresh(&report).await.unwrap(), 1);
+    let catalog_context = handle.session_catalog_current_context().await.unwrap();
     let catalog_snapshot = handle.project().await.unwrap();
+    assert_eq!(catalog_context.frontier, catalog_snapshot.frontier);
+    assert_eq!(
+        catalog_context.repositories,
+        evertrace_store::repository::RepositoryCurrentView::from_snapshot(&catalog_snapshot)
+            .unwrap()
+    );
+    assert_eq!(
+        catalog_context.sessions,
+        SessionImportCurrentView::from_snapshot(&catalog_snapshot).unwrap()
+    );
     assert!(evertrace_store::RuntimeSchedulerView::from_snapshot(&catalog_snapshot).is_ok());
     let mut invalid_current = catalog_snapshot.clone();
     invalid_current
@@ -2854,7 +2865,10 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     let worker =
         SessionImportWorker::new(handle.clone(), runtime(temp.path()), Arc::clone(&report))
             .unwrap();
-    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    // Public readability below the private TempDir ancestor is a valid
+    // read-only Host source. Make the root group/other writable instead so
+    // the negative checkpoint exercises an actual unsafe-identity revocation.
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o777)).unwrap();
     assert!(matches!(
         worker
             .process_checkpoint(

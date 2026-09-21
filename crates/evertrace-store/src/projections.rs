@@ -195,6 +195,16 @@ impl RuntimeSchedulerView {
     }
 }
 
+/// The catalog refresh's complete current repository/import facts.
+/// It is assembled under the writer's validated admission stamp without
+/// formatting unrelated captured payloads into a projection snapshot.
+#[derive(Clone, Debug)]
+pub struct SessionCatalogCurrentContext {
+    pub frontier: u64,
+    pub repositories: crate::repository::RepositoryCurrentView,
+    pub sessions: crate::session_import::SessionImportCurrentView,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProcedureEffectCurrentFacts {
     pub frontier: u64,
@@ -2787,7 +2797,7 @@ pub struct ScopeCurrentContext {
     pub facts: Vec<JournalPayload>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ScopeCurrentRequest {
     pub session: Option<String>,
     pub agent: Option<String>,
@@ -3247,7 +3257,15 @@ pub struct ObjectDeletionCandidateAdmissionView {
 
 impl ObjectDeletionCandidateAdmissionView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
-        Self::from_selected_snapshot(snapshot, None)
+        Self::from_rows(&snapshot.rows)
+    }
+
+    /// Apply the existing deletion reduction to an explicitly selected
+    /// request-local row set.  This retains the same payload and suppression
+    /// checks as the projection wrapper without presenting the selection as a
+    /// complete `ProjectionSnapshot`.
+    pub fn from_rows(rows: &[ObjectRow]) -> Result<Self, StoreError> {
+        Self::from_selected_rows(rows, None)
     }
 
     /// The same deletion reduction, restricted before body decoding to the
@@ -3256,6 +3274,10 @@ impl ObjectDeletionCandidateAdmissionView {
         snapshot: &ProjectionSnapshot,
         refs: &[String],
     ) -> Result<Self, StoreError> {
+        Self::for_source_refs_rows(&snapshot.rows, refs)
+    }
+
+    pub fn for_source_refs_rows(rows: &[ObjectRow], refs: &[String]) -> Result<Self, StoreError> {
         if refs.is_empty()
             || refs.len() > 64
             || !refs.windows(2).all(|pair| pair[0] < pair[1])
@@ -3265,14 +3287,14 @@ impl ObjectDeletionCandidateAdmissionView {
         {
             return Err(StoreError::InvalidInput);
         }
-        Self::from_selected_snapshot(snapshot, Some(refs))
+        Self::from_selected_rows(rows, Some(refs))
     }
 
-    fn from_selected_snapshot(
-        snapshot: &ProjectionSnapshot,
+    fn from_selected_rows(
+        rows: &[ObjectRow],
         selected: Option<&[String]>,
     ) -> Result<Self, StoreError> {
-        let ledger = crate::purge::ObjectDeletionCurrentView::from_snapshot(snapshot)?;
+        let ledger = crate::purge::ObjectDeletionCurrentView::from_rows(0, rows.iter())?;
         let deletions = ledger.events.into_values().collect::<Vec<_>>();
         if deletions.is_empty() {
             return Ok(Self {
@@ -3286,7 +3308,7 @@ impl ObjectDeletionCandidateAdmissionView {
         let mut source_receipts = BTreeMap::new();
         let mut selected_receipts = BTreeSet::new();
         for kind in ["source_observation", "source_receipt"] {
-            for row in snapshot.data_rows().filter(|row| {
+            for row in rows.iter().filter(|row| {
                 row.object_kind.as_deref() == Some(kind)
                     && selected.is_none_or(|refs| {
                         row.object_id.as_ref().is_some_and(|id| {
@@ -3336,7 +3358,7 @@ impl ObjectDeletionCandidateAdmissionView {
         }
         let mut source_suppression_refs = BTreeMap::new();
         let mut seen_surfaces = BTreeSet::new();
-        for row in snapshot.data_rows().filter(|row| {
+        for row in rows.iter().filter(|row| {
             row.object_kind.as_deref() == Some("evidence_surface")
                 && selected.is_none_or(|refs| {
                     row.current_revision_id
@@ -3816,6 +3838,18 @@ impl ReducerState {
     }
 }
 
+fn normal_search_row_matches(row: &ObjectRow, references: &BTreeSet<String>) -> bool {
+    references.contains(row.row_id.as_str())
+        || row
+            .object_id
+            .as_deref()
+            .is_some_and(|value| references.contains(value))
+        || row
+            .current_revision_id
+            .as_deref()
+            .is_some_and(|value| references.contains(value))
+}
+
 impl JournalAdmissionState {
     pub(crate) fn committed_frontier(&self) -> u64 {
         self.frontier
@@ -4171,6 +4205,265 @@ impl JournalAdmissionState {
             }
         }
         Ok(ScopeCurrentContext { facts })
+    }
+
+    /// Materialize only the stable control families ordinary Search consumes
+    /// from the already validated admission state. This is neither a complete
+    /// projection snapshot nor a retained cache; candidate bodies still have
+    /// their own current read at the writer boundary.
+    pub(crate) fn normal_search_control_rows(&self) -> Result<Vec<ObjectRow>, StoreError> {
+        let repository_closures = self
+            .repository_closures
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rows = self.procedure.rows(PROJECTION_GENERATION, &self.s23)?;
+        for (value, seq) in self.proposal_revisions.values() {
+            rows.push(semantic_proposal_row(
+                value,
+                &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        rows.extend(self.deletions.rows()?);
+        rows.extend(self.scope_purges.rows()?);
+        filter_product_rows(
+            rows,
+            &self.deletions,
+            &self.scope_purges,
+            repository_closures.iter(),
+        )
+    }
+
+    /// Construct only the concrete current rows named by ordinary Search's
+    /// candidates or their resolver closure. The admitted journal state is
+    /// authoritative under the held single-writer lock; this avoids turning a
+    /// selected read into a native scan of every captured payload.
+    pub(crate) fn normal_search_reference_rows(
+        &self,
+        references: &BTreeSet<String>,
+        include_derived_candidate_rows: bool,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matches = |id: &str| references.contains(id);
+        let mut rows = Vec::new();
+
+        // Capture candidates and their closure use stable, typed ids. Read
+        // those three high-cardinality maps by key: a normal Search has at
+        // most three selected candidates, rather than a reason to format and
+        // compare every receipt/observation/surface in the current journal.
+        // Keep the remaining family walks below because their identifiers can
+        // name either an object or one of its historical revisions.
+        for reference in references {
+            if let Ok(id) = reference.parse::<SourceReceiptId>()
+                && let Some((value, seq)) = self.source_receipts.get(&id)
+            {
+                rows.push(source_receipt_row(value.clone(), *seq)?);
+            }
+            if let Ok(id) = reference.parse::<SourceObservationId>() {
+                if let Some((value, seq)) = self.source_observations.get(&id) {
+                    rows.push(source_observation_row(value.clone(), *seq)?);
+                }
+                if let Some((value, seq)) = self.evidence_surfaces.get(&id) {
+                    rows.push(surface_row(id, value.clone(), *seq)?);
+                }
+            }
+        }
+        for (id, (value, seq)) in &self.repositories {
+            let id = id.to_string();
+            let revision = format!("{id}@{}", value.repository_revision);
+            if matches(&id) || matches(&revision) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "repository",
+                    id,
+                    revision,
+                    &JournalPayload::RepositoryInstanceRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for (id, (value, seq)) in &self.worktrees {
+            let id = id.to_string();
+            let revision = format!("{id}@{}", value.worktree_revision);
+            if matches(&id) || matches(&revision) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "worktree",
+                    id,
+                    revision,
+                    &JournalPayload::WorktreeInstanceRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for (id, (value, seq)) in &self.tasks {
+            let id = id.to_string();
+            let revision = value.revision_id.to_string();
+            if matches(&id) || matches(&revision) {
+                rows.push(work_identity_row(
+                    "task",
+                    id,
+                    revision,
+                    value.lifecycle.as_str(),
+                    Some(value.task_id.to_string()),
+                    None,
+                    None,
+                    None,
+                    &JournalPayload::TaskRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for (id, (value, seq)) in &self.workstreams {
+            let id = id.to_string();
+            let revision = value.revision_id.to_string();
+            if matches(&id) || matches(&revision) {
+                rows.push(work_identity_row(
+                    "workstream",
+                    id,
+                    revision,
+                    value.status.as_str(),
+                    Some(value.task_id.to_string()),
+                    Some(value.workstream_id.to_string()),
+                    value.repository_instance_id.map(|id| id.to_string()),
+                    value.active_worktree_instance_id.map(|id| id.to_string()),
+                    &JournalPayload::WorkstreamRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for (revision, (value, seq)) in &self.attempt_revisions {
+            if matches(&revision.to_string()) || matches(&value.attempt_id.to_string()) {
+                rows.push(inbox_work_row(
+                    &JournalPayload::AttemptRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for (revision, (value, seq)) in &self.experiment_run_revisions {
+            if matches(&revision.to_string()) || matches(&value.run_id.to_string()) {
+                let mut row = work_identity_row(
+                    "experiment_run",
+                    value.run_id.to_string(),
+                    value.revision_id.to_string(),
+                    value.execution_status.as_str(),
+                    None,
+                    Some(value.workstream_id.to_string()),
+                    None,
+                    None,
+                    &JournalPayload::ExperimentRunRecorded(Box::new(value.clone())),
+                    *seq,
+                )?;
+                row.row_id = format!("object:work:experiment_run:{revision}");
+                rows.push(row);
+            }
+        }
+        for (revision, (value, seq)) in &self.result_evidence_revisions {
+            if matches(&revision.to_string()) || matches(&value.result_evidence_id.to_string()) {
+                let mut row = work_identity_row(
+                    "result_evidence",
+                    value.result_evidence_id.to_string(),
+                    value.revision_id.to_string(),
+                    value.completeness.as_str(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &JournalPayload::ResultEvidenceRecorded(Box::new(value.clone())),
+                    *seq,
+                )?;
+                row.row_id = format!("object:work:result_evidence:{revision}");
+                rows.push(row);
+            }
+        }
+        for (revision, (value, seq)) in &self.artifact_revisions {
+            if matches(&revision.to_string()) || matches(&value.work_artifact_id.to_string()) {
+                let mut row = work_identity_row(
+                    "work_artifact",
+                    value.work_artifact_id.to_string(),
+                    value.revision.revision_id.to_string(),
+                    value.revision.payload_status.as_str(),
+                    value.revision.scope.task_id().map(|id| id.to_string()),
+                    None,
+                    value
+                        .revision
+                        .scope
+                        .repository_id()
+                        .map(|id| id.to_string()),
+                    value.revision.scope.worktree_id().map(|id| id.to_string()),
+                    &JournalPayload::WorkArtifactRecorded(Box::new(value.clone())),
+                    *seq,
+                )?;
+                row.row_id = format!("object:work:work_artifact:{revision}");
+                rows.push(row);
+            }
+        }
+        for (revision, (value, seq)) in &self.atom_revisions {
+            if matches(&revision.to_string()) || matches(&value.atom_id.to_string()) {
+                let mut row = semantic_atom_row(
+                    value,
+                    &JournalPayload::AtomRecorded(Box::new(value.clone())),
+                    *seq,
+                )?;
+                row.support_state = self
+                    .s23
+                    .atom_support_state(value.revision_id)
+                    .map(str::to_owned);
+                rows.push(row);
+            }
+        }
+
+        for (id, (value, seq)) in self.synthesis.digests() {
+            if matches(&id.to_string()) {
+                rows.push(synthesis::digest_row(*id, value.clone(), *seq)?);
+            }
+        }
+
+        let repository_closures = self
+            .repository_closures
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if include_derived_candidate_rows {
+            // A small set of legal normal-Search object families are rendered
+            // only by their owning reducers. Keep that existing reduction for
+            // an explicitly selected candidate, but never execute it for
+            // ordinary evidence/source dependencies.
+            // Preserve the full projection's deletion closure before choosing
+            // the candidate. In particular, a support validation can only be
+            // suppressed after its CoreMembership/contract inputs establish
+            // the owned-support closure; selecting it first would hide those
+            // inputs from `filter_product_rows`.
+            let mut derived = self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?;
+            derived.extend(self.synthesis.clone().rows()?);
+            derived.extend(synthesis::wiki_rows(
+                &self.atoms,
+                &self.proposals,
+                &self.episodes,
+                &self.synthesis,
+                &self.s23,
+            )?);
+            for row in filter_product_rows(
+                derived,
+                &self.deletions,
+                &self.scope_purges,
+                repository_closures.iter(),
+            )? {
+                if normal_search_row_matches(&row, references) {
+                    rows.push(row);
+                }
+            }
+        }
+
+        filter_product_rows(
+            rows,
+            &self.deletions,
+            &self.scope_purges,
+            repository_closures.iter(),
+        )
     }
 
     fn scope_fact_visible(&self, payload: &JournalPayload, seq: u64) -> Result<bool, StoreError> {
@@ -5357,6 +5650,86 @@ impl JournalAdmissionState {
                         .ok_or(StoreError::StoreCorrupt)
                 })
                 .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Assemble the whole catalog resolver closure from the validated
+    /// admission state. Unlike `project`, this only formats the repository,
+    /// import-current families the catalog actually reads;
+    /// it still passes them through the same deletion and repository-purge
+    /// closure before the existing typed reducers decode them.
+    pub(crate) fn session_catalog_current_context(
+        &self,
+    ) -> Result<crate::SessionCatalogCurrentContext, StoreError> {
+        let repository_closures = self
+            .repository_closures
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        rows.extend(
+            self.session_imports
+                .values()
+                .map(|value| crate::session_import::current_row(value, PROJECTION_GENERATION))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        for (id, (value, seq)) in &self.repositories {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "repository",
+                id.to_string(),
+                format!("{}@{}", id, value.repository_revision),
+                &JournalPayload::RepositoryInstanceRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        for (id, (value, seq)) in &self.worktrees {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "worktree",
+                id.to_string(),
+                format!("{}@{}", id, value.worktree_revision),
+                &JournalPayload::WorktreeInstanceRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        for (id, (value, seq)) in &self.worktree_snapshots {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "worktree_snapshot",
+                id.to_string(),
+                id.to_string(),
+                &JournalPayload::WorktreeSnapshotRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        for (value, seq) in self.worktree_transitions.values() {
+            rows.push(inbox_work_row(
+                &JournalPayload::WorktreeTransitionRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        for (id, (value, seq)) in &self.integration_events {
+            rows.push(physical_object_row(
+                ObjectFamily::Work,
+                "integration_event",
+                id.to_string(),
+                id.to_string(),
+                &JournalPayload::IntegrationEventRecorded(Box::new(value.clone())),
+                *seq,
+            )?);
+        }
+        let rows = filter_product_rows(
+            rows,
+            &self.deletions,
+            &self.scope_purges,
+            repository_closures.iter(),
+        )?;
+        let frontier = self.frontier;
+        Ok(crate::SessionCatalogCurrentContext {
+            frontier,
+            repositories: crate::repository::RepositoryCurrentView::from_rows(frontier, &rows)?,
+            sessions: crate::session_import::SessionImportCurrentView::from_rows(frontier, &rows)?,
         })
     }
 

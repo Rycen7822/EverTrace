@@ -15,6 +15,7 @@ use evertrace_domain::{
 
 use crate::{
     command::{JournalEventDraft, JournalPayload, StoreError},
+    objects::{ObjectRow, ObjectRowKind},
     projections::ProjectionSnapshot,
     relations::{RepositoryRelationRow, build_repository_relation_rows},
 };
@@ -39,11 +40,21 @@ pub struct RepositoryCurrentView {
 
 impl RepositoryCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    /// Decode the repository/worktree current reduction from a caller-owned,
+    /// already filtered row selection. This is deliberately not a partial
+    /// `ProjectionSnapshot`; callers supply the frontier they validated.
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+        {
             if crate::session_import::restore_current(row)?.is_some() {
                 continue;
             }

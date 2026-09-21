@@ -45,7 +45,9 @@ use evertrace_protocol::{
     request_mcp_binding_sync,
     response::{McpBindingIssuedResponse, Response},
 };
-use evertrace_store::{JournalCommand, JournalEventDraft, JournalPayload, SearchIndex};
+use evertrace_store::{
+    DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload, SearchIndex,
+};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -1092,6 +1094,51 @@ async fn real_store_scope_union_and_four_actions_preserve_authority_boundaries()
         item.object_revision_ref.as_deref() == Some(unrelated_revision.to_string().as_str())
     }));
     assert!(action_search.next_refs.len() <= 32);
+    // A distinct scheduler target advances the journal but does not alter the
+    // selected task/repository/source closure.  Normal Search must use its
+    // fresh candidate read rather than treating every append as a stale scope.
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    8,
+                    [0x20; 32],
+                    "s20-test-v1",
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::ObjectsProjection,
+                        target_id: "unrelated-normal-search-work".into(),
+                        algorithm_revision: "s20-test-v1".into(),
+                        source_watermark: 7,
+                    }),
+                )],
+            )
+            .unwrap(),
+            8,
+        )
+        .await
+        .unwrap();
+    let after_unrelated_append = service
+        .handle(
+            "connection-actions",
+            McpServiceRequest {
+                request_id: RequestId::new_v7(),
+                action: McpServiceAction::Search,
+                workspace: workspace.clone(),
+                input: "needle".into(),
+                refs: Vec::new(),
+                client_cwd: repository_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        after_unrelated_append.status,
+        McpServiceStatus::Ok | McpServiceStatus::Partial
+    ));
+    assert!(after_unrelated_append.items.iter().any(|item| {
+        item.object_revision_ref.as_deref() == Some(repo_revision.to_string().as_str())
+    }));
     let projected = handle.project().await.unwrap();
     let base = projected
         .rows

@@ -284,9 +284,9 @@ impl ProcedureUsageCurrentView {
         usage_command(context, next, None)
     }
 
-    pub(crate) fn route_search(
+    pub(crate) fn route_search_rows(
         &self,
-        snapshot: &ProjectionSnapshot,
+        rows: &[evertrace_store::ObjectRow],
         anchor: &crate::service::McpQueryAnchor,
         context: &SearchContext,
         revisions: &[String],
@@ -318,7 +318,7 @@ impl ProcedureUsageCurrentView {
         };
         let mut checkpoint = None;
         let mut scenario: Option<evertrace_domain::semantic::Scenario> = None;
-        for row in snapshot.data_rows().filter(|row| {
+        for row in rows.iter().filter(|row| {
             matches!(
                 row.object_kind.as_deref(),
                 Some("work_checkpoint" | "scenario")
@@ -371,8 +371,9 @@ impl ProcedureUsageCurrentView {
         let scenario_fresh = checkpoint.is_some()
             && scenario.as_ref().is_some_and(|scenario| {
                 scenario.active_lineage.active_episode_id == Some(episode.episode_id)
-                    && crate::semantic::ScenarioCompiler::compile(
-                        snapshot,
+                    && crate::semantic::ScenarioCompiler::compile_rows(
+                        self.frontier,
+                        rows,
                         scenario_scope.clone(),
                         Some(scenario),
                     )
@@ -456,7 +457,7 @@ impl ProcedureUsageCurrentView {
                     .is_empty()
                     || scenario.active_workstreams.len() > 1
             });
-        let trace = super::alignment::StageTrace::compile(snapshot, episode)?;
+        let trace = super::alignment::StageTrace::compile_rows(rows, episode)?;
         let candidates = revisions
             .iter()
             .enumerate()
@@ -625,6 +626,17 @@ impl ProcedureUsageCurrentView {
 
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, SemanticServiceError> {
         Self::from_snapshot_input(snapshot, false, false)
+    }
+
+    /// Construct the same usage reducer from a named request-local selection.
+    /// The selection is deliberately not a `ProjectionSnapshot`: callers must
+    /// provide the current frontier and the finite closure their operation
+    /// consumes.
+    pub(crate) fn from_rows(
+        frontier: u64,
+        rows: &[evertrace_store::ObjectRow],
+    ) -> Result<Self, SemanticServiceError> {
+        Self::from_rows_input(frontier, rows, false, false)
     }
 
     /// Candidate text is only a read filter. Every selected binding and source
@@ -846,6 +858,13 @@ impl ProcedureUsageCurrentView {
         Self::from_snapshot_input(snapshot, true, false)
     }
 
+    pub(crate) fn from_promotion_rows(
+        frontier: u64,
+        rows: &[evertrace_store::ObjectRow],
+    ) -> Result<Self, SemanticServiceError> {
+        Self::from_rows_input(frontier, rows, true, false)
+    }
+
     pub(crate) fn from_coverage_snapshot(
         snapshot: &ProjectionSnapshot,
         contexts: &std::collections::BTreeSet<(
@@ -899,11 +918,28 @@ impl ProcedureUsageCurrentView {
         promotion_only: bool,
         execution_inputs: bool,
     ) -> Result<Self, SemanticServiceError> {
+        Self::from_rows_input(
+            snapshot.frontier,
+            &snapshot.rows,
+            promotion_only,
+            execution_inputs,
+        )
+    }
+
+    fn from_rows_input(
+        frontier: u64,
+        rows: &[evertrace_store::ObjectRow],
+        promotion_only: bool,
+        execution_inputs: bool,
+    ) -> Result<Self, SemanticServiceError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
+        {
             let promotion_input = matches!(
                 row.object_kind.as_deref(),
                 Some(

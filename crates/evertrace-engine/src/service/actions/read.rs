@@ -1,4 +1,30 @@
+use std::{collections::BTreeMap, future::Future, pin::Pin};
+
 use super::*;
+
+struct SearchCandidateReview {
+    items: Vec<McpServiceItem>,
+    omitted: BTreeSet<String>,
+    unreadable_methods: BTreeSet<String>,
+}
+
+// Both normal Search and the legacy complete-snapshot consumers share the
+// candidate classification, authorization, route accounting, and response
+// presentation path. This is deliberately a request-local argument bundle,
+// not another snapshot or reusable read abstraction: only preparation of the
+// rows differs between the two callers.
+struct SearchCandidateReviewInput<'a> {
+    request_id: &'a RequestId,
+    label: &'a str,
+    anchor: &'a McpQueryAnchor,
+    frontier: u64,
+    rows: &'a [ObjectRow],
+    context: &'a SearchContext,
+    candidates: &'a [evertrace_domain::query::SearchCandidate],
+    methods: &'a BTreeSet<String>,
+    blocked_candidates: &'a BTreeSet<String>,
+    unavailable_current: &'a BTreeSet<String>,
+}
 
 impl McpActionService {
     pub(super) async fn blocked_read_rows(
@@ -8,26 +34,58 @@ impl McpActionService {
         rows: &[&ObjectRow],
         repository_context: Option<evertrace_domain::ids::RepositoryId>,
     ) -> Result<BTreeSet<String>, McpServiceError> {
-        let mut blocked = crate::session_import::blocked_source_rows(
+        self.blocked_read_rows_from_rows(report, &snapshot.rows, rows, repository_context, None)
+            .await
+    }
+
+    async fn blocked_read_rows_from_rows(
+        &self,
+        report: Option<&evertrace_codex::HostProbeReport>,
+        all_rows: &[ObjectRow],
+        rows: &[&ObjectRow],
+        repository_context: Option<evertrace_domain::ids::RepositoryId>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<BTreeSet<String>, McpServiceError> {
+        let lookup = all_rows
+            .iter()
+            .map(|row| (row.row_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        let mut blocked = crate::session_import::blocked_source_rows_from_rows_before(
             &self.writer,
             report,
-            snapshot,
+            all_rows,
             rows,
             self.runtime_snapshot.effective_config_hash,
+            Some(&lookup),
+            deadline,
         )
         .await
         .map_err(|_| McpServiceError::Store)?;
-        let scopes = crate::repository::row_repository_contexts(snapshot, rows)
+        let scopes = crate::repository::row_repository_contexts_from_scopes(all_rows.iter(), rows)
             .map_err(|_| McpServiceError::Store)?;
         let mut ids = scopes.values().flatten().copied().collect::<BTreeSet<_>>();
         ids.extend(repository_context);
-        let repositories = crate::repository::blocked_repositories(
-            &self.writer,
-            ids,
-            report,
-            self.runtime_snapshot.effective_config_hash,
-        )
-        .await
+        let repositories = match deadline {
+            Some(deadline) => {
+                crate::repository::blocked_repositories_before(
+                    &self.writer,
+                    ids,
+                    report,
+                    self.runtime_snapshot.effective_config_hash,
+                    deadline,
+                )
+                .await
+            }
+            None => {
+                crate::repository::blocked_repositories(
+                    &self.writer,
+                    ids,
+                    report,
+                    self.runtime_snapshot.effective_config_hash,
+                )
+                .await
+            }
+        }
         .map_err(|_| McpServiceError::Store)?;
         if repository_context.is_some_and(|id| repositories.contains(&id)) {
             blocked.extend(rows.iter().map(|row| row.row_id.clone()));
@@ -40,6 +98,549 @@ impl McpActionService {
                 .map(|(row, _)| row.to_owned()),
         );
         Ok(blocked)
+    }
+
+    pub(super) fn normal_search(
+        &self,
+        request_id: RequestId,
+        scope: NormalSearchScope,
+        query: String,
+    ) -> Pin<Box<dyn Future<Output = Result<McpServiceResult, McpServiceError>> + Send + '_>> {
+        Box::pin(self.normal_search_inner(request_id, scope, query, false))
+    }
+
+    async fn normal_search_inner(
+        &self,
+        request_id: RequestId,
+        scope: NormalSearchScope,
+        query: String,
+        retried_anchor: bool,
+    ) -> Result<McpServiceResult, McpServiceError> {
+        let label = scope_label_for_binding(&scope.binding);
+        let remaining = scope
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let latency_us = u64::try_from(remaining.as_micros()).unwrap_or(u64::MAX);
+        if latency_us == 0 {
+            return Ok(empty_result(
+                request_id,
+                McpServiceStatus::Partial,
+                &label,
+                "partial",
+                ["search_deadline_exhausted"],
+            ));
+        }
+        let context = SearchContext {
+            intent: SearchIntent::StageAssistance,
+            raw_query: query.clone(),
+            query_facets: QueryFacetSet {
+                parse_status: FacetParseStatus::Unknown,
+                exact_identifiers: Vec::new(),
+                condition_literals: Vec::new(),
+                relation_requirements: Vec::new(),
+                polarity: Polarity::Positive,
+                explicit_exclusions: Vec::new(),
+                temporal_mode: TemporalMode::Current,
+                temporal_qualifiers: Vec::new(),
+                quantity_constraints: vec![QuantityConstraint::ResultLimit { limit: 3 }],
+                scope_boundary: None,
+                source_boundary: None,
+                answer_shape: None,
+                lifecycle_boundary: LifecycleBoundary::Active,
+            },
+            task_id: scope.anchor.task_id,
+            repository_id: scope.anchor.repository_id,
+            worktree_id: scope.anchor.worktree_id,
+            suppression: deletion_suppression_rows(scope.context.frontier, &scope.context.rows)?,
+            budget: RetrievalBudget {
+                candidates_remaining: 3,
+                tokens_remaining: 1_200,
+                latency_us_remaining: latency_us,
+                hops_remaining: 0,
+                follow_ups_remaining: 0,
+            },
+        };
+        let include_probationary = self.operation_config.as_ref().map_or_else(
+            || evertrace_domain::config::ProcedureConfig::default().include_probationary,
+            |config| config.config().procedure.include_probationary,
+        );
+        let searchable_procedure_revisions =
+            crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                scope.context.frontier,
+                &scope.context.rows,
+            )
+            .map_err(|_| McpServiceError::Store)?
+            .searchable_procedure_revisions(include_probationary);
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        let method_deadline = scope.deadline;
+        let methods = crate::jobs::procedure::readable_revisions_from_rows(
+            &self.writer,
+            &scope.context.rows,
+            scope
+                .binding
+                .repository_report
+                .as_deref()
+                .or(report.as_ref()),
+            self.runtime_snapshot.effective_config_hash,
+            (scope.anchor.repository_id, scope.anchor.worktree_id),
+            None,
+            method_deadline,
+        )
+        .await
+        .map_err(|_| McpServiceError::Store)?;
+        let found = ProductionSearch::new(self.search_index.clone())
+            .with_validated_frontier(scope.context.frontier)
+            .with_method_proposals(methods)
+            .with_procedure_revisions(searchable_procedure_revisions)
+            .search(context.clone())
+            .await
+            .map_err(|_| McpServiceError::Store)?;
+        let selected_candidates = found.candidates.iter().take(3).collect::<Vec<_>>();
+        let candidate_ids = selected_candidates
+            .iter()
+            .map(|candidate| candidate.candidate_id.clone())
+            // Reserve room for each selected candidate's source reference in
+            // the bounded writer read below.
+            .chain(found.omitted_refs.iter().take(59).cloned())
+            .collect::<BTreeSet<_>>();
+        let mut candidate_references = candidate_ids.clone();
+        candidate_references.extend(
+            selected_candidates
+                .iter()
+                .map(|candidate| candidate.source_ref.clone()),
+        );
+        let has_procedure = selected_candidates
+            .iter()
+            .any(|candidate| candidate.object_kind.as_deref() == Some("procedure_revision"));
+        let candidate_context = if candidate_ids.is_empty() {
+            None
+        } else {
+            Some(
+                self.writer
+                    .normal_search_candidate_context(
+                        scope.request.clone(),
+                        evertrace_store::NormalSearchCandidateRequest {
+                            identifiers: candidate_references.iter().cloned().collect(),
+                            task_id: scope.anchor.task_id,
+                            repository_id: scope.anchor.repository_id,
+                            worktree_id: scope.anchor.worktree_id,
+                            include_procedure_route: has_procedure,
+                            include_derived_candidate_rows: selected_candidates.iter().any(
+                                |candidate| {
+                                    matches!(
+                                        candidate.object_kind.as_deref(),
+                                        Some(
+                                            "scenario"
+                                                | "core_membership"
+                                                | "global_support_contract"
+                                                | "global_support_validation"
+                                                | "wiki_projection"
+                                        )
+                                    )
+                                },
+                            ),
+                        },
+                    )
+                    .await
+                    .map_err(|_| McpServiceError::Store)?,
+            )
+        };
+        if let Some(fresh) = &candidate_context {
+            let fresh_anchor = super::super::scope::resolve_current_anchor(
+                &fresh.scope,
+                &scope.binding,
+                &scope.client_cwd,
+            );
+            if fresh_anchor.as_ref() != Some(&scope.anchor) {
+                if !retried_anchor && let Some(anchor) = fresh_anchor {
+                    return Box::pin(self.normal_search_inner(
+                        request_id,
+                        NormalSearchScope {
+                            binding: scope.binding,
+                            anchor,
+                            client_cwd: scope.client_cwd,
+                            deadline: scope.deadline,
+                            request: scope.request,
+                            context: candidate_context.expect("checked above"),
+                        },
+                        query,
+                        true,
+                    ))
+                    .await;
+                }
+                return Ok(scope_unresolved(request_id));
+            }
+        }
+        let stale_current_candidate = candidate_context.as_ref().is_some_and(|fresh| {
+            found.candidates.iter().take(3).any(|candidate| {
+                candidate.row_variant == evertrace_domain::query::SearchCandidateVariant::Object
+                    && !matches!(
+                        select_object_row_rows(&fresh.rows, &candidate.candidate_id),
+                        Ok(Some((_, true)))
+                    )
+            })
+        });
+        if stale_current_candidate && !retried_anchor {
+            return Box::pin(self.normal_search_inner(
+                request_id,
+                NormalSearchScope {
+                    binding: scope.binding,
+                    anchor: scope.anchor,
+                    client_cwd: scope.client_cwd,
+                    deadline: scope.deadline,
+                    request: scope.request,
+                    context: candidate_context.expect("checked above"),
+                },
+                query,
+                true,
+            ))
+            .await;
+        }
+        let mut blocked_candidates = BTreeSet::new();
+        let mut methods = BTreeSet::new();
+        let mut unavailable_current = BTreeSet::new();
+        if let Some(candidate_context) = &candidate_context {
+            let selected = candidate_context
+                .rows
+                .iter()
+                .filter(|row| {
+                    candidate_references.contains(&row.row_id)
+                        || row
+                            .object_id
+                            .as_deref()
+                            .is_some_and(|id| candidate_references.contains(id))
+                        || row
+                            .current_revision_id
+                            .as_deref()
+                            .is_some_and(|id| candidate_references.contains(id))
+                })
+                .take(65)
+                .collect::<Vec<_>>();
+            let blocked = self
+                .blocked_read_rows_from_rows(
+                    scope
+                        .binding
+                        .repository_report
+                        .as_deref()
+                        .or(report.as_ref()),
+                    &candidate_context.rows,
+                    &selected,
+                    scope.anchor.repository_id,
+                    Some(method_deadline),
+                )
+                .await?;
+            let reviewed_candidates = selected_candidates
+                .iter()
+                .filter(|candidate| {
+                    selected
+                        .iter()
+                        .any(|row| normal_search_candidate_matches_row(candidate, row))
+                })
+                .map(|candidate| candidate.candidate_id.clone())
+                .collect::<BTreeSet<_>>();
+            blocked_candidates = selected_candidates
+                .iter()
+                .filter(|candidate| {
+                    selected.iter().any(|row| {
+                        normal_search_candidate_matches_row(candidate, row)
+                            && blocked.contains(&row.row_id)
+                    })
+                })
+                .map(|candidate| candidate.candidate_id.clone())
+                .collect();
+            // Continuations that were not part of the bounded current review
+            // never become a permission bypass.
+            blocked_candidates.extend(
+                candidate_ids
+                    .iter()
+                    .filter(|reference| !reviewed_candidates.contains(*reference))
+                    .cloned(),
+            );
+            let method_hits = found
+                .candidates
+                .iter()
+                .take(3)
+                .filter(|candidate| {
+                    candidate.object_kind.as_deref() == Some("revision_proposal_revision")
+                })
+                .map(|candidate| candidate.candidate_id.clone())
+                .collect::<BTreeSet<_>>();
+            if !method_hits.is_empty() {
+                methods = crate::jobs::procedure::readable_revisions_from_rows(
+                    &self.writer,
+                    &candidate_context.rows,
+                    scope
+                        .binding
+                        .repository_report
+                        .as_deref()
+                        .or(report.as_ref()),
+                    self.runtime_snapshot.effective_config_hash,
+                    (scope.anchor.repository_id, scope.anchor.worktree_id),
+                    Some(&method_hits),
+                    method_deadline,
+                )
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            }
+            unavailable_current.extend(
+                found
+                    .candidates
+                    .iter()
+                    .take(3)
+                    .filter(|candidate| {
+                        candidate.row_variant
+                            == evertrace_domain::query::SearchCandidateVariant::Object
+                            && !matches!(
+                                select_object_row_rows(
+                                    &candidate_context.rows,
+                                    &candidate.candidate_id,
+                                ),
+                                Ok(Some((_, true)))
+                            )
+                    })
+                    .map(|candidate| candidate.candidate_id.clone()),
+            );
+        }
+        let (review_frontier, review_rows) = candidate_context
+            .as_ref()
+            .map(|context| (context.frontier, context.rows.as_slice()))
+            .unwrap_or((scope.context.frontier, scope.context.rows.as_slice()));
+        let mut review = self
+            .classify_search_candidates(SearchCandidateReviewInput {
+                request_id: &request_id,
+                label: &label,
+                anchor: &scope.anchor,
+                frontier: review_frontier,
+                rows: review_rows,
+                context: &context,
+                candidates: &found.candidates,
+                methods: &methods,
+                blocked_candidates: &blocked_candidates,
+                unavailable_current: &unavailable_current,
+            })
+            .await?;
+        // The original normal path reports an unreadable method proposal as
+        // truncated rather than presenting it; keep that output contract
+        // while sharing the selection and route implementation above.
+        review.omitted.extend(review.unreadable_methods);
+        Ok(Self::search_result_from_review(
+            request_id,
+            label,
+            scope.anchor.cwd_only,
+            found,
+            review.items,
+            review.omitted,
+            blocked_candidates,
+        ))
+    }
+
+    async fn classify_search_candidates(
+        &self,
+        input: SearchCandidateReviewInput<'_>,
+    ) -> Result<SearchCandidateReview, McpServiceError> {
+        let SearchCandidateReviewInput {
+            request_id,
+            label,
+            anchor,
+            frontier,
+            rows,
+            context,
+            candidates,
+            methods,
+            blocked_candidates,
+            unavailable_current,
+        } = input;
+        let now = unix_time_us_for_mcp();
+        let mut items = Vec::new();
+        let mut omitted = BTreeSet::new();
+        let mut unreadable_methods = BTreeSet::new();
+        let mut procedure_revisions = Vec::new();
+        for candidate in candidates.iter().take(3) {
+            if candidate.object_kind.as_deref() == Some("revision_proposal_revision")
+                && !methods.contains(&candidate.candidate_id)
+            {
+                unreadable_methods.insert(candidate.candidate_id.clone());
+                continue;
+            }
+            if blocked_candidates.contains(candidate.candidate_id.as_str()) {
+                continue;
+            }
+            if unavailable_current.contains(&candidate.candidate_id) {
+                // A bounded recomputation handles a newly stale current
+                // candidate once.  If it remains unprovable, never present
+                // an old body as current.
+                omitted.insert(candidate.candidate_id.clone());
+                continue;
+            }
+            if candidate.object_kind.as_deref() == Some("procedure_revision") {
+                procedure_revisions.push(candidate.candidate_id.clone());
+                continue;
+            }
+            match classify_search_candidate_rows(rows, label, candidate, now) {
+                Some(item) => items.push(item),
+                None => {
+                    omitted.insert(candidate.candidate_id.clone());
+                }
+            }
+        }
+        if !procedure_revisions.is_empty() {
+            let procedure_view =
+                crate::procedure::ProcedureUsageCurrentView::from_rows(frontier, rows)
+                    .map_err(|_| McpServiceError::Store)?;
+            let routed = procedure_view
+                .route_search_rows(rows, anchor, context, &procedure_revisions)
+                .map_err(|_| McpServiceError::Store)?;
+            omitted.extend(procedure_revisions);
+            let command_id =
+                CommandId::from_uuid(request_id.as_uuid()).map_err(|_| McpServiceError::Store)?;
+            let mut route_events = Vec::new();
+            for item in routed.items {
+                let (Some(workstream), Some(episode)) =
+                    (anchor.workstream_id, anchor.episode_revision_id)
+                else {
+                    continue;
+                };
+                let route_context = ProposalCommandContext {
+                    command_id,
+                    occurred_at_us: now,
+                    effective_config_hash: self.runtime_snapshot.effective_config_hash,
+                    algorithm_revision: "s34-mcp-procedure-route-v1".into(),
+                };
+                let resolution = crate::procedure::begin_procedure_usage(
+                    &procedure_view,
+                    route_context.clone(),
+                    &item,
+                    workstream,
+                    episode,
+                )
+                .map_err(|_| McpServiceError::Store)?;
+                match resolution {
+                    crate::procedure::ProcedureUsageResolution::Command { command, .. } => {
+                        route_events.extend_from_slice(command.events())
+                    }
+                    crate::procedure::ProcedureUsageResolution::NoDelta(usage)
+                        if usage.stage
+                            == evertrace_domain::procedure::ProcedureUsageStage::Routed =>
+                    {
+                        let command = procedure_view
+                            .reroute_pending_usage(route_context, &usage)
+                            .map_err(|_| McpServiceError::Store)?;
+                        route_events.extend_from_slice(command.events());
+                    }
+                    crate::procedure::ProcedureUsageResolution::NoDelta(_)
+                    | crate::procedure::ProcedureUsageResolution::HistoricalRouteMismatch
+                    | crate::procedure::ProcedureUsageResolution::UnprovenContext => {}
+                }
+                let apply = item.decision == crate::procedure::ProcedureDecision::Apply;
+                let mut presentation = serde_json::json!({
+                    "decision": if apply { "APPLY" } else { "DEFER" },
+                    "reason": item.reason,
+                    "guardrail_only": item.mode == crate::procedure::ProcedureGuidanceMode::GuardrailOnly,
+                    "avoid": item.avoid,
+                    "excludes": item.excludes,
+                    "pitfalls": item.pitfalls,
+                });
+                if apply && item.mode == crate::procedure::ProcedureGuidanceMode::Normal {
+                    presentation["actions"] =
+                        serde_json::to_value(&item.actions).map_err(|_| McpServiceError::Store)?;
+                    presentation["done"] =
+                        serde_json::to_value(&item.done).map_err(|_| McpServiceError::Store)?;
+                }
+                let text =
+                    serde_json::to_string(&presentation).map_err(|_| McpServiceError::Store)?;
+                omitted.remove(&item.revision_id.to_string());
+                items.push(McpServiceItem {
+                    partition: McpItemPartition::Procedure,
+                    kind: "procedure_revision".into(),
+                    object_ref: Some(item.procedure_id.to_string()),
+                    object_revision_ref: Some(item.revision_id.to_string()),
+                    source_revision_ref: None,
+                    scope: Some(label.into()),
+                    applicability: Some(if apply { "apply" } else { "defer" }.into()),
+                    authority: Some("none".into()),
+                    content_trust: ContentTrust::UntrustedSourceContent,
+                    capture_completeness: None,
+                    instruction_authority: InstructionAuthority::None,
+                    text: Some(text),
+                });
+            }
+            if !route_events.is_empty() {
+                let command = JournalCommand::new(command_id, route_events)
+                    .map_err(|_| McpServiceError::Store)?;
+                self.writer
+                    .commit_if_frontier(command, now, frontier)
+                    .await
+                    .map_err(|_| McpServiceError::Store)?;
+            }
+        }
+        Ok(SearchCandidateReview {
+            items,
+            omitted,
+            unreadable_methods,
+        })
+    }
+
+    fn search_result_from_review(
+        request_id: RequestId,
+        label: String,
+        cwd_only: bool,
+        found: evertrace_domain::query::SearchResult,
+        items: Vec<McpServiceItem>,
+        classification_omitted: BTreeSet<String>,
+        blocked_candidates: BTreeSet<String>,
+    ) -> McpServiceResult {
+        let mut completeness = match found.completeness {
+            RetrievalCompleteness::Complete => "complete",
+            RetrievalCompleteness::Partial => "partial",
+            RetrievalCompleteness::Conflicted => "conflicted",
+            RetrievalCompleteness::Unknown => "unknown",
+        };
+        let mut status = if found.candidates.is_empty() {
+            McpServiceStatus::NoMatch
+        } else if found.degraded_reasons.contains("search_projection_stale") {
+            McpServiceStatus::Partial
+        } else if found.degraded_reasons.is_empty() {
+            McpServiceStatus::Ok
+        } else {
+            McpServiceStatus::DegradedIndex
+        };
+        let mut omitted_refs = found.omitted_refs;
+        omitted_refs.extend(classification_omitted);
+        omitted_refs.retain(|reference| !blocked_candidates.contains(reference.as_str()));
+        if !blocked_candidates.is_empty() && items.is_empty() && omitted_refs.is_empty() {
+            status = McpServiceStatus::NoMatch;
+        }
+        if !omitted_refs.is_empty() {
+            status = McpServiceStatus::Partial;
+            completeness = "partial";
+        }
+        McpServiceResult {
+            request_id,
+            status,
+            scope: label,
+            freshness: if found.projection_frontier == found.authoritative_frontier {
+                "current".into()
+            } else {
+                "stale".into()
+            },
+            completeness: completeness.into(),
+            items,
+            warnings: {
+                let mut warnings = found.degraded_reasons.into_iter().collect::<Vec<_>>();
+                if cwd_only {
+                    warnings.push("cwd_only_scope".into());
+                }
+                if !blocked_candidates.is_empty() {
+                    warnings.push("source_read_restricted".into());
+                }
+                warnings
+            },
+            truncated: !omitted_refs.is_empty(),
+            next_refs: omitted_refs.into_iter().take(32).collect(),
+        }
     }
 
     pub(super) async fn search(
@@ -117,23 +718,6 @@ impl McpActionService {
             .search(context.clone())
             .await
             .map_err(|_| McpServiceError::Store)?;
-        let mut completeness = match found.completeness {
-            RetrievalCompleteness::Complete => "complete",
-            RetrievalCompleteness::Partial => "partial",
-            RetrievalCompleteness::Conflicted => "conflicted",
-            RetrievalCompleteness::Unknown => "unknown",
-        };
-        let mut status = if found.candidates.is_empty() {
-            McpServiceStatus::NoMatch
-        } else if found.degraded_reasons.contains("search_projection_stale") {
-            McpServiceStatus::Partial
-        } else if found.degraded_reasons.is_empty() {
-            McpServiceStatus::Ok
-        } else {
-            McpServiceStatus::DegradedIndex
-        };
-        let mut classified = Vec::new();
-        let mut classification_omitted = BTreeSet::new();
         let candidate_ids = found
             .candidates
             .iter()
@@ -238,157 +822,31 @@ impl McpActionService {
             .await
             .map_err(|_| McpServiceError::Store)?
         };
-        let now = unix_time_us_for_mcp();
-        let mut procedure_revisions = Vec::new();
-        for candidate in found.candidates.into_iter().take(3) {
-            if candidate.object_kind.as_deref() == Some("revision_proposal_revision")
-                && !methods.contains(&candidate.candidate_id)
-            {
-                continue;
-            }
-            if blocked_candidates.contains(candidate.candidate_id.as_str()) {
-                continue;
-            }
-            if candidate.object_kind.as_deref() == Some("procedure_revision") {
-                procedure_revisions.push(candidate.candidate_id);
-                continue;
-            }
-            match classify_search_candidate(&scope, &candidate, now) {
-                Some(item) => classified.push(item),
-                None => {
-                    classification_omitted.insert(candidate.candidate_id);
-                }
-            }
-        }
-        if !procedure_revisions.is_empty() {
-            let procedure_view =
-                crate::procedure::ProcedureUsageCurrentView::from_snapshot(&scope.snapshot)
-                    .map_err(|_| McpServiceError::Store)?;
-            let routed = procedure_view
-                .route_search(
-                    &scope.snapshot,
-                    &scope.anchor,
-                    &context,
-                    &procedure_revisions,
-                )
-                .map_err(|_| McpServiceError::Store)?;
-            classification_omitted.extend(procedure_revisions);
-            let command_id =
-                CommandId::from_uuid(request_id.as_uuid()).map_err(|_| McpServiceError::Store)?;
-            let mut route_events = Vec::new();
-            for item in routed.items {
-                let (Some(workstream), Some(episode)) =
-                    (scope.anchor.workstream_id, scope.anchor.episode_revision_id)
-                else {
-                    continue;
-                };
-                let route_context = ProposalCommandContext {
-                    command_id,
-                    occurred_at_us: now,
-                    effective_config_hash: self.runtime_snapshot.effective_config_hash,
-                    algorithm_revision: "s34-mcp-procedure-route-v1".into(),
-                };
-                let resolution = crate::procedure::begin_procedure_usage(
-                    &procedure_view,
-                    route_context.clone(),
-                    &item,
-                    workstream,
-                    episode,
-                )
-                .map_err(|_| McpServiceError::Store)?;
-                match resolution {
-                    crate::procedure::ProcedureUsageResolution::Command { command, .. } => {
-                        route_events.extend_from_slice(command.events())
-                    }
-                    crate::procedure::ProcedureUsageResolution::NoDelta(usage)
-                        if usage.stage
-                            == evertrace_domain::procedure::ProcedureUsageStage::Routed =>
-                    {
-                        let command = procedure_view
-                            .reroute_pending_usage(route_context, &usage)
-                            .map_err(|_| McpServiceError::Store)?;
-                        route_events.extend_from_slice(command.events());
-                    }
-                    crate::procedure::ProcedureUsageResolution::NoDelta(_)
-                    | crate::procedure::ProcedureUsageResolution::HistoricalRouteMismatch
-                    | crate::procedure::ProcedureUsageResolution::UnprovenContext => {}
-                }
-                let apply = item.decision == crate::procedure::ProcedureDecision::Apply;
-                let mut presentation = serde_json::json!({
-                    "decision": if apply { "APPLY" } else { "DEFER" },
-                    "reason": item.reason,
-                    "guardrail_only": item.mode == crate::procedure::ProcedureGuidanceMode::GuardrailOnly,
-                    "avoid": item.avoid,
-                    "excludes": item.excludes,
-                    "pitfalls": item.pitfalls,
-                });
-                if apply && item.mode == crate::procedure::ProcedureGuidanceMode::Normal {
-                    presentation["actions"] =
-                        serde_json::to_value(&item.actions).map_err(|_| McpServiceError::Store)?;
-                    presentation["done"] =
-                        serde_json::to_value(&item.done).map_err(|_| McpServiceError::Store)?;
-                }
-                let text =
-                    serde_json::to_string(&presentation).map_err(|_| McpServiceError::Store)?;
-                classification_omitted.remove(&item.revision_id.to_string());
-                classified.push(McpServiceItem {
-                    partition: McpItemPartition::Procedure,
-                    kind: "procedure_revision".into(),
-                    object_ref: Some(item.procedure_id.to_string()),
-                    object_revision_ref: Some(item.revision_id.to_string()),
-                    source_revision_ref: None,
-                    scope: Some(scope_label(&scope)),
-                    applicability: Some(if apply { "apply" } else { "defer" }.into()),
-                    authority: Some("none".into()),
-                    content_trust: ContentTrust::UntrustedSourceContent,
-                    capture_completeness: None,
-                    instruction_authority: InstructionAuthority::None,
-                    text: Some(text),
-                });
-            }
-            if !route_events.is_empty() {
-                let command = JournalCommand::new(command_id, route_events)
-                    .map_err(|_| McpServiceError::Store)?;
-                self.writer
-                    .commit_if_frontier(command, now, scope.snapshot.frontier)
-                    .await
-                    .map_err(|_| McpServiceError::Store)?;
-            }
-        }
-        let mut omitted_refs = found.omitted_refs;
-        omitted_refs.extend(classification_omitted);
-        omitted_refs.retain(|reference| !blocked_candidates.contains(reference.as_str()));
-        if !blocked_candidates.is_empty() && classified.is_empty() && omitted_refs.is_empty() {
-            status = McpServiceStatus::NoMatch;
-        }
-        if !omitted_refs.is_empty() {
-            status = McpServiceStatus::Partial;
-            completeness = "partial";
-        }
-        Ok(McpServiceResult {
+        let label = scope_label(&scope);
+        let unavailable_current = BTreeSet::new();
+        let review = self
+            .classify_search_candidates(SearchCandidateReviewInput {
+                request_id: &request_id,
+                label: &label,
+                anchor: &scope.anchor,
+                frontier: scope.snapshot.frontier,
+                rows: &scope.snapshot.rows,
+                context: &context,
+                candidates: &found.candidates,
+                methods: &methods,
+                blocked_candidates: &blocked_candidates,
+                unavailable_current: &unavailable_current,
+            })
+            .await?;
+        Ok(Self::search_result_from_review(
             request_id,
-            status,
-            scope: scope_label(&scope),
-            freshness: if found.projection_frontier == found.authoritative_frontier {
-                "current".into()
-            } else {
-                "stale".into()
-            },
-            completeness: completeness.into(),
-            items: classified,
-            warnings: {
-                let mut warnings = found.degraded_reasons.into_iter().collect::<Vec<_>>();
-                if scope.anchor.cwd_only {
-                    warnings.push("cwd_only_scope".into());
-                }
-                if !blocked_candidates.is_empty() {
-                    warnings.push("source_read_restricted".into());
-                }
-                warnings
-            },
-            truncated: !omitted_refs.is_empty(),
-            next_refs: omitted_refs.into_iter().take(32).collect(),
-        })
+            label,
+            scope.anchor.cwd_only,
+            found,
+            review.items,
+            review.omitted,
+            blocked_candidates,
+        ))
     }
 
     async fn search_due(
@@ -979,8 +1437,15 @@ impl McpActionService {
 fn deletion_suppression(
     snapshot: &ProjectionSnapshot,
 ) -> Result<SuppressionSnapshot, McpServiceError> {
-    let ledger =
-        ObjectDeletionCurrentView::from_snapshot(snapshot).map_err(|_| McpServiceError::Store)?;
+    deletion_suppression_rows(snapshot.frontier, &snapshot.rows)
+}
+
+fn deletion_suppression_rows(
+    frontier: u64,
+    rows: &[ObjectRow],
+) -> Result<SuppressionSnapshot, McpServiceError> {
+    let ledger = ObjectDeletionCurrentView::from_rows(frontier, rows.iter())
+        .map_err(|_| McpServiceError::Store)?;
     Ok(SuppressionSnapshot::Current {
         generation: ledger.generation,
         ref_hashes: ledger.suppression_ref_hashes(),
@@ -1021,9 +1486,35 @@ fn classify_search_candidate(
     candidate: &evertrace_domain::query::SearchCandidate,
     now: i64,
 ) -> Option<McpServiceItem> {
+    classify_search_candidate_rows(&scope.snapshot.rows, &scope_label(scope), candidate, now)
+}
+
+fn normal_search_candidate_matches_row(
+    candidate: &evertrace_domain::query::SearchCandidate,
+    row: &ObjectRow,
+) -> bool {
     match candidate.row_variant {
         evertrace_domain::query::SearchCandidateVariant::Object => {
-            let (row, is_current) = select_object_row(&scope.snapshot, &candidate.candidate_id)
+            row.row_id == candidate.candidate_id
+                || row.object_id.as_deref() == Some(candidate.candidate_id.as_str())
+                || row.current_revision_id.as_deref() == Some(candidate.candidate_id.as_str())
+        }
+        evertrace_domain::query::SearchCandidateVariant::EvidenceSurface => {
+            row.object_kind.as_deref() == Some("evidence_surface")
+                && row.current_revision_id.as_deref() == Some(candidate.source_ref.as_str())
+        }
+    }
+}
+
+fn classify_search_candidate_rows(
+    rows: &[ObjectRow],
+    scope: &str,
+    candidate: &evertrace_domain::query::SearchCandidate,
+    now: i64,
+) -> Option<McpServiceItem> {
+    match candidate.row_variant {
+        evertrace_domain::query::SearchCandidateVariant::Object => {
+            let (row, is_current) = select_object_row_rows(rows, &candidate.candidate_id)
                 .ok()
                 .flatten()?;
             if row.object_kind.as_deref() == Some("procedure_revision") {
@@ -1057,7 +1548,7 @@ fn classify_search_candidate(
                 object_ref: Some(candidate.source_ref.clone()),
                 object_revision_ref: Some(candidate.candidate_id.clone()),
                 source_revision_ref: Some(candidate.source_ref.clone()),
-                scope: Some(scope_label(scope)),
+                scope: Some(scope.into()),
                 applicability: None,
                 authority: None,
                 content_trust,

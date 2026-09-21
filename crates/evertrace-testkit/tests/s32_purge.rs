@@ -45,8 +45,8 @@ use evertrace_engine::{
 };
 use evertrace_store::{
     DefaultRetrievalSuppressionGeneration, JournalCommand, JournalEventDraft, JournalPayload,
-    NormalizationWatermark, ObjectDeletionCandidateAdmissionView, ObjectDeletionCurrentView,
-    ProjectionSnapshot, SemanticCurrentView, SourceIngestWatermark,
+    NormalSearchCandidateRequest, NormalizationWatermark, ObjectDeletionCandidateAdmissionView,
+    ObjectDeletionCurrentView, ProjectionSnapshot, SemanticCurrentView, SourceIngestWatermark,
     default_retrieval_suppression_ref_hash, object_deletion_preview,
 };
 use tempfile::TempDir;
@@ -1004,6 +1004,35 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
     let mut pending_writer = open_writer(&store).await.unwrap();
+    // A selected derived validation must see the same deletion closure as the
+    // full projection. Selecting the validation before the membership and
+    // contract rows are filtered would otherwise leave its support ownership
+    // unprovable and let it survive this fresh normal-Search read.
+    assert!(!before_pending.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("global_support_validation")
+            && row.object_id.as_deref()
+                == Some(core_membership.support_contract_ref.to_string().as_str())
+    }));
+    let selected_support = pending_writer
+        .normal_search_candidate_context(
+            &Default::default(),
+            &NormalSearchCandidateRequest {
+                identifiers: vec![core_membership.support_contract_ref.to_string()],
+                task_id: None,
+                repository_id: Some(repository_id),
+                worktree_id: None,
+                include_procedure_route: false,
+                include_derived_candidate_rows: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected_support.frontier, before_pending.frontier);
+    assert!(!selected_support.rows.iter().any(|row| {
+        row.object_kind.as_deref() == Some("global_support_validation")
+            && row.object_id.as_deref()
+                == Some(core_membership.support_contract_ref.to_string().as_str())
+    }));
     let mut missing_fanout = pending_command.events().to_vec();
     let missing_index = missing_fanout
         .iter()

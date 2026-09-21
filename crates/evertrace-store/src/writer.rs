@@ -19,7 +19,10 @@ use crate::{
         validate_complete_command,
     },
     migrations::{L0002, MigrationOutcome},
-    objects::{OBJECTS_TABLE, read_object_checkpoint, read_object_rows, validate_objects_table},
+    objects::{
+        OBJECTS_TABLE, ObjectRow, read_object_checkpoint, read_object_rows,
+        read_object_rows_filtered, validate_objects_table,
+    },
     projections::{
         JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
         ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
@@ -89,8 +92,293 @@ pub struct CommittedCommand {
     pub payloads: Vec<JournalPayload>,
 }
 
+/// A named, request-local selection for ordinary MCP Search.  It carries only
+/// the control and exact dependency rows consumed by that request; it is not a
+/// partial `ProjectionSnapshot` and cannot be reused after the call returns.
+#[derive(Debug)]
+pub struct NormalSearchReadContext {
+    pub frontier: u64,
+    pub scope: crate::projections::ScopeCurrentContext,
+    pub rows: Vec<ObjectRow>,
+}
+
+/// Candidate identifiers and the concrete scope needed to expand the finite
+/// route closure for a normal Search request.
+#[derive(Debug)]
+pub struct NormalSearchCandidateRequest {
+    pub identifiers: Vec<String>,
+    pub task_id: Option<evertrace_domain::ids::TaskId>,
+    pub repository_id: Option<evertrace_domain::ids::RepositoryId>,
+    pub worktree_id: Option<evertrace_domain::ids::WorktreeId>,
+    pub include_procedure_route: bool,
+    /// A selected candidate is backed by an admission-derived family whose
+    /// exact row is not addressable without its existing reducer.  Ordinary
+    /// evidence and directly-addressable object candidates leave this false,
+    /// so their finite verification never rebuilds unrelated derived rows.
+    pub include_derived_candidate_rows: bool,
+}
+
 /// A transient replay read bound, not a persistent journal index.
 pub const MAX_COMMITTED_COMMAND_READ: usize = 64;
+
+const NORMAL_SEARCH_ROUTE_SCOPE_KINDS: &[&str] = &[
+    "task",
+    "workstream",
+    "work_episode",
+    "attempt",
+    "atom_revision",
+    "experiment_run",
+    "work_artifact",
+    "scenario",
+    "work_binding",
+    "result_evidence",
+];
+
+const NORMAL_SEARCH_ROUTE_GLOBAL_KINDS: &[&str] = &["work_checkpoint"];
+const NORMAL_SEARCH_CLOSURE_ROUNDS: usize = 8;
+
+fn normal_search_sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn normal_search_kinds_predicate(kinds: &[&str]) -> String {
+    let values = kinds
+        .iter()
+        .map(|kind| normal_search_sql_literal(kind))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("row_kind = 'data' AND object_kind IN ({values})")
+}
+
+async fn normal_search_route_scope_rows(
+    table: &Table,
+    task_id: Option<evertrace_domain::ids::TaskId>,
+    repository_id: Option<evertrace_domain::ids::RepositoryId>,
+    worktree_id: Option<evertrace_domain::ids::WorktreeId>,
+) -> Result<Vec<ObjectRow>, StoreError> {
+    let scope = [
+        task_id.map(|id| format!("task_id = {}", normal_search_sql_literal(&id.to_string()))),
+        repository_id.map(|id| {
+            format!(
+                "repository_id = {}",
+                normal_search_sql_literal(&id.to_string())
+            )
+        }),
+        worktree_id.map(|id| {
+            format!(
+                "worktree_id = {}",
+                normal_search_sql_literal(&id.to_string())
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if scope.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scoped = normal_search_kinds_predicate(NORMAL_SEARCH_ROUTE_SCOPE_KINDS);
+    let global = normal_search_kinds_predicate(NORMAL_SEARCH_ROUTE_GLOBAL_KINDS);
+    read_object_rows_filtered(
+        table,
+        format!("(({scoped}) AND ({})) OR ({global})", scope.join(" OR ")),
+    )
+    .await
+}
+
+fn normal_search_validate_candidate_request(
+    candidate: &NormalSearchCandidateRequest,
+) -> Result<(), StoreError> {
+    if candidate.identifiers.is_empty()
+        || candidate.identifiers.len() > 65
+        || candidate.identifiers.iter().any(|value| value.is_empty())
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn normal_search_dedup_rows(rows: &mut Vec<ObjectRow>) -> Result<(), StoreError> {
+    let mut by_id = BTreeMap::new();
+    for row in std::mem::take(rows) {
+        if let Some(previous) = by_id.get(&row.row_id) {
+            if previous != &row {
+                return Err(StoreError::StoreCorrupt);
+            }
+        } else {
+            by_id.insert(row.row_id.clone(), row);
+        }
+    }
+    *rows = by_id.into_values().collect();
+    Ok(())
+}
+
+fn normal_search_has_reference(rows: &[ObjectRow], reference: &str) -> bool {
+    rows.iter().any(|row| {
+        row.row_id == reference
+            || row.object_id.as_deref() == Some(reference)
+            || row.current_revision_id.as_deref() == Some(reference)
+    })
+}
+
+fn normal_search_proposal_references(rows: &[ObjectRow]) -> Result<BTreeSet<String>, StoreError> {
+    let mut references = BTreeSet::new();
+    for row in rows
+        .iter()
+        .filter(|row| row.object_kind.as_deref() == Some("revision_proposal_revision"))
+    {
+        let JournalPayload::RevisionProposalRecorded(proposal) = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?
+        else {
+            return Err(StoreError::StoreCorrupt);
+        };
+        references.extend(proposal.source_cohort_refs.iter().cloned());
+        references.extend(proposal.evidence_refs.iter().cloned());
+        if let evertrace_domain::semantic::ProposalPayload::Procedure(payload) = &proposal.payload {
+            references.extend(payload.draft().evidence_refs.iter().cloned());
+        }
+    }
+    Ok(references)
+}
+
+fn normal_search_permission_scope_references(
+    rows: &[ObjectRow],
+    candidate: Option<&NormalSearchCandidateRequest>,
+) -> BTreeSet<String> {
+    let identifiers = candidate
+        .map(|candidate| candidate.identifiers.iter().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    rows.iter()
+        .filter(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some(
+                    "source_receipt"
+                        | "source_observation"
+                        | "evidence_surface"
+                        | "semantic_digest"
+                        | "revision_proposal_revision"
+                )
+            ) || identifiers.contains(&row.row_id)
+                || row
+                    .object_id
+                    .as_ref()
+                    .is_some_and(|id| identifiers.contains(id))
+                || row
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|id| identifiers.contains(id))
+        })
+        .flat_map(|row| [row.task_id.as_deref(), row.worktree_id.as_deref()])
+        .flatten()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn normal_search_linked_references(
+    rows: &[ObjectRow],
+    include_route: bool,
+    candidate_identifiers: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<String>, StoreError> {
+    let mut references = normal_search_proposal_references(rows)?;
+    // Route evaluation already gets its task/workstream/episode closure from
+    // the scoped native read below. It consumes the current procedure usage
+    // reducer, not historical Operation/ScopeEffect/HostOccurrence chains;
+    // those families are neither materialized by this exact-reference reader
+    // nor inputs to route_search_rows or begin_procedure_usage.
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == crate::ObjectRowKind::Data)
+    {
+        if candidate_identifiers.is_some_and(|identifiers| {
+            identifiers.contains(&row.row_id)
+                || row
+                    .object_id
+                    .as_ref()
+                    .is_some_and(|id| identifiers.contains(id))
+                || row
+                    .current_revision_id
+                    .as_ref()
+                    .is_some_and(|id| identifiers.contains(id))
+        }) && let Some(object_id) = &row.object_id
+        {
+            // A current Search result may name a historical revision.  Fetch
+            // that object's complete lineage so the existing current/tie
+            // reduction never treats an old body as current.
+            references.insert(object_id.clone());
+        }
+        let Some(payload) = row.payload_json.as_deref() else {
+            continue;
+        };
+        let payload: JournalPayload =
+            serde_json::from_str(payload).map_err(|_| StoreError::StoreCorrupt)?;
+        match payload {
+            JournalPayload::SourceObservationRecorded(value) => {
+                references.insert(value.source_receipt_ref.to_string());
+            }
+            JournalPayload::EvidenceSurfaceRecorded(value) => {
+                references.insert(value.source_observation_revision_ref.to_string());
+            }
+            JournalPayload::SemanticDigestRecorded(value) => {
+                references.extend(value.selected_direct_refs.iter().cloned());
+            }
+            JournalPayload::WorkEpisodeRecorded(value) if include_route => {
+                references.extend(value.checkpoint_refs.iter().cloned());
+            }
+            JournalPayload::AttemptRecorded(value) if include_route => {
+                references.extend(value.experiment_run_ids.iter().map(ToString::to_string));
+                references.extend(value.outcome_refs.iter().cloned());
+            }
+            JournalPayload::ExperimentRunRecorded(value) if include_route => {
+                references.insert(value.run_id.to_string());
+            }
+            JournalPayload::ResultEvidenceRecorded(value) if include_route => {
+                references.insert(value.result_evidence_id.to_string());
+                references.insert(value.experiment_run_id.to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(references)
+}
+
+fn normal_search_expand_dependencies(
+    state: &crate::projections::JournalAdmissionState,
+    rows: &mut Vec<ObjectRow>,
+    candidate: Option<&NormalSearchCandidateRequest>,
+) -> Result<(), StoreError> {
+    let include_route = candidate.is_some_and(|candidate| candidate.include_procedure_route);
+    let candidate_identifiers = candidate.map(|candidate| {
+        candidate
+            .identifiers
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    });
+    for _ in 0..NORMAL_SEARCH_CLOSURE_ROUNDS {
+        let mut references =
+            normal_search_linked_references(rows, include_route, candidate_identifiers.as_ref())?;
+        references.retain(|reference| !normal_search_has_reference(rows, reference));
+        if references.is_empty() {
+            return Ok(());
+        }
+        let before = rows.len();
+        // The selected candidate, including a reducer-backed family, was
+        // materialized before this closure walk. Every later reference came
+        // from that bounded payload and therefore uses direct current-state
+        // reads rather than another all-derived-family pass.
+        rows.extend(state.normal_search_reference_rows(&references, false)?);
+        normal_search_dedup_rows(rows)?;
+        if rows.len() == before {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
 
 fn decode_committed_command(
     mut rows: Vec<crate::JournalRow>,
@@ -287,6 +575,15 @@ impl JournalWriter {
     ) -> Result<Option<crate::SessionImportContext>, StoreError> {
         self.admission_state
             .session_import_context(self.frontier(), source)
+    }
+
+    /// Read the catalog resolver's complete typed closure without formatting
+    /// unrelated captured payloads into a `ProjectionSnapshot`.
+    pub async fn session_catalog_current_context(
+        &self,
+    ) -> Result<crate::SessionCatalogCurrentContext, StoreError> {
+        self.validated_current_read(|state, _| state.session_catalog_current_context())
+            .await
     }
 
     pub fn repository_read_context(
@@ -917,6 +1214,131 @@ impl JournalWriter {
     ) -> Result<crate::projections::ScopeCurrentContext, StoreError> {
         self.validated_current_read(|state, _| state.scope_current_context(request))
             .await
+    }
+
+    /// Select the compact control closure ordinary Search needs before its
+    /// native FTS pin.  Full `project()` callers retain their existing path.
+    pub async fn normal_search_current_context(
+        &self,
+        request: &crate::projections::ScopeCurrentRequest,
+    ) -> Result<NormalSearchReadContext, StoreError> {
+        self.normal_search_context(request, None).await
+    }
+
+    /// Re-read only selected Search candidates and their concrete dependency
+    /// closure at the writer's current validated stamp.  This is deliberately
+    /// a request-local fresh read, not a cache or a partial projection.
+    pub async fn normal_search_candidate_context(
+        &self,
+        request: &crate::projections::ScopeCurrentRequest,
+        candidate: &NormalSearchCandidateRequest,
+    ) -> Result<NormalSearchReadContext, StoreError> {
+        self.normal_search_context(request, Some(candidate)).await
+    }
+
+    async fn normal_search_context(
+        &self,
+        request: &crate::projections::ScopeCurrentRequest,
+        candidate: Option<&NormalSearchCandidateRequest>,
+    ) -> Result<NormalSearchReadContext, StoreError> {
+        // This bounded admission read does not open every objects row, but it
+        // still has to bind its in-memory stamp to the writer's held native
+        // root and table directories. Otherwise an external replacement could
+        // reuse the old versions/frontier while Search pins new native text.
+        self.validate_projection_directories(false)?;
+        // Startup (and an uncertain append) has no reusable proof yet. Recover
+        // it through the ordinary validated path before using admission facts;
+        // steady requests avoid that native table-version round trip.
+        if self
+            .projection_validation
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?[0]
+            .is_none()
+        {
+            self.project_validated(false, false).await?;
+        }
+        // Route facts are the one bounded Search closure still read directly
+        // from the native objects table. A Procedure candidate can arrive
+        // after an intervening committed command: admission is already current
+        // then, while that table may only carry the old confirmed input. Bring
+        // it to the held frontier before selecting route rows. On an unchanged
+        // stamp this is the existing no-row validation hit; ordinary evidence
+        // Search never takes this branch.
+        if candidate.is_some_and(|candidate| candidate.include_procedure_route) {
+            self.project_validated(false, false).await?;
+        }
+        let frontier = self.normal_search_admission_frontier()?;
+        let scope = self.admission_state.scope_current_context(request)?;
+        let mut rows = self.admission_state.normal_search_control_rows()?;
+        if let Some(candidate) = candidate {
+            normal_search_validate_candidate_request(candidate)?;
+            let references = candidate.identifiers.iter().cloned().collect();
+            rows.extend(self.admission_state.normal_search_reference_rows(
+                &references,
+                candidate.include_derived_candidate_rows,
+            )?);
+            if candidate.include_procedure_route {
+                rows.extend(
+                    normal_search_route_scope_rows(
+                        &self.objects,
+                        candidate.task_id,
+                        candidate.repository_id,
+                        candidate.worktree_id,
+                    )
+                    .await?,
+                );
+            }
+        }
+        normal_search_dedup_rows(&mut rows)?;
+        normal_search_expand_dependencies(&self.admission_state, &mut rows, candidate)?;
+        let scope_references = normal_search_permission_scope_references(&rows, candidate);
+        rows.extend(
+            self.admission_state
+                .normal_search_reference_rows(&scope_references, false)?,
+        );
+        normal_search_dedup_rows(&mut rows)?;
+        if self.normal_search_admission_frontier()? != frontier {
+            return Err(StoreError::StoreCorrupt);
+        }
+        // Match `projection_versions`' post-read identity boundary without a
+        // table-version or all-row read. A replacement during the selected
+        // native route read must fail closed instead of mixing its text with
+        // the admission facts above.
+        self.validate_projection_directories(false)?;
+        Ok(NormalSearchReadContext {
+            frontier,
+            scope,
+            rows,
+        })
+    }
+
+    /// Bind ordinary Search's request-local admission facts without reopening
+    /// the entire objects projection. The exclusive writer has either kept a
+    /// fully validated stamp at this frontier, or retained a confirmed
+    /// successor proof for an append whose old objects input is unchanged.
+    /// Any uncertain append clears that proof before awaiting native I/O.
+    /// SearchIndex still pins and checks the authoritative journal frontier
+    /// after its native read, so this does not treat the admission state as a
+    /// substitute for search-index freshness.
+    fn normal_search_admission_frontier(&self) -> Result<u64, StoreError> {
+        let stamp = self
+            .projection_validation
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?[0]
+            .clone()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let journal_version = self
+            .command_ids
+            .as_ref()
+            .map(|(version, _)| *version)
+            .ok_or(StoreError::StoreCorrupt)?;
+        let frontier = self.admission_state.committed_frontier();
+        if (stamp.versions[0] == journal_version && stamp.frontier == frontier)
+            || stamp.appended_through == Some((journal_version, frontier))
+        {
+            return Ok(frontier);
+        }
+        Err(StoreError::StoreCorrupt)
     }
 
     pub async fn passive_source_current_context(
@@ -1591,7 +2013,8 @@ mod tests {
 
     use evertrace_domain::{
         evidence::{IdentityStrength, SourceInstanceId, SourceRevision},
-        ids::{CaptureReceiptId, CommandId, ExecutionLaneId},
+        ids::{CaptureReceiptId, CommandId, ExecutionLaneId, RepositoryId},
+        repository::{FilesystemIdentity, GitObjectFormat, PathObservation, RepositoryInstance},
         work::{
             AdmissionFailureObservability, CaptureReceipt, CoverageLevel, ExecutionLane,
             LaneStatus, LivenessState, OrderingIntegrity, PairingIntegrity, PayloadIntegrity,
@@ -1664,6 +2087,14 @@ mod tests {
             fs::rename(moved.join(&name), native.join(name)).unwrap();
         }
         assert_eq!(writer.objects.version().await.unwrap(), versions[1]);
+        // A valid in-memory stamp alone must not authorize normal Search after
+        // the held native root has been replaced with same-version tables.
+        assert!(
+            writer
+                .normal_search_current_context(&Default::default())
+                .await
+                .is_err()
+        );
         assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
         assert!(matches!(
             writer.reconciliation_frontier(8).await,
@@ -2209,6 +2640,211 @@ mod tests {
             writer.capture_current_context(None, None, 8).await,
             Err(StoreError::StoreCorrupt)
         ));
+    }
+
+    #[tokio::test]
+    async fn normal_search_candidate_context_accepts_an_unrelated_append_at_its_fresh_stamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let initial = writer
+            .normal_search_current_context(&Default::default())
+            .await
+            .unwrap();
+        let command = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [1; 32],
+                "normal-search-test-v1",
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::ObjectsProjection,
+                    target_id: "unrelated-normal-search-work".into(),
+                    algorithm_revision: "normal-search-test-v1".into(),
+                    source_watermark: 1,
+                }),
+            )],
+        )
+        .unwrap();
+        let appended = writer.commit(&command, 2).await.unwrap();
+        let fresh = writer
+            .normal_search_candidate_context(
+                &Default::default(),
+                &NormalSearchCandidateRequest {
+                    identifiers: vec!["not-a-current-object".into()],
+                    task_id: None,
+                    repository_id: None,
+                    worktree_id: None,
+                    include_procedure_route: false,
+                    include_derived_candidate_rows: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        // The second read is bound to its own validated stamp.  It must not
+        // reject an unrelated command merely because the pre-pin context was
+        // older; candidate-specific facts are checked at this fresh frontier.
+        assert!(fresh.frontier > initial.frontier);
+        assert_eq!(fresh.frontier, appended.last_seq);
+        assert!(fresh.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn normal_search_procedure_candidate_syncs_intervening_native_route_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        writer
+            .normal_search_current_context(&Default::default())
+            .await
+            .unwrap();
+        let command = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [1; 32],
+                "normal-search-test-v1",
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::ObjectsProjection,
+                    target_id: "procedure-route-interleaving".into(),
+                    algorithm_revision: "normal-search-test-v1".into(),
+                    source_watermark: 1,
+                }),
+            )],
+        )
+        .unwrap();
+        let appended = writer.commit(&command, 2).await.unwrap();
+        assert!(
+            writer.projection_validation.lock().unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .appended_through
+                .is_some()
+        );
+
+        let fresh = writer
+            .normal_search_candidate_context(
+                &Default::default(),
+                &NormalSearchCandidateRequest {
+                    identifiers: vec!["not-a-current-procedure".into()],
+                    task_id: None,
+                    repository_id: None,
+                    worktree_id: None,
+                    include_procedure_route: true,
+                    include_derived_candidate_rows: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let stamp = writer.projection_validation.lock().unwrap()[0]
+            .clone()
+            .unwrap();
+        assert_eq!(fresh.frontier, appended.last_seq);
+        assert_eq!(stamp.frontier, appended.last_seq);
+        assert!(stamp.appended_through.is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_search_candidate_context_rechecks_a_related_repository_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let repository_id = RepositoryId::new_v7();
+        let path = temp.path().join("repository").display().to_string();
+        let repository = RepositoryInstance {
+            repository_id,
+            repository_revision: 1,
+            predecessor_revision: None,
+            current_path: path.clone(),
+            path_history: vec![PathObservation {
+                path: path.clone(),
+                first_observed_at_us: 1,
+                last_observed_at_us: 1,
+                evidence_refs: vec!["normal-search-repository-evidence".into()],
+            }],
+            git_common_dir_path: Some(format!("{path}/.git")),
+            common_dir_filesystem: Some(FilesystemIdentity {
+                device: 1,
+                inode: 1,
+            }),
+            object_format: Some(GitObjectFormat::Sha1),
+            remote_fingerprints: Vec::new(),
+            derived_from: None,
+            identity_evidence_refs: vec!["normal-search-repository-identity".into()],
+            recorded_at_us: 1,
+            user_disabled: false,
+            capability_state: None,
+        };
+        writer
+            .commit(
+                &JournalCommand::new(
+                    CommandId::new_v7(),
+                    vec![JournalEventDraft::runtime(
+                        1,
+                        [1; 32],
+                        "normal-search-test-v1",
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                    )],
+                )
+                .unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+        let initial = writer
+            .normal_search_current_context(&Default::default())
+            .await
+            .unwrap();
+        let mut disabled = repository;
+        disabled.repository_revision = 2;
+        disabled.predecessor_revision = Some(1);
+        disabled.recorded_at_us = 2;
+        disabled.user_disabled = true;
+        let mut disabled_event = JournalEventDraft::runtime(
+            2,
+            [1; 32],
+            "normal-search-test-v1",
+            JournalPayload::RepositoryInstanceRecorded(Box::new(disabled)),
+        );
+        disabled_event.source_kind = crate::command::SourceKind::Manual;
+        let appended = writer
+            .commit(
+                &JournalCommand::new(CommandId::new_v7(), vec![disabled_event]).unwrap(),
+                2,
+            )
+            .await
+            .unwrap();
+        let fresh = writer
+            .normal_search_candidate_context(
+                &Default::default(),
+                &NormalSearchCandidateRequest {
+                    identifiers: vec![repository_id.to_string()],
+                    task_id: None,
+                    repository_id: Some(repository_id),
+                    worktree_id: None,
+                    include_procedure_route: false,
+                    include_derived_candidate_rows: false,
+                },
+            )
+            .await
+            .unwrap();
+        let current = fresh
+            .rows
+            .iter()
+            .find(|row| row.object_id.as_deref() == Some(repository_id.to_string().as_str()))
+            .unwrap();
+        let JournalPayload::RepositoryInstanceRecorded(current) =
+            serde_json::from_str(current.payload_json.as_deref().unwrap()).unwrap()
+        else {
+            panic!("repository candidate expected");
+        };
+
+        assert!(fresh.frontier > initial.frontier);
+        assert_eq!(fresh.frontier, appended.last_seq);
+        assert!(current.user_disabled);
+        assert_eq!(current.repository_revision, 2);
     }
 
     #[tokio::test]

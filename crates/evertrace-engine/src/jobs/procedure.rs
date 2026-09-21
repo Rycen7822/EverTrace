@@ -762,6 +762,33 @@ pub(crate) async fn readable_revisions(
     selected: Option<&BTreeSet<String>>,
     deadline: std::time::Instant,
 ) -> Result<BTreeSet<String>, SemanticServiceError> {
+    readable_revisions_from_rows(
+        writer,
+        &snapshot.rows,
+        report,
+        config,
+        scope,
+        selected,
+        deadline,
+    )
+    .await
+}
+
+/// Evaluate method proposals from a named finite closure.  The full snapshot
+/// wrapper remains for its existing consumers; normal Search supplies the
+/// exact proposal/source/scope rows this reducer needs.
+pub(crate) async fn readable_revisions_from_rows(
+    writer: &crate::WriterHandle,
+    all_rows: &[evertrace_store::ObjectRow],
+    report: Option<&evertrace_codex::HostProbeReport>,
+    config: [u8; 32],
+    scope: (
+        Option<evertrace_domain::ids::RepositoryId>,
+        Option<evertrace_domain::ids::WorktreeId>,
+    ),
+    selected: Option<&BTreeSet<String>>,
+    deadline: std::time::Instant,
+) -> Result<BTreeSet<String>, SemanticServiceError> {
     let mut output = BTreeSet::new();
     let (repository, worktree) = scope;
     let Some(repository) = repository else {
@@ -773,7 +800,10 @@ pub(crate) async fn readable_revisions(
     let mut refs_index = BTreeMap::<&str, Vec<&evertrace_store::ObjectRow>>::new();
     let mut lookup = BTreeMap::new();
     let mut current = BTreeMap::<&str, &evertrace_store::ObjectRow>::new();
-    for row in snapshot.data_rows() {
+    for row in all_rows
+        .iter()
+        .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
+    {
         lookup.insert(row.row_id.as_str(), row);
         for reference in row
             .object_id
@@ -814,7 +844,7 @@ pub(crate) async fn readable_revisions(
     if candidate_rows.is_empty() {
         return Ok(output);
     }
-    let deletion = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
+    let deletion = ObjectDeletionCandidateAdmissionView::from_rows(all_rows)?;
     let mut candidates = Vec::new();
     let mut union = BTreeMap::new();
     for row in candidate_rows {
@@ -899,7 +929,7 @@ pub(crate) async fn readable_revisions(
         return Ok(output);
     }
     let rows = union.into_values().collect::<Vec<_>>();
-    let contexts = crate::repository::row_repository_contexts(snapshot, &rows)
+    let contexts = crate::repository::row_repository_contexts_from_scopes(all_rows.iter(), &rows)
         .map_err(|_| StoreError::StoreCorrupt)?;
     let ids = contexts
         .values()
@@ -914,10 +944,10 @@ pub(crate) async fn readable_revisions(
     if blocked_repositories.contains(&repository) {
         return Ok(output);
     }
-    let blocked_sources = crate::session_import::blocked_source_rows_before(
+    let blocked_sources = crate::session_import::blocked_source_rows_from_rows_before(
         writer,
         report,
-        snapshot,
+        all_rows,
         &rows,
         config,
         Some(&lookup),

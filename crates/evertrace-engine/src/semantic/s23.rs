@@ -560,10 +560,19 @@ impl ScenarioCompiler {
         scope: ScenarioScope,
         previous: Option<&Scenario>,
     ) -> Result<Option<Scenario>, SemanticServiceError> {
+        Self::compile_rows(snapshot.frontier, &snapshot.rows, scope, previous)
+    }
+
+    pub(crate) fn compile_rows(
+        frontier: u64,
+        rows: &[evertrace_store::ObjectRow],
+        scope: ScenarioScope,
+        previous: Option<&Scenario>,
+    ) -> Result<Option<Scenario>, SemanticServiceError> {
         scope
             .validate()
             .map_err(|_| SemanticServiceError::InvalidInput)?;
-        let view = ScenarioView::from_snapshot(snapshot)?;
+        let view = ScenarioView::from_rows(rows)?;
         let task = view
             .tasks
             .get(&scope.task_id)
@@ -770,7 +779,7 @@ impl ScenarioCompiler {
             },
             relevant_artifacts,
             support_atom_ids,
-            source_watermark: snapshot.frontier,
+            source_watermark: frontier,
         };
         revision
             .validate()
@@ -1232,10 +1241,9 @@ struct ScenarioView {
     artifacts: BTreeMap<evertrace_domain::ids::WorkArtifactId, (WorkArtifact, u64)>,
 }
 impl ScenarioView {
-    fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+    fn from_rows(rows: &[evertrace_store::ObjectRow]) -> Result<Self, StoreError> {
         let mut view = Self::default();
-        for row in snapshot
-            .rows
+        for row in rows
             .iter()
             .filter(|row| row.row_kind == ObjectRowKind::Data)
         {

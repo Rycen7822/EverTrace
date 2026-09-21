@@ -199,21 +199,28 @@ pub struct SessionImportCurrentView {
 
 impl SessionImportCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    /// Decode current import state from a caller-owned, already filtered row
+    /// selection. The supplied frontier remains an explicit freshness input;
+    /// this does not present the selection as a complete projection snapshot.
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut sessions = BTreeMap::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+        {
             let Some(value) = restore_current(row)? else {
                 continue;
             };
-            if value.source_event_seq > snapshot.frontier
+            if value.source_event_seq > frontier
                 || sessions.insert(value.source_key(), value).is_some()
             {
                 return Err(StoreError::StoreCorrupt);
             }
         }
-        Ok(Self {
-            frontier: snapshot.frontier,
-            sessions,
-        })
+        Ok(Self { frontier, sessions })
     }
 }
 

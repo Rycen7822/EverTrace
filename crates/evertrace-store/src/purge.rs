@@ -543,12 +543,22 @@ pub struct ObjectDeletionCurrentView {
 
 impl ObjectDeletionCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, snapshot.data_rows())
+    }
+
+    /// Reduce only the deletion ledger rows selected by a request-local
+    /// consumer.  The caller owns the frontier proof; these rows are not a
+    /// partial projection snapshot.
+    pub fn from_rows<'a>(
+        frontier: u64,
+        rows: impl IntoIterator<Item = &'a ObjectRow>,
+    ) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .into_iter()
             .filter(|row| row.object_kind.as_deref() == Some(OBJECT_DELETION_LEDGER_KIND))
         {
             let payload: JournalPayload = serde_json::from_str(
@@ -698,12 +708,19 @@ pub struct ScopePurgeCurrentView {
 
 impl ScopePurgeCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, snapshot.data_rows())
+    }
+
+    pub fn from_rows<'a>(
+        frontier: u64,
+        rows: impl IntoIterator<Item = &'a ObjectRow>,
+    ) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .into_iter()
             .filter(|row| row.object_kind.as_deref() == Some(SCOPE_PURGE_PROGRESS_KIND))
         {
             let payload: JournalPayload = serde_json::from_str(

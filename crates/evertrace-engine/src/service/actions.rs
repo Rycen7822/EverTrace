@@ -58,6 +58,15 @@ struct McpRequestScope {
     snapshot: ProjectionSnapshot,
 }
 
+struct NormalSearchScope {
+    binding: McpResolvedScope,
+    anchor: McpQueryAnchor,
+    client_cwd: String,
+    deadline: std::time::Instant,
+    request: evertrace_store::ScopeCurrentRequest,
+    context: evertrace_store::NormalSearchReadContext,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpServiceAction {
     Search,
@@ -307,34 +316,50 @@ impl McpActionService {
             self.bindings
                 .retain_inventory_report(connection_id, &binding);
         }
-        if matches!(action, McpServiceAction::Search | McpServiceAction::Get)
+        if action == McpServiceAction::Search
             && input != "@due"
             && !work::has_work_refs(action, &input, &refs)
         {
-            let mut request = evertrace_store::ScopeCurrentRequest {
-                session: binding
-                    .anchor
+            let request = normal_search_scope_request(&binding, &client_cwd);
+            let context = self
+                .writer
+                .normal_search_current_context(request.clone())
+                .await
+                .map_err(|_| McpServiceError::Store)?;
+            // The existing complete-snapshot path starts its retrieval budget
+            // after the current scope is assembled. Preserve that budget
+            // boundary while keeping every normal-path recomputation under the
+            // one deadline below.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_micros(750_000);
+            let anchor =
+                super::scope::resolve_current_anchor(&context.scope, &binding, &client_cwd);
+            if anchor.is_none()
+                || (anchor
                     .as_ref()
-                    .map(|anchor| anchor.session_id.clone()),
-                agent: binding
-                    .anchor
-                    .as_ref()
-                    .and_then(|anchor| anchor.agent_id.clone()),
-                paths: vec![client_cwd.clone()],
-                ..Default::default()
-            };
-            match &binding.workspace {
-                evertrace_codex::binding::PublicWorkspace::Repository(id) => {
-                    request.repository = Some(*id)
-                }
-                evertrace_codex::binding::PublicWorkspace::Worktree(id) => {
-                    request.worktree = Some(*id)
-                }
-                evertrace_codex::binding::PublicWorkspace::PathHint(path) => {
-                    request.paths.push(path.clone())
-                }
-                evertrace_codex::binding::PublicWorkspace::Active => {}
+                    .is_some_and(|anchor| anchor.task_id.is_none())
+                    && binding.anchor.is_some()
+                    && !refs.is_empty())
+            {
+                return Box::pin(
+                    self.passive_source_read(request_id, action, binding, input, refs),
+                )
+                .await;
             }
+            let scope = NormalSearchScope {
+                binding,
+                anchor: anchor.expect("checked above"),
+                client_cwd,
+                deadline,
+                request,
+                context,
+            };
+            return self.normal_search(request_id, scope, input).await;
+        }
+        if action == McpServiceAction::Get
+            && input != "@due"
+            && !work::has_work_refs(action, &input, &refs)
+        {
+            let request = normal_search_scope_request(&binding, &client_cwd);
             let facts = self
                 .writer
                 .scope_current_context(request)
@@ -518,11 +543,17 @@ pub(super) fn select_object_row<'a>(
     snapshot: &'a ProjectionSnapshot,
     identifier: &str,
 ) -> Result<Option<(&'a ObjectRow, bool)>, ()> {
+    select_object_row_rows(&snapshot.rows, identifier)
+}
+
+pub(super) fn select_object_row_rows<'a>(
+    rows: &'a [ObjectRow],
+    identifier: &str,
+) -> Result<Option<(&'a ObjectRow, bool)>, ()> {
     let eligible = |row: &&ObjectRow| {
         row.row_kind == ObjectRowKind::Data && row.row_class == Some(ObjectRowClass::Object)
     };
-    let mut exact = snapshot
-        .rows
+    let mut exact = rows
         .iter()
         .filter(eligible)
         .filter(|row| row.current_revision_id.as_deref() == Some(identifier));
@@ -531,17 +562,17 @@ pub(super) fn select_object_row<'a>(
             return Err(());
         }
         let object_id = row.object_id.as_deref().ok_or(())?;
-        let current = current_object_row(snapshot, object_id)?.ok_or(())?;
+        let current = current_object_row_rows(rows, object_id)?.ok_or(())?;
         return Ok(Some((row, current == row)));
     }
-    Ok(current_object_row(snapshot, identifier)?.map(|row| (row, true)))
+    Ok(current_object_row_rows(rows, identifier)?.map(|row| (row, true)))
 }
 
-fn current_object_row<'a>(
-    snapshot: &'a ProjectionSnapshot,
+fn current_object_row_rows<'a>(
+    rows: &'a [ObjectRow],
     object_id: &str,
 ) -> Result<Option<&'a ObjectRow>, ()> {
-    let mut rows = snapshot.rows.iter().filter(|row| {
+    let mut rows = rows.iter().filter(|row| {
         row.row_kind == ObjectRowKind::Data
             && row.row_class == Some(ObjectRowClass::Object)
             && row.object_id.as_deref() == Some(object_id)
@@ -800,7 +831,38 @@ fn empty_result<const N: usize>(
 }
 
 fn scope_label(scope: &McpRequestScope) -> String {
-    scope.binding.workspace.canonical()
+    scope_label_for_binding(&scope.binding)
+}
+
+fn scope_label_for_binding(binding: &McpResolvedScope) -> String {
+    binding.workspace.canonical()
+}
+
+fn normal_search_scope_request(
+    binding: &McpResolvedScope,
+    client_cwd: &str,
+) -> evertrace_store::ScopeCurrentRequest {
+    let mut request = evertrace_store::ScopeCurrentRequest {
+        session: binding
+            .anchor
+            .as_ref()
+            .map(|anchor| anchor.session_id.clone()),
+        agent: binding
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.agent_id.clone()),
+        paths: vec![client_cwd.into()],
+        ..Default::default()
+    };
+    match &binding.workspace {
+        evertrace_codex::binding::PublicWorkspace::Repository(id) => request.repository = Some(*id),
+        evertrace_codex::binding::PublicWorkspace::Worktree(id) => request.worktree = Some(*id),
+        evertrace_codex::binding::PublicWorkspace::PathHint(path) => {
+            request.paths.push(path.clone())
+        }
+        evertrace_codex::binding::PublicWorkspace::Active => {}
+    }
+    request
 }
 
 fn scope_unresolved(request_id: RequestId) -> McpServiceResult {

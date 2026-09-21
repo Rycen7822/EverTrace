@@ -2,8 +2,9 @@ use evertrace_store::{
     BackupError, BackupSummary, CommitOutcome, CommittedCommand, DurableJob, JobStatus,
     JournalCommand, JournalWriter, ObjectDeletionCurrentView, ProjectionSnapshot, ProjectionWorker,
     RecallCurrentContext, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
-    ReconciliationFrontier, RuntimeSchedulerView, ScopePurgeCurrentView, SessionImportContext,
-    SessionImportPrefixPage, SessionImportPrefixRequest, SessionImportSelection, StoreError,
+    ReconciliationFrontier, RuntimeSchedulerView, ScopePurgeCurrentView,
+    SessionCatalogCurrentContext, SessionImportContext, SessionImportPrefixPage,
+    SessionImportPrefixRequest, SessionImportSelection, StoreError,
 };
 use std::{
     collections::BTreeSet,
@@ -63,6 +64,15 @@ enum WriterRequest {
     ScopeCurrent {
         request: evertrace_store::ScopeCurrentRequest,
         reply: oneshot::Sender<Result<evertrace_store::ScopeCurrentContext, WriterActorError>>,
+    },
+    NormalSearchCurrent {
+        request: evertrace_store::ScopeCurrentRequest,
+        reply: oneshot::Sender<Result<evertrace_store::NormalSearchReadContext, WriterActorError>>,
+    },
+    NormalSearchCandidates {
+        request: evertrace_store::ScopeCurrentRequest,
+        candidate: evertrace_store::NormalSearchCandidateRequest,
+        reply: oneshot::Sender<Result<evertrace_store::NormalSearchReadContext, WriterActorError>>,
     },
     PassiveSourceCurrent {
         selection: evertrace_store::PassiveSourceSelection,
@@ -125,6 +135,9 @@ enum WriterRequest {
         source: String,
         repository_locator: Option<(evertrace_domain::repository::FilesystemIdentity, String)>,
         reply: oneshot::Sender<Result<Option<SessionImportContext>, WriterActorError>>,
+    },
+    SessionCatalogCurrent {
+        reply: oneshot::Sender<Result<SessionCatalogCurrentContext, WriterActorError>>,
     },
     SessionImportContexts {
         after: Option<String>,
@@ -285,6 +298,17 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub async fn session_catalog_current_context(
+        &self,
+    ) -> Result<SessionCatalogCurrentContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SessionCatalogCurrent { reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub async fn repository_read_context(
         &self,
         ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
@@ -416,6 +440,35 @@ impl WriterHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::ScopeCurrent { request, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn normal_search_current_context(
+        &self,
+        request: evertrace_store::ScopeCurrentRequest,
+    ) -> Result<evertrace_store::NormalSearchReadContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::NormalSearchCurrent { request, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn normal_search_candidate_context(
+        &self,
+        request: evertrace_store::ScopeCurrentRequest,
+        candidate: evertrace_store::NormalSearchCandidateRequest,
+    ) -> Result<evertrace_store::NormalSearchReadContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::NormalSearchCandidates {
+                request,
+                candidate,
+                reply,
+            })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -915,6 +968,42 @@ async fn run_writer(
                         return Err(WriterActorError::Store);
                     }
                 }
+                WriterRequest::NormalSearchCurrent { request, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .normal_search_current_context(&request)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::NormalSearchCandidates {
+                    request,
+                    candidate,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .normal_search_candidate_context(&request, &candidate)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
                 WriterRequest::PassiveSourceCurrent { selection, reply } => {
                     if reply.is_closed() {
                         continue;
@@ -1078,6 +1167,22 @@ async fn run_writer(
                     }
                     .map_err(map_store_error);
                     let _ = reply.send(result);
+                }
+                WriterRequest::SessionCatalogCurrent { reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .session_catalog_current_context()
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
                 }
                 WriterRequest::RepositoryReadContext { ids, reply } => {
                     let result = writer

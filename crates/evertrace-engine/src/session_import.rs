@@ -208,11 +208,14 @@ impl SessionCatalogService {
         report: &HostProbeReport,
     ) -> Result<usize, SessionImportServiceError> {
         let mut cursor = self.cursor.lock().await;
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let mut repositories = RepositoryCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| SessionImportServiceError::Corrupt)?;
-        let current = SessionImportCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        let catalog = self
+            .writer
+            .session_catalog_current_context()
+            .await
+            .map_err(map_writer)?;
+        let frontier = catalog.frontier;
+        let mut repositories = catalog.repositories;
+        let current = catalog.sessions;
         let path = report
             .session_catalog_roots()
             .iter()
@@ -316,7 +319,15 @@ impl SessionCatalogService {
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         for (session_id, reason) in terminal_sessions {
-            if let Some(mut job) = active_import_job(&snapshot, &session_id)? {
+            let current = self
+                .writer
+                .session_import_context(&session_id)
+                .await
+                .map_err(map_writer)?;
+            if let Some(mut job) = current
+                .filter(|current| !current.repository_purged)
+                .and_then(|current| current.job)
+            {
                 job.state = JobStatus::Failed;
                 job.lease_until_us = None;
                 job.terminal = Some(Box::new(JobTerminalAudit {
@@ -385,7 +396,7 @@ impl SessionCatalogService {
             payloads,
         )?;
         self.writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(command, occurred_at_us, frontier)
             .await
             .map_err(|error| {
                 cursor.invalidate();
@@ -1673,6 +1684,22 @@ pub(crate) fn source_summary_receipts(
     through_sequence: u64,
     refs: &[String],
 ) -> Result<Vec<evertrace_domain::evidence::SourceReceipt>, SessionImportServiceError> {
+    source_summary_receipts_rows(
+        &snapshot.rows,
+        source,
+        after_sequence,
+        through_sequence,
+        refs,
+    )
+}
+
+pub(crate) fn source_summary_receipts_rows(
+    rows: &[evertrace_store::ObjectRow],
+    source: &evertrace_domain::semantic::SemanticSourceTarget,
+    after_sequence: u64,
+    through_sequence: u64,
+    refs: &[String],
+) -> Result<Vec<evertrace_domain::evidence::SourceReceipt>, SessionImportServiceError> {
     if refs.is_empty()
         || refs.len() > 64
         || !refs.windows(2).all(|pair| pair[0] < pair[1])
@@ -1681,7 +1708,7 @@ pub(crate) fn source_summary_receipts(
         return Err(SessionImportServiceError::Corrupt);
     }
     let mut observations = BTreeMap::new();
-    for row in snapshot.data_rows().filter(|row| {
+    for row in rows.iter().filter(|row| {
         row.object_kind.as_deref() == Some("source_observation")
             && row
                 .object_id
@@ -1700,7 +1727,7 @@ pub(crate) fn source_summary_receipts(
         observations.insert(observation.source_receipt_ref.to_string(), observation);
     }
     let mut receipts = Vec::new();
-    for row in snapshot.data_rows().filter(|row| {
+    for row in rows.iter().filter(|row| {
         row.object_kind.as_deref() == Some("source_receipt")
             && row
                 .object_id
@@ -1719,7 +1746,7 @@ pub(crate) fn source_summary_receipts(
         receipts.push(*receipt);
     }
     let suppressed =
-        evertrace_store::ObjectDeletionCandidateAdmissionView::for_source_refs(snapshot, refs)
+        evertrace_store::ObjectDeletionCandidateAdmissionView::for_source_refs_rows(rows, refs)
             .and_then(|view| view.source_refs_suppressed(refs))
             .map_err(|_| SessionImportServiceError::Corrupt)?;
     validate_source_summary_receipts(
@@ -1800,6 +1827,30 @@ pub(crate) async fn blocked_source_rows_before(
     lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
     deadline: Option<Instant>,
 ) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
+    blocked_source_rows_from_rows_before(
+        writer,
+        report,
+        &snapshot.rows,
+        rows,
+        config_hash,
+        lookup,
+        deadline,
+    )
+    .await
+}
+
+/// The source gate over a named request-local closure.  It intentionally
+/// shares the same source-summary, Host report, and revocation logic as the
+/// full-projection wrapper above.
+pub(crate) async fn blocked_source_rows_from_rows_before(
+    writer: &WriterHandle,
+    report: Option<&HostProbeReport>,
+    all_rows: &[evertrace_store::ObjectRow],
+    rows: &[&evertrace_store::ObjectRow],
+    config_hash: [u8; 32],
+    lookup: Option<&BTreeMap<&str, &evertrace_store::ObjectRow>>,
+    deadline: Option<Instant>,
+) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
     let mut sources = BTreeMap::new();
     let mut observations = BTreeMap::new();
     let mut blocked = std::collections::BTreeSet::new();
@@ -1824,8 +1875,8 @@ pub(crate) async fn blocked_source_rows_before(
                 digest
                     .validate()
                     .map_err(|_| SessionImportServiceError::Corrupt)?;
-                if source_summary_receipts(
-                    snapshot,
+                if source_summary_receipts_rows(
+                    all_rows,
                     source,
                     digest.from_watermark,
                     digest.to_watermark,
@@ -1870,8 +1921,8 @@ pub(crate) async fn blocked_source_rows_before(
             .keys()
             .filter_map(|id| lookup.get(id.as_str()).copied())
             .collect::<Vec<_>>(),
-        None => snapshot
-            .data_rows()
+        None => all_rows
+            .iter()
             .filter(|row| observations.contains_key(&row.row_id))
             .collect(),
     };
