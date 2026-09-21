@@ -367,29 +367,31 @@ pub(crate) fn validate_journal_rows(rows: &[JournalRow]) -> Result<(), StoreErro
             return Err(StoreError::StoreCorrupt);
         }
     }
-    let mut commands: BTreeMap<CommandId, Vec<JournalRow>> = BTreeMap::new();
+    let mut commands: BTreeMap<CommandId, Vec<&JournalRow>> = BTreeMap::new();
     for row in rows {
-        commands
-            .entry(row.command_id)
-            .or_default()
-            .push(row.clone());
+        commands.entry(row.command_id).or_default().push(row);
     }
-    for command_rows in commands.values() {
-        validate_complete_command(command_rows)?;
+    for command_rows in commands.into_values() {
+        validate_complete_command_refs(command_rows)?;
     }
     Ok(())
 }
 
 pub(crate) fn validate_complete_command(rows: &[JournalRow]) -> Result<(), StoreError> {
-    if rows.is_empty() {
+    validate_complete_command_refs(rows.iter().collect()).map(|_| ())
+}
+
+fn validate_complete_command_refs(
+    mut ordered: Vec<&JournalRow>,
+) -> Result<Vec<&JournalRow>, StoreError> {
+    if ordered.is_empty() {
         return Err(StoreError::StoreCorrupt);
     }
-    let expected_count = rows[0].command_event_count;
-    if expected_count == 0 || rows.len() != usize::from(expected_count) {
+    let expected_count = ordered[0].command_event_count;
+    if expected_count == 0 || ordered.len() != usize::from(expected_count) {
         return Err(StoreError::StoreCorrupt);
     }
-    let command_id = rows[0].command_id;
-    let mut ordered = rows.to_vec();
+    let command_id = ordered[0].command_id;
     ordered.sort_by_key(|row| row.ordinal);
     for (index, row) in ordered.iter().enumerate() {
         if row.command_id != command_id
@@ -404,7 +406,7 @@ pub(crate) fn validate_complete_command(rows: &[JournalRow]) -> Result<(), Store
         command_id,
         ordered
             .iter()
-            .map(JournalRow::draft)
+            .map(|row| (*row).draft())
             .collect::<Result<Vec<_>, _>>()?,
     )?;
     let prepared = prepare_command(&command)?;
@@ -424,7 +426,7 @@ pub(crate) fn validate_complete_command(rows: &[JournalRow]) -> Result<(), Store
             return Err(StoreError::StoreCorrupt);
         }
     }
-    Ok(())
+    Ok(ordered)
 }
 
 pub(crate) fn replay_outcome(
@@ -434,7 +436,7 @@ pub(crate) fn replay_outcome(
     if rows.is_empty() {
         return Ok(None);
     }
-    validate_complete_command(rows)?;
+    let ordered = validate_complete_command_refs(rows.iter().collect())?;
     if rows
         .iter()
         .any(|row| row.command_hash != prepared.command_hash)
@@ -445,8 +447,6 @@ pub(crate) fn replay_outcome(
     if rows.len() != expected_count {
         return Err(StoreError::IdempotencyConflict);
     }
-    let mut ordered = rows.to_vec();
-    ordered.sort_by_key(|row| row.ordinal);
     for (index, row) in ordered.iter().enumerate() {
         if usize::from(row.ordinal) != index || row.command_event_count != prepared.event_count {
             return Err(StoreError::StoreCorrupt);
@@ -461,7 +461,10 @@ pub(crate) fn replay_outcome(
         command_id: prepared.command_id,
         first_seq: ordered.first().ok_or(StoreError::StoreCorrupt)?.seq,
         last_seq: ordered.last().ok_or(StoreError::StoreCorrupt)?.seq,
-        event_ids: ordered.into_iter().map(|row| row.event_id).collect(),
+        event_ids: ordered
+            .into_iter()
+            .map(|row| row.event_id.clone())
+            .collect(),
         replayed: true,
     }))
 }
