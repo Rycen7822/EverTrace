@@ -13,5 +13,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { version = "=0.6.1", default-features = true }
+
 [lints]
 workspace = true

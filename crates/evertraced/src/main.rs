@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod mcp_output;
 
 use std::{
