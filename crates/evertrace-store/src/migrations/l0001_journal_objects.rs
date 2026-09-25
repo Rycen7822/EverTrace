@@ -113,8 +113,6 @@ impl L0001 {
             {
                 validate_empty_objects_schema(&table).await?;
                 append_initial_checkpoint(&table).await?;
-            } else {
-                validate_objects_table(&table).await?;
             }
             table
         } else {
