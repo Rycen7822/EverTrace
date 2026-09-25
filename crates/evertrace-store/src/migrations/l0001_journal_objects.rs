@@ -133,8 +133,12 @@ impl L0001 {
             append_migration_event(&journal, &startup.rows).await?;
         }
 
-        let projection = ProjectionWorker::new(journal.clone(), objects);
-        projection.catch_up().await?;
+        // L0002 performs its own objects catch-up before using the derived
+        // tables. Standalone L0001 still needs to finish that projection here.
+        if !l0002_tables_present {
+            let projection = ProjectionWorker::new(journal.clone(), objects);
+            projection.catch_up().await?;
+        }
 
         Ok(if !journal_exists && !objects_exists {
             MigrationOutcome::Applied

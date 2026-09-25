@@ -64,6 +64,10 @@ impl L0002 {
             .await
             .map_err(|_| StoreError::LanceDb)?;
         validate_objects_table(&objects).await?;
+        // Check the authoritative objects projection before creating a missing
+        // derived table. L0001 previously provided this barrier on reopen.
+        let projection = ProjectionWorker::new(journal.clone(), objects);
+        let mut objects_snapshot = projection.catch_up().await?;
 
         let relations = open_or_create_relations(connection, has_relation).await?;
         let search = open_or_create_search(connection, has_search).await?;
@@ -103,20 +107,18 @@ impl L0002 {
         if appended {
             // L0002 is not durable until every derived table is usable at the
             // exact pre-marker frontier. A crash here leaves no completion marker.
-            let pre_marker = ProjectionWorker::new(journal.clone(), objects.clone())
-                .catch_up()
-                .await?;
-            worker.catch_up(&pre_marker).await?;
+            worker.catch_up(&objects_snapshot).await?;
             ensure_fts(&search).await?;
             if crash_before_marker {
                 return Err(StoreError::Migration);
             }
             append_migration(&journal, before).await?;
+            // The marker itself advances the authoritative frontier.
+            objects_snapshot = projection.catch_up().await?;
         }
 
-        // The marker itself advances the authoritative frontier. Independently
-        // committed projections converge to it on this run or the next reopen.
-        let objects_snapshot = ProjectionWorker::new(journal, objects).catch_up().await?;
+        // Independently committed projections converge to the validated
+        // frontier on this run or the next reopen.
         worker.catch_up(&objects_snapshot).await?;
         ensure_fts(&search).await?;
 
@@ -373,6 +375,20 @@ mod tests {
             crate::read_relation_rows(&rebuilt).await.unwrap()[0].source_event_seq,
             2
         );
+        connection.drop_table(OBJECTS_TABLE, &[]).await.unwrap();
+        assert_eq!(
+            L0002::apply(&connection).await,
+            Ok(MigrationOutcome::RebuiltObjects)
+        );
+        let objects = connection
+            .open_table(OBJECTS_TABLE)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::objects::read_object_checkpoint(&objects).await,
+            Ok(2)
+        );
     }
 
     #[tokio::test]
@@ -404,6 +420,40 @@ mod tests {
         assert_eq!(L0002::apply(&corrupt).await, Err(StoreError::StoreCorrupt));
         assert!(
             !corrupt
+                .table_names()
+                .execute()
+                .await
+                .unwrap()
+                .contains(&SEARCH_TABLE.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_objects_fail_before_recreating_a_missing_derived_table() {
+        let (_temp, connection) = test_connection().await;
+        L0002::apply(&connection).await.unwrap();
+        connection.drop_table(OBJECTS_TABLE, &[]).await.unwrap();
+        let objects = connection
+            .create_empty_table(OBJECTS_TABLE, crate::objects::objects_schema())
+            .execute()
+            .await
+            .unwrap();
+        objects
+            .add(
+                crate::objects::objects_batch(&[crate::objects::ObjectRow::checkpoint(3, 1)])
+                    .unwrap(),
+            )
+            .execute()
+            .await
+            .unwrap();
+        connection.drop_table(SEARCH_TABLE, &[]).await.unwrap();
+
+        assert_eq!(
+            L0002::apply(&connection).await,
+            Err(StoreError::StoreCorrupt)
+        );
+        assert!(
+            !connection
                 .table_names()
                 .execute()
                 .await
