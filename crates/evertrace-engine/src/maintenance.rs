@@ -2912,7 +2912,7 @@ impl BackgroundScheduler {
                 return Ok(BackgroundProgress::default());
             }
             if !self.synthesis_repository_allowed(&snapshot, job).await? {
-                let frontier = self.writer.project().await.map_err(map_writer)?.frontier;
+                let frontier = self.writer.sync_frontier().await.map_err(map_writer)?;
                 self.fail_stale(job, frontier).await?;
                 return Ok(BackgroundProgress {
                     completed: 1,
