@@ -646,8 +646,9 @@ impl JournalWriter {
         crate::connection::prepare_native_root(&data_dir)?;
         let native = crate::connection::native_root(&data_dir);
         lock.validate_held()?;
+        let session = crate::connection::native_session();
         let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
-            .session(crate::connection::native_session())
+            .session(session.clone())
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
@@ -657,7 +658,11 @@ impl JournalWriter {
         {
             return Err(StoreError::UpgradeRequired);
         }
-        Self::open_on_connection(lock, &native, connection, startup).await
+        let writer = Self::open_on_connection(lock, &native, connection, startup).await?;
+        // Startup validates the entire native history. Keep its metadata from
+        // occupying the long-lived writer cache after that work is complete.
+        session.file_metadata_cache().clear().await;
+        Ok(writer)
     }
 
     pub(crate) async fn existing_profile(
