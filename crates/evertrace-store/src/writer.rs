@@ -20,7 +20,7 @@ use crate::{
     },
     migrations::{L0002, MigrationOutcome},
     objects::{
-        OBJECTS_TABLE, ObjectRow, read_object_checkpoint, read_object_rows,
+        OBJECTS_TABLE, ObjectRow, checkpoint_from_rows, read_object_checkpoint, read_object_rows,
         read_object_rows_filtered, validate_objects_table,
     },
     projections::{
@@ -822,17 +822,23 @@ impl JournalWriter {
     }
 
     pub async fn read_diagnostics(&self) -> NativeDiagnostics {
+        let journal_checkpoint = read_journal_frontier(&self.journal).await;
+        let validated_objects = validate_objects_table(&self.objects).await;
+        let object_checkpoint = match &validated_objects {
+            Ok(rows) => checkpoint_from_rows(rows),
+            Err(_) => read_object_checkpoint(&self.objects).await,
+        };
         let mut tables = Vec::with_capacity(4);
         for (table, expected, checkpoint) in [
             (
                 &self.journal,
                 crate::journal::journal_schema(),
-                read_journal_frontier(&self.journal).await,
+                journal_checkpoint,
             ),
             (
                 &self.objects,
                 crate::objects::objects_schema(),
-                read_object_checkpoint(&self.objects).await,
+                object_checkpoint,
             ),
             (
                 &self.relations,
@@ -851,13 +857,11 @@ impl JournalWriter {
                 checkpoint: checkpoint.ok(),
             });
         }
-        let objects = match tables[1].checkpoint {
-            Some(frontier) => validate_objects_table(&self.objects)
-                .await
+        let objects = tables[1].checkpoint.and_then(|frontier| {
+            validated_objects
                 .ok()
-                .map(|rows| ProjectionSnapshot { frontier, rows }),
-            None => None,
-        };
+                .map(|rows| ProjectionSnapshot { frontier, rows })
+        });
         let fts_index_present = self.search.list_indices().await.ok().map(|indices| {
             indices.len() == 1
                 && indices[0].columns == ["text"]
@@ -2190,6 +2194,25 @@ mod tests {
         let objects = writer.project_objects().await.unwrap();
         assert_eq!(objects.frontier, writer.frontier());
         assert_eq!(writer.search.version().await.unwrap(), version);
+        let mut malformed = ObjectRow::checkpoint(0, 1);
+        malformed.row_id = "diagnostic:malformed".into();
+        malformed.row_kind = crate::objects::ObjectRowKind::Data;
+        malformed.row_class = Some(crate::objects::ObjectRowClass::Runtime);
+        malformed.payload_json = Some("{}".into());
+        let mut columns = crate::objects::objects_batch(&[malformed])
+            .unwrap()
+            .columns()
+            .to_vec();
+        let generation_column = crate::objects::objects_schema()
+            .index_of("projection_generation")
+            .unwrap();
+        columns[generation_column] = std::sync::Arc::new(arrow_array::UInt64Array::from(vec![0]));
+        let malformed_batch =
+            arrow_array::RecordBatch::try_new(crate::objects::objects_schema(), columns).unwrap();
+        writer.objects.add(malformed_batch).execute().await.unwrap();
+        let read = writer.read_diagnostics().await;
+        assert_eq!(read.tables[1].checkpoint, Some(objects.frontier));
+        assert!(read.objects.is_none());
         writer.objects.delete("true").await.unwrap();
         assert!(writer.project_objects().await.is_err());
     }

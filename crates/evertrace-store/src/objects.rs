@@ -282,12 +282,17 @@ pub(crate) async fn read_object_checkpoint(table: &Table) -> Result<u64, StoreEr
     for batch in &batches {
         rows.extend(rows_from_batch(batch)?);
     }
-    let [checkpoint] = rows.as_slice() else {
+    checkpoint_from_rows(&rows)
+}
+
+pub(crate) fn checkpoint_from_rows(rows: &[ObjectRow]) -> Result<u64, StoreError> {
+    let mut matches = rows
+        .iter()
+        .filter(|row| row.row_id == OBJECTS_CHECKPOINT_ID);
+    let Some(checkpoint) = matches.next() else {
         return Err(StoreError::StoreCorrupt);
     };
-    if checkpoint.row_id != OBJECTS_CHECKPOINT_ID
-        || checkpoint.row_kind != ObjectRowKind::Checkpoint
-    {
+    if matches.next().is_some() || checkpoint.row_kind != ObjectRowKind::Checkpoint {
         return Err(StoreError::StoreCorrupt);
     }
     Ok(checkpoint.source_event_seq)
@@ -440,5 +445,24 @@ mod tests {
             objects_schema().fields()[..20].to_vec(),
         )));
         assert_eq!(rows_from_batch(&partial), Err(StoreError::StoreCorrupt));
+    }
+
+    #[test]
+    fn checkpoint_from_rows_rejects_missing_or_occupied_identity() {
+        let checkpoint = ObjectRow::checkpoint(7, 1);
+        assert_eq!(
+            checkpoint_from_rows(std::slice::from_ref(&checkpoint)),
+            Ok(7)
+        );
+        assert_eq!(checkpoint_from_rows(&[]), Err(StoreError::StoreCorrupt));
+        let mut occupied = checkpoint.clone();
+        occupied.row_kind = ObjectRowKind::Data;
+        occupied.row_class = Some(ObjectRowClass::Runtime);
+        occupied.payload_json = Some("{}".into());
+        assert_eq!(occupied.validate(), Ok(()));
+        assert_eq!(
+            checkpoint_from_rows(&[checkpoint, occupied]),
+            Err(StoreError::StoreCorrupt)
+        );
     }
 }
