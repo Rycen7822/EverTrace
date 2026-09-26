@@ -4599,9 +4599,16 @@ pub fn select_jobs(
     view: &RuntimeSchedulerView,
     capture_state: CaptureAdmissionState,
 ) -> Result<Vec<ScheduledJob>, BackgroundSchedulerError> {
+    select_jobs_from(&view.jobs, capture_state)
+}
+
+fn select_jobs_from<'a>(
+    jobs: impl IntoIterator<Item = &'a DurableJob>,
+    capture_state: CaptureAdmissionState,
+) -> Result<Vec<ScheduledJob>, BackgroundSchedulerError> {
     let now = now_us()?;
     let mut active = BTreeMap::<(String, String), DurableJob>::new();
-    for job in view.jobs.iter().filter(|job| {
+    for job in jobs.into_iter().filter(|job| {
         job.state == JobStatus::Queued
             && (!matches!(
                 job.kind.as_str(),
@@ -5163,8 +5170,7 @@ impl SynthesisIdle {
         config: &evertrace_domain::config::DreamingConfig,
         now: i64,
     ) -> Result<Vec<ScheduledJob>, BackgroundSchedulerError> {
-        let mut selectable = view.clone();
-        selectable.jobs.clear();
+        let mut selectable = Vec::new();
         for job in &view.jobs {
             // Requested backups validate pending frames at their own exclusive
             // boundary and retain the original admission gate. Other optional
@@ -5201,10 +5207,10 @@ impl SynthesisIdle {
                     && !job_target_is_current(snapshot, view, job, job.config_hash)
                         .map_err(|_| BackgroundSchedulerError::Store)?)
             {
-                selectable.jobs.push(job.clone());
+                selectable.push(job);
             }
         }
-        select_jobs(&selectable, capture)
+        select_jobs_from(selectable, capture)
     }
 }
 
