@@ -2352,12 +2352,12 @@ impl BackgroundScheduler {
                     snapshot = self.writer.project().await.map_err(map_writer)?;
                     view = RuntimeSchedulerView::from_snapshot(&snapshot)
                         .map_err(|_| BackgroundSchedulerError::Store)?;
+                    idle.refresh(&snapshot, &view)?;
                 }
                 Err(WriterActorError::StaleFrontier) => retryable = true,
                 Err(error) => return Err(map_writer(error)),
             }
         }
-        idle.refresh(&snapshot, &view)?;
         let selected = idle.select(
             &snapshot,
             &view,
