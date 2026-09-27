@@ -822,7 +822,7 @@ impl JournalWriter {
     }
 
     pub async fn read_diagnostics(&self) -> NativeDiagnostics {
-        let journal_checkpoint = read_journal_frontier(&self.journal).await;
+        let journal_checkpoint = self.diagnostic_journal_frontier().await;
         let validated_objects = validate_objects_table(&self.objects).await;
         let object_checkpoint = match &validated_objects {
             Ok(rows) => checkpoint_from_rows(rows),
@@ -873,6 +873,28 @@ impl JournalWriter {
                 .unwrap_or_else(|_| unreachable!("four fixed native tables")),
             fts_index_present,
             objects,
+        }
+    }
+
+    async fn diagnostic_journal_frontier(&self) -> Result<u64, StoreError> {
+        let Ok(frontier) = self.normal_search_admission_frontier() else {
+            return read_journal_frontier(&self.journal).await;
+        };
+        self.validate_projection_directories(false)?;
+        self.journal
+            .checkout_latest()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let native_version = self
+            .journal
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        self.validate_projection_directories(false)?;
+        if self.command_ids.as_ref().map(|(version, _)| *version) == Some(native_version) {
+            Ok(frontier)
+        } else {
+            read_journal_frontier(&self.journal).await
         }
     }
 
@@ -2085,6 +2107,10 @@ mod tests {
         let mut startup = StartupJournal::read(writer.journal.clone()).await.unwrap();
         writer.sync_frontier().await.unwrap();
         assert!(writer.projection_validation.lock().unwrap()[1].is_some());
+        assert_eq!(
+            writer.read_diagnostics().await.tables[0].checkpoint,
+            Some(writer.frontier())
+        );
         let versions = writer.projection_versions(true).await.unwrap();
         let native = crate::connection::native_root(&root);
         let moved = root.join("previous-store");
@@ -2096,6 +2122,7 @@ mod tests {
             fs::rename(moved.join(&name), native.join(name)).unwrap();
         }
         assert_eq!(writer.objects.version().await.unwrap(), versions[1]);
+        assert_eq!(writer.read_diagnostics().await.tables[0].checkpoint, None);
         // A valid in-memory stamp alone must not authorize normal Search after
         // the held native root has been replaced with same-version tables.
         assert!(
@@ -2370,6 +2397,10 @@ mod tests {
         let committed_frontier = read_journal_frontier(&writer.journal).await.unwrap();
         assert!(writer.frontier() > committed_frontier);
         assert_eq!(
+            writer.diagnostic_journal_frontier().await.unwrap(),
+            committed_frontier
+        );
+        assert_eq!(
             writer.sync_objects_frontier().await.unwrap(),
             committed_frontier
         );
@@ -2378,6 +2409,10 @@ mod tests {
         assert_eq!(first_seq, abandoned + u64::from(prepared.event_count));
         let rows = rows_for_append(&prepared, first_seq, 2).unwrap();
         append_rows(&writer.journal, &rows).await.unwrap();
+        assert_eq!(
+            writer.diagnostic_journal_frontier().await.unwrap(),
+            first_seq
+        );
         // A direct native successor is not proof of an append by this writer.
         let old_version = writer.projection_validation.lock().unwrap()[0]
             .as_ref()
