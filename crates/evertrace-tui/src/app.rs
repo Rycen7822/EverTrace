@@ -609,6 +609,11 @@ impl App {
                 UiCommand::None
             }
             AppEvent::Tick => {
+                let refresh_interval = if self.state.route == Route::System {
+                    15
+                } else {
+                    5
+                };
                 if !self.modal_open()
                     && self.state.ui.input.is_none()
                     && !self.state.ui.reading
@@ -618,7 +623,7 @@ impl App {
                         .state
                         .ui
                         .read_finished
-                        .is_some_and(|t| t.elapsed() >= Duration::from_secs(5))
+                        .is_some_and(|t| t.elapsed() >= Duration::from_secs(refresh_interval))
                 {
                     self.state.ui.reading = true;
                     UiCommand::Refresh
@@ -4231,6 +4236,31 @@ mod tests {
         });
         assert_eq!(command, UiCommand::None);
         assert!(app.state.human.is_none());
+    }
+
+    #[test]
+    fn system_auto_refresh_is_15_seconds_and_other_surfaces_stay_5_seconds() {
+        let mut app = App::with_language(crate::Language::English);
+        app.state.shell.connection = ConnectionState::Connected;
+        let six = Some(std::time::Instant::now() - Duration::from_secs(6));
+        app.state.ui.read_finished = six;
+        assert_eq!(app.handle(AppEvent::Tick), UiCommand::None);
+        assert_eq!(
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE
+            ))),
+            UiCommand::Refresh
+        );
+        app.state.ui.reading = false;
+        app.state.ui.read_finished = Some(std::time::Instant::now() - Duration::from_secs(16));
+        assert_eq!(app.handle(AppEvent::Tick), UiCommand::Refresh);
+        for route in [crate::Route::Inbox, crate::Route::Explorer] {
+            app.dispatch(UiCommand::Navigate(route));
+            app.state.ui.reading = false;
+            app.state.ui.read_finished = six;
+            assert_eq!(app.handle(AppEvent::Tick), UiCommand::Refresh);
+        }
     }
 
     #[test]
