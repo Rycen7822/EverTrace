@@ -1845,7 +1845,7 @@ mod tests {
         store: PathBuf,
         runtime: RuntimeSnapshot,
         handle: WriterHandle,
-        writer_task: tokio::task::JoinHandle<Result<(), crate::WriterActorError>>,
+        writer_task: crate::jobs::WriterTask,
         service: RecoveryActionService,
         request: RecoveryRequest,
     }

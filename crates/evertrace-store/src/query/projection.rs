@@ -12,7 +12,6 @@ use lancedb::Table;
 
 use crate::{
     JournalPayload, ObjectRowKind, ProjectionSnapshot, StoreError,
-    journal::{read_journal_after, read_journal_frontier},
     projections::{
         ProjectionJournalDelta, l3_core_projection, procedure_context_effect, recall_need,
         recall_trigger_contract, synthesis::wiki_render_identity, validate_delta, wiki_projection,
@@ -26,9 +25,10 @@ use crate::{
         build_repository_relation_rows, build_segmentation_correction_relation_rows,
         build_semantic_digest_relation_rows, build_semantic_relation_rows,
         build_wiki_relation_rows, build_work_binding_relation_rows,
-        build_work_identity_relation_rows, read_relation_rows, relations_batch,
+        build_work_identity_relation_rows,
     },
     search::{SearchProjectionRow, read_search_rows, search_batch},
+    sqlite_state::SqliteHandle,
 };
 
 use super::derive::{exact_identifier_row, surface_row, wiki_search_row};
@@ -97,34 +97,39 @@ impl L0002ProjectionSnapshot {
 
 #[derive(Clone)]
 pub struct L0002ProjectionWorker {
-    journal: Table,
-    relations: Table,
+    sqlite: SqliteHandle,
     search: Table,
 }
 
 impl L0002ProjectionWorker {
+    pub(crate) fn new(sqlite: SqliteHandle, search: Table) -> Self {
+        Self { sqlite, search }
+    }
+
     pub(crate) async fn rebuild_for_restore(
         &self,
         objects: &ProjectionSnapshot,
     ) -> Result<(), StoreError> {
         let expected = derive_l0002_projections(objects)?;
-        let relations = read_relation_rows(&self.relations).await?;
+        let relations = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .relation_rows()?;
         let search = read_search_rows(&self.search).await?;
-        commit_relation_rows(&self.relations, &relations, &expected.relations, false).await?;
+        commit_relation_rows(&self.sqlite, &relations, &expected.relations)?;
         commit_search_rows(&self.search, &search, &expected.search, false).await?;
-        if read_relation_rows(&self.relations).await? != expected.relations
+        if self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .relation_rows()?
+            != expected.relations
             || read_search_rows(&self.search).await? != expected.search
         {
             return Err(StoreError::Projection);
         }
         Ok(())
-    }
-    pub(crate) fn new(journal: Table, relations: Table, search: Table) -> Self {
-        Self {
-            journal,
-            relations,
-            search,
-        }
     }
 
     pub async fn catch_up(
@@ -143,19 +148,6 @@ impl L0002ProjectionWorker {
             .await
     }
 
-    async fn versions(&self) -> Result<[u64; 2], StoreError> {
-        Ok([
-            self.relations
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?,
-            self.search
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?,
-        ])
-    }
-
     async fn catch_up_inner(
         &self,
         objects: &ProjectionSnapshot,
@@ -163,50 +155,62 @@ impl L0002ProjectionWorker {
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
-        self.relations
-            .checkout_latest()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
+        let (journal_epoch, committed_frontier, relations_epoch, relation_frontier) = {
+            let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            let stamp = state.stamp()?;
+            let relations = state.relation_rows()?;
+            let relation_frontier = checkpoint_relation(&relations)?;
+            (
+                stamp.journal_epoch,
+                stamp.frontier,
+                stamp.relations_epoch,
+                relation_frontier,
+            )
+        };
         self.search
             .checkout_latest()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        let current_versions = self.versions().await?;
-        let relations = read_relation_rows(&self.relations).await?;
+        let search_version = self
+            .search
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
         let search = read_search_rows(&self.search).await?;
-        if self.versions().await? != current_versions {
+        if self
+            .search
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?
+            != search_version
+        {
             return Err(StoreError::StoreCorrupt);
         }
-        let relation_frontier = checkpoint_relation(&relations)?;
         let search_frontier = checkpoint_search(&search)?;
-        let journal_delta = if let Some(delta) = journal_delta {
-            self.journal
-                .checkout_latest()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            delta.at_version(
-                self.journal
-                    .version()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?,
-            )
-        } else {
-            None
-        };
+        let current_versions = [relations_epoch, search_version];
+        let journal_delta = journal_delta.and_then(|delta| delta.at_epoch(journal_epoch));
         let journal_frontier = if let Some(frontier) = journal_delta
             .as_ref()
             .and_then(ProjectionJournalDelta::frontier)
         {
             // The preceding objects catch-up validated the actual delta's end
-            // against this exact native journal version, not a reserved seq.
+            // against this exact journal epoch, not a reserved seq.
             frontier
         } else {
-            read_journal_frontier(&self.journal).await?
+            committed_frontier
         };
         if objects.frontier != journal_frontier
             || relation_frontier > journal_frontier
             || search_frontier > journal_frontier
         {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let relation_rows = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .relation_rows()?;
+        if checkpoint_relation(&relation_rows)? != relation_frontier {
             return Err(StoreError::StoreCorrupt);
         }
         for checkpoint in BTreeSet::from([relation_frontier, search_frontier]) {
@@ -217,11 +221,15 @@ impl L0002ProjectionWorker {
             {
                 rows
             } else {
-                persisted_delta = read_journal_after(&self.journal, checkpoint).await?;
+                persisted_delta = self
+                    .sqlite
+                    .lock()
+                    .map_err(|_| StoreError::StoreCorrupt)?
+                    .rows_after(checkpoint)?;
                 persisted_delta.as_slice()
             };
             // Each distinct checkpoint still validates the complete command
-            // delta against the frontier of the current native journal version.
+            // delta against the frontier of the current physical journal.
             validate_delta(checkpoint, journal_frontier, delta)?;
         }
         // No downstream derivation needs journal payloads. Release the handoff
@@ -231,31 +239,37 @@ impl L0002ProjectionWorker {
             return Ok((
                 L0002ProjectionSnapshot {
                     frontier: journal_frontier,
-                    relations,
+                    relations: relation_rows,
                     search,
                 },
                 current_versions,
             ));
         }
         let expected = derive_l0002_projections(objects)?;
-        commit_relation_rows(
-            &self.relations,
-            &relations,
-            &expected.relations,
-            fail_relation_commit,
-        )
-        .await?;
-        commit_search_rows(&self.search, &search, &expected.search, fail_search_commit).await?;
-        let versions = self.versions().await?;
-        let persisted = L0002ProjectionSnapshot {
-            frontier: expected.frontier,
-            relations: read_relation_rows(&self.relations).await?,
-            search: read_search_rows(&self.search).await?,
-        };
-        if persisted != expected || self.versions().await? != versions {
+        if fail_relation_commit {
             return Err(StoreError::Projection);
         }
-        Ok((persisted, versions))
+        commit_relation_rows(&self.sqlite, &relation_rows, &expected.relations)?;
+        commit_search_rows(&self.search, &search, &expected.search, fail_search_commit).await?;
+        let (relations_epoch_after, relations) = {
+            let state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            (state.relations_epoch(), state.relation_rows()?)
+        };
+        let search_after = read_search_rows(&self.search).await?;
+        let search_version_after = self
+            .search
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        let persisted = L0002ProjectionSnapshot {
+            frontier: expected.frontier,
+            relations,
+            search: search_after,
+        };
+        if persisted != expected {
+            return Err(StoreError::Projection);
+        }
+        Ok((persisted, [relations_epoch_after, search_version_after]))
     }
 
     #[cfg(test)]
@@ -278,7 +292,11 @@ impl L0002ProjectionWorker {
     }
 
     pub async fn current(&self) -> Result<L0002ProjectionSnapshot, StoreError> {
-        let relations = read_relation_rows(&self.relations).await?;
+        let relations = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .relation_rows()?;
         let search = read_search_rows(&self.search).await?;
         let relation_frontier = checkpoint_relation(&relations)?;
         let search_frontier = checkpoint_search(&search)?;
@@ -877,11 +895,10 @@ fn deleted_row_predicate(removed: &[&str]) -> String {
     format!("row_id IN ({})", ids.join(","))
 }
 
-async fn commit_relation_rows(
-    table: &Table,
+fn commit_relation_rows(
+    state: &SqliteHandle,
     current: &[RelationProjectionRow],
     rows: &[RelationProjectionRow],
-    fail_before_execute: bool,
 ) -> Result<(), StoreError> {
     if current == rows {
         return Ok(());
@@ -899,27 +916,16 @@ async fn commit_relation_rows(
     let removed = current
         .iter()
         .filter(|row| !expected.contains(&row.row_id))
-        .map(|row| row.row_id.as_str())
+        .map(|row| row.row_id.clone())
         .collect::<Vec<_>>();
-    let reader = Box::new(RecordBatchIterator::new(
-        vec![Ok(relations_batch(&changed)?)],
-        crate::relations::relations_schema(),
-    ));
-    let mut merge = table.merge_insert(&["row_id"]);
-    merge
-        .when_matched_update_all(None)
-        .when_not_matched_insert_all();
-    if !removed.is_empty() {
-        merge.when_not_matched_by_source_delete(Some(deleted_row_predicate(&removed)));
-    }
-    if fail_before_execute {
-        return Err(StoreError::Projection);
-    }
-    merge
-        .execute(reader)
-        .await
-        .map_err(|_| StoreError::Projection)?;
-    Ok(())
+    let checkpoint = rows
+        .iter()
+        .find(|row| row.row_id == crate::relations::RELATIONS_CHECKPOINT_ID)
+        .ok_or(StoreError::StoreCorrupt)?;
+    state
+        .lock()
+        .map_err(|_| StoreError::StoreCorrupt)?
+        .commit_relation_rows(&changed, &removed, checkpoint)
 }
 async fn commit_search_rows(
     table: &Table,

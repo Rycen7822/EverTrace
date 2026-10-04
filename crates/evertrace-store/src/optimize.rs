@@ -7,23 +7,30 @@ use std::{
 
 use evertrace_capture::{CasStore, MaintenanceGuard, cas::CasGcCandidate};
 
-use crate::{JournalPayload, StoreError};
+use crate::{JournalPayload, StoreError, sqlite_state::SqliteHandle};
 
 /// Scan the authoritative append-only payloads, including revisions suppressed
-/// from product projections. The writer owns the table and serializes this scan.
+/// from product projections. The writer owns the physical state and serializes
+/// this scan; the bounded pages read only committed rows up to the frontier.
 pub(crate) async fn historical_cas_refs(
-    journal: &lancedb::Table,
+    sqlite: &SqliteHandle,
     frontier: u64,
     candidates: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>, StoreError> {
     let mut retained = BTreeSet::new();
     let mut after = 0_u64;
-    let version = journal.version().await.map_err(|_| StoreError::LanceDb)?;
+    let epoch = sqlite
+        .lock()
+        .map_err(|_| StoreError::StoreCorrupt)?
+        .journal_epoch();
     let mut pending = Vec::<crate::JournalRow>::new();
     let mut pending_bytes = 0_u64;
     let mut seen_commands = BTreeSet::new();
     loop {
-        let rows = crate::journal::read_journal_page(journal, after, frontier).await?;
+        let rows = sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .rows_page(after, frontier)?;
         if rows.is_empty() {
             break;
         }
@@ -98,7 +105,11 @@ pub(crate) async fn historical_cas_refs(
     }
     if !pending.is_empty()
         || frontier != 0 && after != frontier
-        || journal.version().await.map_err(|_| StoreError::LanceDb)? != version
+        || sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .journal_epoch()
+            != epoch
     {
         return Err(StoreError::StoreCorrupt);
     }
@@ -212,6 +223,13 @@ impl GcReport {
                 .iter()
                 .any(|entry| CasStore::parse_digest(&entry.cas_ref).is_err())
             || !self.conservative_prune.is_empty()
+                && self
+                    .conservative_prune
+                    .iter()
+                    .map(|entry| entry.table.as_str())
+                    .ne([crate::SEARCH_TABLE])
+                // Historical reports describe the old physical four-table
+                // store. Reading them does not cause retired tables to open.
                 && self
                     .conservative_prune
                     .iter()
@@ -388,47 +406,43 @@ fn delete_and_report_inner(
 
 pub(crate) async fn conservative_prune(
     data_dir: &std::path::Path,
-    tables: [&lancedb::Table; 4],
+    search: &lancedb::Table,
     mut report: GcReport,
 ) -> Result<GcReport, StoreError> {
     let root = evertrace_capture::confined_read::ConfinedRoot::open_owned_private(
         &data_dir.join("maintenance"),
     )
     .map_err(|_| StoreError::StoreCorrupt)?;
-    report.conservative_prune = [
-        crate::JOURNAL_TABLE,
-        crate::OBJECTS_TABLE,
-        crate::RELATIONS_TABLE,
-        crate::SEARCH_TABLE,
-    ]
-    .into_iter()
-    .map(|table| ConservativePruneResult {
-        table: table.into(),
-        bytes_removed: None,
-        old_versions: None,
-    })
-    .collect();
+    report.conservative_prune = [crate::SEARCH_TABLE]
+        .into_iter()
+        .map(|table| ConservativePruneResult {
+            table: table.into(),
+            bytes_removed: None,
+            old_versions: None,
+        })
+        .collect();
     report.checksum = report.entries_checksum()?;
     publish_report(&root, &report, true)?;
-    for (index, table) in tables.into_iter().enumerate() {
-        let stats = table
-            .optimize(lancedb::table::OptimizeAction::Prune {
-                older_than: Some(
-                    lancedb::table::Duration::from_std(PRUNE_RETENTION)
-                        .map_err(|_| StoreError::InvalidInput)?,
-                ),
-                delete_unverified: Some(false),
-                error_if_tagged_old_versions: Some(true),
-            })
-            .await
-            .map_err(|_| StoreError::LanceDb)?
-            .prune
-            .ok_or(StoreError::StoreCorrupt)?;
-        report.conservative_prune[index].bytes_removed = Some(stats.bytes_removed);
-        report.conservative_prune[index].old_versions = Some(stats.old_versions);
-        report.checksum = report.entries_checksum()?;
-        publish_report(&root, &report, true)?;
-    }
+    // Only the real Lance search projection is physically pruned. The
+    // journal, objects and relations families are SQLite state with no Lance
+    // versions to prune; their logical rows stay exactly as delivered.
+    let stats = search
+        .optimize(lancedb::table::OptimizeAction::Prune {
+            older_than: Some(
+                lancedb::table::Duration::from_std(PRUNE_RETENTION)
+                    .map_err(|_| StoreError::InvalidInput)?,
+            ),
+            delete_unverified: Some(false),
+            error_if_tagged_old_versions: Some(true),
+        })
+        .await
+        .map_err(|_| StoreError::LanceDb)?
+        .prune
+        .ok_or(StoreError::StoreCorrupt)?;
+    report.conservative_prune[0].bytes_removed = Some(stats.bytes_removed);
+    report.conservative_prune[0].old_versions = Some(stats.old_versions);
+    report.checksum = report.entries_checksum()?;
+    publish_report(&root, &report, true)?;
     Ok(report)
 }
 
@@ -560,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l0001_requires_upgrade_and_has_an_independently_verifiable_backup() {
+    async fn old_four_lance_layout_is_refused_without_being_touched() {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let temporary = tempfile::TempDir::new().unwrap();
         let data = temporary.path().join("data");
@@ -568,77 +582,22 @@ mod tests {
             .mode(0o700)
             .create(&data)
             .unwrap();
-        let connection = lancedb::connect(data.to_str().unwrap())
-            .execute()
-            .await
+        let legacy = data.join(format!("{}.lance", crate::JOURNAL_TABLE));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&legacy)
             .unwrap();
-        crate::migrations::L0001::apply(&connection).await.unwrap();
-        drop(connection);
+        std::fs::write(legacy.join("data.lance"), b"old-format-bytes").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
             crate::JournalWriter::open(&data).await,
             Err(StoreError::UpgradeRequired)
         ));
-        assert!(
-            !data
-                .join(format!("{}.lance", crate::RELATIONS_TABLE))
-                .exists()
+        assert_eq!(
+            std::fs::read(legacy.join("data.lance")).unwrap(),
+            b"old-format-bytes"
         );
-        let _lock = crate::SiblingWriterLock::acquire(&data).unwrap();
-        let (states, snapshot) = crate::backup::read_verified_store_tables(&data)
-            .await
-            .unwrap();
-        assert!(states.relations.is_none() && states.search.is_none());
-        let mut runtime = runtime_for(&data);
-        let config = evertrace_domain::config::EffectiveConfig::default();
-        runtime.effective_config_hash = config.hash();
-        runtime
-            .publish(&RuntimeSnapshot::snapshot_path(&data))
-            .unwrap();
-        let config_path = temporary.path().join("config.toml");
-        std::fs::write(&config_path, config.to_toml().unwrap()).unwrap();
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        CasStore::open(runtime.cas_dir.clone()).unwrap();
-        let (mut spool, _) =
-            DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
-        let fence = evertrace_capture::MaintenanceFence::open(&data).unwrap();
-        let guard = fence.exclusive().unwrap();
-        let boundary = crate::backup::BackupFrozenBoundary {
-            spool: spool
-                .freeze_backup_boundary(&guard, runtime.generation)
-                .unwrap(),
-            hook: crate::backup::BackupHookBoundary {
-                current_generation: None,
-                retained_generations: Vec::new(),
-                pin_count: 0,
-                pinned_generation_count: 0,
-                files: Vec::new(),
-            },
-        };
-        drop(guard);
-        let id = JobId::new_v7();
-        let plan = crate::backup::prepare_backup(
-            (&data, &data),
-            &config_path,
-            &runtime,
-            id,
-            &snapshot,
-            states,
-            boundary,
-        )
-        .unwrap();
-        let staging = crate::backup::stage_backup(plan).unwrap();
-        let summary = crate::backup::verify_staged_backup(&staging).await.unwrap();
-        crate::backup::publish_backup(staging, summary).unwrap();
-        let backup = data.join(format!("backups/backup-{id}"));
-        let isolated = temporary.path().join("independent-backup");
-        std::fs::rename(backup, &isolated).unwrap();
-        drop((spool, fence, _lock));
-        std::fs::rename(&data, temporary.path().join("old-live")).unwrap();
-        let verified = crate::backup::prepare_verification_directory(&isolated, Some(id)).unwrap();
-        let summary = crate::backup::complete_backup_verification(verified)
-            .await
-            .unwrap();
-        assert!(summary.table_states.relations.is_none() && summary.table_states.search.is_none());
+        assert!(!data.join(crate::sqlite_state::SQLITE_FILE_NAME).exists());
     }
 
     #[tokio::test]
@@ -668,20 +627,20 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
+        let search = connection
+            .open_table(crate::SEARCH_TABLE)
             .execute()
             .await
             .unwrap();
-        let version = journal.version().await.unwrap();
-        journal
+        let version = search.version().await.unwrap();
+        search
             .tags()
             .await
             .unwrap()
             .create("retention-test-pin", version)
             .await
             .unwrap();
-        let versions_before = journal.list_versions().await.unwrap().len();
+        let versions_before = search.list_versions().await.unwrap().len();
         let mut restarted = writer.mark_gc(&runtime, 0).await.unwrap();
         assert!(restarted.ready_at() > old_ready);
         assert!(
@@ -706,19 +665,16 @@ mod tests {
             ),
             (1, bytes, 0)
         );
-        assert_eq!(report.conservative_prune.len(), 4);
+        assert_eq!(report.conservative_prune.len(), 1);
         assert!(
             report
                 .conservative_prune
                 .iter()
                 .all(|result| result.old_versions == Some(0))
         );
-        assert_eq!(
-            journal.list_versions().await.unwrap().len(),
-            versions_before
-        );
-        journal.checkout_tag("retention-test-pin").await.unwrap();
-        assert_eq!(journal.version().await.unwrap(), version);
+        assert_eq!(search.list_versions().await.unwrap().len(), versions_before);
+        search.checkout_tag("retention-test-pin").await.unwrap();
+        assert_eq!(search.version().await.unwrap(), version);
         assert_eq!(
             read_gc_report(runtime.data_dir().unwrap(), job).unwrap(),
             report
@@ -838,7 +794,12 @@ mod tests {
         };
         drop(guard);
         let backup_id = JobId::new_v7();
-        let (closed, staging) = writer.close_for_backup().stage_backup(
+        let guard = writer
+            .quiesce_for_backup()
+            .await
+            .unwrap()
+            .expect("no external reader holds the WAL");
+        let (closed, staging) = writer.close_for_backup(guard).unwrap().stage_backup(
             config_path,
             runtime.clone(),
             backup_id,
@@ -974,25 +935,19 @@ mod tests {
             .unwrap();
         let frontier = writer.frontier();
         let mut rows = writer.journal_rows().await.unwrap();
+        let data = runtime.data_dir().unwrap().to_owned();
         drop(writer);
-        let connection = lancedb::connect(
-            crate::connection::native_root(runtime.data_dir().unwrap())
-                .to_str()
-                .unwrap(),
-        )
-        .execute()
-        .await
-        .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
         rows.last_mut().unwrap().content_hash[0] ^= 1;
-        journal.delete("true").await.unwrap();
-        crate::journal::append_rows(&journal, &rows).await.unwrap();
+        let sqlite = crate::sqlite_state::SqliteState::open(&data)
+            .unwrap()
+            .handle();
+        sqlite
+            .lock()
+            .unwrap()
+            .overwrite_rows_for_test(&rows)
+            .unwrap();
         assert!(
-            historical_cas_refs(&journal, frontier, &BTreeSet::new())
+            historical_cas_refs(&sqlite, frontier, &BTreeSet::new())
                 .await
                 .is_err()
         );

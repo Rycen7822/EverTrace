@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Test-only fault-injection surface for integration tests.
+test-utils = []
+
 [dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
@@ -12,9 +16,11 @@ evertrace-capture = { path = "../evertrace-capture" }
 evertrace-domain = { path = "../evertrace-domain" }
 fs2.workspace = true
 lancedb.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

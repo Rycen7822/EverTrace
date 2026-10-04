@@ -1795,15 +1795,7 @@ async fn frozen_memory_export_maps_to_l0_pending_proposal_and_provenance() {
     assert_eq!(reopened.project().await.unwrap(), replayed);
     reopened.full_projection().await.unwrap();
     assert_eq!(reopened.project().await.unwrap(), replayed);
-    assert_eq!(
-        reopened.table_names().await.unwrap(),
-        [
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
-    );
+    assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3431,13 +3423,5 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(reopened.project().await.unwrap(), projected);
     reopened.full_projection().await.unwrap();
     assert_eq!(reopened.project().await.unwrap(), projected);
-    assert_eq!(
-        reopened.table_names().await.unwrap(),
-        [
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
-    );
+    assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
 }

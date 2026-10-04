@@ -40,8 +40,8 @@ use evertrace_engine::{
 };
 use evertrace_store::{
     CompatibilityStore, DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft,
-    JournalPayload, JournalWriter, OBJECTS_TABLE, SourceIngestWatermark, StoreError,
-    objects_schema, reduce_journal,
+    JournalPayload, JournalWriter, SourceIngestWatermark, StoreError, objects_schema,
+    reduce_journal,
     relations::{PhysicalRelationKind, build_physical_relation_rows},
     repository::RepositoryCurrentView,
 };
@@ -2741,12 +2741,7 @@ async fn production_tables_stay_at_the_four_l0002_tables() {
     harness.refresh(&canonical(&repo)).await;
     assert_eq!(
         harness.writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
+        vec!["evertrace_search"]
     );
 
     // A wrong-schema partial L0002 table makes opening the store fail closed.
@@ -2854,16 +2849,5 @@ async fn object_rows_only_use_s11_object_kinds_for_repository_data() {
         let row_id = format!("object:work:repository:{}", repository.repository_id);
         assert!(rows.iter().any(|row| row.row_id == row_id));
     }
-    let reader = CompatibilityStore::connect_local(&evertrace_store::connection::native_root(
-        &harness.temp.path().join("store"),
-    ))
-    .await
-    .unwrap();
-    let objects = reader
-        .connection()
-        .open_table(OBJECTS_TABLE)
-        .execute()
-        .await
-        .unwrap();
-    assert!(objects.version().await.unwrap() > 0);
+    assert!(!harness.writer.object_rows().await.unwrap().is_empty());
 }

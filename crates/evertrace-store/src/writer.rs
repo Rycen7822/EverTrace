@@ -5,7 +5,7 @@ use std::{
     io,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use fs2::FileExt;
@@ -13,23 +13,20 @@ use lancedb::{Connection, Table};
 
 use crate::{
     command::{CommitOutcome, JournalCommand, JournalPayload, StoreError, prepare_command},
+    connection::StoreReadHandle,
     journal::{
-        JOURNAL_TABLE, StartupJournal, append_rows, read_all_journal_rows, read_command_rows,
-        read_commands_rows, read_journal_frontier, replay_outcome, rows_for_append,
-        validate_complete_command,
+        JournalRow, replay_outcome, rows_for_append, validate_complete_command,
+        validate_journal_rows,
     },
     migrations::{L0002, MigrationOutcome},
-    objects::{
-        OBJECTS_TABLE, ObjectRow, checkpoint_from_rows, read_object_checkpoint, read_object_rows,
-        read_object_rows_filtered, validate_objects_table,
-    },
+    objects::{ObjectRow, checkpoint_from_rows},
     projections::{
         JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
         ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
     },
     query::L0002ProjectionWorker,
-    relations::RELATIONS_TABLE,
     search::SEARCH_TABLE,
+    sqlite_state::{SqliteHandle, SqliteStamp, SqliteState},
 };
 
 /// Existing native handles only: no replay, projection repair, or content verification.
@@ -121,70 +118,7 @@ pub struct NormalSearchCandidateRequest {
 /// A transient replay read bound, not a persistent journal index.
 pub const MAX_COMMITTED_COMMAND_READ: usize = 64;
 
-const NORMAL_SEARCH_ROUTE_SCOPE_KINDS: &[&str] = &[
-    "task",
-    "workstream",
-    "work_episode",
-    "attempt",
-    "atom_revision",
-    "experiment_run",
-    "work_artifact",
-    "scenario",
-    "work_binding",
-    "result_evidence",
-];
-
-const NORMAL_SEARCH_ROUTE_GLOBAL_KINDS: &[&str] = &["work_checkpoint"];
 const NORMAL_SEARCH_CLOSURE_ROUNDS: usize = 8;
-
-fn normal_search_sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn normal_search_kinds_predicate(kinds: &[&str]) -> String {
-    let values = kinds
-        .iter()
-        .map(|kind| normal_search_sql_literal(kind))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("row_kind = 'data' AND object_kind IN ({values})")
-}
-
-async fn normal_search_route_scope_rows(
-    table: &Table,
-    task_id: Option<evertrace_domain::ids::TaskId>,
-    repository_id: Option<evertrace_domain::ids::RepositoryId>,
-    worktree_id: Option<evertrace_domain::ids::WorktreeId>,
-) -> Result<Vec<ObjectRow>, StoreError> {
-    let scope = [
-        task_id.map(|id| format!("task_id = {}", normal_search_sql_literal(&id.to_string()))),
-        repository_id.map(|id| {
-            format!(
-                "repository_id = {}",
-                normal_search_sql_literal(&id.to_string())
-            )
-        }),
-        worktree_id.map(|id| {
-            format!(
-                "worktree_id = {}",
-                normal_search_sql_literal(&id.to_string())
-            )
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    if scope.is_empty() {
-        return Ok(Vec::new());
-    }
-    let scoped = normal_search_kinds_predicate(NORMAL_SEARCH_ROUTE_SCOPE_KINDS);
-    let global = normal_search_kinds_predicate(NORMAL_SEARCH_ROUTE_GLOBAL_KINDS);
-    read_object_rows_filtered(
-        table,
-        format!("(({scoped}) AND ({})) OR ({global})", scope.join(" OR ")),
-    )
-    .await
-}
 
 fn normal_search_validate_candidate_request(
     candidate: &NormalSearchCandidateRequest,
@@ -286,10 +220,10 @@ fn normal_search_linked_references(
 ) -> Result<BTreeSet<String>, StoreError> {
     let mut references = normal_search_proposal_references(rows)?;
     // Route evaluation already gets its task/workstream/episode closure from
-    // the scoped native read below. It consumes the current procedure usage
-    // reducer, not historical Operation/ScopeEffect/HostOccurrence chains;
-    // those families are neither materialized by this exact-reference reader
-    // nor inputs to route_search_rows or begin_procedure_usage.
+    // the scoped read below. It consumes the current procedure usage reducer,
+    // not historical Operation/ScopeEffect/HostOccurrence chains; those
+    // families are neither materialized by this exact-reference reader nor
+    // inputs to route_search_rows or begin_procedure_usage.
     for row in rows
         .iter()
         .filter(|row| row.row_kind == crate::ObjectRowKind::Data)
@@ -507,6 +441,11 @@ impl SiblingWriterLock {
 
 #[derive(Debug)]
 pub struct ClosedJournalWriter {
+    readers: StoreReadHandle,
+    /// Held from physical close until the reopened writer is installed; it
+    /// blocks new readers for the whole closed backup window.
+    guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    // Declared last: the sibling lock outlives the closed read binding.
     pub(crate) lock: SiblingWriterLock,
 }
 
@@ -514,45 +453,83 @@ const MAX_PROJECTION_HANDOFF_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct ProjectionValidation {
-    // These versions bind the checkpoint/generation and full rows validated by
-    // the existing workers. No full current-row set or reducer state is retained.
-    versions: [u64; 4],
+    // The physical stamp already binds the connection incarnation, observed
+    // external data_version, every family's successful commit epoch and the
+    // real committed checkpoints/generations.
+    stamp: SqliteStamp,
+    // Full-projection stamps additionally bind the real search native version.
+    search_version: u64,
     frontier: u64,
     has_failed_job: bool,
     // Last confirmed append, not a claim that the old objects or indexes have
-    // advanced. Each retained successor is bound to its committed frontier.
-    appended_through: Option<(u64, u64)>,
-    // At most one small immutable batch. Multiple appends use the ordinary
-    // journal delta read without retaining or concatenating their batches.
-    appended_batch: Option<arrow_array::RecordBatch>,
+    // advanced. Each retained successor is bound to the input stamp plus the
+    // committed frontier it appended.
+    appended_through: Option<(SqliteStamp, u64)>,
+    // At most one small typed delta. Multiple appends use the ordinary
+    // journal delta read without retaining or concatenating their rows.
+    appended_rows: Option<Vec<crate::JournalRow>>,
+}
+
+impl ProjectionValidation {
+    fn objects_bound(&self, other: &SqliteStamp) -> bool {
+        self.stamp.incarnation == other.incarnation
+            && self.stamp.data_version == other.data_version
+            && self.stamp.journal_epoch == other.journal_epoch
+            && self.stamp.frontier == other.frontier
+            && self.stamp.objects_epoch == other.objects_epoch
+            && self.stamp.object_checkpoint == other.object_checkpoint
+            && self.stamp.object_generation == other.object_generation
+    }
+
+    fn appended_successor_bound(&self, other: &SqliteStamp) -> bool {
+        self.appended_through
+            .as_ref()
+            .is_some_and(|(input, frontier)| {
+                input.incarnation == other.incarnation
+                    && input.data_version == other.data_version
+                    && input.objects_epoch == other.objects_epoch
+                    && input.object_checkpoint == other.object_checkpoint
+                    && input.object_generation == other.object_generation
+                    && *frontier == other.frontier
+            })
+    }
 }
 
 pub struct JournalWriter {
-    _lock: SiblingWriterLock,
-    connection: Connection,
-    journal: Table,
-    objects: Table,
-    relations: Table,
+    sqlite: SqliteHandle,
     search: Table,
+    connection: Connection,
+    readers: StoreReadHandle,
     next_seq: u64,
     admission_state: JournalAdmissionState,
-    // Negative lookups only, derived from the journal already validated at open.
-    // A changed table version or uncertain append falls back to the journal.
-    command_ids: Option<(u64, BTreeSet<evertrace_domain::ids::CommandId>)>,
     migration_outcome: MigrationOutcome,
-    // Keep directory inodes alive so replacement cannot reuse their identity.
+    // Keep the search table directory inode alive so replacement cannot reuse
+    // its identity. The SQLite side revalidates its own file/directory.
     projection_directories: Vec<(PathBuf, File)>,
     // Objects and all mandatory projections have separate successful stamps.
     projection_validation: Mutex<[Option<ProjectionValidation>; 2]>,
+    // Declared last: the sibling lock must be released only after the native
+    // and SQLite bindings of this writer have been dropped.
+    _lock: SiblingWriterLock,
 }
 
 impl JournalWriter {
-    pub const fn frontier(&self) -> u64 {
-        self.next_seq.saturating_sub(1)
+    /// The persisted committed frontier. Reserved sequence numbers are not a
+    /// frontier and may leave legal gaps.
+    pub fn frontier(&self) -> u64 {
+        self.admission_state.committed_frontier()
     }
 
     pub fn projection_worker(&self) -> ProjectionWorker {
-        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
+        ProjectionWorker::new(Arc::clone(&self.sqlite))
+    }
+
+    pub(crate) fn l0002_projection_worker(&self) -> L0002ProjectionWorker {
+        L0002ProjectionWorker::new(Arc::clone(&self.sqlite), self.search.clone())
+    }
+
+    pub fn read_handle(&self) -> StoreReadHandle {
+        self.readers.clone()
     }
 
     /// Select GC candidates from already validated journal admission state.
@@ -566,7 +543,7 @@ impl JournalWriter {
         limit: usize,
     ) -> Result<Vec<crate::projections::RecallCurrentContext>, StoreError> {
         self.admission_state
-            .recall_current_contexts(self.next_seq.saturating_sub(1), limit)
+            .recall_current_contexts(self.frontier(), limit)
     }
 
     pub fn session_import_context(
@@ -636,227 +613,176 @@ impl JournalWriter {
 
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
         let lock = SiblingWriterLock::acquire(data_dir)?;
-        Self::open_with_lock(lock).await
+        let readers = StoreReadHandle::open(data_dir);
+        Self::open_with_lock(lock, readers).await
     }
 
-    pub(crate) async fn open_with_lock(lock: SiblingWriterLock) -> Result<Self, StoreError> {
+    /// Reopen the same store on a lock and read handle carried across a closed
+    /// backup window; the new physical incarnation replaces the old one.
+    pub(crate) async fn open_with_lock(
+        lock: SiblingWriterLock,
+        readers: StoreReadHandle,
+    ) -> Result<Self, StoreError> {
         let data_dir = lock.data_dir().to_owned();
         crate::restore::reject_retained_upgrade_candidate(&data_dir)
             .map_err(|_| StoreError::UpgradeRequired)?;
         crate::connection::prepare_native_root(&data_dir)?;
-        let native = crate::connection::native_root(&data_dir);
         lock.validate_held()?;
         let session = crate::connection::native_session();
-        let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
-            .session(session.clone())
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let mut startup = Self::read_existing_journal(&connection, &native).await?;
-        if let Some(journal) = &mut startup
-            && Self::journal_profile(journal)? == Some("L0001")
-        {
-            return Err(StoreError::UpgradeRequired);
-        }
-        let writer = Self::open_on_connection(lock, &native, connection, startup).await?;
+        let connection = lancedb::connect(
+            crate::connection::native_root(&data_dir)
+                .to_str()
+                .ok_or(StoreError::InvalidPath)?,
+        )
+        .session(session.clone())
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+        let writer = Self::open_on_connection(lock, &data_dir, connection, readers).await?;
         // Startup validates the entire native history. Keep its metadata from
         // occupying the long-lived writer cache after that work is complete.
         session.file_metadata_cache().clear().await;
         Ok(writer)
     }
 
-    pub(crate) async fn existing_profile(
-        data_dir: &Path,
-    ) -> Result<Option<&'static str>, StoreError> {
-        if !Self::journal_exists(data_dir)? {
-            return Ok(None);
-        }
-        let connection = lancedb::connect(data_dir.to_str().ok_or(StoreError::InvalidPath)?)
-            .session(crate::connection::native_session())
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        match Self::read_existing_journal(&connection, data_dir).await? {
-            Some(mut journal) => Self::journal_profile(&mut journal),
-            None => Ok(None),
-        }
-    }
-
-    async fn read_existing_journal(
-        connection: &Connection,
-        data_dir: &Path,
-    ) -> Result<Option<StartupJournal>, StoreError> {
-        if !Self::journal_exists(data_dir)? {
-            return Ok(None);
-        }
-        let journal = connection
-            .open_table(JOURNAL_TABLE)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        Ok(Some(StartupJournal::read(journal).await?))
-    }
-
-    fn journal_exists(data_dir: &Path) -> Result<bool, StoreError> {
-        let path = data_dir.join(format!("{JOURNAL_TABLE}.lance"));
+    /// Whether the physical store database exists at all, without creating it.
+    pub(crate) fn store_database_exists(data_dir: &Path) -> Result<bool, StoreError> {
+        let path = crate::connection::sqlite_path(data_dir);
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(_) => Err(StoreError::Io),
-            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
                 Err(StoreError::StoreCorrupt)
             }
             Ok(_) => Ok(true),
         }
     }
 
-    fn journal_profile(journal: &mut StartupJournal) -> Result<Option<&'static str>, StoreError> {
-        let rows = &journal.rows;
-        drop(JournalAdmissionState::from_journal_rows(rows)?);
-        journal.requires_admission_validation = true;
-        let populated = !rows.is_empty();
-        let mut profile = None;
-        for row in rows {
-            if let JournalPayload::MigrationApplied(migration) = row.payload()? {
-                match migration.migration_id.as_str() {
-                    "L0001" if profile.is_none() => profile = Some("L0001"),
-                    "L0002" if profile == Some("L0001") => profile = Some("L0002"),
-                    _ => return Err(StoreError::StoreCorrupt),
-                }
-            }
-        }
-        if populated && profile.is_none() {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Ok(profile)
-    }
-
-    async fn open_at_with_lock(
+    pub(crate) async fn open_at_with_lock(
         lock: SiblingWriterLock,
-        native_dir: &Path,
+        data_dir: &Path,
+        readers: StoreReadHandle,
     ) -> Result<Self, StoreError> {
         lock.validate_held()?;
-        let connection = lancedb::connect(native_dir.to_str().ok_or(StoreError::InvalidPath)?)
-            .session(crate::connection::native_session())
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        Self::open_on_connection(lock, native_dir, connection, None).await
+        let connection = lancedb::connect(
+            crate::connection::native_root(data_dir)
+                .to_str()
+                .ok_or(StoreError::InvalidPath)?,
+        )
+        .session(crate::connection::native_session())
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+        Self::open_on_connection(lock, data_dir, connection, readers).await
     }
 
     async fn open_on_connection(
         lock: SiblingWriterLock,
-        native_dir: &Path,
+        data_dir: &Path,
         connection: Connection,
-        mut startup: Option<StartupJournal>,
+        readers: StoreReadHandle,
     ) -> Result<Self, StoreError> {
         lock.validate_held()?;
-        let migration_outcome = L0002::apply_with_journal(&connection, &mut startup).await?;
-        let mut projection_directories = Vec::with_capacity(5);
-        for path in std::iter::once(native_dir.to_owned()).chain(
-            [JOURNAL_TABLE, OBJECTS_TABLE, RELATIONS_TABLE, SEARCH_TABLE]
-                .map(|table| native_dir.join(format!("{table}.lance"))),
-        ) {
-            let located = fs::symlink_metadata(&path).map_err(|_| StoreError::StoreCorrupt)?;
-            let file = File::open(&path).map_err(|_| StoreError::StoreCorrupt)?;
-            let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
-            if !located.is_dir()
-                || located.file_type().is_symlink()
-                || (located.dev(), located.ino()) != (held.dev(), held.ino())
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            projection_directories.push((path, file));
-        }
-        let mut startup = startup.ok_or(StoreError::StoreCorrupt)?;
-        startup.refresh().await?;
-        let journal = startup.table.clone();
-        let objects = connection
-            .open_table(OBJECTS_TABLE)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let relations = connection
-            .open_table(RELATIONS_TABLE)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
+        let sqlite = SqliteState::open(data_dir)?.handle();
+        let migration_outcome = L0002::apply(&sqlite, &connection).await?;
         let search = connection
             .open_table(SEARCH_TABLE)
             .execute()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        validate_objects_table(&objects).await?;
-        let admission_state = JournalAdmissionState::from_journal_rows(&startup.rows)?;
-        let journal_rows = &startup.rows;
-        let command_ids = Some((
-            startup.version,
-            journal_rows.iter().map(|row| row.command_id).collect(),
-        ));
-        let next_seq = journal_rows
-            .iter()
-            .map(|row| row.seq)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(StoreError::StoreCorrupt)?;
-        let journal_version = startup.version;
-        drop(startup);
-        let writer = Self {
+        crate::search::read_search_rows(&search).await?;
+        let native_dir = crate::connection::native_root(data_dir);
+        let path = native_dir.join(format!("{SEARCH_TABLE}.lance"));
+        let located = fs::symlink_metadata(&path).map_err(|_| StoreError::StoreCorrupt)?;
+        let file = File::open(&path).map_err(|_| StoreError::StoreCorrupt)?;
+        let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
+        if !located.is_dir()
+            || located.file_type().is_symlink()
+            || (located.dev(), located.ino()) != (held.dev(), held.ino())
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let projection_directories = vec![(path, file)];
+        let (admission_state, next_seq) = {
+            let state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            let rows = state.rows()?;
+            let admission_state = JournalAdmissionState::from_journal_rows(&rows)?;
+            let next_seq = rows
+                .last()
+                .map(|row| row.seq)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(StoreError::StoreCorrupt)?;
+            (admission_state, next_seq)
+        };
+        readers.publish_writer_binding(connection.clone(), &sqlite)?;
+        Ok(Self {
             _lock: lock,
-            connection,
-            journal,
-            objects,
-            relations,
+            sqlite,
             search,
+            connection,
+            readers,
             next_seq,
             admission_state,
-            command_ids,
             migration_outcome,
             projection_directories,
             projection_validation: Mutex::new([None, None]),
-        };
-        if writer.projection_versions(true).await?[0] != journal_version {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Ok(writer)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_handle(&self) -> crate::sqlite_state::SqliteHandle {
+        self.sqlite.clone()
+    }
+
+    fn lock_sqlite(&self) -> Result<MutexGuard<'_, SqliteState>, StoreError> {
+        self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)
+    }
+
+    fn physical_stamp(&self) -> Result<SqliteStamp, StoreError> {
+        self.lock_sqlite()?.stamp()
     }
 
     pub async fn read_diagnostics(&self) -> NativeDiagnostics {
-        let journal_checkpoint = self.diagnostic_journal_frontier().await;
-        let validated_objects = validate_objects_table(&self.objects).await;
+        let journal_checkpoint = self.physical_stamp().map(|stamp| stamp.frontier);
+        let validated_objects = self.lock_sqlite().and_then(|state| state.object_rows());
         let object_checkpoint = match &validated_objects {
             Ok(rows) => checkpoint_from_rows(rows),
-            Err(_) => read_object_checkpoint(&self.objects).await,
+            Err(_) => self
+                .lock_sqlite()
+                .and_then(|state| state.object_checkpoint_row())
+                .map(|checkpoint| checkpoint.map(|(frontier, _)| frontier).unwrap_or(0)),
         };
-        let mut tables = Vec::with_capacity(4);
-        for (table, expected, checkpoint) in [
-            (
-                &self.journal,
-                crate::journal::journal_schema(),
-                journal_checkpoint,
-            ),
-            (
-                &self.objects,
-                crate::objects::objects_schema(),
-                object_checkpoint,
-            ),
-            (
-                &self.relations,
-                crate::relations::relations_schema(),
-                crate::relations::read_relation_checkpoint(&self.relations).await,
-            ),
-            (
-                &self.search,
-                crate::search::search_schema(),
-                crate::search::read_search_checkpoint(&self.search).await,
-            ),
-        ] {
-            tables.push(NativeDiagnosticTable {
-                schema_matches: table.schema().await.ok().map(|schema| schema == expected),
-                version: table.version().await.ok(),
-                checkpoint: checkpoint.ok(),
-            });
-        }
+        let relation_checkpoint = self
+            .lock_sqlite()
+            .and_then(|state| state.relation_checkpoint_row())
+            .map(|checkpoint| checkpoint.map(|(frontier, _)| frontier).unwrap_or(0));
+        let search_checkpoint = crate::search::read_search_checkpoint(&self.search).await;
+        let search_version = self.search.version().await.ok();
+        let search_schema = self.search.schema().await.ok();
+        let tables = vec![
+            NativeDiagnosticTable {
+                schema_matches: Some(true),
+                version: None,
+                checkpoint: journal_checkpoint.ok(),
+            },
+            NativeDiagnosticTable {
+                schema_matches: Some(true),
+                version: None,
+                checkpoint: object_checkpoint.ok(),
+            },
+            NativeDiagnosticTable {
+                schema_matches: Some(true),
+                version: None,
+                checkpoint: relation_checkpoint.ok(),
+            },
+            NativeDiagnosticTable {
+                schema_matches: search_schema
+                    .map(|schema| schema == crate::search::search_schema()),
+                version: search_version,
+                checkpoint: search_checkpoint.ok(),
+            },
+        ];
         let objects = tables[1].checkpoint.and_then(|frontier| {
             validated_objects
                 .ok()
@@ -876,99 +802,163 @@ impl JournalWriter {
         }
     }
 
-    async fn diagnostic_journal_frontier(&self) -> Result<u64, StoreError> {
-        let Ok(frontier) = self.normal_search_admission_frontier() else {
-            return read_journal_frontier(&self.journal).await;
-        };
-        self.validate_projection_directories(false)?;
-        self.journal
-            .checkout_latest()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let native_version = self
-            .journal
+    pub async fn backup_table_states(&self) -> Result<crate::BackupTableStates, StoreError> {
+        let stamp = self.physical_stamp()?;
+        let search_checkpoint = crate::search::read_search_checkpoint(&self.search).await?;
+        let search_version = self
+            .search
             .version()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        self.validate_projection_directories(false)?;
-        if self.command_ids.as_ref().map(|(version, _)| *version) == Some(native_version) {
-            Ok(frontier)
-        } else {
-            read_journal_frontier(&self.journal).await
-        }
-    }
-
-    pub async fn backup_table_states(&self) -> Result<crate::BackupTableStates, StoreError> {
-        let journal_checkpoint = read_journal_frontier(&self.journal).await?;
-        let object_checkpoint = read_object_checkpoint(&self.objects).await?;
-        let relation_checkpoint =
-            crate::relations::read_relation_checkpoint(&self.relations).await?;
-        let search_checkpoint = crate::search::read_search_checkpoint(&self.search).await?;
+        let relation_generation = self
+            .lock_sqlite()?
+            .relation_checkpoint_row()?
+            .map(|(_, generation)| generation)
+            .unwrap_or(1);
         Ok(crate::BackupTableStates {
             journal: crate::BackupTableState {
-                version: self
-                    .journal
-                    .version()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?,
-                checkpoint: journal_checkpoint,
+                version: None,
+                checkpoint: stamp.frontier,
+                projection_generation: None,
             },
             objects: crate::BackupTableState {
-                version: self
-                    .objects
-                    .version()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?,
-                checkpoint: object_checkpoint,
+                version: None,
+                checkpoint: stamp.object_checkpoint,
+                projection_generation: Some(stamp.object_generation),
             },
             relations: Some(crate::BackupTableState {
-                version: self
-                    .relations
-                    .version()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?,
-                checkpoint: relation_checkpoint,
+                version: None,
+                checkpoint: stamp.relation_checkpoint,
+                projection_generation: Some(relation_generation),
             }),
             search: Some(crate::BackupTableState {
-                version: self
-                    .search
-                    .version()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?,
+                version: Some(search_version),
                 checkpoint: search_checkpoint,
+                projection_generation: Some(crate::search::SEARCH_PROJECTION_GENERATION),
             }),
         })
     }
 
-    pub fn close_for_backup(self) -> ClosedJournalWriter {
+    /// Drain every external reader lease, checkpoint the WAL with TRUNCATE and
+    /// actually close the physical connection. `Some(guard)` means the store is
+    /// confirmed closed and the guard must be held until the reopened writer is
+    /// installed. `None` means SQLite explicitly reported the checkpoint busy:
+    /// this backup failed, but the writer keeps its open database, published
+    /// read binding and Lance connection. An unknown checkpoint/close/identity
+    /// failure revokes the binding and fails closed.
+    pub async fn quiesce_for_backup(
+        &mut self,
+    ) -> Result<Option<tokio::sync::OwnedRwLockWriteGuard<()>>, StoreError> {
+        let guard = self.readers.quiesce().await;
+        match self
+            .lock_sqlite()
+            .and_then(|mut state| state.checkpoint_and_close())
+        {
+            Ok(true) => {
+                // Only a confirmed physical close revokes the binding; readers
+                // that arrive during the closed window are still blocked by the
+                // guard and bind again when the reopened writer publishes its
+                // new incarnation.
+                self.readers.revoke();
+                Ok(Some(guard))
+            }
+            Ok(false) => {
+                // A known-busy checkpoint is one ordinary failed backup: the
+                // open connection, its binding and the native handle stay
+                // usable for later commands and backups.
+                drop(guard);
+                Ok(None)
+            }
+            Err(error) => {
+                // Unknown physical state: no reader may keep observing it.
+                self.readers.revoke();
+                drop(guard);
+                Err(error)
+            }
+        }
+    }
+
+    /// Terminal cleanup for the writer actor. Wait for every real reader (and
+    /// block new ones), revoke the read binding, close the physical SQLite
+    /// connection without a normal checkpoint, release the native handles, and
+    /// only then release the sibling lock. This is not a backup path: the
+    /// closed-backup window uses `quiesce_for_backup`/`close_for_backup`.
+    pub async fn shutdown(self) -> Result<(), StoreError> {
+        let guard = self.readers.quiesce().await;
         let Self {
-            _lock: lock,
-            connection,
-            journal,
-            objects,
-            relations,
+            sqlite,
             search,
+            connection,
+            readers,
             next_seq,
             admission_state,
-            command_ids,
             migration_outcome,
             projection_directories,
             projection_validation,
+            _lock,
         } = self;
+        readers.revoke();
+        let closed = match sqlite.lock() {
+            Ok(mut state) => state.close_connection(),
+            Err(_) => Err(StoreError::StoreCorrupt),
+        };
+        // Drop the native and SQLite bindings while the fence is still held;
+        // the sibling lock is released last.
         drop((
-            connection,
-            journal,
-            objects,
-            relations,
             search,
+            connection,
             next_seq,
             admission_state,
-            command_ids,
             migration_outcome,
             projection_directories,
             projection_validation,
         ));
-        ClosedJournalWriter { lock }
+        drop(sqlite);
+        drop(readers);
+        drop(guard);
+        drop(_lock);
+        closed
+    }
+
+    pub fn close_for_backup(
+        self,
+        guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    ) -> Result<ClosedJournalWriter, StoreError> {
+        let Self {
+            _lock: lock,
+            sqlite,
+            search,
+            connection,
+            readers,
+            next_seq,
+            admission_state,
+            migration_outcome,
+            projection_directories,
+            projection_validation,
+        } = self;
+        readers.revoke();
+        drop((
+            search,
+            connection,
+            next_seq,
+            admission_state,
+            migration_outcome,
+            projection_directories,
+            projection_validation,
+        ));
+        let state = Arc::try_unwrap(sqlite)
+            .map_err(|_| StoreError::Io)?
+            .into_inner()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        if state.has_open_connection() {
+            return Err(StoreError::Io);
+        }
+        drop(state);
+        Ok(ClosedJournalWriter {
+            lock,
+            readers,
+            guard: Some(guard),
+        })
     }
 
     pub const fn migration_outcome(&self) -> MigrationOutcome {
@@ -994,13 +984,9 @@ impl JournalWriter {
             .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
         self.validate_restore_lock()?;
         let objects = self.projection_worker().rebuild_for_restore().await?;
-        crate::query::L0002ProjectionWorker::new(
-            self.journal.clone(),
-            self.relations.clone(),
-            self.search.clone(),
-        )
-        .rebuild_for_restore(&objects)
-        .await?;
+        self.l0002_projection_worker()
+            .rebuild_for_restore(&objects)
+            .await?;
         self.validate_restore_lock()
     }
 
@@ -1023,8 +1009,8 @@ impl JournalWriter {
                 .apply_row_batch(&rows.iter().collect::<Vec<_>>())?;
             self.validate_restore_lock()?;
             reserve_range(&mut self.next_seq, prepared.event_count)?;
-            self.command_ids = None;
-            append_rows(&self.journal, &rows).await?;
+            self.lock_sqlite()?.append_command_rows(&rows)?;
+            self._lock.validate_held()?;
             self.admission_state = admission;
         }
         Ok(())
@@ -1052,7 +1038,7 @@ impl JournalWriter {
         &self,
         command_id: evertrace_domain::ids::CommandId,
     ) -> Result<Option<CommittedCommand>, StoreError> {
-        let rows = self.existing_command_rows(command_id).await?;
+        let rows = self.existing_command_rows(command_id)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -1066,47 +1052,31 @@ impl JournalWriter {
         if command_ids.len() > MAX_COMMITTED_COMMAND_READ {
             return Err(StoreError::StoreCorrupt);
         }
-        let mut ids = command_ids.iter().copied().collect::<BTreeSet<_>>();
-        if let Some((version, known)) = &self.command_ids
-            && self
-                .journal
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                == *version
-        {
-            ids.retain(|id| known.contains(id));
-        }
-        let rows =
-            read_commands_rows(&self.journal, &ids.iter().copied().collect::<Vec<_>>()).await?;
+        // The journal is the SQL index: no retained in-memory id set and no
+        // separate command index to keep in sync.
+        let ids = command_ids.iter().copied().collect::<BTreeSet<_>>();
+        let state = self.lock_sqlite()?;
         let mut grouped = BTreeMap::<_, Vec<_>>::new();
-        for row in rows {
-            grouped.entry(row.command_id).or_default().push(row);
+        for id in ids {
+            let rows = state.committed_rows(id)?;
+            if !rows.is_empty() {
+                grouped.insert(id, rows);
+            }
         }
+        drop(state);
         grouped
             .into_iter()
             .map(|(id, rows)| Ok((id, decode_committed_command(rows)?)))
             .collect()
     }
 
-    async fn existing_command_rows(
+    fn existing_command_rows(
         &self,
         command_id: evertrace_domain::ids::CommandId,
     ) -> Result<Vec<crate::JournalRow>, StoreError> {
-        if let Some((version, ids)) = &self.command_ids
-            && !ids.contains(&command_id)
-            && self
-                .journal
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                == *version
-        {
-            return Ok(Vec::new());
-        }
         // Positive/replay reads still validate actual persisted rows, not a
         // cached payload or acknowledgement.
-        read_command_rows(&self.journal, command_id).await
+        self.lock_sqlite()?.committed_rows(command_id)
     }
 
     async fn commit_inner(
@@ -1124,68 +1094,60 @@ impl JournalWriter {
             return Err(StoreError::InvalidInput);
         }
         let prepared = prepare_command(command)?;
-        let existing = self.existing_command_rows(prepared.command_id).await?;
+        // Persisted replay still requires a live, identity-bound store. Keep
+        // replay ahead of the logical expected-frontier comparison, but do
+        // not acknowledge rows through a replaced root or poisoned handle.
+        let live = self.physical_stamp()?;
+        let existing = self.existing_command_rows(prepared.command_id)?;
         if let Some(outcome) = replay_outcome(&existing, &prepared)? {
             return Ok(outcome);
         }
         if let Some(expected) = expected_frontier
-            && read_journal_frontier(&self.journal).await? != expected
+            && live.frontier != expected
         {
             return Err(StoreError::StaleFrontier);
         }
         let next_admission_state = self.admission_state.apply_command(command, self.next_seq)?;
         let first_seq = reserve_range(&mut self.next_seq, prepared.event_count)?;
         let rows = rows_for_append(&prepared, first_seq, ingested_at_us)?;
-        let version = self
-            .journal
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let known = self
-            .command_ids
-            .take()
-            .filter(|(known, _)| *known == version);
-        let stamps = self
-            .projection_validation
-            .get_mut()
-            .map_err(|_| StoreError::StoreCorrupt)?;
-        let validated_input = stamps[0]
+        let last_seq = rows.last().ok_or(StoreError::StoreCorrupt)?.seq;
+        let validated_input = {
+            let mut stamps = self
+                .projection_validation
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            // Clear before the commit, including uncertain failures. Only a
+            // confirmed direct successor may retain proof of the unchanged OLD
+            // objects input, never of the new frontier or synchronized indexes.
+            let input = stamps[0].take();
+            stamps[1] = None;
+            input
+        };
+        let handoff = validated_input
             .as_ref()
             .filter(|stamp| {
-                let (input_version, input_frontier) = stamp
-                    .appended_through
-                    .unwrap_or((stamp.versions[0], stamp.frontier));
-                known.is_some()
-                    && input_version == version
-                    && input_frontier == self.admission_state.committed_frontier()
+                stamp.appended_through.is_none()
+                    && rows.iter().map(|row| row.payload_json.len()).sum::<usize>()
+                        <= MAX_PROJECTION_HANDOFF_BYTES
             })
-            .cloned();
-        // Clear before the await, including uncertain append failures. Only a
-        // confirmed direct successor may retain proof of the unchanged OLD
-        // objects input, never of the new frontier or synchronized indexes.
-        *stamps = [None, None];
-        let (committed_version, batch) = append_rows(&self.journal, &rows).await?;
-        if version.checked_add(1) == Some(committed_version)
-            && let Some(mut stamp) = validated_input
+            .map(|_| rows.clone());
         {
-            stamp.appended_batch = (stamp.appended_through.is_none()
-                && batch.get_array_memory_size() <= MAX_PROJECTION_HANDOFF_BYTES)
-                .then_some(batch);
-            stamp.appended_through =
-                Some((committed_version, next_admission_state.committed_frontier()));
-            stamps[0] = Some(stamp);
+            let mut state = self.lock_sqlite()?;
+            state.append_command_rows(&rows)?;
         }
+        self._lock.validate_held()?;
         self.admission_state = next_admission_state;
-        if let Some((_, mut ids)) = known {
-            ids.insert(prepared.command_id);
-            // The native append already reports its committed version. A
-            // second, fallible read must not discard this successful proof.
-            self.command_ids = Some((committed_version, ids));
+        if let Some(mut input) = validated_input {
+            input.appended_through = Some((input.stamp, last_seq));
+            input.appended_rows = handoff;
+            self.projection_validation
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?[0] = Some(input);
         }
         Ok(CommitOutcome {
             command_id: prepared.command_id,
             first_seq,
-            last_seq: rows.last().ok_or(StoreError::StoreCorrupt)?.seq,
+            last_seq,
             event_ids: rows.into_iter().map(|row| row.event_id).collect(),
             replayed: false,
         })
@@ -1272,14 +1234,14 @@ impl JournalWriter {
         request: &crate::projections::ScopeCurrentRequest,
         candidate: Option<&NormalSearchCandidateRequest>,
     ) -> Result<NormalSearchReadContext, StoreError> {
-        // This bounded admission read does not open every objects row, but it
-        // still has to bind its in-memory stamp to the writer's held native
-        // root and table directories. Otherwise an external replacement could
-        // reuse the old versions/frontier while Search pins new native text.
+        // This bounded read does not open every objects row, but it still has
+        // to bind its in-memory stamp to the writer's held physical identity.
+        // Otherwise an external replacement could reuse the old epochs while
+        // Search pins new native text.
         self.validate_projection_directories(false)?;
         // Startup (and an uncertain append) has no reusable proof yet. Recover
         // it through the ordinary validated path before using admission facts;
-        // steady requests avoid that native table-version round trip.
+        // steady requests avoid that full projection round trip.
         if self
             .projection_validation
             .lock()
@@ -1288,11 +1250,11 @@ impl JournalWriter {
         {
             self.project_validated(false, false).await?;
         }
-        // Route facts are the one bounded Search closure still read directly
-        // from the native objects table. A Procedure candidate can arrive
-        // after an intervening committed command: admission is already current
-        // then, while that table may only carry the old confirmed input. Bring
-        // it to the held frontier before selecting route rows. On an unchanged
+        // Route facts are the one bounded Search closure read directly from
+        // the persisted objects table. A Procedure candidate can arrive after
+        // an intervening committed command: admission is already current then,
+        // while those rows may only carry the old confirmed input. Bring them
+        // to the held frontier before selecting route rows. On an unchanged
         // stamp this is the existing no-row validation hit; ordinary evidence
         // Search never takes this branch.
         if candidate.is_some_and(|candidate| candidate.include_procedure_route) {
@@ -1309,15 +1271,11 @@ impl JournalWriter {
                 candidate.include_derived_candidate_rows,
             )?);
             if candidate.include_procedure_route {
-                rows.extend(
-                    normal_search_route_scope_rows(
-                        &self.objects,
-                        candidate.task_id,
-                        candidate.repository_id,
-                        candidate.worktree_id,
-                    )
-                    .await?,
-                );
+                rows.extend(self.lock_sqlite()?.normal_search_route_scope_rows(
+                    candidate.task_id,
+                    candidate.repository_id,
+                    candidate.worktree_id,
+                )?);
             }
         }
         normal_search_dedup_rows(&mut rows)?;
@@ -1331,10 +1289,9 @@ impl JournalWriter {
         if self.normal_search_admission_frontier()? != frontier {
             return Err(StoreError::StoreCorrupt);
         }
-        // Match `projection_versions`' post-read identity boundary without a
-        // table-version or all-row read. A replacement during the selected
-        // native route read must fail closed instead of mixing its text with
-        // the admission facts above.
+        // Match `project_validated`'s post-read identity boundary without a
+        // full read. A replacement during the selected route read must fail
+        // closed instead of mixing its text with the admission facts above.
         self.validate_projection_directories(false)?;
         Ok(NormalSearchReadContext {
             frontier,
@@ -1347,7 +1304,8 @@ impl JournalWriter {
     /// the entire objects projection. The exclusive writer has either kept a
     /// fully validated stamp at this frontier, or retained a confirmed
     /// successor proof for an append whose old objects input is unchanged.
-    /// Any uncertain append clears that proof before awaiting native I/O.
+    /// Any uncertain append clears that proof before committing.
+    ///
     /// SearchIndex still pins and checks the authoritative journal frontier
     /// after its native read, so this does not treat the admission state as a
     /// substitute for search-index freshness.
@@ -1358,14 +1316,10 @@ impl JournalWriter {
             .map_err(|_| StoreError::StoreCorrupt)?[0]
             .clone()
             .ok_or(StoreError::StoreCorrupt)?;
-        let journal_version = self
-            .command_ids
-            .as_ref()
-            .map(|(version, _)| *version)
-            .ok_or(StoreError::StoreCorrupt)?;
+        let live = self.physical_stamp()?;
         let frontier = self.admission_state.committed_frontier();
-        if (stamp.versions[0] == journal_version && stamp.frontier == frontier)
-            || stamp.appended_through == Some((journal_version, frontier))
+        if (stamp.objects_bound(&live) && stamp.frontier == frontier)
+            || (stamp.appended_successor_bound(&live) && live.frontier == frontier)
         {
             return Ok(frontier);
         }
@@ -1395,13 +1349,14 @@ impl JournalWriter {
                 .map_err(|_| StoreError::StoreCorrupt)?[0]
                 .clone()
                 .ok_or(StoreError::StoreCorrupt)?;
-            if self.command_ids.as_ref().map(|(version, _)| *version) != Some(stamp.versions[0])
-                || self.admission_state.committed_frontier() != stamp.frontier
+            let live = self.physical_stamp()?;
+            if !(stamp.objects_bound(&live) || stamp.appended_successor_bound(&live))
+                || live.frontier != self.admission_state.committed_frontier()
             {
                 return Err(StoreError::StoreCorrupt);
             }
             let context = read(&self.admission_state, &stamp)?;
-            if self.projection_versions(false).await? != stamp.versions {
+            if self.physical_stamp()? != live {
                 return Err(StoreError::StoreCorrupt);
             }
             Ok(context)
@@ -1418,7 +1373,7 @@ impl JournalWriter {
 
     /// Synchronize all mandatory projections to the actual committed journal.
     /// Reserved sequence numbers are not a committed frontier. All projection
-    /// validation and per-table commits must succeed before this returns.
+    /// validation and per-family commits must succeed before this returns.
     pub async fn sync_frontier(&self) -> Result<u64, StoreError> {
         Ok(self.project_validated(true, false).await?.0)
     }
@@ -1432,39 +1387,20 @@ impl JournalWriter {
 
     fn validate_projection_directories(&self, indexes: bool) -> Result<(), StoreError> {
         self._lock.validate_held()?;
-        for (path, file) in self
-            .projection_directories
-            .iter()
-            .take(if indexes { 5 } else { 3 })
-        {
-            let located = fs::symlink_metadata(path).map_err(|_| StoreError::StoreCorrupt)?;
-            let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
-            if !located.is_dir()
-                || located.file_type().is_symlink()
-                || (located.dev(), located.ino()) != (held.dev(), held.ino())
-            {
-                return Err(StoreError::StoreCorrupt);
+        self.lock_sqlite()?.revalidate()?;
+        if indexes {
+            for (path, file) in &self.projection_directories {
+                let located = fs::symlink_metadata(path).map_err(|_| StoreError::StoreCorrupt)?;
+                let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
+                if !located.is_dir()
+                    || located.file_type().is_symlink()
+                    || (located.dev(), located.ino()) != (held.dev(), held.ino())
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
         }
         Ok(())
-    }
-
-    async fn projection_versions(&self, indexes: bool) -> Result<[u64; 4], StoreError> {
-        self.validate_projection_directories(indexes)?;
-        let mut versions = [0; 4];
-        for (index, table) in [&self.journal, &self.objects, &self.relations, &self.search]
-            .into_iter()
-            .take(if indexes { 4 } else { 2 })
-            .enumerate()
-        {
-            table
-                .checkout_latest()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            versions[index] = table.version().await.map_err(|_| StoreError::LanceDb)?;
-        }
-        self.validate_projection_directories(indexes)?;
-        Ok(versions)
     }
 
     async fn project_validated(
@@ -1473,7 +1409,16 @@ impl JournalWriter {
         return_rows: bool,
     ) -> Result<(u64, Option<ProjectionSnapshot>), StoreError> {
         let result = async {
-            let before = self.projection_versions(indexes).await?;
+            self.validate_projection_directories(indexes)?;
+            let before = self.physical_stamp()?;
+            let before_search = if indexes {
+                self.search
+                    .version()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?
+            } else {
+                0
+            };
             let stamps = self
                 .projection_validation
                 .lock()
@@ -1481,71 +1426,113 @@ impl JournalWriter {
                 .clone();
             let objects = stamps[0]
                 .as_ref()
-                .filter(|stamp| stamp.versions[..2] == before[..2]);
-            let validated_input = stamps[0].as_ref().filter(|stamp| {
-                stamp.appended_through
-                    == Some((before[0], self.admission_state.committed_frontier()))
-                    && stamp.versions[1] == before[1]
-                    && self
-                        .command_ids
-                        .as_ref()
-                        .is_some_and(|(version, _)| *version == before[0])
-            });
+                .filter(|stamp| stamp.objects_bound(&before));
+            let validated_input = stamps[0]
+                .as_ref()
+                .filter(|stamp| stamp.appended_successor_bound(&before));
             let validated_current = validated_input.map(|stamp| {
                 (
-                    stamp.versions[1],
-                    stamp.frontier,
-                    self.admission_state.committed_frontier(),
+                    stamp.stamp.objects_epoch,
+                    stamp.stamp.object_checkpoint,
+                    before.frontier,
                 )
             });
             let all = indexes
                 .then_some(stamps[1].as_ref())
                 .flatten()
-                .filter(|stamp| stamp.versions == before);
+                .filter(|stamp| stamp.stamp == before && stamp.search_version == before_search);
             let hit = if indexes { all } else { objects };
-            let mut validated_versions = before;
-            let (frontier, snapshot, has_failed_job) = if let Some(stamp) = hit {
+            let (frontier, snapshot, has_failed_job, search_version) = if let Some(stamp) = hit {
                 let snapshot = if return_rows {
                     Some(ProjectionSnapshot {
                         frontier: stamp.frontier,
-                        rows: read_object_rows(&self.objects).await?,
+                        rows: self.lock_sqlite()?.object_rows()?,
                     })
                 } else {
                     None
                 };
-                (stamp.frontier, snapshot, stamp.has_failed_job)
+                (
+                    stamp.frontier,
+                    snapshot,
+                    stamp.has_failed_job,
+                    stamp.search_version,
+                )
+            } else if let Some(stamp) = objects.filter(|_| !indexes) {
+                // Objects are already validated; only the derived families
+                // may still lag. Their worker consumes the complete expected
+                // snapshot, including large deltas.
+                let snapshot = ProjectionSnapshot {
+                    frontier: stamp.frontier,
+                    rows: self.lock_sqlite()?.object_rows()?,
+                };
+                let (_, versions) = self
+                    .l0002_projection_worker()
+                    .catch_up_validated(&snapshot, None)
+                    .await?;
+                let after = self.physical_stamp()?;
+                if after.incarnation != before.incarnation
+                    || after.frontier != before.frontier
+                    || after.journal_epoch != before.journal_epoch
+                    || after.objects_epoch != stamp.stamp.objects_epoch
+                    || after.relations_epoch != versions[0]
+                    || self
+                        .search
+                        .version()
+                        .await
+                        .map_err(|_| StoreError::LanceDb)?
+                        != versions[1]
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (
+                    snapshot.frontier,
+                    return_rows.then_some(snapshot),
+                    stamp.has_failed_job,
+                    versions[1],
+                )
             } else {
-                let (snapshot, delta) = if let Some(stamp) = objects {
+                let (snapshot, objects_epoch, delta) = if let Some(stamp) = objects {
                     (
                         ProjectionSnapshot {
                             frontier: stamp.frontier,
-                            rows: read_object_rows(&self.objects).await?,
+                            rows: self.lock_sqlite()?.object_rows()?,
                         },
+                        stamp.stamp.objects_epoch,
                         None,
                     )
                 } else {
-                    let (snapshot, version, delta) = self
-                        .projection_worker()
-                        .catch_up_validated(
-                            validated_current,
-                            validated_input.and_then(|stamp| stamp.appended_batch.as_ref()),
-                        )
-                        .await?;
-                    validated_versions[1] = version;
-                    (snapshot, delta)
+                    let appended = validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
+                    let worker = self.projection_worker();
+                    worker
+                        .catch_up_validated(validated_current, appended)
+                        .await?
                 };
-                if indexes {
-                    let (_, versions) = L0002ProjectionWorker::new(
-                        self.journal.clone(),
-                        self.relations.clone(),
-                        self.search.clone(),
-                    )
-                    .catch_up_validated(&snapshot, delta)
-                    .await?;
-                    validated_versions[2..].copy_from_slice(&versions);
-                } else {
-                    drop(delta);
+                let objects_stamp = self.physical_stamp()?;
+                if objects_stamp.objects_epoch != objects_epoch
+                    || objects_stamp.incarnation != before.incarnation
+                    || objects_stamp.journal_epoch != before.journal_epoch
+                    || objects_stamp.frontier != before.frontier
+                {
+                    return Err(StoreError::StoreCorrupt);
                 }
+                let search_version = if indexes {
+                    let worker = self.l0002_projection_worker();
+                    let (_, versions) = worker.catch_up_validated(&snapshot, delta).await?;
+                    if self.physical_stamp()?.relations_epoch != versions[0] {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    let search_version = self
+                        .search
+                        .version()
+                        .await
+                        .map_err(|_| StoreError::LanceDb)?;
+                    if search_version != versions[1] {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    search_version
+                } else {
+                    0
+                };
                 let has_failed_job =
                     crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
                         .jobs
@@ -1555,23 +1542,34 @@ impl JournalWriter {
                     snapshot.frontier,
                     return_rows.then_some(snapshot),
                     has_failed_job,
+                    search_version,
                 )
             };
-            let after = self.projection_versions(indexes).await?;
-            if validated_versions != after {
+            self.validate_projection_directories(indexes)?;
+            let after = self.physical_stamp()?;
+            if after.incarnation != before.incarnation
+                || after.data_version != before.data_version
+                || after.frontier != before.frontier
+                || after.journal_epoch != before.journal_epoch
+            {
                 return Err(StoreError::StoreCorrupt);
             }
-            // Workers bind validated rows to a full readback version or an
-            // ordinary objects upsert's verified native commit version.
-            // The journal must remain at the version used on entry;
-            // latest versions and held directory identities are checked above.
+            let search_version = if indexes {
+                self.search
+                    .version()
+                    .await
+                    .map_err(|_| StoreError::LanceDb)?
+            } else {
+                search_version
+            };
             {
                 let stamp = Some(ProjectionValidation {
-                    versions: validated_versions,
+                    stamp: after,
+                    search_version,
                     frontier,
                     has_failed_job,
                     appended_through: None,
-                    appended_batch: None,
+                    appended_rows: None,
                 });
                 let mut stamps = self
                     .projection_validation
@@ -1582,7 +1580,7 @@ impl JournalWriter {
                     stamps[1] = stamp;
                 } else if stamps[1]
                     .as_ref()
-                    .is_some_and(|stamp| stamp.versions[..2] != after[..2])
+                    .is_some_and(|stamp| !stamp.objects_bound(&after))
                 {
                     stamps[1] = None;
                 }
@@ -1617,27 +1615,20 @@ impl JournalWriter {
     }
 
     pub async fn full_projection(&self) -> Result<ProjectionSnapshot, StoreError> {
-        ProjectionWorker::new(self.journal.clone(), self.objects.clone())
+        ProjectionWorker::new(Arc::clone(&self.sqlite))
             .full_snapshot()
             .await
     }
 
     pub async fn journal_rows(&self) -> Result<Vec<crate::JournalRow>, StoreError> {
-        read_all_journal_rows(&self.journal).await
+        self.lock_sqlite()?.rows()
     }
 
-    pub fn llm_budget_page(
+    pub async fn project_at_frontier(
         &self,
-        day_start_us: i64,
-        after: u64,
         frontier: u64,
-    ) -> impl std::future::Future<Output = Result<Vec<crate::JournalRow>, StoreError>> + Send + use<>
-    {
-        let journal = self.journal.clone();
-        let frontier = frontier.min(self.frontier());
-        async move {
-            crate::journal::read_llm_budget_page(&journal, day_start_us, after, frontier).await
-        }
+    ) -> Result<ProjectionSnapshot, StoreError> {
+        self.projection_worker().project_at_frontier(frontier).await
     }
 
     pub async fn mark_gc(
@@ -1705,7 +1696,7 @@ impl JournalWriter {
         &self,
         candidates: &std::collections::BTreeSet<String>,
     ) -> Result<std::collections::BTreeSet<String>, StoreError> {
-        crate::optimize::historical_cas_refs(&self.journal, self.frontier(), candidates).await
+        crate::optimize::historical_cas_refs(&self.sqlite, self.frontier(), candidates).await
     }
 
     pub async fn sweep_gc(
@@ -1738,12 +1729,7 @@ impl JournalWriter {
         )?;
         drop(guard);
         self._lock.validate_held()?;
-        crate::optimize::conservative_prune(
-            self._lock.data_dir(),
-            [&self.journal, &self.objects, &self.relations, &self.search],
-            report,
-        )
-        .await
+        crate::optimize::conservative_prune(self._lock.data_dir(), &self.search, report).await
     }
 
     pub(crate) async fn gc_authority(
@@ -1825,17 +1811,19 @@ impl JournalWriter {
     }
 
     pub async fn object_rows(&self) -> Result<Vec<crate::ObjectRow>, StoreError> {
-        read_object_rows(&self.objects).await
+        self.lock_sqlite()?.object_rows()
     }
 
     pub async fn relation_rows(&self) -> Result<Vec<crate::RelationProjectionRow>, StoreError> {
-        crate::read_relation_rows(&self.relations).await
+        self.lock_sqlite()?.relation_rows()
     }
 
     pub async fn search_rows(&self) -> Result<Vec<crate::SearchProjectionRow>, StoreError> {
         crate::read_search_rows(&self.search).await
     }
 
+    /// The retired three Lance tables are gone; the native connection only
+    /// serves the search projection.
     pub async fn table_names(&self) -> Result<Vec<String>, StoreError> {
         self.connection
             .table_names()
@@ -1867,11 +1855,11 @@ impl ClosedJournalWriter {
         };
         let result = crate::backup::prepare_backup(
             (&data_dir, &crate::connection::native_root(&data_dir)),
-            &config_path,
-            &runtime,
+            (&config_path, &runtime),
             backup_job_id,
             &snapshot,
             table_states,
+            crate::backup::BackupShape::Current,
             boundary,
         )
         .and_then(crate::backup::stage_backup);
@@ -1916,16 +1904,18 @@ impl ClosedJournalWriter {
     pub fn discard_staged_backup(
         &self,
         staging: &crate::backup::BackupStaging,
-    ) -> Result<(), crate::BackupError> {
+    ) -> Result<(), crate::backup::BackupError> {
         crate::backup::discard_backup(staging)
     }
 
-    pub async fn reopen(self) -> Result<JournalWriter, StoreError> {
-        JournalWriter::open_with_lock(self.lock).await
+    pub async fn reopen(mut self) -> Result<JournalWriter, StoreError> {
+        let writer = JournalWriter::open_with_lock(self.lock, self.readers.clone()).await?;
+        drop(self.guard.take());
+        Ok(writer)
     }
 
     pub(crate) async fn open_restore_candidate(
-        self,
+        mut self,
         candidate: &Path,
     ) -> Result<JournalWriter, StoreError> {
         self.lock.validate_held()?;
@@ -1933,9 +1923,182 @@ impl ClosedJournalWriter {
             return Err(StoreError::InvalidPath);
         }
         crate::connection::prepare_native_root(candidate)?;
-        JournalWriter::open_at_with_lock(self.lock, &crate::connection::native_root(candidate))
-            .await
+        // The candidate is a different directory: it gets its own read binding
+        // rooted at the candidate path. The live handle stays revoked, so no
+        // reader can observe candidate rows under the live root identity.
+        let readers = StoreReadHandle::open(candidate);
+        let writer = JournalWriter::open_at_with_lock(self.lock, candidate, readers).await?;
+        drop(self.guard.take());
+        Ok(writer)
     }
+}
+
+/// The retired physical layouts accepted by the one-shot offline converter.
+/// The caller owns the candidate custody and the original sibling lock; this
+/// type never grants access to a live store.
+pub(crate) enum LegacyCandidate {
+    /// `<root>/store/` is the native directory (offline restore copy layout).
+    StateRoot(PathBuf),
+    /// The directory itself is the native directory (upgrade candidate).
+    Native(PathBuf),
+}
+
+impl LegacyCandidate {
+    fn open_state(&self) -> Result<SqliteState, StoreError> {
+        match self {
+            Self::StateRoot(root) => SqliteState::open(root),
+            Self::Native(native) => SqliteState::open_native(native),
+        }
+    }
+
+    fn native_dir(&self) -> PathBuf {
+        match self {
+            Self::StateRoot(root) => crate::connection::native_root(root),
+            Self::Native(native) => native.clone(),
+        }
+    }
+}
+
+/// Import one already-validated retired journal into a fresh candidate SQLite
+/// database, retire the copied old tables, then run the approved L0002
+/// migration/rebuild/FTS. This is the only bypass of writer admission and it is
+/// crate-private to the offline converter; it never renumbers markers or seq.
+pub(crate) async fn bootstrap_legacy_candidate(
+    candidate: &LegacyCandidate,
+    custody: &evertrace_capture::ConfinedRoot,
+    rows: &[JournalRow],
+) -> Result<(), StoreError> {
+    validate_journal_rows(rows)?;
+    let batches = ordered_legacy_commands(rows)?;
+    for batch in &batches {
+        validate_complete_command(batch)?;
+    }
+    JournalAdmissionState::from_journal_rows(rows)?;
+    let native = candidate.native_dir();
+    let mut state = candidate.open_state()?;
+    for batch in &batches {
+        state.append_command_rows(batch)?;
+    }
+    if state.rows()? != rows {
+        return Err(StoreError::StoreCorrupt);
+    }
+    if !state.checkpoint_and_close()? {
+        return Err(StoreError::Io);
+    }
+    drop(state);
+    retire_legacy_tables(&native, custody)?;
+    let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
+        .session(crate::connection::native_session())
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let state = candidate.open_state()?;
+    let handle = state.handle();
+    crate::migrations::L0002::apply(&handle, &connection).await?;
+    let mut state = Arc::try_unwrap(handle)
+        .map_err(|_| StoreError::Io)?
+        .into_inner()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    if !state.has_open_connection() || !state.checkpoint_and_close()? {
+        return Err(StoreError::Io);
+    }
+    Ok(())
+}
+
+fn ordered_legacy_commands(rows: &[JournalRow]) -> Result<Vec<Vec<JournalRow>>, StoreError> {
+    let mut by_command: BTreeMap<evertrace_domain::ids::CommandId, Vec<&JournalRow>> =
+        BTreeMap::new();
+    for row in rows {
+        by_command.entry(row.command_id).or_default().push(row);
+    }
+    let mut batches = Vec::with_capacity(by_command.len());
+    for mut batch in by_command.into_values() {
+        batch.sort_by_key(|row| row.ordinal);
+        let first = batch
+            .first()
+            .map(|row| row.seq)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if batch
+            .iter()
+            .enumerate()
+            .any(|(index, row)| row.seq != first + index as u64)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        batches.push(batch.into_iter().cloned().collect::<Vec<_>>());
+    }
+    batches.sort_by_key(|batch| batch.first().map(|row| row.seq).unwrap_or(0));
+    Ok(batches)
+}
+
+/// Remove only the retired tables copied into this candidate. Every path is
+/// revalidated through its own held directory; nothing is guessed by name.
+fn retire_legacy_tables(
+    native: &Path,
+    custody: &evertrace_capture::ConfinedRoot,
+) -> Result<(), StoreError> {
+    custody
+        .revalidate_stable()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    for name in [
+        crate::JOURNAL_TABLE,
+        crate::OBJECTS_TABLE,
+        crate::RELATIONS_TABLE,
+    ] {
+        let path = native.join(format!("{name}.lance"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                let table = evertrace_capture::ConfinedRoot::open_owned_private(&path)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                table
+                    .revalidate_stable()
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let held = table.proc_cwd_path().map_err(|_| StoreError::Io)?;
+                for entry in std::fs::read_dir(&held).map_err(|_| StoreError::Io)? {
+                    let entry = entry.map_err(|_| StoreError::Io)?;
+                    let metadata =
+                        std::fs::symlink_metadata(entry.path()).map_err(|_| StoreError::Io)?;
+                    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                        std::fs::remove_dir_all(entry.path()).map_err(|_| StoreError::Io)?;
+                    } else {
+                        std::fs::remove_file(entry.path()).map_err(|_| StoreError::Io)?;
+                    }
+                }
+                std::fs::remove_dir(&path).map_err(|_| StoreError::Io)?;
+                File::open(native)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|_| StoreError::Io)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(StoreError::Io),
+        }
+    }
+    custody
+        .revalidate_stable()
+        .map_err(|_| StoreError::StoreCorrupt)
+}
+
+pub(crate) fn journal_profile(
+    rows: &[crate::JournalRow],
+) -> Result<Option<&'static str>, StoreError> {
+    let populated = !rows.is_empty();
+    let mut profile = None;
+    for row in rows {
+        if let JournalPayload::MigrationApplied(migration) = row.payload()? {
+            match migration.migration_id.as_str() {
+                "L0001" if profile.is_none() => profile = Some("L0001"),
+                "L0002" if profile == Some("L0001") => profile = Some("L0002"),
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+    }
+    if populated && profile.is_none() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(profile)
 }
 
 fn reserve_range(next_seq: &mut u64, count: u16) -> Result<u64, StoreError> {
@@ -2040,7 +2203,7 @@ fn current_uid() -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, time::Duration};
 
     use evertrace_domain::{
         evidence::{IdentityStrength, SourceInstanceId, SourceRevision},
@@ -2059,12 +2222,148 @@ mod tests {
         SourceCloseReconciliation, reduce_journal,
     };
 
+    /// The single SQLite state replaces the former Lance journal. This view
+    /// mirrors `StartupJournal`: it binds the validated rows to the observed
+    /// physical journal epoch and revalidates identity, structural
+    /// completeness and (when required) admission on refresh.
+    struct StartupJournal {
+        sqlite: SqliteHandle,
+        rows: Vec<crate::JournalRow>,
+        version: u64,
+        requires_admission_validation: bool,
+    }
+
+    impl StartupJournal {
+        fn read(sqlite: SqliteHandle) -> Result<Self, StoreError> {
+            let (rows, version) = {
+                let mut state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+                let rows = state.rows()?;
+                let version = state.stamp()?.journal_epoch;
+                (rows, version)
+            };
+            crate::journal::validate_journal_rows(&rows)?;
+            Ok(Self {
+                sqlite,
+                rows,
+                version,
+                requires_admission_validation: false,
+            })
+        }
+
+        async fn refresh(&mut self) -> Result<(), StoreError> {
+            let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            state.revalidate()?;
+            let version = state.stamp()?.journal_epoch;
+            if version != self.version {
+                let rows = state.rows()?;
+                crate::journal::validate_journal_rows(&rows)?;
+                if self.requires_admission_validation {
+                    drop(JournalAdmissionState::from_journal_rows(&rows)?);
+                }
+                self.rows = rows;
+                self.version = version;
+            }
+            Ok(())
+        }
+    }
+
+    impl JournalWriter {
+        fn journal_profile(
+            startup: &mut StartupJournal,
+        ) -> Result<Option<&'static str>, StoreError> {
+            drop(JournalAdmissionState::from_journal_rows(&startup.rows)?);
+            startup.requires_admission_validation = true;
+            super::journal_profile(&startup.rows)
+        }
+    }
+
+    async fn read_journal_frontier(sqlite: &SqliteHandle) -> Result<u64, StoreError> {
+        Ok(sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .rows()?
+            .last()
+            .map(|row| row.seq)
+            .unwrap_or(0))
+    }
+
+    async fn append_rows(
+        sqlite: &SqliteHandle,
+        rows: &[crate::JournalRow],
+    ) -> Result<(), StoreError> {
+        sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .append_rows_for_test(rows)
+    }
+
+    async fn overwrite_rows(
+        sqlite: &SqliteHandle,
+        rows: &[crate::JournalRow],
+    ) -> Result<(), StoreError> {
+        sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .overwrite_rows_for_test(rows)
+    }
+
+    async fn read_command_rows(
+        sqlite: &SqliteHandle,
+        command_id: CommandId,
+    ) -> Result<Vec<crate::JournalRow>, StoreError> {
+        sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .committed_rows(command_id)
+    }
+
+    async fn clear_object_rows(sqlite: &SqliteHandle) -> Result<(), StoreError> {
+        sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .clear_object_rows_for_test()
+    }
+
+    async fn insert_object_row(sqlite: &SqliteHandle, row: &ObjectRow) -> Result<(), StoreError> {
+        sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .insert_object_row_for_test(row)
+    }
+
+    fn validation_versions(validation: &ProjectionValidation) -> [u64; 4] {
+        [
+            validation.stamp.journal_epoch,
+            validation.stamp.objects_epoch,
+            validation.stamp.relations_epoch,
+            validation.search_version,
+        ]
+    }
+
+    async fn projection_versions(writer: &JournalWriter) -> Result<[u64; 4], StoreError> {
+        let stamp = {
+            let handle = writer.projection_handle();
+            let mut state = handle.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            state.stamp()?
+        };
+        Ok([
+            stamp.journal_epoch,
+            stamp.objects_epoch,
+            stamp.relations_epoch,
+            writer
+                .search
+                .version()
+                .await
+                .map_err(|_| StoreError::LanceDb)?,
+        ])
+    }
+
     #[tokio::test]
     async fn startup_admission_failure_precedes_missing_objects_repair() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("data");
         let writer = JournalWriter::open(&root).await.unwrap();
-        let mut startup = StartupJournal::read(writer.journal.clone()).await.unwrap();
+        let mut startup = StartupJournal::read(writer.projection_handle()).unwrap();
         assert_eq!(
             JournalWriter::journal_profile(&mut startup),
             Ok(Some("L0002"))
@@ -2081,22 +2380,31 @@ mod tests {
         // This command is structurally complete, but its required receipt is
         // missing. Only admission replay detects the corruption.
         crate::journal::validate_journal_rows(&rows).unwrap();
-        append_rows(&writer.journal, &rows).await.unwrap();
+        append_rows(&writer.projection_handle(), &rows)
+            .await
+            .unwrap();
         // Revalidation must still reject semantic corruption after the
         // precheck's temporary admission state has been released.
         assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
         drop(startup);
+        let journal_before = writer.journal_rows().await.unwrap();
+        // The former test renamed the objects table away so a repair would
+        // have to rebuild it. Objects now live in the same SQLite file, so the
+        // analogue is clearing the persisted objects family.
+        clear_object_rows(&writer.projection_handle())
+            .await
+            .unwrap();
         drop(writer);
-        let objects = crate::connection::native_root(&root).join(format!("{OBJECTS_TABLE}.lance"));
-        fs::rename(&objects, temp.path().join("saved-objects")).unwrap();
         assert!(matches!(
             JournalWriter::open(&root).await,
             Err(StoreError::StoreCorrupt)
         ));
-        assert!(
-            !objects.exists(),
-            "admission must fail before migration writes"
-        );
+        // Nothing was repaired: the journal did not gain a migration row and
+        // the objects family was not projected to the corrupt frontier.
+        let state = SqliteState::open(&root).unwrap();
+        assert_eq!(state.rows().unwrap(), journal_before);
+        assert_eq!(state.object_checkpoint_row().unwrap(), Some((0, 1)));
+        assert_eq!(state.object_rows().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2104,34 +2412,44 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("data");
         let writer = JournalWriter::open(&root).await.unwrap();
-        let mut startup = StartupJournal::read(writer.journal.clone()).await.unwrap();
+        let mut startup = StartupJournal::read(writer.projection_handle()).unwrap();
         writer.sync_frontier().await.unwrap();
         assert!(writer.projection_validation.lock().unwrap()[1].is_some());
         assert_eq!(
             writer.read_diagnostics().await.tables[0].checkpoint,
             Some(writer.frontier())
         );
-        let versions = writer.projection_versions(true).await.unwrap();
+        let versions = projection_versions(&writer).await.unwrap();
         let native = crate::connection::native_root(&root);
         let moved = root.join("previous-store");
         fs::rename(&native, &moved).unwrap();
         DirBuilder::new().mode(0o700).create(&native).unwrap();
-        // Reuse the very same table directories/versions under a new native root.
-        for table in [JOURNAL_TABLE, OBJECTS_TABLE, RELATIONS_TABLE, SEARCH_TABLE] {
-            let name = format!("{table}.lance");
-            fs::rename(moved.join(&name), native.join(name)).unwrap();
-        }
-        assert_eq!(writer.objects.version().await.unwrap(), versions[1]);
-        assert_eq!(writer.read_diagnostics().await.tables[0].checkpoint, None);
-        // A valid in-memory stamp alone must not authorize normal Search after
-        // the held native root has been replaced with same-version tables.
-        assert!(
-            writer
-                .normal_search_current_context(&Default::default())
-                .await
-                .is_err()
+        // Reuse the very same derived search directory under a new root and
+        // copy the SQLite database byte-for-byte: identity must still reject it.
+        let search = format!("{SEARCH_TABLE}.lance");
+        fs::rename(moved.join(&search), native.join(search)).unwrap();
+        let database = native.join(crate::sqlite_state::SQLITE_FILE_NAME);
+        fs::copy(moved.join(crate::sqlite_state::SQLITE_FILE_NAME), &database).unwrap();
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            fs::read(moved.join(crate::sqlite_state::SQLITE_FILE_NAME)).unwrap()
+        );
+        assert_eq!(writer.search.version().await.unwrap(), versions[3]);
+        // Identity binding, not content or version reuse, is the authority
+        // every validated path checks.
+        assert_eq!(
+            writer.projection_handle().lock().unwrap().revalidate(),
+            Err(StoreError::StoreCorrupt)
         );
         assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
+        // A valid in-memory stamp alone must not authorize normal Search after
+        // the held native root has been replaced with same-content state.
+        assert!(matches!(
+            writer
+                .normal_search_current_context(&Default::default())
+                .await,
+            Err(StoreError::StoreCorrupt)
+        ));
         assert!(matches!(
             writer.reconciliation_frontier(8).await,
             Err(StoreError::StoreCorrupt)
@@ -2169,6 +2487,12 @@ mod tests {
         );
         assert_eq!(
             writer.project_objects().await,
+            Err(StoreError::StoreCorrupt)
+        );
+        // Even the stamp entry point must reject the replaced root, rather
+        // than exposing the old connection's epochs as reusable proof.
+        assert_eq!(
+            projection_versions(&writer).await,
             Err(StoreError::StoreCorrupt)
         );
     }
@@ -2221,26 +2545,62 @@ mod tests {
         let objects = writer.project_objects().await.unwrap();
         assert_eq!(objects.frontier, writer.frontier());
         assert_eq!(writer.search.version().await.unwrap(), version);
+        // A checkpoint advanced without a matching projection is the objects
+        // analogue of the disposable search checkpoint above: diagnostics must
+        // report it from the existing family without rebuilding it, while
+        // every validated read fails closed on the logical gap.
+        let checkpoint = writer
+            .object_rows()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.row_id == crate::objects::OBJECTS_CHECKPOINT_ID)
+            .unwrap();
+        writer
+            .projection_handle()
+            .lock()
+            .unwrap()
+            .advance_object_checkpoint_for_test()
+            .unwrap();
+        let read = writer.read_diagnostics().await;
+        assert_eq!(read.tables[1].checkpoint, Some(objects.frontier + 1));
+        assert!(read.objects.is_some());
+        assert_eq!(
+            writer.sync_objects_frontier().await,
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(
+            writer
+                .projection_handle()
+                .lock()
+                .unwrap()
+                .object_checkpoint()
+                .0,
+            objects.frontier + 1
+        );
+        // Put the checkpoint back so the malformed-row case starts from a
+        // consistent family.
+        insert_object_row(&writer.projection_handle(), &checkpoint)
+            .await
+            .unwrap();
+        // The former test appended an unvalidated Arrow row that normalized to
+        // generation 0. The SQLite table accepts the same unvalidated shape
+        // through a raw upsert, and validation must reject it on read.
         let mut malformed = ObjectRow::checkpoint(0, 1);
         malformed.row_id = "diagnostic:malformed".into();
         malformed.row_kind = crate::objects::ObjectRowKind::Data;
         malformed.row_class = Some(crate::objects::ObjectRowClass::Runtime);
         malformed.payload_json = Some("{}".into());
-        let mut columns = crate::objects::objects_batch(&[malformed])
-            .unwrap()
-            .columns()
-            .to_vec();
-        let generation_column = crate::objects::objects_schema()
-            .index_of("projection_generation")
+        malformed.projection_generation = 0;
+        insert_object_row(&writer.projection_handle(), &malformed)
+            .await
             .unwrap();
-        columns[generation_column] = std::sync::Arc::new(arrow_array::UInt64Array::from(vec![0]));
-        let malformed_batch =
-            arrow_array::RecordBatch::try_new(crate::objects::objects_schema(), columns).unwrap();
-        writer.objects.add(malformed_batch).execute().await.unwrap();
         let read = writer.read_diagnostics().await;
         assert_eq!(read.tables[1].checkpoint, Some(objects.frontier));
         assert!(read.objects.is_none());
-        writer.objects.delete("true").await.unwrap();
+        clear_object_rows(&writer.projection_handle())
+            .await
+            .unwrap();
         assert!(writer.project_objects().await.is_err());
     }
 
@@ -2394,11 +2754,16 @@ mod tests {
                 .is_none()
         );
         let abandoned = reserve_range(&mut writer.next_seq, prepared.event_count).unwrap();
-        let committed_frontier = read_journal_frontier(&writer.journal).await.unwrap();
-        assert!(writer.frontier() > committed_frontier);
+        let committed_frontier = read_journal_frontier(&writer.projection_handle())
+            .await
+            .unwrap();
+        // A reservation is not a committed frontier: the next sequence moved
+        // but the persisted and validated frontier did not.
+        assert!(writer.next_seq > abandoned);
+        assert_eq!(writer.frontier(), committed_frontier);
         assert_eq!(
-            writer.diagnostic_journal_frontier().await.unwrap(),
-            committed_frontier
+            writer.read_diagnostics().await.tables[0].checkpoint,
+            Some(committed_frontier)
         );
         assert_eq!(
             writer.sync_objects_frontier().await.unwrap(),
@@ -2408,18 +2773,31 @@ mod tests {
         let first_seq = reserve_range(&mut writer.next_seq, prepared.event_count).unwrap();
         assert_eq!(first_seq, abandoned + u64::from(prepared.event_count));
         let rows = rows_for_append(&prepared, first_seq, 2).unwrap();
-        append_rows(&writer.journal, &rows).await.unwrap();
+        append_rows(&writer.projection_handle(), &rows)
+            .await
+            .unwrap();
         assert_eq!(
-            writer.diagnostic_journal_frontier().await.unwrap(),
-            first_seq
+            writer.read_diagnostics().await.tables[0].checkpoint,
+            Some(first_seq)
         );
         // A direct native successor is not proof of an append by this writer.
         let old_version = writer.projection_validation.lock().unwrap()[0]
             .as_ref()
             .unwrap()
-            .versions[0];
-        assert_eq!(writer.journal.version().await.unwrap(), old_version + 1);
-        assert_eq!(writer.command_ids.as_ref().unwrap().0, old_version);
+            .stamp
+            .journal_epoch;
+        assert_eq!(
+            writer.projection_handle().lock().unwrap().journal_epoch(),
+            old_version + 1
+        );
+        assert_eq!(
+            writer.projection_validation.lock().unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .stamp
+                .journal_epoch,
+            old_version
+        );
         assert_eq!(writer.sync_objects_frontier().await.unwrap(), first_seq);
         // The first catch-up validates its own committed version immediately.
         assert_eq!(
@@ -2433,31 +2811,24 @@ mod tests {
         assert_eq!(writer.sync_objects_frontier().await.unwrap(), first_seq);
         assert!(writer.projection_validation.lock().unwrap()[0].is_some());
         assert!(writer.projection_validation.lock().unwrap()[1].is_none());
-        let stale_indexes = L0002ProjectionWorker::new(
-            writer.journal.clone(),
-            writer.relations.clone(),
-            writer.search.clone(),
-        )
-        .current()
-        .await
-        .unwrap();
+        let stale_indexes =
+            L0002ProjectionWorker::new(writer.sqlite.clone(), writer.search.clone())
+                .current()
+                .await
+                .unwrap();
         assert!(stale_indexes.frontier < first_seq);
         assert_eq!(writer.sync_frontier().await.unwrap(), first_seq);
-        let indexes = L0002ProjectionWorker::new(
-            writer.journal.clone(),
-            writer.relations.clone(),
-            writer.search.clone(),
-        )
-        .current()
-        .await
-        .unwrap();
+        let indexes = L0002ProjectionWorker::new(writer.sqlite.clone(), writer.search.clone())
+            .current()
+            .await
+            .unwrap();
         assert_eq!(indexes.frontier, first_seq);
         assert_eq!(
             writer.project_objects().await.unwrap(),
             writer.full_projection().await.unwrap()
         );
-        // The command was absent from the startup set. A changed journal
-        // version must bypass that negative hint and read the actual commit.
+        // The command was absent from the startup set. A read of the actual
+        // persisted rows must see the commit, not a stale negative hint.
         assert!(
             writer
                 .committed_command(command.command_id())
@@ -2488,9 +2859,16 @@ mod tests {
             .unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[&command.command_id()], inspected);
-        // A batch is not merely an existence hint: duplicate/partial command
-        // corruption must fail exactly as the original single read does.
-        append_rows(&reopened.journal, &rows).await.unwrap();
+        // A batch is not merely an existence hint: partial command corruption
+        // must fail exactly as the original single read does.
+        let mut partial = rows[0].clone();
+        partial.ordinal = 1;
+        partial.command_event_count = 2;
+        partial.event_id.push_str("-partial");
+        partial.seq = 100;
+        append_rows(&reopened.projection_handle(), &[partial])
+            .await
+            .unwrap();
         assert!(
             reopened
                 .committed_commands(&[command.command_id()])
@@ -2550,20 +2928,34 @@ mod tests {
             .await
             .unwrap();
         assert!(!committed.replayed);
-        let (version, ids) = writer.command_ids.as_ref().unwrap();
-        assert_eq!(*version, writer.journal.version().await.unwrap());
-        assert!(ids.contains(&first.command_id()));
+        assert_eq!(
+            writer.projection_handle().lock().unwrap().journal_epoch(),
+            initial.stamp.journal_epoch + 1
+        );
+        assert_eq!(
+            read_command_rows(&writer.projection_handle(), first.command_id())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         let stamps = writer.projection_validation.lock().unwrap().clone();
         let old_input = stamps[0].as_ref().unwrap();
-        assert_eq!(old_input.versions, initial.versions);
+        assert_eq!(old_input.stamp, initial.stamp);
         assert_eq!(old_input.frontier, initial_frontier);
         assert_ne!(old_input.frontier, committed.last_seq);
         assert!(stamps[1].is_none());
-        let batch = old_input.appended_batch.as_ref().unwrap();
-        assert!(batch.get_array_memory_size() <= MAX_PROJECTION_HANDOFF_BYTES);
+        let handoff = old_input.appended_rows.as_ref().unwrap();
+        assert!(
+            handoff
+                .iter()
+                .map(|row| row.payload_json.len())
+                .sum::<usize>()
+                <= MAX_PROJECTION_HANDOFF_BYTES
+        );
         assert_eq!(
-            crate::journal::rows_from_batch(batch).unwrap(),
-            read_command_rows(&writer.journal, first.command_id())
+            handoff,
+            &read_command_rows(&writer.projection_handle(), first.command_id())
                 .await
                 .unwrap()
         );
@@ -2572,10 +2964,10 @@ mod tests {
         let validated = writer.projection_validation.lock().unwrap()[1]
             .clone()
             .unwrap();
-        assert!(validated.appended_batch.is_none());
+        assert!(validated.appended_rows.is_none());
         assert_eq!(
-            validated.versions,
-            writer.projection_versions(true).await.unwrap()
+            validation_versions(&validated),
+            projection_versions(&writer).await.unwrap()
         );
         assert_eq!(validated.frontier, committed.last_seq);
         assert_eq!(
@@ -2587,11 +2979,12 @@ mod tests {
             Err(StoreError::InvalidInput)
         );
         assert_eq!(
-            writer.projection_validation.lock().unwrap()[1]
-                .as_ref()
-                .unwrap()
-                .versions,
-            validated.versions
+            validation_versions(
+                writer.projection_validation.lock().unwrap()[1]
+                    .as_ref()
+                    .unwrap()
+            ),
+            validation_versions(&validated)
         );
         let replayed = writer
             .commit_if_frontier(&first, 2, initial_frontier)
@@ -2600,11 +2993,12 @@ mod tests {
         assert!(replayed.replayed);
         assert_eq!(replayed.first_seq, committed.first_seq);
         assert_eq!(
-            writer.projection_validation.lock().unwrap()[1]
-                .as_ref()
-                .unwrap()
-                .versions,
-            validated.versions
+            validation_versions(
+                writer.projection_validation.lock().unwrap()[1]
+                    .as_ref()
+                    .unwrap()
+            ),
+            validation_versions(&validated)
         );
         assert_eq!(
             writer
@@ -2613,20 +3007,22 @@ mod tests {
             Err(StoreError::StaleFrontier)
         );
         assert_eq!(
-            writer.projection_validation.lock().unwrap()[1]
-                .as_ref()
-                .unwrap()
-                .versions,
-            validated.versions
+            validation_versions(
+                writer.projection_validation.lock().unwrap()[1]
+                    .as_ref()
+                    .unwrap()
+            ),
+            validation_versions(&validated)
         );
         assert_eq!(writer.sync_frontier().await.unwrap(), committed.last_seq);
         assert_eq!(
-            writer.projection_versions(true).await.unwrap(),
-            validated.versions
+            projection_versions(&writer).await.unwrap(),
+            validation_versions(&validated)
         );
         assert_eq!(writer.journal_rows().await.unwrap().len(), 3);
         reserve_range(&mut writer.next_seq, 2).unwrap();
-        assert!(writer.frontier() > committed.last_seq);
+        assert_eq!(writer.frontier(), committed.last_seq);
+        assert!(writer.next_seq > writer.frontier());
         let capture = writer.capture_current_context(None, None, 8).await.unwrap();
         assert_eq!(capture.frontier, committed.last_seq);
         assert!(capture.items.is_empty());
@@ -2655,12 +3051,13 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            writer.projection_versions(true).await.unwrap(),
-            validated.versions
+            projection_versions(&writer).await.unwrap(),
+            validation_versions(&validated)
         );
         let appended = writer.commit(&second, 3).await.unwrap();
         reserve_range(&mut writer.next_seq, 2).unwrap();
-        assert!(writer.frontier() > appended.last_seq);
+        assert_eq!(writer.frontier(), appended.last_seq);
+        assert!(writer.next_seq > writer.frontier());
         assert_eq!(
             writer.sync_objects_frontier().await.unwrap(),
             appended.last_seq
@@ -2669,7 +3066,13 @@ mod tests {
             writer.project_objects().await.unwrap(),
             writer.full_projection().await.unwrap()
         );
-        let proof = writer.command_ids.take();
+        // The in-memory admission proof must agree with the physical journal
+        // version; a version this writer never admitted fails closed.
+        let journal_before = writer.journal_rows().await.unwrap();
+        let lagging = journal_before[..journal_before.len() - 1].to_vec();
+        overwrite_rows(&writer.projection_handle(), &lagging)
+            .await
+            .unwrap();
         assert!(matches!(
             writer.inbox_current_context(None, 8, 64).await,
             Err(StoreError::StoreCorrupt)
@@ -2696,9 +3099,13 @@ mod tests {
             writer.capture_current_context(None, None, 8).await,
             Err(StoreError::StoreCorrupt)
         ));
-        writer.command_ids = proof;
+        overwrite_rows(&writer.projection_handle(), &journal_before)
+            .await
+            .unwrap();
         assert!(writer.capture_current_context(None, None, 8).await.is_ok());
-        writer.command_ids.as_mut().unwrap().0 += 1;
+        overwrite_rows(&writer.projection_handle(), &lagging)
+            .await
+            .unwrap();
         assert!(matches!(
             writer.capture_current_context(None, None, 8).await,
             Err(StoreError::StoreCorrupt)
@@ -2937,15 +3344,18 @@ mod tests {
             .unwrap();
             let committed = writer.commit(&command, 2).await.unwrap();
             last_seq = committed.last_seq;
-            let version = writer.journal.version().await.unwrap();
-            assert_eq!(version, initial.versions[0] + ordinal);
-            assert_eq!(writer.objects.version().await.unwrap(), initial.versions[1]);
+            let version = writer.projection_handle().lock().unwrap().journal_epoch();
+            assert_eq!(version, initial.stamp.journal_epoch + ordinal);
+            assert_eq!(
+                writer.projection_handle().lock().unwrap().objects_epoch(),
+                initial.stamp.objects_epoch
+            );
             let stamps = writer.projection_validation.lock().unwrap().clone();
             let input = stamps[0].as_ref().unwrap();
-            assert_eq!(input.versions, initial.versions);
+            assert_eq!(input.stamp, initial.stamp);
             assert_eq!(input.frontier, initial.frontier);
-            assert_eq!(input.appended_through, Some((version, last_seq)));
-            assert_eq!(input.appended_batch.is_some(), ordinal == 1);
+            assert_eq!(input.appended_through, Some((initial.stamp, last_seq)));
+            assert_eq!(input.appended_rows.is_some(), ordinal == 1);
             assert!(stamps[1].is_none());
             assert!(writer.commit(&command, 3).await.unwrap().replayed);
             if ordinal == 1 {
@@ -2956,13 +3366,13 @@ mod tests {
         let projected = writer.project().await.unwrap();
         assert_eq!(projected.frontier, last_seq);
         assert_eq!(projected, writer.full_projection().await.unwrap());
-        let versions = writer.projection_versions(true).await.unwrap();
+        let versions = projection_versions(&writer).await.unwrap();
         for stamp in writer.projection_validation.lock().unwrap().iter() {
             let stamp = stamp.as_ref().unwrap();
-            assert_eq!(stamp.versions, versions);
+            assert_eq!(validation_versions(stamp), versions);
             assert_eq!(stamp.frontier, last_seq);
             assert!(stamp.appended_through.is_none());
-            assert!(stamp.appended_batch.is_none());
+            assert!(stamp.appended_rows.is_none());
         }
     }
 
@@ -2980,9 +3390,11 @@ mod tests {
                         1,
                         [1; 32],
                         "objects-v1",
-                        JournalPayload::WatermarkAdvanced(crate::WatermarkAdvanced {
-                            kind: crate::WatermarkKind::RuntimeJobs,
-                            value,
+                        JournalPayload::DirtyTarget(DirtyTarget {
+                            target_kind: DirtyTargetKind::ObjectsProjection,
+                            target_id: format!("batch-{value:0>250}"),
+                            algorithm_revision: "objects-v1".into(),
+                            source_watermark: value,
                         }),
                     )
                 })
@@ -2995,7 +3407,7 @@ mod tests {
             writer.projection_validation.lock().unwrap()[0]
                 .as_ref()
                 .unwrap()
-                .appended_batch
+                .appended_rows
                 .is_none()
         );
         assert_eq!(
@@ -3138,5 +3550,161 @@ mod tests {
             Err(StoreError::StoreCorrupt)
         ));
         assert_eq!(reduce_journal(&proof_rows), Err(StoreError::StoreCorrupt));
+    }
+    fn private_store_root(temp: &tempfile::TempDir) -> PathBuf {
+        let root = temp.path().join("store");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    fn chmod_private(path: &std::path::Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    async fn read_frontier(readers: &StoreReadHandle) -> Result<u64, StoreError> {
+        readers
+            .read(|connection, _| crate::sqlite_state::read_persisted_frontier(connection))
+            .await
+    }
+
+    #[tokio::test]
+    async fn backup_close_and_reopen_publish_a_new_writer_incarnation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = private_store_root(&temp);
+        chmod_private(temp.path());
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let readers = writer.read_handle();
+        let first = readers.incarnation();
+        assert_ne!(first, 0);
+        read_frontier(&readers).await.unwrap();
+        drop(readers.search_lease().await.unwrap());
+
+        let guard = writer
+            .quiesce_for_backup()
+            .await
+            .unwrap()
+            .expect("no external reader holds the WAL");
+        let closed = writer.close_for_backup(guard).unwrap();
+        // The closed window revokes the binding and fences readers: a read
+        // waits instead of silently observing the previous incarnation.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), read_frontier(&readers))
+                .await
+                .is_err()
+        );
+
+        let reopened = closed.reopen().await.unwrap();
+        let second = readers.incarnation();
+        assert_ne!(second, first);
+        read_frontier(&readers).await.unwrap();
+        drop(readers.search_lease().await.unwrap());
+        assert_eq!(reopened.frontier(), reopened.frontier());
+        drop(reopened);
+    }
+
+    #[tokio::test]
+    async fn healthy_busy_checkpoint_keeps_the_writer_binding_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = private_store_root(&temp);
+        chmod_private(temp.path());
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let readers = writer.read_handle();
+        let incarnation = readers.incarnation();
+        let command = JournalCommand::new(
+            CommandId::from_str("01890f47-6a4a-7cc1-98b9-01890f476a7b").unwrap(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [1; 32],
+                "objects-v1",
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::ObjectsProjection,
+                    target_id: "busy-checkpoint".into(),
+                    algorithm_revision: "objects-v1".into(),
+                    source_watermark: 1,
+                }),
+            )],
+        )
+        .unwrap();
+        writer.commit(&command, 1).await.unwrap();
+
+        // A live WAL read transaction makes the TRUNCATE checkpoint busy.
+        let path = crate::connection::sqlite_path(&root);
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))
+            .unwrap();
+        assert!(writer.quiesce_for_backup().await.unwrap().is_none());
+        // A known-busy checkpoint is an ordinary backup failure: the writer,
+        // its binding and its search connection stay usable.
+        writer.project().await.unwrap();
+        assert_eq!(readers.incarnation(), incarnation);
+        readers
+            .read(|connection, _| crate::sqlite_state::read_persisted_frontier(connection))
+            .await
+            .unwrap();
+        drop(readers.search_lease().await.unwrap());
+        drop(reader);
+
+        let frontier = writer.frontier();
+        let guard = writer
+            .quiesce_for_backup()
+            .await
+            .unwrap()
+            .expect("the external transaction is gone");
+        let writer = writer
+            .close_for_backup(guard)
+            .unwrap()
+            .reopen()
+            .await
+            .unwrap();
+        assert_eq!(writer.frontier(), frontier);
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn external_sqlite_commit_prevents_backup_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = private_store_root(&temp);
+        chmod_private(temp.path());
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let readers = writer.read_handle();
+        let external = rusqlite::Connection::open(crate::connection::sqlite_path(&root)).unwrap();
+        external.execute_batch("PRAGMA user_version = 0").unwrap();
+        drop(external);
+        assert!(matches!(
+            writer.quiesce_for_backup().await,
+            Err(StoreError::StoreCorrupt)
+        ));
+        assert!(readers.journal_rows().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_reopen_refuses_reads_until_a_new_binding_is_published() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = private_store_root(&temp);
+        chmod_private(temp.path());
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let readers = writer.read_handle();
+        let guard = writer
+            .quiesce_for_backup()
+            .await
+            .unwrap()
+            .expect("nothing holds the WAL");
+        let closed = writer.close_for_backup(guard).unwrap();
+        // Corrupt the closed database: reopen must fail before publishing.
+        fs::write(crate::connection::sqlite_path(&root), b"not a database").unwrap();
+        assert!(closed.reopen().await.is_err());
+        assert!(
+            readers
+                .read(|connection, _| crate::sqlite_state::read_persisted_frontier(connection))
+                .await
+                .is_err()
+        );
     }
 }

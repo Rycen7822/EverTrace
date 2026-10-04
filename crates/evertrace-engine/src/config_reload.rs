@@ -761,18 +761,10 @@ mod tests {
             panic!("config audit");
         };
         assert_eq!(audit.reload.unwrap().previous_config_hash, changed.hash());
-        let native = evertrace_store::connection::CompatibilityStore::connect_local(
-            &evertrace_store::connection::native_root(&data),
-        )
-        .await
-        .unwrap();
-        let table = native
-            .connection()
-            .open_table(evertrace_store::JOURNAL_TABLE)
-            .execute()
+        let rows = evertrace_store::StoreReadHandle::open_read_only(&data)
             .await
-            .unwrap();
-        let rows = evertrace_store::journal::read_all_journal_rows(&table)
+            .unwrap()
+            .journal_rows()
             .await
             .unwrap();
         let mut prepared_time = None;
@@ -788,8 +780,6 @@ mod tests {
                 }
             }
         }
-        drop(table);
-        drop(native);
         writer.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
         drop(startup);

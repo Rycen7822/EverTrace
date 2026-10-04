@@ -12,15 +12,12 @@ use std::{
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::{
-    Connection, Table,
+    Table,
     index::scalar::FullTextSearchQuery,
     query::{QueryBase, Select},
 };
 
-use crate::{
-    StoreError,
-    journal::{JOURNAL_TABLE, read_journal_frontier},
-};
+use crate::{StoreError, connection::StoreReadHandle};
 
 pub const SEARCH_TABLE: &str = "evertrace_search";
 pub const SEARCH_CHECKPOINT_ID: &str = "checkpoint:evertrace_search";
@@ -29,12 +26,15 @@ pub const SEARCH_PROJECTION_GENERATION: u64 = 1;
 #[derive(Clone)]
 pub struct SearchIndex {
     data_dir: PathBuf,
+    readers: StoreReadHandle,
 }
 
 pub struct SearchSnapshot {
     table: Table,
     frontier: u64,
     authoritative_frontier: u64,
+    // Declared last so the pinned table drops before the read fence and permit.
+    _lease: crate::connection::StoreReadLease,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -59,9 +59,32 @@ pub struct SearchHardFilter {
 }
 
 impl SearchIndex {
+    /// Standalone read-only opener: validate the real on-disk store, attach a
+    /// native connection to the same binding and open the search table.
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
+        let readers = StoreReadHandle::open_read_only(data_dir).await?;
         let connection = crate::connection::connect_native(data_dir).await?;
-        let table = connection
+        readers.bind_read_only_search(connection)?;
+        Self::from_read_handle(data_dir, readers).await
+    }
+
+    /// Share the writer's single Lance search lifecycle and read fence. The
+    /// writer publishes its validated binding; a handle without one fails
+    /// closed instead of opening a private connection from the path.
+    pub async fn open_with_read_handle(
+        data_dir: &Path,
+        readers: StoreReadHandle,
+    ) -> Result<Self, StoreError> {
+        Self::from_read_handle(data_dir, readers).await
+    }
+
+    async fn from_read_handle(
+        data_dir: &Path,
+        readers: StoreReadHandle,
+    ) -> Result<Self, StoreError> {
+        let lease = readers.search_lease().await?;
+        let table = lease
+            .lance()
             .open_table(SEARCH_TABLE)
             .execute()
             .await
@@ -74,9 +97,16 @@ impl SearchIndex {
         if indices.len() != 1 || indices[0].columns != ["text"] {
             return Err(StoreError::StoreCorrupt);
         }
+        drop(table);
+        drop(lease);
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
+            readers,
         })
+    }
+
+    pub fn read_handle(&self) -> StoreReadHandle {
+        self.readers.clone()
     }
 
     pub async fn all(&self) -> Result<Vec<SearchProjectionRow>, StoreError> {
@@ -92,8 +122,7 @@ impl SearchIndex {
     }
 
     pub async fn snapshot(&self) -> Result<SearchSnapshot, StoreError> {
-        let connection = crate::connection::connect_native(&self.data_dir).await?;
-        self.snapshot_validated(&connection).await
+        self.snapshot_validated(None).await
     }
 
     /// Use a frontier freshly validated by the caller's current projection.
@@ -105,48 +134,45 @@ impl SearchIndex {
         &self,
         validated_frontier: u64,
     ) -> Result<SearchSnapshot, StoreError> {
-        let connection = crate::connection::connect_native(&self.data_dir).await?;
-        let snapshot = self.pinned_snapshot(&connection).await?;
-        let after = self.authoritative_frontier(&connection).await?;
-        if after != validated_frontier {
-            return self.snapshot_validated(&connection).await;
-        }
-        if snapshot.frontier > after {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Ok(SearchSnapshot {
-            authoritative_frontier: after,
-            ..snapshot
-        })
+        self.snapshot_validated(Some(validated_frontier)).await
     }
 
     async fn snapshot_validated(
         &self,
-        connection: &Connection,
+        validated_frontier: Option<u64>,
     ) -> Result<SearchSnapshot, StoreError> {
         for attempt in 0..2 {
-            let before = self.authoritative_frontier(connection).await?;
-            let snapshot = self.pinned_snapshot(connection).await?;
-            let after = self.authoritative_frontier(connection).await?;
-            if before == after || attempt == 1 {
-                if snapshot.frontier > after {
+            // The snapshot holds the fence and Lance connection. SQL frontier
+            // reads take a permit only for their actual blocking lifetime.
+            let lease = self.readers.search_lease().await?;
+            let before = self.authoritative_frontier(&lease).await?;
+            let (table, frontier) = self.pinned_snapshot(&lease).await?;
+            let after = self.authoritative_frontier(&lease).await?;
+            if before == after || after == validated_frontier.unwrap_or(u64::MAX) || attempt == 1 {
+                if frontier > after {
                     return Err(StoreError::StoreCorrupt);
                 }
                 return Ok(SearchSnapshot {
+                    table,
+                    frontier,
                     authoritative_frontier: after,
-                    ..snapshot
+                    _lease: lease,
                 });
             }
         }
         unreachable!("bounded snapshot loop always returns")
     }
 
-    async fn pinned_snapshot(&self, connection: &Connection) -> Result<SearchSnapshot, StoreError> {
+    async fn pinned_snapshot(
+        &self,
+        lease: &crate::connection::StoreReadLease,
+    ) -> Result<(Table, u64), StoreError> {
         evertrace_capture::ConfinedRoot::open_owned_private(&crate::connection::native_root(
             &self.data_dir,
         ))
         .map_err(|_| StoreError::StoreCorrupt)?;
-        let table = connection
+        let table = lease
+            .lance()
             .open_table(SEARCH_TABLE)
             .execute()
             .await
@@ -177,28 +203,22 @@ impl SearchIndex {
         )
         .await?;
         let frontier = exact_checkpoint_frontier(&checkpoints)?;
-        Ok(SearchSnapshot {
-            table,
-            frontier,
-            authoritative_frontier: 0,
-        })
+        Ok((table, frontier))
     }
 
-    async fn authoritative_frontier(&self, connection: &Connection) -> Result<u64, StoreError> {
+    async fn authoritative_frontier(
+        &self,
+        lease: &crate::connection::StoreReadLease,
+    ) -> Result<u64, StoreError> {
         evertrace_capture::ConfinedRoot::open_owned_private(&crate::connection::native_root(
             &self.data_dir,
         ))
         .map_err(|_| StoreError::StoreCorrupt)?;
-        let table = connection
-            .open_table(JOURNAL_TABLE)
-            .execute()
+        self.readers
+            .lease_read(lease, |connection, _| {
+                crate::sqlite_state::read_persisted_frontier(connection)
+            })
             .await
-            .map_err(|_| StoreError::LanceDb)?;
-        table
-            .checkout_latest()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        read_journal_frontier(&table).await
     }
 }
 
@@ -1179,5 +1199,83 @@ mod tests {
             .unwrap();
         assert_eq!(refreshed.frontier(), appended.last_seq);
         assert_eq!(refreshed.authoritative_frontier(), appended.last_seq);
+    }
+    #[tokio::test]
+    async fn two_live_snapshots_bound_the_read_permits_and_queued_maintenance_completes() {
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let mut writer = crate::JournalWriter::open(&data).await.unwrap();
+        let index = SearchIndex::open_with_read_handle(&data, writer.read_handle())
+            .await
+            .unwrap();
+        let first = index.snapshot().await.unwrap();
+        let second = index.snapshot().await.unwrap();
+        // Snapshots hold a read fence, not a SQL connection: further live
+        // snapshots stay usable instead of queueing behind the short permits.
+        let third = index.snapshot().await.unwrap();
+        assert_eq!(third.frontier(), second.frontier());
+        // Queued maintenance waits for the live read fences but must not
+        // deadlock behind them: releasing every snapshot completes the quiesce.
+        let mut quiesce = Box::pin(writer.quiesce_for_backup());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut quiesce)
+                .await
+                .is_err()
+        );
+        drop(first);
+        drop(second);
+        drop(third);
+        let guard = tokio::time::timeout(Duration::from_secs(5), &mut quiesce)
+            .await
+            .expect("queued maintenance must not deadlock behind released readers")
+            .unwrap()
+            .expect("no external reader holds the WAL");
+        drop(quiesce);
+        drop(writer.close_for_backup(guard).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_lease_read_keeps_the_fence_until_the_real_task_exits() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let writer = crate::JournalWriter::open(&temp.path().join("data"))
+            .await
+            .unwrap();
+        let readers = writer.read_handle();
+        let lease = readers.search_lease().await.unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let task_readers = readers.clone();
+        let task = tokio::spawn(async move {
+            task_readers
+                .lease_read(&lease, move |_, cancel| {
+                    let _ = started.send(());
+                    released
+                        .recv_timeout(Duration::from_secs(3))
+                        .map_err(|_| StoreError::Io)?;
+                    cancel.check()
+                })
+                .await
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        // The outer future and its lease are gone, but the started blocking
+        // closure is still alive. Maintenance must not pass it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), readers.quiesce())
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(3), readers.quiesce())
+            .await
+            .expect("the actual task must release the fence");
+        drop(guard);
+        assert!(!readers.journal_rows().await.unwrap().is_empty());
+        writer.sync_frontier().await.unwrap();
     }
 }

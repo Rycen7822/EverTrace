@@ -40,8 +40,7 @@ use evertrace_engine::{
     open_writer, spawn_writer,
 };
 use evertrace_store::{
-    EventScope, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter, OBJECTS_TABLE,
-    SourceKind,
+    EventScope, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter, SourceKind,
     relations::{CaptureRelationKind, build_capture_relation_rows},
 };
 use tempfile::TempDir;
@@ -419,12 +418,7 @@ async fn current_projection_rebuild_no_delta_relations_and_table_boundary_hold()
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            OBJECTS_TABLE,
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
 }
 

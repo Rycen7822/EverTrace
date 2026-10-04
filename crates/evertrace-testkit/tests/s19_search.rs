@@ -1006,15 +1006,7 @@ async fn l0002_real_fts_latest_delta_deletion_first_and_diagnostic_gates() {
     );
 
     assert_eq!(reopened.migration_outcome(), MigrationOutcome::Noop);
-    assert_eq!(
-        reopened.table_names().await.unwrap(),
-        [
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
-    );
+    assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
     let incremental = reopened.project().await.unwrap();
     let full = reopened.full_projection().await.unwrap();
     assert_eq!(incremental, full);

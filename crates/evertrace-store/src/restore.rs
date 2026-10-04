@@ -18,31 +18,36 @@ pub enum NativeUpgradeOutcome {
     },
 }
 
-/// Offline native publication only. Capture's state root and all durable inputs
-/// remain in place; this transaction never performs Restore authority resets.
-pub async fn upgrade_native(
-    data_dir: &Path,
-    config_path: &Path,
-    freeze_hook: impl FnOnce() -> Result<crate::backup::BackupHookBoundary, crate::BackupError>,
-    verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
-) -> Result<NativeUpgradeOutcome, RestoreError> {
-    upgrade_native_inner(data_dir, config_path, freeze_hook, verify_hook, |_| Ok(())).await
-}
-
+/// Named durable boundaries of the original native publication algorithm.
+/// Crate-private so the store's own interruption tests can drive real process
+/// exits at each point without adding a product wrapper.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativePublicationPoint {
+pub(crate) enum NativePublicationPoint {
     BackupFrozen,
     Prepared,
     Published,
     Durable,
 }
 
-async fn upgrade_native_inner(
+/// Offline native publication only. Capture's state root and all durable inputs
+/// remain in place; this transaction never performs Restore authority resets.
+/// A current store is validated read-only and left in place; a retired layout
+/// goes through the one-shot converter and the same atomic publication.
+pub async fn upgrade_native(
     data_dir: &Path,
     config_path: &Path,
     freeze_hook: impl FnOnce() -> Result<crate::backup::BackupHookBoundary, crate::BackupError>,
     verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
-    checkpoint: impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
+) -> Result<NativeUpgradeOutcome, RestoreError> {
+    upgrade_native_inner(data_dir, config_path, freeze_hook, verify_hook, &|_| Ok(())).await
+}
+
+pub(crate) async fn upgrade_native_inner(
+    data_dir: &Path,
+    config_path: &Path,
+    freeze_hook: impl FnOnce() -> Result<crate::backup::BackupHookBoundary, crate::BackupError>,
+    verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
+    checkpoint: &impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
 ) -> Result<NativeUpgradeOutcome, RestoreError> {
     match prepare_upgrade_inner(
         data_dir,
@@ -50,7 +55,7 @@ async fn upgrade_native_inner(
         freeze_hook,
         verify_hook,
         false,
-        &checkpoint,
+        checkpoint,
     )
     .await?
     {
@@ -99,7 +104,7 @@ pub async fn prepare_native_upgrade(
     data_dir: &Path,
     config_path: &Path,
     freeze_hook: impl FnOnce() -> Result<crate::backup::BackupHookBoundary, crate::BackupError>,
-    verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
+    verify_hook: impl Fn(&Path, &crate::backup::BackupSummary) -> Result<(), crate::BackupError>,
 ) -> Result<NativeUpgradePreparation, RestoreError> {
     prepare_upgrade_inner(
         data_dir,
@@ -112,11 +117,14 @@ pub async fn prepare_native_upgrade(
     .await
 }
 
+/// One prepared conversion under the continuously held sibling lock. A
+/// current store never yields a candidate; a retired layout yields exactly one
+/// private native candidate plus its independently verified v2 backup.
 async fn prepare_upgrade_inner(
     data_dir: &Path,
     config_path: &Path,
     freeze_hook: impl FnOnce() -> Result<crate::backup::BackupHookBoundary, crate::BackupError>,
-    verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
+    verify_hook: impl Fn(&Path, &crate::backup::BackupSummary) -> Result<(), crate::BackupError>,
     check_package: bool,
     checkpoint: &impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
 ) -> Result<NativeUpgradePreparation, RestoreError> {
@@ -130,31 +138,46 @@ async fn prepare_upgrade_inner(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => return Err(RestoreError::Io),
     };
+    if canonical_exists {
+        evertrace_capture::ConfinedRoot::open_owned_private(&canonical)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+    }
+    // A database at the canonical location always wins over a flat residue: a
+    // valid new store is never re-opened as an old one and a corrupt canonical
+    // is never silently replaced by flat tables.
+    if crate::JournalWriter::store_database_exists(data_dir)? {
+        if !canonical_exists {
+            return Err(StoreError::StoreCorrupt.into());
+        }
+        verify_native_store_tables(&canonical).await?;
+        let retained_native = flat_retained_tables(data_dir)?;
+        if check_package && !retained_native.is_empty() {
+            // A package check must not certify a container that still holds an
+            // unconverted retired layout; only the offline path may retain it.
+            return Err(StoreError::StoreCorrupt.into());
+        }
+        return Ok(NativeUpgradePreparation::Unchanged(
+            NativeUpgradeOutcome::Noop { retained_native },
+        ));
+    }
     let source = if canonical_exists {
         canonical.as_path()
     } else {
         data_dir
     };
-    let source_root = evertrace_capture::ConfinedRoot::open_owned_private(source)
-        .map_err(|_| StoreError::StoreCorrupt)?;
-    let profile = crate::JournalWriter::existing_profile(source).await?;
-    if profile.is_none() {
-        if canonical_exists
-            || [
-                crate::OBJECTS_TABLE,
-                crate::RELATIONS_TABLE,
-                crate::SEARCH_TABLE,
-            ]
-            .iter()
-            .any(|table| source.join(format!("{table}.lance")).exists())
-        {
+    let Some(legacy) = crate::legacy_lance::read_legacy_store(source).await? else {
+        if canonical_exists {
+            // An existing canonical container without either physical format
+            // must never be replaced by a fresh empty database.
             return Err(StoreError::StoreCorrupt.into());
         }
         return Ok(NativeUpgradePreparation::Unchanged(
             NativeUpgradeOutcome::Empty,
         ));
-    }
-    let table_names: &'static [&'static str] = if profile == Some("L0001") {
+    };
+    let source_root = evertrace_capture::ConfinedRoot::open_owned_private(source)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let table_names: &'static [&'static str] = if legacy.profile == "L0001" {
         &[crate::JOURNAL_TABLE, crate::OBJECTS_TABLE]
     } else {
         &[
@@ -164,35 +187,15 @@ async fn prepare_upgrade_inner(
             crate::SEARCH_TABLE,
         ]
     };
-    let source_tables = table_names
-        .iter()
-        .map(|name| {
-            let path = source.join(format!("{name}.lance"));
-            let custody = evertrace_capture::ConfinedRoot::open_owned_private(&path)
-                .map_err(|_| StoreError::StoreCorrupt)?;
-            Ok::<_, RestoreError>((path, custody))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    crate::backup::read_verified_store_tables(source).await?;
-    if !check_package && canonical_exists && profile == Some("L0002") {
-        let mut retained_native = Vec::new();
-        for table in table_names {
-            let path = data_dir.join(format!("{table}.lance"));
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => retained_native.push(path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(RestoreError::Io),
-            }
-        }
-        return Ok(NativeUpgradePreparation::Unchanged(
-            NativeUpgradeOutcome::Noop { retained_native },
-        ));
-    }
     if canonical_exists {
         validate_upgrade_container_entries(source, table_names)?;
     }
-    catch_up_upgrade_source(source, profile == Some("L0002")).await?;
-    let (states, snapshot) = crate::backup::read_verified_store_tables(source).await?;
+    let table_states = legacy.table_states();
+    let compiler_watermark = legacy.object_checkpoint;
+    let snapshot = legacy.full_snapshot()?;
+    let rows = legacy.rows.clone();
+    drop(legacy);
+
     let runtime = evertrace_capture::RuntimeSnapshot::load(
         &evertrace_capture::RuntimeSnapshot::snapshot_path(data_dir),
     )
@@ -220,14 +223,13 @@ async fn prepare_upgrade_inner(
     let id = evertrace_domain::ids::JobId::new_v7();
     let plan = crate::backup::prepare_backup(
         (data_dir, source),
-        config_path,
-        &runtime,
+        (config_path, &runtime),
         id,
         &snapshot,
-        states,
+        table_states,
+        crate::backup::BackupShape::Legacy { compiler_watermark },
         boundary,
     )?;
-    plan.check_upgrade_space()?;
     let staging = crate::backup::stage_backup(plan)?;
     let verified_staging = async {
         let summary = crate::backup::verify_staged_backup(&staging).await?;
@@ -269,8 +271,27 @@ async fn prepare_upgrade_inner(
             }
         })?;
     let prepared = async {
+        crate::backup::check_restore_copy_budget(&verification, &candidate)?;
         crate::backup::copy_upgrade_native_candidate(&verification, &candidate, &custody)?;
-        rebuild_upgrade_native(&candidate).await?;
+        crate::writer::bootstrap_legacy_candidate(
+            &crate::writer::LegacyCandidate::Native(candidate.clone()),
+            &custody,
+            &rows,
+        )
+        .await?;
+        // The converted candidate is a complete current store; its live CAS
+        // closure must be present in the pre-upgrade backup.
+        let references = verify_native_store_tables(&candidate).await?;
+        if !references.is_empty() {
+            let cas = evertrace_capture::CasStore::open_existing(backup.join("cas"))
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            for reference in references {
+                let digest = evertrace_capture::CasStore::parse_digest(&reference)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                cas.verify_envelope(&digest)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+            }
+        }
         lock.validate_held()?;
         source_root
             .revalidate_stable()
@@ -294,6 +315,18 @@ async fn prepare_upgrade_inner(
             };
         }
     };
+    let source_tables = if canonical_exists {
+        Vec::new()
+    } else {
+        let mut tables = Vec::new();
+        for table in table_names {
+            let path = source.join(format!("{table}.lance"));
+            let table_custody = evertrace_capture::ConfinedRoot::open_owned_private(&path)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            tables.push((path, table_custody));
+        }
+        tables
+    };
     Ok(NativeUpgradePreparation::Prepared(Box::new(
         PreparedNativeUpgrade {
             lock,
@@ -310,9 +343,100 @@ async fn prepare_upgrade_inner(
             verification,
             prepared_manifest,
             table_names,
-            migrated: profile == Some("L0001"),
+            migrated: table_names.len() == 2,
         },
     )))
+}
+
+fn flat_retained_tables(data_dir: &Path) -> Result<Vec<PathBuf>, RestoreError> {
+    let mut retained = Vec::new();
+    for table in [
+        crate::JOURNAL_TABLE,
+        crate::OBJECTS_TABLE,
+        crate::RELATIONS_TABLE,
+        crate::SEARCH_TABLE,
+    ] {
+        let path = data_dir.join(format!("{table}.lance"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => retained.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(RestoreError::Io),
+        }
+    }
+    Ok(retained)
+}
+
+fn validate_upgrade_container_entries(native: &Path, tables: &[&str]) -> Result<(), RestoreError> {
+    for entry in std::fs::read_dir(native)
+        .map_err(|_| RestoreError::Io)?
+        .take(tables.len() + 1)
+    {
+        let name = entry.map_err(|_| RestoreError::Io)?.file_name();
+        if !tables
+            .iter()
+            .any(|table| name == std::ffi::OsStr::new(&format!("{table}.lance")))
+        {
+            return Err(StoreError::StoreCorrupt.into());
+        }
+    }
+    Ok(())
+}
+
+/// Full read-only validation of a current-format store: authoritative SQLite
+/// rows, the actual Lance search projection and its single FTS index. It never
+/// repairs and returns the live CAS references for the caller's own policy.
+pub(crate) async fn verify_native_store_tables(
+    native: &Path,
+) -> Result<std::collections::BTreeSet<String>, RestoreError> {
+    let verified = crate::backup::read_verified_store_tables(native).await?;
+    let frontier = verified.states.journal.checkpoint;
+    if !verified.states.validate(frontier)
+        || verified
+            .states
+            .relations
+            .as_ref()
+            .is_none_or(|relations| relations.checkpoint != frontier || relations.version.is_some())
+        || verified.states.search.as_ref().is_none_or(|search| {
+            search.checkpoint != frontier
+                || search.version.is_none()
+                || search.projection_generation != Some(crate::SEARCH_PROJECTION_GENERATION)
+        })
+    {
+        return Err(StoreError::Projection.into());
+    }
+    let expected = crate::projections::reduce_journal(&verified.journal_rows)?;
+    if expected != verified.objects {
+        return Err(StoreError::Projection.into());
+    }
+    let derived = crate::query::derive_l0002_projections(&expected)?;
+    let actual = verified.projected;
+    if actual.frontier != frontier
+        || actual.relation_hash()? != derived.relation_hash()?
+        || actual.search_hash()? != derived.search_hash()?
+    {
+        return Err(StoreError::Projection.into());
+    }
+    // The search projection must carry the real FTS index, not just rows.
+    evertrace_capture::ConfinedRoot::open_owned_private(native)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
+        .session(crate::connection::native_session())
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let table = connection
+        .open_table(crate::SEARCH_TABLE)
+        .execute()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let indices = table
+        .list_indices()
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    if indices.len() != 1 || indices[0].columns != ["text"] {
+        return Err(StoreError::StoreCorrupt.into());
+    }
+    expected.live_cas_refs().map_err(Into::into)
 }
 
 impl PreparedNativeUpgrade {
@@ -320,18 +444,23 @@ impl PreparedNativeUpgrade {
         self,
         publish: impl FnOnce() -> PackagePublication,
     ) -> Result<NativeUpgradeOutcome, RestoreError> {
-        self.publish(|_| Ok(()), publish).await
+        self.publish(&|_| Ok(()), publish).await
     }
+
     pub fn path(&self) -> &Path {
         &self.candidate
     }
+
     pub fn backup(&self) -> &Path {
         &self.backup
     }
+
     pub fn migrated(&self) -> bool {
         self.migrated
     }
 
+    /// Check-only disposal: remove exactly this owned candidate under the held
+    /// lock and touch nothing else.
     pub fn discard(self) -> Result<(), RestoreError> {
         let cleanup = self
             .lock
@@ -346,7 +475,7 @@ impl PreparedNativeUpgrade {
 
     async fn publish(
         self,
-        checkpoint: impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
+        checkpoint: &impl Fn(NativePublicationPoint) -> Result<(), RestoreError>,
         publish_package: impl FnOnce() -> PackagePublication,
     ) -> Result<NativeUpgradeOutcome, RestoreError> {
         let Self {
@@ -384,15 +513,16 @@ impl PreparedNativeUpgrade {
                 directory: candidate.clone(),
                 cause: Box::new(cause),
             })?;
-        // Package material must have left this native-only closure before swap.
+        // The native-only candidate must not have changed since preparation.
         if crate::backup::native_upgrade_manifest(&candidate)? != prepared_manifest {
             return Err(RestoreError::ResidualCandidate {
                 directory: candidate,
                 cause: Box::new(StoreError::StoreCorrupt.into()),
             });
         }
-        // No semantic write resumes until publication, directory sync and validation
-        // have all succeeded. Flat source tables are never moved or overwritten.
+        // No semantic write resumes until publication, directory sync and
+        // validation have all succeeded. Old source tables are never moved or
+        // overwritten by a partial step.
         let publish = if canonical_exists {
             parent.exchange_directories(&custody, &source_root)
         } else {
@@ -430,8 +560,10 @@ impl PreparedNativeUpgrade {
                 .map_err(|_| RestoreError::Io)?;
             checkpoint(NativePublicationPoint::Durable)?;
             lock.validate_held()?;
-            let (states, _) = crate::backup::read_verified_store_tables(&canonical).await?;
-            if states.relations.is_none() || states.search.is_none() {
+            let verified = crate::backup::read_verified_store_tables(&canonical)
+                .await
+                .map_err(RestoreError::from)?;
+            if verified.states.relations.is_none() || verified.states.search.is_none() {
                 return Err(StoreError::StoreCorrupt.into());
             }
             if crate::backup::native_upgrade_manifest(&canonical)? != prepared_manifest {
@@ -453,6 +585,8 @@ impl PreparedNativeUpgrade {
             }
         }
         if let Err(cause) = checked {
+            // Reverse exchange before any semantic write resumes. Two ordinary
+            // renames never pretend to be one atomic boundary.
             if directory_identity(&canonical).ok() != Some(candidate_identity)
                 || (canonical_exists
                     && directory_identity(&candidate).ok() != Some(previous_identity))
@@ -604,113 +738,58 @@ pub(crate) fn reject_retained_upgrade_candidate(data_dir: &Path) -> Result<(), R
     Ok(())
 }
 
-fn validate_upgrade_container_entries(native: &Path, tables: &[&str]) -> Result<(), RestoreError> {
-    for entry in std::fs::read_dir(native)
-        .map_err(|_| RestoreError::Io)?
-        .take(tables.len() + 1)
-    {
-        let name = entry.map_err(|_| RestoreError::Io)?.file_name();
-        if !tables
-            .iter()
-            .any(|table| name == std::ffi::OsStr::new(&format!("{table}.lance")))
-        {
-            return Err(StoreError::StoreCorrupt.into());
-        }
-    }
-    Ok(())
-}
-
-async fn catch_up_upgrade_source(native: &Path, l0002: bool) -> Result<(), RestoreError> {
-    let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
-        .session(crate::connection::native_session())
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let journal = connection
-        .open_table(crate::JOURNAL_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let objects = connection
-        .open_table(crate::OBJECTS_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let frontier = crate::journal::read_journal_frontier(&journal).await?;
-    let journal_version = journal.version().await.map_err(|_| StoreError::LanceDb)?;
-    let snapshot = crate::ProjectionWorker::new(journal.clone(), objects)
-        .catch_up()
-        .await?;
-    if l0002 {
-        let relations = connection
-            .open_table(crate::RELATIONS_TABLE)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let search = connection
-            .open_table(crate::SEARCH_TABLE)
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        crate::query::L0002ProjectionWorker::new(journal.clone(), relations, search)
-            .catch_up(&snapshot)
-            .await?;
-    }
-    if crate::journal::read_journal_frontier(&journal).await? != frontier
-        || journal.version().await.map_err(|_| StoreError::LanceDb)? != journal_version
-    {
-        return Err(StoreError::StoreCorrupt.into());
-    }
-    Ok(())
-}
-
-async fn rebuild_upgrade_native(native: &Path) -> Result<(), RestoreError> {
-    let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
-        .session(crate::connection::native_session())
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    crate::migrations::L0002::apply(&connection).await?;
-    let journal = connection
-        .open_table(crate::JOURNAL_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let objects = connection
-        .open_table(crate::OBJECTS_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let relations = connection
-        .open_table(crate::RELATIONS_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let search = connection
-        .open_table(crate::SEARCH_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let projected = crate::ProjectionWorker::new(journal.clone(), objects)
-        .rebuild_for_restore()
-        .await?;
-    crate::query::L0002ProjectionWorker::new(journal, relations, search)
-        .rebuild_for_restore(&projected)
-        .await?;
-    Ok(())
-}
-
-/// Before service recovery, verify the unchanged old native side under the
-/// sibling lock and reject every uncertain upgrade remnant. No repair runs.
+/// Before service recovery, verify the original native container under the
+/// sibling lock and reject every uncertain upgrade remnant. A canonical old
+/// or flat retired layout is read with the named legacy decoder; only a
+/// missing canonical may fall back to the flat root. SQLite checkpoint/close
+/// may legitimately change directory timestamps; custody is its no-follow
+/// inode, owner and mode, while the full verifier proves contents. No repair runs.
 pub async fn verify_package_resume(
     data: &Path,
     original: &evertrace_capture::ConfinedRoot,
 ) -> Result<(), RestoreError> {
     let _lock = crate::SiblingWriterLock::acquire(data)?;
     reject_retained_upgrade_candidate(data)?;
-    original.revalidate().map_err(|_| RestoreError::Io)?;
-    verify_package_native(&crate::connection::native_root(data), &data.join("cas")).await?;
-    original.revalidate().map_err(|_| RestoreError::Io)?;
+    original.revalidate_stable().map_err(|_| RestoreError::Io)?;
+    let canonical = crate::connection::native_root(data);
+    let canonical_exists = match std::fs::symlink_metadata(&canonical) {
+        Ok(_) => {
+            evertrace_capture::ConfinedRoot::open_owned_private(&canonical)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err(RestoreError::Io),
+    };
+    if crate::JournalWriter::store_database_exists(data)? {
+        if !canonical_exists {
+            return Err(StoreError::StoreCorrupt.into());
+        }
+        verify_package_native(&canonical, &data.join("cas")).await?;
+    } else {
+        // canonical selection falls back to flat only when the canonical
+        // locator is actually absent, never on any open error.
+        let source = if canonical_exists {
+            canonical.as_path()
+        } else {
+            data
+        };
+        let legacy = crate::legacy_lance::read_legacy_store(source)
+            .await?
+            .ok_or(StoreError::StoreCorrupt)?;
+        let refs = legacy.full_snapshot()?.live_cas_refs()?;
+        if !refs.is_empty() {
+            let cas = evertrace_capture::CasStore::open_existing(data.join("cas"))
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            for reference in refs {
+                let digest = evertrace_capture::CasStore::parse_digest(&reference)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                cas.verify_envelope(&digest)
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+            }
+        }
+    }
+    original.revalidate_stable().map_err(|_| RestoreError::Io)?;
     Ok(())
 }
 
@@ -719,52 +798,7 @@ pub async fn verify_package_native(native: &Path, cas: &Path) -> Result<(), Rest
     let custody = evertrace_capture::ConfinedRoot::open_owned_private(native)
         .map_err(|_| StoreError::InvalidPath)?;
     let before = crate::backup::native_upgrade_manifest(native)?;
-    let (_, persisted) = crate::backup::read_verified_store_tables(native).await?;
-    if crate::JournalWriter::existing_profile(native).await? != Some("L0002") {
-        return Err(StoreError::StoreCorrupt.into());
-    }
-    let connection = lancedb::connect(native.to_str().ok_or(StoreError::InvalidPath)?)
-        .session(crate::connection::native_session())
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let journal = connection
-        .open_table(crate::JOURNAL_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let objects = connection
-        .open_table(crate::OBJECTS_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let expected = crate::ProjectionWorker::new(journal.clone(), objects)
-        .full_snapshot()
-        .await?;
-    if expected != persisted {
-        return Err(StoreError::Projection.into());
-    }
-    let relations = connection
-        .open_table(crate::RELATIONS_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let search = connection
-        .open_table(crate::SEARCH_TABLE)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let actual = crate::query::L0002ProjectionWorker::new(journal, relations, search)
-        .current()
-        .await?;
-    let derived = crate::query::derive_l0002_projections(&expected)?;
-    if actual.frontier != derived.frontier
-        || actual.relation_hash()? != derived.relation_hash()?
-        || actual.search_hash()? != derived.search_hash()?
-    {
-        return Err(StoreError::Projection.into());
-    }
-    let references = expected.live_cas_refs()?;
+    let references = verify_native_store_tables(native).await?;
     if !references.is_empty() {
         let cas = evertrace_capture::CasStore::open_existing(cas.to_owned())
             .map_err(|_| StoreError::StoreCorrupt)?;
@@ -937,7 +971,9 @@ impl RestoreCandidate {
         let custody = evertrace_capture::ConfinedRoot::open_owned_private(&self.path)
             .map_err(|_| StoreError::StoreCorrupt)?;
         let candidate_identity = custody.identity();
-        let mut closed = self.writer.close_for_backup();
+        let mut writer = self.writer;
+        let guard = writer.quiesce_for_backup().await?.ok_or(StoreError::Io)?;
+        let mut closed = writer.close_for_backup(guard)?;
         let active = closed.lock.data_dir().to_owned();
         let live_fence = evertrace_capture::MaintenanceFence::open(&active)
             .map_err(|_| StoreError::StoreCorrupt)?;
@@ -1065,9 +1101,11 @@ impl RestoreCandidate {
                 .revalidate_stable()
                 .map_err(|_| StoreError::StoreCorrupt)?;
             sync_root(&data_parent_file).map_err(|_| RestoreError::Io)?;
-            let (actual_states, actual) =
+            let verified =
                 crate::backup::read_verified_store_tables(&crate::connection::native_root(&active))
                     .await?;
+            let actual_states = verified.states;
+            let actual = verified.objects;
             if actual_states != states || actual.rows != expected.rows {
                 return Err(StoreError::StoreCorrupt.into());
             }
@@ -1277,17 +1315,58 @@ pub enum RestorePreparation {
     Candidate(Box<RestoreCandidate>),
 }
 
+enum CurrentStoreFormat {
+    Current,
+    Legacy(PathBuf),
+    Empty,
+}
+
+/// Explicit physical-format discrimination for the live root. I/O errors and
+/// a corrupt canonical container are never mapped to "absent"; only a root
+/// with neither a database nor retired tables is empty.
+fn current_store_format(data_dir: &Path) -> Result<CurrentStoreFormat, RestoreError> {
+    let canonical = crate::connection::native_root(data_dir);
+    let canonical_exists = match std::fs::symlink_metadata(&canonical) {
+        Ok(_) => {
+            evertrace_capture::ConfinedRoot::open_owned_private(&canonical)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err(RestoreError::Io),
+    };
+    if crate::JournalWriter::store_database_exists(data_dir)? {
+        if !canonical_exists {
+            return Err(StoreError::StoreCorrupt.into());
+        }
+        return Ok(CurrentStoreFormat::Current);
+    }
+    let source = if canonical_exists {
+        canonical.as_path()
+    } else {
+        data_dir
+    };
+    match crate::legacy_lance::legacy_profile(source)? {
+        Some(_) => Ok(CurrentStoreFormat::Legacy(source.to_owned())),
+        None if canonical_exists => Err(StoreError::StoreCorrupt.into()),
+        None => Ok(CurrentStoreFormat::Empty),
+    }
+}
+
 pub async fn prepare(
     data_dir: &Path,
     backup: &Path,
     occurred_at_us: i64,
     config_hash: [u8; 32],
+    verify_hook: impl Fn(&Path, &crate::BackupSummary) -> Result<(), crate::BackupError>,
 ) -> Result<RestorePreparation, RestoreError> {
+    if occurred_at_us < 0 {
+        return Err(StoreError::InvalidInput.into());
+    }
     let lock = crate::SiblingWriterLock::acquire(data_dir)?;
-    let current_exists = crate::connection::native_root(data_dir)
-        .join(format!("{}.lance", crate::JOURNAL_TABLE))
-        .exists();
+    let current = current_store_format(data_dir)?;
     let source = crate::backup::prepare_verification_directory(backup, None)?;
+    let legacy_backup = source.manifest_version() == 2;
     let parent = data_dir.parent().ok_or(StoreError::InvalidPath)?;
     let name = data_dir
         .file_name()
@@ -1311,16 +1390,70 @@ pub async fn prepare(
     let result = async {
         crate::backup::copy_restore_candidate(&source, &path, &custody)?;
         let verified = crate::backup::prepare_verification_directory(&path, None)?;
-        crate::backup::complete_backup_verification_ref(&verified).await?;
-        if !current_exists {
-            return Ok(RestorePreparation::Historical {
-                directory: path.clone(),
-            });
+        let summary = crate::backup::complete_backup_verification_ref(&verified).await?;
+        // Adapter-owned hook assets are verified against the copied candidate
+        // before Historical is returned and before any conversion write.
+        verify_hook(&path, &summary)?;
+        // A historical copy keeps the verified original manifest and files;
+        // only a candidate with current deletion authority is converted.
+        if legacy_backup && !matches!(&current, CurrentStoreFormat::Empty) {
+            let legacy = crate::legacy_lance::read_legacy_store(&path.join("store"))
+                .await?
+                .ok_or(StoreError::StoreCorrupt)?;
+            crate::writer::bootstrap_legacy_candidate(
+                &crate::writer::LegacyCandidate::StateRoot(path.clone()),
+                &custody,
+                &legacy.rows,
+            )
+            .await?;
         }
-        let current_writer = crate::JournalWriter::open_with_lock(lock).await?;
+        let mut current_writer = match &current {
+            CurrentStoreFormat::Empty => {
+                return Ok(RestorePreparation::Historical {
+                    directory: path.clone(),
+                });
+            }
+            CurrentStoreFormat::Current => {
+                crate::JournalWriter::open_with_lock(lock, crate::StoreReadHandle::open(data_dir))
+                    .await?
+            }
+            CurrentStoreFormat::Legacy(source_dir) => {
+                let lock_inode = lock.inode_identity()?;
+                let ledger = CurrentLedger::read_legacy(source_dir, lock_inode).await?;
+                let mut writer = crate::JournalWriter::open_at_with_lock(
+                    lock,
+                    &path,
+                    crate::StoreReadHandle::open(&path),
+                )
+                .await?;
+                let physical = candidate_scope_refs(&writer, &ledger).await?;
+                writer
+                    .import_restore_ledger(&ledger, occurred_at_us, config_hash)
+                    .await?;
+                complete_candidate_deletions(
+                    &mut writer,
+                    &path,
+                    &ledger,
+                    physical,
+                    occurred_at_us,
+                    config_hash,
+                )
+                .await?;
+                reset_runtime_authority(&mut writer, occurred_at_us, config_hash).await?;
+                writer.rebuild_restore_projections().await?;
+                return Ok(RestorePreparation::Candidate(Box::new(RestoreCandidate {
+                    writer,
+                    path: path.clone(),
+                })));
+            }
+        };
         let ledger = CurrentLedger::read(&current_writer).await?;
+        let guard = current_writer
+            .quiesce_for_backup()
+            .await?
+            .ok_or(StoreError::Io)?;
         let mut writer = current_writer
-            .close_for_backup()
+            .close_for_backup(guard)?
             .open_restore_candidate(&path)
             .await?;
         let physical = candidate_scope_refs(&writer, &ledger).await?;
@@ -1490,28 +1623,55 @@ pub(crate) struct CurrentLedger {
 impl CurrentLedger {
     async fn read(writer: &crate::JournalWriter) -> Result<Self, StoreError> {
         writer.validate_restore_lock()?;
-        let snapshot = writer.full_projection().await?;
-        let mut result = Self {
-            lock_inode: writer.lock_inode_identity()?,
+        let rows = writer.journal_rows().await?;
+        let lock_inode = writer.lock_inode_identity()?;
+        let mut result = Self::from_rows(&rows, lock_inode)?;
+        result.fill_scope_plans(&rows)?;
+        writer.validate_restore_lock()?;
+        Ok(result)
+    }
+
+    /// The same validated-history ledger from a read-only retired layout. The
+    /// live store is never converted or reopened as a writer just to read it.
+    async fn read_legacy(dir: &Path, lock_inode: (u64, u64)) -> Result<Self, StoreError> {
+        let store = crate::legacy_lance::read_legacy_store(dir)
+            .await?
+            .ok_or(StoreError::StoreCorrupt)?;
+        let mut result = Self::from_rows(&store.rows, lock_inode)?;
+        result.fill_scope_plans(&store.rows)?;
+        Ok(result)
+    }
+
+    fn from_rows(rows: &[JournalRow], lock_inode: (u64, u64)) -> Result<Self, StoreError> {
+        let snapshot = crate::projections::reduce_journal(rows)?;
+        Ok(Self {
+            lock_inode,
             object: crate::ObjectDeletionCurrentView::from_snapshot(&snapshot)?,
             scope: crate::ScopePurgeCurrentView::from_snapshot(&snapshot)?,
             jobs: crate::RuntimeSchedulerView::from_snapshot(&snapshot)?.jobs,
             scope_plans: std::collections::BTreeMap::new(),
-        };
-        for progress in result.scope.events.values() {
+        })
+    }
+
+    /// Each unfinished scope is rebuilt from the exact confirmation frontier
+    /// of the verified history prefix, not from the candidate's current.
+    fn fill_scope_plans(&mut self, rows: &[JournalRow]) -> Result<(), StoreError> {
+        for progress in self.scope.events.values().cloned().collect::<Vec<_>>() {
             if progress.stage == evertrace_domain::purge::ScopePurgeStage::Purged {
                 continue;
             }
-            let confirmed = writer
-                .projection_worker()
-                .project_at_frontier(progress.confirmation_frontier)
-                .await?;
+            let prefix = rows
+                .iter()
+                .filter(|row| row.seq <= progress.confirmation_frontier)
+                .cloned()
+                .collect::<Vec<_>>();
+            let confirmed = crate::projections::reduce_journal(&prefix)?;
             let plan = crate::repository_scope_purge_preview(
                 &confirmed,
                 progress.target.repository_id(),
                 progress.target.repository_revision(),
             )?;
-            let job = result
+            let job = self
                 .jobs
                 .iter()
                 .find(|job| job.job_id == progress.purge_job_id)
@@ -1521,12 +1681,10 @@ impl CurrentLedger {
             {
                 return Err(StoreError::StoreCorrupt);
             }
-            result
-                .scope_plans
+            self.scope_plans
                 .insert(progress.target.repository_id(), plan.exclusive_cas_refs);
         }
-        writer.validate_restore_lock()?;
-        Ok(result)
+        Ok(())
     }
 
     pub(crate) fn commands(
@@ -1882,457 +2040,107 @@ mod tests {
     use crate::{JobLease, JournalEventDraft};
     use evertrace_domain::ids::JobId;
 
-    async fn upgrade_fixture(data: &Path, canonical: bool) -> PathBuf {
-        use evertrace_capture::{
-            RecallCueGateMode, RecoveryGateMode, RecoverySnapshotSettings, RuntimeSnapshot,
-            SpoolLimits,
-        };
+    async fn current_store(data: &Path) {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::DirBuilder::new().mode(0o700).create(data).unwrap();
-        let native = if canonical {
-            data.join("store")
-        } else {
-            data.to_owned()
-        };
-        if canonical {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&native)
-                .unwrap();
-        }
-        let connection = lancedb::connect(native.to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        crate::L0001::apply(&connection).await.unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let pending = crate::JournalCommand::new(
-            evertrace_domain::ids::CommandId::new_v7(),
-            vec![crate::JournalEventDraft::runtime(
-                1,
-                [0; 32],
-                "upgrade-lag-proof",
-                crate::JournalPayload::DirtyTarget(crate::DirtyTarget {
-                    target_kind: crate::DirtyTargetKind::ObjectsProjection,
-                    target_id: "objects".into(),
-                    algorithm_revision: "upgrade-lag-proof".into(),
-                    source_watermark: 1,
-                }),
-            )],
-        )
-        .unwrap();
-        crate::journal::append_rows(
-            &journal,
-            &crate::journal::rows_for_append(&crate::prepare_command(&pending).unwrap(), 2, 1)
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        drop(journal);
-        drop(connection);
-        let config = evertrace_domain::config::EffectiveConfig::default();
-        let path = data.parent().unwrap().join("config.toml");
-        std::fs::write(&path, config.to_toml().unwrap()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let runtime = RuntimeSnapshot::for_data_dir(
-            data,
-            1,
-            SpoolLimits {
-                high_watermark_bytes: 4 << 20,
-                low_watermark_bytes: 64 << 10,
-                max_main_files: 16,
-                emergency_slots: 2,
-            },
-            RecoverySnapshotSettings {
-                gate: RecoveryGateMode::Disabled,
-                preflight_timeout_ms: 250,
-                effective_config_hash: config.hash(),
-                adapter_manifest_id: None,
-                classifier_revision: 1,
-                max_bundle_bytes: 4 << 20,
-                max_untracked_file_bytes: 1 << 20,
-                max_untracked_total_bytes: 2 << 20,
-                recall_cue_gate: RecallCueGateMode::Disabled,
-                recall_cue_adapter_manifest_id: None,
-            },
-        )
-        .unwrap();
-        runtime
-            .publish(&RuntimeSnapshot::snapshot_path(data))
-            .unwrap();
-        evertrace_capture::CasStore::open(runtime.cas_dir).unwrap();
-        path
-    }
-
-    fn empty_hook() -> Result<crate::backup::BackupHookBoundary, crate::BackupError> {
-        Ok(crate::backup::BackupHookBoundary {
-            current_generation: None,
-            retained_generations: Vec::new(),
-            pin_count: 0,
-            pinned_generation_count: 0,
-            files: Vec::new(),
-        })
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(data.parent().unwrap())
+            .ok();
+        let writer = crate::JournalWriter::open(data).await.unwrap();
+        drop(writer);
+        std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[tokio::test]
-    async fn native_upgrade_rolls_back_before_resuming_writes() {
-        for (canonical, failure) in [
-            (false, NativePublicationPoint::Prepared),
-            (false, NativePublicationPoint::Published),
-            (true, NativePublicationPoint::Published),
-        ] {
+    async fn old_four_lance_layout_requires_the_offline_converter() {
+        // A partial retired layout is not a convertible legacy store: the
+        // converter refuses it as corruption and leaves every original byte
+        // in place. A complete L0001/L0002 closure is converted by the
+        // legacy reader tests instead.
+        for canonical in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path().join("data");
-            let config = upgrade_fixture(&data, canonical).await;
-            let source = if canonical {
-                data.join("store")
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&data)
+                .unwrap();
+            let native = if canonical {
+                let native = data.join("store");
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&native)
+                    .unwrap();
+                native
             } else {
                 data.clone()
             };
-            let original = std::fs::metadata(&source).unwrap().ino();
-            let journal_files = |files: Vec<crate::backup::BackupFileManifest>| {
-                files
-                    .into_iter()
-                    .filter(|entry| {
-                        entry
-                            .relative_path
-                            .starts_with(&format!("store/{}.lance", crate::JOURNAL_TABLE))
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let original_journal =
-                journal_files(crate::backup::native_upgrade_manifest(&source).unwrap());
-            let (before, _) = crate::backup::read_verified_store_tables(&source)
-                .await
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(native.join("evertrace_journal.lance"))
                 .unwrap();
-            assert!(before.objects.checkpoint < before.journal.checkpoint);
-            let shared_capture = std::cell::RefCell::new(None);
-            let sibling_identity = std::cell::Cell::new(None);
-            let result = upgrade_native_inner(
+            let result = upgrade_native(
                 &data,
-                &config,
-                empty_hook,
+                &temp.path().join("config.toml"),
+                || Err(crate::BackupError::InvalidInput),
                 |_, _| Ok(()),
-                |point| {
-                    if point == NativePublicationPoint::BackupFrozen {
-                        let fence = evertrace_capture::MaintenanceFence::open(&data).unwrap();
-                        *shared_capture.borrow_mut() = Some(fence.shared().unwrap());
-                        let metadata =
-                            std::fs::metadata(data.with_extension("writer.lock")).unwrap();
-                        sibling_identity.set(Some((metadata.dev(), metadata.ino())));
-                    }
-                    if point == NativePublicationPoint::Published {
-                        let metadata =
-                            std::fs::metadata(data.with_extension("writer.lock")).unwrap();
-                        assert_eq!(
-                            sibling_identity.get(),
-                            Some((metadata.dev(), metadata.ino()))
-                        );
-                        let status = std::process::Command::new(std::env::current_exe().unwrap())
-                            .args([
-                                "--exact",
-                                "restore::tests::native_upgrade_process_exit_has_one_restart_entry",
-                                "--test-threads=1",
-                            ])
-                            .env("EVERTRACE_TEST_NATIVE_UPGRADE_ROOT", &data)
-                            .env("EVERTRACE_TEST_NATIVE_UPGRADE_POINT", "LockProbe")
-                            .status()
-                            .unwrap();
-                        assert_eq!(status.code(), Some(78));
-                    }
-                    if point == failure {
-                        Err(RestoreError::Io)
-                    } else {
-                        Ok(())
-                    }
-                },
             )
             .await;
-            assert!(
-                shared_capture.borrow().is_some(),
-                "capture shared guard spans backup verification and native publication"
-            );
-            assert!(matches!(result, Err(RestoreError::Io)));
-            assert_eq!(std::fs::metadata(&source).unwrap().ino(), original);
-            assert_eq!(
-                journal_files(crate::backup::native_upgrade_manifest(&source).unwrap()),
-                original_journal
-            );
-            let (caught_up, _) = crate::backup::read_verified_store_tables(&source)
-                .await
-                .unwrap();
-            assert_eq!(caught_up.objects.checkpoint, caught_up.journal.checkpoint);
-            assert_eq!(
-                crate::JournalWriter::existing_profile(&source)
-                    .await
-                    .unwrap(),
-                Some("L0001")
-            );
-            assert!(!std::fs::read_dir(&data).unwrap().any(|entry| {
-                entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".upgrade-")
-            }));
             assert!(matches!(
-                crate::JournalWriter::open(&data).await,
-                Err(StoreError::UpgradeRequired)
+                result,
+                Err(RestoreError::Store(StoreError::StoreCorrupt))
             ));
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        let config = upgrade_fixture(&data, false).await;
-        let result = upgrade_native_inner(
-            &data,
-            &config,
-            empty_hook,
-            |_, _| Ok(()),
-            |point| {
-                if point == NativePublicationPoint::Prepared {
-                    std::fs::create_dir(data.join("store")).unwrap();
-                    std::fs::write(data.join("store/unknown-user-asset"), b"keep").unwrap();
-                }
-                Ok(())
-            },
-        )
-        .await;
-        assert!(matches!(result, Err(RestoreError::Io)));
-        assert_eq!(
-            std::fs::read(data.join("store/unknown-user-asset")).unwrap(),
-            b"keep"
-        );
-        assert!(!std::fs::read_dir(&data).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".upgrade-")
-        }));
-    }
-
-    #[tokio::test]
-    async fn package_callback_controls_finalize_rollback_and_restart_admission() {
-        for disposition in [
-            PackagePublication::Committed,
-            PackagePublication::Restored,
-            PackagePublication::Uncertain,
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let data = temp.path().join("data");
-            let config = upgrade_fixture(&data, true).await;
-            let old = std::fs::metadata(data.join("store")).unwrap().ino();
-            let NativeUpgradePreparation::Prepared(prepared) =
-                prepare_native_upgrade(&data, &config, empty_hook, |_, _| Ok(()))
-                    .await
-                    .unwrap()
-            else {
-                panic!("package always prepares");
-            };
-            let candidate = prepared.path().to_owned();
-            let new = std::fs::metadata(&candidate).unwrap().ino();
-            let uncertain = matches!(disposition, PackagePublication::Uncertain);
-            let committed = matches!(disposition, PackagePublication::Committed);
-            let result = prepared
-                .publish_package(|| {
-                    assert_eq!(std::fs::metadata(data.join("store")).unwrap().ino(), new);
-                    assert!(crate::SiblingWriterLock::acquire(&data).is_err());
-                    disposition
-                })
-                .await;
-            assert_eq!(
-                std::fs::metadata(data.join("store")).unwrap().ino(),
-                if committed || uncertain { new } else { old }
+            assert!(
+                native.join("evertrace_journal.lance").exists(),
+                "refusal must not touch the old layout"
             );
-            assert_eq!(candidate.exists(), uncertain);
-            if uncertain {
-                assert!(matches!(
-                    result,
-                    Err(RestoreError::NativePublicationUncertain { .. })
-                ));
-                assert!(matches!(
-                    crate::JournalWriter::open(&data).await,
-                    Err(StoreError::UpgradeRequired)
-                ));
-            } else {
-                assert_eq!(result.is_ok(), committed);
-                if committed {
-                    crate::JournalWriter::open(&data).await.unwrap();
-                } else {
-                    assert_eq!(
-                        crate::JournalWriter::existing_profile(&data.join("store"))
-                            .await
-                            .unwrap(),
-                        Some("L0001")
-                    );
-                }
-            }
         }
     }
 
     #[tokio::test]
-    async fn native_upgrade_preserves_replaced_flat_table() {
+    async fn current_store_upgrade_is_unchanged() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
-        let config = upgrade_fixture(&data, false).await;
-        let original = data.join(format!("{}.lance", crate::JOURNAL_TABLE));
-        let moved = temp.path().join("original-journal");
-        let outcome = upgrade_native_inner(
+        current_store(&data).await;
+        let outcome = upgrade_native(
             &data,
-            &config,
-            empty_hook,
+            &temp.path().join("config.toml"),
+            || Err(crate::BackupError::InvalidInput),
             |_, _| Ok(()),
-            |point| {
-                if point == NativePublicationPoint::Durable {
-                    std::fs::rename(&original, &moved).unwrap();
-                    std::fs::create_dir(&original).unwrap();
-                    std::fs::write(original.join("unknown"), b"keep").unwrap();
-                }
-                Ok(())
-            },
         )
         .await
         .unwrap();
-        assert!(
-            matches!(outcome, NativeUpgradeOutcome::Published { retained_native, .. }
-            if retained_native == vec![original.clone()])
-        );
-        assert_eq!(std::fs::read(original.join("unknown")).unwrap(), b"keep");
-        assert!(moved.is_dir());
-        assert!(
-            !data
-                .join(format!("{}.lance", crate::OBJECTS_TABLE))
-                .exists()
-        );
-        crate::JournalWriter::open(&data).await.unwrap();
+        assert!(matches!(outcome, NativeUpgradeOutcome::Noop { .. }));
+        let preparation = prepare_native_upgrade(
+            &data,
+            &temp.path().join("config.toml"),
+            || Err(crate::BackupError::InvalidInput),
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            preparation,
+            NativeUpgradePreparation::Unchanged(NativeUpgradeOutcome::Noop { .. })
+        ));
     }
 
     #[tokio::test]
-    async fn native_upgrade_process_exit_has_one_restart_entry() {
-        const CHILD_ROOT: &str = "EVERTRACE_TEST_NATIVE_UPGRADE_ROOT";
-        const CHILD_POINT: &str = "EVERTRACE_TEST_NATIVE_UPGRADE_POINT";
-        if let Some(path) = std::env::var_os(CHILD_ROOT) {
-            let data = PathBuf::from(path);
-            let wanted = std::env::var(CHILD_POINT).unwrap();
-            if wanted == "LockProbe" {
-                assert!(matches!(
-                    crate::SiblingWriterLock::acquire(&data),
-                    Err(StoreError::WriterAlreadyRunning)
-                ));
-                std::process::exit(78);
-            }
-            upgrade_native_inner(
-                &data,
-                &data.parent().unwrap().join("config.toml"),
-                empty_hook,
-                |_, _| Ok(()),
-                |point| {
-                    if format!("{point:?}") == wanted {
-                        std::process::exit(77);
-                    }
-                    Ok(())
-                },
-            )
-            .await
+    async fn empty_store_upgrade_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&data)
             .unwrap();
-            panic!("publication checkpoint was not reached");
-        }
-        for (canonical, point) in [(false, "Prepared"), (false, "Durable"), (true, "Durable")] {
-            let temp = tempfile::tempdir().unwrap();
-            let data = temp.path().join("data");
-            upgrade_fixture(&data, canonical).await;
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "restore::tests::native_upgrade_process_exit_has_one_restart_entry",
-                    "--test-threads=1",
-                ])
-                .env(CHILD_ROOT, &data)
-                .env(CHILD_POINT, point)
-                .status()
-                .unwrap();
-            assert_eq!(status.code(), Some(77));
-            let entries_before = std::fs::read_dir(&data)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<std::collections::BTreeSet<_>>();
-            let backups_before = std::fs::read_dir(data.join("backups"))
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<std::collections::BTreeSet<_>>();
-            if point == "Prepared" {
-                assert!(!data.join("store").exists());
-                assert_eq!(
-                    crate::JournalWriter::existing_profile(&data).await.unwrap(),
-                    Some("L0001")
-                );
-            } else if canonical {
-                assert!(matches!(
-                    crate::JournalWriter::open(&data).await,
-                    Err(StoreError::UpgradeRequired)
-                ));
-                let (_, snapshot) = crate::backup::read_verified_store_tables(&data.join("store"))
-                    .await
-                    .unwrap();
-                assert_eq!(snapshot.frontier, 3);
-            } else {
-                let writer = crate::JournalWriter::open(&data).await.unwrap();
-                assert_eq!(writer.full_projection().await.unwrap().frontier, 3);
-            }
-            if point == "Durable" && !canonical {
-                let outcome = upgrade_native(
-                    &data,
-                    &data.parent().unwrap().join("config.toml"),
-                    empty_hook,
-                    |_, _| Ok(()),
-                )
-                .await
-                .unwrap();
-                assert!(
-                    matches!(outcome, NativeUpgradeOutcome::Noop { retained_native }
-                    if retained_native == vec![data.join(format!("{}.lance", crate::JOURNAL_TABLE)), data.join(format!("{}.lance", crate::OBJECTS_TABLE))])
-                );
-            }
-            if point == "Prepared" || canonical {
-                let residual = std::fs::read_dir(&data)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
-                    .find(|path| {
-                        path.file_name()
-                            .unwrap()
-                            .as_encoded_bytes()
-                            .starts_with(b".upgrade-")
-                    })
-                    .unwrap();
-                let original = crate::backup::native_upgrade_manifest(&residual).unwrap();
-                assert!(
-                    matches!(upgrade_native(&data, &data.parent().unwrap().join("config.toml"), empty_hook, |_, _| Ok(())).await,
-                    Err(RestoreError::ResidualCandidate { directory, .. }) if directory == residual)
-                );
-                assert_eq!(
-                    crate::backup::native_upgrade_manifest(&residual).unwrap(),
-                    original
-                );
-                assert_eq!(
-                    std::fs::read_dir(&data)
-                        .unwrap()
-                        .map(|entry| entry.unwrap().file_name())
-                        .collect::<std::collections::BTreeSet<_>>(),
-                    entries_before
-                );
-                assert_eq!(
-                    std::fs::read_dir(data.join("backups"))
-                        .unwrap()
-                        .map(|entry| entry.unwrap().file_name())
-                        .collect::<std::collections::BTreeSet<_>>(),
-                    backups_before
-                );
-            }
-        }
+        let outcome = upgrade_native(
+            &data,
+            &temp.path().join("config.toml"),
+            || Err(crate::BackupError::InvalidInput),
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, NativeUpgradeOutcome::Empty));
     }
 
     #[tokio::test]
@@ -2341,7 +2149,7 @@ mod tests {
         for fail_syncs in [0, 1, 2] {
             let temp = tempfile::tempdir().unwrap();
             let active = temp.path().join("data");
-            let writer = crate::JournalWriter::open(&active).await.unwrap();
+            let mut writer = crate::JournalWriter::open(&active).await.unwrap();
             evertrace_capture::CasStore::open(active.join("cas")).unwrap();
             let old_identity = std::fs::metadata(&active).unwrap().ino();
             let config_parent = active.join("settings");
@@ -2362,8 +2170,14 @@ mod tests {
                 .mode(0o700)
                 .create(&path)
                 .unwrap();
+            let guard = writer
+                .quiesce_for_backup()
+                .await
+                .unwrap()
+                .expect("no external reader holds the WAL");
             let writer = writer
-                .close_for_backup()
+                .close_for_backup(guard)
+                .unwrap()
                 .open_restore_candidate(&path)
                 .await
                 .unwrap();

@@ -1462,12 +1462,7 @@ async fn s25_keeps_the_production_store_at_four_tables() {
         .unwrap();
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
 }
 

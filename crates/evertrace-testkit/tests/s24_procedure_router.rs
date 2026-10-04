@@ -808,12 +808,7 @@ async fn missing_inventory_blocks_auto_full_but_manual_acceptance_is_atomic_and_
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
     drop(writer);
     let reopened = JournalWriter::open(&root).await.unwrap();

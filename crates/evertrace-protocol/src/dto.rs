@@ -613,7 +613,7 @@ pub struct HumanJobBudget {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanBackupTableState {
-    pub version: u64,
+    pub version: Option<u64>,
     pub frontier: u64,
 }
 
@@ -1935,16 +1935,16 @@ impl HumanJobBudget {
 impl HumanBackupSummary {
     fn validate(&self) -> bool {
         self.frontier > 0
-            && self.journal.version > 0
+            && self.journal.version.is_none()
             && self.journal.frontier == self.frontier
-            && self.objects.version > 0
+            && self.objects.version.is_none()
             && self.objects.frontier == self.frontier
             && match (&self.relations, &self.search) {
                 (None, None) => self.index_generation == 0,
                 (Some(relations), Some(search)) => {
-                    relations.version > 0
+                    relations.version.is_none()
                         && relations.frontier <= self.frontier
-                        && search.version > 0
+                        && search.version.is_some_and(|version| version > 0)
                         && search.frontier <= self.frontier
                         && self.index_generation > 0
                 }

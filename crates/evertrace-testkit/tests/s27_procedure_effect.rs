@@ -2497,12 +2497,7 @@ mod controlled_projection_proof {
         );
         assert_eq!(
             writer.table_names().await.unwrap(),
-            vec![
-                "evertrace_journal",
-                "evertrace_objects",
-                "evertrace_relations",
-                "evertrace_search",
-            ]
+            vec!["evertrace_search"]
         );
         drop(writer);
 
@@ -2653,12 +2648,7 @@ mod controlled_projection_proof {
         assert_eq!(incremental, writer.full_projection().await.unwrap());
         assert_eq!(
             writer.table_names().await.unwrap(),
-            vec![
-                "evertrace_journal",
-                "evertrace_objects",
-                "evertrace_relations",
-                "evertrace_search",
-            ]
+            vec!["evertrace_search"]
         );
         drop(writer);
         let mut reopened = JournalWriter::open(&store_root).await.unwrap();

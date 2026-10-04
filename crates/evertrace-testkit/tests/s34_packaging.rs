@@ -1,7 +1,8 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     process::{Command, Stdio},
 };
 
@@ -1665,20 +1666,13 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if package_health(paths.data_root.join("runtime/evertraced-v1.sock")).await {
-                let connection = evertrace_store::connection::CompatibilityStore::connect_local(
-                    &evertrace_store::connection::native_root(&paths.data_root),
-                )
-                .await
-                .unwrap();
-                let journal = connection
-                    .connection()
-                    .open_table(evertrace_store::JOURNAL_TABLE)
-                    .execute()
-                    .await
-                    .unwrap();
-                let payloads = evertrace_store::journal::read_all_journal_rows(&journal)
+                let rows = evertrace_store::StoreReadHandle::open_read_only(&paths.data_root)
                     .await
                     .unwrap()
+                    .journal_rows()
+                    .await
+                    .unwrap();
+                let payloads = rows
                     .iter()
                     .map(|row| row.payload().unwrap())
                     .collect::<Vec<_>>();
@@ -1844,18 +1838,10 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
             invoke(&paths, &serde_json::to_vec(&native).unwrap());
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
-                let connection = evertrace_store::connection::CompatibilityStore::connect_local(
-                    &evertrace_store::connection::native_root(&paths.data_root),
-                )
-                .await
-                .unwrap();
-                let journal = connection
-                    .connection()
-                    .open_table(evertrace_store::JOURNAL_TABLE)
-                    .execute()
+                let rows = evertrace_store::StoreReadHandle::open_read_only(&paths.data_root)
                     .await
-                    .unwrap();
-                let rows = evertrace_store::journal::read_all_journal_rows(&journal)
+                    .unwrap()
+                    .journal_rows()
                     .await
                     .unwrap();
                 let current_hash = EffectiveConfig::new(settings.clone()).unwrap().hash();
@@ -2023,18 +2009,10 @@ async fn submitted_inputs_are_weak_independent_and_visible_after_automatic_inges
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if package_health(socket.clone()).await {
-                let connection = evertrace_store::connection::CompatibilityStore::connect_local(
-                    &evertrace_store::connection::native_root(&paths.data_root),
-                )
-                .await
-                .unwrap();
-                let journal = connection
-                    .connection()
-                    .open_table(evertrace_store::JOURNAL_TABLE)
-                    .execute()
+                let rows = evertrace_store::StoreReadHandle::open_read_only(&paths.data_root)
                     .await
-                    .unwrap();
-                let rows = evertrace_store::journal::read_all_journal_rows(&journal)
+                    .unwrap()
+                    .journal_rows()
                     .await
                     .unwrap();
                 let payloads = rows
@@ -2198,14 +2176,10 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         fs::read_to_string(&paths.host_config).unwrap()
     ).replace("# END EverTrace managed wiring v1", "[hooks.state.review]\ntrusted_hash = 'keep-host-state'\n[projects.\"/private/work\"]\ntrust_level = 'trusted'\n[mcp_servers.evertrace.tools.evertrace]\napproval_mode = 'approve'\n# END EverTrace managed wiring v1");
     fs::write(&paths.host_config, &host_with_token).unwrap();
-    let connection =
-        evertrace_store::connection::CompatibilityStore::connect_local(&paths.data_root)
-            .await
-            .unwrap();
-    evertrace_store::L0001::apply(connection.connection())
+    let writer = evertrace_engine::open_writer(&paths.data_root)
         .await
         .unwrap();
-    drop(connection);
+    drop(writer);
     let native = serde_json::json!({"cwd": paths.data_root, "hook_event_name":"PreToolUse", "model":"test", "permission_mode":"default", "session_id":"package-pin", "tool_input":{"command":"true"}, "tool_name":"Bash", "tool_use_id":"one", "transcript_path":null, "turn_id":"one"});
     invoke(&paths, &serde_json::to_vec(&native).unwrap());
     let owned = [
@@ -2370,7 +2344,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     .await
     .unwrap();
     assert!(
-        checked.materials_validated && checked.migrated,
+        checked.materials_validated && !checked.migrated,
         "native={} daemon={}",
         checked.candidate_native_verified,
         checked.candidate_daemon_verified
@@ -2385,11 +2359,11 @@ async fn package_check_prepares_native_and_materials_without_publication() {
             .all(|path| !path.exists())
     );
     assert_eq!(checked.generation, Some(2));
-    assert!(!paths.data_root.join("store").exists());
-    assert!(matches!(
-        JournalWriter::open(&paths.data_root).await,
-        Err(evertrace_store::StoreError::UpgradeRequired)
-    ));
+    // The check leaves the current isolated store in place: it is neither
+    // republished nor rewritten, and it still opens as the current profile.
+    assert!(paths.data_root.join("store").is_dir());
+    assert!(JournalWriter::open(&paths.data_root).await.is_ok());
+    assert!(!checked.published);
     let id = checked
         .backup
         .file_name()
@@ -2403,7 +2377,10 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     let verified = evertrace_store::backup::verify_backup(&paths.data_root, id)
         .await
         .unwrap();
-    assert!(verified.table_states.relations.is_none());
+    // The backed-up store is current: relations are typed rows without a native
+    // Lance version, tracked by the projection generation instead.
+    let relations = verified.table_states.relations.as_ref().unwrap();
+    assert!(relations.version.is_none() && relations.projection_generation.is_some());
     assert!(!fs::read_dir(&paths.data_root).unwrap().any(|entry| {
         entry
             .unwrap()
@@ -2556,8 +2533,9 @@ async fn package_prepare_failure_restores_service_only_with_verified_old_side() 
         log=log.display(),unit=paths.unit.display(),stopped=stopped.display(),control=control.display()
     )).unwrap();
     fs::set_permissions(&paths.systemctl, fs::Permissions::from_mode(0o700)).unwrap();
-    // A regular file makes backup preparation fail before candidate creation.
-    fs::write(paths.data_root.join("backups"), b"owned test obstruction").unwrap();
+    // A retained legacy locator makes native preparation fail closed before any
+    // candidate or backup is created; the current store itself stays verifiable.
+    fs::write(paths.data_root.join("evertrace_journal.lance"), b"legacy").unwrap();
     for case in 0..4 {
         fs::write(&control, case.to_string()).unwrap();
         fs::write(&log, b"").unwrap();
@@ -3051,18 +3029,10 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
     }
     drop(client);
     drop(daemon);
-    let connection = evertrace_store::connection::CompatibilityStore::connect_local(
-        &evertrace_store::connection::native_root(&paths.data_root),
-    )
-    .await
-    .unwrap();
-    let journal = connection
-        .connection()
-        .open_table(evertrace_store::JOURNAL_TABLE)
-        .execute()
+    let rows = evertrace_store::StoreReadHandle::open_read_only(&paths.data_root)
         .await
-        .unwrap();
-    let rows = evertrace_store::journal::read_all_journal_rows(&journal)
+        .unwrap()
+        .journal_rows()
         .await
         .unwrap();
     let payloads = rows
@@ -3104,8 +3074,7 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
         .unwrap()
         .as_ref()
         .clone();
-    drop(journal);
-    drop(connection);
+    drop(rows);
     let mut writer = JournalWriter::open(&paths.data_root).await.unwrap();
     let snapshot = writer.project().await.unwrap();
     let now = std::time::SystemTime::now()
@@ -4185,4 +4154,953 @@ fn unsupported_host_and_bounded_service_probe_never_publish_wiring() {
     assert!(started.elapsed() < std::time::Duration::from_secs(6));
     assert!(!paths.host_config.exists());
     assert!(!paths.unit.exists());
+}
+
+fn cas_blob_names(data_root: &std::path::Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let blobs = data_root.join("cas/blobs");
+    let Ok(shards) = fs::read_dir(&blobs) else {
+        return names;
+    };
+    for shard in shards {
+        let shard = shard.unwrap();
+        for blob in fs::read_dir(shard.path()).unwrap() {
+            let blob = blob.unwrap();
+            names.insert(format!(
+                "blobs/{}/{}",
+                shard.file_name().to_string_lossy(),
+                blob.file_name().to_string_lossy()
+            ));
+        }
+    }
+    names
+}
+
+fn spool_file_bytes(data_root: &std::path::Path) -> BTreeSet<(String, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        out: &mut BTreeSet<(String, Vec<u8>)>,
+    ) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            if metadata.is_dir() {
+                visit(root, &entry.path(), out);
+            } else {
+                out.insert((
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    visit(&data_root.join("spool"), &data_root.join("spool"), &mut out);
+    out
+}
+
+/// A real built evertrace-hook must produce a durable CAS+spool record after the
+/// pre-upgrade backup boundary while the prepared native upgrade still holds its
+/// sibling lock. Publication keeps every durable input in place, and ordinary
+/// engine ingestion then commits the record exactly once across reopen.
+#[tokio::test]
+async fn real_hook_capture_during_prepared_native_upgrade_is_durable_and_ingests_once() {
+    use evertrace_capture::CasStore;
+    use evertrace_codex::install::StableLauncher;
+    use evertrace_store::{
+        backup::{BackupFrozenFile, BackupHookBoundary},
+        restore::{NativeUpgradeOutcome, NativeUpgradePreparation, PackagePublication},
+    };
+    let (_root, paths, _) = fixture();
+    install_offline(&paths, false).unwrap();
+
+    // A real current store gives the retired fixture a nonempty journal, then
+    // the same data root becomes a valid old canonical layout.
+    drop(JournalWriter::open(&paths.data_root).await.unwrap());
+    let rows = evertrace_store::StoreReadHandle::open_read_only(&paths.data_root)
+        .await
+        .unwrap()
+        .journal_rows()
+        .await
+        .unwrap();
+    assert!(!rows.is_empty());
+    fs::remove_dir_all(paths.data_root.join("store")).unwrap();
+    evertrace_store::test_support::write_legacy_fixture(&paths.data_root, true, "L0002", &rows)
+        .await
+        .unwrap();
+    CasStore::open(paths.data_root.join("cas")).unwrap();
+    evertrace_capture::DeviceKeyStore::new(paths.data_root.join("keys"))
+        .load_or_create()
+        .unwrap();
+    fs::create_dir_all(paths.data_root.join("spool")).unwrap();
+    fs::set_permissions(
+        paths.data_root.join("spool"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let identity = |path: &std::path::Path| {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    let watched = [
+        paths.data_root.clone(),
+        paths.data_root.join("cas"),
+        paths.data_root.join("spool"),
+        paths.data_root.join("keys"),
+        RuntimeSnapshot::snapshot_path(&paths.data_root),
+        paths.data_root.join("hook-v1"),
+        paths.data_root.join("hooks/generations/1/evertrace-hook"),
+    ];
+    let watched_before = watched
+        .iter()
+        .map(|path| identity(path))
+        .collect::<Vec<_>>();
+    let cas_before = cas_blob_names(&paths.data_root);
+    let spool_before = spool_file_bytes(&paths.data_root);
+
+    let freeze = || {
+        StableLauncher::freeze_backup_snapshot(&paths.data_root)
+            .map(|snapshot| BackupHookBoundary {
+                current_generation: snapshot.current_generation,
+                retained_generations: snapshot.retained_generations,
+                pin_count: snapshot.pin_count,
+                pinned_generation_count: snapshot.pinned_generation_count,
+                files: snapshot
+                    .files
+                    .into_iter()
+                    .map(|file| BackupFrozenFile {
+                        directories: file.directories,
+                        source: file.source,
+                        relative_path: file.relative_path,
+                        device: file.device,
+                        inode: file.inode,
+                        length: file.length,
+                        modified_seconds: file.modified_seconds,
+                        modified_nanoseconds: file.modified_nanoseconds,
+                        changed_seconds: file.changed_seconds,
+                        changed_nanoseconds: file.changed_nanoseconds,
+                    })
+                    .collect(),
+            })
+            .map_err(|_| evertrace_store::BackupError::Io)
+    };
+    let prepared = evertrace_store::restore::prepare_native_upgrade(
+        &paths.data_root,
+        &paths.config,
+        freeze,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let NativeUpgradePreparation::Prepared(prepared) = prepared else {
+        panic!("a retired canonical layout must prepare a conversion")
+    };
+    let backup = prepared.backup().to_owned();
+
+    // The real installed hook records a durable frame while the prepared
+    // upgrade still holds the sibling writer lock.
+    let native = serde_json::json!({"cwd": paths.data_root, "hook_event_name":"PreToolUse", "model":"test", "permission_mode":"default", "session_id":"native-upgrade-hook", "tool_input":{"command":"true"}, "tool_name":"Bash", "tool_use_id":"upgrade-one", "transcript_path":null, "turn_id":"upgrade-turn"});
+    let started = std::time::Instant::now();
+    let mut hook = Command::new(paths.data_root.join("hook-v1"))
+        .arg("--launcher-root")
+        .arg(&paths.data_root)
+        .current_dir(&paths.data_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&native).unwrap())
+        .unwrap();
+    let output = hook.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "real hook must exit zero: {output:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "hook capture must stay inside its original 2s budget"
+    );
+    let cas_after = cas_blob_names(&paths.data_root);
+    let added = cas_after
+        .difference(&cas_before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        added.len(),
+        1,
+        "the real hook must durably add exactly one CAS blob: {added:?}"
+    );
+    assert!(paths.data_root.join("cas").join(&added[0]).is_file());
+    // The post-boundary record must not be part of the pre-upgrade backup.
+    assert!(!backup.join("cas").join(&added[0]).exists());
+    let spool_after = spool_file_bytes(&paths.data_root);
+    assert!(
+        spool_after.len() > spool_before.len(),
+        "the real hook must durably append a spool frame"
+    );
+    for entry in &spool_before {
+        assert!(
+            spool_after.contains(entry),
+            "pre-boundary spool record vanished"
+        );
+    }
+
+    let outcome = prepared
+        .publish_package(|| PackagePublication::Committed)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, NativeUpgradeOutcome::Published { .. }));
+    for (path, before) in watched.iter().zip(watched_before) {
+        assert_eq!(identity(path), before, "{}", path.display());
+    }
+    assert!(cas_blob_names(&paths.data_root).contains(&added[0]));
+    assert_eq!(spool_file_bytes(&paths.data_root), spool_after);
+
+    // Ordinary engine ingestion fully commits and projects the record, and a
+    // reopen plus retry replays it without duplicating a row.
+    let effective =
+        EffectiveConfig::parse_toml(&fs::read_to_string(&paths.config).unwrap()).unwrap();
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(&paths.data_root)).unwrap();
+    let writer = evertrace_engine::open_writer(&paths.data_root)
+        .await
+        .unwrap();
+    let (handle, actor) = spawn_writer(writer, 8).unwrap();
+    let first = EvidenceIngestor::new(
+        runtime.clone(),
+        handle.clone(),
+        effective.hash(),
+        "native-upgrade-hook-v1",
+    )
+    .unwrap()
+    .drain_once()
+    .await
+    .unwrap();
+    assert!(first.committed_frames >= 1, "{first:?}");
+    let committed = handle.read_handle().journal_rows().await.unwrap();
+    let receipt_rows = committed
+        .iter()
+        .filter(|row| {
+            row.payload().ok().is_some_and(|payload| {
+                matches!(
+                    payload,
+                    JournalPayload::SourceReceiptRecorded(receipt)
+                        if receipt.source_session_ref == "native-upgrade-hook"
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(receipt_rows.len(), 1, "exactly one receipt row expected");
+    let command_id = receipt_rows[0].command_id;
+    assert!(committed.iter().any(|row| {
+        row.command_id == command_id
+            && row.payload().ok().is_some_and(|payload| {
+                matches!(payload, JournalPayload::SourceObservationRecorded(_))
+            })
+    }));
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+
+    let writer = evertrace_engine::open_writer(&paths.data_root)
+        .await
+        .unwrap();
+    let (handle, actor) = spawn_writer(writer, 8).unwrap();
+    EvidenceIngestor::new(
+        runtime,
+        handle.clone(),
+        effective.hash(),
+        "native-upgrade-hook-v1",
+    )
+    .unwrap()
+    .drain_once()
+    .await
+    .unwrap();
+    let replayed = handle.read_handle().journal_rows().await.unwrap();
+    assert_eq!(replayed, committed, "retry after reopen must not duplicate");
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+}
+
+fn tree_bytes(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn visit(root: &std::path::Path, path: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            if metadata.is_dir() {
+                visit(root, &entry.path(), out);
+            } else {
+                out.push((
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, root, &mut out);
+    out.sort();
+    out
+}
+
+async fn retired_live_fixture(
+    canonical: bool,
+) -> (
+    TempDir,
+    ManagedInstallPaths,
+    EffectiveConfig,
+    Vec<evertrace_store::JournalRow>,
+) {
+    let (root, paths, config) = fixture();
+    install_offline(&paths, false).unwrap();
+    drop(JournalWriter::open(&paths.data_root).await.unwrap());
+    let rows = evertrace_store::StoreReadHandle::open_read_only(&paths.data_root)
+        .await
+        .unwrap()
+        .journal_rows()
+        .await
+        .unwrap();
+    assert!(!rows.is_empty());
+    fs::remove_dir_all(paths.data_root.join("store")).unwrap();
+    evertrace_store::test_support::write_legacy_fixture(
+        &paths.data_root,
+        canonical,
+        "L0002",
+        &rows,
+    )
+    .await
+    .unwrap();
+    evertrace_capture::CasStore::open(paths.data_root.join("cas")).unwrap();
+    evertrace_capture::DeviceKeyStore::new(paths.data_root.join("keys"))
+        .load_or_create()
+        .unwrap();
+    fs::create_dir_all(paths.data_root.join("spool")).unwrap();
+    fs::set_permissions(
+        paths.data_root.join("spool"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    (root, paths, config, rows)
+}
+
+fn next_package(root: &std::path::Path, paths: &ManagedInstallPaths) -> std::path::PathBuf {
+    let package = root.join("next-package");
+    fs::create_dir(&package).unwrap();
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+        let destination = package.join(name);
+        fs::copy(paths.cli.parent().unwrap().join(name), &destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    package
+}
+
+/// Fake user service that is initially active/enabled and becomes inactive after/// `disable --now`, like the real quiesce/resume contract expects.
+fn active_systemctl(paths: &ManagedInstallPaths, root: &std::path::Path) {
+    let log = root.join("systemctl.log");
+    let stopped = root.join("systemctl-stopped");
+    fs::write(
+        &paths.systemctl,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\nshift\ncase \"$1\" in\nshow) echo '{unit}';;\nis-enabled) echo enabled;;\nis-active) if [ -f '{stopped}' ]; then echo inactive; else echo active; fi;;\ndisable) touch '{stopped}';;\n*) exit 0;;\nesac\n",
+            log = log.display(),
+            unit = paths.unit.display(),
+            stopped = stopped.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&paths.systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Fake user service whose `disable --now` fails so quiesce must recover the
+/// still-active previous service after verifying the untouched old side.
+fn failing_disable_systemctl(paths: &ManagedInstallPaths, root: &std::path::Path) {
+    let log = root.join("systemctl.log");
+    let stopped = root.join("systemctl-stopped");
+    fs::write(
+        &paths.systemctl,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\nshift\ncase \"$1\" in\nshow) echo '{unit}';;\nis-enabled) echo enabled;;\nis-active) if [ -f '{stopped}' ]; then echo inactive; else echo active; fi;;\ndisable) exit 1;;\n*) exit 0;;\nesac\n",
+            log = log.display(),
+            unit = paths.unit.display(),
+            stopped = stopped.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&paths.systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn fast_failing_host(paths: &ManagedInstallPaths) {
+    fs::write(
+        &paths.host_executable,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.1.0'; exit 0; fi\nif [ \"$1\" = features ]; then echo 'hooks experimental true'; exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&paths.host_executable, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn qualified_gate() -> evertrace_codex::probe::GateQualification {
+    evertrace_codex::probe::GateQualification {
+        result: evertrace_codex::probe::GateResult::Enabled,
+        reason: evertrace_codex::probe::GateReason::RequirementsSatisfied,
+    }
+}
+
+/// The scripted fixture Host cannot complete the interactive canary handshake
+/// (existing canary tests observe TimedOut). This test double preserves the real
+/// candidate scope returned by the disposable daemon and supplies the
+/// qualification a live Host would produce; publication and package commit
+/// below remain entirely real.
+fn observed_canary(check_id: String, generation: u64) -> evertrace_engine::HostCanaryDiagnostic {
+    evertrace_engine::HostCanaryDiagnostic {
+        scope: evertrace_engine::HostCanaryScope::Candidate {
+            check_id,
+            generation,
+        },
+        status: evertrace_engine::HostCanaryStatus::Observed,
+        native_delivery_observed: true,
+        mcp_claim_consumed: true,
+        capture_receipt_observed: true,
+        qualification: Some(evertrace_codex::probe::HostProbeQualification {
+            hook_activation: evertrace_codex::HookActivation::Active,
+            mcp_binding: evertrace_codex::McpSessionBinding::Exact,
+            mcp_mechanism: evertrace_codex::McpBindingMechanism::HookStamped,
+            capture: qualified_gate(),
+            recovery: qualified_gate(),
+            active_search_due: qualified_gate(),
+            strong_normalization: qualified_gate(),
+            project_policy: qualified_gate(),
+        }),
+    }
+}
+
+async fn real_candidate_scope(
+    socket: std::path::PathBuf,
+    request: evertrace_engine::HostCanaryRequest,
+) -> Option<(String, u64)> {
+    let mut client = evertrace_protocol::LocalClient::connect(
+        &socket,
+        env!("CARGO_PKG_VERSION"),
+        evertrace_protocol::dto::ClientKind::Cli,
+        std::time::Duration::from_secs(35),
+    )
+    .await
+    .ok()?;
+    let response = client
+        .request(
+            evertrace_domain::ids::RequestId::new_v7(),
+            evertrace_protocol::command::Command::RunHostCanary(
+                evertrace_protocol::command::RunHostCanaryCommand {
+                    host_executable: request.host_executable,
+                    host_config: request.host_config,
+                },
+            ),
+        )
+        .await
+        .ok()?;
+    let evertrace_protocol::response::Response::HostCanary(real) = response else {
+        return None;
+    };
+    let evertrace_protocol::dto::HostCanaryScope::Candidate {
+        check_id,
+        generation,
+    } = real.scope
+    else {
+        return None;
+    };
+    Some((check_id, generation))
+}
+
+fn retired_table_bytes(data_root: &std::path::Path, canonical: bool) -> Vec<(String, Vec<u8>)> {
+    let root = if canonical {
+        data_root.join("store")
+    } else {
+        data_root.to_owned()
+    };
+    [
+        evertrace_store::JOURNAL_TABLE,
+        evertrace_store::OBJECTS_TABLE,
+        evertrace_store::RELATIONS_TABLE,
+        evertrace_store::SEARCH_TABLE,
+    ]
+    .iter()
+    .flat_map(|table| {
+        tree_bytes(&root.join(format!("{table}.lance")))
+            .into_iter()
+            .map(move |(relative, bytes)| (format!("{table}.lance/{relative}"), bytes))
+    })
+    .collect()
+}
+
+fn upgrade_request(paths: &ManagedInstallPaths) -> evertrace_engine::HostCanaryRequest {
+    evertrace_engine::HostCanaryRequest {
+        host_executable: paths.host_executable.to_string_lossy().into_owned(),
+        host_config: paths.host_config.to_string_lossy().into_owned(),
+    }
+}
+
+#[tokio::test]
+async fn old_profile_package_check_validates_then_discards_without_publication() {
+    let (_root, paths, _config, rows) = retired_live_fixture(true).await;
+    let package = next_package(_root.path(), &paths);
+    let legacy_before = retired_table_bytes(&paths.data_root, true);
+    let host_before = fs::read(&paths.host_config).unwrap();
+    let unit_before = fs::read(&paths.unit).unwrap();
+    let checked = evertrace_engine::maintenance::check_package_upgrade(
+        &paths.data_root,
+        &paths.config,
+        &paths.host_config,
+        &paths.unit,
+        &package,
+        |socket| async move { package_health(socket).await },
+        (None, |_, _| async { None }),
+    )
+    .await
+    .unwrap();
+    assert!(checked.native_prepared && checked.materials_validated);
+    assert!(!checked.published && !checked.migrated);
+    // Check-only disposal: no native publication, no residual candidate, no
+    // package material publication.
+    assert!(!paths.data_root.join("store/evertrace.sqlite").exists());
+    assert!(!paths.data_root.join("hooks/generations/2").exists());
+    assert!(!fs::read_dir(&paths.data_root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".upgrade-")
+    }));
+    assert_eq!(retired_table_bytes(&paths.data_root, true), legacy_before);
+    assert_eq!(fs::read(&paths.host_config).unwrap(), host_before);
+    assert_eq!(fs::read(&paths.unit).unwrap(), unit_before);
+    let manifest: evertrace_store::BackupManifest =
+        serde_json::from_slice(&fs::read(checked.backup.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.manifest_version, 2);
+    let verified = evertrace_store::verify_backup(&paths.data_root, manifest.backup_job_id)
+        .await
+        .unwrap();
+    assert_eq!(verified.frontier, rows.last().unwrap().seq);
+}
+
+#[tokio::test]
+async fn old_profile_package_publication_and_resume_are_real() {
+    use evertrace_engine::maintenance::package_upgrade;
+    // A legitimate publication through the real Prepared path.
+    {
+        let (root, paths, _config, rows) = retired_live_fixture(true).await;
+        let package = next_package(root.path(), &paths);
+        active_systemctl(&paths, root.path());
+        fast_failing_host(&paths);
+        let live_socket = paths.data_root.join("runtime/evertraced-v1.sock");
+        let health = move |socket: std::path::PathBuf| {
+            let live_socket = live_socket.clone();
+            async move {
+                if socket == live_socket {
+                    true
+                } else {
+                    package_health(socket).await
+                }
+            }
+        };
+        let canary = move |socket: std::path::PathBuf,
+                           request: evertrace_engine::HostCanaryRequest| {
+            async move {
+                let (check_id, generation) = real_candidate_scope(socket, request).await?;
+                Some(observed_canary(check_id, generation))
+            }
+        };
+        let checked = package_upgrade(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+            &paths.unit,
+            (&package, Some(&paths.systemctl)),
+            health,
+            (Some(upgrade_request(&paths)), canary),
+        )
+        .await
+        .unwrap();
+        assert!(checked.published && checked.materials_validated);
+        assert!(!checked.migrated && checked.retained_native.is_empty());
+        assert!(checked.candidate_native_verified && checked.candidate_daemon_verified);
+        assert_eq!(checked.service_running, Some(true));
+        assert!(!checked.service_error);
+        let writer = JournalWriter::open(&paths.data_root).await.unwrap();
+        assert_eq!(writer.journal_rows().await.unwrap(), rows);
+        drop(writer);
+        assert!(
+            fs::read_to_string(root.path().join("systemctl.log"))
+                .unwrap()
+                .contains("--user start")
+        );
+        assert!(!fs::read_dir(&paths.data_root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".upgrade-")
+        }));
+        // The package materials were really published with the candidate
+        // binaries and the registry advanced to the staged generation.
+        assert!(
+            paths
+                .data_root
+                .join("hooks/generations/2/evertrace-hook")
+                .is_file()
+        );
+        let registry: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.data_root.join("hooks/registry-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry["current_generation"], 2);
+    }
+
+    // A failed quiesce on an old canonical root resumes only after
+    // verify_package_resume re-validates the untouched retired source under the
+    // sibling lock; the engine reports that verified recovery as restored.
+    {
+        let (root, paths, _config, _rows) = retired_live_fixture(true).await;
+        let package = next_package(root.path(), &paths);
+        failing_disable_systemctl(&paths, root.path());
+        let legacy_before = retired_table_bytes(&paths.data_root, true);
+        let host_before = fs::read(&paths.host_config).unwrap();
+        let error = package_upgrade(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+            &paths.unit,
+            (&package, Some(&paths.systemctl)),
+            |_| async { true },
+            (Some(upgrade_request(&paths)), |_, _| async { None }),
+        )
+        .await
+        .err()
+        .expect("expected the package upgrade to fail");
+        assert!(
+            error.to_string().contains("service quiesce failed")
+                && error.to_string().contains("recovery=restored"),
+            "{error}"
+        );
+        let calls = fs::read_to_string(root.path().join("systemctl.log")).unwrap();
+        assert!(calls.contains("--user start"), "{calls}");
+        assert!(!paths.data_root.join("store/evertrace.sqlite").exists());
+        assert_eq!(retired_table_bytes(&paths.data_root, true), legacy_before);
+        assert_eq!(fs::read(&paths.host_config).unwrap(), host_before);
+    }
+
+    // A flat retired root has no canonical locator for the old side, so the
+    // engine withholds resume; the flat decoder itself still verifies.
+    {
+        let (root, paths, _config, _rows) = retired_live_fixture(false).await;
+        let package = next_package(root.path(), &paths);
+        active_systemctl(&paths, root.path());
+        fs::create_dir(paths.data_root.join(".upgrade-unknown")).unwrap();
+        let flat_before = retired_table_bytes(&paths.data_root, false);
+        let live_socket = paths.data_root.join("runtime/evertraced-v1.sock");
+        let health = move |socket: std::path::PathBuf| {
+            let live_socket = live_socket.clone();
+            async move {
+                if socket == live_socket {
+                    true
+                } else {
+                    package_health(socket).await
+                }
+            }
+        };
+        let error = package_upgrade(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+            &paths.unit,
+            (&package, Some(&paths.systemctl)),
+            health,
+            (Some(upgrade_request(&paths)), |_, _| async { None }),
+        )
+        .await
+        .err()
+        .expect("expected the package upgrade to fail");
+        assert!(
+            error.to_string().contains("withheld_unverified_native"),
+            "{error}"
+        );
+        assert!(
+            !fs::read_to_string(root.path().join("systemctl.log"))
+                .unwrap()
+                .contains("--user start")
+        );
+        assert_eq!(retired_table_bytes(&paths.data_root, false), flat_before);
+        // The flat decoder itself is exercised directly: a flat-only container
+        // has no canonical old-side locator for the engine to hand over.
+        fs::remove_dir_all(paths.data_root.join(".upgrade-unknown")).unwrap();
+        let original =
+            evertrace_capture::ConfinedRoot::open_owned_private(&paths.data_root).unwrap();
+        evertrace_store::restore::verify_package_resume(&paths.data_root, &original)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn fresh_v3_uncertain_preserves_staged_assets_and_restored_discards() {
+    use evertrace_engine::maintenance::package_upgrade;
+    use evertrace_store::restore::RestoreError;
+
+    // A healthy unpublished check must resume the original service even when
+    // our own SQLite checkpoint/close changed native directory timestamps.
+    {
+        let (root, paths, _config) = fixture();
+        install_offline(&paths, false).unwrap();
+        drop(
+            evertrace_engine::open_writer(&paths.data_root)
+                .await
+                .unwrap(),
+        );
+        let input = serde_json::json!({"cwd": paths.data_root, "hook_event_name":"PreToolUse", "model":"test", "permission_mode":"default", "session_id":"fresh-check", "tool_input":{"command":"true"}, "tool_name":"Bash", "tool_use_id":"one", "transcript_path":null, "turn_id":"one"});
+        invoke(&paths, &serde_json::to_vec(&input).unwrap());
+        let package = next_package(root.path(), &paths);
+        active_systemctl(&paths, root.path());
+        fast_failing_host(&paths);
+        let live_socket = paths.data_root.join("runtime/evertraced-v1.sock");
+        let checked = package_upgrade(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+            &paths.unit,
+            (&package, Some(&paths.systemctl)),
+            move |socket| {
+                let live_socket = live_socket.clone();
+                async move { socket == live_socket || package_health(socket).await }
+            },
+            (Some(upgrade_request(&paths)), |socket, request| async {
+                let (check_id, generation) = real_candidate_scope(socket, request).await?;
+                Some(evertrace_engine::HostCanaryDiagnostic {
+                    scope: evertrace_engine::HostCanaryScope::Candidate {
+                        check_id,
+                        generation,
+                    },
+                    status: evertrace_engine::HostCanaryStatus::TimedOut,
+                    native_delivery_observed: false,
+                    mcp_claim_consumed: false,
+                    capture_receipt_observed: false,
+                    qualification: None,
+                })
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !checked.published && checked.materials_validated,
+            "published={} materials={} native={} daemon={} recovery={:?}",
+            checked.published,
+            checked.materials_validated,
+            checked.candidate_native_verified,
+            checked.candidate_daemon_verified,
+            checked.service_recovery
+        );
+        assert_eq!(checked.service_recovery, Some("restored"));
+        assert!(
+            fs::read_to_string(root.path().join("systemctl.log"))
+                .unwrap()
+                .contains("--user start")
+        );
+    }
+
+    // PackageCommit::Uncertain must retain staged assets and never resume.
+    {
+        let (root, paths, _config) = fixture();
+        install_offline(&paths, false).unwrap();
+        drop(
+            evertrace_engine::open_writer(&paths.data_root)
+                .await
+                .unwrap(),
+        );
+        let capture = serde_json::json!({"cwd": paths.data_root, "hook_event_name":"PreToolUse", "model":"test", "permission_mode":"default", "session_id":"fresh-v3-capture", "tool_input":{"command":"true"}, "tool_name":"Bash", "tool_use_id":"one", "transcript_path":null, "turn_id":"one"});
+        invoke(&paths, &serde_json::to_vec(&capture).unwrap());
+        let package = next_package(root.path(), &paths);
+        active_systemctl(&paths, root.path());
+        fast_failing_host(&paths);
+        let host_before = fs::read(&paths.host_config).unwrap();
+        let live_socket = paths.data_root.join("runtime/evertraced-v1.sock");
+        let health = move |socket: std::path::PathBuf| {
+            let live_socket = live_socket.clone();
+            async move {
+                if socket == live_socket {
+                    true
+                } else {
+                    package_health(socket).await
+                }
+            }
+        };
+        let sabotage_root = paths.data_root.clone();
+        let canary = move |socket: std::path::PathBuf,
+                           request: evertrace_engine::HostCanaryRequest| {
+            let sabotage_root = sabotage_root.clone();
+            async move {
+                // Removing the registry lock after validation but before commit
+                // makes the real commit unable to confirm its own transaction.
+                fs::remove_file(sabotage_root.join("hooks/registry.lock")).unwrap();
+                let (check_id, generation) = real_candidate_scope(socket, request).await?;
+                Some(observed_canary(check_id, generation))
+            }
+        };
+        let error = package_upgrade(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+            &paths.unit,
+            (&package, Some(&paths.systemctl)),
+            health,
+            (Some(upgrade_request(&paths)), canary),
+        )
+        .await
+        .err()
+        .expect("expected the package upgrade to fail");
+        match error {
+            evertrace_engine::maintenance::PackageUpgradeError::Service { cause, recovery } => {
+                assert!(
+                    matches!(&cause, RestoreError::NativePublicationUncertain { .. }),
+                    "cause={cause:?} recovery={recovery}"
+                );
+                assert_eq!(recovery, "withheld_uncertain");
+            }
+            other => panic!("expected a typed uncertain publication, got {other:?}"),
+        }
+        assert!(
+            !fs::read_to_string(root.path().join("systemctl.log"))
+                .unwrap()
+                .contains("--user start")
+        );
+        let staged = paths.data_root.join("hooks/generations/2/evertrace-hook");
+        assert!(
+            staged.is_file(),
+            "uncertain publication must preserve staged assets: {}",
+            staged.display()
+        );
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            fs::read(package.join("evertrace-hook")).unwrap()
+        );
+        let scratch_prefix = format!(
+            "{}.package-check-",
+            paths.data_root.file_name().unwrap().to_string_lossy()
+        );
+        assert!(
+            fs::read_dir(root.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&scratch_prefix)
+            }),
+            "uncertain publication must retain its scratch root"
+        );
+        assert_eq!(fs::read(&paths.host_config).unwrap(), host_before);
+        assert!(JournalWriter::open(&paths.data_root).await.is_ok());
+    }
+
+    // A healthy Restored result still discards the staged generation once the
+    // rollback has been verified.
+    {
+        let (root, paths, _config) = fixture();
+        install_offline(&paths, false).unwrap();
+        drop(
+            evertrace_engine::open_writer(&paths.data_root)
+                .await
+                .unwrap(),
+        );
+        let capture = serde_json::json!({"cwd": paths.data_root, "hook_event_name":"PreToolUse", "model":"test", "permission_mode":"default", "session_id":"fresh-v3-capture", "tool_input":{"command":"true"}, "tool_name":"Bash", "tool_use_id":"one", "transcript_path":null, "turn_id":"one"});
+        invoke(&paths, &serde_json::to_vec(&capture).unwrap());
+        let package = next_package(root.path(), &paths);
+        active_systemctl(&paths, root.path());
+        fast_failing_host(&paths);
+        let host_before = fs::read(&paths.host_config).unwrap();
+        let live_socket = paths.data_root.join("runtime/evertraced-v1.sock");
+        let health = move |socket: std::path::PathBuf| {
+            let live_socket = live_socket.clone();
+            async move {
+                if socket == live_socket {
+                    true
+                } else {
+                    package_health(socket).await
+                }
+            }
+        };
+        // The candidate runtime is republished by package commit. A read-only
+        // runtime directory therefore forces the real commit into its verified
+        // rollback path without disturbing any frozen hook identity.
+        let launcher_runtime = paths.data_root.join("runtime");
+        let canary_runtime = launcher_runtime.clone();
+        let canary = move |socket: std::path::PathBuf,
+                           request: evertrace_engine::HostCanaryRequest| {
+            let canary_runtime = canary_runtime.clone();
+            async move {
+                fs::set_permissions(&canary_runtime, fs::Permissions::from_mode(0o555)).unwrap();
+                let (check_id, generation) = real_candidate_scope(socket, request).await?;
+                Some(observed_canary(check_id, generation))
+            }
+        };
+        let error = package_upgrade(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config,
+            &paths.unit,
+            (&package, Some(&paths.systemctl)),
+            health,
+            (Some(upgrade_request(&paths)), canary),
+        )
+        .await
+        .err()
+        .expect("expected the package upgrade to fail");
+        fs::set_permissions(&launcher_runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(
+                &error,
+                evertrace_engine::maintenance::PackageUpgradeError::Service {
+                    cause: RestoreError::Io,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        // Restored is unpublished. The sabotaged runtime directory is not a
+        // valid private root, so the service stays quiesced even though the
+        // original native container itself remains valid after checkpoint.
+        assert!(
+            !fs::read_to_string(root.path().join("systemctl.log"))
+                .unwrap()
+                .contains("--user start")
+        );
+        // The verified rollback discards the staged generation exactly once.
+        assert!(!paths.data_root.join("hooks/generations/2").exists());
+        assert_eq!(fs::read(&paths.host_config).unwrap(), host_before);
+        assert!(JournalWriter::open(&paths.data_root).await.is_ok());
+        // Restoring runtime permissions makes the unchanged native side
+        // eligible for independent verification again.
+        let original =
+            evertrace_capture::ConfinedRoot::open_owned_private(&paths.data_root.join("store"))
+                .unwrap();
+        evertrace_store::restore::verify_package_resume(&paths.data_root, &original)
+            .await
+            .unwrap();
+    }
 }

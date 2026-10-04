@@ -28,7 +28,7 @@ pub use ingest::{DrainProgress, EvidenceIngestor, IngestError};
 pub use jobs::{
     JobResultDisposition, RecoveryAction, SessionImportBudget, SessionImportError,
     SessionImportProgress, SessionImportWorker, SupportClosureAction, SynthesisPlanner,
-    WriterActorError, WriterHandle, classify_job_result, expired_leases, open_writer,
+    WriterActorError, WriterHandle, WriterTask, classify_job_result, expired_leases, open_writer,
     pending_dirty, pending_outbox, spawn_writer, support_closure_result,
 };
 pub use maintenance::{

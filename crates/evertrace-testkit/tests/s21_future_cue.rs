@@ -622,12 +622,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
 
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
+        vec!["evertrace_search"]
     );
     let object_rows = writer.object_rows().await.unwrap();
     let relation_rows = writer.relation_rows().await.unwrap();

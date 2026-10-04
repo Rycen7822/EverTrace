@@ -26,7 +26,7 @@ pub const QUIESCED_BACKUP_CREATE_JOB_KIND: &str = "quiesced_backup_create_v1";
 pub const QUIESCED_BACKUP_VERIFY_JOB_KIND: &str = "quiesced_backup_verify_v1";
 pub const QUIESCED_BACKUP_ALGORITHM_REVISION: &str = "quiesced_backup_v1";
 const MANIFEST_NAME: &str = "manifest.json";
-const MANIFEST_VERSION: u16 = 2;
+const MANIFEST_VERSION: u16 = 3;
 const MAX_BACKUP_FILES: usize = 100_000;
 const MAX_BACKUP_DEPTH: usize = 256;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
@@ -52,8 +52,15 @@ pub struct BackupFileManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupTableState {
-    pub version: u64,
+    /// Only a real Lance table carries a native table version. The SQLite
+    /// journal/objects/relations families report `None` and their committed
+    /// checkpoint plus the actual projection generation. Manifest version 2
+    /// did not carry a projection generation at all; a new v2 snapshot must
+    /// omit the field rather than write `null` into the retired wire shape.
+    pub version: Option<u64>,
     pub checkpoint: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -66,7 +73,7 @@ pub struct BackupTableStates {
 }
 
 impl BackupTableStates {
-    fn profile(&self) -> Result<&'static str, BackupError> {
+    pub(crate) fn profile(&self) -> Result<&'static str, BackupError> {
         match (&self.relations, &self.search) {
             (None, None) => Ok("L0001"),
             (Some(_), Some(_)) => Ok("L0002"),
@@ -74,24 +81,90 @@ impl BackupTableStates {
         }
     }
 
-    fn validate(&self, frontier: u64) -> bool {
+    pub(crate) fn validate(&self, frontier: u64) -> bool {
         self.profile().is_ok()
-            && self.journal.version > 0
+            && self.journal.version.is_none()
             && self.journal.checkpoint == frontier
-            && self.objects.version > 0
+            && self.journal.projection_generation.is_none()
+            && self.objects.version.is_none()
             && self.objects.checkpoint == frontier
+            && self.objects.projection_generation.is_some()
             && [&self.relations, &self.search]
                 .into_iter()
                 .flatten()
-                .all(|table| table.version > 0 && table.checkpoint <= frontier)
+                .all(|table| table.checkpoint <= frontier)
+            && self.relations.as_ref().is_none_or(|table| {
+                table.version.is_none() && table.projection_generation.is_some()
+            })
+            && self.search.as_ref().is_none_or(|table| {
+                table.version.is_some() && table.projection_generation.is_some()
+            })
     }
 
-    fn table_names(&self) -> Result<Vec<&'static str>, BackupError> {
-        let mut names = vec![crate::JOURNAL_TABLE, crate::OBJECTS_TABLE];
+    /// The physical store sources of this format, as names below `store/`.
+    fn store_files(&self) -> Result<Vec<(&'static str, BackupFileKind)>, BackupError> {
+        if self.profile()? != "L0002" {
+            // The new physical layout always carries the derived families;
+            // an L0001-only backup belongs to the offline converter.
+            return Err(BackupError::Corrupt);
+        }
+        Ok(vec![
+            (
+                crate::sqlite_state::SQLITE_FILE_NAME,
+                BackupFileKind::Regular,
+            ),
+            ("evertrace_search.lance", BackupFileKind::Directory),
+        ])
+    }
+
+    /// The retired four-Lance closure, used by the one-shot converter and by
+    /// the pre-upgrade manifest version 2 snapshot.
+    fn legacy_store_files(&self) -> Result<Vec<(String, BackupFileKind)>, BackupError> {
+        let mut names = vec![
+            (
+                format!("{}.lance", crate::JOURNAL_TABLE),
+                BackupFileKind::Directory,
+            ),
+            (
+                format!("{}.lance", crate::OBJECTS_TABLE),
+                BackupFileKind::Directory,
+            ),
+        ];
         if self.profile()? == "L0002" {
-            names.extend([crate::RELATIONS_TABLE, crate::SEARCH_TABLE]);
+            names.extend([
+                (
+                    format!("{}.lance", crate::RELATIONS_TABLE),
+                    BackupFileKind::Directory,
+                ),
+                (
+                    format!("{}.lance", crate::SEARCH_TABLE),
+                    BackupFileKind::Directory,
+                ),
+            ]);
         }
         Ok(names)
+    }
+
+    /// Manifest version 2 carried real positive Lance table versions and no
+    /// projection generation. The objects family may legitimately lag the
+    /// journal; `compiler_watermark` records exactly where it stood.
+    pub(crate) fn validate_legacy(&self, frontier: u64, compiler_watermark: u64) -> bool {
+        self.profile().is_ok()
+            && self.journal.version.is_some_and(|version| version > 0)
+            && self.journal.checkpoint == frontier
+            && self.journal.projection_generation.is_none()
+            && self.objects.version.is_some_and(|version| version > 0)
+            && self.objects.checkpoint == compiler_watermark
+            && self.objects.checkpoint <= frontier
+            && self.objects.projection_generation.is_none()
+            && [&self.relations, &self.search]
+                .into_iter()
+                .flatten()
+                .all(|table| {
+                    table.version.is_some_and(|version| version > 0)
+                        && table.checkpoint <= frontier
+                        && table.projection_generation.is_none()
+                })
     }
 }
 
@@ -239,6 +312,16 @@ pub enum BackupError {
     Io,
 }
 
+/// Which physical layout and manifest version one backup plan records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackupShape {
+    /// Current one-SQLite + Lance search layout, manifest version 3.
+    Current,
+    /// Retired four-Lance layout, manifest version 2. `compiler_watermark`
+    /// preserves the actual old objects checkpoint, which may lag the journal.
+    Legacy { compiler_watermark: u64 },
+}
+
 #[derive(Debug)]
 pub(crate) struct BackupPlan {
     data_dir: PathBuf,
@@ -248,30 +331,6 @@ pub(crate) struct BackupPlan {
     sources: Vec<PlannedSource>,
     source_directories: Vec<PlannedDirectory>,
     backup_runtime: RuntimeSnapshot,
-}
-
-impl BackupPlan {
-    /// Upgrade retains its preflight backup and one native-only candidate.
-    pub(crate) fn check_upgrade_space(&self) -> Result<(), BackupError> {
-        let native_bytes = self
-            .manifest
-            .files
-            .iter()
-            .filter(|entry| Path::new(&entry.relative_path).starts_with("store"))
-            .try_fold(0u64, |total, entry| total.checked_add(entry.size))
-            .ok_or(BackupError::ResourceExhausted)?;
-        let needed = self
-            .manifest
-            .files
-            .iter()
-            .try_fold(native_bytes, |total, entry| total.checked_add(entry.size))
-            .and_then(|total| total.checked_add(COPY_SPACE_RESERVE))
-            .ok_or(BackupError::ResourceExhausted)?;
-        if fs2::available_space(&self.data_dir).map_err(|_| BackupError::Io)? < needed {
-            return Err(BackupError::ResourceExhausted);
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -293,10 +352,6 @@ pub struct BackupVerification {
 }
 
 impl BackupVerification {
-    pub(crate) fn files(&self) -> &[BackupFileManifest] {
-        &self.manifest.files
-    }
-
     pub(crate) fn revalidate_gc_inputs(
         &self,
         deadline: std::time::Instant,
@@ -331,6 +386,14 @@ impl BackupVerification {
             .filter(|value| candidates.contains(*value))
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn files(&self) -> &[BackupFileManifest] {
+        &self.manifest.files
+    }
+
+    pub(crate) fn manifest_version(&self) -> u16 {
+        self.manifest.manifest_version
     }
 }
 
@@ -391,14 +454,15 @@ impl Write for BoundedCountWriter {
 
 pub(crate) fn prepare_backup(
     roots: (&Path, &Path),
-    config_path: &Path,
-    expected_runtime: &RuntimeSnapshot,
+    identity: (&Path, &RuntimeSnapshot),
     backup_job_id: JobId,
     snapshot: &ProjectionSnapshot,
     table_states: BackupTableStates,
+    shape: BackupShape,
     boundary: BackupFrozenBoundary,
 ) -> Result<BackupPlan, BackupError> {
     let (data_dir, native_dir) = roots;
+    let (config_path, expected_runtime) = identity;
     let BackupFrozenBoundary { spool, hook } = boundary;
     expected_runtime
         .validate()
@@ -409,7 +473,12 @@ pub(crate) fn prepare_backup(
         != data_dir
         || expected_runtime.effective_config_hash == [0; 32]
         || snapshot.frontier == 0
-        || !table_states.validate(snapshot.frontier)
+        || match shape {
+            BackupShape::Current => !table_states.validate(snapshot.frontier),
+            BackupShape::Legacy { compiler_watermark } => {
+                !table_states.validate_legacy(snapshot.frontier, compiler_watermark)
+            }
+        }
     {
         return Err(BackupError::InvalidInput);
     }
@@ -422,12 +491,27 @@ pub(crate) fn prepare_backup(
     remove_owned_staging(&staging_dir)?;
 
     let mut sources = Vec::new();
-    for table in table_states.table_names()? {
-        collect_tree(
-            &native_dir.join(format!("{table}.lance")),
-            &PathBuf::from("store").join(format!("{table}.lance")),
-            &mut sources,
-        )?;
+    let native_files = match shape {
+        BackupShape::Current => table_states
+            .store_files()?
+            .into_iter()
+            .map(|(name, kind)| (name.to_owned(), kind))
+            .collect::<Vec<_>>(),
+        BackupShape::Legacy { .. } => table_states.legacy_store_files()?,
+    };
+    for (name, kind) in native_files {
+        let relative = PathBuf::from("store").join(&name);
+        match kind {
+            BackupFileKind::Regular => push_source(
+                &native_dir.join(&name),
+                &relative,
+                BackupFileKind::Regular,
+                &mut sources,
+            )?,
+            BackupFileKind::Directory => {
+                collect_tree(&native_dir.join(&name), &relative, &mut sources)?
+            }
+        }
     }
 
     let live_cas = snapshot.live_cas_refs().map_err(map_store)?;
@@ -635,7 +719,10 @@ pub(crate) fn prepare_backup(
         backup_dir,
         staging_dir,
         manifest: BackupManifest {
-            manifest_version: MANIFEST_VERSION,
+            manifest_version: match shape {
+                BackupShape::Current => MANIFEST_VERSION,
+                BackupShape::Legacy { .. } => 2,
+            },
             backup_job_id,
             frontier: snapshot.frontier,
             table_states,
@@ -651,7 +738,10 @@ pub(crate) fn prepare_backup(
             quarantine_count: spool.quarantine_count,
             runtime_outbox_watermark,
             index_generation,
-            compiler_watermark: snapshot.frontier,
+            compiler_watermark: match shape {
+                BackupShape::Current => snapshot.frontier,
+                BackupShape::Legacy { compiler_watermark } => compiler_watermark,
+            },
             effective_config_hash: current_runtime.effective_config_hash,
             runtime_generation: current_runtime.generation,
             hook_current_generation: hook.current_generation,
@@ -1112,6 +1202,8 @@ pub(crate) fn copy_restore_candidate(
     copy_verified_candidate(verification, destination, destination_root, false)
 }
 
+/// Copy only the native closure below `store/` into the upgrade candidate.
+/// Live CAS/spool/keys/hooks/runtime are never part of this copy.
 pub(crate) fn copy_upgrade_native_candidate(
     verification: &BackupVerification,
     destination: &Path,
@@ -1373,9 +1465,19 @@ fn verify_backup_cas_and_spool(
     Ok(())
 }
 
+pub(crate) struct VerifiedStoreTables {
+    pub(crate) states: BackupTableStates,
+    pub(crate) objects: ProjectionSnapshot,
+    pub(crate) projected: crate::L0002ProjectionSnapshot,
+    pub(crate) journal_rows: Vec<crate::JournalRow>,
+}
+
 pub(crate) async fn read_verified_store_tables(
     store_dir: &Path,
-) -> Result<(BackupTableStates, ProjectionSnapshot), BackupError> {
+) -> Result<VerifiedStoreTables, BackupError> {
+    let verified = crate::sqlite_state::verify_store_database(store_dir).map_err(map_store)?;
+    let journal_checkpoint = verified.rows.last().map(|row| row.seq).unwrap_or(0);
+    let (object_checkpoint, object_generation) = verified.object_checkpoint;
     let connection = lancedb::connect(store_dir.to_str().ok_or(BackupError::Corrupt)?)
         .session(crate::connection::native_session())
         .execute()
@@ -1387,122 +1489,73 @@ pub(crate) async fn read_verified_store_tables(
         .await
         .map_err(|_| BackupError::Corrupt)?;
     names.sort();
-    let mut expected_names = vec![
-        crate::JOURNAL_TABLE.to_owned(),
-        crate::OBJECTS_TABLE.to_owned(),
-    ];
-    let l0002 = names
-        .iter()
-        .any(|name| name == crate::RELATIONS_TABLE || name == crate::SEARCH_TABLE);
-    if l0002 {
-        expected_names.extend([
-            crate::RELATIONS_TABLE.to_owned(),
-            crate::SEARCH_TABLE.to_owned(),
-        ]);
-    }
-    expected_names.sort();
-    if names != expected_names {
+    // The retired journal/objects/relations Lance tables must not exist in a
+    // verified copy; only the search projection is native state.
+    if names != vec![crate::SEARCH_TABLE.to_owned()] {
         return Err(BackupError::Corrupt);
     }
-    let journal = connection
-        .open_table(crate::JOURNAL_TABLE)
+    let search = connection
+        .open_table(crate::SEARCH_TABLE)
         .execute()
         .await
         .map_err(|_| BackupError::Corrupt)?;
-    let objects = connection
-        .open_table(crate::OBJECTS_TABLE)
-        .execute()
-        .await
-        .map_err(|_| BackupError::Corrupt)?;
-    let relations = if l0002 {
-        Some(
-            connection
-                .open_table(crate::RELATIONS_TABLE)
-                .execute()
-                .await
-                .map_err(|_| BackupError::Corrupt)?,
-        )
-    } else {
-        None
-    };
-    let search = if l0002 {
-        Some(
-            connection
-                .open_table(crate::SEARCH_TABLE)
-                .execute()
-                .await
-                .map_err(|_| BackupError::Corrupt)?,
-        )
-    } else {
-        None
-    };
-    crate::journal::validate_journal_table(&journal)
+    let search_rows = crate::search::read_search_rows(&search)
         .await
         .map_err(map_store)?;
-    let journal_checkpoint = crate::journal::read_journal_frontier(&journal)
-        .await
-        .map_err(map_store)?;
-    let object_rows = crate::objects::validate_objects_table(&objects)
-        .await
-        .map_err(map_store)?;
-    let object_checkpoint = object_rows
-        .iter()
-        .find(|row| row.row_id == crate::OBJECTS_CHECKPOINT_ID)
-        .ok_or(BackupError::Corrupt)?
-        .source_event_seq;
-    let relation_state = if let Some(table) = &relations {
-        Some(BackupTableState {
-            version: table.version().await.map_err(|_| BackupError::Corrupt)?,
-            checkpoint: crate::relations::read_relation_checkpoint(table)
-                .await
-                .map_err(map_store)?,
-        })
-    } else {
-        None
-    };
-    let search_state = if let Some(table) = &search {
-        Some(BackupTableState {
-            version: table.version().await.map_err(|_| BackupError::Corrupt)?,
-            checkpoint: crate::search::read_search_checkpoint(table)
-                .await
-                .map_err(map_store)?,
-        })
-    } else {
-        None
+    let search_state = BackupTableState {
+        version: Some(search.version().await.map_err(|_| BackupError::Corrupt)?),
+        checkpoint: crate::search::read_search_checkpoint(&search)
+            .await
+            .map_err(map_store)?,
+        projection_generation: Some(crate::SEARCH_PROJECTION_GENERATION),
     };
     let actual = BackupTableStates {
         journal: BackupTableState {
-            version: journal.version().await.map_err(|_| BackupError::Corrupt)?,
+            version: None,
             checkpoint: journal_checkpoint,
+            projection_generation: None,
         },
         objects: BackupTableState {
-            version: objects.version().await.map_err(|_| BackupError::Corrupt)?,
+            version: None,
             checkpoint: object_checkpoint,
+            projection_generation: Some(object_generation),
         },
-        relations: relation_state,
-        search: search_state,
+        relations: Some(BackupTableState {
+            version: None,
+            checkpoint: verified.relation_checkpoint.0,
+            projection_generation: Some(verified.relation_checkpoint.1),
+        }),
+        search: Some(search_state),
     };
-    if crate::JournalWriter::existing_profile(store_dir)
-        .await
-        .map_err(map_store)?
-        != Some(actual.profile()?)
-    {
+    let profile = crate::writer::journal_profile(&verified.rows).map_err(map_store)?;
+    if profile != Some(actual.profile()?) {
         return Err(BackupError::Corrupt);
     }
-    Ok((
-        actual,
-        ProjectionSnapshot {
+    Ok(VerifiedStoreTables {
+        states: actual,
+        objects: ProjectionSnapshot {
             frontier: journal_checkpoint,
-            rows: object_rows,
+            rows: verified.objects,
         },
-    ))
+        projected: crate::L0002ProjectionSnapshot {
+            frontier: journal_checkpoint,
+            relations: verified.relations,
+            search: search_rows,
+        },
+        journal_rows: verified.rows,
+    })
 }
 
 async fn verify_backup_tables(
     directory: &Path,
     manifest: &BackupManifest,
 ) -> Result<(), BackupError> {
-    let (actual, snapshot) = read_verified_store_tables(&directory.join("store")).await?;
+    if manifest.manifest_version == 2 {
+        return verify_legacy_backup_tables(directory, manifest).await;
+    }
+    let verified = read_verified_store_tables(&directory.join("store")).await?;
+    let actual = verified.states;
+    let snapshot = verified.objects;
     let journal_checkpoint = actual.journal.checkpoint;
     let object_checkpoint = actual.objects.checkpoint;
     if actual != manifest.table_states
@@ -1520,6 +1573,48 @@ async fn verify_backup_tables(
     {
         return Err(BackupError::Corrupt);
     }
+    let (committed_source_watermarks, runtime_outbox_watermark) = backup_watermarks(&snapshot)?;
+    let object_deletions =
+        ObjectDeletionCurrentView::from_snapshot(&snapshot).map_err(map_store)?;
+    let scope_purges = ScopePurgeCurrentView::from_snapshot(&snapshot).map_err(map_store)?;
+    if committed_source_watermarks != manifest.committed_source_watermarks
+        || runtime_outbox_watermark != manifest.runtime_outbox_watermark
+        || snapshot.live_cas_refs().map_err(map_store)?
+            != manifest.live_cas_refs.iter().cloned().collect()
+        || object_deletions.generation != manifest.object_deletion_generation
+        || scope_purges.generation != manifest.repository_purge_generation
+    {
+        return Err(BackupError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Independent validation of a retired manifest version 2 snapshot. The
+/// backup is never rewritten; the decoder reads the copied Lance closure and
+/// the derived families are recomputed from the full verified journal.
+async fn verify_legacy_backup_tables(
+    directory: &Path,
+    manifest: &BackupManifest,
+) -> Result<(), BackupError> {
+    let legacy = crate::legacy_lance::read_legacy_store(&directory.join("store"))
+        .await
+        .map_err(map_store)?
+        .ok_or(BackupError::Corrupt)?;
+    let actual = legacy.table_states();
+    if actual != manifest.table_states
+        || !actual.validate_legacy(manifest.frontier, manifest.compiler_watermark)
+        || legacy.frontier() != manifest.frontier
+        || manifest.schema_revision != legacy.profile
+        || manifest.index_generation
+            != if legacy.profile == "L0002" {
+                crate::SEARCH_PROJECTION_GENERATION
+            } else {
+                0
+            }
+    {
+        return Err(BackupError::Corrupt);
+    }
+    let snapshot = legacy.full_snapshot().map_err(map_store)?;
     let (committed_source_watermarks, runtime_outbox_watermark) = backup_watermarks(&snapshot)?;
     let object_deletions =
         ObjectDeletionCurrentView::from_snapshot(&snapshot).map_err(map_store)?;
@@ -1743,16 +1838,24 @@ fn valid_hook_pin_path(path: &str) -> bool {
 }
 
 fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
-    if manifest.manifest_version != MANIFEST_VERSION
+    let legacy = manifest.manifest_version == 2;
+    if (manifest.manifest_version != MANIFEST_VERSION && !legacy)
         || manifest.frontier == 0
-        || !manifest.table_states.validate(manifest.frontier)
+        || if legacy {
+            !manifest
+                .table_states
+                .validate_legacy(manifest.frontier, manifest.compiler_watermark)
+        } else {
+            !manifest.table_states.validate(manifest.frontier)
+        }
         || manifest.index_generation
             != if manifest.schema_revision == "L0002" {
                 crate::SEARCH_PROJECTION_GENERATION
             } else {
                 0
             }
-        || manifest.compiler_watermark != manifest.frontier
+        || manifest.compiler_watermark == 0
+        || (!legacy && manifest.compiler_watermark != manifest.frontier)
         || manifest.effective_config_hash == [0; 32]
         || manifest.runtime_generation == 0
         || !valid_hook_manifest(manifest)
@@ -1892,23 +1995,38 @@ fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
             return Err(BackupError::Corrupt);
         }
     }
-    for table in manifest.table_states.table_names()? {
-        let prefix = format!("store/{table}.lance/");
-        if !manifest
-            .files
-            .iter()
-            .any(|item| item.relative_path.starts_with(&prefix))
-        {
+    for (name, kind) in if legacy {
+        manifest.table_states.legacy_store_files()?
+    } else {
+        manifest
+            .table_states
+            .store_files()?
+            .into_iter()
+            .map(|(name, kind)| (name.to_owned(), kind))
+            .collect()
+    } {
+        let relative = format!("store/{name}");
+        let present = match kind {
+            BackupFileKind::Regular => manifest
+                .files
+                .iter()
+                .any(|item| item.relative_path == relative),
+            BackupFileKind::Directory => {
+                let prefix = format!("{relative}/");
+                manifest
+                    .files
+                    .iter()
+                    .any(|item| item.relative_path.starts_with(&prefix))
+            }
+        };
+        if !present {
             return Err(BackupError::Corrupt);
         }
     }
     if manifest.table_states.profile()? == "L0001"
         && manifest.files.iter().any(|item| {
             item.relative_path
-                .starts_with("store/evertrace_relations.lance")
-                || item
-                    .relative_path
-                    .starts_with("store/evertrace_search.lance")
+                .starts_with("store/evertrace_search.lance")
         })
     {
         return Err(BackupError::Corrupt);
@@ -1919,23 +2037,24 @@ fn validate_manifest(manifest: &BackupManifest) -> Result<(), BackupError> {
         .filter(|item| item.kind == BackupFileKind::Regular)
         .map(|item| item.relative_path.as_str())
         .collect::<BTreeSet<_>>();
+    let allowed_store: &[&str] = if legacy {
+        &[
+            "store/evertrace_journal.lance/",
+            "store/evertrace_objects.lance/",
+            "store/evertrace_relations.lance/",
+            "store/evertrace_search.lance/",
+        ]
+    } else {
+        &["store/evertrace.sqlite", "store/evertrace_search.lance/"]
+    };
     if manifest.files.iter().any(|item| match item.kind {
         BackupFileKind::Regular => {
             item.relative_path != "config/config.toml"
                 && item.relative_path != "runtime/hook-runtime-v1.json"
                 && item.relative_path != "hook-v1"
-                && !item
-                    .relative_path
-                    .starts_with("store/evertrace_journal.lance/")
-                && !item
-                    .relative_path
-                    .starts_with("store/evertrace_objects.lance/")
-                && !item
-                    .relative_path
-                    .starts_with("store/evertrace_relations.lance/")
-                && !item
-                    .relative_path
-                    .starts_with("store/evertrace_search.lance/")
+                && !allowed_store.iter().any(|allowed| {
+                    item.relative_path == *allowed || item.relative_path.starts_with(allowed)
+                })
                 && !item.relative_path.starts_with("cas/blobs/")
                 && !declared_spool_paths.contains(&item.relative_path)
                 && !item.relative_path.starts_with("hooks/")

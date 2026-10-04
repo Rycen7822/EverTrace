@@ -91,7 +91,7 @@ use evertrace_store::{
     BackupError, BackupSummary, DirtyTargetKind, DurableJob, EventScope, JobBudget, JobLease,
     JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalCommand,
     JournalEventDraft, JournalPayload, QUIESCED_BACKUP_CREATE_JOB_KIND,
-    QUIESCED_BACKUP_VERIFY_JOB_KIND, RuntimeSchedulerView, SourceKind,
+    QUIESCED_BACKUP_VERIFY_JOB_KIND, RuntimeSchedulerView, SourceKind, restore::RestoreError,
 };
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
@@ -200,6 +200,9 @@ pub struct PackageUpgradeCheck {
     pub backup: std::path::PathBuf,
     pub migrated: bool,
     pub generation: Option<u64>,
+    /// A private native candidate was prepared for this check; it is discarded
+    /// unless publication was explicitly requested and completed.
+    pub native_prepared: bool,
     pub materials_validated: bool,
     pub candidate_native_verified: bool,
     pub candidate_daemon_verified: bool,
@@ -235,15 +238,29 @@ async fn resume_unpublished_service(
     original: Option<&evertrace_capture::ConfinedRoot>,
     eligible: bool,
 ) -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+
     if !eligible {
         return "withheld_uncertain";
     }
     let Some(original) = original else {
         return "withheld_unverified_native";
     };
+    let runtime_path = data.join("runtime");
+    let Ok(runtime) = evertrace_capture::ConfinedRoot::open_owned_private(&runtime_path) else {
+        return "withheld_unverified_native";
+    };
+    // Recovery filesystem roots may be public-readable, but the installed
+    // daemon runtime has the stricter existing 0700 contract.
+    if !std::fs::symlink_metadata(&runtime_path)
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o700)
+    {
+        return "withheld_unverified_native";
+    }
     if evertrace_store::restore::verify_package_resume(data, original)
         .await
         .is_err()
+        || runtime.revalidate_stable().is_err()
     {
         return "withheld_unverified_native";
     }
@@ -261,8 +278,115 @@ pub async fn verify_package_native(
     evertrace_store::restore::verify_package_native(native, cas).await
 }
 
+/// Mint one verified backup of the current isolated store for a package check.
+/// The caller owns exclusive writer access (service quiesced or no daemon); the
+/// store itself is never copied through a candidate locator.
+async fn create_check_backup(
+    data_dir: &Path,
+    config_path: &Path,
+) -> Result<
+    (
+        std::path::PathBuf,
+        evertrace_store::backup::BackupSummary,
+        evertrace_store::ClosedJournalWriter,
+    ),
+    RestoreError,
+> {
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
+        .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+    let mut writer = Some(
+        crate::jobs::open_writer(data_dir)
+            .await
+            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?,
+    );
+    let job_id = evertrace_domain::ids::JobId::new_v7();
+    let summary =
+        crate::jobs::create_quiesced_backup(&mut writer, job_id, config_path.to_owned(), runtime)
+            .await
+            .map_err(|_| RestoreError::Io)?
+            .map_err(|_| RestoreError::Io)?;
+    // The same sibling lock stays held, physically closed, through backup
+    // verification, native verification and package publish/rollback. It is
+    // released only immediately before the service is started again.
+    let mut writer = writer.take().ok_or(RestoreError::Io)?;
+    let guard = match writer.quiesce_for_backup().await? {
+        Some(guard) => guard,
+        // Known SQLite-busy checkpoint: the package check reports the typed
+        // failure and never swaps or publishes any directory.
+        None => return Err(RestoreError::Store(evertrace_store::StoreError::Io)),
+    };
+    let closed = writer.close_for_backup(guard)?;
+    Ok((
+        data_dir.join("backups").join(format!("backup-{job_id}")),
+        summary,
+        closed,
+    ))
+}
+
 /// Pre-publication only. The returned materials result never certifies a Host
 /// or package-ready state; the verified backup survives candidate disposal.
+/// Private scratch root for one package check. The native store is never
+/// copied or rewritten: only the candidate package materials and probes need
+/// an owned directory, removed on every ordinary exit.
+struct PackageCheckScratch {
+    path: std::path::PathBuf,
+    custody: Option<evertrace_capture::ConfinedRoot>,
+    retained: bool,
+}
+
+impl PackageCheckScratch {
+    fn create(data_dir: &Path) -> Result<Self, evertrace_store::restore::RestoreError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let parent = data_dir
+            .parent()
+            .ok_or(evertrace_store::StoreError::InvalidPath)?;
+        let name = data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(evertrace_store::StoreError::InvalidPath)?;
+        let path = parent.join(format!(
+            "{name}.package-check-{}",
+            evertrace_domain::ids::JobId::new_v7()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|_| evertrace_store::restore::RestoreError::Io)?;
+        let custody = evertrace_capture::ConfinedRoot::open_owned_private(&path)
+            .map_err(|_| evertrace_store::restore::RestoreError::Io)?;
+        Ok(Self {
+            path,
+            custody: Some(custody),
+            retained: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn retain(&mut self) {
+        self.retained = true;
+    }
+
+    fn cleanup(&mut self) -> Result<(), evertrace_store::restore::RestoreError> {
+        use evertrace_store::restore::RestoreError;
+        let custody = self.custody.as_ref().ok_or(RestoreError::Io)?;
+        custody.revalidate_stable().map_err(|_| RestoreError::Io)?;
+        std::fs::remove_dir_all(&self.path).map_err(|_| RestoreError::Io)?;
+        self.custody = None;
+        Ok(())
+    }
+}
+
+impl Drop for PackageCheckScratch {
+    fn drop(&mut self) {
+        if !self.retained && self.custody.is_some() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 pub async fn check_package_upgrade<F, Fut, G, Run>(
     data_dir: &Path,
     config_path: &Path,
@@ -360,6 +484,9 @@ where
         None
     };
     let mut may_resume = false;
+    // The preflight revalidation is captured before the validation block moves
+    // the preflight; the recovery path re-verifies the old side independently.
+    let preflight_original_ok = preflight.revalidate_original().is_ok();
     let result: Result<PackageUpgradeCheck, RestoreError> = async {
         let generation = preflight.generation();
         let preparation = evertrace_store::restore::prepare_native_upgrade(
@@ -376,12 +503,47 @@ where
                 return Err(error);
             }
         };
-        let NativeUpgradePreparation::Prepared(prepared) = preparation else {
-            may_resume = preflight.revalidate_original().is_ok();
-            return Err(evertrace_store::StoreError::InvalidInput.into());
+        let (mut prepared, mut retained_native) = match preparation {
+            NativeUpgradePreparation::Prepared(prepared) => (Some(prepared), Vec::new()),
+            NativeUpgradePreparation::Unchanged(outcome) => (
+                None,
+                match outcome {
+                    evertrace_store::restore::NativeUpgradeOutcome::Noop { retained_native } => {
+                        retained_native
+                    }
+                    evertrace_store::restore::NativeUpgradeOutcome::Empty => Vec::new(),
+                    evertrace_store::restore::NativeUpgradeOutcome::Published {
+                        retained_native,
+                        ..
+                    } => retained_native,
+                },
+            ),
         };
-        let backup = prepared.backup().to_owned();
-        let migrated = prepared.migrated();
+        // A retired layout was already converted into a private native-only
+        // candidate with its published v2 backup; a current store is validated
+        // read-only and left byte-for-byte in place. Package materials always
+        // live in their own scratch root and never pollute the candidate.
+        let mut scratch = PackageCheckScratch::create(data_dir)?;
+        let mut check_lock = None;
+        let native_prepared = prepared.is_some();
+        let (native, cas, backup, migrated) = if let Some(prepared) = prepared.as_ref() {
+            (
+                prepared.path().to_owned(),
+                prepared.backup().join("cas"),
+                prepared.backup().to_owned(),
+                prepared.migrated(),
+            )
+        } else {
+            let native = evertrace_store::connection::native_root(data_dir);
+            let cas = data_dir.join("cas");
+            // The check still mints a verified pre-upgrade backup of the
+            // current store even though the native itself is not republished;
+            // restore authority comes from that backup.
+            let (backup, _backup_summary, closed) =
+                create_check_backup(data_dir, config_path).await?;
+            check_lock = Some(closed);
+            (native, cas, backup, false)
+        };
         let mut candidate_native_verified = false;
         let mut candidate_daemon_verified = false;
         let mut candidate_host = None;
@@ -396,7 +558,7 @@ where
             runtime.recall_cues.clear();
             let materials = evertrace_codex::install::prepare_package_check(
                 preflight,
-                prepared.path(),
+                scratch.path(),
                 |destination| {
                     runtime
                         .publish(destination)
@@ -406,13 +568,9 @@ where
             .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
             let candidate_runtime = RuntimeSnapshot::load(&materials.runtime)
                 .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
-            probe_package_capture(prepared.path(), &materials.executable, &candidate_runtime)?;
-            run_package_native(
-                &package.join("evertraced"),
-                prepared.path(),
-                &backup.join("cas"),
-            )
-            .await?;
+            probe_package_capture(scratch.path(), &materials.executable, &candidate_runtime)?;
+            evertrace_store::restore::verify_package_native(&native, &cas).await?;
+            run_package_native(&package.join("evertraced"), &native, &cas).await?;
             candidate_native_verified = true;
             candidate_host =
                 probe_package_daemon(package, materials.generation, &health, live_host, &canary)
@@ -443,62 +601,109 @@ where
                     cause: Box::new(RestoreError::Io),
                 }
             })?;
-            let mut called = false;
-            let outcome = prepared
-                .publish_package(|| {
-                    called = true;
-                    let Ok(_guard) = fence.exclusive() else {
-                        return evertrace_store::restore::PackagePublication::Uncertain;
-                    };
-                    match materials.commit(data_dir, &RuntimeSnapshot::snapshot_path(data_dir)) {
-                        evertrace_codex::install::PackageCommit::Committed => {
-                            evertrace_store::restore::PackagePublication::Committed
-                        }
-                        evertrace_codex::install::PackageCommit::Restored
-                            if materials.discard_staged().is_ok() =>
+            if let Some(prepared) = prepared.take() {
+                // The native candidate is published first, then package assets
+                // commit; any package failure rolls the native back before a
+                // semantic writer resumes.
+                let mut called = false;
+                let outcome = prepared
+                    .publish_package(|| {
+                        called = true;
+                        let Ok(_guard) = fence.exclusive() else {
+                            return evertrace_store::restore::PackagePublication::Uncertain;
+                        };
+                        match materials
+                            .commit(data_dir, &RuntimeSnapshot::snapshot_path(data_dir))
                         {
-                            evertrace_store::restore::PackagePublication::Restored
+                            evertrace_codex::install::PackageCommit::Committed => {
+                                evertrace_store::restore::PackagePublication::Committed
+                            }
+                            evertrace_codex::install::PackageCommit::Restored
+                                if materials.discard_staged().is_ok() =>
+                            {
+                                evertrace_store::restore::PackagePublication::Restored
+                            }
+                            _ => evertrace_store::restore::PackagePublication::Uncertain,
                         }
-                        _ => evertrace_store::restore::PackagePublication::Uncertain,
-                    }
-                })
-                .await;
-            if !called
-                && outcome.is_err()
-                && !matches!(
-                    outcome,
-                    Err(RestoreError::NativePublicationUncertain { .. })
-                )
-            {
-                materials
-                    .discard_staged()
-                    .map_err(|_| RestoreError::ResidualCandidate {
-                        directory: data_dir.to_owned(),
-                        cause: Box::new(RestoreError::Io),
+                    })
+                    .await;
+                if !called
+                    && outcome.is_err()
+                    && !matches!(outcome, Err(RestoreError::NativePublicationUncertain { .. }))
+                {
+                    materials.discard_staged().map_err(|_| {
+                        RestoreError::ResidualCandidate {
+                            directory: data_dir.to_owned(),
+                            cause: Box::new(RestoreError::Io),
+                        }
                     })?;
-            }
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    if !matches!(
-                        error,
-                        RestoreError::NativePublicationUncertain { .. }
-                            | RestoreError::ResidualCandidate { .. }
-                    ) {
-                        may_resume = true;
+                }
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if !matches!(
+                            error,
+                            RestoreError::NativePublicationUncertain { .. }
+                                | RestoreError::ResidualCandidate { .. }
+                        ) {
+                            may_resume = true;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
+                };
+                retained_native = match outcome {
+                    evertrace_store::restore::NativeUpgradeOutcome::Published {
+                        retained_native,
+                        ..
+                    }
+                    | evertrace_store::restore::NativeUpgradeOutcome::Noop { retained_native } => {
+                        retained_native
+                    }
+                    evertrace_store::restore::NativeUpgradeOutcome::Empty => Vec::new(),
+                };
+            } else {
+                let published = {
+                    let Ok(_guard) = fence.exclusive() else {
+                        scratch.retain();
+                        return Err(RestoreError::ResidualCandidate {
+                            directory: scratch.path().to_owned(),
+                            cause: Box::new(RestoreError::Io),
+                        });
+                    };
+                    materials.commit(data_dir, &RuntimeSnapshot::snapshot_path(data_dir))
+                };
+                match published {
+                    evertrace_codex::install::PackageCommit::Committed => {}
+                    evertrace_codex::install::PackageCommit::Restored => {
+                        // The adapter rolled the package back to the previous
+                        // verified generation: an unpublished failure, never a
+                        // committed publication.
+                        materials.discard_staged().map_err(|_| {
+                            RestoreError::ResidualCandidate {
+                                directory: data_dir.to_owned(),
+                                cause: Box::new(RestoreError::Io),
+                            }
+                        })?;
+                        may_resume = preflight_original_ok;
+                        return Err(RestoreError::Io);
+                    }
+                    evertrace_codex::install::PackageCommit::Uncertain => {
+                        // An uncertain package commit may leave the registry or
+                        // a rollback still referencing the staged generation.
+                        // Never unlink assets that may be active or recoverable:
+                        // retain the scratch and return the typed uncertainty
+                        // without resuming the service.
+                        scratch.retain();
+                        return Err(RestoreError::NativePublicationUncertain {
+                            active: data_dir.to_owned(),
+                            preserved: scratch.path().to_owned(),
+                        });
+                    }
                 }
-            };
-            let retained_native = match outcome {
-                evertrace_store::restore::NativeUpgradeOutcome::Published {
-                    retained_native, ..
-                }
-                | evertrace_store::restore::NativeUpgradeOutcome::Noop { retained_native } => {
-                    retained_native
-                }
-                evertrace_store::restore::NativeUpgradeOutcome::Empty => Vec::new(),
-            };
+            }
+            // Publication is complete: release the sibling lock before the
+            // daemon is asked to reopen the store.
+            drop(check_lock.take());
             let resumed = if !retained_native.is_empty() {
                 Err(evertrace_codex::install::InstallError::Io)
             } else {
@@ -526,10 +731,12 @@ where
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
+            scratch.cleanup()?;
             return Ok(PackageUpgradeCheck {
                 backup,
                 migrated,
                 generation: Some(generation),
+                native_prepared,
                 materials_validated: true,
                 candidate_native_verified,
                 candidate_daemon_verified,
@@ -541,13 +748,23 @@ where
                 retained_native,
             });
         }
-        // Both failed and successful checks dispose only this owned candidate while
-        // the same sibling lock is still held. Unknown residuals are explicit errors.
-        if matches!(&validation, Err(RestoreError::ResidualCandidate { directory, .. }) if directory.starts_with(prepared.path()))
+        // Check-only (or failed validation) disposes exactly this owned
+        // prepared candidate before any status is reported. An unknown residual
+        // is still an explicit error, never silently adopted or deleted.
+        if let Some(prepared) = prepared.take() {
+            prepared.discard()?;
+        }
+        // Failed checks dispose only this owned scratch candidate; any unknown
+        // residual is an explicit error.
+        if matches!(&validation, Err(RestoreError::ResidualCandidate { directory, .. }) if directory.starts_with(scratch.path()))
         {
+            scratch.retain();
             return validation.map(|_| unreachable!());
         }
-        prepared.discard()?;
+        if let Err(error) = scratch.cleanup() {
+            scratch.retain();
+            return Err(error);
+        }
         if matches!(&validation, Err(RestoreError::ResidualCandidate { .. })) {
             return validation.map(|_| unreachable!());
         }
@@ -559,6 +776,7 @@ where
                 .as_ref()
                 .ok()
                 .map(|materials| materials.generation),
+            native_prepared,
             materials_validated: validation.is_ok(),
             candidate_native_verified,
             candidate_daemon_verified,
@@ -811,9 +1029,8 @@ where
         crate::recovery::finish_owned_child(&mut hook.0, true).map_err(|_| uncertain())?;
         hook_result?;
         loop {
-            let connection = evertrace_store::connection::CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root)).await.map_err(|_| invalid())?;
-            let journal = connection.connection().open_table(evertrace_store::JOURNAL_TABLE).execute().await.map_err(|_| invalid())?;
-            let payloads = evertrace_store::journal::read_all_journal_rows(&journal).await?.iter().map(|row| row.payload()).collect::<Result<Vec<_>, _>>()?;
+            let readers = evertrace_store::StoreReadHandle::open_read_only(&root).await.map_err(|_| invalid())?;
+            let payloads = readers.journal_rows().await.map_err(|_| invalid())?.iter().map(|row| row.payload()).collect::<Result<Vec<_>, _>>()?;
             let receipt = payloads.iter().find_map(|payload| match payload {
                 JournalPayload::SourceReceiptRecorded(receipt) if receipt.source_session_ref == "package-daemon-probe" => Some(receipt), _ => None,
             });
@@ -827,7 +1044,7 @@ where
                 if !payload.windows(b"package-daemon-probe".len()).any(|value| value == b"package-daemon-probe") { return Err(invalid()); }
                 break;
             }
-            drop(journal); drop(connection);
+            drop(readers);
             if tokio::time::Instant::now() >= deadline { return Err(invalid()); }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -866,7 +1083,14 @@ pub async fn restore_offline(
 ) -> Result<OfflineRestoreOutcome, evertrace_store::restore::RestoreError> {
     use evertrace_store::restore::{RestoreError, RestorePreparation};
     let at = now_us().map_err(|_| RestoreError::Io)?;
-    let preparation = evertrace_store::restore::prepare(data_dir, backup, at, config_hash).await?;
+    let preparation = evertrace_store::restore::prepare(
+        data_dir,
+        backup,
+        at,
+        config_hash,
+        verify_hook_backup_assets,
+    )
+    .await?;
     let RestorePreparation::Candidate(mut candidate) = preparation else {
         let RestorePreparation::Historical { directory } = preparation else {
             unreachable!()

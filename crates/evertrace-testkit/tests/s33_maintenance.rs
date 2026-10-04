@@ -54,10 +54,10 @@ use evertrace_engine::{
     work::{WorkCommandContext, activate_episode, new_episode},
 };
 use evertrace_store::{
-    BackupManifest, DurableJob, JobBudget, JobLease, JobStatus, JobTerminalReason, JournalCommand,
-    JournalEventDraft, JournalPayload, JournalWriter, QUIESCED_BACKUP_CREATE_JOB_KIND,
-    RuntimeSchedulerView, ScopePurgeCurrentView, SemanticCurrentView, SessionBodyState,
-    SessionImportCurrentView, StoreError,
+    BackupError, BackupManifest, DurableJob, JobBudget, JobLease, JobStatus, JobTerminalReason,
+    JournalCommand, JournalEventDraft, JournalPayload, JournalWriter,
+    QUIESCED_BACKUP_CREATE_JOB_KIND, RuntimeSchedulerView, ScopePurgeCurrentView, SearchIndex,
+    SemanticCurrentView, SessionBodyState, SessionImportCurrentView, StoreError,
     repository::RepositoryCurrentView,
     session_import::{
         BodyStateReason, MetadataState, SessionImportEvent, SessionImportEventKind,
@@ -199,7 +199,7 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
         .collect::<BTreeSet<_>>();
     // Invalid command time fails after the verified copy, not before candidate creation.
     assert!(matches!(
-        evertrace_store::restore::prepare(&data, &backup, -1, CONFIG).await,
+        evertrace_store::restore::prepare(&data, &backup, -1, CONFIG, |_, _| Ok(())).await,
         Err(evertrace_store::restore::RestoreError::Store(
             StoreError::InvalidInput
         ))
@@ -215,7 +215,7 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
         std::fs::read(backup.join("manifest.json")).unwrap(),
         manifest_before
     );
-    let prepared = evertrace_store::restore::prepare(&data, &backup, 3, CONFIG)
+    let prepared = evertrace_store::restore::prepare(&data, &backup, 3, CONFIG, |_, _| Ok(()))
         .await
         .unwrap();
     let evertrace_store::restore::RestorePreparation::Candidate(candidate) = prepared else {
@@ -296,10 +296,15 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
     assert_eq!(progress.next_ordinal, 1);
     handle.shutdown().await.unwrap();
     actor.await.unwrap().unwrap();
-    let prepared =
-        evertrace_store::restore::prepare(&data, &backup, progress.recorded_at_us + 1, CONFIG)
-            .await
-            .unwrap();
+    let prepared = evertrace_store::restore::prepare(
+        &data,
+        &backup,
+        progress.recorded_at_us + 1,
+        CONFIG,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
     let evertrace_store::restore::RestorePreparation::Candidate(candidate) = prepared else {
         panic!("intermediate deletion must prepare a candidate");
     };
@@ -371,9 +376,15 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
     std::fs::write(&unwritable_config, &old_config).unwrap();
     std::fs::set_permissions(&unwritable_config, std::fs::Permissions::from_mode(0o600)).unwrap();
     let evertrace_store::restore::RestorePreparation::Candidate(candidate) =
-        evertrace_store::restore::prepare(&data, &backup, progress.recorded_at_us + 1, CONFIG)
-            .await
-            .unwrap()
+        evertrace_store::restore::prepare(
+            &data,
+            &backup,
+            progress.recorded_at_us + 1,
+            CONFIG,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap()
     else {
         panic!("candidate required")
     };
@@ -565,6 +576,98 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
         std::fs::read_to_string(&historical_config_path).unwrap(),
         historical_config
     );
+}
+
+#[tokio::test]
+async fn busy_checkpoint_is_an_inner_backup_failure_and_the_actor_keeps_serving() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    let mut config_file = EffectiveConfig::default().config().clone();
+    config_file.runtime.data_dir = data.to_str().unwrap().to_owned();
+    let effective = EffectiveConfig::new(config_file).unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, effective.to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let writer = JournalWriter::open(&data).await.unwrap();
+    let (handle, actor) = spawn_writer(writer, 8).unwrap();
+    let mut runtime = runtime_snapshot(&data);
+    runtime.effective_config_hash = effective.hash();
+    runtime
+        .publish(&RuntimeSnapshot::snapshot_path(&data))
+        .unwrap();
+    let _ = DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
+    CasStore::open(runtime.cas_dir.clone()).unwrap();
+    let repository_id = RepositoryId::new_v7();
+    handle
+        .commit(
+            repository_command(repository(repository_id, "/busy-target", 1), 1),
+            1,
+        )
+        .await
+        .unwrap();
+
+    // A real third-party read-only transaction pins the WAL, so the TRUNCATE
+    // checkpoint reports busy while the database itself stays healthy.
+    let sqlite = evertrace_store::connection::native_root(&data).join("evertrace.sqlite");
+    let external = rusqlite::Connection::open_with_flags(
+        &sqlite,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .unwrap();
+    external.execute_batch("BEGIN").unwrap();
+    let _: i64 = external
+        .query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))
+        .unwrap();
+
+    let busy_id = JobId::new_v7();
+    let busy = handle
+        .create_backup(busy_id, config.clone(), runtime.clone())
+        .await;
+    // The busy checkpoint is one ordinary inner backup failure, not an actor
+    // fatal error, and no backup directory was published.
+    assert!(matches!(&busy, Ok(Err(BackupError::Io))), "{busy:?}");
+    assert!(
+        !data
+            .join("backups")
+            .join(format!("backup-{busy_id}"))
+            .exists()
+    );
+
+    // The same actor keeps committing, reading and serving search snapshots.
+    let second_repository = RepositoryId::new_v7();
+    handle
+        .commit(
+            repository_command(repository(second_repository, "/busy-target-2", 2), 2),
+            2,
+        )
+        .await
+        .unwrap();
+    let projected = handle.project().await.unwrap();
+    assert!(projected.frontier >= 2);
+    assert!(handle.read_handle().journal_rows().await.unwrap().len() >= 2);
+    let index = SearchIndex::open_with_read_handle(&data, handle.read_handle())
+        .await
+        .unwrap();
+    drop(index.snapshot().await.unwrap());
+    drop(index);
+
+    // Releasing the external transaction lets the same actor complete the same
+    // backup path, and the published result verifies independently.
+    drop(external);
+    let complete_id = JobId::new_v7();
+    handle
+        .create_backup(complete_id, config, runtime)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        data.join("backups")
+            .join(format!("backup-{complete_id}"))
+            .is_dir()
+    );
+    verify_backup(&data, complete_id).await.unwrap();
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -821,23 +924,20 @@ fn file_sha256(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn isolated_upgrade_publishes_native_container_without_moving_durable_inputs() {
-    use evertrace_store::restore::NativeUpgradeOutcome;
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+async fn old_l0001_layout_is_refused_without_moving_durable_inputs() {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let root = TempDir::new().unwrap();
     let data = root.path().join("data");
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&data)
         .unwrap();
-    let connection = evertrace_store::connection::CompatibilityStore::connect_local(&data)
-        .await
+    let legacy = data.join(format!("{}.lance", evertrace_store::JOURNAL_TABLE));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&legacy)
         .unwrap();
-    evertrace_store::L0001::apply(connection.connection())
-        .await
-        .unwrap();
-    drop(connection);
+    std::fs::write(legacy.join("data.lance"), b"legacy-l0001").unwrap();
     assert!(matches!(
         JournalWriter::open(&data).await,
         Err(evertrace_store::StoreError::UpgradeRequired)
@@ -881,50 +981,20 @@ async fn isolated_upgrade_publishes_native_container_without_moving_durable_inpu
             (metadata.dev(), metadata.ino())
         })
         .collect();
-    let binaries = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_owned();
     std::fs::write(data.join("unknown-user-asset"), b"keep").unwrap();
-    let output = Command::new(binaries.join("evertrace"))
-        .arg("--config")
-        .arg(&config)
-        .arg("upgrade")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("upgrade=L0001_to_L0002"));
+    assert!(matches!(
+        evertrace_engine::maintenance::upgrade_offline(&data, &config).await,
+        Err(evertrace_store::restore::RestoreError::Store(
+            evertrace_store::StoreError::StoreCorrupt
+        ))
+    ));
     assert_eq!(
         std::fs::read(data.join("unknown-user-asset")).unwrap(),
         b"keep"
     );
-    let backup = std::fs::read_dir(data.join("backups"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    assert!(
-        data.join("store")
-            .join(format!("{}.lance", evertrace_store::JOURNAL_TABLE))
-            .is_dir()
-    );
-    assert!(
-        !data
-            .join(format!("{}.lance", evertrace_store::OBJECTS_TABLE))
-            .exists()
-    );
-    assert!(
-        !data
-            .join(format!("{}.lance", evertrace_store::JOURNAL_TABLE))
-            .exists()
+    assert_eq!(
+        std::fs::read(legacy.join("data.lance")).unwrap(),
+        b"legacy-l0001"
     );
     for (path, identity) in paths.iter().zip(identities) {
         let metadata = std::fs::metadata(path).unwrap();
@@ -946,114 +1016,35 @@ async fn isolated_upgrade_publishes_native_container_without_moving_durable_inpu
     else {
         panic!("held capture runtime must remain usable")
     };
-    let writer = JournalWriter::open(&data).await.unwrap();
-    assert_eq!(writer.full_projection().await.unwrap().frontier, 2);
-    drop(writer);
-    assert!(matches!(
-        evertrace_engine::maintenance::upgrade_offline(&data, &config)
-            .await
-            .unwrap(),
-        NativeUpgradeOutcome::Noop { retained_native } if retained_native.is_empty()
-    ));
-    let mut hook_correlation = correlation();
-    hook_correlation.pairing_role = ObservationRole::Result;
-    let hook_input = serde_json::json!({
-        "input_version": evertrace_codex::hook_input::CAPTURE_HOOK_INPUT_VERSION,
-        "spool_record_id": "upgrade-real-hook", "source_observation_id_hint": null,
-        "source_instance_id": "upgrade-real-hook", "source_revision": "revision-1",
-        "source_record_identity": "upgrade-real-hook", "identity_strength": "stable_native",
-        "source_kind": "codex_hook", "identity_domain": "codex-hook-v1",
-        "adapter_manifest_ref": "adapter-s33", "eligible_event_manifest_ref": "eligible-s33",
-        "source_revision_mode": "append", "previous_source_revision": null,
-        "source_ref": "upgrade-real-hook", "session_id": "upgrade-real-hook",
-        "turn_id": null, "tool_use_id": null, "event_kind": "post_tool_use",
-        "correlation": hook_correlation, "scope_effect_claims": [], "lifecycle": null,
-        "source_sequence": 1, "source_sequence_origin": null, "task_id": null,
-        "repository_instance_id": null, "worktree_instance_id": null,
-        "event_time_us": 1, "payload": "upgrade real hook evidence"
-    });
-    let bytes = serde_json::to_vec(&hook_input).unwrap();
-    evertrace_codex::hook_input::CaptureHookInput::from_json(&bytes).unwrap();
-    {
-        let mut child = Command::new(binaries.join("evertrace-hook"))
-            .arg("--runtime-snapshot")
-            .arg(RuntimeSnapshot::snapshot_path(&data))
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(&bytes).unwrap();
-        assert!(child.wait().unwrap().success());
-    }
-    drop(capture);
-    let (mut spool, _) =
-        DurableSpool::open(runtime.spool_dir.clone(), runtime.spool_limits().unwrap()).unwrap();
-    spool.seal_active(runtime.generation).unwrap();
-    let replay = spool
-        .sealed_segments(16)
-        .unwrap()
-        .into_iter()
-        .map(|segment| {
-            (
-                segment.path().to_owned(),
-                std::fs::read(segment.path()).unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    drop(spool);
-    let writer = JournalWriter::open(&data).await.unwrap();
-    let (handle, actor) = spawn_writer(writer, 32).unwrap();
-    let ingestor =
-        EvidenceIngestor::new(runtime.clone(), handle.clone(), effective.hash(), ALGORITHM)
-            .unwrap();
-    let drained = ingestor.drain_once().await.unwrap();
-    assert!(drained.committed_frames >= 3, "{drained:?}");
-    let snapshot = handle.project().await.unwrap();
-    let (_, receipt) = source_pair_for_instance(&snapshot, "upgrade-real-hook");
-    assert_eq!(receipt.source_instance_id.as_str(), "upgrade-real-hook");
-    let frontier = snapshot.frontier;
-    // Simulate an acknowledgement lost after commit by restoring the exact
-    // durable input bytes, not by issuing a new Hook capture/command identity.
-    for (path, bytes) in replay {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .unwrap();
-        file.write_all(&bytes).unwrap();
-        file.sync_all().unwrap();
-    }
-    let replayed = ingestor.drain_once().await.unwrap();
-    assert_eq!(replayed.replayed_frames, drained.committed_frames);
-    assert_eq!(replayed.committed_frames, replayed.replayed_frames);
-    assert_eq!(handle.project().await.unwrap().frontier, frontier);
-    drop(ingestor);
-    drop(handle);
-    actor.await.unwrap().unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["schema_revision"], "L0001");
-    assert!(manifest["table_states"]["relations"].is_null());
+    // The explicit offline converter owns the actual conversion in the next
+    // package; nothing here mutates or migrates the refused layout.
+    assert!(!data.join("backups").exists());
+    assert!(!data.join("store").exists());
 }
 
 #[tokio::test]
-async fn isolated_upgrade_converts_flat_l0002_without_an_extra_migration() {
-    use evertrace_store::restore::NativeUpgradeOutcome;
-    use std::os::unix::fs::DirBuilderExt;
+async fn old_flat_l0002_layout_is_refused_and_flat_source_never_used() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = TempDir::new().unwrap();
     let data = root.path().join("data");
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&data)
         .unwrap();
-    let connection = evertrace_store::connection::CompatibilityStore::connect_local(&data)
-        .await
-        .unwrap();
-    evertrace_store::L0002::apply(connection.connection())
-        .await
-        .unwrap();
-    drop(connection);
+    let tables = [
+        evertrace_store::JOURNAL_TABLE,
+        evertrace_store::OBJECTS_TABLE,
+        evertrace_store::RELATIONS_TABLE,
+        evertrace_store::SEARCH_TABLE,
+    ];
+    for table in tables {
+        let legacy = data.join(format!("{table}.lance"));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&legacy)
+            .unwrap();
+        std::fs::write(legacy.join("data.lance"), table.as_bytes()).unwrap();
+    }
     assert!(matches!(
         JournalWriter::open(&data).await,
         Err(evertrace_store::StoreError::UpgradeRequired)
@@ -1067,34 +1058,428 @@ async fn isolated_upgrade_converts_flat_l0002_without_an_extra_migration() {
     runtime
         .publish(&RuntimeSnapshot::snapshot_path(&data))
         .unwrap();
-    CasStore::open(runtime.cas_dir.clone()).unwrap();
+    assert!(
+        evertrace_engine::maintenance::upgrade_offline(&data, &config)
+            .await
+            .is_err()
+    );
+    assert!(!data.join("store").exists());
+    for table in tables {
+        assert_eq!(
+            std::fs::read(data.join(format!("{table}.lance")).join("data.lance")).unwrap(),
+            table.as_bytes()
+        );
+    }
+}
+
+/// A real pre-deletion v2 backup plus a retired live journal carrying later
+/// legal object-deletion and repository-scope purge authority. `restore::prepare`
+/// must read the old live ledger under the same sibling lock, merge it into the
+/// converted private candidate, and never resurrect suppressed/purged objects
+/// or exclusive CAS references.
+#[tokio::test]
+async fn old_live_ledger_merges_into_converted_candidate_without_resurrection() {
+    use evertrace_domain::purge::{ObjectDeletionPhase, ObjectDeletionTarget, ScopePurgeStage};
+    use evertrace_store::{ObjectDeletionCurrentView, ObjectRowClass, object_deletion_preview};
+    use std::os::unix::fs::DirBuilderExt;
+
+    let root = TempDir::new().unwrap();
+    let data_root = root.path().join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data_root)
+        .unwrap();
+    let mut config_file = EffectiveConfig::default().config().clone();
+    config_file.runtime.data_dir = data_root.to_str().unwrap().to_owned();
+    let effective = EffectiveConfig::new(config_file).unwrap();
+    let config_path = root.path().join("config.toml");
+    std::fs::write(&config_path, effective.to_toml().unwrap()).unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut runtime = runtime_snapshot(&data_root);
+    runtime.effective_config_hash = effective.hash();
     DeviceKeyStore::new(runtime.device_key_dir.clone())
         .load_or_create()
         .unwrap();
+    runtime
+        .publish(&RuntimeSnapshot::snapshot_path(&data_root))
+        .unwrap();
+
+    let writer = JournalWriter::open(&data_root).await.unwrap();
+    let (handle, actor) = spawn_writer(writer, 16).unwrap();
     let mut capture = CaptureRuntime::open(runtime.clone()).unwrap();
-    let repository_id = RepositoryId::new_v7();
-    let outcome = evertrace_store::restore::upgrade_native(
-        &data,
-        &config,
+    let atom_repo = RepositoryId::new_v7();
+    let purge_repo = RepositoryId::new_v7();
+    let keep_repo = RepositoryId::new_v7();
+    let worktree_id = WorktreeId::new_v7();
+    let atom_path = root.path().join("legacy-atom").display().to_string();
+    let purge_path = root.path().join("legacy-purge").display().to_string();
+    let keep_path = root.path().join("legacy-keep").display().to_string();
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![
+                    JournalEventDraft::runtime(
+                        1,
+                        CONFIG,
+                        ALGORITHM,
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository(
+                            atom_repo, &atom_path, 1,
+                        ))),
+                    ),
+                    JournalEventDraft::runtime(
+                        1,
+                        CONFIG,
+                        ALGORITHM,
+                        JournalPayload::WorktreeInstanceRecorded(Box::new(worktree(
+                            atom_repo,
+                            worktree_id,
+                            &atom_path,
+                        ))),
+                    ),
+                    JournalEventDraft::runtime(
+                        1,
+                        CONFIG,
+                        ALGORITHM,
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository(
+                            purge_repo,
+                            &purge_path,
+                            1,
+                        ))),
+                    ),
+                    JournalEventDraft::runtime(
+                        1,
+                        CONFIG,
+                        ALGORITHM,
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository(
+                            keep_repo, &keep_path, 1,
+                        ))),
+                    ),
+                ],
+            )
+            .unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    let exclusive = match capture
+        .capture(capture_input(
+            "s33-legacy-exclusive",
+            purge_repo,
+            b"exclusive repository evidence",
+        ))
+        .unwrap()
+    {
+        CaptureOutcome::Durable { cas_digest, .. } => cas_digest,
+        _ => panic!("durable exclusive capture required"),
+    };
+    let shared = match capture
+        .capture(capture_input(
+            "s33-legacy-shared",
+            purge_repo,
+            b"shared repository evidence",
+        ))
+        .unwrap()
+    {
+        CaptureOutcome::Durable { cas_digest, .. } => cas_digest,
+        _ => panic!("durable shared capture required"),
+    };
+    let keep_shared = match capture
+        .capture(capture_input(
+            "s33-legacy-keep",
+            keep_repo,
+            b"shared repository evidence",
+        ))
+        .unwrap()
+    {
+        CaptureOutcome::Durable { cas_digest, .. } => cas_digest,
+        _ => panic!("durable keep capture required"),
+    };
+    assert_eq!(shared, keep_shared);
+    EvidenceIngestor::new(runtime.clone(), handle.clone(), effective.hash(), ALGORITHM)
+        .unwrap()
+        .drain_once()
+        .await
+        .unwrap();
+
+    // A real accepted task-local atom gives the object-deletion ledger a legal
+    // target instead of a synthetic payload.
+    let (task, workstream, episode) = repository_episode(atom_repo, worktree_id);
+    let task_id = task.task_id;
+    handle
+        .commit(
+            JournalCommand::new(
+                CommandId::new_v7(),
+                vec![
+                    JournalEventDraft::runtime(
+                        2,
+                        CONFIG,
+                        ALGORITHM,
+                        JournalPayload::TaskRecorded(Box::new(task)),
+                    ),
+                    JournalEventDraft::runtime(
+                        2,
+                        CONFIG,
+                        ALGORITHM,
+                        JournalPayload::WorkstreamRecorded(Box::new(workstream.clone())),
+                    ),
+                ],
+            )
+            .unwrap(),
+            2,
+        )
+        .await
+        .unwrap();
+    handle
+        .commit(
+            activate_episode(
+                WorkCommandContext {
+                    command_id: CommandId::new_v7(),
+                    occurred_at_us: 2,
+                    effective_config_hash: CONFIG,
+                    algorithm_revision: ALGORITHM,
+                },
+                &workstream,
+                episode,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+            2,
+        )
+        .await
+        .unwrap();
+    let exact_message = "legacy exact instruction";
+    let mut exact_input = capture_input("s33-legacy-atom", atom_repo, exact_message.as_bytes());
+    exact_input.task_id = Some(task_id.to_string());
+    assert!(matches!(
+        capture.capture(exact_input).unwrap(),
+        CaptureOutcome::Durable { .. }
+    ));
+    EvidenceIngestor::new(runtime.clone(), handle.clone(), effective.hash(), ALGORITHM)
+        .unwrap()
+        .drain_once()
+        .await
+        .unwrap();
+    let snapshot = handle.project().await.unwrap();
+    let (observation, receipt) = source_pair_for_instance(&snapshot, "hook-s33-legacy-atom");
+    let task_draft = AtomDraft {
+        kind: AtomKind::Constraint,
+        epistemic_status: EpistemicStatus::NotApplicable,
+        value: AtomValue {
+            text: exact_message.into(),
+            subject: "current_task".into(),
+            predicate: "must_follow_user_message".into(),
+            object: None,
+            qualifiers: Vec::new(),
+            critical_revision_refs: Vec::new(),
+        },
+        scope: AtomScope::Task { task_id },
+        applicability_expr: ApplicabilityExpr::Always,
+        future_cue_lifecycle_exprs: None,
+        validity_interval: ValidityInterval {
+            valid_from_us: 1,
+            valid_until_us: Some(10),
+        },
+        provenance: vec![AtomProvenance::UserAsserted],
+        source_observation_refs: vec![observation.source_observation_id],
+        evidence_refs: vec![receipt.source_receipt_id.to_string()],
+        supersedes_revision_refs: Vec::new(),
+        supports_revision_refs: Vec::new(),
+        contradicts_revision_refs: Vec::new(),
+    };
+    let proposal_service = RevisionProposalService;
+    let ProposalResolution::Revision {
+        value: proposal,
+        command,
+    } = proposal_service
+        .submit(
+            &SemanticCurrentView::from_snapshot(&snapshot).unwrap(),
+            proposal_context(3),
+            SubmitProposalRequest {
+                target_kind: ProposalTargetKind::Atom,
+                target_id: None,
+                base_revision_id: None,
+                operation: ProposalOperation::Create,
+                payload: ProposalPayload::Atom(Box::new(AtomProposalPayload::Create {
+                    draft: task_draft,
+                })),
+                evidence_refs: vec![receipt.source_receipt_id.to_string()],
+                source_cohort_refs: vec![receipt.source_receipt_id.to_string()],
+                eligibility: ProposalEligibility::ManualRequired,
+                created_by: ProposalCreatedBy::Agent,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("atom proposal expected")
+    };
+    handle.commit(command, 3).await.unwrap();
+    let submitted = handle.project().await.unwrap();
+    let accepted = proposal_service
+        .accept(
+            &SemanticCurrentView::from_snapshot(&submitted).unwrap(),
+            proposal_context(3),
+            proposal.proposal_id,
+            AtomAcceptanceContext::CurrentTaskExactMessage {
+                observation: Box::new(observation),
+                receipt: Box::new(receipt),
+                canonical_message: exact_message.into(),
+            },
+        )
+        .unwrap();
+    let atom_id = accepted.atom.atom_id;
+    handle.commit(accepted.command, 3).await.unwrap();
+
+    // Everything above is the pre-deletion state of the live journal.
+    let rows_t0 = handle.read_handle().journal_rows().await.unwrap();
+
+    // Later legal object-deletion authority, still Pending.
+    let before = handle.project().await.unwrap();
+    let deletion_preview =
+        object_deletion_preview(&before, ObjectDeletionTarget::Atom { atom_id }).unwrap();
+    let forget = evertrace_engine::purge::pending_object_forget_command(
+        RequestId::new_v7(),
+        &deletion_preview,
+        &deletion_preview.exact_revision_ids,
+        deletion_preview.deletion_generation,
+        4,
+        before.frontier,
+        CONFIG,
+    )
+    .unwrap();
+    handle.commit(forget, 4).await.unwrap();
+
+    // Later legal repository-scope purge authority: Pending, then a real
+    // PhysicalDeleting progress under an actual job lease.
+    let before = handle.project().await.unwrap();
+    let purge_preview =
+        evertrace_store::repository_scope_purge_preview(&before, purge_repo, 1).unwrap();
+    assert!(purge_preview.blockers.is_empty());
+    let pending = evertrace_engine::purge::pending_repository_purge_command(
+        RequestId::new_v7(),
+        &purge_preview,
+        purge_preview.deletion_generation,
+        5,
+        before.frontier,
+        CONFIG,
+    )
+    .unwrap();
+    handle.commit(pending, 5).await.unwrap();
+    let confirmation_frontier =
+        ScopePurgeCurrentView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .events
+            .get(&purge_repo)
+            .unwrap()
+            .confirmation_frontier;
+    let plan_items = u64::from(purge_preview.physical_item_count().unwrap());
+    let mut at = 6;
+    for (stage, ordinal) in [
+        (ScopePurgeStage::ProjectionClosed, 0_u64),
+        (ScopePurgeStage::PhysicalDeleting, plan_items),
+    ] {
+        let current = handle.project().await.unwrap();
+        let progress = ScopePurgeCurrentView::from_snapshot(&current)
+            .unwrap()
+            .events
+            .get(&purge_repo)
+            .cloned()
+            .unwrap();
+        let job = RuntimeSchedulerView::from_snapshot(&current)
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == progress.purge_job_id)
+            .unwrap();
+        let lease = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                at,
+                CONFIG,
+                ALGORITHM,
+                JournalPayload::JobLease(JobLease {
+                    job_id: job.job_id,
+                    target_generation: job.target_generation,
+                    attempt: job.attempt.checked_add(1).unwrap(),
+                    lease_until_us: at.checked_add(30_000_000).unwrap(),
+                }),
+            )],
+        )
+        .unwrap();
+        handle.commit(lease, at).await.unwrap();
+        at += 1;
+        let leased = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == progress.purge_job_id)
+            .unwrap();
+        assert_eq!(leased.state, JobStatus::Leased);
+        let advance = evertrace_engine::purge::advance_repository_purge_command(
+            CommandId::new_v7(),
+            &progress,
+            &leased,
+            stage,
+            ordinal,
+            at,
+            CONFIG,
+        )
+        .unwrap();
+        handle.commit(advance, at).await.unwrap();
+        at += 1;
+    }
+    // A real live lease that is still outstanding when the live ledger is read:
+    // the converted candidate must clear it as restored runtime authority.
+    let current = handle.project().await.unwrap();
+    let purge_job = RuntimeSchedulerView::from_snapshot(&current)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.kind == "repository_scope_purge_v1")
+        .unwrap();
+    assert_eq!(purge_job.state, JobStatus::Queued);
+    let outstanding = JournalCommand::new(
+        CommandId::new_v7(),
+        vec![JournalEventDraft::runtime(
+            at,
+            CONFIG,
+            ALGORITHM,
+            JournalPayload::JobLease(JobLease {
+                job_id: purge_job.job_id,
+                target_generation: purge_job.target_generation,
+                attempt: purge_job.attempt.checked_add(1).unwrap(),
+                lease_until_us: at.checked_add(30_000_000).unwrap(),
+            }),
+        )],
+    )
+    .unwrap();
+    handle.commit(outstanding, at).await.unwrap();
+    let live = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.kind == "repository_scope_purge_v1")
+        .unwrap();
+    assert_eq!(live.state, JobStatus::Leased);
+    let live_lease = live.lease_until_us;
+    assert!(live_lease.is_some());
+    let rows_t1 = handle.read_handle().journal_rows().await.unwrap();
+    assert!(rows_t1.len() > rows_t0.len());
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+    drop(capture);
+
+    // Mint the real pre-deletion v2 backup with the original publication
+    // algorithm, then leave the live root carrying the later deletion ledger.
+    std::fs::remove_dir_all(data_root.join("store")).unwrap();
+    evertrace_store::test_support::write_legacy_fixture(&data_root, true, "L0002", &rows_t0)
+        .await
+        .unwrap();
+    let prepared = evertrace_store::restore::prepare_native_upgrade(
+        &data_root,
+        &config_path,
         || {
-            assert!(
-                StableLauncher::freeze_backup_snapshot(&data)
-                    .unwrap()
-                    .files
-                    .is_empty()
-            );
-            // The Store has already frozen its backup spool boundary. This new
-            // durable input must survive publication despite not belonging to it.
-            assert!(matches!(
-                capture
-                    .capture(capture_input(
-                        "upgrade-boundary",
-                        repository_id,
-                        b"after backup boundary"
-                    ))
-                    .unwrap(),
-                CaptureOutcome::Durable { .. }
-            ));
             Ok(evertrace_store::backup::BackupHookBoundary {
                 current_generation: None,
                 retained_generations: Vec::new(),
@@ -1103,63 +1488,124 @@ async fn isolated_upgrade_converts_flat_l0002_without_an_extra_migration() {
                 files: Vec::new(),
             })
         },
-        |path, _| {
-            StableLauncher::verify_backup_snapshot(path)
-                .map_err(|_| evertrace_store::BackupError::Corrupt)?;
-            Ok(())
-        },
+        |_, _| Ok(()),
     )
     .await
     .unwrap();
-    assert!(matches!(
-        outcome,
-        NativeUpgradeOutcome::Published {
-            migrated: false,
-            ref retained_native,
-            ..
-        } if retained_native.is_empty()
-    ));
-    for table in [
-        evertrace_store::OBJECTS_TABLE,
-        evertrace_store::JOURNAL_TABLE,
-        evertrace_store::RELATIONS_TABLE,
-        evertrace_store::SEARCH_TABLE,
-    ] {
-        assert!(!data.join(format!("{table}.lance")).exists());
-    }
-    drop(capture);
-    let writer = JournalWriter::open(&data).await.unwrap();
-    assert_eq!(writer.full_projection().await.unwrap().frontier, 2);
-    let (handle, actor) = spawn_writer(writer, 32).unwrap();
-    let ingestor =
-        EvidenceIngestor::new(runtime.clone(), handle.clone(), effective.hash(), ALGORITHM)
-            .unwrap();
-    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 1);
-    source_pair_for_instance(&handle.project().await.unwrap(), "hook-upgrade-boundary");
-    drop(ingestor);
-    drop(handle);
-    actor.await.unwrap().unwrap();
-    let flat = evertrace_store::connection::CompatibilityStore::connect_local(&data)
+    let evertrace_store::restore::NativeUpgradePreparation::Prepared(prepared) = prepared else {
+        panic!("a retired canonical layout must prepare a conversion")
+    };
+    let backup = prepared.backup().to_owned();
+    prepared.discard().unwrap();
+    std::fs::remove_dir_all(data_root.join("store")).unwrap();
+    evertrace_store::test_support::write_legacy_fixture(&data_root, true, "L0002", &rows_t1)
         .await
         .unwrap();
-    evertrace_store::L0002::apply(flat.connection())
-        .await
-        .unwrap();
-    drop(flat);
-    std::fs::remove_dir_all(
-        data.join("store")
-            .join(format!("{}.lance", evertrace_store::JOURNAL_TABLE)),
-    )
-    .unwrap();
-    assert!(
-        JournalWriter::open(&data).await.is_err(),
-        "corrupt canonical must never fall back to complete flat source"
-    );
-    assert!(
-        evertrace_engine::maintenance::upgrade_offline(&data, &config)
+
+    let prepared =
+        evertrace_store::restore::prepare(&data_root, &backup, 50, CONFIG, |_, _| Ok(()))
             .await
-            .is_err()
+            .unwrap();
+    let evertrace_store::restore::RestorePreparation::Candidate(candidate) = prepared else {
+        panic!("an old live ledger must convert into a candidate")
+    };
+    // The old live ledger was read and merged under the same held sibling lock.
+    assert!(matches!(
+        JournalWriter::open(&data_root).await,
+        Err(StoreError::WriterAlreadyRunning)
+    ));
+
+    let full = candidate.full_projection().await.unwrap();
+    let scope = ScopePurgeCurrentView::from_snapshot(&full).unwrap();
+    let progress = scope.events.get(&purge_repo).unwrap();
+    assert_eq!(progress.stage, ScopePurgeStage::Purged);
+    assert_eq!(progress.confirmation_frontier, confirmation_frontier);
+    assert_eq!(
+        progress.deletion_generation,
+        purge_preview.deletion_generation
     );
+    let jobs = RuntimeSchedulerView::from_snapshot(&full).unwrap().jobs;
+    let purge_job = jobs
+        .iter()
+        .find(|job| job.job_id == progress.purge_job_id)
+        .unwrap();
+    assert_eq!(u64::from(purge_job.budget.max_items), plan_items);
+    // The outstanding live lease was merged and then reset by restore runtime
+    // authority: the reset row is a real journaled command, and no lease or
+    // backoff survives into the candidate even though the attempt is kept.
+    assert!(jobs.iter().all(|job| job.state != JobStatus::Leased));
+    let candidate_rows = evertrace_store::StoreReadHandle::open_read_only(candidate.path())
+        .await
+        .unwrap()
+        .journal_rows()
+        .await
+        .unwrap();
+    let reset = candidate_rows
+        .iter()
+        .filter(|row| row.algorithm_revision == "offline_restore_runtime_v1")
+        .find_map(|row| match row.payload().unwrap() {
+            JournalPayload::JobState(job) if job.job_id == purge_job.job_id => Some(job),
+            _ => None,
+        })
+        .expect("the live lease must be reset by restore runtime authority");
+    assert_eq!(reset.state, JobStatus::Queued);
+    assert_eq!(reset.attempt, 4);
+    assert!(reset.lease_until_us.is_none());
+    assert!(reset.backoff_until_us.is_none());
+    let deletions = ObjectDeletionCurrentView::from_snapshot(&full).unwrap();
+    let event = deletions
+        .events
+        .values()
+        .find(|event| event.target == ObjectDeletionTarget::Atom { atom_id })
+        .unwrap();
+    assert_eq!(event.phase, ObjectDeletionPhase::Purged);
+    let leftovers = full
+        .data_rows()
+        .filter(|row| {
+            row.row_class == Some(ObjectRowClass::Object)
+                && row.repository_id.as_deref() == Some(purge_repo.to_string().as_str())
+        })
+        .map(|row| {
+            (
+                row.object_kind.clone(),
+                row.object_id.clone(),
+                row.lifecycle.clone(),
+                row.support_state.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "purged repository objects must not be resurrected: {leftovers:?}"
+    );
+    let repositories =
+        evertrace_store::repository::RepositoryCurrentView::from_snapshot(&full).unwrap();
+    assert!(!repositories.repositories.contains_key(&purge_repo));
+    assert!(repositories.repositories.contains_key(&keep_repo));
+    assert!(
+        !full
+            .data_rows()
+            .any(|row| row.object_id.as_deref() == Some(atom_id.to_string().as_str())),
+        "the deleted atom must not be resurrected"
+    );
+    assert!(
+        full.data_rows()
+            .any(|row| row.repository_id.as_deref() == Some(keep_repo.to_string().as_str())),
+        "unrelated repository rows must survive"
+    );
+    let candidate_cas = CasStore::open_existing(candidate.path().join("cas")).unwrap();
+    let exclusive_digest = CasStore::parse_digest(&exclusive).unwrap();
+    let shared_digest = CasStore::parse_digest(&shared).unwrap();
+    assert!(!candidate_cas.blob_path(&exclusive_digest).exists());
+    assert!(candidate_cas.blob_path(&shared_digest).exists());
+    // The old live source keeps every blob; only the candidate is completed.
+    assert!(
+        CasStore::open_existing(data_root.join("cas"))
+            .unwrap()
+            .blob_path(&exclusive_digest)
+            .exists()
+    );
+    let _ = candidate.discard(evertrace_store::restore::RestoreError::Io);
 }
 
 fn runtime_snapshot(root: &Path) -> RuntimeSnapshot {
@@ -2641,29 +3087,14 @@ async fn repository_purge_closes_immediately_batches_cas_and_resumes_after_reope
             .unwrap_or_else(|error| panic!("artifact revision {index}: {error:?}"));
     }
 
-    let native_reader = evertrace_store::connection::CompatibilityStore::connect_local(
-        &evertrace_store::connection::native_root(&store),
-    )
-    .await
-    .unwrap();
-    let held_objects = native_reader
-        .connection()
-        .open_table(evertrace_store::OBJECTS_TABLE)
-        .execute()
-        .await
-        .unwrap();
-    let held_version = held_objects.version().await.unwrap();
-    held_objects.checkout(held_version).await.unwrap();
-    let held_rows = held_objects.count_rows(None).await.unwrap();
-    assert!(held_rows > 0);
-    assert!(
-        held_objects
-            .count_rows(Some(format!("object_id = '{target_id}'")))
-            .await
-            .unwrap()
-            > 0
-    );
     let before = handle.project().await.unwrap();
+    assert!(before.data_rows().count() > 0);
+    assert!(
+        before
+            .rows
+            .iter()
+            .any(|row| row.object_id.as_deref() == Some(target_id.to_string().as_str()))
+    );
     let unavailable_space = HumanGovernanceService::new(handle.clone(), CONFIG)
         .detail(
             HumanSurface::Explorer,
@@ -3027,17 +3458,6 @@ async fn repository_purge_closes_immediately_batches_cas_and_resumes_after_reope
         Some(evertrace_engine::HumanJobTerminalReason::Completed)
     );
     assert_eq!(detail.native_history_cleanup_availability, Some(evertrace_engine::HumanNativeHistoryCleanupAvailability::ExternalReaderExclusionUnverified));
-    assert_eq!(held_objects.count_rows(None).await.unwrap(), held_rows);
-    assert_eq!(held_objects.version().await.unwrap(), held_version);
-    assert!(
-        held_objects
-            .count_rows(Some(format!("object_id = '{target_id}'")))
-            .await
-            .unwrap()
-            > 0
-    );
-    drop(held_objects);
-    drop(native_reader);
     let after_release = service
         .detail(
             HumanSurface::System,
@@ -3790,7 +4210,8 @@ async fn quiesced_backup_create_verify_preserves_post_boundary_hook_and_reopens_
     std::fs::write(&manifest_path, &canonical_manifest_bytes).unwrap();
 
     let mut forged_table_manifest = canonical_manifest.clone();
-    forged_table_manifest.table_states.journal.version += 1;
+    let forged_search = forged_table_manifest.table_states.search.as_mut().unwrap();
+    forged_search.version = forged_search.version.map(|version| version + 1);
     std::fs::write(
         &manifest_path,
         serde_json::to_vec(&forged_table_manifest).unwrap(),

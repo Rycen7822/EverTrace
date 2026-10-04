@@ -21,9 +21,8 @@ use evertrace_domain::{
 };
 use evertrace_engine::PhysicalNormalizer;
 use evertrace_store::{
-    CompatibilityStore, DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft,
-    JournalPayload, JournalWriter, OBJECTS_TABLE, SourceIngestWatermark, StoreError,
-    reduce_journal,
+    DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter,
+    SourceIngestWatermark, StoreError, reduce_journal,
     relations::{PhysicalRelationKind, build_physical_relation_rows},
 };
 use tempfile::TempDir;
@@ -1097,26 +1096,11 @@ async fn journal_projection_replay_relations_and_no_delta_are_closed() {
 
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
+        vec!["evertrace_search"]
     );
-    let reader =
-        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
-            .await
-            .unwrap();
-    let objects = reader
-        .connection()
-        .open_table(OBJECTS_TABLE)
-        .execute()
-        .await
-        .unwrap();
-    let before = objects.version().await.unwrap();
+    let before = writer.object_rows().await.unwrap();
     writer.project().await.unwrap();
-    assert_eq!(objects.version().await.unwrap(), before);
+    assert_eq!(writer.object_rows().await.unwrap(), before);
 
     let relations = build_physical_relation_rows(
         &normalized.occurrences,

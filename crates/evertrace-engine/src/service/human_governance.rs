@@ -378,7 +378,7 @@ pub struct HumanJobBudget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanBackupTableState {
-    pub version: u64,
+    pub version: Option<u64>,
     pub frontier: u64,
 }
 

@@ -3,7 +3,6 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{
@@ -48,7 +47,6 @@ use evertrace_domain::{
         Workstream,
     },
 };
-use lancedb::Table;
 
 use crate::{
     command::{
@@ -57,18 +55,13 @@ use crate::{
         OutboxEntry, SourceCloseDecision, SourceCloseReconciliation, SourceIngestWatermark,
         SourceKind, SourceRevisionRecorded, StoreError, WatermarkAdvanced, source_revision_ref,
     },
-    journal::{
-        JournalRow, read_all_journal_rows, read_journal_after, read_journal_frontier,
-        validate_journal_rows,
-    },
-    objects::{
-        OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind, objects_batch,
-        validate_objects_table,
-    },
+    journal::{JournalRow, validate_journal_rows},
+    objects::{OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind},
     purge::{
         ObjectDeletionCandidateAdmission, ObjectDeletionRevisionFact, ObjectDeletionSourceContext,
         ObjectDeletionState, ScopePurgeState, derive_object_deletion_preview, filter_product_rows,
     },
+    sqlite_state::{ObjectReconcile, SqliteHandle},
 };
 
 mod autoresearch;
@@ -102,6 +95,11 @@ use segmentation::{
 pub use semantic::SemanticCurrentView;
 
 pub const RECALL_TRIGGER_INDEX_KIND: &str = recall_projection::RECALL_TRIGGER_INDEX_KIND;
+
+/// Physical reconcile family names, one owner for the storage and reducer
+/// sides of the partial objects upsert.
+pub(crate) const CORE_INDEX_KIND: &str = s23::CORE_PROJECTION_KIND;
+pub(crate) const WIKI_INDEX_KIND: &str = synthesis::WIKI_PROJECTION_KIND;
 
 pub fn recall_trigger_contract(
     row: &ObjectRow,
@@ -14606,14 +14604,14 @@ fn source_revision_key(value: &SourceRevisionRecorded) -> String {
 // the same writer call; this is never retained in the writer or a cache.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct ProjectionJournalDelta {
-    journal_version: u64,
+    journal_epoch: u64,
     checkpoint: u64,
     rows: Vec<JournalRow>,
 }
 
 impl ProjectionJournalDelta {
-    pub(crate) fn at_version(self, journal_version: u64) -> Option<Self> {
-        (self.journal_version == journal_version).then_some(self)
+    pub(crate) fn at_epoch(self, journal_epoch: u64) -> Option<Self> {
+        (self.journal_epoch == journal_epoch).then_some(self)
     }
 
     pub(crate) fn frontier(&self) -> Option<u64> {
@@ -14627,13 +14625,12 @@ impl ProjectionJournalDelta {
 
 #[derive(Clone)]
 pub struct ProjectionWorker {
-    journal: Table,
-    objects: Table,
+    sqlite: SqliteHandle,
 }
 
 impl ProjectionWorker {
-    pub(crate) fn new(journal: Table, objects: Table) -> Self {
-        Self { journal, objects }
+    pub(crate) fn new(sqlite: SqliteHandle) -> Self {
+        Self { sqlite }
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
@@ -14642,80 +14639,53 @@ impl ProjectionWorker {
 
     pub(crate) async fn catch_up_validated(
         &self,
-        // Old objects version/checkpoint and the confirmed committed journal frontier.
+        // Old objects epoch/checkpoint and the confirmed committed journal frontier.
         validated_current: Option<(u64, u64, u64)>,
-        appended_batch: Option<&arrow_array::RecordBatch>,
+        appended_rows: Option<&[JournalRow]>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_batch)
+        self.catch_up_inner(false, validated_current, appended_rows)
             .await
-    }
-
-    pub async fn reconciliation_frontier(
-        &self,
-        limit: usize,
-    ) -> Result<ReconciliationFrontier, StoreError> {
-        self.catch_up().await?.reconciliation_frontier(limit)
-    }
-
-    pub async fn reconciliation_artifact_context(
-        &self,
-        descriptors: &[ReconciliationArtifactDescriptor],
-        limit: usize,
-    ) -> Result<ReconciliationArtifactFrontier, StoreError> {
-        self.catch_up()
-            .await?
-            .reconciliation_artifact_context(descriptors, limit)
     }
 
     async fn catch_up_inner(
         &self,
         inject_before_commit_failure: bool,
         validated_current: Option<(u64, u64, u64)>,
-        appended_batch: Option<&arrow_array::RecordBatch>,
+        appended_rows: Option<&[JournalRow]>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        let journal_version = self
-            .journal
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        self.objects
-            .checkout_latest()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let current_version = self
-            .objects
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let current = validate_objects_table(&self.objects).await?;
-        if self
-            .objects
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?
-            != current_version
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
+        let (current, journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
+            let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            let stamp = state.stamp()?;
+            let rows = state.object_rows()?;
+            (
+                rows,
+                stamp.journal_epoch,
+                stamp.objects_epoch,
+                stamp.object_checkpoint,
+                stamp.frontier,
+            )
+        };
         let checkpoint = current
             .iter()
             .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
             .ok_or(StoreError::StoreCorrupt)?;
-        let checkpoint_frontier = checkpoint.source_event_seq;
+        if checkpoint.source_event_seq != checkpoint_frontier {
+            return Err(StoreError::StoreCorrupt);
+        }
         let validated_frontier = validated_current
-            .filter(|(version, checkpoint, _)| {
-                *version == current_version && *checkpoint == checkpoint_frontier
+            .filter(|(epoch, checkpoint, _)| {
+                *epoch == current_epoch && *checkpoint == checkpoint_frontier
             })
             .map(|(_, _, frontier)| frontier);
         let journal_frontier = if let Some(frontier) = validated_frontier {
-            // The writer bound its published admission state to this native
-            // append version. The complete delta below must end at this exact
-            // frontier; reserved sequence numbers are not used as evidence.
+            // The writer bound its published admission state to this physical
+            // stamp. The complete delta below must end at this exact frontier;
+            // reserved sequence numbers are not used as evidence.
             frontier
         } else {
-            read_journal_frontier(&self.journal).await?
+            committed_frontier
         };
-        if checkpoint.source_event_seq > journal_frontier {
+        if checkpoint_frontier > journal_frontier {
             return Err(StoreError::StoreCorrupt);
         }
         if checkpoint_frontier == 0 && current.len() == 1 && journal_frontier > 0 {
@@ -14726,25 +14696,30 @@ impl ProjectionWorker {
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
             }
-            self.commit_rows(&expected.rows, true, true, true, true, false)
-                .await?;
-            let version = self
-                .objects
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            let persisted = validate_objects_table(&self.objects).await?;
-            if persisted != expected.rows
-                || self
-                    .objects
-                    .version()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?
-                    != version
-            {
+            self.commit_rows(
+                &expected.rows,
+                ObjectReconcile {
+                    recall: true,
+                    core: true,
+                    wiki: true,
+                    procedure_effect: true,
+                    all: true,
+                },
+            )?;
+            let persisted = self
+                .sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .object_rows()?;
+            if persisted != expected.rows {
                 return Err(StoreError::Projection);
             }
-            return Ok((expected, version, None));
+            let committed_epoch = self
+                .sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .objects_epoch();
+            return Ok((expected, committed_epoch, None));
         }
         let mut state = if validated_frontier.is_some() {
             // The writer already validated this exact old input before its
@@ -14754,12 +14729,15 @@ impl ProjectionWorker {
         } else {
             ReducerState::from_current_rows(&current, checkpoint_frontier)?
         };
-        let delta = if let Some(batch) = appended_batch.filter(|_| validated_frontier.is_some()) {
-            // Decode the exact immutable batch acknowledged by the native
-            // journal append, through the same decoder as a persisted read.
-            crate::journal::rows_from_batch(batch)?
+        let delta = if let Some(rows) = appended_rows.filter(|_| validated_frontier.is_some()) {
+            // The exact typed delta acknowledged by the physical journal
+            // commit, decoded through the same domain path as a persisted read.
+            rows.to_vec()
         } else {
-            read_journal_after(&self.journal, checkpoint_frontier).await?
+            self.sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .rows_after(checkpoint_frontier)?
         };
         validate_delta(checkpoint_frontier, journal_frontier, &delta)?;
         if delta.is_empty() {
@@ -14768,7 +14746,7 @@ impl ProjectionWorker {
                     frontier: checkpoint_frontier,
                     rows: current,
                 },
-                current_version,
+                current_epoch,
                 None,
             ));
         }
@@ -14842,69 +14820,54 @@ impl ProjectionWorker {
         if inject_before_commit_failure {
             return Err(StoreError::Projection);
         }
-        let committed_version = self
-            .commit_rows(
-                changed.as_deref().unwrap_or(&expected.rows),
-                reconcile_recall,
-                reconcile_core,
-                reconcile_wiki,
-                reconcile_procedure_effect,
-                reconcile_all,
-            )
-            .await?;
+        // The rows, deletions and checkpoint land in one physical transaction;
+        // a no-change commit leaves the family epoch untouched.
+        self.commit_rows(
+            changed.as_deref().unwrap_or(&expected.rows),
+            ObjectReconcile {
+                recall: reconcile_recall,
+                core: reconcile_core,
+                wiki: reconcile_wiki,
+                procedure_effect: reconcile_procedure_effect,
+                all: reconcile_all,
+            },
+        )?;
+        let committed_epoch = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .objects_epoch();
         if ordinary_upsert {
-            validate_ordinary_commit_version(current_version, committed_version)?;
-            self.objects
-                .checkout_latest()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            if self
-                .objects
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                != committed_version
-            {
-                return Err(StoreError::Projection);
-            }
-            // The validated current rows are retained or replaced by changed rows;
-            // the same native commit writes those rows and the checkpoint. Its
-            // direct-successor version excludes a concurrent refresh/rebase.
+            validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            // The validated current rows are retained or replaced by changed
+            // rows; the same transaction wrote those rows and the checkpoint.
             return Ok((
                 expected,
-                committed_version,
+                committed_epoch,
                 Some(ProjectionJournalDelta {
-                    journal_version,
+                    journal_epoch,
                     checkpoint: checkpoint_frontier,
                     rows: delta,
                 }),
             ));
         }
-        let version = self
-            .objects
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let persisted = validate_objects_table(&self.objects).await?;
+        let persisted = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .object_rows()?;
         let persisted_snapshot = ProjectionSnapshot {
             frontier: expected.frontier,
             rows: persisted,
         };
-        if persisted_snapshot.rows != expected.rows
-            || self
-                .objects
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                != version
-        {
+        if persisted_snapshot.rows != expected.rows {
             return Err(StoreError::Projection);
         }
         Ok((
             persisted_snapshot,
-            version,
+            committed_epoch,
             Some(ProjectionJournalDelta {
-                journal_version,
+                journal_epoch,
                 checkpoint: checkpoint_frontier,
                 rows: delta,
             }),
@@ -14917,14 +14880,33 @@ impl ProjectionWorker {
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
-        reduce_journal(&read_all_journal_rows(&self.journal).await?)
+        let rows = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .rows()?;
+        reduce_journal(&rows)
     }
 
     pub(crate) async fn rebuild_for_restore(&self) -> Result<ProjectionSnapshot, StoreError> {
         let expected = self.full_snapshot().await?;
-        self.commit_rows(&expected.rows, true, true, true, true, true)
-            .await?;
-        if validate_objects_table(&self.objects).await? != expected.rows {
+        self.commit_rows(
+            &expected.rows,
+            ObjectReconcile {
+                recall: true,
+                core: true,
+                wiki: true,
+                procedure_effect: true,
+                all: true,
+            },
+        )?;
+        if self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .object_rows()?
+            != expected.rows
+        {
             return Err(StoreError::Projection);
         }
         Ok(expected)
@@ -14934,7 +14916,11 @@ impl ProjectionWorker {
         &self,
         frontier: u64,
     ) -> Result<ProjectionSnapshot, StoreError> {
-        let rows = read_all_journal_rows(&self.journal).await?;
+        let rows = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .rows_until(frontier)?;
         if frontier > rows.last().map_or(0, |row| row.seq) {
             return Err(StoreError::InvalidInput);
         }
@@ -14945,52 +14931,19 @@ impl ProjectionWorker {
         reduce_journal(&rows[..end])
     }
 
-    async fn commit_rows(
+    fn commit_rows(
         &self,
         rows: &[ObjectRow],
-        reconcile_recall: bool,
-        reconcile_core: bool,
-        reconcile_wiki: bool,
-        reconcile_procedure_effect: bool,
-        reconcile_all: bool,
-    ) -> Result<u64, StoreError> {
-        let batch = objects_batch(rows)?;
-        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
-            RecordBatchIterator::new(vec![Ok(batch)], crate::objects::objects_schema()),
-        );
-        let mut merge = self.objects.merge_insert(&["row_id"]);
-        merge.when_matched_update_all(None);
-        merge.when_not_matched_insert_all();
-        if reconcile_all {
-            merge.when_not_matched_by_source_delete(None);
-        } else if reconcile_recall || reconcile_core || reconcile_wiki || reconcile_procedure_effect
-        {
-            let mut predicates = Vec::new();
-            if reconcile_recall {
-                predicates.push(format!(
-                    "object_kind = '{}'",
-                    recall_projection::RECALL_TRIGGER_INDEX_KIND
-                ));
-            }
-            if reconcile_core {
-                predicates.push(format!("object_kind = '{}'", s23::CORE_PROJECTION_KIND));
-            }
-            if reconcile_wiki {
-                predicates.push(format!(
-                    "object_kind = '{}'",
-                    synthesis::WIKI_PROJECTION_KIND
-                ));
-            }
-            if reconcile_procedure_effect {
-                predicates.push("object_kind = 'procedure_context_effect'".into());
-            }
-            merge.when_not_matched_by_source_delete(Some(predicates.join(" OR ")));
-        }
-        let result = merge
-            .execute(reader)
-            .await
-            .map_err(|_| StoreError::Projection)?;
-        Ok(result.version)
+        reconcile: ObjectReconcile,
+    ) -> Result<(), StoreError> {
+        let checkpoint = rows
+            .iter()
+            .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
+            .ok_or(StoreError::StoreCorrupt)?;
+        self.sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .commit_object_rows(rows, reconcile, checkpoint)
     }
 }
 
@@ -15116,7 +15069,6 @@ mod tests {
             PreparedCommand, SourceCloseRange, prepare_command,
         },
         journal::rows_for_append,
-        objects::read_object_rows,
         writer::JournalWriter,
     };
 
@@ -16716,6 +16668,16 @@ mod tests {
         assert_eq!(projected.lease_until_us, Some(100));
     }
 
+    fn all_objects() -> ObjectReconcile {
+        ObjectReconcile {
+            recall: true,
+            core: true,
+            wiki: true,
+            procedure_effect: true,
+            all: true,
+        }
+    }
+
     #[tokio::test]
     async fn projection_commit_fault_does_not_advance_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
@@ -16737,27 +16699,14 @@ mod tests {
         )
         .unwrap();
         writer.commit(&command, 1).await.unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let before = read_object_rows(&objects).await.unwrap();
-        let worker = ProjectionWorker::new(journal, objects.clone());
+        let sqlite = writer.projection_handle();
+        let before = sqlite.lock().unwrap().object_rows().unwrap();
+        let worker = ProjectionWorker::new(sqlite.clone());
         assert_eq!(
             worker.catch_up_with_commit_fault().await,
             Err(StoreError::Projection)
         );
-        assert_eq!(read_object_rows(&objects).await.unwrap(), before);
+        assert_eq!(sqlite.lock().unwrap().object_rows().unwrap(), before);
         assert_eq!(
             worker.catch_up().await.unwrap(),
             writer.full_projection().await.unwrap()
@@ -16769,31 +16718,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
         let writer = JournalWriter::open(&root).await.unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let worker = ProjectionWorker::new(journal, objects);
+        let worker = ProjectionWorker::new(writer.projection_handle());
         worker
             .commit_rows(
                 &[ObjectRow::checkpoint(10_000, PROJECTION_GENERATION)],
-                false,
-                false,
-                false,
-                false,
-                false,
+                all_objects(),
             )
-            .await
             .unwrap();
         assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));
         drop(writer);
@@ -16804,47 +16734,35 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
         let writer = JournalWriter::open(&root).await.unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let worker = ProjectionWorker::new(journal, objects.clone());
-        let before_version = objects.version().await.unwrap();
+        let sqlite = writer.projection_handle();
+        let worker = ProjectionWorker::new(sqlite.clone());
+        let before_epoch = sqlite.lock().unwrap().stamp().unwrap().objects_epoch;
         let frontier = worker.catch_up().await.unwrap().frontier;
-        assert_eq!(writer.sync_frontier().await.unwrap(), frontier);
-        assert_eq!(writer.sync_frontier().await.unwrap(), frontier);
+        assert_eq!(writer.sync_objects_frontier().await.unwrap(), frontier);
+        assert_eq!(writer.sync_objects_frontier().await.unwrap(), frontier);
         assert_eq!(writer.project_objects().await.unwrap().frontier, frontier);
-        assert_eq!(objects.version().await.unwrap(), before_version);
-        let empty_delta = arrow_array::RecordBatch::new_empty(crate::journal::journal_schema());
+        assert_eq!(
+            sqlite.lock().unwrap().stamp().unwrap().objects_epoch,
+            before_epoch
+        );
+        let empty_delta: &[crate::JournalRow] = &[];
         assert!(matches!(
             worker
                 .catch_up_validated(
-                    Some((before_version, frontier, frontier + 1)),
-                    Some(&empty_delta),
+                    Some((before_epoch, frontier, frontier + 1)),
+                    Some(empty_delta)
                 )
                 .await,
             Err(StoreError::StoreCorrupt)
         ));
-        assert_eq!(objects.version().await.unwrap(), before_version);
+        assert_eq!(
+            sqlite.lock().unwrap().stamp().unwrap().objects_epoch,
+            before_epoch
+        );
         // A mismatched old checkpoint cannot supply a frontier or batch shortcut.
-        let invalid_batch =
-            arrow_array::RecordBatch::new_empty(std::sync::Arc::new(arrow_schema::Schema::empty()));
         assert_eq!(
             worker
-                .catch_up_validated(
-                    Some((before_version, frontier + 1, frontier + 1)),
-                    Some(&invalid_batch),
-                )
+                .catch_up_validated(Some((before_epoch, frontier + 1, frontier + 1)), Some(&[]))
                 .await
                 .unwrap()
                 .0
@@ -16852,8 +16770,10 @@ mod tests {
             frontier
         );
 
-        let mut migration = read_object_rows(&objects)
-            .await
+        let mut migration = sqlite
+            .lock()
+            .unwrap()
+            .object_rows()
             .unwrap()
             .into_iter()
             .find(|row| row.row_id == "projection:migration:L0001")
@@ -16867,13 +16787,16 @@ mod tests {
             .canonical_json()
             .unwrap(),
         );
-        worker
-            .commit_rows(&[migration], false, false, false, false, false)
-            .await
+        // Production projection commits reject malformed rows before writing.
+        // Inject physical corruption through the existing raw test seam.
+        sqlite
+            .lock()
+            .unwrap()
+            .insert_object_row_for_test(&migration)
             .unwrap();
         assert!(matches!(
             worker
-                .catch_up_validated(Some((before_version, frontier, frontier)), None)
+                .catch_up_validated(Some((before_epoch, frontier, frontier)), None)
                 .await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
@@ -16882,7 +16805,7 @@ mod tests {
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
         assert!(matches!(
-            writer.sync_frontier().await,
+            writer.sync_objects_frontier().await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
         assert!(matches!(
@@ -16930,31 +16853,19 @@ mod tests {
             )
             .await
             .unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
+        let sqlite = writer.projection_handle();
+        let rows = sqlite.lock().unwrap().rows_after(0).unwrap();
+        let first_seq = rows
+            .iter()
+            .find(|row| row.command_event_count == 2)
+            .map(|row| row.seq)
             .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let worker = ProjectionWorker::new(journal, objects);
+        let worker = ProjectionWorker::new(sqlite);
         worker
             .commit_rows(
-                &[ObjectRow::checkpoint(3, PROJECTION_GENERATION)],
-                false,
-                false,
-                false,
-                false,
-                false,
+                &[ObjectRow::checkpoint(first_seq, PROJECTION_GENERATION)],
+                all_objects(),
             )
-            .await
             .unwrap();
         assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));
     }

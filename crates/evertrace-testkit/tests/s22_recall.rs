@@ -367,7 +367,7 @@ fn runtime(data_dir: &std::path::Path) -> RuntimeSnapshot {
 struct RunningRecall {
     _root: TempDir,
     handle: evertrace_engine::WriterHandle,
-    writer_task: tokio::task::JoinHandle<Result<(), evertrace_engine::WriterActorError>>,
+    writer_task: evertrace_engine::WriterTask,
     worker: tokio::task::JoinHandle<()>,
     data_dir: std::path::PathBuf,
     current_episode_revision: RevisionId,
@@ -792,10 +792,15 @@ async fn offline_restore_resets_claim_authority_without_erasing_presentation_evi
         .data_dir
         .join("backups")
         .join(format!("backup-{backup_id}"));
-    let prepared =
-        evertrace_store::restore::prepare(&running.data_dir, &backup, at + 4, effective.hash())
-            .await
-            .unwrap();
+    let prepared = evertrace_store::restore::prepare(
+        &running.data_dir,
+        &backup,
+        at + 4,
+        effective.hash(),
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
     let evertrace_store::restore::RestorePreparation::Candidate(candidate) = prepared else {
         panic!("current authority required")
     };
@@ -1134,15 +1139,7 @@ async fn real_worker_detects_checkpoint_lineage_and_keeps_four_tables() {
     let reopened = evertrace_store::JournalWriter::open(&running.data_dir)
         .await
         .unwrap();
-    assert_eq!(
-        reopened.table_names().await.unwrap(),
-        [
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
-    );
+    assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,16 +1,8 @@
-use std::{future::poll_fn, sync::Arc};
+use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lancedb::{
-    Table,
-    query::{ExecutableQuery, QueryBase},
-};
 
-use crate::{
-    collect_batches,
-    command::{ObjectFamily, StoreError},
-};
+use crate::command::{ObjectFamily, StoreError};
 
 pub const OBJECTS_TABLE: &str = "evertrace_objects";
 pub const OBJECTS_CHECKPOINT_ID: &str = "checkpoint:evertrace_objects";
@@ -29,7 +21,7 @@ impl ObjectRowKind {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, StoreError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, StoreError> {
         match value {
             "data" => Ok(Self::Data),
             "checkpoint" => Ok(Self::Checkpoint),
@@ -54,7 +46,7 @@ impl ObjectRowClass {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, StoreError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, StoreError> {
         match value {
             "object" => Ok(Self::Object),
             "runtime" => Ok(Self::Runtime),
@@ -167,6 +159,9 @@ impl ObjectRow {
     }
 }
 
+/// Closed logical field set of the objects family. The physical shape is the
+/// single SQLite table; this schema is the logical contract and the future
+/// converter's read boundary.
 pub fn objects_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::Utf8, false),
@@ -193,98 +188,6 @@ pub fn objects_schema() -> SchemaRef {
     ]))
 }
 
-pub(crate) async fn validate_objects_table(table: &Table) -> Result<Vec<ObjectRow>, StoreError> {
-    let actual = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if actual.as_ref() != objects_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let rows = read_object_rows(table).await?;
-    let mut checkpoint_count = 0;
-    for row in &rows {
-        row.validate()?;
-        if row.row_kind == ObjectRowKind::Checkpoint {
-            checkpoint_count += 1;
-        }
-    }
-    if checkpoint_count != 1 {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok(rows)
-}
-
-pub async fn read_object_rows(table: &Table) -> Result<Vec<ObjectRow>, StoreError> {
-    table
-        .checkout_latest()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let mut stream = table
-        .query()
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let mut rows = Vec::new();
-    while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context)).await {
-        rows.extend(rows_from_batch(&batch.map_err(|_| StoreError::LanceDb)?)?);
-    }
-    rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
-    Ok(rows)
-}
-
-/// Read a deliberately selected subset of the already validated objects
-/// projection.  Callers bind this to a `ProjectionValidation` stamp before
-/// and after the read; this helper therefore validates the table shape and
-/// selected rows without turning a request-local selection into a second full
-/// projection scan.
-pub(crate) async fn read_object_rows_filtered(
-    table: &Table,
-    predicate: String,
-) -> Result<Vec<ObjectRow>, StoreError> {
-    table
-        .checkout_latest()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let actual = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if actual.as_ref() != objects_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let mut stream = table
-        .query()
-        .only_if(predicate)
-        .execute()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let mut rows = Vec::new();
-    while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context)).await {
-        rows.extend(rows_from_batch(&batch.map_err(|_| StoreError::LanceDb)?)?);
-    }
-    rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
-    Ok(rows)
-}
-
-pub(crate) async fn read_object_checkpoint(table: &Table) -> Result<u64, StoreError> {
-    table
-        .checkout_latest()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let actual = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if actual.as_ref() != objects_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let batches = collect_batches(
-        &table
-            .query()
-            .only_if(format!("row_id = '{OBJECTS_CHECKPOINT_ID}'"))
-            .limit(2),
-    )
-    .await
-    .map_err(|_| StoreError::LanceDb)?;
-    let mut rows = Vec::new();
-    for batch in &batches {
-        rows.extend(rows_from_batch(batch)?);
-    }
-    checkpoint_from_rows(&rows)
-}
-
 pub(crate) fn checkpoint_from_rows(rows: &[ObjectRow]) -> Result<u64, StoreError> {
     let mut matches = rows
         .iter()
@@ -298,171 +201,23 @@ pub(crate) fn checkpoint_from_rows(rows: &[ObjectRow]) -> Result<u64, StoreError
     Ok(checkpoint.source_event_seq)
 }
 
-pub(crate) fn objects_batch(rows: &[ObjectRow]) -> Result<RecordBatch, StoreError> {
-    for row in rows {
-        row.validate()?;
-    }
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.row_id.as_str()),
-        )),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.row_kind.as_str()),
-        )),
-        strings(
-            rows.iter()
-                .map(|row| row.row_class.map(ObjectRowClass::as_str)),
-        ),
-        strings(
-            rows.iter()
-                .map(|row| row.object_family.map(ObjectFamily::as_str)),
-        ),
-        strings(rows.iter().map(|row| row.object_kind.as_deref())),
-        strings(rows.iter().map(|row| row.object_id.as_deref())),
-        strings(rows.iter().map(|row| row.current_revision_id.as_deref())),
-        strings(rows.iter().map(|row| row.lifecycle.as_deref())),
-        strings(rows.iter().map(|row| row.epistemic.as_deref())),
-        strings(rows.iter().map(|row| row.authority.as_deref())),
-        strings(rows.iter().map(|row| row.publication_state.as_deref())),
-        strings(rows.iter().map(|row| row.support_state.as_deref())),
-        strings(rows.iter().map(|row| row.project_id.as_deref())),
-        strings(rows.iter().map(|row| row.repository_id.as_deref())),
-        strings(rows.iter().map(|row| row.worktree_id.as_deref())),
-        strings(rows.iter().map(|row| row.task_id.as_deref())),
-        strings(rows.iter().map(|row| row.workstream_id.as_deref())),
-        strings(rows.iter().map(|row| row.session_id.as_deref())),
-        Arc::new(LargeStringArray::from_iter(
-            rows.iter().map(|row| row.payload_json.as_deref()),
-        )),
-        Arc::new(UInt64Array::from_iter_values(
-            rows.iter().map(|row| row.source_event_seq),
-        )),
-        Arc::new(UInt64Array::from_iter_values(
-            rows.iter().map(|row| row.projection_generation),
-        )),
-    ];
-    RecordBatch::try_new(objects_schema(), columns).map_err(|_| StoreError::Arrow)
-}
-
-fn rows_from_batch(batch: &RecordBatch) -> Result<Vec<ObjectRow>, StoreError> {
-    if batch.schema().as_ref() != objects_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let row_ids = array::<StringArray>(batch, 0)?;
-    let row_kinds = array::<StringArray>(batch, 1)?;
-    let row_classes = array::<StringArray>(batch, 2)?;
-    let object_families = array::<StringArray>(batch, 3)?;
-    let object_kinds = array::<StringArray>(batch, 4)?;
-    let object_ids = array::<StringArray>(batch, 5)?;
-    let revisions = array::<StringArray>(batch, 6)?;
-    let lifecycles = array::<StringArray>(batch, 7)?;
-    let epistemics = array::<StringArray>(batch, 8)?;
-    let authorities = array::<StringArray>(batch, 9)?;
-    let publications = array::<StringArray>(batch, 10)?;
-    let supports = array::<StringArray>(batch, 11)?;
-    let projects = array::<StringArray>(batch, 12)?;
-    let repositories = array::<StringArray>(batch, 13)?;
-    let worktrees = array::<StringArray>(batch, 14)?;
-    let tasks = array::<StringArray>(batch, 15)?;
-    let workstreams = array::<StringArray>(batch, 16)?;
-    let sessions = array::<StringArray>(batch, 17)?;
-    let payloads = array::<LargeStringArray>(batch, 18)?;
-    let source_seqs = array::<UInt64Array>(batch, 19)?;
-    let generations = array::<UInt64Array>(batch, 20)?;
-    let mut rows = Vec::with_capacity(batch.num_rows());
-    for index in 0..batch.num_rows() {
-        let row = ObjectRow {
-            row_id: row_ids.value(index).into(),
-            row_kind: ObjectRowKind::parse(row_kinds.value(index))?,
-            row_class: optional(row_classes, index)
-                .map(ObjectRowClass::parse)
-                .transpose()?,
-            object_family: optional(object_families, index)
-                .map(ObjectFamily::parse)
-                .transpose()?,
-            object_kind: owned(object_kinds, index),
-            object_id: owned(object_ids, index),
-            current_revision_id: owned(revisions, index),
-            lifecycle: owned(lifecycles, index),
-            epistemic: owned(epistemics, index),
-            authority: owned(authorities, index),
-            publication_state: owned(publications, index),
-            support_state: owned(supports, index),
-            project_id: owned(projects, index),
-            repository_id: owned(repositories, index),
-            worktree_id: owned(worktrees, index),
-            task_id: owned(tasks, index),
-            workstream_id: owned(workstreams, index),
-            session_id: owned(sessions, index),
-            payload_json: (!payloads.is_null(index)).then(|| payloads.value(index).to_owned()),
-            source_event_seq: source_seqs.value(index),
-            projection_generation: generations.value(index),
-        };
-        row.validate()?;
-        rows.push(row);
-    }
-    Ok(rows)
-}
-
-fn array<T: Array + 'static>(batch: &RecordBatch, index: usize) -> Result<&T, StoreError> {
-    batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or(StoreError::StoreCorrupt)
-}
-
-fn strings<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(StringArray::from_iter(values))
-}
-
-fn optional(array: &StringArray, index: usize) -> Option<&str> {
-    (!array.is_null(index)).then(|| array.value(index))
-}
-
-fn owned(array: &StringArray, index: usize) -> Option<String> {
-    optional(array, index).map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn checkpoint_and_schema_are_closed() {
+    fn checkpoint_identity_is_closed() {
         let row = ObjectRow::checkpoint(0, 1);
         assert_eq!(row.validate(), Ok(()));
-        let batch = objects_batch(std::slice::from_ref(&row)).unwrap();
-        assert_eq!(rows_from_batch(&batch).unwrap(), vec![row]);
-        let mut columns = batch.columns().to_vec();
-        columns[3] = Arc::new(StringArray::from(vec![Some("unknown_family")]));
-        let invalid_family = RecordBatch::try_new(objects_schema(), columns).unwrap();
-        assert_eq!(
-            rows_from_batch(&invalid_family),
-            Err(StoreError::StoreCorrupt)
-        );
-        let partial = RecordBatch::new_empty(Arc::new(Schema::new(
-            objects_schema().fields()[..20].to_vec(),
-        )));
-        assert_eq!(rows_from_batch(&partial), Err(StoreError::StoreCorrupt));
-    }
-
-    #[test]
-    fn checkpoint_from_rows_rejects_missing_or_occupied_identity() {
-        let checkpoint = ObjectRow::checkpoint(7, 1);
-        assert_eq!(
-            checkpoint_from_rows(std::slice::from_ref(&checkpoint)),
-            Ok(7)
-        );
-        assert_eq!(checkpoint_from_rows(&[]), Err(StoreError::StoreCorrupt));
-        let mut occupied = checkpoint.clone();
+        let mut occupied = row.clone();
         occupied.row_kind = ObjectRowKind::Data;
         occupied.row_class = Some(ObjectRowClass::Runtime);
         occupied.payload_json = Some("{}".into());
         assert_eq!(occupied.validate(), Ok(()));
         assert_eq!(
-            checkpoint_from_rows(&[checkpoint, occupied]),
+            checkpoint_from_rows(&[row, occupied]),
             Err(StoreError::StoreCorrupt)
         );
+        assert_eq!(checkpoint_from_rows(&[]), Err(StoreError::StoreCorrupt));
     }
 }
