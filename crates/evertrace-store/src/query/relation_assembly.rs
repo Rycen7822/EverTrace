@@ -412,3 +412,65 @@ pub(super) fn add_semantic(
         ));
     }
 }
+
+/// Advance an already complete relation set with the sequence contributions
+/// of this command's truly changed rows. The closed capture shape cannot add
+/// or retract an edge or remove a contribution, so every existing edge keeps
+/// its identity and takes the maximum of its previous causal sequence and the
+/// changed endpoints, and the checkpoint moves in the same committed step.
+/// Rows excluded by the complete derive never contribute here either.
+pub(super) fn update_capture_relations(
+    current: &[RelationProjectionRow],
+    changed_rows: &[crate::ObjectRow],
+    frontier: u64,
+) -> Result<Vec<RelationProjectionRow>, StoreError> {
+    let mut endpoint_seqs = BTreeMap::<String, u64>::new();
+    for row in changed_rows {
+        if crate::projections::recall_trigger_contract(row)?.is_some()
+            || crate::projections::recall_need(row)?.is_some()
+            || crate::projections::l3_core_projection(row)?
+            || crate::projections::wiki_projection(row)?.is_some()
+            || crate::projections::procedure_context_effect(row)?.is_some()
+            || crate::session_import::restore_current(row)?.is_some()
+        {
+            continue;
+        }
+        for endpoint in [row.object_id.as_ref(), row.current_revision_id.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            endpoint_seqs
+                .entry(endpoint.clone())
+                .and_modify(|seq| *seq = (*seq).max(row.source_event_seq))
+                .or_insert(row.source_event_seq);
+        }
+        let payload_json = row
+            .payload_json
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let payload: JournalPayload =
+            serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+        index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
+    }
+    let mut relations = current.to_vec();
+    for row in &mut relations {
+        if row.row_id == crate::relations::RELATIONS_CHECKPOINT_ID {
+            continue;
+        }
+        let seq = causal_seq(
+            &endpoint_seqs,
+            row.source_id.as_deref().unwrap_or_default(),
+            row.target_id.as_deref().unwrap_or_default(),
+        );
+        if seq > row.source_event_seq {
+            row.source_event_seq = seq;
+        }
+    }
+    let checkpoint = relations
+        .iter_mut()
+        .find(|row| row.row_id == crate::relations::RELATIONS_CHECKPOINT_ID)
+        .ok_or(StoreError::StoreCorrupt)?;
+    *checkpoint = RelationProjectionRow::checkpoint(frontier);
+    relations.sort();
+    Ok(relations)
+}

@@ -11,7 +11,7 @@ use evertrace_domain::{
 use lancedb::Table;
 
 use crate::{
-    JournalPayload, ObjectRowKind, ProjectionSnapshot, StoreError,
+    JournalPayload, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
     projections::{
         ProjectionJournalDelta, l3_core_projection, procedure_context_effect, recall_need,
         recall_trigger_contract, synthesis::wiki_render_identity, validate_delta, wiki_projection,
@@ -35,8 +35,18 @@ use super::derive::{exact_identifier_row, surface_row, wiki_search_row};
 use super::relation_assembly::{
     add_attempt, add_autoresearch, add_burst, add_capture, add_correction, add_episode,
     add_physical, add_recovery, add_repository, add_semantic, add_work_binding, add_work_identity,
-    index_typed_ids,
+    index_typed_ids, update_capture_relations,
 };
+
+/// The validated persisted L0002 base for one journal frontier.
+struct L0002Handoff {
+    frontier: u64,
+    relation_rows: Vec<RelationProjectionRow>,
+    search: Vec<SearchProjectionRow>,
+    relation_frontier: u64,
+    search_frontier: u64,
+    versions: [u64; 2],
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct L0002ProjectionSnapshot {
@@ -144,8 +154,79 @@ impl L0002ProjectionWorker {
         objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
+        let (snapshot, versions, _) = self
+            .catch_up_inner(objects, journal_delta, false, false)
+            .await?;
+        Ok((snapshot, versions))
+    }
+
+    /// The ordinary complete path with its actual-derive flag. Only a run that
+    /// really derived and read every persisted row back establishes the
+    /// private full-content grade; the checkpoint early return does not.
+    pub(crate) async fn catch_up_validated_proof(
+        &self,
+        objects: &ProjectionSnapshot,
+        journal_delta: Option<ProjectionJournalDelta>,
+    ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
         self.catch_up_inner(objects, journal_delta, false, false)
             .await
+    }
+
+    /// Complete one confirmed closed capture successor from an already proven
+    /// complete L0002 frontier without rebuilding the all-object typed maps.
+    /// Both derived families must still sit on the proven base frontier; a
+    /// checkpoint already at this frontier is a legal no-op. Any other base
+    /// fails closed instead of deriving from an unproven predecessor.
+    pub(crate) async fn catch_up_capture_delta(
+        &self,
+        frontier: u64,
+        base_frontier: u64,
+        changed_rows: &[ObjectRow],
+        journal_delta: ProjectionJournalDelta,
+    ) -> Result<[u64; 2], StoreError> {
+        self.catch_up_capture_delta_inner(
+            frontier,
+            base_frontier,
+            changed_rows,
+            journal_delta,
+            false,
+            false,
+        )
+        .await
+    }
+
+    async fn catch_up_capture_delta_inner(
+        &self,
+        frontier: u64,
+        base_frontier: u64,
+        changed_rows: &[ObjectRow],
+        journal_delta: ProjectionJournalDelta,
+        fail_relation_commit: bool,
+        fail_search_commit: bool,
+    ) -> Result<[u64; 2], StoreError> {
+        let handoff = self.prepare_handoff(frontier, Some(journal_delta)).await?;
+        if handoff.relation_frontier == handoff.frontier
+            && handoff.search_frontier == handoff.frontier
+        {
+            return Ok(handoff.versions);
+        }
+        if handoff.relation_frontier != base_frontier || handoff.search_frontier != base_frontier {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let relations = update_capture_relations(&handoff.relation_rows, changed_rows, frontier)?;
+        let search = capture_delta_search(&handoff.search, changed_rows, frontier)?;
+        self.commit_expected(
+            handoff,
+            L0002ProjectionSnapshot {
+                frontier,
+                relations,
+                search,
+            },
+            fail_relation_commit,
+            fail_search_commit,
+        )
+        .await
+        .map(|(_, versions)| versions)
     }
 
     async fn catch_up_inner(
@@ -154,7 +235,38 @@ impl L0002ProjectionWorker {
         journal_delta: Option<ProjectionJournalDelta>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
-    ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
+    ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
+        let handoff = self
+            .prepare_handoff(objects.frontier, journal_delta)
+            .await?;
+        if handoff.relation_frontier == handoff.frontier
+            && handoff.search_frontier == handoff.frontier
+        {
+            return Ok((
+                L0002ProjectionSnapshot {
+                    frontier: handoff.frontier,
+                    relations: handoff.relation_rows,
+                    search: handoff.search,
+                },
+                handoff.versions,
+                false,
+            ));
+        }
+        let expected = derive_l0002_projections(objects)?;
+        let (snapshot, versions) = self
+            .commit_expected(handoff, expected, fail_relation_commit, fail_search_commit)
+            .await?;
+        Ok((snapshot, versions, true))
+    }
+
+    /// Read and validate the complete persisted L0002 base for one journal
+    /// frontier: every old relation/search row, the actual family epochs and
+    /// search version, and the complete journal delta from each checkpoint.
+    async fn prepare_handoff(
+        &self,
+        objects_frontier: u64,
+        journal_delta: Option<ProjectionJournalDelta>,
+    ) -> Result<L0002Handoff, StoreError> {
         let (journal_epoch, committed_frontier, relations_epoch, relation_frontier) = {
             let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             let stamp = state.stamp()?;
@@ -199,7 +311,7 @@ impl L0002ProjectionWorker {
         } else {
             committed_frontier
         };
-        if objects.frontier != journal_frontier
+        if objects_frontier != journal_frontier
             || relation_frontier > journal_frontier
             || search_frontier > journal_frontier
         {
@@ -235,22 +347,36 @@ impl L0002ProjectionWorker {
         // No downstream derivation needs journal payloads. Release the handoff
         // before constructing the relation/search state, including large deltas.
         drop(journal_delta);
-        if relation_frontier == journal_frontier && search_frontier == journal_frontier {
-            return Ok((
-                L0002ProjectionSnapshot {
-                    frontier: journal_frontier,
-                    relations: relation_rows,
-                    search,
-                },
-                current_versions,
-            ));
-        }
-        let expected = derive_l0002_projections(objects)?;
+        Ok(L0002Handoff {
+            frontier: journal_frontier,
+            relation_rows,
+            search,
+            relation_frontier,
+            search_frontier,
+            versions: current_versions,
+        })
+    }
+
+    /// Commit the expected derived families, read every persisted row back and
+    /// only then return their real epochs and search version.
+    async fn commit_expected(
+        &self,
+        handoff: L0002Handoff,
+        expected: L0002ProjectionSnapshot,
+        fail_relation_commit: bool,
+        fail_search_commit: bool,
+    ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
         if fail_relation_commit {
             return Err(StoreError::Projection);
         }
-        commit_relation_rows(&self.sqlite, &relation_rows, &expected.relations)?;
-        commit_search_rows(&self.search, &search, &expected.search, fail_search_commit).await?;
+        commit_relation_rows(&self.sqlite, &handoff.relation_rows, &expected.relations)?;
+        commit_search_rows(
+            &self.search,
+            &handoff.search,
+            &expected.search,
+            fail_search_commit,
+        )
+        .await?;
         let (relations_epoch_after, relations) = {
             let state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             (state.relations_epoch(), state.relation_rows()?)
@@ -291,6 +417,27 @@ impl L0002ProjectionWorker {
             .0)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn catch_up_capture_delta_with_fault(
+        &self,
+        frontier: u64,
+        base_frontier: u64,
+        changed_rows: &[ObjectRow],
+        journal_delta: ProjectionJournalDelta,
+        fail_relation_commit: bool,
+        fail_search_commit: bool,
+    ) -> Result<[u64; 2], StoreError> {
+        self.catch_up_capture_delta_inner(
+            frontier,
+            base_frontier,
+            changed_rows,
+            journal_delta,
+            fail_relation_commit,
+            fail_search_commit,
+        )
+        .await
+    }
+
     pub async fn current(&self) -> Result<L0002ProjectionSnapshot, StoreError> {
         let relations = self
             .sqlite
@@ -309,6 +456,58 @@ impl L0002ProjectionWorker {
             search,
         })
     }
+}
+
+/// The search-side delta of one closed capture: only a new evidence surface
+/// (with the receipt that actually authorizes its observation) plus the moved
+/// checkpoint. No closed capture payload is allowlisted for exact-identifier
+/// text, and its new identifiers cannot alter any existing row's currentness.
+fn capture_delta_search(
+    current: &[SearchProjectionRow],
+    changed_rows: &[ObjectRow],
+    frontier: u64,
+) -> Result<Vec<SearchProjectionRow>, StoreError> {
+    let mut rows = current.iter().cloned().collect::<BTreeSet<_>>();
+    let checkpoint = rows
+        .iter()
+        .find(|row| row.row_id == crate::search::SEARCH_CHECKPOINT_ID)
+        .cloned()
+        .ok_or(StoreError::StoreCorrupt)?;
+    if !rows.remove(&checkpoint) {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let mut receipts = Vec::new();
+    let mut surfaces = Vec::new();
+    for row in changed_rows {
+        let payload_json = row
+            .payload_json
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let payload: JournalPayload =
+            serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+        match payload {
+            JournalPayload::SourceReceiptRecorded(value) => {
+                receipts.push((*value, row.source_event_seq));
+            }
+            JournalPayload::EvidenceSurfaceRecorded(value) => {
+                surfaces.push((*value, row.source_event_seq));
+            }
+            _ => {}
+        }
+    }
+    for (surface, seq) in surfaces {
+        surface.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        let mut matching = receipts.iter().filter(|(receipt, _)| {
+            receipt.source_observation_id == surface.source_observation_revision_ref
+        });
+        let receipt = &matching.next().ok_or(StoreError::StoreCorrupt)?.0;
+        if matching.next().is_some() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        rows.insert(surface_row(&surface, receipt, seq)?);
+    }
+    rows.insert(SearchProjectionRow::checkpoint(frontier));
+    Ok(rows.into_iter().collect())
 }
 
 pub fn derive_l0002_projections(

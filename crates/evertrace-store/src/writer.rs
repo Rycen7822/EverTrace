@@ -461,6 +461,12 @@ struct ProjectionValidation {
     search_version: u64,
     frontier: u64,
     has_failed_job: bool,
+    // Private level: this exact physical stamp, the derived-family
+    // checkpoints and the real search version were established by a
+    // completed full L0002 derive whose persisted relations and search rows
+    // were read back equal. It is not a persisted certificate and is never
+    // upgraded by a checkpoint-only no-delta read.
+    content_proven: bool,
     // Last confirmed append, not a claim that the old objects or indexes have
     // advanced. Each retained successor is bound to the input stamp plus the
     // committed frontier it appended.
@@ -493,6 +499,21 @@ impl ProjectionValidation {
                     && *frontier == other.frontier
             })
     }
+
+    /// A confirmed closed single append descending from a proven complete
+    /// content frontier whose derived families still sit on that same base
+    /// and search version. One append is bound by the retained rows, the
+    /// journal epoch and the unchanged objects/relations/search state.
+    fn capture_successor_bound(&self, other: &SqliteStamp, search_version: u64) -> bool {
+        self.content_proven
+            && self.appended_rows.is_some()
+            && self.search_version == search_version
+            && self.stamp.frontier == self.stamp.object_checkpoint
+            && self.stamp.relations_epoch == other.relations_epoch
+            && self.stamp.relation_checkpoint == other.relation_checkpoint
+            && other.journal_epoch == self.stamp.journal_epoch.saturating_add(1)
+            && self.appended_successor_bound(other)
+    }
 }
 
 pub struct JournalWriter {
@@ -508,6 +529,10 @@ pub struct JournalWriter {
     projection_directories: Vec<(PathBuf, File)>,
     // Objects and all mandatory projections have separate successful stamps.
     projection_validation: Mutex<[Option<ProjectionValidation>; 2]>,
+    // Test-only observation of real selections. No production consumer reads
+    // it and it carries no projection content or state.
+    #[cfg(test)]
+    capture_delta_selections: std::sync::atomic::AtomicU64,
     // Declared last: the sibling lock must be released only after the native
     // and SQLite bindings of this writer have been dropped.
     _lock: SiblingWriterLock,
@@ -727,6 +752,8 @@ impl JournalWriter {
             migration_outcome,
             projection_directories,
             projection_validation: Mutex::new([None, None]),
+            #[cfg(test)]
+            capture_delta_selections: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -895,6 +922,8 @@ impl JournalWriter {
             migration_outcome,
             projection_directories,
             projection_validation,
+            #[cfg(test)]
+                capture_delta_selections: _,
             _lock,
         } = self;
         readers.revoke();
@@ -935,6 +964,8 @@ impl JournalWriter {
             migration_outcome,
             projection_directories,
             projection_validation,
+            #[cfg(test)]
+                capture_delta_selections: _,
         } = self;
         readers.revoke();
         drop((
@@ -1378,6 +1409,12 @@ impl JournalWriter {
         Ok(self.project_validated(true, false).await?.0)
     }
 
+    #[cfg(test)]
+    pub(crate) fn capture_delta_selections(&self) -> u64 {
+        self.capture_delta_selections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
         self.project_validated(true, true)
             .await?
@@ -1437,114 +1474,183 @@ impl JournalWriter {
                     before.frontier,
                 )
             });
+            let capture_input = validated_input.filter(|stamp| {
+                indexes && !return_rows && stamp.capture_successor_bound(&before, before_search)
+            });
             let all = indexes
                 .then_some(stamps[1].as_ref())
                 .flatten()
                 .filter(|stamp| stamp.stamp == before && stamp.search_version == before_search);
             let hit = if indexes { all } else { objects };
-            let (frontier, snapshot, has_failed_job, search_version) = if let Some(stamp) = hit {
-                let snapshot = if return_rows {
-                    Some(ProjectionSnapshot {
-                        frontier: stamp.frontier,
-                        rows: self.lock_sqlite()?.object_rows()?,
-                    })
-                } else {
-                    None
-                };
-                (
-                    stamp.frontier,
-                    snapshot,
-                    stamp.has_failed_job,
-                    stamp.search_version,
-                )
-            } else if let Some(stamp) = objects.filter(|_| !indexes) {
-                // Objects are already validated; only the derived families
-                // may still lag. Their worker consumes the complete expected
-                // snapshot, including large deltas.
-                let snapshot = ProjectionSnapshot {
-                    frontier: stamp.frontier,
-                    rows: self.lock_sqlite()?.object_rows()?,
-                };
-                let (_, versions) = self
-                    .l0002_projection_worker()
-                    .catch_up_validated(&snapshot, None)
-                    .await?;
-                let after = self.physical_stamp()?;
-                if after.incarnation != before.incarnation
-                    || after.frontier != before.frontier
-                    || after.journal_epoch != before.journal_epoch
-                    || after.objects_epoch != stamp.stamp.objects_epoch
-                    || after.relations_epoch != versions[0]
-                    || self
-                        .search
-                        .version()
-                        .await
-                        .map_err(|_| StoreError::LanceDb)?
-                        != versions[1]
-                {
-                    return Err(StoreError::StoreCorrupt);
-                }
-                (
-                    snapshot.frontier,
-                    return_rows.then_some(snapshot),
-                    stamp.has_failed_job,
-                    versions[1],
-                )
-            } else {
-                let (snapshot, objects_epoch, delta) = if let Some(stamp) = objects {
-                    (
-                        ProjectionSnapshot {
+            let (frontier, snapshot, has_failed_job, search_version, content_proven) =
+                if let Some(stamp) = hit {
+                    let snapshot = if return_rows {
+                        Some(ProjectionSnapshot {
                             frontier: stamp.frontier,
                             rows: self.lock_sqlite()?.object_rows()?,
-                        },
-                        stamp.stamp.objects_epoch,
-                        None,
+                        })
+                    } else {
+                        None
+                    };
+                    (
+                        stamp.frontier,
+                        snapshot,
+                        stamp.has_failed_job,
+                        stamp.search_version,
+                        stamp.content_proven && (indexes || stamp.stamp == before),
+                    )
+                } else if let Some(stamp) = objects.filter(|_| !indexes) {
+                    // Objects are already validated; only the derived families
+                    // may still lag. Their worker consumes the complete expected
+                    // snapshot, including large deltas.
+                    let snapshot = ProjectionSnapshot {
+                        frontier: stamp.frontier,
+                        rows: self.lock_sqlite()?.object_rows()?,
+                    };
+                    let (_, versions) = self
+                        .l0002_projection_worker()
+                        .catch_up_validated(&snapshot, None)
+                        .await?;
+                    let after = self.physical_stamp()?;
+                    if after.incarnation != before.incarnation
+                        || after.frontier != before.frontier
+                        || after.journal_epoch != before.journal_epoch
+                        || after.objects_epoch != stamp.stamp.objects_epoch
+                        || after.relations_epoch != versions[0]
+                        || self
+                            .search
+                            .version()
+                            .await
+                            .map_err(|_| StoreError::LanceDb)?
+                            != versions[1]
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                    (
+                        snapshot.frontier,
+                        return_rows.then_some(snapshot),
+                        stamp.has_failed_job,
+                        versions[1],
+                        false,
                     )
                 } else {
-                    let appended = validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
-                    let worker = self.projection_worker();
-                    worker
-                        .catch_up_validated(validated_current, appended)
-                        .await?
-                };
-                let objects_stamp = self.physical_stamp()?;
-                if objects_stamp.objects_epoch != objects_epoch
-                    || objects_stamp.incarnation != before.incarnation
-                    || objects_stamp.journal_epoch != before.journal_epoch
-                    || objects_stamp.frontier != before.frontier
-                {
-                    return Err(StoreError::StoreCorrupt);
-                }
-                let search_version = if indexes {
-                    let worker = self.l0002_projection_worker();
-                    let (_, versions) = worker.catch_up_validated(&snapshot, delta).await?;
-                    if self.physical_stamp()?.relations_epoch != versions[0] {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    let search_version = self
-                        .search
-                        .version()
-                        .await
-                        .map_err(|_| StoreError::LanceDb)?;
-                    if search_version != versions[1] {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    search_version
-                } else {
-                    0
-                };
-                let has_failed_job =
-                    crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
+                    let capture_update = match capture_input {
+                        Some(stamp) => {
+                            self.projection_worker()
+                                .catch_up_capture_delta(
+                                    (
+                                        stamp.stamp.objects_epoch,
+                                        stamp.stamp.object_checkpoint,
+                                        before.frontier,
+                                    ),
+                                    stamp
+                                        .appended_rows
+                                        .as_deref()
+                                        .ok_or(StoreError::StoreCorrupt)?,
+                                )
+                                .await?
+                        }
+                        None => None,
+                    };
+                    if let Some(update) = capture_update {
+                        let objects_stamp = self.physical_stamp()?;
+                        if objects_stamp.objects_epoch != update.objects_epoch
+                            || objects_stamp.incarnation != before.incarnation
+                            || objects_stamp.journal_epoch != before.journal_epoch
+                            || objects_stamp.frontier != before.frontier
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                        let versions = self
+                            .l0002_projection_worker()
+                            .catch_up_capture_delta(
+                                update.frontier,
+                                update.base_frontier,
+                                &update.changed_rows,
+                                update.delta,
+                            )
+                            .await?;
+                        if self.physical_stamp()?.relations_epoch != versions[0] {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                        let search_version = self
+                            .search
+                            .version()
+                            .await
+                            .map_err(|_| StoreError::LanceDb)?;
+                        if search_version != versions[1] {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                        let has_failed_job = crate::projections::RuntimeSchedulerView::from_rows(
+                            update.frontier,
+                            &update.runtime_rows,
+                        )?
                         .jobs
                         .iter()
                         .any(|job| job.state == crate::JobStatus::Failed);
-                (
-                    snapshot.frontier,
-                    return_rows.then_some(snapshot),
-                    has_failed_job,
-                    search_version,
-                )
-            };
+                        #[cfg(test)]
+                        self.capture_delta_selections
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        (update.frontier, None, has_failed_job, search_version, true)
+                    } else {
+                        let (snapshot, objects_epoch, delta) = if let Some(stamp) = objects {
+                            (
+                                ProjectionSnapshot {
+                                    frontier: stamp.frontier,
+                                    rows: self.lock_sqlite()?.object_rows()?,
+                                },
+                                stamp.stamp.objects_epoch,
+                                None,
+                            )
+                        } else {
+                            let appended =
+                                validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
+                            let worker = self.projection_worker();
+                            worker
+                                .catch_up_validated(validated_current, appended)
+                                .await?
+                        };
+                        let objects_stamp = self.physical_stamp()?;
+                        if objects_stamp.objects_epoch != objects_epoch
+                            || objects_stamp.incarnation != before.incarnation
+                            || objects_stamp.journal_epoch != before.journal_epoch
+                            || objects_stamp.frontier != before.frontier
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                        let (search_version, content_proven) = if indexes {
+                            let worker = self.l0002_projection_worker();
+                            let (_, versions, derived) =
+                                worker.catch_up_validated_proof(&snapshot, delta).await?;
+                            if self.physical_stamp()?.relations_epoch != versions[0] {
+                                return Err(StoreError::StoreCorrupt);
+                            }
+                            let search_version = self
+                                .search
+                                .version()
+                                .await
+                                .map_err(|_| StoreError::LanceDb)?;
+                            if search_version != versions[1] {
+                                return Err(StoreError::StoreCorrupt);
+                            }
+                            (search_version, derived)
+                        } else {
+                            (0, false)
+                        };
+                        let has_failed_job =
+                            crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
+                                .jobs
+                                .iter()
+                                .any(|job| job.state == crate::JobStatus::Failed);
+                        (
+                            snapshot.frontier,
+                            return_rows.then_some(snapshot),
+                            has_failed_job,
+                            search_version,
+                            content_proven,
+                        )
+                    }
+                };
             self.validate_projection_directories(indexes)?;
             let after = self.physical_stamp()?;
             if after.incarnation != before.incarnation
@@ -1568,6 +1674,7 @@ impl JournalWriter {
                     search_version,
                     frontier,
                     has_failed_job,
+                    content_proven,
                     appended_through: None,
                     appended_rows: None,
                 });

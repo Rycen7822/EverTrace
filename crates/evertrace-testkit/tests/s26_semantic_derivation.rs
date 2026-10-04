@@ -1834,6 +1834,83 @@ async fn frozen_source_summary_requires_every_interval_message_ref() {
 }
 
 #[tokio::test]
+async fn imported_source_prefix_rejects_late_message_before_objects_commit() {
+    let root = TempDir::new().unwrap();
+    // Messages 1 and 3 exist, 2 has not arrived yet. This exercises imported
+    // prefix monotonicity after a summary, not frozen-ref validation alone.
+    let (mut writer, snapshot, source, messages) =
+        frozen_source_prefix(&root.path().join("store"), &[1, 3]).await;
+    let complete = messages
+        .iter()
+        .map(|(receipt, observation)| (receipt, observation))
+        .collect::<Vec<_>>();
+    let (run, digest, planned) =
+        plan_frozen_source_summary(&snapshot, source.clone(), &complete).await;
+    let job = source_synthesis_job(
+        &run,
+        messages[0].1.source_observation_id,
+        messages[1].1.source_observation_id,
+    );
+    install_source_synthesis_job(&mut writer, &job, 6).await;
+    let before = writer.project().await.unwrap();
+    let committed = writer
+        .commit_if_frontier(
+            &source_summary_submission(&planned, &job, digest.semantic_digest_id.to_string(), 10),
+            10,
+            before.frontier,
+        )
+        .await
+        .unwrap();
+    assert!(!committed.replayed);
+    let frozen = writer.project().await.unwrap();
+    assert!(frozen.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_digest")
+            && row.object_id.as_deref() == Some(&digest.semantic_digest_id.to_string())
+    }));
+    let objects_checkpoint = writer
+        .backup_table_states()
+        .await
+        .unwrap()
+        .objects
+        .checkpoint;
+    assert_eq!(objects_checkpoint, frozen.frontier);
+
+    // The late in-interval Message is durably committed, but the very next
+    // sync must reject it at the same persisted boundary as the ordinary
+    // complete algorithm, before any objects commit happens.
+    let late = session_message(
+        "frozen-interval",
+        2,
+        1,
+        messages[0].0.task_id.unwrap(),
+        source.repository_id,
+        source.worktree_id,
+    );
+    let first_range = messages[0].0.source_byte_range.clone().unwrap();
+    let first_digest = session_prefix_digest(&messages[0].0, &first_range, None);
+    persist_session_message(&mut writer, &late.0, &late.1, Some(&first_digest), 11).await;
+    assert!(writer.journal_rows().await.unwrap().len() as u64 > frozen.frontier);
+    // Independent full replay must reject the same invalid prefix too.
+    assert_eq!(
+        writer.full_projection().await,
+        Err(StoreError::StoreCorrupt)
+    );
+    let rejected = writer.sync_frontier().await;
+    assert!(
+        matches!(rejected, Err(StoreError::StoreCorrupt)),
+        "a late in-interval Message must fail at the frozen boundary: {rejected:?}"
+    );
+    assert_eq!(writer.project().await, Err(StoreError::StoreCorrupt));
+    assert_eq!(
+        writer.full_projection().await,
+        Err(StoreError::StoreCorrupt)
+    );
+    // No partial objects commit survived the rejected request.
+    let states = writer.backup_table_states().await.unwrap();
+    assert_eq!(states.objects.checkpoint, objects_checkpoint);
+}
+
+#[tokio::test]
 async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
     let first_temp = TempDir::new().unwrap();
     let second_temp = TempDir::new().unwrap();
