@@ -1499,40 +1499,6 @@ impl JournalWriter {
                         stamp.search_version,
                         stamp.content_proven && (indexes || stamp.stamp == before),
                     )
-                } else if let Some(stamp) = objects.filter(|_| !indexes) {
-                    // Objects are already validated; only the derived families
-                    // may still lag. Their worker consumes the complete expected
-                    // snapshot, including large deltas.
-                    let snapshot = ProjectionSnapshot {
-                        frontier: stamp.frontier,
-                        rows: self.lock_sqlite()?.object_rows()?,
-                    };
-                    let (_, versions) = self
-                        .l0002_projection_worker()
-                        .catch_up_validated(&snapshot, None)
-                        .await?;
-                    let after = self.physical_stamp()?;
-                    if after.incarnation != before.incarnation
-                        || after.frontier != before.frontier
-                        || after.journal_epoch != before.journal_epoch
-                        || after.objects_epoch != stamp.stamp.objects_epoch
-                        || after.relations_epoch != versions[0]
-                        || self
-                            .search
-                            .version()
-                            .await
-                            .map_err(|_| StoreError::LanceDb)?
-                            != versions[1]
-                    {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    (
-                        snapshot.frontier,
-                        return_rows.then_some(snapshot),
-                        stamp.has_failed_job,
-                        versions[1],
-                        false,
-                    )
                 } else {
                     let capture_update = match capture_input {
                         Some(stamp) => {

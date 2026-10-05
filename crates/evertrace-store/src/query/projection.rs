@@ -149,17 +149,6 @@ impl L0002ProjectionWorker {
         Ok(self.catch_up_inner(objects, None, false, false).await?.0)
     }
 
-    pub(crate) async fn catch_up_validated(
-        &self,
-        objects: &ProjectionSnapshot,
-        journal_delta: Option<ProjectionJournalDelta>,
-    ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
-        let (snapshot, versions, _) = self
-            .catch_up_inner(objects, journal_delta, false, false)
-            .await?;
-        Ok((snapshot, versions))
-    }
-
     /// The ordinary complete path with its actual-derive flag. Only a run that
     /// really derived and read every persisted row back establishes the
     /// private full-content grade; the checkpoint early return does not.

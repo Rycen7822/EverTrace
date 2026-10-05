@@ -72,7 +72,7 @@ mod tests {
         let mut ahead = snapshot.clone();
         ahead.frontier += 1;
         assert_eq!(
-            worker.catch_up_validated(&ahead, Some(delta.clone())).await,
+            worker.catch_up_validated_proof(&ahead, Some(delta.clone())).await,
             Err(StoreError::StoreCorrupt)
         );
 
@@ -102,7 +102,7 @@ mod tests {
             before_search
         );
         assert_eq!(
-            worker.catch_up_validated(&snapshot, Some(delta.clone())).await.unwrap().0.frontier,
+            worker.catch_up_validated_proof(&snapshot, Some(delta.clone())).await.unwrap().0.frontier,
             snapshot.frontier
         );
 
@@ -127,7 +127,7 @@ mod tests {
         let search_version = search.version().await.unwrap();
         writer.commit(&later, 2).await.unwrap();
         assert_eq!(
-            worker.catch_up_validated(&snapshot, Some(delta)).await,
+            worker.catch_up_validated_proof(&snapshot, Some(delta)).await,
             Err(StoreError::StoreCorrupt)
         );
         let relations_epoch_after = {
