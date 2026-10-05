@@ -35,7 +35,7 @@ use evertrace_engine::{
         probe_is_ancestor as engine_probe_is_ancestor,
         probe_patch_equivalence as engine_probe_patch_equivalence,
         probe_repository as engine_probe_repository, remote_fingerprint, resolve_integration,
-        resolve_repository,
+        resolve_repository, resolve_repository_source_start,
     },
 };
 use evertrace_store::{
@@ -307,6 +307,65 @@ impl Harness {
         }
     }
 
+    /// Source-start boundary refresh with explicit source references and an
+    /// explicit instant, committed through the same frontier gate as every
+    /// other harness refresh.
+    async fn refresh_source_start(
+        &mut self,
+        path: &Path,
+        refs: &[String],
+        occurred: i64,
+    ) -> Refresh {
+        let view = self.view().await;
+        let evidence =
+            source_start_evidence(&view, path, HostTrustDecision::Trusted, refs, occurred);
+        let resolution = resolve_repository_source_start(
+            &RepositoryResolveInput {
+                view: &view,
+                evidence: &evidence,
+                derived_from_hint: None,
+            },
+            &refs[0],
+        )
+        .unwrap_or_else(|error| {
+            panic!("source-start resolve failed: {error:?}\nevidence: {evidence:#?}")
+        });
+        let command = resolution
+            .journal_command(occurred, CONFIG_HASH, ALGO)
+            .unwrap();
+        if let Some(command) = &command {
+            self.writer
+                .commit_if_frontier(command, occurred, view.frontier)
+                .await
+                .unwrap();
+        }
+        Refresh {
+            resolution,
+            command,
+            frontier: view.frontier,
+        }
+    }
+
+    /// The same factory without committing, for fail-closed cases.
+    async fn source_start_result(
+        &mut self,
+        path: &Path,
+        trust: HostTrustDecision,
+        refs: &[String],
+        occurred: i64,
+    ) -> Result<RepositoryResolution, RepositoryResolveError> {
+        let view = self.view().await;
+        let evidence = source_start_evidence(&view, path, trust, refs, occurred);
+        resolve_repository_source_start(
+            &RepositoryResolveInput {
+                view: &view,
+                evidence: &evidence,
+                derived_from_hint: None,
+            },
+            &refs[0],
+        )
+    }
+
     async fn commit_integration(&mut self, evidence: IntegrationEvidence) -> RepositoryResolution {
         let occurred = self.tick();
         let view = self.view().await;
@@ -322,6 +381,25 @@ impl Harness {
         }
         resolution
     }
+}
+
+fn source_start_evidence(
+    view: &RepositoryCurrentView,
+    path: &Path,
+    trust: HostTrustDecision,
+    refs: &[String],
+    occurred: i64,
+) -> GitProbeEvidence {
+    probe_repository(
+        path,
+        trust,
+        refs,
+        occurred,
+        &ProbeLimits::default(),
+        &view.known_admin_paths(),
+        &known_head_oids(view),
+    )
+    .unwrap()
 }
 
 fn only_repository(view: &RepositoryCurrentView) -> &RepositoryInstance {
@@ -1140,6 +1218,351 @@ async fn snapshot_capture_status_tracks_completeness() {
 // ---------------------------------------------------------------------------
 // Fresh UUIDv7 identity allocation
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Source-start boundary tests
+// ---------------------------------------------------------------------------
+
+fn assert_source_closure(
+    view: &RepositoryCurrentView,
+    worktree_id: WorktreeId,
+    root: &Path,
+    source: &str,
+    boundary: i64,
+    head: &GitOid,
+) -> WorktreeSnapshotId {
+    let root = root.to_string_lossy();
+    let worktree = view.worktrees.get(&worktree_id).unwrap();
+    let snapshot_id = worktree.current_snapshot_id.unwrap();
+    let snapshot = view.snapshots.get(&snapshot_id).unwrap();
+    assert_eq!(snapshot.captured_at_us, boundary);
+    assert_eq!(snapshot.head_oid.as_deref(), Some(head.as_str()));
+    assert!(
+        snapshot
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == source)
+    );
+    let singleton = worktree
+        .path_history
+        .iter()
+        .find(|entry| {
+            entry.path == root
+                && entry.first_observed_at_us == boundary
+                && entry.last_observed_at_us == boundary
+                && entry.evidence_refs.iter().any(|value| value == source)
+        })
+        .expect("source-linked singleton path observation at the boundary");
+    assert!(singleton.evidence_refs.iter().any(|value| value == source));
+    snapshot_id
+}
+
+#[tokio::test]
+async fn source_start_boundary_closes_established_repository_and_stays_no_delta() {
+    let mut harness = Harness::open().await;
+    let repo = harness.path("repo");
+    init_repo(&repo);
+    let repo = canonical(&repo);
+    // Ordinary registration first: identity setup never uses the factory.
+    let create = harness.refresh(&repo).await;
+    assert_eq!(create.resolution.kind, Some(ResolutionKind::Create));
+    let view = harness.view().await;
+    let repository = only_repository(&view).clone();
+    let worktree = main_worktree(&view, repository.repository_id).clone();
+    let head = head_oid(&repo);
+    let before_frontier = view.frontier;
+    let before_snapshots = view.snapshots.len();
+    let before_transitions = view.transitions.len();
+
+    // A second source start on the already-established repository: a plain
+    // NoDelta identity still records exactly one boundary snapshot, one
+    // worktree successor and the source-linked singleton path observation, and
+    // fabricates no transition.
+    let source = "session-rollout:source-start-1:source-start-1".to_owned();
+    let boundary = 1_000_000;
+    let retained_evidence = source_start_evidence(
+        &view,
+        &repo,
+        HostTrustDecision::Trusted,
+        std::slice::from_ref(&source),
+        boundary,
+    );
+    let start = harness
+        .refresh_source_start(&repo, std::slice::from_ref(&source), boundary)
+        .await;
+    assert_eq!(start.resolution.kind, Some(ResolutionKind::Successor));
+    assert_eq!(start.resolution.snapshots.len(), 1);
+    assert_eq!(start.resolution.worktrees.len(), 1);
+    assert!(start.resolution.transitions.is_empty());
+    assert!(start.resolution.repositories.is_empty());
+    assert!(start.command.is_some());
+    let view = harness.view().await;
+    assert!(view.frontier > before_frontier);
+    let worktree_after = view.worktrees.get(&worktree.worktree_instance_id).unwrap();
+    assert_eq!(
+        worktree_after.worktree_revision,
+        worktree.worktree_revision + 1
+    );
+    assert_eq!(worktree_after.recorded_at_us, boundary);
+    assert_eq!(worktree_after.lifecycle, WorktreeLifecycle::Active);
+    assert_eq!(
+        worktree_after.path_history.len(),
+        worktree.path_history.len() + 1
+    );
+    assert_eq!(
+        only_repository(&view).repository_revision,
+        repository.repository_revision
+    );
+    assert_eq!(view.transitions.len(), before_transitions);
+    assert_eq!(view.snapshots.len(), before_snapshots + 1);
+    let snapshot = assert_source_closure(
+        &view,
+        worktree.worktree_instance_id,
+        &repo,
+        &source,
+        boundary,
+        &head,
+    );
+    let frontier_after = view.frontier;
+
+    // Exact retry of the same source references and instant: no object, no
+    // frontier growth, the durable closure is reused.
+    let retry = harness
+        .refresh_source_start(&repo, std::slice::from_ref(&source), boundary)
+        .await;
+    assert_eq!(retry.resolution.kind, Some(ResolutionKind::NoDelta));
+    assert!(retry.command.is_none());
+    let view = harness.view().await;
+    assert_eq!(view.frontier, frontier_after);
+    assert_eq!(view.snapshots.len(), before_snapshots + 1);
+    assert_eq!(view.worktrees.len(), 1);
+    assert_eq!(
+        view.snapshots.get(&snapshot).unwrap().captured_at_us,
+        boundary
+    );
+
+    // Restart: the rebuilt view still resolves the retry as NoDelta.
+    let store_root = harness.temp.path().join("store");
+    harness.writer = {
+        let _reopen_gate = enter_reopen();
+        drop(harness.writer);
+        JournalWriter::open(&store_root).await.unwrap()
+    };
+    let restart = harness
+        .refresh_source_start(&repo, std::slice::from_ref(&source), boundary)
+        .await;
+    assert_eq!(restart.resolution.kind, Some(ResolutionKind::NoDelta));
+    assert!(restart.command.is_none());
+    assert_eq!(harness.view().await.frontier, frontier_after);
+
+    // Lost-ACK: resubmitting the already constructed command is deduplicated
+    // by command id and adds nothing.
+    let command = start.command.clone().unwrap();
+    harness
+        .writer
+        .commit_if_frontier(&command, boundary, frontier_after)
+        .await
+        .unwrap();
+    let view = harness.view().await;
+    assert_eq!(view.frontier, frontier_after);
+    assert_eq!(view.snapshots.len(), before_snapshots + 1);
+
+    // The ordinary resolver keeps its exact behaviour: the same input stays a
+    // zero-object NoDelta and never creates a source boundary.
+    let ordinary = harness.refresh(&repo).await;
+    assert_eq!(ordinary.resolution.kind, Some(ResolutionKind::NoDelta));
+    assert!(ordinary.command.is_none());
+    assert_eq!(harness.view().await.frontier, frontier_after);
+
+    // Replaying original evidence after a newer physical state must neither
+    // roll back the current pointer nor append an in-call duplicate snapshot.
+    commit_file(&repo, "newer.txt", "newer");
+    let newer_source = "session-rollout:source-start-newer:source-start-newer".to_owned();
+    harness
+        .refresh_source_start(&repo, &[newer_source], boundary + 1)
+        .await;
+    let newer = harness.view().await;
+    let late_retry = resolve_repository_source_start(
+        &RepositoryResolveInput {
+            view: &newer,
+            evidence: &retained_evidence,
+            derived_from_hint: None,
+        },
+        &source,
+    )
+    .unwrap();
+    assert_eq!(late_retry.kind, Some(ResolutionKind::NoDelta));
+    assert!(
+        late_retry
+            .journal_command(boundary, CONFIG_HASH, ALGO)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(harness.view().await, newer);
+}
+
+#[tokio::test]
+async fn source_start_boundary_fails_closed_on_contradiction_unavailable_and_old_instants() {
+    let mut harness = Harness::open().await;
+    let repo = harness.path("repo");
+    init_repo(&repo);
+    let repo = canonical(&repo);
+    harness.refresh(&repo).await;
+    let source = "session-rollout:source-start-2:source-start-2".to_owned();
+    let boundary = 2_000_000;
+    let closed = harness
+        .refresh_source_start(&repo, std::slice::from_ref(&source), boundary)
+        .await;
+    assert_eq!(closed.resolution.kind, Some(ResolutionKind::Successor));
+    let view = harness.view().await;
+    let frontier = view.frontier;
+    let snapshots = view.snapshots.len();
+    let revision = main_worktree(&view, only_repository(&view).repository_id).worktree_revision;
+    let head = head_oid(&repo);
+
+    // The same boundary instant with a different HEAD is contradictory.
+    commit_file(&repo, "b.txt", "b");
+    assert_ne!(head_oid(&repo), head);
+    let contradiction = harness
+        .source_start_result(
+            &repo,
+            HostTrustDecision::Trusted,
+            std::slice::from_ref(&source),
+            boundary,
+        )
+        .await;
+    assert_eq!(contradiction, Err(RepositoryResolveError::InvalidEvidence));
+
+    // Trust denied never closes, even though the ordinary resolver reports
+    // NoDelta for the already known worktree.
+    let denied = harness
+        .source_start_result(
+            &repo,
+            HostTrustDecision::Untrusted,
+            std::slice::from_ref(&source),
+            boundary + 1,
+        )
+        .await;
+    assert_eq!(denied, Err(RepositoryResolveError::InsufficientEvidence));
+
+    // A late fact older than the recorded revision must not roll it back.
+    let old = "session-rollout:source-start-old:source-start-old".to_owned();
+    let older = harness
+        .source_start_result(
+            &repo,
+            HostTrustDecision::Trusted,
+            std::slice::from_ref(&old),
+            boundary - 1,
+        )
+        .await;
+    assert_eq!(older, Err(RepositoryResolveError::InsufficientEvidence));
+
+    // A missing path is unavailable evidence: fail closed, never a boundary.
+    let moved = harness.path("repo-moved-away");
+    std::fs::rename(&repo, &moved).unwrap();
+    let missing = harness
+        .source_start_result(
+            &repo,
+            HostTrustDecision::Trusted,
+            std::slice::from_ref(&old),
+            boundary + 2,
+        )
+        .await;
+    std::fs::rename(&moved, &repo).unwrap();
+    assert_eq!(missing, Err(RepositoryResolveError::InsufficientEvidence));
+
+    let view = harness.view().await;
+    assert_eq!(view.frontier, frontier);
+    assert_eq!(view.snapshots.len(), snapshots);
+    let worktree = main_worktree(&view, only_repository(&view).repository_id);
+    assert_eq!(worktree.worktree_revision, revision);
+    assert_eq!(worktree.recorded_at_us, boundary);
+}
+
+#[tokio::test]
+async fn source_start_boundary_keeps_one_boundary_per_source_and_instant() {
+    let mut harness = Harness::open().await;
+    let repo = harness.path("repo");
+    init_repo(&repo);
+    let repo = canonical(&repo);
+    harness.refresh(&repo).await;
+    let view = harness.view().await;
+    let repository = only_repository(&view).clone();
+    let worktree = main_worktree(&view, repository.repository_id).clone();
+    let head = head_oid(&repo);
+    let first = "session-rollout:source-start-a:source-start-a".to_owned();
+    let second = "session-rollout:source-start-b:source-start-b".to_owned();
+    let first_at = 1_000_000;
+    let second_at = first_at;
+    let first_refs = vec![first.clone(), "probe:shared".to_owned()];
+    let second_refs = vec![second.clone(), "probe:shared".to_owned()];
+
+    let a = harness
+        .refresh_source_start(&repo, &first_refs, first_at)
+        .await;
+    assert_eq!(a.resolution.kind, Some(ResolutionKind::Successor));
+    assert!(a.resolution.transitions.is_empty());
+    let view = harness.view().await;
+    let a_snapshot = assert_source_closure(
+        &view,
+        worktree.worktree_instance_id,
+        &repo,
+        &first,
+        first_at,
+        &head,
+    );
+
+    // A different source at the same path and HEAD still gets its own boundary
+    // snapshot and path evidence.
+    let b = harness
+        .refresh_source_start(&repo, &second_refs, second_at)
+        .await;
+    assert_eq!(b.resolution.kind, Some(ResolutionKind::Successor));
+    assert!(b.resolution.transitions.is_empty());
+    let view = harness.view().await;
+    let b_snapshot = assert_source_closure(
+        &view,
+        worktree.worktree_instance_id,
+        &repo,
+        &second,
+        second_at,
+        &head,
+    );
+    assert_ne!(a_snapshot, b_snapshot);
+    let a_record = view.snapshots.get(&a_snapshot).unwrap();
+    assert_eq!(a_record.captured_at_us, first_at);
+    assert_eq!(a_record.evidence_refs, first_refs);
+    let worktree_after = view.worktrees.get(&worktree.worktree_instance_id).unwrap();
+    assert_eq!(
+        worktree_after.path_history.len(),
+        worktree.path_history.len() + 2
+    );
+    assert_eq!(
+        worktree_after.worktree_revision,
+        worktree.worktree_revision + 2
+    );
+    assert_eq!(worktree_after.current_snapshot_id, Some(b_snapshot));
+
+    // The first source stays closed while the second is current: an exact
+    // retry is still NoDelta and both durable closures stay intact.
+    let retry = harness
+        .refresh_source_start(&repo, &first_refs, first_at)
+        .await;
+    assert_eq!(retry.resolution.kind, Some(ResolutionKind::NoDelta));
+    assert!(retry.command.is_none());
+    let view = harness.view().await;
+    assert_eq!(
+        view.snapshots.get(&a_snapshot).unwrap().captured_at_us,
+        first_at
+    );
+    assert_eq!(
+        view.worktrees
+            .get(&worktree.worktree_instance_id)
+            .unwrap()
+            .current_snapshot_id,
+        Some(b_snapshot)
+    );
+}
 
 fn now_millis() -> u128 {
     SystemTime::now()

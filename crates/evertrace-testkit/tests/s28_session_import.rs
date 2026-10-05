@@ -3425,3 +3425,226 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(reopened.project().await.unwrap(), projected);
     assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
 }
+
+/// The source-start boundary factory is exactly the input the catalog
+/// resolution consumes: with one ordinary registration already durable, a
+/// second source stays `Repository`-resolved at its own start instant with the
+/// expected IDs and read scope, while sources without that durable closure
+/// (wrong source, wrong instant) never receive a resolved scope.
+#[tokio::test]
+async fn source_start_boundary_is_the_catalog_resolution_input() {
+    use evertrace_engine::repository::{
+        HostTrustDecision, ProbeLimits, RepositoryResolveInput, ResolutionKind, probe_repository,
+        resolve_repository, resolve_repository_source_start,
+    };
+    use evertrace_store::{WorkspaceResolutionKind, repository::RepositoryCurrentView};
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+    fn write_transcript(
+        path: &std::path::Path,
+        session: &str,
+        stamp: &str,
+        workspace: &std::path::Path,
+        head: &str,
+    ) {
+        let header = serde_json::json!({"timestamp":stamp,"type":"session_meta","payload":{"id":session,"session_id":session,"cwd":workspace,"git":{"commit_hash":head}}});
+        let raw = serde_json::json!({"type":"response_item","metadata":{"client_authored":false,"fallback_token_limit_override":8192},"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"marigold source start boundary"}]}});
+        let message = serde_json::json!({"timestamp":stamp,"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"marigold source start boundary","text_elements":[]}]},"completed_at_ms":1791244801000i64}});
+        fs::write(path, format!("{header}\n{raw}\n{message}\n")).unwrap();
+    }
+
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q", "-b", "main"]);
+    git(&workspace, &["commit", "--allow-empty", "-qm", "initial"]);
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let head = git(&workspace, &["rev-parse", "HEAD"]);
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/10/06");
+    fs::create_dir_all(&dated).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&dated, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let (writer, task) =
+        spawn_writer(open_writer(&temp.path().join("data")).await.unwrap(), 32).unwrap();
+
+    // Fixed clock: 2026-10-06T00:00:01Z, not a subprocess parsing local time.
+    let at = 1_791_244_801_000_000;
+    let start = "2026-10-06T00:00:01Z";
+    let cases = [
+        ("019d0000-0000-7000-8000-0000000000a1", start, true),
+        ("019d0000-0000-7000-8000-0000000000a2", start, false),
+        (
+            "019d0000-0000-7000-8000-0000000000a3",
+            "2026-10-06T00:01:01Z",
+            false,
+        ),
+    ];
+    let evidence = probe_repository(
+        &workspace,
+        HostTrustDecision::Trusted,
+        &["register:source-start".into()],
+        at - 1_000_000,
+        &ProbeLimits::default(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let empty = RepositoryCurrentView::default();
+    let registration = resolve_repository(&RepositoryResolveInput {
+        view: &empty,
+        evidence: &evidence,
+        derived_from_hint: None,
+    })
+    .unwrap();
+    assert_eq!(registration.kind, Some(ResolutionKind::Create));
+    let repository = registration.repositories[0].repository_id;
+    let worktree = registration.worktrees[0].worktree_instance_id;
+    writer
+        .commit(
+            registration
+                .journal_command(at - 1_000_000, CONFIG, "source-attribution")
+                .unwrap()
+                .unwrap(),
+            at - 1_000_000,
+        )
+        .await
+        .unwrap();
+
+    // a1 has a matching boundary; a2 has none. a3 has the right source ref
+    // but the wrong time, so its negative tests time rather than missing refs.
+    for index in [0, 2] {
+        let session = cases[index].0;
+        let source = format!("session-rollout:{session}:{session}");
+        let projected = writer.project().await.unwrap();
+        let current = RepositoryCurrentView::from_snapshot(&projected).unwrap();
+        let evidence = probe_repository(
+            &workspace,
+            HostTrustDecision::Trusted,
+            std::slice::from_ref(&source),
+            at,
+            &ProbeLimits::default(),
+            &current.known_admin_paths(),
+            &[],
+        )
+        .unwrap();
+        let boundary = resolve_repository_source_start(
+            &RepositoryResolveInput {
+                view: &current,
+                evidence: &evidence,
+                derived_from_hint: None,
+            },
+            &source,
+        )
+        .unwrap();
+        assert_eq!(boundary.kind, Some(ResolutionKind::Successor));
+        writer
+            .commit_if_frontier(
+                boundary
+                    .journal_command(at, CONFIG, "source-start-boundary")
+                    .unwrap()
+                    .unwrap(),
+                at,
+                current.frontier,
+            )
+            .await
+            .unwrap();
+    }
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    for (session, stamp, resolved) in cases {
+        let source = format!("session-rollout:{session}:{session}");
+        let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+        write_transcript(&transcript, session, stamp, &workspace, &head);
+        let report =
+            observe_session_catalog_report(transcript.to_str(), session, "source-summary", None)
+                .unwrap();
+        catalog.refresh(&report).await.unwrap();
+        let context = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata = &context.current.metadata;
+        if resolved {
+            assert_eq!(
+                metadata.workspace_resolution_kind,
+                WorkspaceResolutionKind::Repository
+            );
+            assert_eq!(metadata.resolved_repository_instance_id, Some(repository));
+            assert_eq!(metadata.resolved_worktree_instance_id, Some(worktree));
+            assert!(metadata.read_restrictions().any(|id| id == repository));
+            assert!(
+                context
+                    .read_repositories
+                    .iter()
+                    .any(|value| value.repository_id == repository)
+            );
+            let current_snapshot = context
+                .worktree
+                .as_ref()
+                .unwrap()
+                .current_snapshot_id
+                .unwrap();
+            assert!(
+                context
+                    .read_snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.worktree_instance_id == worktree
+                        && snapshot.worktree_snapshot_id == current_snapshot)
+            );
+            // This read intentionally omits repeated historical HEADs. Check
+            // the source-time proof in durable state, not the bounded getter.
+            let durable =
+                RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+            assert!(
+                durable
+                    .snapshots
+                    .values()
+                    .any(|snapshot| snapshot.worktree_instance_id == worktree
+                        && snapshot.captured_at_us == at
+                        && snapshot.evidence_refs.contains(&source))
+            );
+        } else {
+            assert_eq!(
+                metadata.workspace_resolution_kind,
+                WorkspaceResolutionKind::Ambiguous
+            );
+            assert!(metadata.resolved_repository_instance_id.is_none());
+            assert!(metadata.resolved_worktree_instance_id.is_none());
+        }
+    }
+    drop(catalog);
+    drop(writer);
+    task.await.unwrap().unwrap();
+}
