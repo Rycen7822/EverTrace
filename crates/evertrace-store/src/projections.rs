@@ -12319,6 +12319,82 @@ impl ReducerState {
         Ok(state)
     }
 
+    /// Restore one persisted data row into this state with the original
+    /// per-row canonical/metadata/payload validation. Non-data rows are not
+    /// part of the restore. Paged restores call this per row so the SQLite
+    /// mutex is not held across decoding.
+    fn restore_current_row(
+        &mut self,
+        row: &ObjectRow,
+        checkpoint_frontier: u64,
+    ) -> Result<(), StoreError> {
+        if row.row_kind != ObjectRowKind::Data {
+            return Ok(());
+        }
+        if row.source_event_seq > checkpoint_frontier
+            || row.projection_generation != PROJECTION_GENERATION
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if recall_projection::contract(row)?.is_some() {
+            return Ok(());
+        }
+        if let Some(value) = crate::session_import::restore_current(row)? {
+            if self
+                .session_imports
+                .insert(value.source_key(), value)
+                .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            return Ok(());
+        }
+        if s23::S23State::restore_projection(row)? {
+            return Ok(());
+        }
+        if synthesis::restore_wiki_projection(row)?.is_some() {
+            return Ok(());
+        }
+        if procedure_effect::restore(row)?.is_some() {
+            return Ok(());
+        }
+        if let Some(need) = recall_ledger::need(row)? {
+            self.recall_ledger.restore(row, need)?;
+            return Ok(());
+        }
+        let payload_json = row
+            .payload_json
+            .as_deref()
+            .ok_or(StoreError::StoreCorrupt)?;
+        let payload: JournalPayload =
+            serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+        payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+        if !payload
+            .matches_canonical_json(payload_json)
+            .map_err(|_| StoreError::StoreCorrupt)?
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.restore_row(row, payload)
+    }
+
+    /// The restore tail that needs the complete row set: deletion and purge
+    /// restoration invariants and the current revision winners.
+    fn finish_current_restore(&mut self) -> Result<(), StoreError> {
+        self.deletions.validate_restored()?;
+        if self.session_imports.values().any(|current| {
+            current
+                .metadata
+                .repository_read_restrictions
+                .as_ref()
+                .is_some_and(|ids| ids.iter().any(|id| !self.repositories.contains_key(id)))
+        }) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        self.scope_purges.validate_restored()?;
+        self.rebuild_revision_currents()
+    }
+
     fn decode_current_rows(
         rows: &[ObjectRow],
         checkpoint_frontier: u64,
@@ -12340,64 +12416,9 @@ impl ReducerState {
             .iter()
             .filter(|row| row.row_kind == ObjectRowKind::Data)
         {
-            if row.source_event_seq > checkpoint_frontier
-                || row.projection_generation != PROJECTION_GENERATION
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            if recall_projection::contract(row)?.is_some() {
-                continue;
-            }
-            if let Some(value) = crate::session_import::restore_current(row)? {
-                if state
-                    .session_imports
-                    .insert(value.source_key(), value)
-                    .is_some()
-                {
-                    return Err(StoreError::StoreCorrupt);
-                }
-                continue;
-            }
-            if s23::S23State::restore_projection(row)? {
-                continue;
-            }
-            if synthesis::restore_wiki_projection(row)?.is_some() {
-                continue;
-            }
-            if procedure_effect::restore(row)?.is_some() {
-                continue;
-            }
-            if let Some(need) = recall_ledger::need(row)? {
-                state.recall_ledger.restore(row, need)?;
-                continue;
-            }
-            let payload_json = row
-                .payload_json
-                .as_deref()
-                .ok_or(StoreError::StoreCorrupt)?;
-            let payload: JournalPayload =
-                serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
-            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
-            if !payload
-                .matches_canonical_json(payload_json)
-                .map_err(|_| StoreError::StoreCorrupt)?
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            state.restore_row(row, payload)?;
+            state.restore_current_row(row, checkpoint_frontier)?;
         }
-        state.deletions.validate_restored()?;
-        if state.session_imports.values().any(|current| {
-            current
-                .metadata
-                .repository_read_restrictions
-                .as_ref()
-                .is_some_and(|ids| ids.iter().any(|id| !state.repositories.contains_key(id)))
-        }) {
-            return Err(StoreError::StoreCorrupt);
-        }
-        state.scope_purges.validate_restored()?;
-        state.rebuild_revision_currents()?;
+        state.finish_current_restore()?;
         Ok(state)
     }
 
@@ -13278,105 +13299,153 @@ impl ReducerState {
         Ok(ProjectionSnapshot { frontier, rows })
     }
 
-    fn into_rows(mut self) -> Result<Vec<ObjectRow>, StoreError> {
-        self.close_deleted_product_state();
+    /// The complete-path collection over the row emission: every canonical
+    /// row is emitted once and the original deletion/purge product filters
+    /// run over the collected set, exactly as before the emit refactor.
+    fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
+        let deletions = self.deletions.clone();
+        let scope_purges = self.scope_purges.clone();
         let repository_closures = self
             .repository_closures
             .values()
             .cloned()
             .collect::<Vec<_>>();
         let mut rows = Vec::new();
-        rows.extend(recall_projection::rows(&self.atoms, |atom| {
+        self.emit_rows(&mut |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        filter_product_rows(rows, &deletions, &scope_purges, repository_closures.iter())
+    }
+
+    /// The original snapshot emission, checkpoint included, without the
+    /// complete-path sort/collection. Each canonical row is emitted exactly
+    /// once to the caller, which owns its lifecycle.
+    fn emit_snapshot(
+        self,
+        frontier: u64,
+        emit: &mut dyn FnMut(ObjectRow) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.validate_evidence_relations()?;
+        self.emit_rows(emit)?;
+        emit(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION))
+    }
+
+    /// Emit every canonical row once, in constructor order (unsorted). The
+    /// complete snapshot path collects and sorts; the fused ordinary path
+    /// consumes each row and releases it immediately.
+    fn emit_rows(
+        mut self,
+        emit: &mut dyn FnMut(ObjectRow) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.close_deleted_product_state();
+        for row in recall_projection::rows(&self.atoms, |atom| {
             self.s23.atom_support_eligible(atom.revision_id)
-        })?);
-        rows.extend(self.recall_ledger.clone().rows(PROJECTION_GENERATION)?);
-        rows.extend(
-            self.session_imports
-                .values()
-                .map(|value| crate::session_import::current_row(value, PROJECTION_GENERATION))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        rows.extend(synthesis::wiki_rows(
+        })? {
+            emit(row)?;
+        }
+        for row in self.recall_ledger.clone().rows(PROJECTION_GENERATION)? {
+            emit(row)?;
+        }
+        for row in self
+            .session_imports
+            .values()
+            .map(|value| crate::session_import::current_row(value, PROJECTION_GENERATION))
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            emit(row)?;
+        }
+        for row in synthesis::wiki_rows(
             &self.atoms,
             &self.proposals,
             &self.episodes,
             &self.synthesis,
             &self.s23,
-        )?);
-        rows.extend(self.procedure.rows(PROJECTION_GENERATION, &self.s23)?);
-        rows.extend(self.procedure.effect_rows(
+        )? {
+            emit(row)?;
+        }
+        for row in self.procedure.rows(PROJECTION_GENERATION, &self.s23)? {
+            emit(row)?;
+        }
+        for row in self.procedure.effect_rows(
             &self.episode_revisions,
             &self.worktree_snapshots,
             &self.worktrees,
             &self.result_evidence_revisions,
             &self.artifact_revisions,
             PROJECTION_GENERATION,
-        )?);
-        rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
-        rows.extend(self.synthesis.rows()?);
+        )? {
+            emit(row)?;
+        }
+        for row in self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)? {
+            emit(row)?;
+        }
+        for row in self.synthesis.rows()? {
+            emit(row)?;
+        }
         for (migration, (payload, seq)) in self.migrations {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("projection:migration:{migration}"),
                 ObjectRowClass::Projection,
                 &payload,
                 seq,
-            )?);
+            )?)?;
         }
         for (key, (value, seq)) in self.dirty {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("runtime:dirty:{key}"),
                 ObjectRowClass::Runtime,
                 &JournalPayload::DirtyTarget(value),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.outbox {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("runtime:outbox:{id}"),
                 ObjectRowClass::Runtime,
                 &JournalPayload::OutboxEnqueued(value),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.jobs {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("runtime:job:{id}"),
                 ObjectRowClass::Runtime,
                 &JournalPayload::JobState(value),
                 seq,
-            )?);
+            )?)?;
         }
         for (kind, (value, seq)) in self.watermarks {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("runtime:watermark:{kind}"),
                 ObjectRowClass::Runtime,
                 &JournalPayload::WatermarkAdvanced(value),
                 seq,
-            )?);
+            )?)?;
         }
         if let Some((payload, seq)) = self.config {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 "runtime:config:current".into(),
                 ObjectRowClass::Runtime,
                 &payload,
                 seq,
-            )?);
+            )?)?;
         }
         if let Some((payload, seq)) = self.config_attempt {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 "runtime:config:attempt".into(),
                 ObjectRowClass::Runtime,
                 &payload,
                 seq,
-            )?);
+            )?)?;
         }
         for (event_id, (payload, seq)) in self.stale_audits {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("projection:audit:stale:{event_id}"),
                 ObjectRowClass::Projection,
                 &payload,
                 seq,
-            )?);
+            )?)?;
         }
         for (key, (value, seq)) in self.source_revisions {
             let fields = evidence_fields(
@@ -13388,28 +13457,28 @@ impl ReducerState {
                 None,
                 None,
             );
-            rows.push(evidence_object_row(
+            emit(evidence_object_row(
                 fields,
                 &JournalPayload::SourceRevisionRecorded(value),
                 seq,
-            )?);
+            )?)?;
         }
         for (_, (value, seq)) in self.source_receipts {
-            rows.push(source_receipt_row(value, seq)?);
+            emit(source_receipt_row(value, seq)?)?;
         }
         for (_, (value, seq)) in self.source_observations {
-            rows.push(source_observation_row(value, seq)?);
+            emit(source_observation_row(value, seq)?)?;
         }
         for (key, (value, seq)) in self.source_watermarks {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("runtime:watermark:source:{key}"),
                 ObjectRowClass::Runtime,
                 &JournalPayload::SourceIngestWatermark(value),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.evidence_surfaces {
-            rows.push(surface_row(id, value, seq)?);
+            emit(surface_row(id, value, seq)?)?;
         }
         for ((id, revision), (value, seq)) in self.host_occurrence_revisions {
             let mut row = physical_object_row(
@@ -13421,7 +13490,7 @@ impl ReducerState {
                 seq,
             )?;
             row.row_id = format!("object:evidence:host_occurrence:{id}@{revision}");
-            rows.push(row);
+            emit(row)?;
         }
         for ((id, revision), (value, seq)) in self.operation_revisions {
             let mut row = physical_object_row(
@@ -13433,31 +13502,31 @@ impl ReducerState {
                 seq,
             )?;
             row.row_id = format!("object:work:operation:{id}@{revision}");
-            rows.push(row);
+            emit(row)?;
         }
         for (id, (value, seq)) in self.scope_effects {
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Work,
                 "scope_effect",
                 id.to_string(),
                 id.to_string(),
                 &JournalPayload::ScopeEffectDerived(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.normalization_watermarks {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("runtime:watermark:normalization:{id}"),
                 ObjectRowClass::Runtime,
                 &JournalPayload::NormalizationWatermark(value),
                 seq,
-            )?);
+            )?)?;
         }
         for (value, seq) in self.execution_lanes.into_values() {
-            rows.push(inbox_work_row(
+            emit(inbox_work_row(
                 &JournalPayload::ExecutionLaneRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         let current_capture_revision_ids = self
             .capture_receipts
@@ -13465,101 +13534,103 @@ impl ReducerState {
             .map(|(value, _)| value.capture_receipt_revision_id)
             .collect::<BTreeSet<_>>();
         for (value, seq) in self.capture_receipts.into_values() {
-            rows.push(inbox_work_row(
+            emit(inbox_work_row(
                 &JournalPayload::CaptureReceiptRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (revision_id, (value, seq)) in self.capture_receipt_revisions {
             if current_capture_revision_ids.contains(&revision_id) {
                 continue;
             }
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Evidence,
                 "capture_receipt_revision",
                 revision_id.to_string(),
                 revision_id.to_string(),
                 &JournalPayload::CaptureReceiptRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (marker_id, (value, seq)) in self.capture_gaps {
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Evidence,
                 "capture_gap_marker",
                 marker_id.clone(),
                 format!("{}@{}", marker_id, value.reconciliation_revision),
                 &JournalPayload::CaptureGapMarkerRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.capture_outages {
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Evidence,
                 "capture_outage_interval",
                 id.to_string(),
                 format!("{}@{}", id, value.reconciliation_revision),
                 &JournalPayload::CaptureOutageIntervalRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (reference, (value, seq)) in self.source_close_reconciliations {
-            rows.push(runtime_row(
+            emit(runtime_row(
                 format!("runtime:reconciliation:{reference}"),
                 ObjectRowClass::Runtime,
                 &JournalPayload::SourceCloseReconciliation(value),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.repositories {
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Work,
                 "repository",
                 id.to_string(),
                 format!("{}@{}", id, value.repository_revision),
                 &JournalPayload::RepositoryInstanceRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
-        rows.extend(self.inventory.rows()?);
+        for row in self.inventory.rows()? {
+            emit(row)?;
+        }
         for (id, (value, seq)) in self.worktrees {
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Work,
                 "worktree",
                 id.to_string(),
                 format!("{}@{}", id, value.worktree_revision),
                 &JournalPayload::WorktreeInstanceRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.worktree_snapshots {
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Work,
                 "worktree_snapshot",
                 id.to_string(),
                 id.to_string(),
                 &JournalPayload::WorktreeSnapshotRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (value, seq) in self.worktree_transitions.into_values() {
-            rows.push(inbox_work_row(
+            emit(inbox_work_row(
                 &JournalPayload::WorktreeTransitionRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.integration_events {
-            rows.push(physical_object_row(
+            emit(physical_object_row(
                 ObjectFamily::Work,
                 "integration_event",
                 id.to_string(),
                 id.to_string(),
                 &JournalPayload::IntegrationEventRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.tasks {
-            rows.push(work_identity_row(
+            emit(work_identity_row(
                 "task",
                 id.to_string(),
                 value.revision_id.to_string(),
@@ -13570,10 +13641,10 @@ impl ReducerState {
                 None,
                 &JournalPayload::TaskRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.workstreams {
-            rows.push(work_identity_row(
+            emit(work_identity_row(
                 "workstream",
                 id.to_string(),
                 value.revision_id.to_string(),
@@ -13584,25 +13655,25 @@ impl ReducerState {
                 value.active_worktree_instance_id.map(|id| id.to_string()),
                 &JournalPayload::WorkstreamRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (value, seq) in self.work_bindings.into_values() {
-            rows.push(inbox_work_row(
+            emit(inbox_work_row(
                 &JournalPayload::WorkBindingRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (value, seq) in self.attempt_revisions.into_values() {
-            rows.push(inbox_work_row(
+            emit(inbox_work_row(
                 &JournalPayload::AttemptRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (value, seq) in self.competing_group_revisions.into_values() {
-            rows.push(inbox_work_row(
+            emit(inbox_work_row(
                 &JournalPayload::CompetingAttemptGroupRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (_revision_id, (value, seq)) in self.operation_burst_revisions {
             let mut row = work_identity_row(
@@ -13623,16 +13694,16 @@ impl ReducerState {
                     .as_deref()
                     .ok_or(StoreError::StoreCorrupt)?
             );
-            rows.push(row);
+            emit(row)?;
         }
         for (value, seq) in self.episode_revisions.into_values() {
-            rows.push(inbox_work_row(
+            emit(inbox_work_row(
                 &JournalPayload::WorkEpisodeRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (key, (value, seq)) in self.checkpoints {
-            rows.push(work_identity_row(
+            emit(work_identity_row(
                 "work_checkpoint",
                 key,
                 value.episode_revision_id.to_string(),
@@ -13643,10 +13714,10 @@ impl ReducerState {
                 None,
                 &JournalPayload::WorkCheckpointRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
         for (id, (value, seq)) in self.corrections {
-            rows.push(work_identity_row(
+            emit(work_identity_row(
                 "segmentation_correction",
                 id.to_string(),
                 id.to_string(),
@@ -13657,13 +13728,15 @@ impl ReducerState {
                 None,
                 &JournalPayload::SegmentationCorrectionRecorded(Box::new(value)),
                 seq,
-            )?);
+            )?)?;
         }
-        rows.extend(recovery::revision_rows(
+        for row in recovery::revision_rows(
             self.recovery_request_revisions,
             self.recovery_bundles,
             self.recovery_application_revisions,
-        )?);
+        )? {
+            emit(row)?;
+        }
         for (_revision_id, (value, seq)) in self.experiment_run_revisions {
             let mut row = work_identity_row(
                 "experiment_run",
@@ -13683,7 +13756,7 @@ impl ReducerState {
                     .as_deref()
                     .ok_or(StoreError::StoreCorrupt)?
             );
-            rows.push(row);
+            emit(row)?;
         }
         for (_revision_id, (value, seq)) in self.result_evidence_revisions {
             let mut row = work_identity_row(
@@ -13704,7 +13777,7 @@ impl ReducerState {
                     .as_deref()
                     .ok_or(StoreError::StoreCorrupt)?
             );
-            rows.push(row);
+            emit(row)?;
         }
         for (_revision_id, (value, seq)) in self.artifact_revisions {
             let mut row = work_identity_row(
@@ -13729,7 +13802,7 @@ impl ReducerState {
                     .as_deref()
                     .ok_or(StoreError::StoreCorrupt)?
             );
-            rows.push(row);
+            emit(row)?;
         }
         for (_revision_id, (value, seq)) in self.atom_revisions {
             let mut row = semantic_atom_row(
@@ -13741,23 +13814,22 @@ impl ReducerState {
                 .s23
                 .atom_support_state(value.revision_id)
                 .map(str::to_owned);
-            rows.push(row);
+            emit(row)?;
         }
         for (_revision_id, (value, seq)) in self.proposal_revisions {
-            rows.push(semantic_proposal_row(
+            emit(semantic_proposal_row(
                 &value,
                 &JournalPayload::RevisionProposalRecorded(Box::new(value.clone())),
                 seq,
-            )?);
+            )?)?;
         }
-        rows.extend(self.deletions.rows()?);
-        rows.extend(self.scope_purges.rows()?);
-        filter_product_rows(
-            rows,
-            &self.deletions,
-            &self.scope_purges,
-            repository_closures.iter(),
-        )
+        for row in self.deletions.rows()? {
+            emit(row)?;
+        }
+        for row in self.scope_purges.rows()? {
+            emit(row)?;
+        }
+        Ok(())
     }
 
     fn close_deleted_product_state(&mut self) {
@@ -14679,9 +14751,9 @@ fn source_revision_key(value: &SourceRevisionRecorded) -> String {
 // the same writer call; this is never retained in the writer or a cache.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct ProjectionJournalDelta {
-    journal_epoch: u64,
-    checkpoint: u64,
-    rows: Vec<JournalRow>,
+    pub(crate) journal_epoch: u64,
+    pub(crate) checkpoint: u64,
+    pub(crate) rows: Vec<JournalRow>,
 }
 
 impl ProjectionJournalDelta {
@@ -14727,23 +14799,70 @@ pub(crate) struct CaptureObjectsUpdate {
     pub delta: ProjectionJournalDelta,
 }
 
+/// The single ordinary catch-up result. `Complete` is the original complete
+/// algorithm's snapshot; `Consumed` is the fused row consumption's fixed
+/// scalars plus the rows and accumulator its original consumers need.
+pub(crate) enum CatchUpOutcome {
+    Complete {
+        snapshot: ProjectionSnapshot,
+        objects_epoch: u64,
+        delta: Option<ProjectionJournalDelta>,
+    },
+    Consumed {
+        frontier: u64,
+        objects_epoch: u64,
+        delta: ProjectionJournalDelta,
+        runtime_rows: Vec<ObjectRow>,
+        l0002: Box<crate::query::L0002RowAccumulator>,
+    },
+}
+
+/// The classified scalars shared by every post-restore finish path.
+struct CatchUpScalars {
+    validated_frontier: Option<u64>,
+    journal_frontier: u64,
+    checkpoint_frontier: u64,
+    journal_epoch: u64,
+    current_epoch: u64,
+    reconcile_recall: bool,
+    reconcile_core: bool,
+    reconcile_wiki: bool,
+    reconcile_procedure_effect: bool,
+    reconcile_all: bool,
+    existing_ledger: bool,
+    inject_before_commit_failure: bool,
+}
+
 impl ProjectionWorker {
     pub(crate) fn new(sqlite: SqliteHandle) -> Self {
         Self { sqlite }
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(false, None, None).await?.0)
+        match self.catch_up_inner(false, None, None, None).await? {
+            CatchUpOutcome::Complete { snapshot, .. } => Ok(snapshot),
+            CatchUpOutcome::Consumed { .. } => unreachable!("no accumulator was provided"),
+        }
     }
 
+    #[cfg(test)]
     pub(crate) async fn catch_up_validated(
         &self,
         // Old objects epoch/checkpoint and the confirmed committed journal frontier.
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_rows)
-            .await
+        match self
+            .catch_up_inner(false, validated_current, appended_rows, None)
+            .await?
+        {
+            CatchUpOutcome::Complete {
+                snapshot,
+                objects_epoch,
+                delta,
+            } => Ok((snapshot, objects_epoch, delta)),
+            CatchUpOutcome::Consumed { .. } => unreachable!("no accumulator was provided"),
+        }
     }
 
     /// Try the closed capture successor path. `Ok(None)` means the retained
@@ -14869,31 +14988,28 @@ impl ProjectionWorker {
         }))
     }
 
-    async fn catch_up_inner(
+    /// The one ordinary catch-up core. Every path restores the complete
+    /// current at the fixed stamp, reads and classifies the delta, and hands
+    /// the shared restored state to the single admission/ordinal application
+    /// and finish. Error order is the original one: physical current reads
+    /// first, then the decode/checkpoint errors, then the delta errors.
+    pub(crate) async fn catch_up_inner(
         &self,
         inject_before_commit_failure: bool,
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
-    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        let (current, journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
+        l0002: Option<Box<crate::query::L0002RowAccumulator>>,
+    ) -> Result<CatchUpOutcome, StoreError> {
+        let (journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
             let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             let stamp = state.stamp()?;
-            let rows = state.object_rows()?;
             (
-                rows,
                 stamp.journal_epoch,
                 stamp.objects_epoch,
                 stamp.object_checkpoint,
                 stamp.frontier,
             )
         };
-        let checkpoint = current
-            .iter()
-            .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
-            .ok_or(StoreError::StoreCorrupt)?;
-        if checkpoint.source_event_seq != checkpoint_frontier {
-            return Err(StoreError::StoreCorrupt);
-        }
         let validated_frontier = validated_current
             .filter(|(epoch, checkpoint, _)| {
                 *epoch == current_epoch && *checkpoint == checkpoint_frontier
@@ -14910,7 +15026,85 @@ impl ProjectionWorker {
         if checkpoint_frontier > journal_frontier {
             return Err(StoreError::StoreCorrupt);
         }
-        if checkpoint_frontier == 0 && current.len() == 1 && journal_frontier > 0 {
+        let untrusted = validated_frontier.is_none();
+        // Restore the complete current in bounded pages. Each page read takes
+        // a short guard that ends before decoding/reducing, so a later page's
+        // physical failure still precedes an earlier page's staged decode
+        // failure, exactly like the original one-shot read followed by the
+        // full decode.
+        let mut state = ReducerState::default();
+        let mut membership: BTreeMap<String, bool> = BTreeMap::new();
+        let mut retained_current: Vec<ObjectRow> = Vec::new();
+        let mut current_checkpoint: Option<(String, u64, u64)> = None;
+        let mut current_checkpoint_rows = 0usize;
+        let mut duplicate_current_row = false;
+        let mut staged_decode: Option<StoreError> = None;
+        let mut offset = 0u64;
+        loop {
+            let page = {
+                let guard = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+                guard.object_page(crate::sqlite_state::OBJECT_ROW_PAGE_SIZE, offset)?
+            };
+            let last = page.len() < crate::sqlite_state::OBJECT_ROW_PAGE_SIZE;
+            for row in &page {
+                if membership.insert(row.row_id.clone(), false).is_some() {
+                    duplicate_current_row = true;
+                }
+                if untrusted {
+                    retained_current.push(row.clone());
+                }
+                if row.row_kind == ObjectRowKind::Checkpoint {
+                    current_checkpoint_rows += 1;
+                    current_checkpoint = Some((
+                        row.row_id.clone(),
+                        row.source_event_seq,
+                        row.projection_generation,
+                    ));
+                }
+                if staged_decode.is_some() || duplicate_current_row {
+                    // Keep validating the remaining pages physically; the
+                    // first staged decode failure has already been kept.
+                    continue;
+                }
+                if let Err(error) = state.restore_current_row(row, checkpoint_frontier) {
+                    staged_decode = Some(error);
+                }
+            }
+            if last {
+                break;
+            }
+            offset = offset
+                .checked_add(crate::sqlite_state::OBJECT_ROW_PAGE_SIZE as u64)
+                .ok_or(StoreError::StoreCorrupt)?;
+        }
+        match current_checkpoint {
+            Some((row_id, seq, generation))
+                if current_checkpoint_rows == 1
+                    && row_id == OBJECTS_CHECKPOINT_ID
+                    && seq == checkpoint_frontier
+                    && generation == PROJECTION_GENERATION => {}
+            _ => return Err(StoreError::StoreCorrupt),
+        }
+        if duplicate_current_row {
+            // The original membership walk rejects a current set whose row
+            // ids are not a strict subset of the expected unique ids.
+            return Err(StoreError::Projection);
+        }
+        // Decode failures precede the delta exactly like the original, which
+        // restored and validated the current before reading it.
+        if let Some(error) = staged_decode {
+            return Err(error);
+        }
+        state.finish_current_restore()?;
+        if untrusted {
+            // The writer did not validate this exact old input before its
+            // append: the persisted rows must be the canonical regeneration.
+            let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
+            if canonical.rows != retained_current {
+                return Err(StoreError::Projection);
+            }
+        }
+        if checkpoint_frontier == 0 && membership.len() == 1 && journal_frontier > 0 {
             let expected = self.full_snapshot().await?;
             if expected.frontier != journal_frontier {
                 return Err(StoreError::StoreCorrupt);
@@ -14941,16 +15135,12 @@ impl ProjectionWorker {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .objects_epoch();
-            return Ok((expected, committed_epoch, None));
+            return Ok(CatchUpOutcome::Complete {
+                snapshot: expected,
+                objects_epoch: committed_epoch,
+                delta: None,
+            });
         }
-        let mut state = if validated_frontier.is_some() {
-            // The writer already validated this exact old input before its
-            // append. Decode it fully, but do not regenerate the same old rows.
-            // Delta admission and the resulting snapshot are still validated.
-            ReducerState::decode_current_rows(&current, checkpoint_frontier)?
-        } else {
-            ReducerState::from_current_rows(&current, checkpoint_frontier)?
-        };
         let delta = if let Some(rows) = appended_rows.filter(|_| validated_frontier.is_some()) {
             // The exact typed delta acknowledged by the physical journal
             // commit, decoded through the same domain path as a persisted read.
@@ -14963,14 +15153,22 @@ impl ProjectionWorker {
         };
         validate_delta(checkpoint_frontier, journal_frontier, &delta)?;
         if delta.is_empty() {
-            return Ok((
-                ProjectionSnapshot {
+            let rows = if untrusted {
+                retained_current
+            } else {
+                self.sqlite
+                    .lock()
+                    .map_err(|_| StoreError::StoreCorrupt)?
+                    .object_rows()?
+            };
+            return Ok(CatchUpOutcome::Complete {
+                snapshot: ProjectionSnapshot {
                     frontier: checkpoint_frontier,
-                    rows: current,
+                    rows,
                 },
-                current_epoch,
-                None,
-            ));
+                objects_epoch: current_epoch,
+                delta: None,
+            });
         }
         let reconcile_core = delta.iter().any(|row| {
             matches!(
@@ -15008,6 +15206,66 @@ impl ProjectionWorker {
                 || progress.stage == ScopePurgeStage::Pending
                 || row.algorithm_revision == crate::restore::LEDGER_REVISION)
         })?;
+        // A previous deletion/purge also needs the complete product filter;
+        // looking only at this command's delta does not establish eligibility
+        // for the fused consumption.
+        let existing_ledger = state.deletions.events().next().is_some()
+            || state.scope_purges.events().next().is_some();
+        // The finish futures embed large sequential locals; box them so the
+        // caller's composed future stays small enough for a debug stack.
+        Box::pin(self.catch_up_apply_and_finish(
+            CatchUpScalars {
+                validated_frontier,
+                journal_frontier,
+                checkpoint_frontier,
+                journal_epoch,
+                current_epoch,
+                reconcile_recall,
+                reconcile_core,
+                reconcile_wiki,
+                reconcile_procedure_effect,
+                reconcile_all,
+                existing_ledger,
+                inject_before_commit_failure,
+            },
+            state,
+            membership,
+            if untrusted {
+                Some(retained_current)
+            } else {
+                None
+            },
+            delta,
+            l0002,
+        ))
+        .await
+    }
+
+    /// The shared admission/ordinal application and the original finish:
+    /// complete snapshot validation and commit for every non-fused path.
+    async fn catch_up_apply_and_finish(
+        &self,
+        scalars: CatchUpScalars,
+        mut state: ReducerState,
+        membership: BTreeMap<String, bool>,
+        retained_current: Option<Vec<ObjectRow>>,
+        delta: Vec<JournalRow>,
+        l0002: Option<Box<crate::query::L0002RowAccumulator>>,
+    ) -> Result<CatchUpOutcome, StoreError> {
+        let CatchUpScalars {
+            validated_frontier,
+            journal_frontier,
+            checkpoint_frontier,
+            journal_epoch,
+            current_epoch,
+            reconcile_recall,
+            reconcile_core,
+            reconcile_wiki,
+            reconcile_procedure_effect,
+            reconcile_all,
+            existing_ledger,
+            inject_before_commit_failure,
+        } = scalars;
         let mut admission = state.admission_state(checkpoint_frontier)?;
         for batch in ordered_command_batches(&delta)? {
             admission = admission.apply_row_batch_owned(&batch)?;
@@ -15016,12 +15274,35 @@ impl ProjectionWorker {
             }
             state.validate_evidence_relations()?;
         }
-        let expected = state.into_snapshot(journal_frontier)?;
         let ordinary_upsert = !reconcile_all
             && !reconcile_recall
             && !reconcile_core
             && !reconcile_wiki
             && !reconcile_procedure_effect;
+        if ordinary_upsert && validated_frontier.is_some() && !existing_ledger {
+            // The fused consumption: an accumulator only exists when the
+            // writer really needs the L0002 derivation (indexes on, no public
+            // snapshot consumer, trusted warm ordinary delta).
+            if let Some(accumulator) = l0002 {
+                return Box::pin(self.catch_up_consumed(
+                    scalars,
+                    state,
+                    membership,
+                    delta,
+                    accumulator,
+                ))
+                .await;
+            }
+        }
+        let current = if let Some(rows) = retained_current {
+            rows
+        } else {
+            self.sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .object_rows()?
+        };
+        let expected = state.into_snapshot(journal_frontier)?;
         if ordinary_upsert {
             validate_ordinary_upsert_rows(&current, &expected.rows)?;
         }
@@ -15063,15 +15344,15 @@ impl ProjectionWorker {
             validate_ordinary_commit_version(current_epoch, committed_epoch)?;
             // The validated current rows are retained or replaced by changed
             // rows; the same transaction wrote those rows and the checkpoint.
-            return Ok((
-                expected,
-                committed_epoch,
-                Some(ProjectionJournalDelta {
+            return Ok(CatchUpOutcome::Complete {
+                snapshot: expected,
+                objects_epoch: committed_epoch,
+                delta: Some(ProjectionJournalDelta {
                     journal_epoch,
                     checkpoint: checkpoint_frontier,
                     rows: delta,
                 }),
-            ));
+            });
         }
         let persisted = self
             .sqlite
@@ -15085,20 +15366,130 @@ impl ProjectionWorker {
         if persisted_snapshot.rows != expected.rows {
             return Err(StoreError::Projection);
         }
-        Ok((
-            persisted_snapshot,
-            committed_epoch,
-            Some(ProjectionJournalDelta {
+        Ok(CatchUpOutcome::Complete {
+            snapshot: persisted_snapshot,
+            objects_epoch: committed_epoch,
+            delta: Some(ProjectionJournalDelta {
                 journal_epoch,
                 checkpoint: checkpoint_frontier,
                 rows: delta,
             }),
-        ))
+        })
+    }
+
+    /// The fused row consumption over the shared restored state: each
+    /// canonical row is emitted exactly once into the changed-row membership
+    /// walk (per-id original-row equality), the runtime collector and the
+    /// L0002 accumulator, and released immediately; only changed rows and
+    /// fixed scalars survive. No complete expected collection is built.
+    async fn catch_up_consumed(
+        &self,
+        scalars: CatchUpScalars,
+        state: ReducerState,
+        mut membership: BTreeMap<String, bool>,
+        delta: Vec<JournalRow>,
+        mut accumulator: Box<crate::query::L0002RowAccumulator>,
+    ) -> Result<CatchUpOutcome, StoreError> {
+        let CatchUpScalars {
+            journal_frontier,
+            checkpoint_frontier,
+            journal_epoch,
+            current_epoch,
+            inject_before_commit_failure,
+            ..
+        } = scalars;
+        let mut changed_rows: Vec<ObjectRow> = Vec::new();
+        let mut runtime_rows: Vec<ObjectRow> = Vec::new();
+        let mut comparison_batch = Vec::new();
+        let mut staged_compare: Option<StoreError> = None;
+        state.emit_snapshot(journal_frontier, &mut |row: ObjectRow| {
+            if row.row_kind == ObjectRowKind::Data && row.row_class == Some(ObjectRowClass::Runtime)
+            {
+                runtime_rows.push(row.clone());
+            }
+            accumulator.consume_row(&row);
+            let previous = membership.insert(row.row_id.clone(), true);
+            if staged_compare.is_none() {
+                match previous {
+                    Some(true) => staged_compare = Some(StoreError::Projection),
+                    None => changed_rows.push(row),
+                    Some(false) => comparison_batch.push(row),
+                }
+                if comparison_batch.len() == crate::sqlite_state::OBJECT_ROW_PAGE_SIZE {
+                    staged_compare = self
+                        .compare_object_batch(&mut comparison_batch, &mut changed_rows)
+                        .err();
+                }
+            }
+            Ok(())
+        })?;
+        if staged_compare.is_none() {
+            staged_compare = self
+                .compare_object_batch(&mut comparison_batch, &mut changed_rows)
+                .err();
+        }
+        if let Some(error) = staged_compare {
+            return Err(error);
+        }
+        if membership.values().any(|produced| !produced) {
+            // An upsert cannot remove an old row: every current row id must
+            // be emitted again by the producer.
+            return Err(StoreError::Projection);
+        }
+        if inject_before_commit_failure {
+            return Err(StoreError::Projection);
+        }
+        self.commit_rows(&changed_rows, ObjectReconcile::default())?;
+        let committed_epoch = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .objects_epoch();
+        validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+        runtime_rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        Ok(CatchUpOutcome::Consumed {
+            frontier: journal_frontier,
+            objects_epoch: committed_epoch,
+            delta: ProjectionJournalDelta {
+                journal_epoch,
+                checkpoint: checkpoint_frontier,
+                rows: delta,
+            },
+            runtime_rows,
+            l0002: accumulator,
+        })
+    }
+
+    fn compare_object_batch(
+        &self,
+        batch: &mut Vec<ObjectRow>,
+        changed: &mut Vec<ObjectRow>,
+    ) -> Result<(), StoreError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let ids = batch
+            .iter()
+            .map(|row| row.row_id.as_str())
+            .collect::<Vec<_>>();
+        let old_rows = {
+            let state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            state.object_rows_by_ids(&ids)?
+        };
+        for (row, old) in batch.drain(..).zip(old_rows) {
+            if row != old.ok_or(StoreError::StoreCorrupt)? {
+                changed.push(row);
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     async fn catch_up_with_commit_fault(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(true, None, None).await?.0)
+        Ok(match self.catch_up_inner(true, None, None, None).await? {
+            CatchUpOutcome::Complete { snapshot, .. } => snapshot,
+            CatchUpOutcome::Consumed { .. } => unreachable!("no accumulator was provided"),
+        })
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {

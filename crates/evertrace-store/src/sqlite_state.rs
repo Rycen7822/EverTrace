@@ -810,6 +810,46 @@ impl SqliteState {
         self.with_connection(read_object_rows)
     }
 
+    /// A bounded batch of full physical rows, in the requested ID order.
+    pub(crate) fn object_rows_by_ids(
+        &self,
+        ids: &[&str],
+    ) -> Result<Vec<Option<ObjectRow>>, StoreError> {
+        if ids.len() > OBJECT_ROW_PAGE_SIZE {
+            return Err(StoreError::Projection);
+        }
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(SELECT_OBJECT_CHECKPOINT)
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            ids.iter()
+                .map(|id| {
+                    let mut queried = statement
+                        .query(params![id])
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    match queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+                        Some(sql_row) => {
+                            let row = object_row_from_sql(sql_row)?;
+                            row.validate()?;
+                            Ok(Some(row))
+                        }
+                        None => Ok(None),
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Read one bounded row_id-ordered page. Release the state guard before
+    /// decoding domain payloads or reducing the returned rows.
+    pub(crate) fn object_page(
+        &self,
+        page_size: usize,
+        offset: u64,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
+        self.with_connection(|connection| read_object_page(connection, page_size, offset))
+    }
+
     #[cfg(test)]
     pub(crate) fn object_checkpoint(&self) -> (u64, u64) {
         (self.object_checkpoint, self.object_generation)
@@ -817,6 +857,17 @@ impl SqliteState {
 
     /// Test-only raw upsert of one object row without validation, so consumers
     /// must detect a malformed row themselves.
+    #[cfg(test)]
+    pub(crate) fn delete_object_row_for_test(&mut self, row_id: &str) -> Result<(), StoreError> {
+        self.ensure_usable()?;
+        let connection = self.connection.as_mut().ok_or(StoreError::Io)?;
+        connection
+            .execute("DELETE FROM object_rows WHERE row_id = ?1", params![row_id])
+            .map_err(|_| StoreError::Io)?;
+        self.data_version_known = false;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_object_row_for_test(&mut self, row: &ObjectRow) -> Result<(), StoreError> {
         self.ensure_usable()?;
@@ -1588,6 +1639,31 @@ pub(crate) fn read_all_rows(connection: &Connection) -> Result<Vec<JournalRow>, 
     while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
         rows.push(journal_row_from_sql(sql_row)?);
     }
+    Ok(rows)
+}
+
+pub(crate) const OBJECT_ROW_PAGE_SIZE: usize = 1024;
+
+fn read_object_page(
+    connection: &Connection,
+    page_size: usize,
+    offset: u64,
+) -> Result<Vec<ObjectRow>, StoreError> {
+    let mut statement = connection
+        .prepare(&format!("{} LIMIT ?1 OFFSET ?2", SELECT_OBJECT_ROWS))
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let limit = i64::try_from(page_size).map_err(|_| StoreError::StoreCorrupt)?;
+    let offset = i64::try_from(offset).map_err(|_| StoreError::StoreCorrupt)?;
+    let mut queried = statement
+        .query(params![limit, offset])
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut rows = Vec::new();
+    while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+        let row = object_row_from_sql(sql_row)?;
+        row.validate()?;
+        rows.push(row);
+    }
+    rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
     Ok(rows)
 }
 

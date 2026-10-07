@@ -5,8 +5,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
+    evidence::{EvidenceSurface, HostOccurrence, Operation, ScopeEffect, SourceReceipt},
+    ids::{
+        AttemptId, CompetingAttemptGroupId, ExecutionLaneId, ExperimentRunId, HostOccurrenceId,
+        IntegrationEventId, OperationBurstId, OperationId, ProcedureNegativeEvidenceId,
+        ProcedureUsageId, RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId,
+        RepositoryId, ResultEvidenceId, ScopeEffectId, SourceObservationId, SourceReceiptId,
+        TaskId, WorkArtifactId, WorkBindingRevisionId, WorkEpisodeId, WorkstreamId, WorktreeId,
+        WorktreeSnapshotId, WorktreeTransitionId,
+    },
+    procedure::{
+        ProcedureNegativeEvidence, ProcedureNegativeReviewEvent, ProcedureRevision,
+        ProcedureUsageRevision,
+    },
+    repository::{
+        IntegrationEvent, RecoveryApplication, RecoveryBundle, RecoveryCaptureRequest,
+        RepositoryInstance, WorktreeInstance, WorktreeSnapshot, WorktreeTransition,
+    },
     revision::RevisionId,
-    semantic::Atom,
+    semantic::{
+        Atom, CoreMembership, GlobalSuccessorSupportContract, ResultEvidence, RevisionProposal,
+        SemanticDigest, WikiProjection,
+    },
+    work::{
+        Attempt, CaptureReceipt, CompetingAttemptGroup, ExecutionLane, ExperimentRun,
+        OperationBurst, SegmentationCorrection, Task, WorkArtifact, WorkBindingRevision,
+        WorkCheckpoint, WorkEpisode, Workstream,
+    },
 };
 use lancedb::Table;
 
@@ -246,6 +271,36 @@ impl L0002ProjectionWorker {
             .commit_expected(handoff, expected, fail_relation_commit, fail_search_commit)
             .await?;
         Ok((snapshot, versions, true))
+    }
+
+    /// The fused ordinary path: the objects producer already fed the
+    /// accumulator row-by-row and staged its first derive-classed error.
+    /// The original operation order is preserved exactly: the persisted
+    /// handoff validates first (a native handoff error wins over any staged
+    /// derive error); a checkpoint-complete handoff is a legal NoOp that never
+    /// exposes a staged derive error; only a handoff that really needs
+    /// derivation finishes the accumulator and commits the families.
+    pub(crate) async fn catch_up_fused_handoff(
+        &self,
+        objects_frontier: u64,
+        journal_delta: Option<ProjectionJournalDelta>,
+        accumulator: Box<L0002RowAccumulator>,
+    ) -> Result<([u64; 2], bool), StoreError> {
+        let handoff = self
+            .prepare_handoff(objects_frontier, journal_delta)
+            .await?;
+        if handoff.relation_frontier == handoff.frontier
+            && handoff.search_frontier == handoff.frontier
+        {
+            // The legal NoOp never runs the derivation and never exposes a
+            // staged derive error; the accumulator and its staging drop with it.
+            return Ok((handoff.versions, false));
+        }
+        let expected = accumulator.finish(handoff.frontier)?;
+        let (_, versions) = self
+            .commit_expected(handoff, expected, false, false)
+            .await?;
+        Ok((versions, true))
     }
 
     /// Read and validate the complete persisted L0002 base for one journal
@@ -499,73 +554,216 @@ fn capture_delta_search(
     Ok(rows.into_iter().collect())
 }
 
-pub fn derive_l0002_projections(
-    objects: &ProjectionSnapshot,
-) -> Result<L0002ProjectionSnapshot, StoreError> {
-    if objects
-        .rows
-        .iter()
-        .filter(|row| row.row_kind == ObjectRowKind::Checkpoint)
-        .count()
-        != 1
-        || objects
-            .rows
-            .iter()
-            .find(|row| row.row_kind == ObjectRowKind::Checkpoint)
-            .is_none_or(|row| row.source_event_seq != objects.frontier)
-        || objects
-            .rows
-            .iter()
-            .any(|row| row.source_event_seq > objects.frontier)
+/// One staged entry of a keyed L0002 map. The row_id is kept only so the
+/// original physical-order tie-breaks (first/last lexicographic row_id at an
+/// equal sequence) stay explicit when rows no longer arrive in row_id order.
+#[derive(Clone)]
+struct Latest<V> {
+    value: V,
+    seq: u64,
+    row_id: Box<str>,
+}
+
+impl<V> Latest<V> {
+    fn new(value: V, seq: u64, row_id: &str) -> Self {
+        Self {
+            value,
+            seq,
+            row_id: row_id.into(),
+        }
+    }
+}
+
+/// Strictly-newer-sequence semantics of the original `latest` helper, made
+/// explicit for arbitrary visit order: a strictly greater sequence wins; at an
+/// equal sequence the first lexicographic row_id (the original physical read
+/// order) wins.
+fn latest_insert<K: Ord, V>(
+    map: &mut BTreeMap<K, Latest<V>>,
+    key: K,
+    value: V,
+    seq: u64,
+    row_id: &str,
+) {
+    match map.get(&key) {
+        Some(existing)
+            if existing.seq > seq
+                || (existing.seq == seq && existing.row_id.as_ref() <= row_id) => {}
+        _ => {
+            map.insert(key, Latest::new(value, seq, row_id));
+        }
+    }
+}
+
+/// The original unconditional map insertions selected the last visit in
+/// lexicographic row_id order, independent of sequence; an equal row_id is a
+/// later visit and replaces too.
+fn replace_insert<K: Ord, V>(
+    map: &mut BTreeMap<K, Latest<V>>,
+    key: K,
+    value: V,
+    seq: u64,
+    row_id: &str,
+) {
+    if map
+        .get(&key)
+        .is_none_or(|existing| row_id >= existing.row_id.as_ref())
     {
-        return Err(StoreError::StoreCorrupt);
+        map.insert(key, Latest::new(value, seq, row_id));
+    }
+}
+
+/// The current-revision winner needs the strictly-newest sequence; at an
+/// equal sequence the first lexicographic row_id wins, as in the original
+/// physical read order.
+fn current_revision_insert(
+    map: &mut BTreeMap<String, (u64, String, Box<str>)>,
+    object_id: &str,
+    revision_id: &str,
+    seq: u64,
+    row_id: &str,
+) {
+    match map.get(object_id) {
+        Some((existing_seq, _, existing_row))
+            if *existing_seq > seq || (*existing_seq == seq && existing_row.as_ref() <= row_id) => {
+        }
+        _ => {
+            map.insert(
+                object_id.to_owned(),
+                (seq, revision_id.to_owned(), row_id.into()),
+            );
+        }
+    }
+}
+
+fn latest_values<K: Ord, V: Clone>(map: &BTreeMap<K, Latest<V>>) -> Vec<V> {
+    map.values().map(|entry| entry.value.clone()).collect()
+}
+
+/// The private L0002 accumulator: the concrete local maps and algorithms of
+/// the original whole-snapshot derive moved into one consume/finish owner.
+/// Rows are consumed exactly once; evaluation that needs future facts (Wiki
+/// source atoms and exact-identifier currentness) is deferred to `finish`,
+/// never buffered as raw rows.
+#[derive(Default)]
+pub(crate) struct L0002RowAccumulator {
+    staged_wiki_atom: Option<StoreError>,
+    staged_filter: Option<StoreError>,
+    staged_body: Option<StoreError>,
+    checkpoint_count: usize,
+    checkpoint_seq: Option<u64>,
+    max_data_seq: u64,
+    wiki_atoms_by_revision: BTreeMap<RevisionId, Atom>,
+    current_revisions: BTreeMap<String, (u64, String, Box<str>)>,
+    receipts: BTreeMap<SourceReceiptId, Latest<SourceReceipt>>,
+    surfaces: BTreeMap<SourceObservationId, Latest<EvidenceSurface>>,
+    occurrences: BTreeMap<HostOccurrenceId, Latest<HostOccurrence>>,
+    operations: BTreeMap<OperationId, Latest<Operation>>,
+    effects: BTreeMap<ScopeEffectId, Latest<ScopeEffect>>,
+    repositories: BTreeMap<RepositoryId, Latest<RepositoryInstance>>,
+    worktrees: BTreeMap<WorktreeId, Latest<WorktreeInstance>>,
+    snapshots: BTreeMap<WorktreeSnapshotId, Latest<WorktreeSnapshot>>,
+    transitions: BTreeMap<WorktreeTransitionId, Latest<WorktreeTransition>>,
+    integrations: BTreeMap<IntegrationEventId, Latest<IntegrationEvent>>,
+    tasks: BTreeMap<TaskId, Latest<Task>>,
+    workstreams: BTreeMap<WorkstreamId, Latest<Workstream>>,
+    bindings: BTreeMap<WorkBindingRevisionId, Latest<WorkBindingRevision>>,
+    attempts: BTreeMap<AttemptId, Latest<Attempt>>,
+    groups: BTreeMap<CompetingAttemptGroupId, Latest<CompetingAttemptGroup>>,
+    lanes: BTreeMap<ExecutionLaneId, Latest<ExecutionLane>>,
+    capture_receipts: BTreeMap<ExecutionLaneId, Latest<CaptureReceipt>>,
+    bursts: BTreeMap<OperationBurstId, Latest<OperationBurst>>,
+    episodes: BTreeMap<WorkEpisodeId, Latest<WorkEpisode>>,
+    checkpoints: BTreeMap<String, Latest<WorkCheckpoint>>,
+    corrections: BTreeMap<RevisionId, Latest<SegmentationCorrection>>,
+    recovery_requests: BTreeMap<RecoveryCaptureRequestId, Latest<RecoveryCaptureRequest>>,
+    recovery_bundles: BTreeMap<RecoveryBundleId, Latest<RecoveryBundle>>,
+    recovery_applications: BTreeMap<RecoveryApplicationId, Latest<RecoveryApplication>>,
+    runs: BTreeMap<ExperimentRunId, Latest<ExperimentRun>>,
+    results: BTreeMap<ResultEvidenceId, Latest<ResultEvidence>>,
+    artifacts: BTreeMap<WorkArtifactId, Latest<WorkArtifact>>,
+    atoms: BTreeMap<RevisionId, Latest<Atom>>,
+    proposals: BTreeMap<RevisionId, Latest<RevisionProposal>>,
+    procedures: BTreeMap<RevisionId, Latest<ProcedureRevision>>,
+    procedure_usages: BTreeMap<ProcedureUsageId, Latest<ProcedureUsageRevision>>,
+    procedure_negatives: BTreeMap<ProcedureNegativeEvidenceId, Latest<ProcedureNegativeEvidence>>,
+    procedure_reviews: BTreeMap<ProcedureNegativeEvidenceId, Latest<ProcedureNegativeReviewEvent>>,
+    core_memberships: BTreeMap<RevisionId, Latest<CoreMembership>>,
+    support_contracts: BTreeMap<RevisionId, Latest<GlobalSuccessorSupportContract>>,
+    deferred_wiki: Vec<(WikiProjection, u64, Box<str>)>,
+    deferred_exact: Vec<DeferredExact>,
+    semantic_digests: Vec<SemanticDigest>,
+    wiki_projections: Vec<WikiProjection>,
+    exact_rows: BTreeMap<String, (SearchProjectionRow, Box<str>)>,
+    endpoint_seqs: BTreeMap<String, u64>,
+}
+
+struct DeferredExact {
+    candidate: SearchProjectionRow,
+    object_id: String,
+    current_revision_id: Option<String>,
+    source_row_id: Box<str>,
+}
+
+impl L0002RowAccumulator {
+    /// Consume one canonical objects row. Never fails: the first error of
+    /// each original pass class is staged so a paged physical read that
+    /// discovers a later native failure still takes precedence. Callers that
+    /// need immediate failure semantics use `finish`'s staged reporting.
+    pub(crate) fn consume_row(&mut self, row: &ObjectRow) {
+        if let Err(error) = self.consume_row_inner(row) {
+            self.stage_classed(ConsumeClass::Body, error);
+        }
     }
 
-    let mut receipts = BTreeMap::new();
-    let mut surfaces = BTreeMap::new();
-    let mut occurrences = BTreeMap::new();
-    let mut operations = BTreeMap::new();
-    let mut effects = BTreeMap::new();
-    let mut repositories = BTreeMap::new();
-    let mut worktrees = BTreeMap::new();
-    let mut snapshots = BTreeMap::new();
-    let mut transitions = BTreeMap::new();
-    let mut integrations = BTreeMap::new();
-    let mut tasks = BTreeMap::new();
-    let mut workstreams = BTreeMap::new();
-    let mut bindings = BTreeMap::new();
-    let mut attempts = BTreeMap::new();
-    let mut groups = BTreeMap::new();
-    let mut lanes = BTreeMap::new();
-    let mut capture_receipts = BTreeMap::new();
-    let mut bursts = BTreeMap::new();
-    let mut episodes = BTreeMap::new();
-    let mut checkpoints = BTreeMap::new();
-    let mut corrections = BTreeMap::new();
-    let mut recovery_requests = BTreeMap::new();
-    let mut recovery_bundles = BTreeMap::new();
-    let mut recovery_applications = BTreeMap::new();
-    let mut runs = BTreeMap::new();
-    let mut results = BTreeMap::new();
-    let mut artifacts = BTreeMap::new();
-    let mut atoms = BTreeMap::new();
-    let mut proposals = BTreeMap::new();
-    let mut procedures = BTreeMap::new();
-    let mut procedure_usages = BTreeMap::new();
-    let mut procedure_negatives = BTreeMap::new();
-    let mut procedure_reviews = BTreeMap::new();
-    let mut core_memberships = BTreeMap::new();
-    let mut support_contracts = BTreeMap::new();
-    let mut wiki_projections = Vec::new();
-    let mut semantic_digests = Vec::new();
-    let mut exact_rows = BTreeMap::new();
-    let mut endpoint_seqs = BTreeMap::<String, u64>::new();
-    let mut current_revisions = BTreeMap::<String, (u64, String)>::new();
-    let mut wiki_atoms_by_revision = BTreeMap::<RevisionId, Atom>::new();
-    for row in objects
-        .data_rows()
-        .filter(|row| row.object_kind.as_deref() == Some("atom_revision"))
-    {
+    /// The first staged error of each original pass class, or the first
+    /// immediate error. Error classes follow the original pass order: the
+    /// Wiki atom pre-pass, then the shared per-row filters, then the body.
+    fn stage_classed(&mut self, class: ConsumeClass, error: StoreError) {
+        let slot = match class {
+            ConsumeClass::WikiAtom => &mut self.staged_wiki_atom,
+            ConsumeClass::Filter => &mut self.staged_filter,
+            ConsumeClass::Body => &mut self.staged_body,
+        };
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    }
+
+    fn consume_row_inner(&mut self, row: &ObjectRow) -> Result<(), StoreError> {
+        if row.row_kind != ObjectRowKind::Data {
+            if row.row_kind == ObjectRowKind::Checkpoint {
+                self.checkpoint_count += 1;
+                self.checkpoint_seq = Some(row.source_event_seq);
+            }
+            return Ok(());
+        }
+        self.max_data_seq = self.max_data_seq.max(row.source_event_seq);
+        if self.staged_wiki_atom.is_none()
+            && let Err(error) = self.consume_wiki_atom(row)
+        {
+            self.stage_classed(ConsumeClass::WikiAtom, error);
+        }
+        if self.staged_filter.is_some() {
+            return Ok(());
+        }
+        let wiki = match self.consume_filters(row) {
+            Ok(FilterOutcome::Skipped) => return Ok(()),
+            Ok(FilterOutcome::Accepted { wiki }) => wiki,
+            Err(error) => {
+                self.stage_classed(ConsumeClass::Filter, error);
+                return Ok(());
+            }
+        };
+        self.consume_body(row, wiki)
+    }
+
+    /// The original Wiki pre-pass: historical Atom revisions indexed by
+    /// revision for the deferred Wiki evaluation.
+    fn consume_wiki_atom(&mut self, row: &ObjectRow) -> Result<(), StoreError> {
+        if row.object_kind.as_deref() != Some("atom_revision") {
+            return Ok(());
+        }
         let payload: JournalPayload = serde_json::from_str(
             row.payload_json
                 .as_deref()
@@ -577,57 +775,389 @@ pub fn derive_l0002_projections(
         };
         if row.object_id.as_deref() != Some(&atom.atom_id.to_string())
             || row.current_revision_id.as_deref() != Some(&atom.revision_id.to_string())
-            || wiki_atoms_by_revision
+            || self
+                .wiki_atoms_by_revision
                 .insert(atom.revision_id, *atom)
                 .is_some()
         {
             return Err(StoreError::StoreCorrupt);
         }
-    }
-    for row in objects.data_rows() {
-        if recall_trigger_contract(row)?.is_some()
-            || recall_need(row)?.is_some()
-            || l3_core_projection(row)?
-            || wiki_projection(row)?.is_some()
-            || procedure_context_effect(row)?.is_some()
-            || crate::session_import::restore_current(row)?.is_some()
-        {
-            continue;
-        }
-        if let (Some(object_id), Some(revision_id)) =
-            (row.object_id.as_ref(), row.current_revision_id.as_ref())
-            && current_revisions
-                .get(object_id)
-                .is_none_or(|(seq, _)| *seq < row.source_event_seq)
-        {
-            current_revisions.insert(
-                object_id.clone(),
-                (row.source_event_seq, revision_id.clone()),
-            );
-        }
+        Ok(())
     }
 
-    for row in objects.data_rows() {
+    /// The original two filter passes with their exact short-circuit order.
+    /// A row skipped by the first pass never reaches the current-revision or
+    /// body passes; a Wiki row still runs the second pass's effect/restore
+    /// checks before its deferred body.
+    fn consume_filters(&mut self, row: &ObjectRow) -> Result<FilterOutcome, StoreError> {
+        let mut wiki = None;
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
-            || procedure_context_effect(row)?.is_some()
+        {
+            return Ok(FilterOutcome::Skipped);
+        }
+        match wiki_projection(row)? {
+            Some(value) => wiki = Some(value),
+            None => {
+                if procedure_context_effect(row)?.is_some()
+                    || crate::session_import::restore_current(row)?.is_some()
+                {
+                    return Ok(FilterOutcome::Skipped);
+                }
+                // The original first pass accepted the row: collect its
+                // current revision with the strictly-newer-sequence rule.
+                if let (Some(object_id), Some(revision_id)) =
+                    (row.object_id.as_ref(), row.current_revision_id.as_ref())
+                {
+                    current_revision_insert(
+                        &mut self.current_revisions,
+                        object_id,
+                        revision_id,
+                        row.source_event_seq,
+                        &row.row_id,
+                    );
+                }
+                return Ok(FilterOutcome::Accepted { wiki });
+            }
+        }
+        // The Wiki row: the original second pass re-checked the non-Wiki
+        // chain (all known None above) and evaluated effect/restore before
+        // its Wiki branch.
+        if procedure_context_effect(row)?.is_some()
             || crate::session_import::restore_current(row)?.is_some()
         {
-            continue;
+            return Ok(FilterOutcome::Skipped);
         }
-        if let Some(wiki) = wiki_projection(row)? {
+        Ok(FilterOutcome::Accepted { wiki })
+    }
+
+    /// The original second-pass body for one non-Wiki row: endpoint sequence
+    /// index, the keyed family maps, and the deferred exact-identifier row.
+    fn consume_body(
+        &mut self,
+        row: &ObjectRow,
+        wiki: Option<WikiProjection>,
+    ) -> Result<(), StoreError> {
+        if let Some(wiki) = wiki {
+            self.deferred_wiki
+                .push((wiki, row.source_event_seq, row.row_id.clone().into()));
+            return Ok(());
+        }
+        for endpoint in [row.object_id.as_ref(), row.current_revision_id.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            self.endpoint_seqs
+                .entry(endpoint.clone())
+                .and_modify(|seq| *seq = (*seq).max(row.source_event_seq))
+                .or_insert(row.source_event_seq);
+        }
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+        index_typed_ids(&payload, row.source_event_seq, &mut self.endpoint_seqs)?;
+        match payload {
+            JournalPayload::SourceReceiptRecorded(value) => latest_insert(
+                &mut self.receipts,
+                value.source_receipt_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::EvidenceSurfaceRecorded(value) => latest_insert(
+                &mut self.surfaces,
+                value.source_observation_revision_ref,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::HostOccurrenceNormalized(value) => latest_insert(
+                &mut self.occurrences,
+                value.host_occurrence_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::OperationDerived(value) => latest_insert(
+                &mut self.operations,
+                value.operation_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ScopeEffectDerived(value) => latest_insert(
+                &mut self.effects,
+                value.scope_effect_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::RepositoryInstanceRecorded(value) => latest_insert(
+                &mut self.repositories,
+                value.repository_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorktreeInstanceRecorded(value) => latest_insert(
+                &mut self.worktrees,
+                value.worktree_instance_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorktreeSnapshotRecorded(value) => latest_insert(
+                &mut self.snapshots,
+                value.worktree_snapshot_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorktreeTransitionRecorded(value) => latest_insert(
+                &mut self.transitions,
+                value.worktree_transition_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::IntegrationEventRecorded(value) => latest_insert(
+                &mut self.integrations,
+                value.integration_event_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::TaskRecorded(value) => latest_insert(
+                &mut self.tasks,
+                value.task_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorkstreamRecorded(value) => latest_insert(
+                &mut self.workstreams,
+                value.workstream_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorkBindingRecorded(value) => latest_insert(
+                &mut self.bindings,
+                value.work_binding_revision_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::AttemptRecorded(value) => latest_insert(
+                &mut self.attempts,
+                value.attempt_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::CompetingAttemptGroupRecorded(value) => latest_insert(
+                &mut self.groups,
+                value.competing_group_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ExecutionLaneRecorded(value) => latest_insert(
+                &mut self.lanes,
+                value.execution_lane_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::CaptureReceiptRecorded(value) => latest_insert(
+                &mut self.capture_receipts,
+                value.execution_lane_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::OperationBurstRecorded(value) => latest_insert(
+                &mut self.bursts,
+                value.operation_burst_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorkEpisodeRecorded(value) => latest_insert(
+                &mut self.episodes,
+                value.episode_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorkCheckpointRecorded(value) => latest_insert(
+                &mut self.checkpoints,
+                value.stable_key(),
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::SegmentationCorrectionRecorded(value) => replace_insert(
+                &mut self.corrections,
+                value.correction_revision_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::RecoveryCaptureRequestRecorded(value) => latest_insert(
+                &mut self.recovery_requests,
+                value.recovery_capture_request_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::RecoveryBundleRecorded(value) => latest_insert(
+                &mut self.recovery_bundles,
+                value.recovery_bundle_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::RecoveryApplicationRecorded(value) => latest_insert(
+                &mut self.recovery_applications,
+                value.recovery_application_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ExperimentRunRecorded(value) => latest_insert(
+                &mut self.runs,
+                value.run_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ResultEvidenceRecorded(value) => latest_insert(
+                &mut self.results,
+                value.result_evidence_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::WorkArtifactRecorded(value) => latest_insert(
+                &mut self.artifacts,
+                value.work_artifact_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::AtomRecorded(value) => replace_insert(
+                &mut self.atoms,
+                value.revision_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::RevisionProposalRecorded(value) => replace_insert(
+                &mut self.proposals,
+                value.proposal_revision_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ProcedureRevisionRecorded(value) => replace_insert(
+                &mut self.procedures,
+                value.revision_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ProcedureUsageRecorded(value) => latest_insert(
+                &mut self.procedure_usages,
+                value.procedure_usage_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ProcedureNegativeEvidenceRecorded(value) => latest_insert(
+                &mut self.procedure_negatives,
+                value.negative_evidence_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::ProcedureNegativeReviewRecorded(value) => latest_insert(
+                &mut self.procedure_reviews,
+                value.negative_evidence_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::CoreMembershipRecorded(value) => replace_insert(
+                &mut self.core_memberships,
+                value.membership_revision_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::GlobalSupportContractRecorded(value) => replace_insert(
+                &mut self.support_contracts,
+                value.support_contract_revision_id,
+                *value,
+                row.source_event_seq,
+                &row.row_id,
+            ),
+            JournalPayload::SemanticDigestRecorded(value) => {
+                self.semantic_digests.push(*value);
+            }
+            _ => {}
+        }
+        // Exact-identifier candidacy needs the final currentness, so only the
+        // is_current-independent part is built now; `finish` sets currentness.
+        if let Some(object_id) = row.object_id.as_ref()
+            && let Some(candidate) = exact_identifier_row(row, row.source_event_seq, false)?
+        {
+            self.deferred_exact.push(DeferredExact {
+                candidate,
+                object_id: object_id.clone(),
+                current_revision_id: row.current_revision_id.clone(),
+                source_row_id: row.row_id.clone().into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Finish relations/search from the consumed state. Header checks and
+    /// staged per-pass errors keep the original whole-snapshot derive's
+    /// observable error order.
+    pub(crate) fn finish(mut self, frontier: u64) -> Result<L0002ProjectionSnapshot, StoreError> {
+        if self.checkpoint_count != 1
+            || self.checkpoint_seq != Some(frontier)
+            || self.max_data_seq > frontier
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if let Some(error) = self
+            .staged_wiki_atom
+            .or(self.staged_filter)
+            .or(self.staged_body)
+        {
+            return Err(error);
+        }
+        // Deferred Wiki evaluation, exactly the original second-pass body.
+        for (wiki, seq, row_id) in std::mem::take(&mut self.deferred_wiki) {
             let source_atoms = wiki
                 .source_atom_ids
                 .iter()
                 .map(|atom_id| {
-                    let (_, revision_id) = current_revisions
+                    let (_, revision_id, _) = self
+                        .current_revisions
                         .get(&atom_id.to_string())
                         .ok_or(StoreError::StoreCorrupt)?;
                     let revision_id = revision_id
                         .parse::<RevisionId>()
                         .map_err(|_| StoreError::StoreCorrupt)?;
-                    let atom = wiki_atoms_by_revision
+                    let atom = self
+                        .wiki_atoms_by_revision
                         .get(&revision_id)
                         .ok_or(StoreError::StoreCorrupt)?;
                     if atom.atom_id != *atom_id || atom.revision_id != revision_id {
@@ -660,417 +1190,264 @@ pub fn derive_l0002_projections(
             if source_text.is_empty() {
                 return Err(StoreError::StoreCorrupt);
             }
-            let candidate =
-                wiki_search_row(&wiki, &source_text, &contradictions, row.source_event_seq);
-            exact_rows.insert(candidate.row_id.clone(), candidate);
-            endpoint_seqs.insert(wiki.page_id.to_string(), row.source_event_seq);
-            wiki_projections.push(wiki);
-            continue;
+            let candidate = wiki_search_row(&wiki, &source_text, &contradictions, seq);
+            self.exact_insert(candidate, &row_id);
+            self.endpoint_seqs.insert(wiki.page_id.to_string(), seq);
+            self.wiki_projections.push(wiki);
         }
-        for endpoint in [row.object_id.as_ref(), row.current_revision_id.as_ref()]
-            .into_iter()
-            .flatten()
+        // Exact-identifier currentness is finalized only now that the winning
+        // revision per object id is known.
+        for deferred in std::mem::take(&mut self.deferred_exact) {
+            let mut candidate = deferred.candidate;
+            let is_current =
+                self.current_revisions
+                    .get(&deferred.object_id)
+                    .is_some_and(|(_, revision, _)| {
+                        deferred.current_revision_id.as_ref() == Some(revision)
+                    });
+            candidate.currentness = Some(if is_current { "current" } else { "historical" }.into());
+            self.exact_insert(candidate, &deferred.source_row_id);
+        }
+        self.finish_relations_search(frontier)
+    }
+
+    /// The original unconditional exact-row insertion kept the candidate
+    /// produced by the last row in lexicographic row_id order.
+    fn exact_insert(&mut self, candidate: SearchProjectionRow, source_row_id: &str) {
+        if self
+            .exact_rows
+            .get(&candidate.row_id)
+            .is_none_or(|(_, existing)| source_row_id > existing.as_ref())
         {
-            endpoint_seqs
-                .entry(endpoint.clone())
-                .and_modify(|seq| *seq = (*seq).max(row.source_event_seq))
-                .or_insert(row.source_event_seq);
-        }
-        let payload: JournalPayload = serde_json::from_str(
-            row.payload_json
-                .as_deref()
-                .ok_or(StoreError::StoreCorrupt)?,
-        )
-        .map_err(|_| StoreError::StoreCorrupt)?;
-        index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
-        match payload {
-            JournalPayload::SourceReceiptRecorded(value) => latest(
-                &mut receipts,
-                value.source_receipt_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::EvidenceSurfaceRecorded(value) => latest(
-                &mut surfaces,
-                value.source_observation_revision_ref,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::HostOccurrenceNormalized(value) => latest(
-                &mut occurrences,
-                value.host_occurrence_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::OperationDerived(value) => latest(
-                &mut operations,
-                value.operation_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::ScopeEffectDerived(value) => latest(
-                &mut effects,
-                value.scope_effect_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::RepositoryInstanceRecorded(value) => latest(
-                &mut repositories,
-                value.repository_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::WorktreeInstanceRecorded(value) => latest(
-                &mut worktrees,
-                value.worktree_instance_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::WorktreeSnapshotRecorded(value) => latest(
-                &mut snapshots,
-                value.worktree_snapshot_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::WorktreeTransitionRecorded(value) => latest(
-                &mut transitions,
-                value.worktree_transition_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::IntegrationEventRecorded(value) => latest(
-                &mut integrations,
-                value.integration_event_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::TaskRecorded(value) => {
-                latest(&mut tasks, value.task_id, *value, row.source_event_seq)
-            }
-            JournalPayload::WorkstreamRecorded(value) => latest(
-                &mut workstreams,
-                value.workstream_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::WorkBindingRecorded(value) => latest(
-                &mut bindings,
-                value.work_binding_revision_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::AttemptRecorded(value) => latest(
-                &mut attempts,
-                value.attempt_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::CompetingAttemptGroupRecorded(value) => latest(
-                &mut groups,
-                value.competing_group_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::ExecutionLaneRecorded(value) => latest(
-                &mut lanes,
-                value.execution_lane_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::CaptureReceiptRecorded(value) => latest(
-                &mut capture_receipts,
-                value.execution_lane_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::OperationBurstRecorded(value) => latest(
-                &mut bursts,
-                value.operation_burst_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::WorkEpisodeRecorded(value) => latest(
-                &mut episodes,
-                value.episode_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::WorkCheckpointRecorded(value) => latest(
-                &mut checkpoints,
-                value.stable_key(),
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::SegmentationCorrectionRecorded(value) => {
-                corrections.insert(value.correction_revision_id, (*value, row.source_event_seq));
-            }
-            JournalPayload::RecoveryCaptureRequestRecorded(value) => latest(
-                &mut recovery_requests,
-                value.recovery_capture_request_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::RecoveryBundleRecorded(value) => latest(
-                &mut recovery_bundles,
-                value.recovery_bundle_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::RecoveryApplicationRecorded(value) => latest(
-                &mut recovery_applications,
-                value.recovery_application_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::ExperimentRunRecorded(value) => {
-                latest(&mut runs, value.run_id, *value, row.source_event_seq)
-            }
-            JournalPayload::ResultEvidenceRecorded(value) => latest(
-                &mut results,
-                value.result_evidence_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::WorkArtifactRecorded(value) => latest(
-                &mut artifacts,
-                value.work_artifact_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::AtomRecorded(value) => {
-                atoms.insert(value.revision_id, (*value, row.source_event_seq));
-            }
-            JournalPayload::RevisionProposalRecorded(value) => {
-                proposals.insert(value.proposal_revision_id, (*value, row.source_event_seq));
-            }
-            JournalPayload::ProcedureRevisionRecorded(value) => {
-                procedures.insert(value.revision_id, (*value, row.source_event_seq));
-            }
-            JournalPayload::ProcedureUsageRecorded(value) => latest(
-                &mut procedure_usages,
-                value.procedure_usage_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::ProcedureNegativeEvidenceRecorded(value) => latest(
-                &mut procedure_negatives,
-                value.negative_evidence_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::ProcedureNegativeReviewRecorded(value) => latest(
-                &mut procedure_reviews,
-                value.negative_evidence_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::CoreMembershipRecorded(value) => {
-                core_memberships
-                    .insert(value.membership_revision_id, (*value, row.source_event_seq));
-            }
-            JournalPayload::GlobalSupportContractRecorded(value) => {
-                support_contracts.insert(
-                    value.support_contract_revision_id,
-                    (*value, row.source_event_seq),
-                );
-            }
-            JournalPayload::SemanticDigestRecorded(value) => {
-                semantic_digests.push(*value);
-            }
-            _ => {}
-        }
-        let is_current = row.object_id.as_ref().is_some_and(|object_id| {
-            current_revisions
-                .get(object_id)
-                .is_some_and(|(_, revision)| row.current_revision_id.as_ref() == Some(revision))
-        });
-        if let Some(candidate) = exact_identifier_row(row, row.source_event_seq, is_current)? {
-            exact_rows.insert(candidate.row_id.clone(), candidate);
+            self.exact_rows
+                .insert(candidate.row_id.clone(), (candidate, source_row_id.into()));
         }
     }
 
-    let available_atom_revisions = atoms.keys().copied().collect::<BTreeSet<_>>();
-    let available_procedure_revisions = procedures.keys().copied().collect::<BTreeSet<_>>();
-    let relation_atoms = all_values(&atoms)
-        .into_iter()
-        .map(|mut atom| {
-            atom.parent_revision_id = atom
-                .parent_revision_id
-                .filter(|revision| available_atom_revisions.contains(revision));
-            atom.supersedes_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            atom.supports_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            atom.contradicts_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            atom
-        })
-        .collect::<Vec<_>>();
-    let relation_procedures = all_values(&procedures)
-        .into_iter()
-        .map(|mut procedure| {
-            procedure.parent_revision_id = procedure
-                .parent_revision_id
-                .filter(|revision| available_procedure_revisions.contains(revision));
-            procedure
-                .draft
-                .support_revision_refs
-                .retain(|revision| available_atom_revisions.contains(revision));
-            procedure
-        })
-        .collect::<Vec<_>>();
-    let mut relations = BTreeSet::new();
-    add_physical(
-        &mut relations,
-        build_physical_relation_rows(
-            &values(&occurrences),
-            &values(&operations),
-            &values(&effects),
-        )?,
-        &endpoint_seqs,
-    );
-    add_repository(
-        &mut relations,
-        build_repository_relation_rows(
-            &values(&repositories),
-            &values(&worktrees),
-            &values(&snapshots),
-            &values(&transitions),
-            &values(&integrations),
-        )?,
-        &endpoint_seqs,
-    );
-    add_work_identity(
-        &mut relations,
-        build_work_identity_relation_rows(&values(&tasks), &values(&workstreams))?,
-        &endpoint_seqs,
-    );
-    add_attempt(
-        &mut relations,
-        build_attempt_relation_rows(&values(&attempts), &values(&groups))?,
-        &endpoint_seqs,
-    );
-    add_work_binding(
-        &mut relations,
-        build_work_binding_relation_rows(
-            &values(&bindings),
-            &values(&operations),
-            &values(&effects),
-            &values(&tasks),
-            &values(&workstreams),
-        )?,
-        &endpoint_seqs,
-    );
-    add_episode(
-        &mut relations,
-        build_episode_relation_rows(&values(&episodes), &values(&checkpoints))?,
-        &endpoint_seqs,
-    );
-    for (lane_id, (lane, _)) in &lanes {
-        let receipt = capture_receipts
-            .get(lane_id)
-            .ok_or(StoreError::StoreCorrupt)?;
-        add_capture(
+    fn finish_relations_search(self, frontier: u64) -> Result<L0002ProjectionSnapshot, StoreError> {
+        let available_atom_revisions = self.atoms.keys().copied().collect::<BTreeSet<_>>();
+        let available_procedure_revisions =
+            self.procedures.keys().copied().collect::<BTreeSet<_>>();
+        let relation_atoms = latest_values(&self.atoms)
+            .into_iter()
+            .map(|mut atom| {
+                atom.parent_revision_id = atom
+                    .parent_revision_id
+                    .filter(|revision| available_atom_revisions.contains(revision));
+                atom.supersedes_revision_refs
+                    .retain(|revision| available_atom_revisions.contains(revision));
+                atom.supports_revision_refs
+                    .retain(|revision| available_atom_revisions.contains(revision));
+                atom.contradicts_revision_refs
+                    .retain(|revision| available_atom_revisions.contains(revision));
+                atom
+            })
+            .collect::<Vec<_>>();
+        let relation_procedures = latest_values(&self.procedures)
+            .into_iter()
+            .map(|mut procedure| {
+                procedure.parent_revision_id = procedure
+                    .parent_revision_id
+                    .filter(|revision| available_procedure_revisions.contains(revision));
+                procedure
+                    .draft
+                    .support_revision_refs
+                    .retain(|revision| available_atom_revisions.contains(revision));
+                procedure
+            })
+            .collect::<Vec<_>>();
+        let mut relations = BTreeSet::new();
+        add_physical(
             &mut relations,
-            build_capture_relation_rows(lane, &receipt.0)?,
-            &endpoint_seqs,
+            build_physical_relation_rows(
+                &latest_values(&self.occurrences),
+                &latest_values(&self.operations),
+                &latest_values(&self.effects),
+            )?,
+            &self.endpoint_seqs,
         );
-    }
-    add_burst(
-        &mut relations,
-        build_operation_burst_relation_rows(&values(&episodes), &values(&bursts))?,
-        &endpoint_seqs,
-    );
-    add_correction(
-        &mut relations,
-        build_segmentation_correction_relation_rows(&all_values(&corrections), &values(&episodes))?,
-        &endpoint_seqs,
-    );
-    add_recovery(
-        &mut relations,
-        build_recovery_relation_rows(&values(&recovery_requests), &values(&recovery_bundles))?,
-        &endpoint_seqs,
-    );
-    add_recovery(
-        &mut relations,
-        build_recovery_application_relation_rows(&values(&recovery_applications))?,
-        &endpoint_seqs,
-    );
-    add_autoresearch(
-        &mut relations,
-        build_autoresearch_relation_rows(&values(&runs), &values(&results), &values(&artifacts))?,
-        &endpoint_seqs,
-    );
-    add_semantic(
-        &mut relations,
-        build_semantic_relation_rows(&relation_atoms, &all_values(&proposals))?,
-        &endpoint_seqs,
-    );
-    add_semantic(
-        &mut relations,
-        build_wiki_relation_rows(&wiki_projections)?,
-        &endpoint_seqs,
-    );
-    add_semantic(
-        &mut relations,
-        build_semantic_digest_relation_rows(&semantic_digests)?,
-        &endpoint_seqs,
-    );
-    add_semantic(
-        &mut relations,
-        build_procedure_relation_rows(&relation_procedures, &relation_atoms)?,
-        &endpoint_seqs,
-    );
-    add_semantic(
-        &mut relations,
-        build_procedure_usage_relation_rows(
-            &values(&procedure_usages),
-            &values(&procedure_negatives),
-            &values(&procedure_reviews),
-        )?,
-        &endpoint_seqs,
-    );
-    add_semantic(
-        &mut relations,
-        build_core_support_relation_rows(
-            &all_values(&core_memberships),
-            &all_values(&support_contracts),
-        )?,
-        &endpoint_seqs,
-    );
-    relations.insert(RelationProjectionRow::checkpoint(objects.frontier));
+        add_repository(
+            &mut relations,
+            build_repository_relation_rows(
+                &latest_values(&self.repositories),
+                &latest_values(&self.worktrees),
+                &latest_values(&self.snapshots),
+                &latest_values(&self.transitions),
+                &latest_values(&self.integrations),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_work_identity(
+            &mut relations,
+            build_work_identity_relation_rows(
+                &latest_values(&self.tasks),
+                &latest_values(&self.workstreams),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_attempt(
+            &mut relations,
+            build_attempt_relation_rows(
+                &latest_values(&self.attempts),
+                &latest_values(&self.groups),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_work_binding(
+            &mut relations,
+            build_work_binding_relation_rows(
+                &latest_values(&self.bindings),
+                &latest_values(&self.operations),
+                &latest_values(&self.effects),
+                &latest_values(&self.tasks),
+                &latest_values(&self.workstreams),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_episode(
+            &mut relations,
+            build_episode_relation_rows(
+                &latest_values(&self.episodes),
+                &latest_values(&self.checkpoints),
+            )?,
+            &self.endpoint_seqs,
+        );
+        for (lane_id, lane) in &self.lanes {
+            let receipt = self
+                .capture_receipts
+                .get(lane_id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            add_capture(
+                &mut relations,
+                build_capture_relation_rows(&lane.value, &receipt.value)?,
+                &self.endpoint_seqs,
+            );
+        }
+        add_burst(
+            &mut relations,
+            build_operation_burst_relation_rows(
+                &latest_values(&self.episodes),
+                &latest_values(&self.bursts),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_correction(
+            &mut relations,
+            build_segmentation_correction_relation_rows(
+                &latest_values(&self.corrections),
+                &latest_values(&self.episodes),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_recovery(
+            &mut relations,
+            build_recovery_relation_rows(
+                &latest_values(&self.recovery_requests),
+                &latest_values(&self.recovery_bundles),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_recovery(
+            &mut relations,
+            build_recovery_application_relation_rows(&latest_values(&self.recovery_applications))?,
+            &self.endpoint_seqs,
+        );
+        add_autoresearch(
+            &mut relations,
+            build_autoresearch_relation_rows(
+                &latest_values(&self.runs),
+                &latest_values(&self.results),
+                &latest_values(&self.artifacts),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_semantic(
+            &mut relations,
+            build_semantic_relation_rows(&relation_atoms, &latest_values(&self.proposals))?,
+            &self.endpoint_seqs,
+        );
+        add_semantic(
+            &mut relations,
+            build_wiki_relation_rows(&self.wiki_projections)?,
+            &self.endpoint_seqs,
+        );
+        add_semantic(
+            &mut relations,
+            build_semantic_digest_relation_rows(&self.semantic_digests)?,
+            &self.endpoint_seqs,
+        );
+        add_semantic(
+            &mut relations,
+            build_procedure_relation_rows(&relation_procedures, &relation_atoms)?,
+            &self.endpoint_seqs,
+        );
+        add_semantic(
+            &mut relations,
+            build_procedure_usage_relation_rows(
+                &latest_values(&self.procedure_usages),
+                &latest_values(&self.procedure_negatives),
+                &latest_values(&self.procedure_reviews),
+            )?,
+            &self.endpoint_seqs,
+        );
+        add_semantic(
+            &mut relations,
+            build_core_support_relation_rows(
+                &latest_values(&self.core_memberships),
+                &latest_values(&self.support_contracts),
+            )?,
+            &self.endpoint_seqs,
+        );
+        relations.insert(RelationProjectionRow::checkpoint(frontier));
 
-    let mut search = exact_rows.into_values().collect::<BTreeSet<_>>();
-    let mut receipts_by_observation = BTreeMap::new();
-    for (receipt, _) in receipts.values() {
-        receipts_by_observation
-            .entry(receipt.source_observation_id)
-            .or_insert(receipt);
+        let mut search = self
+            .exact_rows
+            .into_values()
+            .map(|(candidate, _)| candidate)
+            .collect::<BTreeSet<_>>();
+        let mut receipts_by_observation = BTreeMap::new();
+        for receipt in self.receipts.values() {
+            receipts_by_observation
+                .entry(receipt.value.source_observation_id)
+                .or_insert(&receipt.value);
+        }
+        for (revision_ref, surface) in &self.surfaces {
+            let receipt = receipts_by_observation
+                .get(revision_ref)
+                .ok_or(StoreError::StoreCorrupt)?;
+            search.insert(surface_row(&surface.value, receipt, surface.seq)?);
+        }
+        search.insert(SearchProjectionRow::checkpoint(frontier));
+        Ok(L0002ProjectionSnapshot {
+            frontier,
+            relations: relations.into_iter().collect(),
+            search: search.into_iter().collect(),
+        })
     }
-    for (observation_id, (surface, seq)) in surfaces {
-        let receipt = receipts_by_observation
-            .get(&observation_id)
-            .ok_or(StoreError::StoreCorrupt)?;
-        search.insert(surface_row(&surface, receipt, seq)?);
-    }
-    search.insert(SearchProjectionRow::checkpoint(objects.frontier));
-    Ok(L0002ProjectionSnapshot {
-        frontier: objects.frontier,
-        relations: relations.into_iter().collect(),
-        search: search.into_iter().collect(),
-    })
 }
 
-fn latest<K: Ord, V>(map: &mut BTreeMap<K, (V, u64)>, key: K, value: V, seq: u64) {
-    if map.get(&key).is_none_or(|(_, current)| *current < seq) {
-        map.insert(key, (value, seq));
+enum ConsumeClass {
+    WikiAtom,
+    Filter,
+    Body,
+}
+
+enum FilterOutcome {
+    Skipped,
+    Accepted { wiki: Option<WikiProjection> },
+}
+
+/// The complete whole-snapshot derivation, now the thin complete-path driver
+/// over the one private accumulator. Public complete callers keep the exact
+/// original behavior and results.
+pub fn derive_l0002_projections(
+    objects: &ProjectionSnapshot,
+) -> Result<L0002ProjectionSnapshot, StoreError> {
+    let mut accumulator = L0002RowAccumulator::default();
+    for row in &objects.rows {
+        accumulator.consume_row(row);
     }
-}
-fn values<K, V: Clone>(map: &BTreeMap<K, (V, u64)>) -> Vec<V> {
-    map.values().map(|(value, _)| value.clone()).collect()
-}
-fn all_values<K, V: Clone>(map: &BTreeMap<K, (V, u64)>) -> Vec<V> {
-    values(map)
+    accumulator.finish(objects.frontier)
 }
 
 // The merge source contains only changed rows. Deletion must name only rows

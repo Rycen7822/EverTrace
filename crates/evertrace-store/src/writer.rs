@@ -21,7 +21,7 @@ use crate::{
     migrations::{L0002, MigrationOutcome},
     objects::{ObjectRow, checkpoint_from_rows},
     projections::{
-        JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
+        CatchUpOutcome, JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
         ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
     },
     query::L0002ProjectionWorker,
@@ -533,6 +533,8 @@ pub struct JournalWriter {
     // it and it carries no projection content or state.
     #[cfg(test)]
     capture_delta_selections: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    fused_delta_selections: std::sync::atomic::AtomicU64,
     // Declared last: the sibling lock must be released only after the native
     // and SQLite bindings of this writer have been dropped.
     _lock: SiblingWriterLock,
@@ -754,6 +756,8 @@ impl JournalWriter {
             projection_validation: Mutex::new([None, None]),
             #[cfg(test)]
             capture_delta_selections: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            fused_delta_selections: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -924,6 +928,8 @@ impl JournalWriter {
             projection_validation,
             #[cfg(test)]
                 capture_delta_selections: _,
+            #[cfg(test)]
+                fused_delta_selections: _,
             _lock,
         } = self;
         readers.revoke();
@@ -966,6 +972,8 @@ impl JournalWriter {
             projection_validation,
             #[cfg(test)]
                 capture_delta_selections: _,
+            #[cfg(test)]
+                fused_delta_selections: _,
         } = self;
         readers.revoke();
         drop((
@@ -1415,6 +1423,12 @@ impl JournalWriter {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fused_delta_selections(&self) -> u64 {
+        self.fused_delta_selections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
         self.project_validated(true, true)
             .await?
@@ -1559,22 +1573,27 @@ impl JournalWriter {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         (update.frontier, None, has_failed_job, search_version, true)
                     } else {
-                        let (snapshot, objects_epoch, delta) = if let Some(stamp) = objects {
-                            (
-                                ProjectionSnapshot {
+                        let appended =
+                            validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
+                        let outcome = if let Some(stamp) = objects {
+                            CatchUpOutcome::Complete {
+                                snapshot: ProjectionSnapshot {
                                     frontier: stamp.frontier,
                                     rows: self.lock_sqlite()?.object_rows()?,
                                 },
-                                stamp.stamp.objects_epoch,
-                                None,
-                            )
+                                objects_epoch: stamp.stamp.objects_epoch,
+                                delta: None,
+                            }
                         } else {
-                            let appended =
-                                validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
-                            let worker = self.projection_worker();
-                            worker
-                                .catch_up_validated(validated_current, appended)
+                            let accumulator = (indexes && !return_rows)
+                                .then(|| Box::new(crate::query::L0002RowAccumulator::default()));
+                            self.projection_worker()
+                                .catch_up_inner(false, validated_current, appended, accumulator)
                                 .await?
+                        };
+                        let objects_epoch = match &outcome {
+                            CatchUpOutcome::Complete { objects_epoch, .. }
+                            | CatchUpOutcome::Consumed { objects_epoch, .. } => *objects_epoch,
                         };
                         let objects_stamp = self.physical_stamp()?;
                         if objects_stamp.objects_epoch != objects_epoch
@@ -1584,37 +1603,60 @@ impl JournalWriter {
                         {
                             return Err(StoreError::StoreCorrupt);
                         }
-                        let (search_version, content_proven) = if indexes {
-                            let worker = self.l0002_projection_worker();
-                            let (_, versions, derived) =
-                                worker.catch_up_validated_proof(&snapshot, delta).await?;
-                            if self.physical_stamp()?.relations_epoch != versions[0] {
-                                return Err(StoreError::StoreCorrupt);
+                        match outcome {
+                            CatchUpOutcome::Complete {
+                                snapshot, delta, ..
+                            } => {
+                                let (search_version, content_proven) = if indexes {
+                                    let (_, versions, derived) = self
+                                        .l0002_projection_worker()
+                                        .catch_up_validated_proof(&snapshot, delta)
+                                        .await?;
+                                    (self.check_l0002_versions(versions).await?, derived)
+                                } else {
+                                    (0, false)
+                                };
+                                let has_failed_job =
+                                    crate::projections::RuntimeSchedulerView::from_snapshot(
+                                        &snapshot,
+                                    )?
+                                    .jobs
+                                    .iter()
+                                    .any(|job| job.state == crate::JobStatus::Failed);
+                                (
+                                    snapshot.frontier,
+                                    return_rows.then_some(snapshot),
+                                    has_failed_job,
+                                    search_version,
+                                    content_proven,
+                                )
                             }
-                            let search_version = self
-                                .search
-                                .version()
-                                .await
-                                .map_err(|_| StoreError::LanceDb)?;
-                            if search_version != versions[1] {
-                                return Err(StoreError::StoreCorrupt);
+                            CatchUpOutcome::Consumed {
+                                frontier,
+                                delta,
+                                runtime_rows,
+                                l0002,
+                                ..
+                            } => {
+                                #[cfg(test)]
+                                self.fused_delta_selections
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let (versions, derived) = self
+                                    .l0002_projection_worker()
+                                    .catch_up_fused_handoff(frontier, Some(delta), l0002)
+                                    .await?;
+                                let search_version = self.check_l0002_versions(versions).await?;
+                                let has_failed_job =
+                                    crate::projections::RuntimeSchedulerView::from_rows(
+                                        frontier,
+                                        &runtime_rows,
+                                    )?
+                                    .jobs
+                                    .iter()
+                                    .any(|job| job.state == crate::JobStatus::Failed);
+                                (frontier, None, has_failed_job, search_version, derived)
                             }
-                            (search_version, derived)
-                        } else {
-                            (0, false)
-                        };
-                        let has_failed_job =
-                            crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
-                                .jobs
-                                .iter()
-                                .any(|job| job.state == crate::JobStatus::Failed);
-                        (
-                            snapshot.frontier,
-                            return_rows.then_some(snapshot),
-                            has_failed_job,
-                            search_version,
-                            content_proven,
-                        )
+                        }
                     }
                 };
             self.validate_projection_directories(indexes)?;
@@ -1668,6 +1710,21 @@ impl JournalWriter {
                 .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
         }
         result
+    }
+
+    async fn check_l0002_versions(&self, versions: [u64; 2]) -> Result<u64, StoreError> {
+        if self.physical_stamp()?.relations_epoch != versions[0] {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let search_version = self
+            .search
+            .version()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        if search_version != versions[1] {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(search_version)
     }
 
     pub async fn reconciliation_frontier(
