@@ -5,7 +5,6 @@ mod projection;
 mod relation_assembly;
 
 pub use derive::{DefaultRetrievalSuppressionGeneration, default_retrieval_suppression_ref_hash};
-pub(crate) use projection::L0002RowAccumulator;
 pub use projection::{
     L0002ProjectionSnapshot, L0002ProjectionWorker, derive_l0002_projections,
     object_projection_hash,
