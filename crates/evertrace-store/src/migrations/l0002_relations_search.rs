@@ -77,10 +77,10 @@ impl L0002 {
         }
         let search = open_or_create_search(connection, has_search).await?;
 
-        let rows = sqlite
+        let (rows, _journal_exists, frontier) = sqlite
             .lock()
             .map_err(|_| StoreError::StoreCorrupt)?
-            .rows()?;
+            .migration_rows(migration_command_id()?)?;
         let appended = !validate_l0002_migration_marker(&rows, false)?;
         let worker = L0002ProjectionWorker::new(std::sync::Arc::clone(sqlite), search.clone());
         if appended {
@@ -91,7 +91,7 @@ impl L0002 {
             if crash_before_marker {
                 return Err(StoreError::Migration);
             }
-            append_migration(sqlite, rows.last().map(|row| row.seq).unwrap_or(0)).await?;
+            append_migration(sqlite, frontier).await?;
             // The marker itself advances the authoritative frontier.
             objects_snapshot = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
                 .catch_up()
@@ -231,7 +231,7 @@ pub(crate) fn validate_l0002_migration_marker(
 
 fn migration_command() -> Result<JournalCommand, StoreError> {
     JournalCommand::new(
-        CommandId::from_str(MIGRATION_COMMAND_ID).map_err(|_| StoreError::Migration)?,
+        migration_command_id()?,
         vec![JournalEventDraft::runtime(
             0,
             [0; 32],
@@ -243,11 +243,16 @@ fn migration_command() -> Result<JournalCommand, StoreError> {
     )
 }
 
+fn migration_command_id() -> Result<CommandId, StoreError> {
+    CommandId::from_str(MIGRATION_COMMAND_ID).map_err(|_| StoreError::Migration)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::command::{WatermarkAdvanced, WatermarkKind};
     use crate::sqlite_state::SqliteState;
 
     async fn fixture() -> (tempfile::TempDir, SqliteHandle, Connection) {
@@ -270,6 +275,24 @@ mod tests {
 
     fn journal_row_count(sqlite: &SqliteHandle) -> usize {
         sqlite.lock().unwrap().rows().unwrap().len()
+    }
+
+    fn append_watermark(sqlite: &SqliteHandle, command_id: &str, seq: u64) {
+        let command = JournalCommand::new(
+            CommandId::from_str(command_id).unwrap(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [0; 32],
+                "migration-test-v1",
+                JournalPayload::WatermarkAdvanced(WatermarkAdvanced {
+                    kind: WatermarkKind::RuntimeJobs,
+                    value: 7,
+                }),
+            )],
+        )
+        .unwrap();
+        let rows = rows_for_append(&crate::prepare_command(&command).unwrap(), seq, 0).unwrap();
+        sqlite.lock().unwrap().append_command_rows(&rows).unwrap();
     }
 
     #[tokio::test]
@@ -352,5 +375,30 @@ mod tests {
             L0002::apply(&sqlite, &connection).await,
             Ok(MigrationOutcome::Noop)
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_command_id_with_non_marker_payload_is_corruption() {
+        let (_temp, sqlite, connection) = fixture().await;
+        append_watermark(&sqlite, MIGRATION_COMMAND_ID, 1);
+        assert_eq!(
+            L0002::apply(&sqlite, &connection).await,
+            Err(StoreError::StoreCorrupt)
+        );
+    }
+
+    #[tokio::test]
+    async fn l0002_append_uses_global_frontier_after_non_marker_history() {
+        let (_temp, sqlite, connection) = fixture().await;
+        L0001::apply_inner(&sqlite, false).await.unwrap();
+        let ordinary_id = "01890f47-6a4a-7cc1-98b9-01890f476a4b";
+        append_watermark(&sqlite, ordinary_id, 2);
+
+        L0002::apply(&sqlite, &connection).await.unwrap();
+        let rows = sqlite.lock().unwrap().rows().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].command_id.to_string(), ordinary_id);
+        assert_eq!(rows[2].seq, 3);
+        assert_eq!(rows[2].command_id, migration_command_id().unwrap());
     }
 }

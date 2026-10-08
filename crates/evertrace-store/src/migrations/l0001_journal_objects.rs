@@ -45,16 +45,19 @@ impl L0001 {
         sqlite: &SqliteHandle,
         l0002_tables_present: bool,
     ) -> Result<MigrationOutcome, StoreError> {
-        let (rows, object_rows_count, objects_missing, relation_present) = {
+        let canonical_command_id = migration_command_id()?;
+        let (rows, journal_exists, frontier, object_rows_count, objects_missing, relation_present) = {
             let state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            let (rows, journal_exists, frontier) = state.migration_rows(canonical_command_id)?;
             (
-                state.rows()?,
+                rows,
+                journal_exists,
+                frontier,
                 state.object_row_count()?,
                 state.object_checkpoint_row()?.is_none(),
                 state.relation_checkpoint_row()?.is_some(),
             )
         };
-        let journal_exists = !rows.is_empty();
         if l0002_tables_present && !journal_exists {
             return Err(StoreError::StoreCorrupt);
         }
@@ -85,7 +88,7 @@ impl L0001 {
 
         let appended_event = !validate_migration_marker(&rows, l0002_tables_present)?;
         if appended_event {
-            append_migration_event(sqlite, rows.last().map(|row| row.seq).unwrap_or(0)).await?;
+            append_migration_event(sqlite, frontier).await?;
         }
 
         // L0002 performs its own objects catch-up before using the derived
@@ -158,9 +161,13 @@ async fn append_migration_event(
         .append_command_rows(&rows)
 }
 
+fn migration_command_id() -> Result<CommandId, StoreError> {
+    CommandId::from_str(MIGRATION_COMMAND_ID).map_err(|_| StoreError::Migration)
+}
+
 fn migration_command() -> Result<JournalCommand, StoreError> {
     JournalCommand::new(
-        CommandId::from_str(MIGRATION_COMMAND_ID).map_err(|_| StoreError::Migration)?,
+        migration_command_id()?,
         vec![JournalEventDraft::runtime(
             0,
             [0; 32],
@@ -177,6 +184,7 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path};
 
     use super::*;
+    use crate::command::{WatermarkAdvanced, WatermarkKind};
     use crate::sqlite_state::SqliteState;
 
     fn state(root: &Path) -> SqliteHandle {
@@ -245,5 +253,58 @@ mod tests {
             .unwrap();
         assert_eq!(L0001::apply(&sqlite).await, Err(StoreError::StoreCorrupt));
         assert_eq!(sqlite.lock().unwrap().rows().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn canonical_command_id_with_non_marker_payload_is_corruption() {
+        let (_temp, root) = temp_root();
+        let sqlite = state(&root);
+        let occupied = JournalCommand::new(
+            migration_command_id().unwrap(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [0; 32],
+                "migration-test-v1",
+                JournalPayload::WatermarkAdvanced(WatermarkAdvanced {
+                    kind: WatermarkKind::RuntimeJobs,
+                    value: 7,
+                }),
+            )],
+        )
+        .unwrap();
+        let rows = rows_for_append(&prepare_command(&occupied).unwrap(), 1, 0).unwrap();
+        sqlite.lock().unwrap().append_command_rows(&rows).unwrap();
+        assert_eq!(L0001::apply(&sqlite).await, Err(StoreError::StoreCorrupt));
+    }
+
+    #[tokio::test]
+    async fn l0001_append_uses_global_frontier_after_non_marker_history() {
+        let (_temp, root) = temp_root();
+        let sqlite = state(&root);
+        let prior = JournalCommand::new(
+            "01890f47-6a4a-7cc1-98b9-01890f476a4b".parse().unwrap(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [0; 32],
+                "migration-test-v1",
+                JournalPayload::WatermarkAdvanced(WatermarkAdvanced {
+                    kind: WatermarkKind::RuntimeJobs,
+                    value: 7,
+                }),
+            )],
+        )
+        .unwrap();
+        let rows = rows_for_append(&prepare_command(&prior).unwrap(), 1, 0).unwrap();
+        sqlite.lock().unwrap().append_command_rows(&rows).unwrap();
+
+        assert_eq!(
+            L0001::apply(&sqlite).await,
+            Ok(MigrationOutcome::RebuiltObjects)
+        );
+        let rows = sqlite.lock().unwrap().rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event_type, "watermark_advanced_v1");
+        assert_eq!(rows[1].seq, 2);
+        assert_eq!(rows[1].command_id, migration_command_id().unwrap());
     }
 }
