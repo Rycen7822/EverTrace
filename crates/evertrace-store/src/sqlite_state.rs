@@ -969,25 +969,27 @@ impl SqliteState {
             for row in batch {
                 insert_batch_id(connection, &row.row_id)?;
             }
-            let existing = {
+            // Compare against borrowed candidates instead of retaining a second
+            // complete set of persisted payloads. Keep batch order (including
+            // repeated IDs) for the eventual upserts.
+            let mut candidate_order: Vec<_> = (0..batch.len()).collect();
+            candidate_order.sort_unstable_by_key(|&index| batch[index].row_id.as_str());
+            let mut unchanged = vec![false; batch.len()];
+            {
                 let mut statement = connection
                     .prepare(SELECT_BATCH_OBJECT_ROWS)
                     .map_err(|_| StoreError::StoreCorrupt)?;
                 let mut queried = statement.query([]).map_err(|_| StoreError::StoreCorrupt)?;
-                let mut rows = Vec::new();
                 while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
-                    rows.push(object_row_from_sql(sql_row)?);
-                }
-                rows
-            };
-            let existing_by_id = existing
-                .iter()
-                .map(|row| (row.row_id.as_str(), row))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            let mut changed = Vec::new();
-            for row in batch {
-                if existing_by_id.get(row.row_id.as_str()).copied() != Some(row) {
-                    changed.push(row);
+                    let existing = object_row_from_sql(sql_row)?;
+                    let start = candidate_order
+                        .partition_point(|&index| batch[index].row_id < existing.row_id);
+                    for &index in &candidate_order[start..] {
+                        if batch[index].row_id != existing.row_id {
+                            break;
+                        }
+                        unchanged[index] = batch[index] == existing;
+                    }
                 }
             }
             let mut removed = 0_usize;
@@ -1002,11 +1004,13 @@ impl SqliteState {
                         .map_err(|_| StoreError::StoreCorrupt)?;
                 }
             }
-            for row in &changed {
-                upsert_object_row(connection, row)?;
+            for (row, unchanged) in batch.iter().zip(&unchanged) {
+                if !unchanged {
+                    upsert_object_row(connection, row)?;
+                }
             }
             end_batch_table(connection)?;
-            Ok(changed.is_empty() && removed == 0)
+            Ok(unchanged.iter().all(|unchanged| *unchanged) && removed == 0)
         })();
         match outcome {
             Ok(true) => {
@@ -2377,6 +2381,57 @@ mod tests {
             vec!["checkpoint:evertrace_objects", "row:c"]
         );
         assert_eq!(state.objects_epoch(), 4);
+
+        // Compare each duplicate with the original persisted row, not with an
+        // earlier candidate's upsert. An unchanged duplicate stays skipped.
+        let original = rows.iter().find(|row| row.row_id == "row:c").unwrap();
+        let mut changed = original.clone();
+        changed.payload_json = Some("{\"changed\":true}".into());
+        let checkpoint = ObjectRow::checkpoint(6, 1);
+        state
+            .commit_object_rows(
+                &[changed.clone(), checkpoint.clone(), original.clone()],
+                ObjectReconcile::default(),
+                &checkpoint,
+            )
+            .unwrap();
+        assert_eq!(state.objects_epoch(), 5);
+        let persisted = state.object_rows().unwrap();
+        assert_eq!(
+            persisted.iter().find(|row| row.row_id == "row:c"),
+            Some(&changed)
+        );
+        state
+            .commit_object_rows(
+                &[changed.clone(), checkpoint.clone(), changed],
+                ObjectReconcile::default(),
+                &checkpoint,
+            )
+            .unwrap();
+        assert_eq!(state.objects_epoch(), 5);
+
+        // Decode every matching physical row before any write, even after an
+        // earlier row would change. A malformed later row rolls everything back.
+        state
+            .connection
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE object_rows SET object_family = 'invalid' WHERE row_id = 'row:c'",
+                [],
+            )
+            .unwrap();
+        let next_checkpoint = ObjectRow::checkpoint(7, 1);
+        assert_eq!(
+            state.commit_object_rows(
+                &[next_checkpoint.clone(), original.clone()],
+                ObjectReconcile::default(),
+                &next_checkpoint,
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(state.objects_epoch(), 5);
+        assert_eq!(state.object_checkpoint_row().unwrap(), Some((6, 1)));
     }
 
     #[test]
