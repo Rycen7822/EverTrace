@@ -127,7 +127,6 @@ CREATE TABLE relation_rows (
 
 const SELECT_COMMAND_ROWS: &str = "SELECT seq, event_id, command_id, command_hash, ordinal, command_event_count, event_type, record_class, object_family, object_id, revision_id, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, execution_lane_id, occurred_at_us, ingested_at_us, source_kind, source_ref_json, payload_schema, payload_json, content_hash, causation_id, correlation_id, effective_config_hash, algorithm_revision FROM journal_events WHERE command_id = ?1 ORDER BY seq";
 const SELECT_ALL_ROWS: &str = "SELECT seq, event_id, command_id, command_hash, ordinal, command_event_count, event_type, record_class, object_family, object_id, revision_id, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, execution_lane_id, occurred_at_us, ingested_at_us, source_kind, source_ref_json, payload_schema, payload_json, content_hash, causation_id, correlation_id, effective_config_hash, algorithm_revision FROM journal_events ORDER BY seq";
-const SELECT_MIGRATION_ROWS: &str = "SELECT seq, event_id, command_id, command_hash, ordinal, command_event_count, event_type, record_class, object_family, object_id, revision_id, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, execution_lane_id, occurred_at_us, ingested_at_us, source_kind, source_ref_json, payload_schema, payload_json, content_hash, causation_id, correlation_id, effective_config_hash, algorithm_revision FROM journal_events WHERE event_type = ?1 OR command_id = ?2 ORDER BY seq";
 const SELECT_PERSISTED_FRONTIER: &str = "SELECT seq FROM journal_events ORDER BY seq DESC LIMIT 1";
 const SELECT_ROWS_AFTER: &str = "SELECT seq, event_id, command_id, command_hash, ordinal, command_event_count, event_type, record_class, object_family, object_id, revision_id, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, execution_lane_id, occurred_at_us, ingested_at_us, source_kind, source_ref_json, payload_schema, payload_json, content_hash, causation_id, correlation_id, effective_config_hash, algorithm_revision FROM journal_events WHERE seq > ?1 ORDER BY seq";
 const SELECT_ROWS_PAGE: &str = "SELECT seq, event_id, command_id, command_hash, ordinal, command_event_count, event_type, record_class, object_family, object_id, revision_id, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, execution_lane_id, occurred_at_us, ingested_at_us, source_kind, source_ref_json, payload_schema, payload_json, content_hash, causation_id, correlation_id, effective_config_hash, algorithm_revision FROM journal_events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT 256";
@@ -495,33 +494,6 @@ impl SqliteState {
 
     pub(crate) fn rows(&self) -> Result<Vec<JournalRow>, StoreError> {
         self.with_connection(read_all_rows)
-    }
-
-    pub(crate) fn migration_rows(
-        &self,
-        command_id: CommandId,
-    ) -> Result<(Vec<JournalRow>, bool, u64), StoreError> {
-        self.with_connection(|connection| {
-            let rows = {
-                let mut statement = connection
-                    .prepare(SELECT_MIGRATION_ROWS)
-                    .map_err(|_| StoreError::StoreCorrupt)?;
-                let mut queried = statement
-                    .query(params!["migration_applied_v1", command_id.to_string()])
-                    .map_err(|_| StoreError::StoreCorrupt)?;
-                let mut rows = Vec::new();
-                while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
-                    rows.push(journal_row_from_sql(sql_row)?);
-                }
-                rows
-            };
-            let journal_exists: bool = connection
-                .query_row("SELECT EXISTS(SELECT 1 FROM journal_events)", [], |row| {
-                    row.get(0)
-                })
-                .map_err(|_| StoreError::StoreCorrupt)?;
-            Ok((rows, journal_exists, self.frontier))
-        })
     }
 
     pub(crate) fn committed_rows(
