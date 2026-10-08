@@ -1472,13 +1472,14 @@ pub(crate) fn verify_store_database(native_dir: &Path) -> Result<VerifiedSqliteS
     // bookkeeping that the file manifest and its recorded identities do not
     // list.
     let mut uri = String::from("file:");
-    for byte in path.as_os_str().as_encoded_bytes() {
-        match byte {
-            b'%' => uri.push_str("%25"),
-            b'?' => uri.push_str("%3F"),
-            b'#' => uri.push_str("%23"),
-            b' ' => uri.push_str("%20"),
-            _ => uri.push(*byte as char),
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 15)]));
         }
     }
     uri.push_str("?immutable=1");
@@ -2409,11 +2410,7 @@ mod tests {
 
     #[test]
     fn checkpoint_truncate_then_close_removes_wal_and_refuses_reuse() {
-        let temp = tempfile::tempdir().unwrap();
-        let data_dir = temp.path().join("data");
-        fs::create_dir(&data_dir).unwrap();
-        fs::set_permissions(&data_dir, Permissions::from_mode(0o700)).unwrap();
-        let mut state = SqliteState::open(&data_dir).unwrap();
+        let (temp, data_dir, mut state, _) = initialized_state();
         let first = committed_rows_for(&single_event_command(COMMAND_A, "backup"), 1);
         state.append_command_rows(&first).unwrap();
         assert!(state.checkpoint_and_close().unwrap());
@@ -2429,7 +2426,22 @@ mod tests {
             state.append_command_rows(&blocked).err(),
             Some(StoreError::Io)
         );
-        let mut reopened = SqliteState::open(&data_dir).unwrap();
+
+        // Immutable verification must preserve the filename's bytes, including
+        // Unicode and URI delimiters, without creating sidecar bookkeeping.
+        let data_dir_with_delimiters = temp.path().join("记忆 %?#& data");
+        fs::rename(&data_dir, &data_dir_with_delimiters).unwrap();
+        let native_dir = crate::connection::native_root(&data_dir_with_delimiters);
+        let verified = verify_store_database(&native_dir).unwrap();
+        assert_eq!(verified.rows, first);
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                !native_dir
+                    .join(format!("{SQLITE_FILE_NAME}{suffix}"))
+                    .exists()
+            );
+        }
+        let mut reopened = SqliteState::open(&data_dir_with_delimiters).unwrap();
         assert_eq!(reopened.stamp().unwrap().frontier, 1);
     }
 
