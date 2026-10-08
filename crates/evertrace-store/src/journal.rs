@@ -440,6 +440,7 @@ mod tests {
             |row: &mut JournalRow| row.event_id.push('0'),
             |row: &mut JournalRow| row.command_hash[0] ^= 1,
             |row: &mut JournalRow| row.content_hash[0] ^= 1,
+            |row: &mut JournalRow| row.payload_schema += 1,
         ] {
             let mut rows = valid_rows();
             mutate(&mut rows[0]);

@@ -8772,7 +8772,7 @@ impl JournalAdmissionState {
     }
 
     // Replay owns this temporary state; any failed batch discards it in full.
-    fn apply_row_batch_owned(self, rows: &[&JournalRow]) -> Result<Self, StoreError> {
+    pub(crate) fn apply_row_batch_owned(self, rows: &[&JournalRow]) -> Result<Self, StoreError> {
         if crate::restore::ledger_command(rows)? {
             let mut next = self;
             for row in rows {
@@ -10286,7 +10286,9 @@ fn validate_recall_relations<'a>(
     Ok(())
 }
 
-fn ordered_command_batches(rows: &[JournalRow]) -> Result<Vec<Vec<&JournalRow>>, StoreError> {
+pub(crate) fn ordered_command_batches(
+    rows: &[JournalRow],
+) -> Result<Vec<Vec<&JournalRow>>, StoreError> {
     validate_journal_rows(rows)?;
     let mut by_command = BTreeMap::new();
     for row in rows {

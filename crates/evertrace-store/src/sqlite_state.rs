@@ -8,6 +8,7 @@
 //! sequence reservation, domain admission and publication order.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -24,7 +25,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
 use crate::{
     command::{ObjectFamily, RecordClass, SourceKind, StoreError},
-    journal::{JournalRow, validate_journal_rows},
+    journal::{JournalRow, validate_complete_command, validate_journal_rows},
     objects::{OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind},
     relations::{RELATIONS_CHECKPOINT_ID, RelationProjectionRow},
 };
@@ -47,6 +48,11 @@ static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
 /// A cloneable physical-state handle. All SQLite writes execute through this
 /// one connection; readers use separate short-lived read-only connections.
 pub(crate) type SqliteHandle = Arc<Mutex<SqliteState>>;
+
+pub(crate) struct StartupJournalIndex {
+    pub(crate) commands: BTreeMap<CommandId, Vec<(u16, u64)>>,
+    pub(crate) frontier: u64,
+}
 
 /// One real table carrying the existing `JournalRow` fields verbatim. `seq`
 /// is a fixed 8-byte big-endian BLOB so SQL ordering and ranges preserve the
@@ -301,7 +307,9 @@ impl SqliteState {
             Err(_) => return Err(StoreError::Io),
         };
         let directory = File::open(&directory_path).map_err(|_| StoreError::Io)?;
-        validate_directory_metadata(&directory.metadata().map_err(|_| StoreError::Io)?)?;
+        let directory_metadata = directory.metadata().map_err(|_| StoreError::Io)?;
+        validate_directory_metadata(&directory_metadata)?;
+        let directory_identity = (directory_metadata.dev(), directory_metadata.ino());
         let file_metadata = fs::symlink_metadata(&path).map_err(|_| StoreError::Io)?;
         validate_file_metadata(&file_metadata)?;
         let file_identity = (file_metadata.dev(), file_metadata.ino());
@@ -392,9 +400,25 @@ impl SqliteState {
             .and_then(|directory| directory.sync_all())
             .map_err(|_| StoreError::Io)?;
 
-        let rows = read_all_rows(&connection)?;
-        validate_journal_rows(&rows)?;
-        let frontier = rows.last().map(|row| row.seq).unwrap_or(0);
+        let data_version: i64 = connection
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let journal_index = read_startup_journal_index(&connection)?;
+        let command_validation = (|| {
+            for command_id in journal_index.commands.keys() {
+                validate_complete_command(&read_command_rows(&connection, *command_id)?)?;
+            }
+            Ok(())
+        })();
+        revalidate_physical(&directory_path, directory_identity, &path, file_identity)?;
+        let observed_data_version: i64 = connection
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        if observed_data_version != data_version {
+            return Err(StoreError::StoreCorrupt);
+        }
+        command_validation?;
+        let frontier = journal_index.frontier;
         let object_rows = read_object_rows(&connection)?;
         let (object_checkpoint, object_generation) =
             object_checkpoint_from_rows(&object_rows).unwrap_or((0, 0));
@@ -404,9 +428,12 @@ impl SqliteState {
         } else {
             crate::relations::checkpoint_from_rows(&relation_rows)?
         };
-        let data_version: i64 = connection
+        let observed_data_version: i64 = connection
             .pragma_query_value(None, "data_version", |row| row.get(0))
             .map_err(|_| StoreError::StoreCorrupt)?;
+        if observed_data_version != data_version {
+            return Err(StoreError::StoreCorrupt);
+        }
         let mut state = Self {
             connection: Some(connection),
             path,
@@ -416,7 +443,11 @@ impl SqliteState {
             incarnation: NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed),
             data_version,
             data_version_known: true,
-            journal_epoch: if rows.is_empty() { 0 } else { 1 },
+            journal_epoch: if journal_index.commands.is_empty() {
+                0
+            } else {
+                1
+            },
             objects_epoch: if object_rows.is_empty() { 0 } else { 1 },
             relations_epoch: if relation_rows.is_empty() { 0 } else { 1 },
             frontier,
@@ -496,23 +527,15 @@ impl SqliteState {
         self.with_connection(read_all_rows)
     }
 
+    pub(crate) fn startup_journal_index(&self) -> Result<StartupJournalIndex, StoreError> {
+        self.with_connection(read_startup_journal_index)
+    }
+
     pub(crate) fn committed_rows(
         &self,
         command_id: CommandId,
     ) -> Result<Vec<JournalRow>, StoreError> {
-        self.with_connection(|connection| {
-            let mut statement = connection
-                .prepare(SELECT_COMMAND_ROWS)
-                .map_err(|_| StoreError::StoreCorrupt)?;
-            let mut queried = statement
-                .query(params![command_id.to_string()])
-                .map_err(|_| StoreError::StoreCorrupt)?;
-            let mut rows = Vec::new();
-            while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
-                rows.push(journal_row_from_sql(sql_row)?);
-            }
-            Ok(rows)
-        })
+        self.with_connection(|connection| read_command_rows(connection, command_id))
     }
 
     pub(crate) fn rows_after(&self, seq: u64) -> Result<Vec<JournalRow>, StoreError> {
@@ -1592,6 +1615,51 @@ pub(crate) fn read_all_rows(connection: &Connection) -> Result<Vec<JournalRow>, 
     Ok(rows)
 }
 
+fn read_startup_journal_index(connection: &Connection) -> Result<StartupJournalIndex, StoreError> {
+    let mut statement = connection
+        .prepare(SELECT_ALL_ROWS)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut queried = statement.query([]).map_err(|_| StoreError::StoreCorrupt)?;
+    let mut index = StartupJournalIndex {
+        commands: BTreeMap::new(),
+        frontier: 0,
+    };
+    let mut previous_seq = None;
+    let mut invalid_sequence_order = false;
+    while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+        let row = journal_row_from_sql(sql_row)?;
+        invalid_sequence_order |= previous_seq.is_some_and(|seq| seq >= row.seq);
+        previous_seq = Some(row.seq);
+        index.frontier = row.seq;
+        index
+            .commands
+            .entry(row.command_id)
+            .or_default()
+            .push((row.ordinal, row.seq));
+    }
+    if invalid_sequence_order {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(index)
+}
+
+fn read_command_rows(
+    connection: &Connection,
+    command_id: CommandId,
+) -> Result<Vec<JournalRow>, StoreError> {
+    let mut statement = connection
+        .prepare(SELECT_COMMAND_ROWS)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut queried = statement
+        .query(params![command_id.to_string()])
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut rows = Vec::new();
+    while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+        rows.push(journal_row_from_sql(sql_row)?);
+    }
+    Ok(rows)
+}
+
 fn read_object_rows(connection: &Connection) -> Result<Vec<ObjectRow>, StoreError> {
     let mut statement = connection
         .prepare(SELECT_OBJECT_ROWS)
@@ -2181,6 +2249,34 @@ mod tests {
         drop(altered);
         assert_eq!(
             SqliteState::open(&data_dir2).err(),
+            Some(StoreError::StoreCorrupt)
+        );
+
+        let (_temp3, data_dir3, mut state, command) = initialized_state();
+        state
+            .append_command_rows(&committed_rows_for(&command, 1))
+            .unwrap();
+        drop(state);
+        let corrupted = Connection::open(database_path(&data_dir3)).unwrap();
+        corrupted
+            .execute(
+                "UPDATE journal_events SET occurred_at_us = -1 WHERE ordinal = 0",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            SqliteState::open(&data_dir3).err(),
+            Some(StoreError::InvalidInput)
+        );
+        corrupted
+            .execute(
+                "UPDATE journal_events SET source_kind = 'unsupported' WHERE ordinal = 1",
+                [],
+            )
+            .unwrap();
+        drop(corrupted);
+        assert_eq!(
+            SqliteState::open(&data_dir3).err(),
             Some(StoreError::StoreCorrupt)
         );
     }
