@@ -26,7 +26,7 @@ use crate::{
     },
     query::L0002ProjectionWorker,
     search::SEARCH_TABLE,
-    sqlite_state::{SqliteHandle, SqliteStamp, SqliteState, StartupJournalIndex},
+    sqlite_state::{SqliteHandle, SqliteStamp, SqliteState},
 };
 
 /// Existing native handles only: no replay, projection repair, or content verification.
@@ -538,72 +538,6 @@ pub struct JournalWriter {
     _lock: SiblingWriterLock,
 }
 
-fn ordered_startup_command_ids(
-    index: &StartupJournalIndex,
-) -> Result<Vec<(u64, evertrace_domain::ids::CommandId)>, StoreError> {
-    let mut ordered = Vec::with_capacity(index.commands.len());
-    for (command_id, command_rows) in &index.commands {
-        let mut by_ordinal = command_rows.clone();
-        by_ordinal.sort_by_key(|(ordinal, _)| *ordinal);
-        let first_seq = by_ordinal
-            .first()
-            .map(|(_, seq)| *seq)
-            .ok_or(StoreError::StoreCorrupt)?;
-        if by_ordinal
-            .iter()
-            .enumerate()
-            .any(|(ordinal, (_, seq))| *seq != first_seq.saturating_add(ordinal as u64))
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-        ordered.push((first_seq, *command_id));
-    }
-    ordered.sort_by_key(|(first_seq, _)| *first_seq);
-    Ok(ordered)
-}
-
-fn startup_admission(state: &mut SqliteState) -> Result<(JournalAdmissionState, u64), StoreError> {
-    let index = state.startup_journal_index()?;
-    let command_validation: Result<(), StoreError> = (|| {
-        for command_id in index.commands.keys() {
-            let rows = state.committed_rows(*command_id)?;
-            validate_complete_command(&rows)?;
-        }
-        Ok(())
-    })();
-    state.stamp()?;
-    command_validation?;
-    let ordered = ordered_startup_command_ids(&index)?;
-
-    let admission_result: Result<JournalAdmissionState, StoreError> = (|| {
-        let mut admission = JournalAdmissionState::default();
-        for (_, command_id) in ordered {
-            let rows = state.committed_rows(command_id)?;
-            let indexed = index
-                .commands
-                .get(&command_id)
-                .ok_or(StoreError::StoreCorrupt)?;
-            if !rows
-                .iter()
-                .map(|row| (row.ordinal, row.seq))
-                .eq(indexed.iter().copied())
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            let batch = rows.iter().collect::<Vec<_>>();
-            admission = admission.apply_row_batch_owned(&batch)?;
-        }
-        Ok(admission)
-    })();
-    state.stamp()?;
-    let admission = admission_result?;
-    let next_seq = index
-        .frontier
-        .checked_add(1)
-        .ok_or(StoreError::StoreCorrupt)?;
-    Ok((admission, next_seq))
-}
-
 impl JournalWriter {
     /// The persisted committed frontier. Reserved sequence numbers are not a
     /// frontier and may leave legal gaps.
@@ -794,12 +728,18 @@ impl JournalWriter {
             return Err(StoreError::StoreCorrupt);
         }
         let projection_directories = vec![(path, file)];
-        let mut state = Arc::try_unwrap(sqlite)
-            .map_err(|_| StoreError::Io)?
-            .into_inner()
-            .map_err(|_| StoreError::StoreCorrupt)?;
-        let (admission_state, next_seq) = startup_admission(&mut state)?;
-        let sqlite = state.handle();
+        let (admission_state, next_seq) = {
+            let state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            let rows = state.rows()?;
+            let admission_state = JournalAdmissionState::from_journal_rows(&rows)?;
+            let next_seq = rows
+                .last()
+                .map(|row| row.seq)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(StoreError::StoreCorrupt)?;
+            (admission_state, next_seq)
+        };
         readers.publish_writer_binding(connection.clone(), &sqlite)?;
         Ok(Self {
             _lock: lock,
@@ -2538,133 +2478,6 @@ mod tests {
         assert_eq!(state.rows().unwrap(), journal_before);
         assert_eq!(state.object_checkpoint_row().unwrap(), Some((0, 1)));
         assert_eq!(state.object_rows().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn startup_validates_later_command_before_earlier_admission() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("data");
-        drop(JournalWriter::open(&root).await.unwrap());
-        let mut state = SqliteState::open(&root).unwrap();
-        let (lane, _) = capture_pair(
-            ExecutionLaneId::new_v7(),
-            CaptureReceiptId::new_v7(),
-            1,
-            None,
-        );
-        let admission_invalid = capture_command("01890f47-6a4a-7cc1-98b9-01890f476a10", lane, None);
-        let command_invalid = JournalCommand::new(
-            CommandId::from_str("01890f47-6a4a-7cc1-98b9-01890f476a82").unwrap(),
-            vec![JournalEventDraft::runtime(
-                1,
-                [1; 32],
-                "startup-priority",
-                JournalPayload::DirtyTarget(DirtyTarget {
-                    target_kind: DirtyTargetKind::ObjectsProjection,
-                    target_id: "startup-priority".into(),
-                    algorithm_revision: "startup-priority".into(),
-                    source_watermark: 1,
-                }),
-            )],
-        )
-        .unwrap();
-        assert!(admission_invalid.command_id() < command_invalid.command_id());
-        let first_seq = state.stamp().unwrap().frontier + 1;
-        let mut rows =
-            rows_for_append(&prepare_command(&admission_invalid).unwrap(), first_seq, 1).unwrap();
-        let later_rows = rows_for_append(
-            &prepare_command(&command_invalid).unwrap(),
-            first_seq + 1,
-            1,
-        )
-        .unwrap();
-        rows.extend(later_rows);
-        assert!(matches!(
-            JournalAdmissionState::from_journal_rows(&rows),
-            Err(StoreError::StoreCorrupt)
-        ));
-        state.append_rows_for_test(&rows).unwrap();
-        let mut corrupted = state.rows().unwrap();
-        corrupted
-            .iter_mut()
-            .find(|row| row.command_id == command_invalid.command_id())
-            .unwrap()
-            .occurred_at_us = -1;
-        state.overwrite_rows_for_test(&corrupted).unwrap();
-        assert!(matches!(
-            JournalAdmissionState::from_journal_rows(&corrupted),
-            Err(StoreError::InvalidInput)
-        ));
-        assert!(matches!(
-            startup_admission(&mut state),
-            Err(StoreError::InvalidInput)
-        ));
-    }
-
-    #[tokio::test]
-    async fn startup_stream_matches_full_replay_in_sequence_order_across_i64() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("data");
-        let writer = JournalWriter::open(&root).await.unwrap();
-        let dirty_command = |id: &str, watermark| {
-            JournalCommand::new(
-                CommandId::from_str(id).unwrap(),
-                vec![JournalEventDraft::runtime(
-                    1,
-                    [1; 32],
-                    "startup-oracle",
-                    JournalPayload::DirtyTarget(DirtyTarget {
-                        target_kind: DirtyTargetKind::ObjectsProjection,
-                        target_id: "startup-oracle".into(),
-                        algorithm_revision: "startup-oracle".into(),
-                        source_watermark: watermark,
-                    }),
-                )],
-            )
-            .unwrap()
-        };
-        let first = dirty_command("01890f47-6a4a-7cc1-98b9-01890f476a82", 1);
-        let second = dirty_command("01890f47-6a4a-7cc1-98b9-01890f476a10", 2);
-        assert!(second.command_id() < first.command_id());
-        let first_seq = i64::MAX as u64;
-        let first_rows = rows_for_append(&prepare_command(&first).unwrap(), first_seq, 1).unwrap();
-        let second_rows =
-            rows_for_append(&prepare_command(&second).unwrap(), first_seq + 2, 1).unwrap();
-        append_rows(&writer.projection_handle(), &first_rows)
-            .await
-            .unwrap();
-        append_rows(&writer.projection_handle(), &second_rows)
-            .await
-            .unwrap();
-        let full_rows = writer.journal_rows().await.unwrap();
-        let expected_batches = crate::projections::ordered_command_batches(&full_rows)
-            .unwrap()
-            .into_iter()
-            .map(|batch| batch.into_iter().cloned().collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        drop(writer);
-
-        let mut state = SqliteState::open(&root).unwrap();
-        let index = state.startup_journal_index().unwrap();
-        let actual_batches = ordered_startup_command_ids(&index)
-            .unwrap()
-            .into_iter()
-            .map(|(_, command_id)| state.committed_rows(command_id).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(actual_batches, expected_batches);
-        let (streamed, next_seq) = startup_admission(&mut state).unwrap();
-        assert_eq!(next_seq, second_rows[0].seq + 1);
-        drop(streamed);
-        drop(state);
-
-        let mut reopened = JournalWriter::open(&root).await.unwrap();
-        assert_eq!(reopened.next_seq, second_rows[0].seq + 1);
-
-        let continuation = dirty_command("01890f47-6a4a-7cc1-98b9-01890f476a20", 3);
-        assert_eq!(
-            reopened.commit(&continuation, 1).await.unwrap().first_seq,
-            second_rows[0].seq + 1
-        );
     }
 
     #[tokio::test]
