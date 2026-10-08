@@ -14831,6 +14831,7 @@ impl ProjectionWorker {
             }
             state.validate_evidence_relations()?;
         }
+        drop(admission);
         state.validate_evidence_relations()?;
         let candidates = state.capture_delta_rows(&payloads)?;
         let current_by_id = current
@@ -15016,6 +15017,7 @@ impl ProjectionWorker {
             }
             state.validate_evidence_relations()?;
         }
+        drop(admission);
         let expected = state.into_snapshot(journal_frontier)?;
         let ordinary_upsert = !reconcile_all
             && !reconcile_recall
