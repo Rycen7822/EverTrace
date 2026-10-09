@@ -281,7 +281,7 @@ fn runtime_row(payload: JournalPayload, seq: u64) -> ObjectRow {
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json().unwrap()),
+        payload_json: Some(payload.canonical_json().unwrap().into()),
         source_event_seq: seq,
         projection_generation: 1,
     }
@@ -347,7 +347,7 @@ fn synthesis_episode_row_for_task(watermark: u64, task_id: TaskId) -> ObjectRow 
         task_id: Some(task_id.to_string()),
         workstream_id: Some(workstream.workstream_id.to_string()),
         session_id: None,
-        payload_json: Some(payload.canonical_json().unwrap()),
+        payload_json: Some(payload.canonical_json().unwrap().into()),
         source_event_seq: watermark,
         projection_generation: 1,
     }
@@ -421,7 +421,7 @@ fn bound_operation_rows(episode_row: &ObjectRow, surface_row: &ObjectRow) -> [Ob
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(operation_payload.canonical_json().unwrap()),
+            payload_json: Some(operation_payload.canonical_json().unwrap().into()),
             source_event_seq: surface_row.source_event_seq,
             projection_generation: 1,
         },
@@ -447,7 +447,7 @@ fn bound_operation_rows(episode_row: &ObjectRow, surface_row: &ObjectRow) -> [Ob
             task_id: Some(episode.task_id.to_string()),
             workstream_id: Some(episode.workstream_id.to_string()),
             session_id: None,
-            payload_json: Some(binding_payload.canonical_json().unwrap()),
+            payload_json: Some(binding_payload.canonical_json().unwrap().into()),
             source_event_seq: surface_row.source_event_seq,
             projection_generation: 1,
         },
@@ -501,7 +501,8 @@ fn evidence_surface_row(episode_row: &ObjectRow, protected_text: &str, seq: u64)
         payload_json: Some(
             JournalPayload::EvidenceSurfaceRecorded(Box::new(surface))
                 .canonical_json()
-                .unwrap(),
+                .unwrap()
+                .into(),
         ),
         source_event_seq: seq,
         projection_generation: 1,
@@ -1988,7 +1989,8 @@ async fn synthesis_uses_only_validated_evidence_surface_text_for_provider_input(
         serde_json::json!({
             "payload_json_secret_canary": "must-never-reach-provider"
         })
-        .to_string(),
+        .to_string()
+        .into(),
     );
     raw.source_event_seq = 8;
     let snapshot = ProjectionSnapshot {
@@ -2039,7 +2041,11 @@ async fn synthesis_without_eligible_surface_fails_without_calling_provider_or_re
     raw.object_kind = Some("work_artifact".into());
     raw.object_id = Some("work-artifact-no-surface".into());
     raw.current_revision_id = Some("work-artifact-no-surface-revision".into());
-    raw.payload_json = Some(serde_json::json!({"raw": "not-selected"}).to_string());
+    raw.payload_json = Some(
+        serde_json::json!({"raw": "not-selected"})
+            .to_string()
+            .into(),
+    );
     raw.source_event_seq = 8;
     let snapshot = ProjectionSnapshot {
         frontier: 9,
@@ -2271,7 +2277,8 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
         payload_json: Some(
             JournalPayload::SemanticDerivationRunRecorded(Box::new(prior))
                 .canonical_json()
-                .unwrap(),
+                .unwrap()
+                .into(),
         ),
         source_event_seq: 10,
         projection_generation: 1,

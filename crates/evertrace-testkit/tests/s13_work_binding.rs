@@ -388,7 +388,8 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     fork_row.payload_json = Some(
         JournalPayload::WorkBindingRecorded(Box::new(fork_revision))
             .canonical_json()
-            .unwrap(),
+            .unwrap()
+            .into(),
     );
     forked.rows.push(fork_row);
     assert_eq!(

@@ -252,7 +252,7 @@ mod tests {
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(payload.canonical_json().unwrap()),
+            payload_json: Some(payload.canonical_json().unwrap().into()),
             source_event_seq: seq,
             projection_generation: 1,
         }

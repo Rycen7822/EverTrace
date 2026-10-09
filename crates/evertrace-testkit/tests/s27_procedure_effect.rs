@@ -1077,7 +1077,7 @@ mod controlled_projection_proof {
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(payload.canonical_json().unwrap()),
+            payload_json: Some(payload.canonical_json().unwrap().into()),
             source_event_seq: seq,
             projection_generation: 1,
         }
@@ -1511,7 +1511,8 @@ mod controlled_projection_proof {
             row.payload_json = Some(
                 JournalPayload::ExperimentRunRecorded(run)
                     .canonical_json()
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             );
             return;
         }
@@ -1714,7 +1715,8 @@ mod controlled_projection_proof {
         latest.payload_json = Some(
             JournalPayload::WorktreeSnapshotRecorded(snapshot)
                 .canonical_json()
-                .unwrap(),
+                .unwrap()
+                .into(),
         );
         with_new_snapshot.rows.push(latest);
         let stable = compile_snapshot_pairs(
@@ -1742,7 +1744,8 @@ mod controlled_projection_proof {
             row.payload_json = Some(
                 JournalPayload::WorktreeInstanceRecorded(worktree)
                     .canonical_json()
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             );
         }
         assert!(
@@ -1780,7 +1783,7 @@ mod controlled_projection_proof {
                 _ => None,
             };
             if let Some(replacement) = replacement {
-                row.payload_json = Some(replacement.canonical_json().unwrap());
+                row.payload_json = Some(replacement.canonical_json().unwrap().into());
             }
         }
         assert!(

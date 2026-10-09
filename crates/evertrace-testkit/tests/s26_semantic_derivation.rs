@@ -3599,7 +3599,7 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
         unreachable!()
     };
     atom.value.text = "tampered source content".into();
-    atom_row.payload_json = Some(serde_json::to_string(&atom_payload).unwrap());
+    atom_row.payload_json = Some(serde_json::to_string(&atom_payload).unwrap().into());
     assert!(derive_l0002_projections(&mismatched_hash).is_err());
 
     let task_id = seed.task.task_id;

@@ -893,7 +893,7 @@ mod tests {
             row.row_kind = evertrace_store::ObjectRowKind::Data;
             row.object_kind = Some(kind.into());
             row.object_id = Some(id);
-            row.payload_json = Some(json.to_string());
+            row.payload_json = Some(json.to_string().into());
             row
         };
         let observation = row(

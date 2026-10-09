@@ -964,7 +964,8 @@ mod tests {
             session_id: None,
             payload_json: Some(
                 serde_json::to_string(&JournalPayload::AtomRecorded(Box::new(atom.clone())))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             ),
             source_event_seq: sequence,
             projection_generation: 0,

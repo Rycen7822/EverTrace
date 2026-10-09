@@ -559,7 +559,11 @@ pub fn current_row(value: &SessionImportCurrent, generation: u64) -> Result<Obje
         task_id: None,
         workstream_id: None,
         session_id: Some(value.session_id.clone()),
-        payload_json: Some(serde_json::to_string(value).map_err(|_| StoreError::Serialization)?),
+        payload_json: Some(
+            serde_json::to_string(value)
+                .map_err(|_| StoreError::Serialization)?
+                .into(),
+        ),
         source_event_seq: value.source_event_seq,
         projection_generation: generation,
     })

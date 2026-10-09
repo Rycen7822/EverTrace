@@ -1119,7 +1119,7 @@ impl S23State {
                     task_id: None,
                     workstream_id: None,
                     session_id: None,
-                    payload_json: Some(payload_json),
+                    payload_json: Some(payload_json.into()),
                     source_event_seq: projection.source_watermark,
                     projection_generation: generation,
                 })
@@ -1290,7 +1290,7 @@ fn object_row(
         task_id,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq: seq,
         projection_generation: generation,
     })

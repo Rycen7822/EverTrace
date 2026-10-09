@@ -904,7 +904,7 @@ impl ProcedureUsageCurrentView {
             {
                 continue;
             }
-            bytes += row.payload_json.as_ref().map_or(0, String::len);
+            bytes += row.payload_json.as_ref().map_or(0, |payload| payload.len());
             if selected.rows.len() == 512 || bytes > 2 * 1024 * 1024 {
                 return Ok(None);
             }
@@ -3959,7 +3959,7 @@ mod negative_review_selection_tests {
                 row_kind: evertrace_store::ObjectRowKind::Data,
                 object_id: Some(id),
                 object_kind: Some(kind.into()),
-                payload_json: Some(serde_json::to_string(&payload).unwrap()),
+                payload_json: Some(serde_json::to_string(&payload).unwrap().into()),
                 source_event_seq: seq,
                 ..evertrace_store::ObjectRow::checkpoint(seq, 1)
             };
@@ -4337,7 +4337,7 @@ mod negative_review_selection_tests {
             .map(|(kind, payload)| evertrace_store::ObjectRow {
                 row_kind: evertrace_store::ObjectRowKind::Data,
                 object_kind: Some(kind.into()),
-                payload_json: Some(serde_json::to_string(&payload).unwrap()),
+                payload_json: Some(serde_json::to_string(&payload).unwrap().into()),
                 ..evertrace_store::ObjectRow::checkpoint(20, 1)
             })
             .collect(),
@@ -4348,7 +4348,7 @@ mod negative_review_selection_tests {
         snapshot.rows.push(evertrace_store::ObjectRow {
             row_kind: evertrace_store::ObjectRowKind::Data,
             object_kind: Some("source_receipt".into()),
-            payload_json: Some("x".repeat(64 * 1024)),
+            payload_json: Some("x".repeat(64 * 1024).into()),
             ..evertrace_store::ObjectRow::checkpoint(20, 1)
         });
         assert!(ProcedureUsageCurrentView::from_snapshot(&snapshot).is_err());

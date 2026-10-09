@@ -634,7 +634,7 @@ fn current_row(kind: &str, payload: &JournalPayload) -> ObjectRow {
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(serde_json::to_string(payload).unwrap()),
+        payload_json: Some(serde_json::to_string(payload).unwrap().into()),
         source_event_seq: 1,
         projection_generation: 1,
     }
@@ -1447,7 +1447,7 @@ fn ambiguous_attempt_group_context_fails_closed_without_a_primary_binding_ref() 
             unreachable!();
         };
         attempt.competing_group_ids = groups.clone();
-        row.payload_json = Some(serde_json::to_string(&payload).unwrap());
+        row.payload_json = Some(serde_json::to_string(&payload).unwrap().into());
     }
     observed.view = SegmentationCurrentState::from_snapshot(&ProjectionSnapshot {
         frontier: 100,

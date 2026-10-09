@@ -1053,7 +1053,8 @@ mod tests {
                 serde_json::to_string(&JournalPayload::WorkEpisodeRecorded(Box::new(
                     episode.clone(),
                 )))
-                .unwrap(),
+                .unwrap()
+                .into(),
             ),
             source_event_seq: seq,
             ..evertrace_store::ObjectRow::checkpoint(0, 1)
@@ -1070,7 +1071,8 @@ mod tests {
                         serde_json::to_string(&JournalPayload::WorkCheckpointRecorded(Box::new(
                             checkpoint.clone(),
                         )))
-                        .unwrap(),
+                        .unwrap()
+                        .into(),
                     ),
                     source_event_seq: 2,
                     ..evertrace_store::ObjectRow::checkpoint(0, 1)

@@ -586,7 +586,7 @@ async fn create_successor_no_delta_replay_rebuild_and_restart_are_equivalent() {
     value.parent_verification_refs.clear();
     row.row_id = format!("object:work:attempt:{}", value.revision_id);
     row.current_revision_id = Some(value.revision_id.to_string());
-    row.payload_json = Some(payload.canonical_json().unwrap());
+    row.payload_json = Some(payload.canonical_json().unwrap().into());
     rollback.rows.push(row);
     assert_eq!(
         AttemptCurrentView::from_snapshot(&rollback),

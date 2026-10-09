@@ -185,7 +185,7 @@ mod tests {
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(dirty.canonical_json().unwrap()),
+            payload_json: Some(dirty.canonical_json().unwrap().into()),
             source_event_seq: frontier,
             projection_generation: 1,
         };

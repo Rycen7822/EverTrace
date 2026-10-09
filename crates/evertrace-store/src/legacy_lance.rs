@@ -421,7 +421,8 @@ fn objects_from_batch(batch: &RecordBatch) -> Result<Vec<ObjectRow>, StoreError>
             task_id: owned(tasks, index),
             workstream_id: owned(workstreams, index),
             session_id: owned(sessions, index),
-            payload_json: (!payloads.is_null(index)).then(|| payloads.value(index).to_owned()),
+            payload_json: (!payloads.is_null(index))
+                .then(|| crate::objects::RowPayload::from(payloads.value(index))),
             source_event_seq: source_seqs.value(index),
             projection_generation: generations.value(index),
         };

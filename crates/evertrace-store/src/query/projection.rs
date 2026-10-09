@@ -82,7 +82,11 @@ pub fn object_projection_hash(objects: &ProjectionSnapshot) -> Result<[u8; 32], 
                         option(row.task_id.clone()),
                         option(row.workstream_id.clone()),
                         option(row.session_id.clone()),
-                        option(row.payload_json.clone()),
+                        option(
+                            row.payload_json
+                                .as_ref()
+                                .map(|payload| payload.to_owned_string()),
+                        ),
                         CanonicalValue::Integer(i128::from(row.source_event_seq)),
                         CanonicalValue::Integer(i128::from(row.projection_generation)),
                     ])

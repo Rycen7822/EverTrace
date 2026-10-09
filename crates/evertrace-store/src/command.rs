@@ -1214,6 +1214,11 @@ impl JournalPayload {
         serde_json::to_string(self).map_err(|_| StoreError::Serialization)
     }
 
+    pub(crate) fn canonical_json_into(&self, output: &mut Vec<u8>) -> Result<(), StoreError> {
+        output.clear();
+        serde_json::to_writer(output, self).map_err(|_| StoreError::Serialization)
+    }
+
     pub(crate) fn matches_canonical_json(&self, expected: &str) -> Result<bool, StoreError> {
         // Use the same serializer as canonical_json, but compare its output
         // directly instead of allocating another full payload String.
@@ -2617,6 +2622,10 @@ mod tests {
             reload: None,
         });
         let canonical = payload.canonical_json().unwrap();
+        let mut reused_scratch = b"stale bytes".to_vec();
+        payload.canonical_json_into(&mut reused_scratch).unwrap();
+        assert_eq!(reused_scratch, serde_json::to_vec(&payload).unwrap());
+        assert_eq!(std::str::from_utf8(&reused_scratch).unwrap(), canonical);
         assert!(payload.matches_canonical_json(&canonical).unwrap());
         assert!(
             !payload

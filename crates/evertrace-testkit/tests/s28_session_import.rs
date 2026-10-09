@@ -2249,8 +2249,11 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
     let foreign = evertrace_domain::ids::RepositoryId::new_v7();
     receipt.repository_instance_id = Some(foreign);
     row.repository_id = Some(foreign.to_string());
-    row.payload_json =
-        Some(serde_json::to_string(&JournalPayload::SourceReceiptRecorded(receipt)).unwrap());
+    row.payload_json = Some(
+        serde_json::to_string(&JournalPayload::SourceReceiptRecorded(receipt))
+            .unwrap()
+            .into(),
+    );
     assert!(
         evertrace_store::projections::repository_scope_purge_preview(
             &foreign_scope,

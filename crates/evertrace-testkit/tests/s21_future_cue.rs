@@ -590,7 +590,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
         task_id: Some(scope.task.task_id.to_string()),
         workstream_id: None,
         session_id: None,
-        payload_json: Some(descriptive_payload.canonical_json().unwrap()),
+        payload_json: Some(descriptive_payload.canonical_json().unwrap().into()),
         source_event_seq: snapshot.frontier,
         projection_generation: 1,
     });

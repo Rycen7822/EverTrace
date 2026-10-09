@@ -254,7 +254,7 @@ pub async fn resolve_procedure_coverage(
                 continue;
             }
             inventory_items += 1;
-            inventory_bytes += row.payload_json.as_ref().map_or(0, String::len);
+            inventory_bytes += row.payload_json.as_ref().map_or(0, |payload| payload.len());
             if inventory_items > 256 || inventory_bytes > 2 * 1024 * 1024 {
                 coverage.omissions.push(Omission::CandidateLimit);
                 break;

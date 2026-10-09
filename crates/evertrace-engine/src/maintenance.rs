@@ -5851,7 +5851,7 @@ mod idle_tests {
         row.row_id = id;
         row.row_kind = evertrace_store::ObjectRowKind::Data;
         row.object_kind = Some(kind.into());
-        row.payload_json = Some(payload.canonical_json().unwrap());
+        row.payload_json = Some(payload.canonical_json().unwrap().into());
         row
     }
 
@@ -6135,7 +6135,8 @@ mod idle_tests {
         future.event_time_us = i64::MAX;
         snapshot.rows.last_mut().unwrap().payload_json = Some(
             serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(future)))
-                .unwrap(),
+                .unwrap()
+                .into(),
         );
         snapshot.rows.last_mut().unwrap().source_event_seq = 13;
         assert!(
@@ -6148,7 +6149,9 @@ mod idle_tests {
         let mut fresh = receipt;
         fresh.recorded_at_us = 2_000_000_000;
         snapshot.rows.last_mut().unwrap().payload_json = Some(
-            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(fresh))).unwrap(),
+            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(fresh)))
+                .unwrap()
+                .into(),
         );
         snapshot.rows.last_mut().unwrap().source_event_seq = 14;
         idle.refresh(

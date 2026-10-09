@@ -13314,6 +13314,8 @@ impl ReducerState {
         )?);
         rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
         rows.extend(self.synthesis.rows()?);
+        let mut payload_blocks = crate::objects::RowPayloadBlockBuilder::default();
+        let mut payload_scratch = Vec::new();
         for (migration, (payload, seq)) in self.migrations {
             rows.push(runtime_row(
                 format!("projection:migration:{migration}"),
@@ -13395,10 +13397,24 @@ impl ReducerState {
             )?);
         }
         for (_, (value, seq)) in self.source_receipts {
-            rows.push(source_receipt_row(value, seq)?);
+            let (fields, payload) = source_receipt_parts(value);
+            push_canonical_row(
+                &mut rows,
+                &mut payload_blocks,
+                evidence_object_row_fields(fields, seq),
+                &payload,
+                &mut payload_scratch,
+            )?;
         }
         for (_, (value, seq)) in self.source_observations {
-            rows.push(source_observation_row(value, seq)?);
+            let (fields, payload) = source_observation_parts(value);
+            push_canonical_row(
+                &mut rows,
+                &mut payload_blocks,
+                evidence_object_row_fields(fields, seq),
+                &payload,
+                &mut payload_scratch,
+            )?;
         }
         for (key, (value, seq)) in self.source_watermarks {
             rows.push(runtime_row(
@@ -13409,7 +13425,14 @@ impl ReducerState {
             )?);
         }
         for (id, (value, seq)) in self.evidence_surfaces {
-            rows.push(surface_row(id, value, seq)?);
+            let (row, payload) = surface_row_parts(id, value, seq);
+            push_canonical_row(
+                &mut rows,
+                &mut payload_blocks,
+                row,
+                &payload,
+                &mut payload_scratch,
+            )?;
         }
         for ((id, revision), (value, seq)) in self.host_occurrence_revisions {
             let mut row = physical_object_row(
@@ -13752,6 +13775,8 @@ impl ReducerState {
         }
         rows.extend(self.deletions.rows()?);
         rows.extend(self.scope_purges.rows()?);
+        drop(payload_scratch);
+        payload_blocks.finish(&mut rows)?;
         filter_product_rows(
             rows,
             &self.deletions,
@@ -14293,13 +14318,29 @@ fn runtime_row(
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
 }
 
-fn source_receipt_row(value: SourceReceipt, seq: u64) -> Result<ObjectRow, StoreError> {
+fn push_canonical_row(
+    rows: &mut Vec<ObjectRow>,
+    payload_blocks: &mut crate::objects::RowPayloadBlockBuilder,
+    row: ObjectRow,
+    payload: &JournalPayload,
+    scratch: &mut Vec<u8>,
+) -> Result<(), StoreError> {
+    payload.canonical_json_into(scratch)?;
+    let text = std::str::from_utf8(scratch).map_err(|_| StoreError::Serialization)?;
+    payload_blocks.push_text(rows, row, text)?;
+    if scratch.capacity() > crate::objects::OBJECT_ROW_PAYLOAD_BLOCK_BYTES {
+        *scratch = Vec::new();
+    }
+    Ok(())
+}
+
+fn source_receipt_parts(value: SourceReceipt) -> (EvidenceRowFields, JournalPayload) {
     let id = value.source_receipt_id;
     let fields = evidence_fields(
         format!("object:evidence:source_receipt:{id}"),
@@ -14310,14 +14351,18 @@ fn source_receipt_row(value: SourceReceipt, seq: u64) -> Result<ObjectRow, Store
         value.worktree_instance_id.map(|id| id.to_string()),
         value.task_id.map(|id| id.to_string()),
     );
-    evidence_object_row(
+    (
         fields,
-        &JournalPayload::SourceReceiptRecorded(Box::new(value)),
-        seq,
+        JournalPayload::SourceReceiptRecorded(Box::new(value)),
     )
 }
 
-fn source_observation_row(value: SourceObservation, seq: u64) -> Result<ObjectRow, StoreError> {
+fn source_receipt_row(value: SourceReceipt, seq: u64) -> Result<ObjectRow, StoreError> {
+    let (fields, payload) = source_receipt_parts(value);
+    evidence_object_row(fields, &payload, seq)
+}
+
+fn source_observation_parts(value: SourceObservation) -> (EvidenceRowFields, JournalPayload) {
     let id = value.source_observation_id;
     let fields = evidence_fields(
         format!("object:evidence:source_observation:{id}"),
@@ -14328,11 +14373,15 @@ fn source_observation_row(value: SourceObservation, seq: u64) -> Result<ObjectRo
         None,
         None,
     );
-    evidence_object_row(
+    (
         fields,
-        &JournalPayload::SourceObservationRecorded(Box::new(value)),
-        seq,
+        JournalPayload::SourceObservationRecorded(Box::new(value)),
     )
+}
+
+fn source_observation_row(value: SourceObservation, seq: u64) -> Result<ObjectRow, StoreError> {
+    let (fields, payload) = source_observation_parts(value);
+    evidence_object_row(fields, &payload, seq)
 }
 
 fn evidence_object_row(
@@ -14340,7 +14389,13 @@ fn evidence_object_row(
     payload: &JournalPayload,
     source_event_seq: u64,
 ) -> Result<ObjectRow, StoreError> {
-    Ok(ObjectRow {
+    let mut row = evidence_object_row_fields(fields, source_event_seq);
+    row.payload_json = Some(payload.canonical_json()?.into());
+    Ok(row)
+}
+
+fn evidence_object_row_fields(fields: EvidenceRowFields, source_event_seq: u64) -> ObjectRow {
+    ObjectRow {
         row_id: fields.row_id,
         row_kind: ObjectRowKind::Data,
         row_class: Some(ObjectRowClass::Object),
@@ -14359,10 +14414,10 @@ fn evidence_object_row(
         task_id: fields.task_id,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: None,
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
-    })
+    }
 }
 
 fn physical_object_row(
@@ -14392,7 +14447,7 @@ fn physical_object_row(
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14516,7 +14571,7 @@ fn semantic_atom_row(
         task_id: atom.scope.task_id().map(|id| id.to_string()),
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14549,7 +14604,7 @@ fn semantic_proposal_row(
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14624,7 +14679,7 @@ fn work_identity_row(
         task_id,
         workstream_id,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14635,7 +14690,23 @@ fn surface_row(
     surface: EvidenceSurface,
     source_event_seq: u64,
 ) -> Result<ObjectRow, StoreError> {
-    Ok(ObjectRow {
+    let (mut row, payload) = surface_row_parts(id, surface, source_event_seq);
+    row.payload_json = Some(payload.canonical_json()?.into());
+    Ok(row)
+}
+
+fn surface_row_parts(
+    id: SourceObservationId,
+    surface: EvidenceSurface,
+    source_event_seq: u64,
+) -> (ObjectRow, JournalPayload) {
+    let repository_id = surface
+        .repository_instance_id
+        .map(|value| value.to_string());
+    let worktree_id = surface.worktree_instance_id.map(|value| value.to_string());
+    let task_id = surface.task_id.map(|value| value.to_string());
+    let payload = JournalPayload::EvidenceSurfaceRecorded(Box::new(surface));
+    let row = ObjectRow {
         row_id: format!("projection:evidence_surface:{id}"),
         row_kind: ObjectRowKind::Data,
         row_class: Some(ObjectRowClass::Projection),
@@ -14649,19 +14720,16 @@ fn surface_row(
         publication_state: None,
         support_state: None,
         project_id: None,
-        repository_id: surface
-            .repository_instance_id
-            .map(|value| value.to_string()),
-        worktree_id: surface.worktree_instance_id.map(|value| value.to_string()),
-        task_id: surface.task_id.map(|value| value.to_string()),
+        repository_id,
+        worktree_id,
+        task_id,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(
-            JournalPayload::EvidenceSurfaceRecorded(Box::new(surface)).canonical_json()?,
-        ),
+        payload_json: None,
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
-    })
+    };
+    (row, payload)
 }
 
 fn source_revision_key(value: &SourceRevisionRecorded) -> String {
@@ -16426,7 +16494,7 @@ mod tests {
         let mut encoded: serde_json::Value =
             serde_json::from_str(invalid.payload_json.as_deref().unwrap()).unwrap();
         encoded["value"]["decision"] = serde_json::Value::String("failed".into());
-        invalid.payload_json = Some(serde_json::to_string(&encoded).unwrap());
+        invalid.payload_json = Some(serde_json::to_string(&encoded).unwrap().into());
         let invalid_rows = vec![ObjectRow::checkpoint(1, PROJECTION_GENERATION), invalid];
         assert!(matches!(
             ReducerState::from_current_rows(&invalid_rows, 1),
@@ -17127,7 +17195,8 @@ mod tests {
                 reload: None,
             })
             .canonical_json()
-            .unwrap(),
+            .unwrap()
+            .into(),
         );
         // Production projection commits reject malformed rows before writing.
         // Inject physical corruption through the existing raw test seam.

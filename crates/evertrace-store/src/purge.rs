@@ -1206,7 +1206,8 @@ fn ledger_row(event: &ObjectDeletionLedgerEvent, seq: u64) -> Result<ObjectRow, 
         session_id: None,
         payload_json: Some(
             JournalPayload::ObjectDeletionLedgerRecorded(Box::new(event.clone()))
-                .canonical_json()?,
+                .canonical_json()?
+                .into(),
         ),
         source_event_seq: seq,
         projection_generation: PROJECTION_GENERATION,
@@ -1248,7 +1249,9 @@ fn scope_purge_row(event: &ScopePurgeProgress, seq: u64) -> Result<ObjectRow, St
         workstream_id: None,
         session_id: None,
         payload_json: Some(
-            JournalPayload::ScopePurgeProgressRecorded(Box::new(event.clone())).canonical_json()?,
+            JournalPayload::ScopePurgeProgressRecorded(Box::new(event.clone()))
+                .canonical_json()?
+                .into(),
         ),
         source_event_seq: seq,
         projection_generation: PROJECTION_GENERATION,

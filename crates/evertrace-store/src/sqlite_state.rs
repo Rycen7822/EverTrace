@@ -1393,7 +1393,7 @@ fn upsert_object_row(transaction: &Connection, row: &ObjectRow) -> Result<(), St
                 row.task_id,
                 row.workstream_id,
                 row.session_id,
-                row.payload_json,
+                row.payload_json.as_deref(),
                 row.source_event_seq.to_be_bytes().as_slice(),
                 row.projection_generation.to_be_bytes().as_slice(),
             ],
@@ -1598,11 +1598,12 @@ fn read_object_rows(connection: &Connection) -> Result<Vec<ObjectRow>, StoreErro
         .map_err(|_| StoreError::StoreCorrupt)?;
     let mut queried = statement.query([]).map_err(|_| StoreError::StoreCorrupt)?;
     let mut rows = Vec::new();
+    let mut payload_blocks = crate::objects::RowPayloadBlockBuilder::default();
     while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
         let row = object_row_from_sql(sql_row)?;
-        row.validate()?;
-        rows.push(row);
+        payload_blocks.push_row(&mut rows, row)?;
     }
+    payload_blocks.finish(&mut rows)?;
     rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
     Ok(rows)
 }
@@ -1727,7 +1728,7 @@ fn object_row_from_sql(row: &Row<'_>) -> Result<ObjectRow, StoreError> {
         task_id: optional_text(row, 15)?,
         workstream_id: optional_text(row, 16)?,
         session_id: optional_text(row, 17)?,
-        payload_json: optional_text(row, 18)?,
+        payload_json: optional_text(row, 18)?.map(crate::objects::RowPayload::from),
         source_event_seq: seq_from_blob(&sql_value::<Vec<u8>>(row, 19)?)?,
         projection_generation: seq_from_blob(&sql_value::<Vec<u8>>(row, 20)?)?,
     })
