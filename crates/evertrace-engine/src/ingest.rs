@@ -32,6 +32,7 @@ pub struct DrainProgress {
     pub committed_frames: usize,
     pub replayed_frames: usize,
     pub projected_surfaces: usize,
+    pub synced_frontier: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -720,10 +721,12 @@ impl EvidenceIngestor {
                 return Ok(progress);
             }
             if committed != 0 {
-                self.writer
-                    .sync_frontier()
-                    .await
-                    .map_err(map_writer_error)?;
+                progress.synced_frontier = Some(
+                    self.writer
+                        .sync_frontier()
+                        .await
+                        .map_err(map_writer_error)?,
+                );
             }
             let consumed = committed
                 .checked_add(terminal.len())

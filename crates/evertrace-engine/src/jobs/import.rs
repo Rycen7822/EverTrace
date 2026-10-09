@@ -26,10 +26,10 @@ use evertrace_domain::{
     ids::{CommandId, RequestId},
 };
 use evertrace_store::{
-    BodyStateReason, EventScope, JobLease, JobStatus, JobTerminalAudit, JobTerminalOutcome,
-    JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload, SessionBodyState,
-    SessionImportContext, SessionImportCurrent, SessionImportEvent, SessionImportEventKind,
-    SessionImportPrefixRecord, SessionImportPrefixRequest, SourceKind,
+    BodyStateReason, DurableJob, EventScope, JobLease, JobStatus, JobTerminalAudit,
+    JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
+    SessionBodyState, SessionImportContext, SessionImportCurrent, SessionImportEvent,
+    SessionImportEventKind, SessionImportPrefixRecord, SessionImportPrefixRequest, SourceKind,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -84,6 +84,12 @@ pub struct SessionImportWorker {
     config: Option<Arc<crate::ConfigReloadService>>,
     #[cfg(test)]
     claim_delay: Duration,
+}
+
+#[derive(Clone)]
+struct ClaimedImportLease {
+    lease: JobLease,
+    deadline: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,7 +260,7 @@ impl SessionImportWorker {
             self.verified_prefix.lock().await.remove(session_id);
             return Err(SessionImportError::Budget);
         }
-        self.claim_job(&fresh).await?;
+        let lease = self.claim_job(&fresh).await?;
         let current = &fresh.current;
         let offset = fresh
             .watermark
@@ -406,18 +412,15 @@ impl SessionImportWorker {
         }
         if observations.is_empty() {
             if eof && pending.is_empty() {
-                let latest = self.current(session_id).await?;
-                root.revalidate_file(&relative, identity)
-                    .map_err(map_source_read)?;
-                self.advance(
-                    &latest,
-                    SessionBodyState::Imported,
-                    BodyStateReason::Completed,
+                self.finish_import_handoff(
+                    current,
+                    (&relative, identity),
+                    offset,
+                    None,
+                    self.writer.subscribe_background_frontier(),
+                    &lease,
                 )
                 .await?;
-                root.revalidate_file(&relative, identity)
-                    .map_err(map_source_read)?;
-                self.verified_prefix.lock().await.remove(session_id);
                 return Ok(SessionImportProgress {
                     records: 0,
                     bytes: consumed,
@@ -426,43 +429,43 @@ impl SessionImportWorker {
             }
             return Err(SessionImportError::Budget);
         }
-        ingestor
+        let background = self.writer.subscribe_background_frontier();
+        let progress = ingestor
             .drain_observations_once(&observations)
             .await
             .map_err(|_| SessionImportError::Persistence)?;
-        let confirmed = self.context(session_id).await?;
-        let watermark = confirmed
-            .watermark
-            .as_ref()
-            .filter(|watermark| watermark.source_sequence == pending_start)
-            .ok_or(SessionImportError::Persistence)?;
-        let confirmed_digest = watermark
-            .confirmed_prefix_digest
-            .clone()
-            .ok_or(SessionImportError::Persistence)?;
-        let latest = confirmed.current;
         let completed = eof && pending.is_empty();
-        root.revalidate_file(&relative, identity)
-            .map_err(map_source_read)?;
-        self.advance(
-            &latest,
-            if completed {
-                SessionBodyState::Imported
-            } else {
-                SessionBodyState::Partial
-            },
-            if completed {
-                BodyStateReason::Completed
-            } else {
-                BodyStateReason::BudgetExhausted
-            },
-        )
-        .await?;
-        root.revalidate_file(&relative, identity)
-            .map_err(map_source_read)?;
         if completed {
-            self.verified_prefix.lock().await.remove(session_id);
+            self.finish_import_handoff(
+                current,
+                (&relative, identity),
+                pending_start,
+                progress.synced_frontier,
+                background,
+                &lease,
+            )
+            .await?;
         } else {
+            let confirmed = self.context(session_id).await?;
+            let watermark = confirmed
+                .watermark
+                .as_ref()
+                .filter(|watermark| watermark.source_sequence == pending_start)
+                .ok_or(SessionImportError::Persistence)?;
+            let confirmed_digest = watermark
+                .confirmed_prefix_digest
+                .clone()
+                .ok_or(SessionImportError::Persistence)?;
+            root.revalidate_file(&relative, identity)
+                .map_err(map_source_read)?;
+            self.advance(
+                &confirmed.current,
+                SessionBodyState::Partial,
+                BodyStateReason::BudgetExhausted,
+            )
+            .await?;
+            root.revalidate_file(&relative, identity)
+                .map_err(map_source_read)?;
             self.remember_prefix(VerifiedPrefix {
                 source_key: current.source_key(),
                 source_revision: current.metadata.source_revision.clone(),
@@ -554,6 +557,149 @@ impl SessionImportWorker {
             .await
             .map_err(|_| SessionImportError::Persistence)?
             .ok_or(SessionImportError::Unavailable)
+    }
+
+    fn handoff_target_ready(
+        context: &SessionImportContext,
+        expected: &SessionImportCurrent,
+        target_end: u64,
+        lease: &ClaimedImportLease,
+    ) -> Result<bool, SessionImportError> {
+        let current = &context.current;
+        if current.source_instance_id != expected.source_instance_id
+            || current.metadata.source_revision != expected.metadata.source_revision
+        {
+            return Err(SessionImportError::Changed);
+        }
+        if context.repository_purged
+            || current.access_decision == Some(evertrace_store::SessionAccessDecision::Revoked)
+            || current.body_state != SessionBodyState::Importing
+        {
+            return Err(SessionImportError::Unavailable);
+        }
+        let job = context
+            .job
+            .as_ref()
+            .ok_or(SessionImportError::Unavailable)?;
+        if job.job_id != lease.lease.job_id
+            || job.target_generation != lease.lease.target_generation
+            || job.attempt != lease.lease.attempt
+            || job.lease_until_us != Some(lease.lease.lease_until_us)
+            || job.state != JobStatus::Leased
+        {
+            return Err(SessionImportError::Unavailable);
+        }
+        if Instant::now() >= lease.deadline || now_us()? >= lease.lease.lease_until_us {
+            return Err(SessionImportError::Budget);
+        }
+        match context.watermark.as_ref() {
+            Some(watermark) => {
+                if watermark.source_instance_id.as_str() != current.source_instance()
+                    || watermark.source_revision != current.metadata.source_revision
+                    || watermark.source_sequence > target_end
+                {
+                    return Err(SessionImportError::Changed);
+                }
+                if watermark.source_sequence < target_end {
+                    return Ok(false);
+                }
+                if target_end != 0 && watermark.confirmed_prefix_digest.is_none() {
+                    return Err(SessionImportError::Persistence);
+                }
+                Ok(true)
+            }
+            None => Ok(target_end == 0),
+        }
+    }
+
+    async fn finish_import_handoff(
+        &self,
+        expected: &SessionImportCurrent,
+        source: (&std::path::Path, ConfinedFileIdentity),
+        target_end: u64,
+        synced_frontier: Option<u64>,
+        mut background: tokio::sync::watch::Receiver<u64>,
+        lease: &ClaimedImportLease,
+    ) -> Result<(), SessionImportError> {
+        // The watch is only a wakeup. Keep the exact committed evidence, not
+        // the old context's repository views, across projection synchronization.
+        let (frontier, watermark) = loop {
+            let _ = *background.borrow_and_update();
+            let context = self.context(&expected.source_key()).await?;
+            if Self::handoff_target_ready(&context, expected, target_end, lease)? {
+                break (context.frontier, context.watermark);
+            }
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(lease.deadline),
+                background.changed(),
+            )
+            .await
+            .map_err(|_| SessionImportError::Budget)?
+            .map_err(|_| SessionImportError::Unavailable)?;
+        };
+
+        if synced_frontier.is_none_or(|synced| synced < frontier) {
+            if Instant::now() >= lease.deadline {
+                return Err(SessionImportError::Budget);
+            }
+            let synced = self
+                .writer
+                .sync_frontier()
+                .await
+                .map_err(|_| SessionImportError::Persistence)?;
+            if synced < frontier {
+                return Err(SessionImportError::Persistence);
+            }
+        }
+        let report = self
+            .report
+            .read()
+            .await
+            .clone()
+            .ok_or(SessionImportError::Unavailable)?;
+        let checked = self.context(&expected.source_key()).await?;
+        if !Self::handoff_target_ready(&checked, expected, target_end, lease)?
+            || checked.watermark != watermark
+        {
+            return Err(SessionImportError::Changed);
+        }
+        // This read-only check revalidates approval, purge, current repository
+        // trust, the host root and exact file identity; no metadata discovery
+        // or second preflight command belongs in the completion handoff.
+        let (root, fresh_relative, fresh_identity) = self.authorized_source(
+            &report,
+            &checked,
+            lease
+                .deadline
+                .min(Instant::now() + SESSION_ROOT_PROBE_BUDGET),
+        )?;
+        if fresh_relative != source.0 || fresh_identity != source.1 {
+            return Err(SessionImportError::Changed);
+        }
+        root.revalidate_file(&fresh_relative, fresh_identity)
+            .map_err(map_source_read)?;
+        let occurred_at_us = now_us()?;
+        let command = self.body_state_command(
+            &checked.current,
+            checked.job,
+            SessionBodyState::Imported,
+            BodyStateReason::Completed,
+            occurred_at_us,
+        )?;
+        if Instant::now() >= lease.deadline || occurred_at_us >= lease.lease.lease_until_us {
+            return Err(SessionImportError::Budget);
+        }
+        self.writer
+            .commit_if_frontier(command, occurred_at_us, checked.frontier)
+            .await
+            .map_err(|_| SessionImportError::Persistence)?;
+        self.verified_prefix
+            .lock()
+            .await
+            .remove(&expected.source_key());
+        root.revalidate_file(&fresh_relative, fresh_identity)
+            .map_err(map_source_read)?;
+        Ok(())
     }
 
     async fn verify_confirmed_prefix(
@@ -745,7 +891,10 @@ impl SessionImportWorker {
         }
     }
 
-    async fn claim_job(&self, context: &SessionImportContext) -> Result<(), SessionImportError> {
+    async fn claim_job(
+        &self,
+        context: &SessionImportContext,
+    ) -> Result<ClaimedImportLease, SessionImportError> {
         let current = &context.current;
         if let Some(config) = &self.config {
             let current = config
@@ -761,6 +910,7 @@ impl SessionImportWorker {
         let Some(job) = context.job.as_ref() else {
             return Err(SessionImportError::Unavailable);
         };
+        let monotonic_started = Instant::now();
         let now = now_us()?;
         if job.state == JobStatus::Leased
             && job.lease_until_us.is_some_and(|deadline| deadline > now)
@@ -774,6 +924,12 @@ impl SessionImportWorker {
         let lease_until_us = now
             .checked_add(5_000_000)
             .ok_or(SessionImportError::Persistence)?;
+        let lease = JobLease {
+            job_id: job.job_id,
+            target_generation: job.target_generation,
+            attempt,
+            lease_until_us,
+        };
         let command = JournalCommand::new(
             CommandId::new_v7(),
             vec![JournalEventDraft {
@@ -787,12 +943,7 @@ impl SessionImportWorker {
                 correlation_id: None,
                 effective_config_hash: self.runtime.effective_config_hash,
                 algorithm_revision: "session_import_v1".into(),
-                payload: JournalPayload::JobLease(JobLease {
-                    job_id: job.job_id,
-                    target_generation: job.target_generation,
-                    attempt,
-                    lease_until_us,
-                }),
+                payload: JournalPayload::JobLease(lease.clone()),
             }],
         )
         .map_err(|_| SessionImportError::Persistence)?;
@@ -802,7 +953,10 @@ impl SessionImportWorker {
             .commit_if_frontier(command, now, context.frontier)
             .await
             .map_err(|_| SessionImportError::Persistence)?;
-        Ok(())
+        Ok(ClaimedImportLease {
+            lease,
+            deadline: monotonic_started + Duration::from_secs(5),
+        })
     }
 
     async fn mark_source_replaced(
@@ -885,7 +1039,46 @@ impl SessionImportWorker {
         body_state: SessionBodyState,
         reason: BodyStateReason,
     ) -> Result<(), SessionImportError> {
+        let job = if body_state == SessionBodyState::Partial
+            || matches!(
+                body_state,
+                SessionBodyState::Imported
+                    | SessionBodyState::SourceReplaced
+                    | SessionBodyState::Failed
+                    | SessionBodyState::BlockedUnapproved
+                    | SessionBodyState::BlockedUntrusted
+                    | SessionBodyState::BlockedScopeUnresolved
+            ) {
+            self.context(&current.source_key()).await?.job
+        } else {
+            None
+        };
         let occurred_at_us = now_us()?;
+        let command = self.body_state_command(current, job, body_state, reason, occurred_at_us)?;
+        self.writer
+            .commit(command, occurred_at_us)
+            .await
+            .map_err(|_| SessionImportError::Persistence)?;
+        if !matches!(
+            body_state,
+            SessionBodyState::Queued | SessionBodyState::Importing | SessionBodyState::Partial
+        ) {
+            self.verified_prefix
+                .lock()
+                .await
+                .remove(&current.source_key());
+        }
+        Ok(())
+    }
+
+    fn body_state_command(
+        &self,
+        current: &SessionImportCurrent,
+        job: Option<DurableJob>,
+        body_state: SessionBodyState,
+        reason: BodyStateReason,
+        occurred_at_us: i64,
+    ) -> Result<JournalCommand, SessionImportError> {
         let request_id = RequestId::new_v7();
         let event = SessionImportEvent {
             source_instance_id: current.source_instance_id.clone(),
@@ -897,7 +1090,7 @@ impl SessionImportWorker {
         };
         let mut payloads = vec![JournalPayload::SessionImportEventRecorded(Box::new(event))];
         if body_state == SessionBodyState::Partial {
-            if let Some(mut job) = self.context(&current.source_key()).await?.job {
+            if let Some(mut job) = job {
                 job.state = JobStatus::Queued;
                 job.lease_until_us = None;
                 job.terminal = None;
@@ -911,7 +1104,7 @@ impl SessionImportWorker {
                 | SessionBodyState::BlockedUnapproved
                 | SessionBodyState::BlockedUntrusted
                 | SessionBodyState::BlockedScopeUnresolved
-        ) && let Some(mut job) = self.context(&current.source_key()).await?.job
+        ) && let Some(mut job) = job
         {
             job.state = if body_state == SessionBodyState::Imported {
                 JobStatus::Succeeded
@@ -964,20 +1157,7 @@ impl SessionImportWorker {
             events,
         )
         .map_err(|_| SessionImportError::Persistence)?;
-        self.writer
-            .commit(command, occurred_at_us)
-            .await
-            .map_err(|_| SessionImportError::Persistence)?;
-        if !matches!(
-            body_state,
-            SessionBodyState::Queued | SessionBodyState::Importing | SessionBodyState::Partial
-        ) {
-            self.verified_prefix
-                .lock()
-                .await
-                .remove(&current.source_key());
-        }
-        Ok(())
+        Ok(command)
     }
 
     fn authorized_source(
