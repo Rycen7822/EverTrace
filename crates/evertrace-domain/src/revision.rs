@@ -1,6 +1,5 @@
 use std::{fmt, str::FromStr};
 
-use crate::ids::{deserialize_from_str, uuid_text_is_canonical};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::{Uuid, Variant};
@@ -49,8 +48,7 @@ impl Serialize for RevisionId {
     where
         S: Serializer,
     {
-        let mut text = [0_u8; 36];
-        serializer.serialize_str(self.0.hyphenated().encode_lower(&mut text))
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -59,7 +57,9 @@ impl<'de> Deserialize<'de> for RevisionId {
     where
         D: Deserializer<'de>,
     {
-        deserialize_from_str(deserializer)
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -68,7 +68,7 @@ impl FromStr for RevisionId {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let uuid = Uuid::parse_str(value).map_err(|_| RevisionIdError::InvalidUuid)?;
-        if !uuid_text_is_canonical(uuid, value) {
+        if uuid.hyphenated().to_string() != value {
             return Err(RevisionIdError::InvalidUuid);
         }
         Self::from_uuid(uuid)
