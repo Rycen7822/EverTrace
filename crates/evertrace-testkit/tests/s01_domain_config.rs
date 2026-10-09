@@ -6,7 +6,7 @@ use evertrace_domain::config::{
 };
 use evertrace_domain::error::{ErrorCode, PublicError};
 use evertrace_domain::ids::{
-    AnyPublicId, CommandId, IdParseError, JobId, OrganizeTarget, RequestId, TaskId,
+    AnyPublicId, CasId, CommandId, IdParseError, JobId, OrganizeTarget, RequestId, TaskId,
 };
 use evertrace_domain::revision::{
     AlgorithmRevision, ImmutableRevision, RevisionId, RevisionIdError,
@@ -112,6 +112,79 @@ fn public_id_families_are_strict_and_organize_targets_are_bounded() {
         serde_json::from_str::<CommandId>(&serialized).expect("deserialize command ID"),
         CommandId::from_str(UUID_V7).expect("command ID")
     );
+}
+
+#[test]
+fn compact_id_serde_output_matches_the_previous_expression_and_frozen_json() {
+    let task = TaskId::from_str(&format!("task:{UUID_V7}")).expect("task ID");
+    let command = CommandId::from_str(UUID_V7).expect("command ID");
+    let cas = CasId::from_digest([0xab; 32]);
+    let revision = RevisionId::from_str(UUID_V7).expect("revision ID");
+
+    let task_json = r#""task:01890f47-6a4a-7cc1-98b9-01890f476a4a""#;
+    let command_json = r#""01890f47-6a4a-7cc1-98b9-01890f476a4a""#;
+    let cas_json = r#""cas:abababababababababababababababababababababababababababababababab""#;
+    let revision_json = r#""01890f47-6a4a-7cc1-98b9-01890f476a4a""#;
+
+    let cases = [
+        (
+            serde_json::to_string(&task),
+            serde_json::to_string(&task.to_string()),
+            task_json,
+        ),
+        (
+            serde_json::to_string(&command),
+            serde_json::to_string(&command.to_string()),
+            command_json,
+        ),
+        (
+            serde_json::to_string(&cas),
+            serde_json::to_string(&cas.to_string()),
+            cas_json,
+        ),
+        (
+            serde_json::to_string(&revision),
+            serde_json::to_string(&revision.to_string()),
+            revision_json,
+        ),
+    ];
+    for (candidate, old_expression, frozen) in cases {
+        assert_eq!(old_expression.expect("old Display expression"), frozen);
+        assert_eq!(candidate.expect("ID serializer"), frozen);
+    }
+    let decoded = (
+        serde_json::from_str::<CasId>(cas_json).expect("deserialize CAS ID"),
+        serde_json::from_str::<RevisionId>(revision_json).expect("deserialize revision"),
+    );
+    assert_eq!(decoded, (cas, revision));
+}
+
+#[test]
+fn compact_id_serde_keeps_nested_map_reader_escape_and_error_behavior() {
+    let task_text = format!("task:{UUID_V7}");
+    let task = TaskId::from_str(&task_text).expect("task ID");
+    let nested: Vec<TaskId> = serde_json::from_str(&format!("[{task_text:?}]")).expect("nested ID");
+    assert_eq!(nested, [task]);
+
+    let map: std::collections::BTreeMap<TaskId, bool> =
+        serde_json::from_str(&format!("{{{task_text:?}:true}}")).expect("ID map key");
+    assert_eq!(map.get(&task), Some(&true));
+
+    let escaped: TaskId =
+        serde_json::from_str(r#""task\u003a01890f47-6a4a-7cc1-98b9-01890f476a4a""#)
+            .expect("escaped JSON string");
+    assert_eq!(escaped, task);
+    let from_reader: TaskId =
+        serde_json::from_reader(format!("{task_text:?}").as_bytes()).expect("reader ID");
+    assert_eq!(from_reader, task);
+
+    let non_string_error = serde_json::from_str::<TaskId>("17")
+        .expect_err("non-string ID")
+        .to_string();
+    let old_string_error = serde_json::from_str::<String>("17")
+        .expect_err("non-string String")
+        .to_string();
+    assert_eq!(non_string_error, old_string_error);
 }
 
 #[test]

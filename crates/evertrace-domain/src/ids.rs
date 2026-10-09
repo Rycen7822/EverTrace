@@ -1,6 +1,6 @@
-use std::fmt;
-use std::str::FromStr;
+use std::{fmt, marker::PhantomData, str::FromStr};
 
+use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::{Uuid, Variant};
@@ -45,10 +45,55 @@ fn split_family<'a>(value: &'a str, expected: &str) -> Result<&'a str, IdParseEr
 fn parse_uuid_payload(payload: &str) -> Result<Uuid, IdParseError> {
     let uuid = Uuid::parse_str(payload).map_err(|_| IdParseError::InvalidUuid)?;
     validate_uuid(uuid)?;
-    if uuid.hyphenated().to_string() != payload {
+    if !uuid_text_is_canonical(uuid, payload) {
         return Err(IdParseError::NonCanonicalUuid);
     }
     Ok(uuid)
+}
+
+pub(crate) fn uuid_text_is_canonical(uuid: Uuid, value: &str) -> bool {
+    let mut canonical = [0_u8; 36];
+    uuid.hyphenated().encode_lower(&mut canonical);
+    canonical.as_slice() == value.as_bytes()
+}
+
+struct FromStrVisitor<T>(PhantomData<fn() -> T>);
+
+impl<'de, T> Visitor<'de> for FromStrVisitor<T>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let value = std::str::from_utf8(value)
+            .map_err(|_| E::invalid_value(Unexpected::Bytes(value), &self))?;
+        self.visit_str(value)
+    }
+}
+
+pub(crate) fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    deserializer.deserialize_string(FromStrVisitor(PhantomData))
 }
 
 fn validate_uuid(uuid: Uuid) -> Result<(), IdParseError> {
@@ -127,7 +172,13 @@ macro_rules! uuid_id {
             where
                 S: Serializer,
             {
-                serializer.serialize_str(&self.to_string())
+                let mut text = [0_u8; $prefix.len() + 37];
+                let prefix = $prefix.as_bytes();
+                let payload_start = prefix.len() + 1;
+                text[..prefix.len()].copy_from_slice(prefix);
+                text[prefix.len()] = b':';
+                self.0.hyphenated().encode_lower(&mut text[payload_start..]);
+                serializer.serialize_str(std::str::from_utf8(&text).expect("ID text is ASCII"))
             }
         }
 
@@ -136,8 +187,7 @@ macro_rules! uuid_id {
             where
                 D: Deserializer<'de>,
             {
-                let value = String::deserialize(deserializer)?;
-                value.parse().map_err(serde::de::Error::custom)
+                $crate::ids::deserialize_from_str(deserializer)
             }
         }
     };
@@ -182,7 +232,8 @@ macro_rules! internal_uuid_id {
             where
                 S: Serializer,
             {
-                serializer.serialize_str(&self.to_string())
+                let mut text = [0_u8; 36];
+                serializer.serialize_str(self.0.hyphenated().encode_lower(&mut text))
             }
         }
 
@@ -191,8 +242,7 @@ macro_rules! internal_uuid_id {
             where
                 D: Deserializer<'de>,
             {
-                let value = String::deserialize(deserializer)?;
-                value.parse().map_err(serde::de::Error::custom)
+                $crate::ids::deserialize_from_str(deserializer)
             }
         }
     };
@@ -235,7 +285,17 @@ macro_rules! digest_id {
             where
                 S: Serializer,
             {
-                serializer.serialize_str(&self.to_string())
+                let mut text = [0_u8; $prefix.len() + 65];
+                let prefix = $prefix.as_bytes();
+                let payload_start = prefix.len() + 1;
+                text[..prefix.len()].copy_from_slice(prefix);
+                text[prefix.len()] = b':';
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for (index, byte) in self.0.iter().enumerate() {
+                    text[payload_start + index * 2] = HEX[(byte >> 4) as usize];
+                    text[payload_start + index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+                }
+                serializer.serialize_str(std::str::from_utf8(&text).expect("ID text is ASCII"))
             }
         }
 
@@ -244,8 +304,7 @@ macro_rules! digest_id {
             where
                 D: Deserializer<'de>,
             {
-                let value = String::deserialize(deserializer)?;
-                value.parse().map_err(serde::de::Error::custom)
+                $crate::ids::deserialize_from_str(deserializer)
             }
         }
     };
@@ -526,5 +585,109 @@ impl FromStr for OrganizeTarget {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::try_from(value.parse::<AnyPublicId>()?)
+    }
+}
+
+#[cfg(test)]
+mod text_deserializer_tests {
+    use super::{IdParseError, TaskId, split_family, validate_uuid};
+    use crate::revision::{RevisionId, RevisionIdError};
+    use serde::Deserialize;
+    use serde::de::Visitor;
+    use serde::de::value::{
+        BorrowedBytesDeserializer, BorrowedStrDeserializer, BytesDeserializer, Error as ValueError,
+        StrDeserializer, StringDeserializer,
+    };
+    use std::str::FromStr;
+    use uuid::Uuid;
+
+    const TASK_TEXT: &str = "task:01890f47-6a4a-7cc1-98b9-01890f476a4a";
+    const UUID_V4_UPPERCASE: &str = "550E8400-E29B-41D4-A716-446655440000";
+
+    #[test]
+    fn text_visitor_accepts_serde_string_and_utf8_byte_value_forms() {
+        let expected = TaskId::from_str(TASK_TEXT).expect("task ID");
+        let forms = [
+            TaskId::deserialize(BorrowedStrDeserializer::<ValueError>::new(TASK_TEXT)),
+            TaskId::deserialize(StrDeserializer::<ValueError>::new(TASK_TEXT)),
+            TaskId::deserialize(StringDeserializer::<ValueError>::new(TASK_TEXT.to_owned())),
+            TaskId::deserialize(BorrowedBytesDeserializer::<ValueError>::new(
+                TASK_TEXT.as_bytes(),
+            )),
+            TaskId::deserialize(BytesDeserializer::<ValueError>::new(TASK_TEXT.as_bytes())),
+        ];
+        for form in forms {
+            assert_eq!(form.expect("string or UTF-8 byte form"), expected);
+        }
+        assert_eq!(
+            super::FromStrVisitor::<TaskId>(std::marker::PhantomData)
+                .visit_byte_buf::<ValueError>(TASK_TEXT.as_bytes().to_vec())
+                .expect("owned bytes"),
+            expected
+        );
+    }
+
+    #[test]
+    fn text_visitor_preserves_string_visitor_errors_for_bad_utf8() {
+        let invalid_utf8 = [0xff, 0xfe];
+        let old_error =
+            String::deserialize(BorrowedBytesDeserializer::<ValueError>::new(&invalid_utf8))
+                .expect_err("invalid UTF-8")
+                .to_string();
+        let new_error =
+            TaskId::deserialize(BorrowedBytesDeserializer::<ValueError>::new(&invalid_utf8))
+                .expect_err("invalid UTF-8")
+                .to_string();
+        assert_eq!(new_error, old_error);
+        assert_eq!(new_error, "invalid value: byte array, expected a string");
+    }
+
+    #[test]
+    fn uuid_parsers_match_the_previous_canonical_and_validation_order() {
+        fn old_task_parse(value: &str) -> Result<Uuid, IdParseError> {
+            let payload = split_family(value, "task")?;
+            let uuid = Uuid::parse_str(payload).map_err(|_| IdParseError::InvalidUuid)?;
+            validate_uuid(uuid)?;
+            if uuid.hyphenated().to_string() != payload {
+                return Err(IdParseError::NonCanonicalUuid);
+            }
+            Ok(uuid)
+        }
+
+        fn old_revision_parse(value: &str) -> Result<RevisionId, RevisionIdError> {
+            let uuid = Uuid::parse_str(value).map_err(|_| RevisionIdError::InvalidUuid)?;
+            if uuid.hyphenated().to_string() != value {
+                return Err(RevisionIdError::InvalidUuid);
+            }
+            RevisionId::from_uuid(uuid)
+        }
+
+        let compact = "01890f476a4a7cc198b901890f476a4a";
+        let task_inputs = [
+            TASK_TEXT.to_owned(),
+            format!("task:{}", TASK_TEXT[5..].to_uppercase()),
+            format!("task:{compact}"),
+            format!("ws:{}", &TASK_TEXT[5..]),
+            format!("task:{UUID_V4_UPPERCASE}"),
+            "task:01890f47-6a4a-7cc1-18b9-01890f476a4a".to_owned(),
+        ];
+        for input in task_inputs {
+            let old = old_task_parse(&input);
+            let new = TaskId::from_str(&input).map(TaskId::as_uuid);
+            assert_eq!(new, old, "input classification changed for {input:?}");
+        }
+
+        let revision_inputs = [
+            TASK_TEXT[5..].to_owned(),
+            TASK_TEXT[5..].to_uppercase(),
+            compact.to_owned(),
+            UUID_V4_UPPERCASE.to_owned(),
+            "01890f47-6a4a-7cc1-18b9-01890f476a4a".to_owned(),
+        ];
+        for input in revision_inputs {
+            let old = old_revision_parse(&input);
+            let new = RevisionId::from_str(&input);
+            assert_eq!(new, old, "input classification changed for {input:?}");
+        }
     }
 }
