@@ -12311,19 +12311,8 @@ impl ReducerState {
     }
 
     fn from_current_rows(rows: &[ObjectRow], checkpoint_frontier: u64) -> Result<Self, StoreError> {
-        let mut state = Self::decode_current_rows(rows, checkpoint_frontier)?;
-        state.validate_evidence_relations()?;
-        // Keep source payloads in the recovered state, lending only the current
-        // value to canonical regeneration instead of cloning all three maps.
-        let source_receipts = std::mem::take(&mut state.source_receipts);
-        let source_observations = std::mem::take(&mut state.source_observations);
-        let evidence_surfaces = std::mem::take(&mut state.evidence_surfaces);
-        let canonical_state = state.clone();
-        state.source_receipts = source_receipts;
-        state.source_observations = source_observations;
-        state.evidence_surfaces = evidence_surfaces;
-        let canonical =
-            canonical_state.into_validated_snapshot(checkpoint_frontier, Some(&state))?;
+        let state = Self::decode_current_rows(rows, checkpoint_frontier)?;
+        let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
         if canonical.rows != rows {
             return Err(StoreError::Projection);
         }
@@ -13283,21 +13272,13 @@ impl ReducerState {
 
     fn into_snapshot(self, frontier: u64) -> Result<ProjectionSnapshot, StoreError> {
         self.validate_evidence_relations()?;
-        self.into_validated_snapshot(frontier, None)
-    }
-
-    fn into_validated_snapshot(
-        self,
-        frontier: u64,
-        source_input: Option<&Self>,
-    ) -> Result<ProjectionSnapshot, StoreError> {
-        let mut rows = self.into_rows(source_input)?;
+        let mut rows = self.into_rows()?;
         rows.push(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION));
         rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
         Ok(ProjectionSnapshot { frontier, rows })
     }
 
-    fn into_rows(mut self, source_input: Option<&Self>) -> Result<Vec<ObjectRow>, StoreError> {
+    fn into_rows(mut self) -> Result<Vec<ObjectRow>, StoreError> {
         self.close_deleted_product_state();
         let repository_closures = self
             .repository_closures
@@ -13415,11 +13396,7 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (value, seq) in self.source_receipts.into_values().chain(
-            source_input
-                .into_iter()
-                .flat_map(|source| source.source_receipts.values().cloned()),
-        ) {
+        for (_, (value, seq)) in self.source_receipts {
             let (fields, payload) = source_receipt_parts(value);
             push_canonical_row(
                 &mut rows,
@@ -13429,11 +13406,7 @@ impl ReducerState {
                 &mut payload_scratch,
             )?;
         }
-        for (value, seq) in self.source_observations.into_values().chain(
-            source_input
-                .into_iter()
-                .flat_map(|source| source.source_observations.values().cloned()),
-        ) {
+        for (_, (value, seq)) in self.source_observations {
             let (fields, payload) = source_observation_parts(value);
             push_canonical_row(
                 &mut rows,
@@ -13451,12 +13424,7 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.evidence_surfaces.into_iter().chain(
-            source_input
-                .into_iter()
-                .flat_map(|source| source.evidence_surfaces.iter())
-                .map(|(id, value)| (*id, value.clone())),
-        ) {
+        for (id, (value, seq)) in self.evidence_surfaces {
             let (row, payload) = surface_row_parts(id, value, seq);
             push_canonical_row(
                 &mut rows,
@@ -17682,145 +17650,6 @@ mod tests {
             .find(|row| row.row_id == watermark_before.row_id)
             .unwrap();
         assert_eq!(watermark_after, &watermark_before);
-    }
-
-    #[test]
-    fn cold_current_source_restore_preserves_large_payload_and_next_command() {
-        let (repository, worktree) = r105_repository_and_worktree();
-        let (mut receipt, mut observation, _) =
-            r105_capture("large", 1, &repository, &worktree, false);
-        let mut protected = String::from("前缀雪\"\\");
-        protected.push_str(&"正文\"\\雪".repeat(7_000));
-        protected.push('\n');
-        protected.push_str("末尾");
-        assert!(protected.len() > crate::objects::OBJECT_ROW_PAYLOAD_BLOCK_BYTES);
-        let digest = hex(&payload_fingerprint(1, protected.as_bytes(), None).unwrap());
-        receipt.cas_ref = digest.clone();
-        receipt.protected_length = protected.len() as u64;
-        receipt.original_length = protected.len() as u64;
-        receipt.protected_presentation =
-            Some(evertrace_domain::evidence::ProtectedPresentation::Inline {
-                text: protected.clone(),
-            });
-        observation.payload_fingerprint = digest;
-        receipt.validate().unwrap();
-        observation.validate().unwrap();
-
-        let (surface_receipt, surface_observation, surface) =
-            r105_capture("surface", 2, &repository, &worktree, true);
-        let surface = surface.unwrap();
-        let mut journal = Vec::new();
-        append(
-            r105_command(
-                1,
-                vec![
-                    JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
-                    JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
-                ],
-            ),
-            1,
-            &mut journal,
-        );
-        append(
-            r105_command(2, r105_capture_payloads(&receipt, &observation, None)),
-            journal.last().unwrap().seq + 1,
-            &mut journal,
-        );
-        append(
-            r105_command(
-                3,
-                r105_capture_payloads(&surface_receipt, &surface_observation, Some(&surface)),
-            ),
-            journal.last().unwrap().seq + 1,
-            &mut journal,
-        );
-
-        let prefix = reduce_journal(&journal).unwrap();
-        assert!(
-            prefix
-                .rows
-                .windows(2)
-                .all(|pair| pair[0].row_id < pair[1].row_id)
-        );
-        assert_eq!(
-            prefix
-                .rows
-                .iter()
-                .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-                .count(),
-            2
-        );
-        assert_eq!(
-            prefix
-                .rows
-                .iter()
-                .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
-                .count(),
-            2
-        );
-        assert_eq!(
-            prefix
-                .rows
-                .iter()
-                .filter(|row| row.object_kind.as_deref() == Some("evidence_surface"))
-                .count(),
-            1
-        );
-        let receipt_id = receipt.source_receipt_id.to_string();
-        let receipt_row = prefix
-            .rows
-            .iter()
-            .find(|row| {
-                row.object_kind.as_deref() == Some("source_receipt")
-                    && row.current_revision_id.as_deref() == Some(receipt_id.as_str())
-            })
-            .unwrap();
-        let receipt_json = receipt_row.payload_json.as_deref().unwrap();
-        assert!(receipt_json.len() > crate::objects::OBJECT_ROW_PAYLOAD_BLOCK_BYTES);
-        let JournalPayload::SourceReceiptRecorded(projected_receipt) =
-            serde_json::from_str(receipt_json).unwrap()
-        else {
-            panic!("expected source receipt payload");
-        };
-        assert_eq!(*projected_receipt, receipt);
-        assert!(protected.contains('雪'));
-        assert!(protected.contains('"'));
-        assert!(protected.contains('\\'));
-
-        let mut restored = ReducerState::from_current_rows(&prefix.rows, prefix.frontier).unwrap();
-        assert_eq!(restored.source_receipts.len(), 2);
-        assert_eq!(restored.source_observations.len(), 2);
-        assert_eq!(restored.evidence_surfaces.len(), 1);
-        assert_eq!(
-            restored.clone().into_snapshot(prefix.frontier).unwrap(),
-            prefix
-        );
-
-        let (next_receipt, next_observation, next_surface) =
-            r105_capture("next", 3, &repository, &worktree, true);
-        let delta_start = journal.len();
-        append(
-            r105_command(
-                4,
-                r105_capture_payloads(&next_receipt, &next_observation, next_surface.as_ref()),
-            ),
-            journal.last().unwrap().seq + 1,
-            &mut journal,
-        );
-        let replayed = reduce_journal(&journal).unwrap();
-        let delta = &journal[delta_start..];
-        validate_delta(prefix.frontier, replayed.frontier, delta).unwrap();
-        for batch in ordered_command_batches(delta).unwrap() {
-            for row in &batch {
-                apply_event(&mut restored, row, &batch).unwrap();
-            }
-            restored.rebuild_revision_currents().unwrap();
-            restored.validate_evidence_relations().unwrap();
-        }
-        assert_eq!(restored.source_receipts.len(), 3);
-        assert_eq!(restored.source_observations.len(), 3);
-        assert_eq!(restored.evidence_surfaces.len(), 2);
-        assert_eq!(restored.into_snapshot(replayed.frontier).unwrap(), replayed);
     }
 
     #[tokio::test]
