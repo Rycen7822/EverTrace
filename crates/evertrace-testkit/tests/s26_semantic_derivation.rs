@@ -764,6 +764,80 @@ async fn persist_session_message(
     confirmed_prefix_digest
 }
 
+fn direct_source_message(
+    label: &str,
+    sequence: u64,
+    task_id: TaskId,
+    repository_id: RepositoryId,
+    worktree_id: WorktreeId,
+) -> (SourceReceipt, SourceObservation) {
+    let (mut receipt, mut observation) =
+        session_message(label, sequence, 0, task_id, repository_id, worktree_id);
+    let source_instance_id = SourceInstanceId::parse(format!("direct-r323:{label}")).unwrap();
+    let observation_id = source_observation_id(
+        &source_instance_id,
+        &receipt.source_revision,
+        &receipt.source_record_identity,
+    )
+    .unwrap();
+    let receipt_id = source_receipt_id(
+        &source_instance_id,
+        &receipt.source_revision,
+        &receipt.source_record_identity,
+    )
+    .unwrap();
+    receipt.source_instance_id = source_instance_id.clone();
+    receipt.source_observation_id = observation_id;
+    receipt.source_receipt_id = receipt_id;
+    receipt.source_byte_range = None;
+    receipt.close_watermark = None;
+    observation.source_instance_id = source_instance_id;
+    observation.source_observation_id = observation_id;
+    observation.source_receipt_ref = receipt_id;
+    receipt.validate().unwrap();
+    observation.validate().unwrap();
+    (receipt, observation)
+}
+
+async fn persist_direct_source_message(
+    writer: &mut JournalWriter,
+    receipt: &SourceReceipt,
+    observation: &SourceObservation,
+    at: i64,
+) {
+    writer
+        .commit(
+            &command(
+                at,
+                vec![
+                    JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                    JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                    JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                        source_instance_id: receipt.source_instance_id.clone(),
+                        source_revision: receipt.source_revision.clone(),
+                        source_sequence: receipt.source_sequence,
+                        confirmed_prefix_digest: None,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::EvidenceSurface,
+                        target_id: observation.source_observation_id.to_string(),
+                        algorithm_revision: "s26-v1".into(),
+                        source_watermark: receipt.source_sequence,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::PhysicalNormalization,
+                        target_id: observation.source_observation_id.to_string(),
+                        algorithm_revision: "s26-v1".into(),
+                        source_watermark: receipt.source_sequence,
+                    }),
+                ],
+            ),
+            at,
+        )
+        .await
+        .unwrap();
+}
+
 struct Seed {
     writer: JournalWriter,
     task: Task,
@@ -1908,6 +1982,149 @@ async fn imported_source_prefix_rejects_late_message_before_objects_commit() {
     // No partial objects commit survived the rejected request.
     let states = writer.backup_table_states().await.unwrap();
     assert_eq!(states.objects.checkpoint, objects_checkpoint);
+}
+
+#[tokio::test]
+async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore() {
+    let root = TempDir::new().unwrap();
+    let seed = seed_store(&root.path().join("store")).await;
+    let mut writer = seed.writer;
+    let first = direct_source_message(
+        "frozen-direct",
+        1,
+        seed.task.task_id,
+        seed.repository.repository_id,
+        seed.worktree.worktree_instance_id,
+    );
+    let third = direct_source_message(
+        "frozen-direct",
+        3,
+        seed.task.task_id,
+        seed.repository.repository_id,
+        seed.worktree.worktree_instance_id,
+    );
+    persist_direct_source_message(&mut writer, &first.0, &first.1, 3).await;
+    persist_direct_source_message(&mut writer, &third.0, &third.1, 4).await;
+    let source = SemanticSourceTarget {
+        source_instance_id: first.0.source_instance_id.clone(),
+        source_revision: first.0.source_revision.clone(),
+        repository_id: seed.repository.repository_id,
+        worktree_id: seed.worktree.worktree_instance_id,
+    };
+    let mut run = SemanticDerivationRun {
+        derivation_run_id: evertrace_domain::ids::SemanticDerivationRunId::new_v7(),
+        episode_id: None,
+        episode_revision_id: None,
+        from_watermark: 0,
+        to_watermark: 3,
+        selected_direct_refs: vec![
+            first.1.source_observation_id.to_string(),
+            third.1.source_observation_id.to_string(),
+        ],
+        job_fingerprint: [0; 32],
+        status: evertrace_domain::semantic::DerivationRunStatus::ProviderFailed,
+        quota_usage: evertrace_domain::semantic::DerivationQuotaUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            calls: 0,
+            wall_time_us: 0,
+        },
+        model_id: "fixture".into(),
+        prompt_hash: [7; 32],
+        schema_version: 1,
+        algorithm_revision: "r323-frozen-source-v1".into(),
+        effective_config_hash: [8; 32],
+        created_at_us: 8,
+        source_target: Some(source.clone()),
+    };
+    run.selected_direct_refs.sort();
+    run.job_fingerprint = run.recompute_job_fingerprint().unwrap();
+    run.validate().unwrap();
+    let frozen_run_id = run.derivation_run_id;
+    let job = source_synthesis_job(
+        &run,
+        first.1.source_observation_id,
+        third.1.source_observation_id,
+    );
+    install_source_synthesis_job(&mut writer, &job, 6).await;
+    let mut failed_job = job;
+    failed_job.state = JobStatus::Failed;
+    failed_job.attempt = 2;
+    failed_job.lease_until_us = None;
+    failed_job.terminal = Some(Box::new(JobTerminalAudit {
+        outcome: JobTerminalOutcome::Failed,
+        reason: JobTerminalReason::SourceUnavailable,
+        result_ref: None,
+    }));
+    writer
+        .commit(
+            &command(
+                8,
+                vec![
+                    JournalPayload::SemanticDerivationRunRecorded(Box::new(run)),
+                    JournalPayload::JobState(failed_job),
+                ],
+            ),
+            8,
+        )
+        .await
+        .unwrap();
+    let frozen = writer.project().await.unwrap();
+    assert!(frozen.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_derivation_run")
+            && row.object_id.as_deref() == Some(&frozen_run_id.to_string())
+    }));
+    assert_eq!(writer.full_projection().await.unwrap(), frozen);
+    let frozen_checkpoint = writer
+        .backup_table_states()
+        .await
+        .unwrap()
+        .objects
+        .checkpoint;
+    assert_eq!(frozen_checkpoint, frozen.frontier);
+
+    let late = direct_source_message(
+        "frozen-direct",
+        2,
+        seed.task.task_id,
+        source.repository_id,
+        source.worktree_id,
+    );
+    persist_direct_source_message(&mut writer, &late.0, &late.1, 11).await;
+    let late_frontier = writer.sync_frontier().await.unwrap();
+    assert!(late_frontier > frozen.frontier);
+    assert_eq!(
+        writer
+            .backup_table_states()
+            .await
+            .unwrap()
+            .objects
+            .checkpoint,
+        late_frontier
+    );
+    assert_eq!(
+        writer.full_projection().await,
+        Err(StoreError::StoreCorrupt)
+    );
+
+    let other = direct_source_message(
+        "different-source",
+        1,
+        seed.task.task_id,
+        source.repository_id,
+        source.worktree_id,
+    );
+    persist_direct_source_message(&mut writer, &other.0, &other.1, 12).await;
+    assert_eq!(writer.sync_frontier().await, Err(StoreError::StoreCorrupt));
+    assert_eq!(
+        writer
+            .backup_table_states()
+            .await
+            .unwrap()
+            .objects
+            .checkpoint,
+        late_frontier
+    );
 }
 
 #[tokio::test]
