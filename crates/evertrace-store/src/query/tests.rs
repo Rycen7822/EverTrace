@@ -8,7 +8,7 @@ mod tests {
     use super::*;
     use crate::{
         DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload,
-        MigrationApplied, ObjectRow, ObjectRowClass, ObjectRowKind, ProjectionWorker,
+        JournalPayloadRef, MigrationApplied, ObjectRow, ObjectRowClass, ObjectRowKind, ProjectionWorker,
         projections::ProjectionJournalDelta, sqlite_state::SqliteHandle,
     };
 
@@ -31,6 +31,71 @@ mod tests {
             .execute()
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn source_payload_id_rebuild_can_lower_max_after_contributor_removed() {
+        use evertrace_domain::{
+            evidence::{
+                CaptureCompleteness, ContentTrust, EvidenceSurface, InstructionAuthority,
+                SourceRole, evidence_span_hash, hex,
+            },
+            ids::{RepositoryId, SourceObservationId},
+        };
+
+        let repository_id = RepositoryId::new_v7();
+        let protected_text = repository_id.to_string();
+        let surface = |digest| {
+            let source_observation_revision_ref = SourceObservationId::from_digest([digest; 32]);
+            EvidenceSurface {
+                source_observation_revision_ref,
+                source_role: SourceRole::User,
+                content_trust: ContentTrust::UserStatement,
+                instruction_authority: InstructionAuthority::None,
+                task_id: None,
+                repository_instance_id: None,
+                worktree_instance_id: None,
+                event_time_us: 1,
+                recorded_at_us: 2,
+                source_sequence: 1,
+                capture_completeness: CaptureCompleteness::Complete,
+                canonicalization_version: 1,
+                span_hash: hex(
+                    &evidence_span_hash(source_observation_revision_ref, 1, &protected_text)
+                        .unwrap(),
+                ),
+                projection_generation: 1,
+                protected_text: protected_text.clone(),
+            }
+        };
+        let earlier = surface(1);
+        let later = surface(2);
+        earlier.validate().unwrap();
+        later.validate().unwrap();
+
+        let mut all_sources = std::collections::BTreeMap::new();
+        super::super::relation_assembly::index_typed_ids(
+            &JournalPayloadRef::Surface(&earlier),
+            4,
+            &mut all_sources,
+        )
+        .unwrap();
+        super::super::relation_assembly::index_typed_ids(
+            &JournalPayloadRef::Surface(&later),
+            17,
+            &mut all_sources,
+        )
+        .unwrap();
+        assert_eq!(all_sources.get(&repository_id.to_string()), Some(&17));
+
+        let mut remaining_sources = std::collections::BTreeMap::new();
+        super::super::relation_assembly::index_typed_ids(
+            &JournalPayloadRef::Surface(&earlier),
+            4,
+            &mut remaining_sources,
+        )
+        .unwrap();
+        assert_eq!(remaining_sources.get(&repository_id.to_string()), Some(&4));
     }
 
     #[tokio::test]

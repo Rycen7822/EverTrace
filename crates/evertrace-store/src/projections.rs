@@ -2233,6 +2233,127 @@ pub(crate) type SourceObservationFacts<'facts> =
 pub(crate) type EvidenceSurfaceFacts<'facts> =
     BTreeMap<SourceObservationId, (Cow<'facts, EvidenceSurface>, u64)>;
 
+/// Complete rows for non-source objects, source-row metadata, and the final
+/// reducer's source facts. Rows in this carrier are an L0002 input only; they
+/// are never a public snapshot or persistence batch with omitted payloads.
+pub(crate) struct SourceConsumerInput<'facts> {
+    pub(crate) frontier: u64,
+    pub(crate) rows: Vec<ObjectRow>,
+    pub(crate) source_receipts: SourceReceiptFacts<'facts>,
+    pub(crate) source_observations: SourceObservationFacts<'facts>,
+    pub(crate) evidence_surfaces: EvidenceSurfaceFacts<'facts>,
+}
+
+/// One request-local objects input for the shared L0002 derivation.
+pub(crate) enum ProjectionOutput<'facts> {
+    Full(ProjectionSnapshot),
+    Sources(SourceConsumerInput<'facts>),
+}
+
+// Full output must release each owned fact as it is encoded, as before; only
+// the request-local source consumer needs to retain the maps after emission.
+fn emit_source_facts<'facts, K: Ord, V: Clone>(
+    facts: &mut BTreeMap<K, (Cow<'facts, V>, u64)>,
+    retain_facts: bool,
+    mut emit: impl FnMut(&K, &V, u64) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    if retain_facts {
+        for (key, (value, seq)) in facts.iter() {
+            emit(key, value.as_ref(), *seq)?;
+        }
+    } else {
+        for (key, (value, seq)) in std::mem::take(facts) {
+            emit(&key, value.as_ref(), seq)?;
+        }
+    }
+    Ok(())
+}
+
+impl ProjectionOutput<'_> {
+    pub(crate) fn frontier(&self) -> u64 {
+        match self {
+            Self::Full(snapshot) => snapshot.frontier,
+            Self::Sources(input) => input.frontier,
+        }
+    }
+
+    /// Rows passed to the projection consumer. The `Sources` variant carries
+    /// source metadata rows without old-prefix payloads and must not escape as
+    /// a complete ProjectionSnapshot.
+    pub(crate) fn rows_for_projection_consumer(&self) -> &[ObjectRow] {
+        match self {
+            Self::Full(snapshot) => &snapshot.rows,
+            Self::Sources(input) => &input.rows,
+        }
+    }
+
+    pub(crate) fn into_snapshot(self) -> Result<ProjectionSnapshot, StoreError> {
+        match self {
+            Self::Full(snapshot) => Ok(snapshot),
+            Self::Sources(_) => Err(StoreError::StoreCorrupt),
+        }
+    }
+}
+
+impl SourceConsumerInput<'_> {
+    pub(crate) fn payload_for_row(
+        &self,
+        row: &ObjectRow,
+    ) -> Result<JournalPayloadRef<'_>, StoreError> {
+        match row.object_kind.as_deref() {
+            Some("source_receipt") => {
+                let id = row
+                    .object_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .parse::<SourceReceiptId>()
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let (value, seq) = self
+                    .source_receipts
+                    .get(&id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if value.source_receipt_id != id || *seq != row.source_event_seq {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                Ok(JournalPayloadRef::Receipt(value.as_ref()))
+            }
+            Some("source_observation") => {
+                let id = row
+                    .object_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .parse::<SourceObservationId>()
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let (value, seq) = self
+                    .source_observations
+                    .get(&id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if value.source_observation_id != id || *seq != row.source_event_seq {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                Ok(JournalPayloadRef::Observation(value.as_ref()))
+            }
+            Some("evidence_surface") => {
+                let id = row
+                    .current_revision_id
+                    .as_deref()
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .parse::<SourceObservationId>()
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let (value, seq) = self
+                    .evidence_surfaces
+                    .get(&id)
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if value.source_observation_revision_ref != id || *seq != row.source_event_seq {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                Ok(JournalPayloadRef::Surface(value.as_ref()))
+            }
+            _ => Err(StoreError::StoreCorrupt),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct ReducerState<'facts> {
     inventory: inventory::InventoryState,
@@ -13531,15 +13652,19 @@ impl<'facts> ReducerState<'facts> {
     }
 
     fn into_snapshot(self, frontier: u64) -> Result<ProjectionSnapshot, StoreError> {
-        self.validate_evidence_relations()?;
-        let mut rows = self.into_rows()?;
-        rows.push(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION));
-        rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
-        Ok(ProjectionSnapshot { frontier, rows })
+        self.into_projection_output(frontier, None)?.into_snapshot()
     }
 
-    fn into_rows(mut self) -> Result<Vec<ObjectRow>, StoreError> {
+    fn into_projection_output(
+        mut self,
+        frontier: u64,
+        source_prefix_checkpoint: Option<u64>,
+    ) -> Result<ProjectionOutput<'facts>, StoreError> {
+        self.validate_evidence_relations()?;
         self.close_deleted_product_state();
+        let mut source_receipts = std::mem::take(&mut self.source_receipts);
+        let mut source_observations = std::mem::take(&mut self.source_observations);
+        let mut evidence_surfaces = std::mem::take(&mut self.evidence_surfaces);
         let repository_closures = self
             .repository_closures
             .values()
@@ -13656,26 +13781,46 @@ impl<'facts> ReducerState<'facts> {
                 seq,
             )?);
         }
-        for (_, (value, seq)) in self.source_receipts {
-            let (fields, payload) = source_receipt_parts(value.as_ref());
-            push_canonical_row(
-                &mut rows,
-                &mut payload_blocks,
-                evidence_object_row_fields(fields, seq),
-                &payload,
-                &mut payload_scratch,
-            )?;
-        }
-        for (_, (value, seq)) in self.source_observations {
-            let (fields, payload) = source_observation_parts(value.as_ref());
-            push_canonical_row(
-                &mut rows,
-                &mut payload_blocks,
-                evidence_object_row_fields(fields, seq),
-                &payload,
-                &mut payload_scratch,
-            )?;
-        }
+        emit_source_facts(
+            &mut source_receipts,
+            source_prefix_checkpoint.is_some(),
+            |_, value, seq| {
+                let (fields, payload) = source_receipt_parts(value);
+                let row = evidence_object_row_fields(fields, seq);
+                if source_prefix_checkpoint.is_some_and(|checkpoint| seq <= checkpoint) {
+                    rows.push(row);
+                } else {
+                    push_canonical_row(
+                        &mut rows,
+                        &mut payload_blocks,
+                        row,
+                        &payload,
+                        &mut payload_scratch,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        emit_source_facts(
+            &mut source_observations,
+            source_prefix_checkpoint.is_some(),
+            |_, value, seq| {
+                let (fields, payload) = source_observation_parts(value);
+                let row = evidence_object_row_fields(fields, seq);
+                if source_prefix_checkpoint.is_some_and(|checkpoint| seq <= checkpoint) {
+                    rows.push(row);
+                } else {
+                    push_canonical_row(
+                        &mut rows,
+                        &mut payload_blocks,
+                        row,
+                        &payload,
+                        &mut payload_scratch,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
         for (key, (value, seq)) in self.source_watermarks {
             rows.push(runtime_row(
                 format!("runtime:watermark:source:{key}"),
@@ -13684,16 +13829,25 @@ impl<'facts> ReducerState<'facts> {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.evidence_surfaces {
-            let (row, payload) = surface_row_parts(id, value.as_ref(), seq);
-            push_canonical_row(
-                &mut rows,
-                &mut payload_blocks,
-                row,
-                &payload,
-                &mut payload_scratch,
-            )?;
-        }
+        emit_source_facts(
+            &mut evidence_surfaces,
+            source_prefix_checkpoint.is_some(),
+            |id, value, seq| {
+                let (row, payload) = surface_row_parts(*id, value, seq);
+                if source_prefix_checkpoint.is_some_and(|checkpoint| seq <= checkpoint) {
+                    rows.push(row);
+                } else {
+                    push_canonical_row(
+                        &mut rows,
+                        &mut payload_blocks,
+                        row,
+                        &payload,
+                        &mut payload_scratch,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
         for ((id, revision), (value, seq)) in self.host_occurrence_revisions {
             let mut row = physical_object_row(
                 ObjectFamily::Evidence,
@@ -14037,12 +14191,24 @@ impl<'facts> ReducerState<'facts> {
         rows.extend(self.scope_purges.rows()?);
         drop(payload_scratch);
         payload_blocks.finish(&mut rows)?;
-        filter_product_rows(
+        let mut rows = filter_product_rows(
             rows,
             &self.deletions,
             &self.scope_purges,
             repository_closures.iter(),
-        )
+        )?;
+        rows.push(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION));
+        rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        Ok(match source_prefix_checkpoint {
+            Some(_) => ProjectionOutput::Sources(SourceConsumerInput {
+                frontier,
+                rows,
+                source_receipts,
+                source_observations,
+                evidence_surfaces,
+            }),
+            None => ProjectionOutput::Full(ProjectionSnapshot { frontier, rows }),
+        })
     }
 
     fn close_deleted_product_state(&mut self) {
@@ -15062,7 +15228,10 @@ impl ProjectionWorker {
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(false, None, None, None).await?.0)
+        self.catch_up_inner(false, None, None, None, false)
+            .await?
+            .0
+            .into_snapshot()
     }
 
     #[cfg(test)]
@@ -15072,18 +15241,34 @@ impl ProjectionWorker {
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_rows, None)
-            .await
+        let (output, epoch, delta) = self
+            .catch_up_inner(false, validated_current, appended_rows, None, false)
+            .await?;
+        Ok((output.into_snapshot()?, epoch, delta))
     }
 
-    pub(crate) async fn catch_up_validated_with_source_facts(
+    pub(crate) async fn catch_up_validated_with_source_facts<'facts>(
         &self,
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
-        source_facts: Option<&SourceFactsRef<'_>>,
-    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_rows, source_facts)
-            .await
+        source_facts: Option<&'facts SourceFactsRef<'_>>,
+        request_source_consumer: bool,
+    ) -> Result<
+        (
+            ProjectionOutput<'facts>,
+            u64,
+            Option<ProjectionJournalDelta>,
+        ),
+        StoreError,
+    > {
+        self.catch_up_inner(
+            false,
+            validated_current,
+            appended_rows,
+            source_facts,
+            request_source_consumer,
+        )
+        .await
     }
 
     /// Try the closed capture successor path. `Ok(None)` means the retained
@@ -15219,13 +15404,21 @@ impl ProjectionWorker {
         }))
     }
 
-    async fn catch_up_inner(
+    async fn catch_up_inner<'facts>(
         &self,
         inject_before_commit_failure: bool,
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
-        source_facts: Option<&SourceFactsRef<'_>>,
-    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
+        source_facts: Option<&'facts SourceFactsRef<'_>>,
+        request_source_consumer: bool,
+    ) -> Result<
+        (
+            ProjectionOutput<'facts>,
+            u64,
+            Option<ProjectionJournalDelta>,
+        ),
+        StoreError,
+    > {
         let (current, journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
             let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             let stamp = state.stamp()?;
@@ -15300,7 +15493,7 @@ impl ProjectionWorker {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .objects_epoch();
-            return Ok((expected, committed_epoch, None));
+            return Ok((ProjectionOutput::Full(expected), committed_epoch, None));
         }
         let mut state = if validated_frontier.is_some() {
             // The writer already validated this exact old input before its
@@ -15329,7 +15522,7 @@ impl ProjectionWorker {
                     rows: current,
                 },
             };
-            return Ok((snapshot, current_epoch, None));
+            return Ok((ProjectionOutput::Full(snapshot), current_epoch, None));
         }
         let reconcile_core = delta.iter().any(|row| {
             matches!(
@@ -15375,14 +15568,20 @@ impl ProjectionWorker {
             }
             state.validate_evidence_relations()?;
         }
-        let expected = state.into_snapshot(journal_frontier)?;
         let ordinary_upsert = !reconcile_all
             && !reconcile_recall
             && !reconcile_core
             && !reconcile_wiki
             && !reconcile_procedure_effect;
+        let source_consumer = request_source_consumer
+            && source_facts.is_some()
+            && ordinary_upsert
+            && state.deletions.events().next().is_none()
+            && state.scope_purges.events().next().is_none();
+        let source_prefix_checkpoint = source_consumer.then_some(checkpoint_frontier);
+        let expected = state.into_projection_output(journal_frontier, source_prefix_checkpoint)?;
         if ordinary_upsert {
-            validate_ordinary_upsert_rows(&current, &expected.rows)?;
+            validate_ordinary_upsert_rows(&current, expected.rows_for_projection_consumer())?;
         }
         let current_by_id = current
             .iter()
@@ -15390,7 +15589,7 @@ impl ProjectionWorker {
             .collect::<BTreeMap<_, _>>();
         let changed = (!reconcile_all).then(|| {
             incremental_changed_rows(
-                &expected,
+                expected.rows_for_projection_consumer(),
                 &current_by_id,
                 reconcile_recall,
                 reconcile_core,
@@ -15407,7 +15606,9 @@ impl ProjectionWorker {
         // The rows, deletions and checkpoint land in one physical transaction;
         // a no-change commit leaves the family epoch untouched.
         self.commit_rows(
-            changed.as_deref().unwrap_or(&expected.rows),
+            changed
+                .as_deref()
+                .unwrap_or_else(|| expected.rows_for_projection_consumer()),
             ObjectReconcile {
                 recall: reconcile_recall,
                 core: reconcile_core,
@@ -15444,17 +15645,20 @@ impl ProjectionWorker {
             }
         };
         let persisted_snapshot = match source_facts {
-            Some(facts) => facts.snapshot_with_source_prefix(persisted_rows, expected.frontier)?,
+            Some(facts) => {
+                facts.snapshot_with_source_prefix(persisted_rows, expected.frontier())?
+            }
             None => ProjectionSnapshot {
-                frontier: expected.frontier,
+                frontier: expected.frontier(),
                 rows: persisted_rows,
             },
         };
+        let expected = expected.into_snapshot()?;
         if persisted_snapshot.rows != expected.rows {
             return Err(StoreError::Projection);
         }
         Ok((
-            persisted_snapshot,
+            ProjectionOutput::Full(persisted_snapshot),
             committed_epoch,
             Some(ProjectionJournalDelta {
                 journal_epoch,
@@ -15466,7 +15670,10 @@ impl ProjectionWorker {
 
     #[cfg(test)]
     async fn catch_up_with_commit_fault(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(true, None, None, None).await?.0)
+        self.catch_up_inner(true, None, None, None, false)
+            .await?
+            .0
+            .into_snapshot()
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
@@ -15691,7 +15898,7 @@ fn runtime_rows_with_upserts(
 }
 
 fn incremental_changed_rows(
-    expected: &ProjectionSnapshot,
+    expected: &[ObjectRow],
     current_by_id: &BTreeMap<&str, &ObjectRow>,
     reconcile_recall: bool,
     reconcile_core: bool,
@@ -15700,7 +15907,6 @@ fn incremental_changed_rows(
     source_prefix_checkpoint: Option<u64>,
 ) -> Vec<ObjectRow> {
     expected
-        .rows
         .iter()
         .filter(|row| {
             !source_prefix_checkpoint.is_some_and(|frontier| {
@@ -16534,11 +16740,27 @@ mod tests {
         };
 
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, false, false, false, false, None),
+            incremental_changed_rows(
+                &expected.rows,
+                &current_by_id,
+                false,
+                false,
+                false,
+                false,
+                None,
+            ),
             vec![expected.rows[0].clone()]
         );
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, true, false, false, false, None),
+            incremental_changed_rows(
+                &expected.rows,
+                &current_by_id,
+                true,
+                false,
+                false,
+                false,
+                None,
+            ),
             expected.rows
         );
     }
@@ -17659,6 +17881,25 @@ mod tests {
         worktree: &WorktreeInstance,
         surface_eligible: bool,
     ) -> (SourceReceipt, SourceObservation, Option<EvidenceSurface>) {
+        let protected = format!("r105 capture {label} sequence {sequence}");
+        r105_capture_with_body(
+            label,
+            sequence,
+            repository,
+            worktree,
+            surface_eligible,
+            &protected,
+        )
+    }
+
+    fn r105_capture_with_body(
+        label: &str,
+        sequence: u64,
+        repository: &RepositoryInstance,
+        worktree: &WorktreeInstance,
+        surface_eligible: bool,
+        protected: &str,
+    ) -> (SourceReceipt, SourceObservation, Option<EvidenceSurface>) {
         let instance = SourceInstanceId::parse(format!("r105-{label}")).unwrap();
         let revision = SourceRevision::parse("revision-1").unwrap();
         let record = SourceRecordIdentity::parse(format!("record-{label}-{sequence}")).unwrap();
@@ -17667,7 +17908,6 @@ mod tests {
                 .unwrap();
         let receipt_id =
             evertrace_domain::evidence::source_receipt_id(&instance, &revision, &record).unwrap();
-        let protected = format!("r105 capture {label} sequence {sequence}");
         let digest = hex(&payload_fingerprint(1, protected.as_bytes(), None).unwrap());
         let receipt = SourceReceipt {
             protected_presentation: None,
@@ -18302,14 +18542,17 @@ mod tests {
         let (repository, worktree) = r105_repository_and_worktree();
         let (receipt, observation, surface) =
             r105_capture("prefix-base", 1, &repository, &worktree, true);
+        let mut base_payloads = vec![
+            JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+            JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+        ];
+        base_payloads.extend(r105_capture_payloads(
+            &receipt,
+            &observation,
+            surface.as_ref(),
+        ));
         writer
-            .commit(
-                &r105_command(
-                    1,
-                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
-                ),
-                1,
-            )
+            .commit(&r105_command(1, base_payloads), 1)
             .await
             .unwrap();
         let base = writer.project_objects().await.unwrap();
@@ -18317,8 +18560,22 @@ mod tests {
         assert!(writer.source_prefix_proven_for_test());
 
         for (index, label) in [(2, "prefix-next"), (3, "prefix-last")] {
-            let (receipt, observation, surface) =
-                r105_capture(label, 1, &repository, &worktree, true);
+            let body = repository.repository_id.to_string();
+            let (mut receipt, observation, mut surface) = if index == 3 {
+                r105_capture_with_body(label, 1, &repository, &worktree, true, &body)
+            } else {
+                r105_capture(label, 1, &repository, &worktree, true)
+            };
+            if let Some(surface) = surface.as_mut()
+                && index == 3
+            {
+                receipt.repository_instance_id = None;
+                receipt.worktree_instance_id = None;
+                surface.task_id = None;
+                surface.repository_instance_id = None;
+                surface.worktree_instance_id = None;
+                surface.validate().unwrap();
+            }
             writer
                 .commit(
                     &r105_command(
@@ -18334,13 +18591,63 @@ mod tests {
         assert!(writer.source_prefix_successor_bound_for_test());
 
         crate::sqlite_state::reset_source_current_row_decodes();
-        let projected = writer.project_objects().await.unwrap();
+        let frontier = writer.sync_frontier().await.unwrap();
         assert_eq!(
             crate::sqlite_state::source_current_row_decodes(),
             0,
-            "a qualified multi-append catch-up must not materialize current source rows from SQLite"
+            "a qualified multi-append sync must not materialize current source rows from SQLite"
         );
-        assert_eq!(projected.frontier, writer.frontier());
+        assert_eq!(writer.source_consumer_selections_for_test(), 1);
+        assert_eq!(frontier, writer.frontier());
+        let projected = r105_assert_projection_eq(&writer, &root, frontier).await;
         assert_eq!(projected, writer.full_projection().await.unwrap());
+
+        let observation_id = r105_capture("prefix-last", 1, &repository, &worktree, true)
+            .1
+            .source_observation_id;
+        let surface = projected
+            .rows
+            .iter()
+            .find(|row| {
+                row.object_kind.as_deref() == Some("evidence_surface")
+                    && row.current_revision_id.as_deref() == Some(&observation_id.to_string())
+            })
+            .unwrap();
+        assert!(surface.payload_json.is_some());
+        assert!(surface.task_id.is_none());
+        assert!(surface.repository_id.is_none());
+        assert!(surface.worktree_id.is_none());
+        let repository_row = projected
+            .rows
+            .iter()
+            .find(|row| {
+                row.object_kind.as_deref() == Some("repository")
+                    && row.object_id.as_deref() == Some(&repository.repository_id.to_string())
+            })
+            .unwrap();
+        let worktree_row = projected
+            .rows
+            .iter()
+            .find(|row| {
+                row.object_kind.as_deref() == Some("worktree")
+                    && row.object_id.as_deref() == Some(&worktree.worktree_instance_id.to_string())
+            })
+            .unwrap();
+        assert!(surface.source_event_seq > repository_row.source_event_seq);
+        assert!(surface.source_event_seq > worktree_row.source_event_seq);
+        let relation = writer
+            .projection_handle()
+            .lock()
+            .unwrap()
+            .relation_rows()
+            .unwrap()
+            .into_iter()
+            .find(|row| {
+                row.relation_kind.as_deref() == Some("repository_to_worktree")
+                    && row.source_id.as_deref() == Some(&repository.repository_id.to_string())
+                    && row.target_id.as_deref() == Some(&worktree.worktree_instance_id.to_string())
+            })
+            .unwrap();
+        assert_eq!(relation.source_event_seq, surface.source_event_seq);
     }
 }
