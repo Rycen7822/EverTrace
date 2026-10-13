@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
-    evidence::{SourceObservation, SourceReceipt},
     ids::{JobId, RepositoryId, SourceObservationId, SourceReceiptId, WorktreeId},
     inventory::{CapabilityInventoryRecorded, InventoryContext},
     repository::{RepositoryCapabilityState, RepositoryInstance, WorktreeInstance},
 };
 
 use super::{
-    JournalPayload, ObjectFamily, ObjectRow, StoreError, physical_object_row, require_physical_row,
+    JournalPayload, ObjectFamily, ObjectRow, SourceObservationFacts, SourceReceiptFacts,
+    StoreError, physical_object_row, require_physical_row,
 };
 use crate::{DurableJob, JobStatus, SourceKind, purge::ScopePurgeState};
 
@@ -100,17 +100,17 @@ pub(super) fn job_repository(job: &DurableJob) -> Option<RepositoryId> {
         .then_some(repository)
 }
 
-pub(super) struct InventoryAdmission<'a> {
+pub(super) struct InventoryAdmission<'a, 'facts> {
     pub inventory: &'a InventoryState,
     pub repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
     pub jobs: &'a BTreeMap<JobId, DurableJob>,
     pub purges: &'a ScopePurgeState,
-    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    pub source_receipts: &'a SourceReceiptFacts<'facts>,
+    pub source_observations: &'a SourceObservationFacts<'facts>,
 }
 
-impl InventoryAdmission<'_> {
+impl InventoryAdmission<'_, '_> {
     pub(super) fn validate_procedure_coverage<'a>(
         &self,
         payloads: impl IntoIterator<Item = &'a JournalPayload>,
@@ -671,11 +671,13 @@ mod tests {
         JobBudget, JobLease, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason,
         JournalCommand, JournalEventDraft, command::prepare_command, journal::rows_for_append,
     };
+    use evertrace_domain::evidence::SourceReceipt;
     use evertrace_domain::{
         ids::CommandId,
         inventory::CapabilityInventoryProfile,
         repository::{GitRegistrationState, PathObservation, WorktreeKind, WorktreeLifecycle},
     };
+    use std::borrow::Cow;
 
     fn old_repository() -> serde_json::Value {
         serde_json::json!({
@@ -1060,13 +1062,13 @@ mod tests {
         receipt.validate().unwrap();
         let source_seq = with_history.inventory.completed[&fact.job_id].1 + 1;
         std::sync::Arc::make_mut(&mut with_history.source_receipts)
-            .insert(receipt_id, (receipt.clone(), source_seq));
+            .insert(receipt_id, (Cow::Owned(receipt.clone()), source_seq));
         let scope = evertrace_domain::procedure::ProcedureScope::Repository {
             repository_id: repository.repository_id,
         };
         let source_refs = vec![receipt_id.to_string()];
         let inventory_refs = vec![fact.job_id, fact_c.job_id];
-        let validate = |state: &JournalAdmissionState, refs: &[JobId]| {
+        let validate = |state: &JournalAdmissionState<'_>, refs: &[JobId]| {
             state
                 .inventory_admission()
                 .validate_procedure_inventory_refs(
@@ -1091,6 +1093,7 @@ mod tests {
             .get_mut(&receipt_id)
             .unwrap()
             .0
+            .to_mut()
             .event_time_us = 2;
         assert!(
             validate(&late_import, &inventory_refs).is_err(),
@@ -1101,16 +1104,18 @@ mod tests {
             .get_mut(&receipt_id)
             .unwrap()
             .0
+            .to_mut()
             .source_session_ref = "other".into();
         assert!(validate(&wrong_source, &inventory_refs).is_err());
         std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
             .get_mut(&receipt_id)
             .unwrap()
-            .0 = receipt;
+            .0 = Cow::Owned(receipt);
         std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
             .get_mut(&receipt_id)
             .unwrap()
             .0
+            .to_mut()
             .worktree_instance_id = Some(WorktreeId::new_v7());
         assert!(validate(&wrong_source, &inventory_refs).is_err());
         let mut disabled = with_history.repositories[&repository.repository_id]

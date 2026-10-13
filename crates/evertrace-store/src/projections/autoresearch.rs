@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use evertrace_capture::CasDigest;
 use evertrace_domain::{
     evidence::{
-        CaptureCompleteness, ContentTrust, EvidenceSurface, Operation, PairingState,
-        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
+        CaptureCompleteness, ContentTrust, Operation, PairingState, SourceArchiveMode,
+        SourceReceipt, SourceRole, hex, payload_fingerprint,
     },
     ids::{
         AttemptId, ExperimentRunId, OperationId, ResultEvidenceId, SourceObservationId,
@@ -24,19 +24,22 @@ use evertrace_domain::{
 use crate::{
     JournalPayload,
     command::StoreError,
-    projections::{ProjectionSnapshot, current_binding_lineage, procedure::ProcedureState},
+    projections::{
+        EvidenceSurfaceFacts, ProjectionSnapshot, SourceObservationFacts, SourceReceiptFacts,
+        current_binding_lineage, procedure::ProcedureState,
+    },
 };
 
-pub(crate) struct ControlledRunAdmissionView<'a> {
+pub(crate) struct ControlledRunAdmissionView<'a, 'facts> {
     pub runs: &'a BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
     pub attempts: &'a BTreeMap<AttemptId, (Attempt, u64)>,
     pub work_bindings:
         &'a BTreeMap<evertrace_domain::ids::WorkBindingRevisionId, (WorkBindingRevision, u64)>,
     pub operations: &'a BTreeMap<OperationId, (Operation, u64)>,
     pub snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
-    pub receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    pub surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    pub receipts: &'a SourceReceiptFacts<'facts>,
+    pub observations: &'a SourceObservationFacts<'facts>,
+    pub surfaces: &'a EvidenceSurfaceFacts<'facts>,
     pub artifacts: &'a BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
     pub procedures: &'a ProcedureState,
     pub tasks: &'a BTreeMap<TaskId, (Task, u64)>,
@@ -47,7 +50,7 @@ pub(crate) struct ControlledRunAdmissionView<'a> {
 }
 
 pub(crate) fn validate_controlled_command<'a>(
-    view: ControlledRunAdmissionView<'_>,
+    view: ControlledRunAdmissionView<'_, '_>,
     payloads: impl IntoIterator<Item = &'a JournalPayload>,
     error: StoreError,
 ) -> Result<(), StoreError> {
@@ -250,7 +253,7 @@ pub(crate) fn validate_controlled_command<'a>(
 }
 
 fn validate_declaration_anchor(
-    view: &ControlledRunAdmissionView<'_>,
+    view: &ControlledRunAdmissionView<'_, '_>,
     procedure_revision_id: RevisionId,
     attempt: &Attempt,
     snapshot_id: WorktreeSnapshotId,
@@ -300,7 +303,7 @@ fn validate_witnesses(
     run: &ExperimentRun,
     attempt: &Attempt,
     bindings: &BTreeMap<OperationId, &WorkBindingRevision>,
-    view: &ControlledRunAdmissionView<'_>,
+    view: &ControlledRunAdmissionView<'_, '_>,
     error: StoreError,
 ) -> Result<ControlledRunSourceEnvelope, StoreError> {
     let mut selected = None;
@@ -443,7 +446,7 @@ pub struct AutoresearchCurrentView {
     pub artifacts: BTreeMap<WorkArtifactId, WorkArtifact>,
 }
 
-pub(crate) struct AutoresearchRelationInputs<'a> {
+pub(crate) struct AutoresearchRelationInputs<'a, 'facts> {
     pub runs: &'a BTreeMap<ExperimentRunId, (ExperimentRun, u64)>,
     pub run_revisions: &'a BTreeMap<RevisionId, (ExperimentRun, u64)>,
     pub results: &'a BTreeMap<ResultEvidenceId, (ResultEvidence, u64)>,
@@ -456,11 +459,13 @@ pub(crate) struct AutoresearchRelationInputs<'a> {
     pub snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
     pub repositories: &'a BTreeMap<evertrace_domain::ids::RepositoryId, (RepositoryInstance, u64)>,
     pub worktrees: &'a BTreeMap<evertrace_domain::ids::WorktreeId, (WorktreeInstance, u64)>,
-    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    pub source_receipts: &'a SourceReceiptFacts<'facts>,
+    pub source_observations: &'a SourceObservationFacts<'facts>,
 }
 
-pub(crate) fn validate_relations(input: AutoresearchRelationInputs<'_>) -> Result<(), StoreError> {
+pub(crate) fn validate_relations(
+    input: AutoresearchRelationInputs<'_, '_>,
+) -> Result<(), StoreError> {
     for (run, _) in input.runs.values() {
         let workstream = &input
             .workstreams
@@ -591,7 +596,7 @@ pub(crate) fn validate_relations(input: AutoresearchRelationInputs<'_>) -> Resul
 }
 
 fn observation_receipt<'a>(
-    input: &'a AutoresearchRelationInputs<'_>,
+    input: &'a AutoresearchRelationInputs<'a, '_>,
     id: SourceObservationId,
 ) -> Result<&'a SourceReceipt, StoreError> {
     let observation = &input
@@ -611,7 +616,7 @@ fn observation_receipt<'a>(
 }
 
 fn actor_matches_scope(
-    input: &AutoresearchRelationInputs<'_>,
+    input: &AutoresearchRelationInputs<'_, '_>,
     actor: &ArtifactActor,
     scope: &ArtifactScope,
     artifact_id: WorkArtifactId,

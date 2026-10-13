@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
     evidence::{
-        CaptureCompleteness, ContentTrust, EvidenceSourceKind, EvidenceSurface, IdentityStrength,
-        ObservationRole, SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode,
-        SourceRole, hex, payload_fingerprint,
+        CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
+        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode, SourceRole, hex,
+        payload_fingerprint,
     },
     ids::{
         AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
@@ -27,7 +27,10 @@ use evertrace_domain::{
 
 use crate::{
     JournalPayload, ObjectRowClass, SourceIngestWatermark, StoreError,
-    projections::ProjectionSnapshot, purge::ObjectDeletionState,
+    projections::{
+        EvidenceSurfaceFacts, ProjectionSnapshot, SourceObservationFacts, SourceReceiptFacts,
+    },
+    purge::ObjectDeletionState,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -304,13 +307,13 @@ pub(crate) fn rebuild_proposals(
     Ok(())
 }
 
-pub(crate) struct SemanticRelationInputs<'a> {
+pub(crate) struct SemanticRelationInputs<'a, 'facts> {
     pub atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
     pub deleted_revision_ids: &'a BTreeSet<RevisionId>,
     pub proposal_revisions: &'a BTreeMap<RevisionId, (RevisionProposal, u64)>,
-    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    pub source_observations: &'a SourceObservationFacts<'facts>,
+    pub source_receipts: &'a SourceReceiptFacts<'facts>,
+    pub evidence_surfaces: &'a EvidenceSurfaceFacts<'facts>,
     pub tasks: &'a BTreeMap<TaskId, (Task, u64)>,
     pub repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
@@ -323,7 +326,7 @@ pub(crate) struct SemanticRelationInputs<'a> {
     pub deletions: &'a ObjectDeletionState,
 }
 
-pub(crate) fn validate_relations(input: SemanticRelationInputs<'_>) -> Result<(), StoreError> {
+pub(crate) fn validate_relations(input: SemanticRelationInputs<'_, '_>) -> Result<(), StoreError> {
     for (atom, _) in input.atom_revisions.values() {
         validate_atom_relations(atom, &input)?;
     }
@@ -1066,7 +1069,7 @@ fn validate_accepted_merge_boundary(
 
 fn validate_atom_relations(
     atom: &Atom,
-    input: &SemanticRelationInputs<'_>,
+    input: &SemanticRelationInputs<'_, '_>,
 ) -> Result<(), StoreError> {
     validate_scope(&atom.scope, input)?;
     for observation_id in &atom.source_observation_refs {
@@ -1259,7 +1262,7 @@ fn validate_atom_relations(
 fn support_acceptance_evidence_exists(
     atom: &Atom,
     evidence_ref: &str,
-    input: &SemanticRelationInputs<'_>,
+    input: &SemanticRelationInputs<'_, '_>,
 ) -> Result<bool, StoreError> {
     let (Some(proposal_id), Some(proposal_revision_id)) = (
         atom.accepted_proposal_id,
@@ -1314,7 +1317,7 @@ fn support_acceptance_evidence_exists(
 
 fn validate_proposal_relations(
     proposal: &RevisionProposal,
-    input: &SemanticRelationInputs<'_>,
+    input: &SemanticRelationInputs<'_, '_>,
 ) -> Result<(), StoreError> {
     let support_validation_ref =
         support_validation_ref(proposal, input.s23, StoreError::StoreCorrupt)?;
@@ -1741,9 +1744,9 @@ struct AcceptanceSources<'a> {
     reviewed: &'a RevisionProposal,
 }
 
-fn validate_acceptance_sources<'a>(
+fn validate_acceptance_sources<'a, 'facts>(
     proposal: &RevisionProposal,
-    input: &'a SemanticRelationInputs<'a>,
+    input: &'a SemanticRelationInputs<'a, 'facts>,
 ) -> Result<AcceptanceSources<'a>, StoreError> {
     let acceptance = proposal
         .acceptance
@@ -1885,7 +1888,7 @@ fn validate_tui_acceptance_event(
     reviewed: &RevisionProposal,
     observation: &SourceObservation,
     receipt: &SourceReceipt,
-    input: &SemanticRelationInputs<'_>,
+    input: &SemanticRelationInputs<'_, '_>,
 ) -> Result<(), StoreError> {
     let plain_payload = tui_acceptance_event_payload(
         proposal.proposal_id,
@@ -1917,7 +1920,7 @@ fn edit_or_reauthorization_fingerprint(
     reviewed: &RevisionProposal,
     observation: &SourceObservation,
     receipt: &SourceReceipt,
-    input: &SemanticRelationInputs<'_>,
+    input: &SemanticRelationInputs<'_, '_>,
 ) -> Result<[u8; 32], StoreError> {
     let source_id = receipt
         .source_ref
@@ -1981,7 +1984,10 @@ fn edit_or_reauthorization_fingerprint(
         .ok_or(StoreError::StoreCorrupt)
 }
 
-fn validate_scope(scope: &AtomScope, input: &SemanticRelationInputs<'_>) -> Result<(), StoreError> {
+fn validate_scope(
+    scope: &AtomScope,
+    input: &SemanticRelationInputs<'_, '_>,
+) -> Result<(), StoreError> {
     match scope {
         AtomScope::Task { task_id } if input.tasks.contains_key(task_id) => Ok(()),
         AtomScope::Repository {
@@ -2005,7 +2011,7 @@ fn validate_scope(scope: &AtomScope, input: &SemanticRelationInputs<'_>) -> Resu
     }
 }
 
-fn evidence_exists(reference: &str, input: &SemanticRelationInputs<'_>) -> bool {
+fn evidence_exists(reference: &str, input: &SemanticRelationInputs<'_, '_>) -> bool {
     reference
         .parse::<SourceReceiptId>()
         .is_ok_and(|id| input.source_receipts.contains_key(&id))
@@ -2029,7 +2035,7 @@ fn evidence_exists(reference: &str, input: &SemanticRelationInputs<'_>) -> bool 
 fn valid_procedure_negative_reference(
     proposal: &RevisionProposal,
     reference: &str,
-    input: &SemanticRelationInputs<'_>,
+    input: &SemanticRelationInputs<'_, '_>,
 ) -> bool {
     let (
         ProposalPayload::Procedure(payload),
@@ -2068,7 +2074,7 @@ fn valid_procedure_negative_reference(
             })
 }
 
-fn objective_evidence_exists(reference: &str, input: &SemanticRelationInputs<'_>) -> bool {
+fn objective_evidence_exists(reference: &str, input: &SemanticRelationInputs<'_, '_>) -> bool {
     reference.parse::<SourceReceiptId>().is_ok_and(|id| {
         input.source_receipts.get(&id).is_some_and(|(receipt, _)| {
             input

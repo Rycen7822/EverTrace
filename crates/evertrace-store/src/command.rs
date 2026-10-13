@@ -1214,6 +1214,7 @@ impl JournalPayload {
         serde_json::to_string(self).map_err(|_| StoreError::Serialization)
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_json_into(&self, output: &mut Vec<u8>) -> Result<(), StoreError> {
         output.clear();
         serde_json::to_writer(output, self).map_err(|_| StoreError::Serialization)
@@ -1248,6 +1249,33 @@ impl JournalPayload {
         };
         serde_json::to_writer(&mut comparison, self).map_err(|_| StoreError::Serialization)?;
         Ok(comparison.matched && comparison.remaining.is_empty())
+    }
+}
+
+/// Borrowed serializer for the immutable source facts already held by the
+/// writer. The tagged wire representation matches `JournalPayload` exactly.
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub(crate) enum JournalPayloadRef<'a> {
+    #[serde(rename = "source_receipt_recorded")]
+    Receipt(&'a SourceReceipt),
+    #[serde(rename = "source_observation_recorded")]
+    Observation(&'a SourceObservation),
+    #[serde(rename = "evidence_surface_recorded")]
+    Surface(&'a EvidenceSurface),
+}
+
+impl JournalPayloadRef<'_> {
+    pub(crate) fn validate(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Receipt(value) => value.validate().map_err(|_| StoreError::InvalidInput),
+            Self::Observation(value) => value.validate().map_err(|_| StoreError::InvalidInput),
+            Self::Surface(value) => value.validate().map_err(|_| StoreError::InvalidInput),
+        }
+    }
+
+    pub(crate) fn canonical_json(&self) -> Result<String, StoreError> {
+        serde_json::to_string(self).map_err(|_| StoreError::Serialization)
     }
 }
 
