@@ -1984,32 +1984,24 @@ async fn imported_source_prefix_rejects_late_message_before_objects_commit() {
     assert_eq!(states.objects.checkpoint, objects_checkpoint);
 }
 
-#[tokio::test]
-async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore() {
-    let root = TempDir::new().unwrap();
-    let seed = seed_store(&root.path().join("store")).await;
-    let mut writer = seed.writer;
-    let first = direct_source_message(
-        "frozen-direct",
-        1,
-        seed.task.task_id,
-        seed.repository.repository_id,
-        seed.worktree.worktree_instance_id,
-    );
-    let third = direct_source_message(
-        "frozen-direct",
-        3,
-        seed.task.task_id,
-        seed.repository.repository_id,
-        seed.worktree.worktree_instance_id,
-    );
-    persist_direct_source_message(&mut writer, &first.0, &first.1, 3).await;
-    persist_direct_source_message(&mut writer, &third.0, &third.1, 4).await;
+async fn install_frozen_source_prefix(
+    writer: &mut JournalWriter,
+    task_id: TaskId,
+    repository_id: RepositoryId,
+    worktree_id: WorktreeId,
+) -> (
+    SemanticSourceTarget,
+    evertrace_domain::ids::SemanticDerivationRunId,
+) {
+    let first = direct_source_message("frozen-direct", 1, task_id, repository_id, worktree_id);
+    let third = direct_source_message("frozen-direct", 3, task_id, repository_id, worktree_id);
+    persist_direct_source_message(writer, &first.0, &first.1, 3).await;
+    persist_direct_source_message(writer, &third.0, &third.1, 4).await;
     let source = SemanticSourceTarget {
         source_instance_id: first.0.source_instance_id.clone(),
         source_revision: first.0.source_revision.clone(),
-        repository_id: seed.repository.repository_id,
-        worktree_id: seed.worktree.worktree_instance_id,
+        repository_id,
+        worktree_id,
     };
     let mut run = SemanticDerivationRun {
         derivation_run_id: evertrace_domain::ids::SemanticDerivationRunId::new_v7(),
@@ -2046,7 +2038,7 @@ async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore(
         first.1.source_observation_id,
         third.1.source_observation_id,
     );
-    install_source_synthesis_job(&mut writer, &job, 6).await;
+    install_source_synthesis_job(writer, &job, 6).await;
     let mut failed_job = job;
     failed_job.state = JobStatus::Failed;
     failed_job.attempt = 2;
@@ -2069,6 +2061,19 @@ async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore(
         )
         .await
         .unwrap();
+    (source, frozen_run_id)
+}
+
+#[tokio::test]
+async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore() {
+    let root = TempDir::new().unwrap();
+    let seed = seed_store(&root.path().join("store")).await;
+    let task_id = seed.task.task_id;
+    let repository_id = seed.repository.repository_id;
+    let worktree_id = seed.worktree.worktree_instance_id;
+    let mut writer = seed.writer;
+    let (source, frozen_run_id) =
+        install_frozen_source_prefix(&mut writer, task_id, repository_id, worktree_id).await;
     let frozen = writer.project().await.unwrap();
     assert!(frozen.data_rows().any(|row| {
         row.object_kind.as_deref() == Some("semantic_derivation_run")
@@ -2124,6 +2129,99 @@ async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore(
             .objects
             .checkpoint,
         late_frontier
+    );
+
+    let returned_root = TempDir::new().unwrap();
+    let returned_seed = seed_store(&returned_root.path().join("store")).await;
+    let returned_task_id = returned_seed.task.task_id;
+    let returned_repository_id = returned_seed.repository.repository_id;
+    let returned_worktree_id = returned_seed.worktree.worktree_instance_id;
+    let mut returned_writer = returned_seed.writer;
+    let (returned_source, returned_frozen_run_id) = install_frozen_source_prefix(
+        &mut returned_writer,
+        returned_task_id,
+        returned_repository_id,
+        returned_worktree_id,
+    )
+    .await;
+    let returned_frozen = returned_writer
+        .project_with_handoff(true, None)
+        .await
+        .unwrap();
+    assert!(returned_frozen.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_derivation_run")
+            && row.object_id.as_deref() == Some(&returned_frozen_run_id.to_string())
+    }));
+    assert_eq!(
+        &*returned_frozen,
+        &returned_writer.full_projection().await.unwrap()
+    );
+    let returned_frozen_frontier = returned_frozen.frontier;
+
+    let returned_late = direct_source_message(
+        "frozen-direct",
+        2,
+        returned_task_id,
+        returned_source.repository_id,
+        returned_source.worktree_id,
+    );
+    persist_direct_source_message(&mut returned_writer, &returned_late.0, &returned_late.1, 11)
+        .await;
+    let returned_late = returned_writer
+        .project_with_handoff(true, Some(returned_frozen))
+        .await
+        .unwrap();
+    let returned_late_frontier = returned_late.frontier;
+    assert!(returned_late_frontier > returned_frozen_frontier);
+    assert_eq!(
+        returned_writer
+            .backup_table_states()
+            .await
+            .unwrap()
+            .objects
+            .checkpoint,
+        returned_late_frontier
+    );
+    assert_eq!(
+        returned_writer.full_projection().await,
+        Err(StoreError::StoreCorrupt)
+    );
+
+    let returned_other = direct_source_message(
+        "different-source",
+        1,
+        returned_task_id,
+        returned_source.repository_id,
+        returned_source.worktree_id,
+    );
+    persist_direct_source_message(
+        &mut returned_writer,
+        &returned_other.0,
+        &returned_other.1,
+        12,
+    )
+    .await;
+    let checkpoint_before_reject = returned_writer
+        .backup_table_states()
+        .await
+        .unwrap()
+        .objects
+        .checkpoint;
+    assert_eq!(checkpoint_before_reject, returned_late_frontier);
+    assert!(matches!(
+        returned_writer
+            .project_with_handoff(true, Some(returned_late))
+            .await,
+        Err(StoreError::StoreCorrupt)
+    ));
+    assert_eq!(
+        returned_writer
+            .backup_table_states()
+            .await
+            .unwrap()
+            .objects
+            .checkpoint,
+        checkpoint_before_reject
     );
 }
 

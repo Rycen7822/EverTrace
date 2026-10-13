@@ -1,3 +1,4 @@
+use evertrace_store::writer::SealedProjectionSnapshot;
 use evertrace_store::{
     BackupError, BackupSummary, CommitOutcome, CommittedCommand, DurableJob, JobStatus,
     JournalCommand, JournalWriter, ObjectDeletionCurrentView, ProjectionSnapshot,
@@ -90,7 +91,8 @@ enum WriterRequest {
     },
     Project {
         indexes: bool,
-        reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
+        previous: Option<SealedProjectionSnapshot>,
+        reply: oneshot::Sender<Result<SealedProjectionSnapshot, WriterActorError>>,
     },
     SyncFrontier {
         indexes: bool,
@@ -539,10 +541,22 @@ impl WriterHandle {
     }
 
     pub(crate) async fn project_objects(&self) -> Result<ProjectionSnapshot, WriterActorError> {
+        Ok(self
+            .project_with_handoff(false, None)
+            .await?
+            .into_snapshot())
+    }
+
+    pub(crate) async fn project_with_handoff(
+        &self,
+        indexes: bool,
+        previous: Option<SealedProjectionSnapshot>,
+    ) -> Result<SealedProjectionSnapshot, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WriterRequest::Project {
-                indexes: false,
+                indexes,
+                previous,
                 reply,
             })
             .await
@@ -551,15 +565,7 @@ impl WriterHandle {
     }
 
     pub async fn project(&self) -> Result<ProjectionSnapshot, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::Project {
-                indexes: true,
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
+        Ok(self.project_with_handoff(true, None).await?.into_snapshot())
     }
 
     /// Complete the projection barrier without transferring a full snapshot.
@@ -1169,17 +1175,19 @@ async fn run_writer(
                         return Err(WriterActorError::Store);
                     }
                 }
-                WriterRequest::Project { indexes, reply } => {
+                WriterRequest::Project {
+                    indexes,
+                    previous,
+                    reply,
+                } => {
                     if reply.is_closed() {
                         continue;
                     }
                     let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
-                    let result = if indexes {
-                        writer.project().await
-                    } else {
-                        writer.project_objects().await
-                    }
-                    .map_err(map_store_error);
+                    let result = writer
+                        .project_with_handoff(indexes, previous)
+                        .await
+                        .map_err(map_store_error);
                     let fatal = result.is_err();
                     let _ = reply.send(result);
                     if fatal {
