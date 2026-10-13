@@ -21,7 +21,7 @@ use crate::{
     migrations::{L0002, MigrationOutcome},
     objects::{ObjectRow, checkpoint_from_rows},
     projections::{
-        JournalAdmissionState, ProjectionOutput, ProjectionSnapshot, ProjectionWorker,
+        JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
         ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
     },
     query::L0002ProjectionWorker,
@@ -281,7 +281,7 @@ fn normal_search_linked_references(
 }
 
 fn normal_search_expand_dependencies(
-    state: &crate::projections::JournalAdmissionState<'_>,
+    state: &crate::projections::JournalAdmissionState,
     rows: &mut Vec<ObjectRow>,
     candidate: Option<&NormalSearchCandidateRequest>,
 ) -> Result<(), StoreError> {
@@ -467,10 +467,6 @@ struct ProjectionValidation {
     // were read back equal. It is not a persisted certificate and is never
     // upgraded by a checkpoint-only no-delta read.
     content_proven: bool,
-    // Exact current/live equality for the immutable source prefix at this
-    // physical objects checkpoint. It is only preserved across a confirmed
-    // append that cannot change the old prefix.
-    source_prefix_proven: bool,
     // Last confirmed append, not a claim that the old objects or indexes have
     // advanced. Each retained successor is bound to the input stamp plus the
     // committed frontier it appended.
@@ -526,7 +522,7 @@ pub struct JournalWriter {
     connection: Connection,
     readers: StoreReadHandle,
     next_seq: u64,
-    admission_state: JournalAdmissionState<'static>,
+    admission_state: JournalAdmissionState,
     migration_outcome: MigrationOutcome,
     // Keep the search table directory inode alive so replacement cannot reuse
     // its identity. The SQLite side revalidates its own file/directory.
@@ -537,8 +533,6 @@ pub struct JournalWriter {
     // it and it carries no projection content or state.
     #[cfg(test)]
     capture_delta_selections: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    source_consumer_selections: std::sync::atomic::AtomicU64,
     // Declared last: the sibling lock must be released only after the native
     // and SQLite bindings of this writer have been dropped.
     _lock: SiblingWriterLock,
@@ -561,28 +555,6 @@ impl JournalWriter {
 
     pub fn read_handle(&self) -> StoreReadHandle {
         self.readers.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn source_prefix_proven_for_test(&self) -> bool {
-        self.projection_validation.lock().unwrap()[0]
-            .as_ref()
-            .is_some_and(|stamp| stamp.source_prefix_proven)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn source_prefix_successor_bound_for_test(&self) -> bool {
-        let stamp = self.projection_validation.lock().unwrap()[0].clone();
-        stamp.is_some_and(|stamp| {
-            self.physical_stamp()
-                .is_ok_and(|live| stamp.appended_successor_bound(&live))
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn source_consumer_selections_for_test(&self) -> u64 {
-        self.source_consumer_selections
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Select GC candidates from already validated journal admission state.
@@ -782,8 +754,6 @@ impl JournalWriter {
             projection_validation: Mutex::new([None, None]),
             #[cfg(test)]
             capture_delta_selections: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            source_consumer_selections: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -954,8 +924,6 @@ impl JournalWriter {
             projection_validation,
             #[cfg(test)]
                 capture_delta_selections: _,
-            #[cfg(test)]
-                source_consumer_selections: _,
             _lock,
         } = self;
         readers.revoke();
@@ -998,8 +966,6 @@ impl JournalWriter {
             projection_validation,
             #[cfg(test)]
                 capture_delta_selections: _,
-            #[cfg(test)]
-                source_consumer_selections: _,
         } = self;
         readers.revoke();
         drop((
@@ -1203,14 +1169,6 @@ impl JournalWriter {
         self._lock.validate_held()?;
         self.admission_state = next_admission_state;
         if let Some(mut input) = validated_input {
-            if rows.iter().any(|row| {
-                matches!(
-                    row.event_type.as_str(),
-                    "object_deletion_ledger_recorded_v1" | "scope_purge_progress_recorded_v1"
-                )
-            }) {
-                input.source_prefix_proven = false;
-            }
             input.appended_through = Some((input.stamp, last_seq));
             input.appended_rows = handoff;
             self.projection_validation
@@ -1410,7 +1368,7 @@ impl JournalWriter {
     async fn validated_current_read<T>(
         &self,
         read: impl FnOnce(
-            &crate::projections::JournalAdmissionState<'_>,
+            &crate::projections::JournalAdmissionState,
             &ProjectionValidation,
         ) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
@@ -1519,185 +1477,64 @@ impl JournalWriter {
             let capture_input = validated_input.filter(|stamp| {
                 indexes && !return_rows && stamp.capture_successor_bound(&before, before_search)
             });
-            let source_facts = validated_input
-                .filter(|stamp| stamp.source_prefix_proven)
-                .map(|_| self.admission_state.source_facts());
             let all = indexes
                 .then_some(stamps[1].as_ref())
                 .flatten()
                 .filter(|stamp| stamp.stamp == before && stamp.search_version == before_search);
             let hit = if indexes { all } else { objects };
-            let (
-                frontier,
-                snapshot,
-                has_failed_job,
-                search_version,
-                content_proven,
-                source_prefix_proven,
-            ) = if let Some(stamp) = hit {
-                let snapshot = if return_rows {
-                    let rows = {
-                        let state = self.lock_sqlite()?;
-                        if stamp.source_prefix_proven {
-                            state.object_rows_without_source_facts()?
-                        } else {
-                            state.object_rows()?
-                        }
-                    };
-                    Some(if stamp.source_prefix_proven {
-                        self.admission_state
-                            .snapshot_with_source_prefix(rows, stamp.frontier)?
-                    } else {
-                        ProjectionSnapshot {
+            let (frontier, snapshot, has_failed_job, search_version, content_proven) =
+                if let Some(stamp) = hit {
+                    let snapshot = if return_rows {
+                        Some(ProjectionSnapshot {
                             frontier: stamp.frontier,
-                            rows,
-                        }
-                    })
-                } else {
-                    None
-                };
-                (
-                    stamp.frontier,
-                    snapshot,
-                    stamp.has_failed_job,
-                    stamp.search_version,
-                    stamp.content_proven && (indexes || stamp.stamp == before),
-                    stamp.source_prefix_proven,
-                )
-            } else {
-                let capture_update = match capture_input {
-                    Some(stamp) => {
-                        self.projection_worker()
-                            .catch_up_capture_delta(
-                                (
-                                    stamp.stamp.objects_epoch,
-                                    stamp.stamp.object_checkpoint,
-                                    before.frontier,
-                                ),
-                                stamp
-                                    .appended_rows
-                                    .as_deref()
-                                    .ok_or(StoreError::StoreCorrupt)?,
-                                source_facts.as_ref(),
-                            )
-                            .await?
-                    }
-                    None => None,
-                };
-                if let Some(update) = capture_update {
-                    let objects_stamp = self.physical_stamp()?;
-                    if objects_stamp.objects_epoch != update.objects_epoch
-                        || objects_stamp.incarnation != before.incarnation
-                        || objects_stamp.journal_epoch != before.journal_epoch
-                        || objects_stamp.frontier != before.frontier
-                    {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    let versions = self
-                        .l0002_projection_worker()
-                        .catch_up_capture_delta(
-                            update.frontier,
-                            update.base_frontier,
-                            &update.changed_rows,
-                            update.delta,
-                        )
-                        .await?;
-                    if self.physical_stamp()?.relations_epoch != versions[0] {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    let search_version = self
-                        .search
-                        .version()
-                        .await
-                        .map_err(|_| StoreError::LanceDb)?;
-                    if search_version != versions[1] {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    let has_failed_job = crate::projections::RuntimeSchedulerView::from_rows(
-                        update.frontier,
-                        &update.runtime_rows,
-                    )?
-                    .jobs
-                    .iter()
-                    .any(|job| job.state == crate::JobStatus::Failed);
-                    let source_prefix_proven =
-                        capture_input.is_some_and(|stamp| stamp.source_prefix_proven);
-                    #[cfg(test)]
-                    self.capture_delta_selections
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            rows: self.lock_sqlite()?.object_rows()?,
+                        })
+                    } else {
+                        None
+                    };
                     (
-                        update.frontier,
-                        None,
-                        has_failed_job,
-                        search_version,
-                        true,
-                        source_prefix_proven,
+                        stamp.frontier,
+                        snapshot,
+                        stamp.has_failed_job,
+                        stamp.search_version,
+                        stamp.content_proven && (indexes || stamp.stamp == before),
                     )
                 } else {
-                    let (output, objects_epoch, delta, source_prefix_proven) =
-                        if let Some(stamp) = objects {
-                            let rows = {
-                                let state = self.lock_sqlite()?;
-                                if stamp.source_prefix_proven {
-                                    state.object_rows_without_source_facts()?
-                                } else {
-                                    state.object_rows()?
-                                }
-                            };
-                            let output = if stamp.source_prefix_proven {
-                                self.admission_state
-                                    .snapshot_with_source_prefix(rows, stamp.frontier)?
-                            } else {
-                                ProjectionSnapshot {
-                                    frontier: stamp.frontier,
-                                    rows,
-                                }
-                            };
-                            (
-                                ProjectionOutput::Full(output),
-                                stamp.stamp.objects_epoch,
-                                None,
-                                stamp.source_prefix_proven,
-                            )
-                        } else {
-                            let appended =
-                                validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
-                            let worker = self.projection_worker();
-                            let (output, objects_epoch, delta) = worker
-                                .catch_up_validated_with_source_facts(
-                                    validated_current,
-                                    appended,
-                                    source_facts.as_ref(),
-                                    !return_rows,
+                    let capture_update = match capture_input {
+                        Some(stamp) => {
+                            self.projection_worker()
+                                .catch_up_capture_delta(
+                                    (
+                                        stamp.stamp.objects_epoch,
+                                        stamp.stamp.object_checkpoint,
+                                        before.frontier,
+                                    ),
+                                    stamp
+                                        .appended_rows
+                                        .as_deref()
+                                        .ok_or(StoreError::StoreCorrupt)?,
                                 )
-                                .await?;
-                            #[cfg(test)]
-                            if matches!(&output, ProjectionOutput::Sources(_)) {
-                                self.source_consumer_selections
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            let source_prefix_proven = if source_facts.is_some() {
-                                true
-                            } else {
-                                self.admission_state.source_prefix_matches_rows(
-                                    output.rows_for_projection_consumer(),
-                                    output.frontier(),
-                                )?
-                            };
-                            (output, objects_epoch, delta, source_prefix_proven)
-                        };
-                    let objects_stamp = self.physical_stamp()?;
-                    if objects_stamp.objects_epoch != objects_epoch
-                        || objects_stamp.incarnation != before.incarnation
-                        || objects_stamp.journal_epoch != before.journal_epoch
-                        || objects_stamp.frontier != before.frontier
-                    {
-                        return Err(StoreError::StoreCorrupt);
-                    }
-                    let (search_version, content_proven) = if indexes {
-                        let worker = self.l0002_projection_worker();
-                        let (_, versions, derived) = worker
-                            .catch_up_projection_output_proof(&output, delta)
+                                .await?
+                        }
+                        None => None,
+                    };
+                    if let Some(update) = capture_update {
+                        let objects_stamp = self.physical_stamp()?;
+                        if objects_stamp.objects_epoch != update.objects_epoch
+                            || objects_stamp.incarnation != before.incarnation
+                            || objects_stamp.journal_epoch != before.journal_epoch
+                            || objects_stamp.frontier != before.frontier
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                        let versions = self
+                            .l0002_projection_worker()
+                            .catch_up_capture_delta(
+                                update.frontier,
+                                update.base_frontier,
+                                &update.changed_rows,
+                                update.delta,
+                            )
                             .await?;
                         if self.physical_stamp()?.relations_epoch != versions[0] {
                             return Err(StoreError::StoreCorrupt);
@@ -1710,33 +1547,76 @@ impl JournalWriter {
                         if search_version != versions[1] {
                             return Err(StoreError::StoreCorrupt);
                         }
-                        (search_version, derived)
+                        let has_failed_job = crate::projections::RuntimeSchedulerView::from_rows(
+                            update.frontier,
+                            &update.runtime_rows,
+                        )?
+                        .jobs
+                        .iter()
+                        .any(|job| job.state == crate::JobStatus::Failed);
+                        #[cfg(test)]
+                        self.capture_delta_selections
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        (update.frontier, None, has_failed_job, search_version, true)
                     } else {
-                        (0, false)
-                    };
-                    let has_failed_job = crate::projections::RuntimeSchedulerView::from_rows(
-                        output.frontier(),
-                        output.rows_for_projection_consumer(),
-                    )?
-                    .jobs
-                    .iter()
-                    .any(|job| job.state == crate::JobStatus::Failed);
-                    let frontier = output.frontier();
-                    let snapshot = if return_rows {
-                        Some(output.into_snapshot()?)
-                    } else {
-                        None
-                    };
-                    (
-                        frontier,
-                        snapshot,
-                        has_failed_job,
-                        search_version,
-                        content_proven,
-                        source_prefix_proven,
-                    )
-                }
-            };
+                        let (snapshot, objects_epoch, delta) = if let Some(stamp) = objects {
+                            (
+                                ProjectionSnapshot {
+                                    frontier: stamp.frontier,
+                                    rows: self.lock_sqlite()?.object_rows()?,
+                                },
+                                stamp.stamp.objects_epoch,
+                                None,
+                            )
+                        } else {
+                            let appended =
+                                validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
+                            let worker = self.projection_worker();
+                            worker
+                                .catch_up_validated(validated_current, appended)
+                                .await?
+                        };
+                        let objects_stamp = self.physical_stamp()?;
+                        if objects_stamp.objects_epoch != objects_epoch
+                            || objects_stamp.incarnation != before.incarnation
+                            || objects_stamp.journal_epoch != before.journal_epoch
+                            || objects_stamp.frontier != before.frontier
+                        {
+                            return Err(StoreError::StoreCorrupt);
+                        }
+                        let (search_version, content_proven) = if indexes {
+                            let worker = self.l0002_projection_worker();
+                            let (_, versions, derived) =
+                                worker.catch_up_validated_proof(&snapshot, delta).await?;
+                            if self.physical_stamp()?.relations_epoch != versions[0] {
+                                return Err(StoreError::StoreCorrupt);
+                            }
+                            let search_version = self
+                                .search
+                                .version()
+                                .await
+                                .map_err(|_| StoreError::LanceDb)?;
+                            if search_version != versions[1] {
+                                return Err(StoreError::StoreCorrupt);
+                            }
+                            (search_version, derived)
+                        } else {
+                            (0, false)
+                        };
+                        let has_failed_job =
+                            crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
+                                .jobs
+                                .iter()
+                                .any(|job| job.state == crate::JobStatus::Failed);
+                        (
+                            snapshot.frontier,
+                            return_rows.then_some(snapshot),
+                            has_failed_job,
+                            search_version,
+                            content_proven,
+                        )
+                    }
+                };
             self.validate_projection_directories(indexes)?;
             let after = self.physical_stamp()?;
             if after.incarnation != before.incarnation
@@ -1761,7 +1641,6 @@ impl JournalWriter {
                     frontier,
                     has_failed_job,
                     content_proven,
-                    source_prefix_proven,
                     appended_through: None,
                     appended_rows: None,
                 });

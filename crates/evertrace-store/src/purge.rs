@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
+    evidence::{EvidenceSurface, SourceObservation, SourceReceipt},
     ids::{JobId, ProcedureNegativeEvidenceId, RepositoryId, SourceObservationId, SourceReceiptId},
     procedure::ProcedureStateEvent,
     purge::{
@@ -18,7 +19,6 @@ use crate::{
     JobLease, JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalPayload,
     ObjectRow, ObjectRowClass, ObjectRowKind, ProjectionSnapshot, StoreError,
     default_retrieval_suppression_ref_hash,
-    projections::{EvidenceSurfaceFacts, SourceObservationFacts, SourceReceiptFacts},
 };
 
 pub(crate) const OBJECT_DELETION_LEDGER_KIND: &str = "object_deletion_ledger";
@@ -83,11 +83,11 @@ pub(crate) struct ObjectDeletionRevisionFact {
     pub current: bool,
 }
 
-pub(crate) struct ObjectDeletionSourceContext<'a, 'facts> {
+pub(crate) struct ObjectDeletionSourceContext<'a> {
     pub other_live_source_refs: &'a BTreeSet<SourceObservationId>,
-    pub source_observations: &'a SourceObservationFacts<'facts>,
-    pub source_receipts: &'a SourceReceiptFacts<'facts>,
-    pub evidence_surfaces: &'a EvidenceSurfaceFacts<'facts>,
+    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    pub evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,7 +392,7 @@ pub(crate) fn derive_object_deletion_preview(
     target: ObjectDeletionTarget,
     mut revisions: Vec<ObjectDeletionRevisionFact>,
     current_guard_source_refs: Vec<String>,
-    source_context: ObjectDeletionSourceContext<'_, '_>,
+    source_context: ObjectDeletionSourceContext<'_>,
     downstream_support_impacts: Vec<ObjectDeletionSupportImpact>,
     dependent_procedure_impacts: Vec<ObjectDeletionProcedureImpact>,
     deletion_generation: u64,

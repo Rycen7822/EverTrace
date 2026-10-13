@@ -1,26 +1,20 @@
 //! L0002 projection workers over one validated L0001 object frontier.
 
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
-    evidence::{EvidenceSurface, SourceReceipt},
-    ids::{SourceObservationId, SourceReceiptId},
     revision::RevisionId,
     semantic::Atom,
 };
 use lancedb::Table;
 
 use crate::{
-    JournalPayload, JournalPayloadRef, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
+    JournalPayload, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
     projections::{
-        ProjectionJournalDelta, ProjectionOutput, SourceConsumerInput, l3_core_projection,
-        procedure_context_effect, recall_need, recall_trigger_contract,
-        synthesis::wiki_render_identity, validate_delta, wiki_projection,
+        ProjectionJournalDelta, l3_core_projection, procedure_context_effect, recall_need,
+        recall_trigger_contract, synthesis::wiki_render_identity, validate_delta, wiki_projection,
     },
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
@@ -156,61 +150,19 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
-        Ok(self
-            .catch_up_inner(objects.frontier, &objects.rows, None, None, false, false)
-            .await?
-            .0)
+        Ok(self.catch_up_inner(objects, None, false, false).await?.0)
     }
 
     /// The ordinary complete path with its actual-derive flag. Only a run that
     /// really derived and read every persisted row back establishes the
     /// private full-content grade; the checkpoint early return does not.
-    #[cfg(test)]
     pub(crate) async fn catch_up_validated_proof(
         &self,
         objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        self.catch_up_inner(
-            objects.frontier,
-            &objects.rows,
-            None,
-            journal_delta,
-            false,
-            false,
-        )
-        .await
-    }
-
-    pub(crate) async fn catch_up_projection_output_proof(
-        &self,
-        objects: &ProjectionOutput<'_>,
-        journal_delta: Option<ProjectionJournalDelta>,
-    ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        match objects {
-            ProjectionOutput::Full(snapshot) => {
-                self.catch_up_inner(
-                    snapshot.frontier,
-                    &snapshot.rows,
-                    None,
-                    journal_delta,
-                    false,
-                    false,
-                )
-                .await
-            }
-            ProjectionOutput::Sources(input) => {
-                self.catch_up_inner(
-                    input.frontier,
-                    &input.rows,
-                    Some(input),
-                    journal_delta,
-                    false,
-                    false,
-                )
-                .await
-            }
-        }
+        self.catch_up_inner(objects, journal_delta, false, false)
+            .await
     }
 
     /// Complete one confirmed closed capture successor from an already proven
@@ -270,16 +222,16 @@ impl L0002ProjectionWorker {
         .map(|(_, versions)| versions)
     }
 
-    async fn catch_up_inner<'rows, 'facts>(
+    async fn catch_up_inner(
         &self,
-        frontier: u64,
-        object_rows: &'rows [ObjectRow],
-        source_input: Option<&'rows SourceConsumerInput<'facts>>,
+        objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        let handoff = self.prepare_handoff(frontier, journal_delta).await?;
+        let handoff = self
+            .prepare_handoff(objects.frontier, journal_delta)
+            .await?;
         if handoff.relation_frontier == handoff.frontier
             && handoff.search_frontier == handoff.frontier
         {
@@ -293,7 +245,7 @@ impl L0002ProjectionWorker {
                 false,
             ));
         }
-        let expected = derive_l0002_rows(frontier, object_rows, source_input)?;
+        let expected = derive_l0002_projections(objects)?;
         let (snapshot, versions) = self
             .commit_expected(handoff, expected, fail_relation_commit, fail_search_commit)
             .await?;
@@ -449,9 +401,7 @@ impl L0002ProjectionWorker {
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
         Ok(self
             .catch_up_inner(
-                objects.frontier,
-                &objects.rows,
-                None,
+                objects,
                 journal_delta,
                 fail_relation_commit,
                 fail_search_commit,
@@ -553,57 +503,30 @@ fn capture_delta_search(
     Ok(rows.into_iter().collect())
 }
 
-enum DerivationPayload<'a> {
-    Canonical(&'a str),
-    Source(JournalPayloadRef<'a>),
-}
-
 pub fn derive_l0002_projections(
     objects: &ProjectionSnapshot,
 ) -> Result<L0002ProjectionSnapshot, StoreError> {
-    derive_l0002_rows(objects.frontier, &objects.rows, None)
-}
-
-fn derivation_payload<'a>(
-    row: &'a ObjectRow,
-    sources: Option<&'a SourceConsumerInput<'_>>,
-) -> Result<DerivationPayload<'a>, StoreError> {
-    if let Some(sources) = sources
-        && matches!(
-            row.object_kind.as_deref(),
-            Some("source_receipt" | "source_observation" | "evidence_surface")
-        )
-    {
-        return Ok(DerivationPayload::Source(sources.payload_for_row(row)?));
-    }
-    Ok(DerivationPayload::Canonical(
-        row.payload_json
-            .as_deref()
-            .ok_or(StoreError::StoreCorrupt)?,
-    ))
-}
-
-fn derive_l0002_rows<'rows, 'facts>(
-    frontier: u64,
-    rows: &'rows [ObjectRow],
-    source_input: Option<&'rows SourceConsumerInput<'facts>>,
-) -> Result<L0002ProjectionSnapshot, StoreError> {
-    if rows
+    if objects
+        .rows
         .iter()
         .filter(|row| row.row_kind == ObjectRowKind::Checkpoint)
         .count()
         != 1
-        || rows
+        || objects
+            .rows
             .iter()
             .find(|row| row.row_kind == ObjectRowKind::Checkpoint)
-            .is_none_or(|row| row.source_event_seq != frontier)
-        || rows.iter().any(|row| row.source_event_seq > frontier)
+            .is_none_or(|row| row.source_event_seq != objects.frontier)
+        || objects
+            .rows
+            .iter()
+            .any(|row| row.source_event_seq > objects.frontier)
     {
         return Err(StoreError::StoreCorrupt);
     }
 
-    let mut receipts = BTreeMap::<SourceReceiptId, (Cow<'rows, SourceReceipt>, u64)>::new();
-    let mut surfaces = BTreeMap::<SourceObservationId, (Cow<'rows, EvidenceSurface>, u64)>::new();
+    let mut receipts = BTreeMap::new();
+    let mut surfaces = BTreeMap::new();
     let mut occurrences = BTreeMap::new();
     let mut operations = BTreeMap::new();
     let mut effects = BTreeMap::new();
@@ -643,9 +566,8 @@ fn derive_l0002_rows<'rows, 'facts>(
     let mut endpoint_seqs = BTreeMap::<String, u64>::new();
     let mut current_revisions = BTreeMap::<String, (u64, String)>::new();
     let mut wiki_atoms_by_revision = BTreeMap::<RevisionId, Atom>::new();
-    for row in rows
-        .iter()
-        .filter(|row| row.row_kind == ObjectRowKind::Data)
+    for row in objects
+        .data_rows()
         .filter(|row| row.object_kind.as_deref() == Some("atom_revision"))
     {
         let payload: JournalPayload = serde_json::from_str(
@@ -666,10 +588,7 @@ fn derive_l0002_rows<'rows, 'facts>(
             return Err(StoreError::StoreCorrupt);
         }
     }
-    for row in rows
-        .iter()
-        .filter(|row| row.row_kind == ObjectRowKind::Data)
-    {
+    for row in objects.data_rows() {
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
@@ -692,10 +611,7 @@ fn derive_l0002_rows<'rows, 'facts>(
         }
     }
 
-    for row in rows
-        .iter()
-        .filter(|row| row.row_kind == ObjectRowKind::Data)
-    {
+    for row in objects.data_rows() {
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
@@ -764,42 +680,24 @@ fn derive_l0002_rows<'rows, 'facts>(
                 .and_modify(|seq| *seq = (*seq).max(row.source_event_seq))
                 .or_insert(row.source_event_seq);
         }
-        let payload_json = match derivation_payload(row, source_input)? {
-            DerivationPayload::Source(payload) => {
-                index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
-                match payload {
-                    JournalPayloadRef::Receipt(value) => latest(
-                        &mut receipts,
-                        value.source_receipt_id,
-                        Cow::Borrowed(value),
-                        row.source_event_seq,
-                    ),
-                    JournalPayloadRef::Observation(_) => {}
-                    JournalPayloadRef::Surface(value) => latest(
-                        &mut surfaces,
-                        value.source_observation_revision_ref,
-                        Cow::Borrowed(value),
-                        row.source_event_seq,
-                    ),
-                }
-                continue;
-            }
-            DerivationPayload::Canonical(payload_json) => payload_json,
-        };
-        let payload: JournalPayload =
-            serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
         index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
         match payload {
             JournalPayload::SourceReceiptRecorded(value) => latest(
                 &mut receipts,
                 value.source_receipt_id,
-                Cow::Owned(*value),
+                *value,
                 row.source_event_seq,
             ),
             JournalPayload::EvidenceSurfaceRecorded(value) => latest(
                 &mut surfaces,
                 value.source_observation_revision_ref,
-                Cow::Owned(*value),
+                *value,
                 row.source_event_seq,
             ),
             JournalPayload::HostOccurrenceNormalized(value) => latest(
@@ -1144,24 +1042,24 @@ fn derive_l0002_rows<'rows, 'facts>(
         )?,
         &endpoint_seqs,
     );
-    relations.insert(RelationProjectionRow::checkpoint(frontier));
+    relations.insert(RelationProjectionRow::checkpoint(objects.frontier));
 
     let mut search = exact_rows.into_values().collect::<BTreeSet<_>>();
     let mut receipts_by_observation = BTreeMap::new();
     for (receipt, _) in receipts.values() {
         receipts_by_observation
             .entry(receipt.source_observation_id)
-            .or_insert(receipt.as_ref());
+            .or_insert(receipt);
     }
     for (observation_id, (surface, seq)) in surfaces {
         let receipt = receipts_by_observation
             .get(&observation_id)
             .ok_or(StoreError::StoreCorrupt)?;
-        search.insert(surface_row(surface.as_ref(), receipt, seq)?);
+        search.insert(surface_row(&surface, receipt, seq)?);
     }
-    search.insert(SearchProjectionRow::checkpoint(frontier));
+    search.insert(SearchProjectionRow::checkpoint(objects.frontier));
     Ok(L0002ProjectionSnapshot {
-        frontier,
+        frontier: objects.frontier,
         relations: relations.into_iter().collect(),
         search: search.into_iter().collect(),
     })

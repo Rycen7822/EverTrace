@@ -143,10 +143,8 @@ content_hash, causation_id, correlation_id, effective_config_hash, algorithm_rev
 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)";
 
 const SELECT_OBJECT_ROWS: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows ORDER BY row_id";
-const SELECT_OBJECT_ROWS_WITHOUT_SOURCE_FACTS: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows WHERE object_kind IS NULL OR object_kind NOT IN ('source_receipt', 'source_observation', 'evidence_surface') ORDER BY row_id";
 const SELECT_OBJECT_CHECKPOINT: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows WHERE row_id = ?1";
 const SELECT_BATCH_OBJECT_ROWS: &str = "SELECT o.row_id, o.row_kind, o.row_class, o.object_family, o.object_kind, o.object_id, o.current_revision_id, o.lifecycle, o.epistemic, o.authority, o.publication_state, o.support_state, o.project_id, o.repository_id, o.worktree_id, o.task_id, o.workstream_id, o.session_id, o.payload_json, o.source_event_seq, o.projection_generation FROM object_rows o JOIN projection_batch_ids b ON o.row_id = b.row_id";
-const SELECT_BATCH_OBJECT_ROWS_WITHOUT_SOURCE_FACTS: &str = "SELECT o.row_id, o.row_kind, o.row_class, o.object_family, o.object_kind, o.object_id, o.current_revision_id, o.lifecycle, o.epistemic, o.authority, o.publication_state, o.support_state, o.project_id, o.repository_id, o.worktree_id, o.task_id, o.workstream_id, o.session_id, o.payload_json, o.source_event_seq, o.projection_generation FROM object_rows o JOIN projection_batch_ids b ON o.row_id = b.row_id WHERE o.object_kind IS NULL OR o.object_kind NOT IN ('source_receipt', 'source_observation', 'evidence_surface')";
 const DELETE_ALL_REMOVED_OBJECTS: &str =
     "DELETE FROM object_rows WHERE row_id NOT IN (SELECT row_id FROM projection_batch_ids)";
 const DELETE_FAMILY_REMOVED_OBJECTS: &str = "DELETE FROM object_rows WHERE object_kind = ?1 AND row_id NOT IN (SELECT row_id FROM projection_batch_ids)";
@@ -812,10 +810,6 @@ impl SqliteState {
         self.with_connection(read_object_rows)
     }
 
-    pub(crate) fn object_rows_without_source_facts(&self) -> Result<Vec<ObjectRow>, StoreError> {
-        self.with_connection(read_object_rows_without_source_facts)
-    }
-
     #[cfg(test)]
     pub(crate) fn object_checkpoint(&self) -> (u64, u64) {
         (self.object_checkpoint, self.object_generation)
@@ -945,26 +939,6 @@ impl SqliteState {
         reconcile: ObjectReconcile,
         checkpoint: &ObjectRow,
     ) -> Result<(), StoreError> {
-        self.commit_object_rows_inner(batch, reconcile, checkpoint, None)
-    }
-
-    pub(crate) fn commit_object_rows_with_source_prefix(
-        &mut self,
-        batch: &[ObjectRow],
-        reconcile: ObjectReconcile,
-        checkpoint: &ObjectRow,
-        source_prefix_checkpoint: u64,
-    ) -> Result<(), StoreError> {
-        self.commit_object_rows_inner(batch, reconcile, checkpoint, Some(source_prefix_checkpoint))
-    }
-
-    fn commit_object_rows_inner(
-        &mut self,
-        batch: &[ObjectRow],
-        reconcile: ObjectReconcile,
-        checkpoint: &ObjectRow,
-        source_prefix_checkpoint: Option<u64>,
-    ) -> Result<(), StoreError> {
         self.ensure_usable()?;
         self.revalidate()?;
         self.observe()?;
@@ -997,11 +971,7 @@ impl SqliteState {
             }
             let existing = {
                 let mut statement = connection
-                    .prepare(if source_prefix_checkpoint.is_some() {
-                        SELECT_BATCH_OBJECT_ROWS_WITHOUT_SOURCE_FACTS
-                    } else {
-                        SELECT_BATCH_OBJECT_ROWS
-                    })
+                    .prepare(SELECT_BATCH_OBJECT_ROWS)
                     .map_err(|_| StoreError::StoreCorrupt)?;
                 let mut queried = statement.query([]).map_err(|_| StoreError::StoreCorrupt)?;
                 let mut rows = Vec::new();
@@ -1016,15 +986,6 @@ impl SqliteState {
                 .collect::<std::collections::BTreeMap<_, _>>();
             let mut changed = Vec::new();
             for row in batch {
-                if source_prefix_checkpoint.is_some_and(|frontier| {
-                    row.source_event_seq <= frontier
-                        && matches!(
-                            row.object_kind.as_deref(),
-                            Some("source_receipt" | "source_observation" | "evidence_surface")
-                        )
-                }) {
-                    continue;
-                }
                 if existing_by_id.get(row.row_id.as_str()).copied() != Some(row) {
                     changed.push(row);
                 }
@@ -1632,21 +1593,8 @@ pub(crate) fn read_all_rows(connection: &Connection) -> Result<Vec<JournalRow>, 
 }
 
 fn read_object_rows(connection: &Connection) -> Result<Vec<ObjectRow>, StoreError> {
-    read_object_rows_query(connection, SELECT_OBJECT_ROWS)
-}
-
-fn read_object_rows_without_source_facts(
-    connection: &Connection,
-) -> Result<Vec<ObjectRow>, StoreError> {
-    read_object_rows_query(connection, SELECT_OBJECT_ROWS_WITHOUT_SOURCE_FACTS)
-}
-
-fn read_object_rows_query(
-    connection: &Connection,
-    query: &str,
-) -> Result<Vec<ObjectRow>, StoreError> {
     let mut statement = connection
-        .prepare(query)
+        .prepare(SELECT_OBJECT_ROWS)
         .map_err(|_| StoreError::StoreCorrupt)?;
     let mut queried = statement.query([]).map_err(|_| StoreError::StoreCorrupt)?;
     let mut rows = Vec::new();
@@ -1755,14 +1703,6 @@ fn object_row_from_sql(row: &Row<'_>) -> Result<ObjectRow, StoreError> {
     let row_kind: String = sql_value(row, 1)?;
     let row_class: Option<String> = sql_value(row, 2)?;
     let object_family: Option<String> = sql_value(row, 3)?;
-    let object_kind = optional_text(row, 4)?;
-    #[cfg(test)]
-    if matches!(
-        object_kind.as_deref(),
-        Some("source_receipt" | "source_observation" | "evidence_surface")
-    ) {
-        SOURCE_CURRENT_ROW_DECODES.with(|count| count.set(count.get() + 1));
-    }
     Ok(ObjectRow {
         row_id,
         row_kind: ObjectRowKind::parse(&row_kind)?,
@@ -1774,7 +1714,7 @@ fn object_row_from_sql(row: &Row<'_>) -> Result<ObjectRow, StoreError> {
             .as_deref()
             .map(ObjectFamily::parse)
             .transpose()?,
-        object_kind,
+        object_kind: optional_text(row, 4)?,
         object_id: optional_text(row, 5)?,
         current_revision_id: optional_text(row, 6)?,
         lifecycle: optional_text(row, 7)?,
@@ -1792,21 +1732,6 @@ fn object_row_from_sql(row: &Row<'_>) -> Result<ObjectRow, StoreError> {
         source_event_seq: seq_from_blob(&sql_value::<Vec<u8>>(row, 19)?)?,
         projection_generation: seq_from_blob(&sql_value::<Vec<u8>>(row, 20)?)?,
     })
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static SOURCE_CURRENT_ROW_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_source_current_row_decodes() {
-    SOURCE_CURRENT_ROW_DECODES.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn source_current_row_decodes() -> usize {
-    SOURCE_CURRENT_ROW_DECODES.with(std::cell::Cell::get)
 }
 
 fn relation_row_from_sql(row: &Row<'_>) -> Result<RelationProjectionRow, StoreError> {

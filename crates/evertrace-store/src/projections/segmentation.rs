@@ -568,7 +568,7 @@ pub(super) fn validate_episode_relations(
     operation_bursts: &BTreeMap<OperationBurstId, (OperationBurst, u64)>,
     operation_revisions: &BTreeMap<(OperationId, u32), (Operation, u64)>,
     host_occurrences: &BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
-    source_observations: &super::SourceObservationFacts<'_>,
+    source_observations: &BTreeMap<SourceObservationId, (SourceObservation, u64)>,
     scope_effects: &BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
     lanes: &BTreeMap<ExecutionLaneId, (ExecutionLane, u64)>,
     receipt_revisions: &BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,

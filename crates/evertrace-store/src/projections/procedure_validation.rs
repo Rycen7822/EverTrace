@@ -2,7 +2,7 @@ use super::procedure::NegativeReviewActionReason;
 use super::*;
 
 /// Borrow only the state consumed by Procedure history and relation validation.
-struct ProcedureRelationInputs<'a, 'facts> {
+struct ProcedureRelationInputs<'a> {
     procedure: &'a procedure::ProcedureState,
     work_bindings: &'a BTreeMap<WorkBindingRevisionId, (WorkBindingRevision, u64)>,
     attempt_revisions: &'a BTreeMap<RevisionId, (Attempt, u64)>,
@@ -12,13 +12,13 @@ struct ProcedureRelationInputs<'a, 'facts> {
     experiment_run_revisions: &'a BTreeMap<RevisionId, (ExperimentRun, u64)>,
     result_evidence_revisions: &'a BTreeMap<RevisionId, (ResultEvidence, u64)>,
     scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
-    source_observations: &'a SourceObservationFacts<'facts>,
-    source_receipts: &'a SourceReceiptFacts<'facts>,
+    source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
     tasks: &'a BTreeMap<TaskId, (Task, u64)>,
 }
 
-impl<'a, 'facts> From<&'a JournalAdmissionState<'facts>> for ProcedureRelationInputs<'a, 'facts> {
-    fn from(state: &'a JournalAdmissionState<'facts>) -> Self {
+impl<'a> From<&'a JournalAdmissionState> for ProcedureRelationInputs<'a> {
+    fn from(state: &'a JournalAdmissionState) -> Self {
         Self {
             procedure: &state.procedure,
             work_bindings: &state.work_bindings,
@@ -36,8 +36,8 @@ impl<'a, 'facts> From<&'a JournalAdmissionState<'facts>> for ProcedureRelationIn
     }
 }
 
-impl<'a, 'facts> From<&'a ReducerState<'facts>> for ProcedureRelationInputs<'a, 'facts> {
-    fn from(state: &'a ReducerState<'facts>) -> Self {
+impl<'a> From<&'a ReducerState> for ProcedureRelationInputs<'a> {
+    fn from(state: &'a ReducerState) -> Self {
         Self {
             procedure: &state.procedure,
             work_bindings: &state.work_bindings,
@@ -55,7 +55,7 @@ impl<'a, 'facts> From<&'a ReducerState<'facts>> for ProcedureRelationInputs<'a, 
     }
 }
 
-impl ReducerState<'_> {
+impl ReducerState {
     pub(super) fn validate_procedure_relations(&self) -> Result<(), StoreError> {
         ProcedureRelationInputs::from(self).validate_procedure_relations()
     }
@@ -121,7 +121,7 @@ struct ProcedureHistoryIndex<'a> {
 }
 
 impl<'a> ProcedureHistoryIndex<'a> {
-    fn new(state: &ProcedureRelationInputs<'a, '_>) -> Result<Self, StoreError> {
+    fn new(state: &ProcedureRelationInputs<'a>) -> Result<Self, StoreError> {
         current_binding_lineage(state.work_bindings.values().map(|(value, _)| value))?;
         let mut index = Self {
             bindings: BTreeMap::new(),
@@ -310,7 +310,7 @@ impl<'a> ProcedureHistoryIndex<'a> {
     }
 }
 
-impl JournalAdmissionState<'_> {
+impl JournalAdmissionState {
     pub(super) fn validate_procedure_relations(&self) -> Result<(), StoreError> {
         ProcedureRelationInputs::from(self).validate_procedure_relations()
     }
@@ -495,7 +495,7 @@ impl JournalAdmissionState<'_> {
     }
 }
 
-impl ProcedureRelationInputs<'_, '_> {
+impl ProcedureRelationInputs<'_> {
     fn validate_procedure_physical_usage(
         &self,
         usage: &evertrace_domain::procedure::ProcedureUsageRevision,
