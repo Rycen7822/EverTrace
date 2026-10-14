@@ -14780,18 +14780,6 @@ pub struct ProjectionWorker {
     sqlite: SqliteHandle,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    // The handoff tests use current-thread Tokio runtimes. Keep their
-    // synchronous read probes isolated from concurrently running tests.
-    static CATCH_UP_OBJECT_ROWS_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn catch_up_object_rows_reads() -> u64 {
-    CATCH_UP_OBJECT_ROWS_READS.get()
-}
-
 /// The objects result of one closed capture successor that committed only this
 /// command's changed rows instead of rematerializing every unchanged row. It
 /// is explicitly not a complete `ProjectionSnapshot`.
@@ -14813,27 +14801,16 @@ impl ProjectionWorker {
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(false, None, None, None).await?.0)
+        Ok(self.catch_up_inner(false, None, None).await?.0)
     }
 
-    #[cfg(test)]
     pub(crate) async fn catch_up_validated(
         &self,
         // Old objects epoch/checkpoint and the confirmed committed journal frontier.
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_validated_with_handoff(validated_current, appended_rows, None)
-            .await
-    }
-
-    pub(crate) async fn catch_up_validated_with_handoff(
-        &self,
-        validated_current: Option<(u64, u64, u64)>,
-        appended_rows: Option<&[JournalRow]>,
-        previous: Option<crate::writer::SealedProjectionSnapshot>,
-    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_rows, previous)
+        self.catch_up_inner(false, validated_current, appended_rows)
             .await
     }
 
@@ -14965,24 +14942,11 @@ impl ProjectionWorker {
         inject_before_commit_failure: bool,
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
-        previous: Option<crate::writer::SealedProjectionSnapshot>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
         let (current, journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
             let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             let stamp = state.stamp()?;
-            let rows = match previous {
-                Some(previous)
-                    if validated_current.is_some() && previous.matches_current(&stamp) =>
-                {
-                    previous.into_snapshot().rows
-                }
-                previous => {
-                    drop(previous);
-                    #[cfg(test)]
-                    CATCH_UP_OBJECT_ROWS_READS.set(CATCH_UP_OBJECT_ROWS_READS.get() + 1);
-                    state.object_rows()?
-                }
-            };
+            let rows = state.object_rows()?;
             (
                 rows,
                 stamp.journal_epoch,
@@ -15202,7 +15166,7 @@ impl ProjectionWorker {
 
     #[cfg(test)]
     async fn catch_up_with_commit_fault(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(true, None, None, None).await?.0)
+        Ok(self.catch_up_inner(true, None, None).await?.0)
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {

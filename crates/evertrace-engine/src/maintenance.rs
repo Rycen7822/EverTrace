@@ -1841,25 +1841,13 @@ impl BackgroundScheduler {
         // Capture-backlog selection consumes current objects; ingest owns its
         // acknowledgement barrier and executable projection jobs sync below.
         let mut snapshot = if capture_state == CaptureAdmissionState::Normal && ordinary_pending {
-            self.writer
-                .project_with_handoff(false, None)
-                .await
-                .map_err(map_writer)?
+            self.writer.project_objects().await.map_err(map_writer)?
         } else {
-            self.writer
-                .project_with_handoff(true, None)
-                .await
-                .map_err(map_writer)?
+            self.writer.project().await.map_err(map_writer)?
         };
         if optional_allowed && let Some(inventory) = &self.inventory {
             match inventory.enqueue_observed(&snapshot).await {
-                Ok(true) => {
-                    snapshot = self
-                        .writer
-                        .project_with_handoff(true, Some(snapshot))
-                        .await
-                        .map_err(map_writer)?
-                }
+                Ok(true) => snapshot = self.writer.project().await.map_err(map_writer)?,
                 Ok(false) => {}
                 Err(crate::jobs::InventoryWorkerError::StaleFrontier) => retryable = true,
                 Err(crate::jobs::InventoryWorkerError::Store) => {
@@ -1901,11 +1889,7 @@ impl BackgroundScheduler {
             {
                 Ok(outcome) => {
                     completed += usize::from(!outcome.replayed);
-                    snapshot = self
-                        .writer
-                        .project_with_handoff(true, Some(snapshot))
-                        .await
-                        .map_err(map_writer)?;
+                    snapshot = self.writer.project().await.map_err(map_writer)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
                     return Ok(RunOnceOutcome {
@@ -1923,11 +1907,7 @@ impl BackgroundScheduler {
         let mut view = RuntimeSchedulerView::from_snapshot(&snapshot)
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if self.seed_capture_artifacts(&snapshot, &view).await? {
-            snapshot = self
-                .writer
-                .project_with_handoff(true, Some(snapshot))
-                .await
-                .map_err(map_writer)?;
+            snapshot = self.writer.project().await.map_err(map_writer)?;
             view = RuntimeSchedulerView::from_snapshot(&snapshot)
                 .map_err(|_| BackgroundSchedulerError::Store)?;
         }
@@ -2015,11 +1995,7 @@ impl BackgroundScheduler {
             {
                 Ok(outcome) => {
                     completed += usize::from(!outcome.replayed);
-                    snapshot = self
-                        .writer
-                        .project_with_handoff(true, Some(snapshot))
-                        .await
-                        .map_err(map_writer)?;
+                    snapshot = self.writer.project().await.map_err(map_writer)?;
                     view = RuntimeSchedulerView::from_snapshot(&snapshot)
                         .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
@@ -2037,11 +2013,7 @@ impl BackgroundScheduler {
         }
         if optional_allowed {
             if self.enqueue_procedure_consumers(&snapshot, &view).await? {
-                snapshot = self
-                    .writer
-                    .project_with_handoff(true, Some(snapshot))
-                    .await
-                    .map_err(map_writer)?;
+                snapshot = self.writer.project().await.map_err(map_writer)?;
                 view = RuntimeSchedulerView::from_snapshot(&snapshot)
                     .map_err(|_| BackgroundSchedulerError::Store)?;
             }
@@ -2106,11 +2078,7 @@ impl BackgroundScheduler {
                     .await
                 {
                     Ok(_) => {
-                        snapshot = self
-                            .writer
-                            .project_with_handoff(true, Some(snapshot))
-                            .await
-                            .map_err(map_writer)?;
+                        snapshot = self.writer.project().await.map_err(map_writer)?;
                         view = RuntimeSchedulerView::from_snapshot(&snapshot)
                             .map_err(|_| BackgroundSchedulerError::Store)?;
                     }
@@ -2203,11 +2171,7 @@ impl BackgroundScheduler {
                 .await
             {
                 Ok(_) => {
-                    snapshot = self
-                        .writer
-                        .project_with_handoff(true, Some(snapshot))
-                        .await
-                        .map_err(map_writer)?;
+                    snapshot = self.writer.project().await.map_err(map_writer)?;
                     view = RuntimeSchedulerView::from_snapshot(&snapshot)
                         .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
@@ -2482,11 +2446,7 @@ impl BackgroundScheduler {
                 .await
             {
                 Ok(_) => {
-                    snapshot = self
-                        .writer
-                        .project_with_handoff(true, Some(snapshot))
-                        .await
-                        .map_err(map_writer)?;
+                    snapshot = self.writer.project().await.map_err(map_writer)?;
                     view = RuntimeSchedulerView::from_snapshot(&snapshot)
                         .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
@@ -2613,11 +2573,7 @@ impl BackgroundScheduler {
                 .await
             {
                 Ok(_) => {
-                    snapshot = self
-                        .writer
-                        .project_with_handoff(true, Some(snapshot))
-                        .await
-                        .map_err(map_writer)?;
+                    snapshot = self.writer.project().await.map_err(map_writer)?;
                     view = RuntimeSchedulerView::from_snapshot(&snapshot)
                         .map_err(|_| BackgroundSchedulerError::Store)?;
                     idle.refresh(&snapshot, &view)?;

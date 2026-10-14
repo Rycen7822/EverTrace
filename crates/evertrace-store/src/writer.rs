@@ -516,44 +516,6 @@ impl ProjectionValidation {
     }
 }
 
-/// A complete object snapshot returned by this writer, sealed to the physical
-/// SQLite state that produced it. Callers may move it back as an old input,
-/// but cannot mutate or reseal its rows.
-pub struct SealedProjectionSnapshot {
-    snapshot: ProjectionSnapshot,
-    stamp: SqliteStamp,
-}
-
-impl SealedProjectionSnapshot {
-    fn new(snapshot: ProjectionSnapshot, stamp: SqliteStamp) -> Result<Self, StoreError> {
-        if snapshot.frontier != stamp.object_checkpoint {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Ok(Self { snapshot, stamp })
-    }
-
-    pub fn into_snapshot(self) -> ProjectionSnapshot {
-        self.snapshot
-    }
-
-    pub(crate) fn matches_current(&self, current: &SqliteStamp) -> bool {
-        self.stamp.incarnation == current.incarnation
-            && self.stamp.data_version == current.data_version
-            && self.stamp.objects_epoch == current.objects_epoch
-            && self.stamp.object_checkpoint == current.object_checkpoint
-            && self.stamp.object_generation == current.object_generation
-            && self.snapshot.frontier == current.object_checkpoint
-    }
-}
-
-impl std::ops::Deref for SealedProjectionSnapshot {
-    type Target = ProjectionSnapshot;
-
-    fn deref(&self) -> &Self::Target {
-        &self.snapshot
-    }
-}
-
 pub struct JournalWriter {
     sqlite: SqliteHandle,
     search: Table,
@@ -1230,24 +1192,6 @@ impl JournalWriter {
             .ok_or(StoreError::StoreCorrupt)
     }
 
-    /// Return a complete snapshot sealed to its physical SQLite input. The
-    /// optional previous snapshot is eligible only for the ordinary validated
-    /// append path; every other path releases it before reading current rows.
-    pub async fn project_with_handoff(
-        &self,
-        indexes: bool,
-        previous: Option<SealedProjectionSnapshot>,
-    ) -> Result<SealedProjectionSnapshot, StoreError> {
-        let (frontier, snapshot, stamp) = self
-            .project_validated_inner(indexes, true, previous)
-            .await?;
-        let snapshot = snapshot.ok_or(StoreError::StoreCorrupt)?;
-        if frontier != snapshot.frontier {
-            return Err(StoreError::StoreCorrupt);
-        }
-        SealedProjectionSnapshot::new(snapshot, stamp)
-    }
-
     /// Synchronize objects without returning their rows to the caller.
     pub async fn sync_objects_frontier(&self) -> Result<u64, StoreError> {
         Ok(self.project_validated(false, false).await?.0)
@@ -1501,18 +1445,6 @@ impl JournalWriter {
         indexes: bool,
         return_rows: bool,
     ) -> Result<(u64, Option<ProjectionSnapshot>), StoreError> {
-        let (frontier, snapshot, _) = self
-            .project_validated_inner(indexes, return_rows, None)
-            .await?;
-        Ok((frontier, snapshot))
-    }
-
-    async fn project_validated_inner(
-        &self,
-        indexes: bool,
-        return_rows: bool,
-        previous: Option<SealedProjectionSnapshot>,
-    ) -> Result<(u64, Option<ProjectionSnapshot>, SqliteStamp), StoreError> {
         let result = async {
             self.validate_projection_directories(indexes)?;
             let before = self.physical_stamp()?;
@@ -1542,12 +1474,6 @@ impl JournalWriter {
                     before.frontier,
                 )
             });
-            let handoff_current = if validated_input.is_some() {
-                previous
-            } else {
-                drop(previous);
-                None
-            };
             let capture_input = validated_input.filter(|stamp| {
                 indexes && !return_rows && stamp.capture_successor_bound(&before, before_search)
             });
@@ -1558,7 +1484,6 @@ impl JournalWriter {
             let hit = if indexes { all } else { objects };
             let (frontier, snapshot, has_failed_job, search_version, content_proven) =
                 if let Some(stamp) = hit {
-                    drop(handoff_current);
                     let snapshot = if return_rows {
                         Some(ProjectionSnapshot {
                             frontier: stamp.frontier,
@@ -1594,7 +1519,6 @@ impl JournalWriter {
                         None => None,
                     };
                     if let Some(update) = capture_update {
-                        drop(handoff_current);
                         let objects_stamp = self.physical_stamp()?;
                         if objects_stamp.objects_epoch != update.objects_epoch
                             || objects_stamp.incarnation != before.incarnation
@@ -1636,7 +1560,6 @@ impl JournalWriter {
                         (update.frontier, None, has_failed_job, search_version, true)
                     } else {
                         let (snapshot, objects_epoch, delta) = if let Some(stamp) = objects {
-                            drop(handoff_current);
                             (
                                 ProjectionSnapshot {
                                     frontier: stamp.frontier,
@@ -1650,11 +1573,7 @@ impl JournalWriter {
                                 validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
                             let worker = self.projection_worker();
                             worker
-                                .catch_up_validated_with_handoff(
-                                    validated_current,
-                                    appended,
-                                    handoff_current,
-                                )
+                                .catch_up_validated(validated_current, appended)
                                 .await?
                         };
                         let objects_stamp = self.physical_stamp()?;
@@ -1739,7 +1658,7 @@ impl JournalWriter {
                     stamps[1] = None;
                 }
             }
-            Ok((frontier, snapshot, after))
+            Ok((frontier, snapshot))
         }
         .await;
         if result.is_err() {
@@ -3528,126 +3447,6 @@ mod tests {
             assert!(stamp.appended_through.is_none());
             assert!(stamp.appended_rows.is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn returned_projection_handoff_reuses_current_for_multiple_appends() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut writer = JournalWriter::open(&temp.path().join("store"))
-            .await
-            .unwrap();
-        let previous = writer.project_with_handoff(true, None).await.unwrap();
-        let first = JournalCommand::new(
-            CommandId::new_v7(),
-            vec![JournalEventDraft::runtime(
-                2,
-                [1; 32],
-                "objects-v1",
-                JournalPayload::DirtyTarget(DirtyTarget {
-                    target_kind: DirtyTargetKind::ObjectsProjection,
-                    target_id: "handoff-left".into(),
-                    algorithm_revision: "objects-v1".into(),
-                    source_watermark: previous.frontier,
-                }),
-            )],
-        )
-        .unwrap();
-        let first = writer.commit(&first, 2).await.unwrap();
-        let second = JournalCommand::new(
-            CommandId::new_v7(),
-            vec![JournalEventDraft::runtime(
-                3,
-                [1; 32],
-                "objects-v1",
-                JournalPayload::DirtyTarget(DirtyTarget {
-                    target_kind: DirtyTargetKind::ObjectsProjection,
-                    target_id: "handoff-right".into(),
-                    algorithm_revision: "objects-v1".into(),
-                    source_watermark: first.last_seq,
-                }),
-            )],
-        )
-        .unwrap();
-        let appended = writer.commit(&second, 3).await.unwrap();
-        assert!(
-            writer.projection_validation.lock().unwrap()[0]
-                .as_ref()
-                .unwrap()
-                .appended_rows
-                .is_none()
-        );
-
-        let reads_before = crate::projections::catch_up_object_rows_reads();
-        let updated = writer
-            .project_with_handoff(true, Some(previous))
-            .await
-            .unwrap();
-        assert_eq!(
-            crate::projections::catch_up_object_rows_reads(),
-            reads_before
-        );
-        assert_eq!(updated.frontier, appended.last_seq);
-        assert_eq!(&*updated, &writer.full_projection().await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn returned_projection_handoff_falls_back_on_physical_mismatch() {
-        let foreign_temp = tempfile::tempdir().unwrap();
-        let foreign_writer = JournalWriter::open(&foreign_temp.path().join("store"))
-            .await
-            .unwrap();
-        let foreign = foreign_writer
-            .project_with_handoff(true, None)
-            .await
-            .unwrap();
-
-        let temp = tempfile::tempdir().unwrap();
-        let mut writer = JournalWriter::open(&temp.path().join("store"))
-            .await
-            .unwrap();
-        let first = JournalCommand::new(
-            CommandId::new_v7(),
-            vec![JournalEventDraft::runtime(
-                1,
-                [1; 32],
-                "objects-v1",
-                JournalPayload::DirtyTarget(DirtyTarget {
-                    target_kind: DirtyTargetKind::ObjectsProjection,
-                    target_id: "physical-base".into(),
-                    algorithm_revision: "objects-v1".into(),
-                    source_watermark: 0,
-                }),
-            )],
-        )
-        .unwrap();
-        let first = writer.commit(&first, 1).await.unwrap();
-        drop(writer.project_with_handoff(true, None).await.unwrap());
-
-        let second = JournalCommand::new(
-            CommandId::new_v7(),
-            vec![JournalEventDraft::runtime(
-                2,
-                [1; 32],
-                "objects-v1",
-                JournalPayload::DirtyTarget(DirtyTarget {
-                    target_kind: DirtyTargetKind::ObjectsProjection,
-                    target_id: "physical-successor".into(),
-                    algorithm_revision: "objects-v1".into(),
-                    source_watermark: first.last_seq,
-                }),
-            )],
-        )
-        .unwrap();
-        let second = writer.commit(&second, 2).await.unwrap();
-
-        let reads_before = crate::projections::catch_up_object_rows_reads();
-        let updated = writer
-            .project_with_handoff(true, Some(foreign))
-            .await
-            .unwrap();
-        assert!(crate::projections::catch_up_object_rows_reads() > reads_before);
-        assert_eq!(updated.frontier, second.last_seq);
-        assert_eq!(&*updated, &writer.full_projection().await.unwrap());
     }
 
     #[tokio::test]
