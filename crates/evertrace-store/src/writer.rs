@@ -281,7 +281,7 @@ fn normal_search_linked_references(
 }
 
 fn normal_search_expand_dependencies(
-    state: &crate::projections::JournalAdmissionState<'_>,
+    state: &crate::projections::JournalAdmissionState,
     rows: &mut Vec<ObjectRow>,
     candidate: Option<&NormalSearchCandidateRequest>,
 ) -> Result<(), StoreError> {
@@ -526,7 +526,7 @@ pub struct JournalWriter {
     connection: Connection,
     readers: StoreReadHandle,
     next_seq: u64,
-    admission_state: JournalAdmissionState<'static>,
+    admission_state: JournalAdmissionState,
     migration_outcome: MigrationOutcome,
     // Keep the search table directory inode alive so replacement cannot reuse
     // its identity. The SQLite side revalidates its own file/directory.
@@ -1396,7 +1396,7 @@ impl JournalWriter {
     async fn validated_current_read<T>(
         &self,
         read: impl FnOnce(
-            &crate::projections::JournalAdmissionState<'_>,
+            &crate::projections::JournalAdmissionState,
             &ProjectionValidation,
         ) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {

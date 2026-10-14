@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
@@ -1683,8 +1682,8 @@ fn current_payload(row: &ObjectRow) -> Result<NamedCurrentDependency, StoreError
 }
 
 fn validate_source_local_relations(
-    observations: &SourceObservationFacts<'_>,
-    receipts: &SourceReceiptFacts<'_>,
+    observations: &SourceObservationFacts,
+    receipts: &SourceReceiptFacts,
     occurrences: &BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     operations: &BTreeMap<OperationId, (Operation, u64)>,
 ) -> Result<(), StoreError> {
@@ -2226,15 +2225,13 @@ fn json_field_fragment<T: serde::Serialize + ?Sized>(
     ))
 }
 
-pub(crate) type SourceReceiptFacts<'facts> =
-    BTreeMap<SourceReceiptId, (Cow<'facts, SourceReceipt>, u64)>;
-pub(crate) type SourceObservationFacts<'facts> =
-    BTreeMap<SourceObservationId, (Cow<'facts, SourceObservation>, u64)>;
-pub(crate) type EvidenceSurfaceFacts<'facts> =
-    BTreeMap<SourceObservationId, (Cow<'facts, EvidenceSurface>, u64)>;
+pub(crate) type SourceReceiptFacts = BTreeMap<SourceReceiptId, (Arc<SourceReceipt>, u64)>;
+pub(crate) type SourceObservationFacts =
+    BTreeMap<SourceObservationId, (Arc<SourceObservation>, u64)>;
+pub(crate) type EvidenceSurfaceFacts = BTreeMap<SourceObservationId, (Arc<EvidenceSurface>, u64)>;
 
 #[derive(Clone, Default)]
-struct ReducerState<'facts> {
+struct ReducerState {
     inventory: inventory::InventoryState,
     session_imports: BTreeMap<String, crate::session_import::SessionImportCurrent>,
     migrations: BTreeMap<String, (JournalPayload, u64)>,
@@ -2246,10 +2243,10 @@ struct ReducerState<'facts> {
     config_attempt: Option<(JournalPayload, u64)>,
     stale_audits: BTreeMap<String, (JournalPayload, u64)>,
     source_revisions: BTreeMap<String, (SourceRevisionRecorded, u64)>,
-    source_receipts: SourceReceiptFacts<'facts>,
-    source_observations: SourceObservationFacts<'facts>,
+    source_receipts: SourceReceiptFacts,
+    source_observations: SourceObservationFacts,
     source_watermarks: BTreeMap<String, (SourceIngestWatermark, u64)>,
-    evidence_surfaces: EvidenceSurfaceFacts<'facts>,
+    evidence_surfaces: EvidenceSurfaceFacts,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
@@ -2362,7 +2359,7 @@ impl KnownSourceRange {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct JournalAdmissionState<'facts> {
+pub(crate) struct JournalAdmissionState {
     inventory: inventory::InventoryState,
     repository_closures: BTreeMap<RepositoryId, RepositoryClosureKeys>,
     session_imports: BTreeMap<String, crate::session_import::SessionImportCurrent>,
@@ -2373,9 +2370,9 @@ pub(crate) struct JournalAdmissionState<'facts> {
     // Live command admission clones the state before append. Capture commands
     // still detach these maps at their existing mutation points, while small
     // unrelated commands keep their verified source state shared.
-    source_observations: Arc<SourceObservationFacts<'facts>>,
-    source_receipts: Arc<SourceReceiptFacts<'facts>>,
-    evidence_surfaces: Arc<EvidenceSurfaceFacts<'facts>>,
+    source_observations: Arc<SourceObservationFacts>,
+    source_receipts: Arc<SourceReceiptFacts>,
+    evidence_surfaces: Arc<EvidenceSurfaceFacts>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
@@ -2438,9 +2435,9 @@ pub(crate) struct JournalAdmissionState<'facts> {
 }
 
 pub(crate) struct SourceFactsRef<'facts> {
-    source_receipts: &'facts SourceReceiptFacts<'static>,
-    source_observations: &'facts SourceObservationFacts<'static>,
-    evidence_surfaces: &'facts EvidenceSurfaceFacts<'static>,
+    source_receipts: &'facts SourceReceiptFacts,
+    source_observations: &'facts SourceObservationFacts,
+    evidence_surfaces: &'facts EvidenceSurfaceFacts,
 }
 
 /// A bounded current read, not a complete projection or a reusable reader.
@@ -3165,10 +3162,10 @@ fn core_membership_deletion_refs(
         .collect()
 }
 
-struct ObjectDeletionPreviewInputs<'a, 'facts> {
-    source_observations: &'a SourceObservationFacts<'facts>,
-    source_receipts: &'a SourceReceiptFacts<'facts>,
-    evidence_surfaces: &'a EvidenceSurfaceFacts<'facts>,
+struct ObjectDeletionPreviewInputs<'a> {
+    source_observations: &'a SourceObservationFacts,
+    source_receipts: &'a SourceReceiptFacts,
+    evidence_surfaces: &'a EvidenceSurfaceFacts,
     host_occurrences: &'a BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     operations: &'a BTreeMap<OperationId, (Operation, u64)>,
     scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
@@ -3198,7 +3195,7 @@ struct ObjectDeletionPreviewInputs<'a, 'facts> {
     deletions: &'a ObjectDeletionState,
 }
 
-struct RepositoryScopePreviewInputs<'a, 'facts> {
+struct RepositoryScopePreviewInputs<'a> {
     inventory: &'a inventory::InventoryState,
     session_imports: &'a BTreeMap<String, crate::session_import::SessionImportCurrent>,
     jobs: Vec<&'a DurableJob>,
@@ -3209,8 +3206,8 @@ struct RepositoryScopePreviewInputs<'a, 'facts> {
     repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
     worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
     worktree_snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
-    source_receipts: &'a SourceReceiptFacts<'facts>,
-    evidence_surfaces: &'a EvidenceSurfaceFacts<'facts>,
+    source_receipts: &'a SourceReceiptFacts,
+    evidence_surfaces: &'a EvidenceSurfaceFacts,
     capture_receipt_revisions:
         &'a BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
     atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
@@ -3466,11 +3463,11 @@ impl ObjectDeletionCandidateAdmissionView {
 }
 
 #[derive(Clone, Copy)]
-enum CandidateSourceLookup<'a, 'facts> {
+enum CandidateSourceLookup<'a> {
     Current {
-        observations: &'a SourceObservationFacts<'facts>,
-        receipts: &'a SourceReceiptFacts<'facts>,
-        surfaces: &'a EvidenceSurfaceFacts<'facts>,
+        observations: &'a SourceObservationFacts,
+        receipts: &'a SourceReceiptFacts,
+        surfaces: &'a EvidenceSurfaceFacts,
     },
     Compact {
         observation_receipts: &'a BTreeMap<SourceObservationId, SourceReceiptId>,
@@ -3493,7 +3490,7 @@ fn source_suppressed<'a>(
     })
 }
 
-impl CandidateSourceLookup<'_, '_> {
+impl CandidateSourceLookup<'_> {
     fn observation_for_ref(self, reference: &str) -> Option<SourceObservationId> {
         let direct_observation =
             reference
@@ -3701,7 +3698,7 @@ fn accepted_root_create_matches_membership(
 fn classify_deletion_candidate<'a>(
     deletions: impl IntoIterator<Item = &'a ObjectDeletionLedgerEvent>,
     candidate: &ObjectDeletionCandidate,
-    source: CandidateSourceLookup<'_, '_>,
+    source: CandidateSourceLookup<'_>,
 ) -> Result<ObjectDeletionCandidateAdmission, StoreError> {
     let stable_refs = candidate_suppression_refs(&candidate.source_derivation_refs, source)?;
     let mut family_deletions = deletions
@@ -3762,7 +3759,7 @@ fn classify_deletion_candidate<'a>(
 
 fn candidate_suppression_refs(
     source_refs: &[String],
-    source: CandidateSourceLookup<'_, '_>,
+    source: CandidateSourceLookup<'_>,
 ) -> Result<Option<Vec<BTreeSet<String>>>, StoreError> {
     if source_refs.is_empty() {
         return Ok(None);
@@ -3784,8 +3781,8 @@ fn candidate_suppression_refs(
     Ok(Some(hashes))
 }
 
-impl<'facts> ReducerState<'facts> {
-    fn object_deletion_inputs(&self) -> ObjectDeletionPreviewInputs<'_, 'facts> {
+impl ReducerState {
+    fn object_deletion_inputs(&self) -> ObjectDeletionPreviewInputs<'_> {
         ObjectDeletionPreviewInputs {
             source_observations: &self.source_observations,
             source_receipts: &self.source_receipts,
@@ -3820,7 +3817,7 @@ impl<'facts> ReducerState<'facts> {
         }
     }
 
-    fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_, 'facts> {
+    fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_> {
         RepositoryScopePreviewInputs {
             inventory: &self.inventory,
             session_imports: &self.session_imports,
@@ -3873,7 +3870,7 @@ fn normal_search_row_matches(row: &ObjectRow, references: &BTreeSet<String>) -> 
             .is_some_and(|value| references.contains(value))
 }
 
-impl<'facts> JournalAdmissionState<'facts> {
+impl JournalAdmissionState {
     pub(crate) fn committed_frontier(&self) -> u64 {
         self.frontier
     }
@@ -5912,7 +5909,7 @@ impl<'facts> JournalAdmissionState<'facts> {
         })
     }
 
-    fn object_deletion_inputs(&self) -> ObjectDeletionPreviewInputs<'_, '_> {
+    fn object_deletion_inputs(&self) -> ObjectDeletionPreviewInputs<'_> {
         ObjectDeletionPreviewInputs {
             source_observations: &self.source_observations,
             source_receipts: &self.source_receipts,
@@ -5947,7 +5944,7 @@ impl<'facts> JournalAdmissionState<'facts> {
         }
     }
 
-    fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_, '_> {
+    fn repository_scope_preview_inputs(&self) -> RepositoryScopePreviewInputs<'_> {
         RepositoryScopePreviewInputs {
             inventory: &self.inventory,
             session_imports: &self.session_imports,
@@ -5988,7 +5985,7 @@ impl<'facts> JournalAdmissionState<'facts> {
     }
 }
 
-impl JournalAdmissionState<'static> {
+impl JournalAdmissionState {
     pub(crate) fn source_facts(&self) -> SourceFactsRef<'_> {
         SourceFactsRef {
             source_receipts: &self.source_receipts,
@@ -6062,7 +6059,7 @@ impl SourceFactsRef<'_> {
 }
 
 fn derive_object_deletion_preview_from_inputs(
-    inputs: ObjectDeletionPreviewInputs<'_, '_>,
+    inputs: ObjectDeletionPreviewInputs<'_>,
     target: ObjectDeletionTarget,
 ) -> Result<crate::purge::ObjectDeletionPreview, StoreError> {
     if inputs.deletions.current(target).is_some() {
@@ -6196,7 +6193,7 @@ fn derive_object_deletion_preview_from_inputs(
 }
 
 fn derive_repository_scope_purge_preview(
-    inputs: RepositoryScopePreviewInputs<'_, '_>,
+    inputs: RepositoryScopePreviewInputs<'_>,
     repository_id: RepositoryId,
     expected_repository_revision: u32,
     existing_allowed: bool,
@@ -7112,7 +7109,7 @@ enum SemanticClosureEntity {
 
 #[allow(clippy::too_many_arguments)]
 fn extend_repository_semantic_closure(
-    inputs: &RepositoryScopePreviewInputs<'_, '_>,
+    inputs: &RepositoryScopePreviewInputs<'_>,
     observations: &BTreeSet<SourceObservationId>,
     receipts: &BTreeSet<SourceReceiptId>,
     atom_ids: &mut BTreeSet<AtomId>,
@@ -8147,7 +8144,7 @@ pub(crate) fn extend_recovery_bundle_cas_refs(
 }
 
 fn other_live_source_observations(
-    inputs: &ObjectDeletionPreviewInputs<'_, '_>,
+    inputs: &ObjectDeletionPreviewInputs<'_>,
     target: ObjectDeletionTarget,
     target_revisions: &BTreeSet<RevisionId>,
 ) -> BTreeSet<SourceObservationId> {
@@ -8406,8 +8403,8 @@ fn other_live_source_observations(
 
 fn add_source_reference(
     value: &str,
-    source_observations: &SourceObservationFacts<'_>,
-    source_receipts: &SourceReceiptFacts<'_>,
+    source_observations: &SourceObservationFacts,
+    source_receipts: &SourceReceiptFacts,
     refs: &mut BTreeSet<SourceObservationId>,
 ) {
     if let Ok(observation_id) = value.parse::<SourceObservationId>()
@@ -8421,7 +8418,7 @@ fn add_source_reference(
     }
 }
 
-impl<'facts> JournalAdmissionState<'facts> {
+impl JournalAdmissionState {
     fn synthesis_ref_set(&self) -> std::collections::BTreeSet<String> {
         let mut refs = std::collections::BTreeSet::new();
         macro_rules! extend_keys {
@@ -8657,7 +8654,7 @@ impl<'facts> JournalAdmissionState<'facts> {
         Ok(state)
     }
 
-    fn inventory_admission(&self) -> inventory::InventoryAdmission<'_, '_> {
+    fn inventory_admission(&self) -> inventory::InventoryAdmission<'_> {
         inventory::InventoryAdmission {
             inventory: &self.inventory,
             repositories: &self.repositories,
@@ -9976,7 +9973,7 @@ impl<'facts> JournalAdmissionState<'facts> {
             JournalPayload::SourceReceiptRecorded(value) => {
                 record_known_source(&mut self.source_ranges, &value)?;
                 if Arc::make_mut(&mut self.source_receipts)
-                    .insert(value.source_receipt_id, (Cow::Owned(*value), seq))
+                    .insert(value.source_receipt_id, (Arc::new(*value), seq))
                     .is_some()
                 {
                     return Err(StoreError::StoreCorrupt);
@@ -9987,7 +9984,7 @@ impl<'facts> JournalAdmissionState<'facts> {
             }
             JournalPayload::SourceObservationRecorded(value) => {
                 if Arc::make_mut(&mut self.source_observations)
-                    .insert(value.source_observation_id, (Cow::Owned(*value), seq))
+                    .insert(value.source_observation_id, (Arc::new(*value), seq))
                     .is_some()
                 {
                     return Err(StoreError::StoreCorrupt);
@@ -9997,7 +9994,7 @@ impl<'facts> JournalAdmissionState<'facts> {
                 if Arc::make_mut(&mut self.evidence_surfaces)
                     .insert(
                         value.source_observation_revision_ref,
-                        (Cow::Owned(*value), seq),
+                        (Arc::new(*value), seq),
                     )
                     .is_some()
                 {
@@ -10407,7 +10404,7 @@ pub(crate) fn proposal_targets_deleted(
         })
 }
 
-fn validate_recall_ledger_relations(state: &ReducerState<'_>) -> Result<(), StoreError> {
+fn validate_recall_ledger_relations(state: &ReducerState) -> Result<(), StoreError> {
     validate_recall_relations(
         state.recall_ledger.values(),
         &state.execution_lanes,
@@ -10556,7 +10553,7 @@ fn record_known_source(
 }
 
 fn current_source_ranges(
-    receipts: &SourceReceiptFacts<'_>,
+    receipts: &SourceReceiptFacts,
 ) -> Result<BTreeMap<String, KnownSourceRange>, StoreError> {
     let mut ranges = BTreeMap::new();
     for (receipt, _) in receipts.values() {
@@ -10796,7 +10793,7 @@ pub fn repository_scope_purge_preview(
 }
 
 fn apply_event(
-    state: &mut ReducerState<'_>,
+    state: &mut ReducerState,
     row: &JournalRow,
     command: &[&JournalRow],
 ) -> Result<(), StoreError> {
@@ -10911,7 +10908,7 @@ fn apply_event(
             let value = *value;
             if state
                 .source_receipts
-                .insert(value.source_receipt_id, (Cow::Owned(value), row.seq))
+                .insert(value.source_receipt_id, (Arc::new(value), row.seq))
                 .is_some()
             {
                 return Err(StoreError::StoreCorrupt);
@@ -10932,7 +10929,7 @@ fn apply_event(
             }
             if state
                 .source_observations
-                .insert(value.source_observation_id, (Cow::Owned(value), row.seq))
+                .insert(value.source_observation_id, (Arc::new(value), row.seq))
                 .is_some()
             {
                 return Err(StoreError::StoreCorrupt);
@@ -10958,7 +10955,7 @@ fn apply_event(
                     .evidence_surfaces
                     .insert(
                         value.source_observation_revision_ref,
-                        (Cow::Owned(value), row.seq),
+                        (Arc::new(value), row.seq),
                     )
                     .is_some()
             {
@@ -11307,7 +11304,7 @@ fn validate_job_successor(
 }
 
 fn validate_source_ingest_watermark(
-    state: &ReducerState<'_>,
+    state: &ReducerState,
     watermark: &SourceIngestWatermark,
     command: &[&JournalRow],
 ) -> Result<(), StoreError> {
@@ -12388,7 +12385,7 @@ fn replace_outage(
     Ok(())
 }
 
-impl<'facts> ReducerState<'facts> {
+impl ReducerState {
     fn rebuild_revision_currents(&mut self) -> Result<(), StoreError> {
         self.host_occurrences.clear();
         let mut occurrences = self
@@ -12499,7 +12496,7 @@ impl<'facts> ReducerState<'facts> {
     fn decode_current_rows(
         rows: &[ObjectRow],
         checkpoint_frontier: u64,
-        source_facts: Option<&'facts SourceFactsRef<'_>>,
+        source_facts: Option<&SourceFactsRef<'_>>,
     ) -> Result<Self, StoreError> {
         let checkpoints = rows
             .iter()
@@ -12657,7 +12654,7 @@ impl<'facts> ReducerState<'facts> {
 
     fn restore_source_prefix(
         &mut self,
-        facts: &'facts SourceFactsRef<'_>,
+        facts: &SourceFactsRef<'_>,
         checkpoint_frontier: u64,
     ) -> Result<(), StoreError> {
         for (value, seq) in facts
@@ -12670,7 +12667,7 @@ impl<'facts> ReducerState<'facts> {
                 .map_err(|_| StoreError::StoreCorrupt)?;
             let fields = source_receipt_parts(value.as_ref()).0;
             let row = evidence_object_row_fields(fields, *seq);
-            if self.restore_source_receipt(&row, Cow::Borrowed(value.as_ref()))? {
+            if self.restore_source_receipt(&row, Arc::clone(value))? {
                 return Err(StoreError::StoreCorrupt);
             }
         }
@@ -12684,7 +12681,7 @@ impl<'facts> ReducerState<'facts> {
                 .map_err(|_| StoreError::StoreCorrupt)?;
             let fields = source_observation_parts(value.as_ref()).0;
             let row = evidence_object_row_fields(fields, *seq);
-            if self.restore_source_observation(&row, Cow::Borrowed(value.as_ref()))? {
+            if self.restore_source_observation(&row, Arc::clone(value))? {
                 return Err(StoreError::StoreCorrupt);
             }
         }
@@ -12698,7 +12695,7 @@ impl<'facts> ReducerState<'facts> {
                 .map_err(|_| StoreError::StoreCorrupt)?;
             let (row, _) =
                 surface_row_parts(value.source_observation_revision_ref, value.as_ref(), *seq);
-            if self.restore_evidence_surface(&row, Cow::Borrowed(value.as_ref()))? {
+            if self.restore_evidence_surface(&row, Arc::clone(value))? {
                 return Err(StoreError::StoreCorrupt);
             }
         }
@@ -12708,7 +12705,7 @@ impl<'facts> ReducerState<'facts> {
     fn restore_source_receipt(
         &mut self,
         row: &ObjectRow,
-        value: Cow<'facts, SourceReceipt>,
+        value: Arc<SourceReceipt>,
     ) -> Result<bool, StoreError> {
         let id = value.source_receipt_id;
         let fields = evidence_fields(
@@ -12730,7 +12727,7 @@ impl<'facts> ReducerState<'facts> {
     fn restore_source_observation(
         &mut self,
         row: &ObjectRow,
-        value: Cow<'facts, SourceObservation>,
+        value: Arc<SourceObservation>,
     ) -> Result<bool, StoreError> {
         let id = value.source_observation_id;
         let fields = evidence_fields(
@@ -12752,7 +12749,7 @@ impl<'facts> ReducerState<'facts> {
     fn restore_evidence_surface(
         &mut self,
         row: &ObjectRow,
-        value: Cow<'facts, EvidenceSurface>,
+        value: Arc<EvidenceSurface>,
     ) -> Result<bool, StoreError> {
         let id = value.source_observation_revision_ref;
         require_surface_row(row, value.as_ref())?;
@@ -13079,10 +13076,10 @@ impl<'facts> ReducerState<'facts> {
                     .is_some()
             }
             JournalPayload::SourceReceiptRecorded(value) => {
-                self.restore_source_receipt(row, Cow::Owned(*value))?
+                self.restore_source_receipt(row, Arc::new(*value))?
             }
             JournalPayload::SourceObservationRecorded(value) => {
-                self.restore_source_observation(row, Cow::Owned(*value))?
+                self.restore_source_observation(row, Arc::new(*value))?
             }
             JournalPayload::SourceIngestWatermark(value) => {
                 let key = value.stable_key();
@@ -13096,7 +13093,7 @@ impl<'facts> ReducerState<'facts> {
                     .is_some()
             }
             JournalPayload::EvidenceSurfaceRecorded(value) => {
-                self.restore_evidence_surface(row, Cow::Owned(*value))?
+                self.restore_evidence_surface(row, Arc::new(*value))?
             }
             JournalPayload::HostOccurrenceNormalized(value) => {
                 let value = *value;
@@ -14314,7 +14311,7 @@ impl<'facts> ReducerState<'facts> {
         Ok(())
     }
 
-    fn admission_state(&self, frontier: u64) -> Result<JournalAdmissionState<'facts>, StoreError> {
+    fn admission_state(&self, frontier: u64) -> Result<JournalAdmissionState, StoreError> {
         let mut import_jobs = BTreeMap::new();
         for (job, _) in self.jobs.values() {
             record_import_job(&mut import_jobs, job);
@@ -15971,10 +15968,8 @@ mod tests {
                     let mut value = receipt.clone();
                     value.source_receipt_id = SourceReceiptId::from_digest([index; 32]);
                     value.observation_role = evertrace_domain::evidence::ObservationRole::Message;
-                    Arc::make_mut(&mut window.source_receipts).insert(
-                        value.source_receipt_id,
-                        (Cow::Owned(value), u64::from(index)),
-                    );
+                    Arc::make_mut(&mut window.source_receipts)
+                        .insert(value.source_receipt_id, (Arc::new(value), u64::from(index)));
                 }
                 let context = window
                     .passive_source_current_context(&PassiveSourceSelection::Session(
@@ -15998,7 +15993,7 @@ mod tests {
             let mut reduced = ReducerState::default();
             reduced
                 .source_receipts
-                .insert(receipt.source_receipt_id, (Cow::Owned(receipt.clone()), 1));
+                .insert(receipt.source_receipt_id, (Arc::new(receipt.clone()), 1));
             reduced
                 .source_watermarks
                 .insert(watermark.stable_key(), (watermark.clone(), 2));
@@ -18292,6 +18287,121 @@ mod tests {
         assert!(!writer.source_prefix_proven_for_test());
         assert!(current.rows.iter().any(|row| row == &altered));
         assert_ne!(current.rows, writer.full_projection().await.unwrap().rows);
+    }
+
+    #[test]
+    fn source_fact_arcs_share_qualified_values_and_failed_candidates_do_not_publish() {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (base_receipt, base_observation, base_surface) =
+            r105_capture("arc-base", 1, &repository, &worktree, true);
+        let mut base_rows = Vec::new();
+        append(
+            r105_command(
+                1,
+                r105_capture_payloads(&base_receipt, &base_observation, base_surface.as_ref()),
+            ),
+            1,
+            &mut base_rows,
+        );
+        let base_row_refs = base_rows.iter().collect::<Vec<_>>();
+        let base = JournalAdmissionState::default()
+            .apply_row_batch(&base_row_refs)
+            .unwrap();
+        let base_receipt_fact =
+            Arc::clone(&base.source_receipts[&base_receipt.source_receipt_id].0);
+        let base_observation_fact =
+            Arc::clone(&base.source_observations[&base_observation.source_observation_id].0);
+        let base_surface_fact =
+            Arc::clone(&base.evidence_surfaces[&base_observation.source_observation_id].0);
+
+        let mut restored = ReducerState::default();
+        restored
+            .restore_source_prefix(&base.source_facts(), base.frontier)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &base_receipt_fact,
+            &restored.source_receipts[&base_receipt.source_receipt_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_observation_fact,
+            &restored.source_observations[&base_observation.source_observation_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_surface_fact,
+            &restored.evidence_surfaces[&base_observation.source_observation_id].0
+        ));
+        drop(restored);
+
+        let (next_receipt, next_observation, next_surface) =
+            r105_capture("arc-next", 1, &repository, &worktree, true);
+        let mut next_rows = Vec::new();
+        append(
+            r105_command(
+                2,
+                r105_capture_payloads(&next_receipt, &next_observation, next_surface.as_ref()),
+            ),
+            base_rows.len() as u64 + 1,
+            &mut next_rows,
+        );
+        let next_row_refs = next_rows.iter().collect::<Vec<_>>();
+        let next = base.apply_row_batch(&next_row_refs).unwrap();
+        assert!(Arc::ptr_eq(
+            &base_receipt_fact,
+            &next.source_receipts[&base_receipt.source_receipt_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_observation_fact,
+            &next.source_observations[&base_observation.source_observation_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_surface_fact,
+            &next.evidence_surfaces[&base_observation.source_observation_id].0
+        ));
+        assert_eq!(
+            next.source_receipts[&next_receipt.source_receipt_id]
+                .0
+                .as_ref(),
+            &next_receipt
+        );
+        assert_eq!(
+            next.source_observations[&next_observation.source_observation_id]
+                .0
+                .as_ref(),
+            &next_observation
+        );
+        assert_eq!(
+            next.evidence_surfaces[&next_observation.source_observation_id]
+                .0
+                .as_ref(),
+            next_surface.as_ref().unwrap()
+        );
+        assert!(!Arc::ptr_eq(
+            &base_receipt_fact,
+            &next.source_receipts[&next_receipt.source_receipt_id].0
+        ));
+        assert!(!Arc::ptr_eq(
+            &base_observation_fact,
+            &next.source_observations[&next_observation.source_observation_id].0
+        ));
+        assert!(!Arc::ptr_eq(
+            &base_surface_fact,
+            &next.evidence_surfaces[&next_observation.source_observation_id].0
+        ));
+
+        let original = next;
+        let mut failed = original.clone();
+        assert!(matches!(
+            failed.apply_payload(
+                JournalPayload::SourceObservationRecorded(Box::new(base_observation.clone())),
+                2,
+            ),
+            Err(StoreError::StoreCorrupt)
+        ));
+        assert_eq!(original.source_observations.len(), 2);
+        assert!(Arc::ptr_eq(
+            &base_observation_fact,
+            &original.source_observations[&base_observation.source_observation_id].0
+        ));
     }
 
     #[tokio::test]

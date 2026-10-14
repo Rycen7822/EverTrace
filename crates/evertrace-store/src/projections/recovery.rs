@@ -1,6 +1,6 @@
 //! Store-owned S16 current truth and immutable recovery revision reducers.
 
-use std::{borrow::Cow, collections::BTreeMap, str::FromStr};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use evertrace_domain::{
     evidence::{EffectRole, ObservationRole, Operation, OperationKind, PairingState, ScopeEffect},
@@ -51,8 +51,8 @@ impl RecoveryCurrentView {
         let mut execution_lane_revisions = BTreeMap::new();
         let mut capture_receipt_revisions = BTreeMap::new();
         let mut scope_effects = BTreeMap::new();
-        let mut source_observations: SourceObservationFacts<'_> = BTreeMap::new();
-        let mut source_receipts: SourceReceiptFacts<'_> = BTreeMap::new();
+        let mut source_observations: SourceObservationFacts = BTreeMap::new();
+        let mut source_receipts: SourceReceiptFacts = BTreeMap::new();
         let mut attempt_revisions = BTreeMap::new();
         let mut competing_group_revisions = BTreeMap::new();
         for row in snapshot.data_rows() {
@@ -131,13 +131,13 @@ impl RecoveryCurrentView {
                 JournalPayload::SourceObservationRecorded(value) => {
                     source_observations.insert(
                         value.source_observation_id,
-                        (Cow::Owned(*value), row.source_event_seq),
+                        (Arc::new(*value), row.source_event_seq),
                     );
                 }
                 JournalPayload::SourceReceiptRecorded(value) => {
                     source_receipts.insert(
                         value.source_receipt_id,
-                        (Cow::Owned(*value), row.source_event_seq),
+                        (Arc::new(*value), row.source_event_seq),
                     );
                 }
                 JournalPayload::AttemptRecorded(value) => {
@@ -335,7 +335,7 @@ fn record_current_request(
     Ok(())
 }
 
-pub(super) struct RecoveryRelationInputs<'a, 'facts> {
+pub(super) struct RecoveryRelationInputs<'a> {
     pub requests: &'a BTreeMap<RecoveryCaptureRequestId, (RecoveryCaptureRequest, u64)>,
     pub bundles: &'a BTreeMap<RecoveryBundleId, (RecoveryBundle, u64)>,
     pub applications: &'a BTreeMap<RecoveryApplicationId, (RecoveryApplication, u64)>,
@@ -346,13 +346,13 @@ pub(super) struct RecoveryRelationInputs<'a, 'facts> {
     pub execution_lane_revisions: &'a BTreeMap<(ExecutionLaneId, u32), (ExecutionLane, u64)>,
     pub capture_receipt_revisions: &'a BTreeMap<CaptureReceiptId, (CaptureReceipt, u64)>,
     pub scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
-    pub source_observations: &'a SourceObservationFacts<'facts>,
-    pub source_receipts: &'a SourceReceiptFacts<'facts>,
+    pub source_observations: &'a SourceObservationFacts,
+    pub source_receipts: &'a SourceReceiptFacts,
     pub attempt_revisions: &'a BTreeMap<RevisionId, (Attempt, u64)>,
     pub competing_group_revisions: &'a BTreeMap<RevisionId, (CompetingAttemptGroup, u64)>,
 }
 
-pub(super) fn validate_relations(inputs: RecoveryRelationInputs<'_, '_>) -> Result<(), StoreError> {
+pub(super) fn validate_relations(inputs: RecoveryRelationInputs<'_>) -> Result<(), StoreError> {
     let RecoveryRelationInputs {
         requests,
         bundles,
