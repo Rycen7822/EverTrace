@@ -2440,6 +2440,21 @@ pub(crate) struct SourceFactsRef<'facts> {
     evidence_surfaces: &'facts EvidenceSurfaceFacts,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static SOURCE_FACT_BORROW_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_source_fact_borrow_lookups() {
+    SOURCE_FACT_BORROW_LOOKUPS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn source_fact_borrow_lookups() -> u64 {
+    SOURCE_FACT_BORROW_LOOKUPS.with(std::cell::Cell::get)
+}
+
 /// A bounded current read, not a complete projection or a reusable reader.
 #[derive(Debug)]
 pub struct CaptureCurrentContext {
@@ -6004,7 +6019,73 @@ impl JournalAdmissionState {
     }
 }
 
-impl SourceFactsRef<'_> {
+impl<'facts> SourceFactsRef<'facts> {
+    pub(crate) fn payload_for_row(
+        &self,
+        row: &ObjectRow,
+    ) -> Result<Option<JournalPayloadRef<'facts>>, StoreError> {
+        let kind = row.object_kind.as_deref();
+        let payload = if kind == Some("source_receipt")
+            || row.row_id.starts_with("object:evidence:source_receipt:")
+        {
+            let id = row
+                .object_id
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?
+                .parse::<SourceReceiptId>()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let (value, seq) = self
+                .source_receipts
+                .get(&id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if source_receipt_row(value.as_ref(), *seq)? != *row {
+                return Err(StoreError::StoreCorrupt);
+            }
+            JournalPayloadRef::Receipt(value.as_ref())
+        } else if kind == Some("source_observation")
+            || row
+                .row_id
+                .starts_with("object:evidence:source_observation:")
+        {
+            let id = row
+                .object_id
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?
+                .parse::<SourceObservationId>()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let (value, seq) = self
+                .source_observations
+                .get(&id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if source_observation_row(value.as_ref(), *seq)? != *row {
+                return Err(StoreError::StoreCorrupt);
+            }
+            JournalPayloadRef::Observation(value.as_ref())
+        } else if kind == Some("evidence_surface")
+            || row.row_id.starts_with("projection:evidence_surface:")
+        {
+            let id = row
+                .current_revision_id
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?
+                .parse::<SourceObservationId>()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let (value, seq) = self
+                .evidence_surfaces
+                .get(&id)
+                .ok_or(StoreError::StoreCorrupt)?;
+            if surface_row(id, value.as_ref(), *seq)? != *row {
+                return Err(StoreError::StoreCorrupt);
+            }
+            JournalPayloadRef::Surface(value.as_ref())
+        } else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        SOURCE_FACT_BORROW_LOOKUPS.with(|count| count.set(count.get() + 1));
+        Ok(Some(payload))
+    }
+
     fn snapshot_with_source_prefix(
         &self,
         mut rows: Vec<ObjectRow>,
@@ -18287,6 +18368,10 @@ mod tests {
         assert!(!writer.source_prefix_proven_for_test());
         assert!(current.rows.iter().any(|row| row == &altered));
         assert_ne!(current.rows, writer.full_projection().await.unwrap().rows);
+        let complete = writer.project().await.unwrap();
+        assert_eq!(complete.rows, current.rows);
+        assert!(complete.rows.iter().any(|row| row == &altered));
+        assert!(!writer.source_prefix_proven_for_test());
     }
 
     #[test]
@@ -18452,5 +18537,28 @@ mod tests {
         );
         assert_eq!(projected.frontier, writer.frontier());
         assert_eq!(projected, writer.full_projection().await.unwrap());
+
+        let oracle_objects = writer.full_projection().await.unwrap();
+        let oracle_indexes = crate::query::derive_l0002_projections(&oracle_objects).unwrap();
+        reset_source_fact_borrow_lookups();
+        assert!(writer.source_prefix_proven_for_test());
+        let complete = writer.project().await.unwrap();
+        assert_eq!(complete, oracle_objects);
+        assert_eq!(source_fact_borrow_lookups(), 9);
+        let sqlite = writer.projection_handle();
+        assert_eq!(
+            sqlite.lock().unwrap().object_rows().unwrap(),
+            oracle_objects.rows
+        );
+        assert_eq!(
+            sqlite.lock().unwrap().relation_rows().unwrap(),
+            oracle_indexes.relations
+        );
+        assert_eq!(
+            crate::search::read_search_rows(&r105_search_table(&root).await)
+                .await
+                .unwrap(),
+            oracle_indexes.search
+        );
     }
 }

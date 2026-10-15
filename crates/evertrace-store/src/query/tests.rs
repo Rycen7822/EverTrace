@@ -2,7 +2,14 @@
 mod tests {
     use std::str::FromStr;
 
-    use evertrace_domain::ids::CommandId;
+    use evertrace_domain::{
+        evidence::{
+            CaptureCompleteness, EvidenceByteRange, EvidenceSourceKind, IdentityStrength,
+            ObservationRole, ProtectedPresentation, SourceArchiveMode, SourceInstanceId,
+            SourceRecordIdentity, SourceReceipt, SourceRevision, SourceRevisionMode,
+        },
+        ids::{CommandId, SourceObservationId},
+    };
 
     use super::super::projection::{checkpoint_relation, checkpoint_search};
     use super::*;
@@ -72,7 +79,9 @@ mod tests {
         let mut ahead = snapshot.clone();
         ahead.frontier += 1;
         assert_eq!(
-            worker.catch_up_validated_proof(&ahead, Some(delta.clone())).await,
+            worker
+                .catch_up_validated_proof(&ahead, Some(delta.clone()), None)
+                .await,
             Err(StoreError::StoreCorrupt)
         );
 
@@ -102,7 +111,12 @@ mod tests {
             before_search
         );
         assert_eq!(
-            worker.catch_up_validated_proof(&snapshot, Some(delta.clone())).await.unwrap().0.frontier,
+            worker
+                .catch_up_validated_proof(&snapshot, Some(delta.clone()), None)
+                .await
+                .unwrap()
+                .0
+                .frontier,
             snapshot.frontier
         );
 
@@ -127,7 +141,9 @@ mod tests {
         let search_version = search.version().await.unwrap();
         writer.commit(&later, 2).await.unwrap();
         assert_eq!(
-            worker.catch_up_validated_proof(&snapshot, Some(delta)).await,
+            worker
+                .catch_up_validated_proof(&snapshot, Some(delta), None)
+                .await,
             Err(StoreError::StoreCorrupt)
         );
         let relations_epoch_after = {
@@ -246,6 +262,107 @@ mod tests {
         drop(writer);
         let reopened = crate::JournalWriter::open(&root).await.unwrap();
         assert_eq!(reopened.project().await.unwrap().frontier, frontier);
+    }
+
+    #[test]
+    fn source_body_ids_contribute_and_replaced_runtime_max_seq_can_decrease() {
+        let body_id = SourceObservationId::from_digest([9; 32]);
+        let body_text = body_id.to_string();
+        let source_instance_id = SourceInstanceId::parse("typed-id-source").unwrap();
+        let source_revision = SourceRevision::parse("revision-1").unwrap();
+        let source_record_identity = SourceRecordIdentity::parse("record-1").unwrap();
+        let receipt = SourceReceipt {
+            source_receipt_id: evertrace_domain::evidence::source_receipt_id(
+                &source_instance_id,
+                &source_revision,
+                &source_record_identity,
+            )
+            .unwrap(),
+            source_observation_id: evertrace_domain::evidence::source_observation_id(
+                &source_instance_id,
+                &source_revision,
+                &source_record_identity,
+            )
+            .unwrap(),
+            source_instance_id,
+            source_kind: EvidenceSourceKind::CodexHook,
+            identity_domain: "typed-id".into(),
+            source_ref: "source-ref".into(),
+            source_session_ref: "typed-id-session".into(),
+            source_revision,
+            source_record_identity,
+            identity_strength: IdentityStrength::StableNative,
+            source_sequence: 1,
+            source_sequence_origin: None,
+            task_id: None,
+            repository_instance_id: None,
+            worktree_instance_id: None,
+            source_byte_range: None,
+            spool_byte_range: EvidenceByteRange { start: 0, end: 1 },
+            source_revision_mode: SourceRevisionMode::Append,
+            previous_source_revision: None,
+            close_watermark: None,
+            observation_role: ObservationRole::Message,
+            unsupported_record_classification: None,
+            capture_completeness: CaptureCompleteness::Complete,
+            archive_mode: SourceArchiveMode::Exact,
+            cas_ref: "0".repeat(64),
+            protected_length: body_text.len() as u64,
+            protected_presentation: Some(ProtectedPresentation::Inline { text: body_text }),
+            original_length: body_id.to_string().len() as u64,
+            protected_secret_digest: None,
+            redaction_spans: Vec::new(),
+            adapter_revision: 1,
+            adapter_manifest_ref: "adapter".into(),
+            eligible_event_manifest_ref: "events".into(),
+            parser_revision: 1,
+            canonicalization_revision: 1,
+            detector_revision: 1,
+            redaction_revision: 1,
+            protection_key_generation: 1,
+            event_time_us: 1,
+            recorded_at_us: 1,
+            lifecycle: None,
+        };
+        let source = crate::command::JournalPayloadRef::Receipt(&receipt);
+        let runtime_max = JournalPayload::DirtyTarget(DirtyTarget {
+            target_kind: DirtyTargetKind::EvidenceSurface,
+            target_id: body_id.to_string(),
+            algorithm_revision: "typed-id-test".into(),
+            source_watermark: 1,
+        });
+        let replacement = JournalPayload::DirtyTarget(DirtyTarget {
+            target_kind: DirtyTargetKind::EvidenceSurface,
+            target_id: SourceObservationId::from_digest([10; 32]).to_string(),
+            algorithm_revision: "typed-id-test".into(),
+            source_watermark: 2,
+        });
+
+        let mut endpoint_seqs = std::collections::BTreeMap::new();
+        super::super::relation_assembly::index_typed_ids(&source, 5, &mut endpoint_seqs).unwrap();
+        assert_eq!(endpoint_seqs.get(&body_id.to_string()), Some(&5));
+        super::super::relation_assembly::index_typed_ids(
+            &runtime_max,
+            9,
+            &mut endpoint_seqs,
+        )
+        .unwrap();
+        assert_eq!(endpoint_seqs.get(&body_id.to_string()), Some(&9));
+
+        let mut after_replacement = std::collections::BTreeMap::new();
+        super::super::relation_assembly::index_typed_ids(
+            &source,
+            5,
+            &mut after_replacement,
+        )
+        .unwrap();
+        super::super::relation_assembly::index_typed_ids(
+            &replacement,
+            10,
+            &mut after_replacement,
+        )
+        .unwrap();
+        assert_eq!(after_replacement.get(&body_id.to_string()), Some(&5));
     }
 
     #[tokio::test]

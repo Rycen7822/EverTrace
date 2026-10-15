@@ -1,6 +1,9 @@
 //! L0002 projection workers over one validated L0001 object frontier.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
@@ -11,10 +14,11 @@ use evertrace_domain::{
 use lancedb::Table;
 
 use crate::{
-    JournalPayload, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
+    JournalPayload, JournalPayloadRef, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
     projections::{
-        ProjectionJournalDelta, l3_core_projection, procedure_context_effect, recall_need,
-        recall_trigger_contract, synthesis::wiki_render_identity, validate_delta, wiki_projection,
+        ProjectionJournalDelta, SourceFactsRef, l3_core_projection, procedure_context_effect,
+        recall_need, recall_trigger_contract, synthesis::wiki_render_identity, validate_delta,
+        wiki_projection,
     },
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
@@ -150,7 +154,10 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(objects, None, false, false).await?.0)
+        Ok(self
+            .catch_up_inner(objects, None, None, false, false)
+            .await?
+            .0)
     }
 
     /// The ordinary complete path with its actual-derive flag. Only a run that
@@ -160,8 +167,9 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
+        source_facts: Option<&SourceFactsRef<'_>>,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        self.catch_up_inner(objects, journal_delta, false, false)
+        self.catch_up_inner(objects, journal_delta, source_facts, false, false)
             .await
     }
 
@@ -226,6 +234,7 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
+        source_facts: Option<&SourceFactsRef<'_>>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
@@ -245,7 +254,7 @@ impl L0002ProjectionWorker {
                 false,
             ));
         }
-        let expected = derive_l0002_projections(objects)?;
+        let expected = derive_l0002_projections_with_source_facts(objects, source_facts)?;
         let (snapshot, versions) = self
             .commit_expected(handoff, expected, fail_relation_commit, fail_search_commit)
             .await?;
@@ -403,6 +412,7 @@ impl L0002ProjectionWorker {
             .catch_up_inner(
                 objects,
                 journal_delta,
+                None,
                 fail_relation_commit,
                 fail_search_commit,
             )
@@ -505,6 +515,13 @@ fn capture_delta_search(
 
 pub fn derive_l0002_projections(
     objects: &ProjectionSnapshot,
+) -> Result<L0002ProjectionSnapshot, StoreError> {
+    derive_l0002_projections_with_source_facts(objects, None)
+}
+
+fn derive_l0002_projections_with_source_facts<'facts>(
+    objects: &ProjectionSnapshot,
+    source_facts: Option<&SourceFactsRef<'facts>>,
 ) -> Result<L0002ProjectionSnapshot, StoreError> {
     if objects
         .rows
@@ -680,6 +697,29 @@ pub fn derive_l0002_projections(
                 .and_modify(|seq| *seq = (*seq).max(row.source_event_seq))
                 .or_insert(row.source_event_seq);
         }
+        let source_payload = source_facts
+            .map(|facts| facts.payload_for_row(row))
+            .transpose()?
+            .flatten();
+        if let Some(payload) = source_payload {
+            index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
+            match payload {
+                JournalPayloadRef::Receipt(value) => latest(
+                    &mut receipts,
+                    value.source_receipt_id,
+                    Cow::Borrowed(value),
+                    row.source_event_seq,
+                ),
+                JournalPayloadRef::Observation(_) => {}
+                JournalPayloadRef::Surface(value) => latest(
+                    &mut surfaces,
+                    value.source_observation_revision_ref,
+                    Cow::Borrowed(value),
+                    row.source_event_seq,
+                ),
+            }
+            continue;
+        }
         let payload: JournalPayload = serde_json::from_str(
             row.payload_json
                 .as_deref()
@@ -688,18 +728,32 @@ pub fn derive_l0002_projections(
         .map_err(|_| StoreError::StoreCorrupt)?;
         index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
         match payload {
-            JournalPayload::SourceReceiptRecorded(value) => latest(
-                &mut receipts,
-                value.source_receipt_id,
-                *value,
-                row.source_event_seq,
-            ),
-            JournalPayload::EvidenceSurfaceRecorded(value) => latest(
-                &mut surfaces,
-                value.source_observation_revision_ref,
-                *value,
-                row.source_event_seq,
-            ),
+            JournalPayload::SourceReceiptRecorded(value) => {
+                if source_facts.is_some() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                latest(
+                    &mut receipts,
+                    value.source_receipt_id,
+                    Cow::Owned(*value),
+                    row.source_event_seq,
+                );
+            }
+            JournalPayload::SourceObservationRecorded(_) if source_facts.is_some() => {
+                return Err(StoreError::StoreCorrupt);
+            }
+            JournalPayload::SourceObservationRecorded(_) => {}
+            JournalPayload::EvidenceSurfaceRecorded(value) => {
+                if source_facts.is_some() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                latest(
+                    &mut surfaces,
+                    value.source_observation_revision_ref,
+                    Cow::Owned(*value),
+                    row.source_event_seq,
+                );
+            }
             JournalPayload::HostOccurrenceNormalized(value) => latest(
                 &mut occurrences,
                 value.host_occurrence_id,
@@ -1045,17 +1099,20 @@ pub fn derive_l0002_projections(
     relations.insert(RelationProjectionRow::checkpoint(objects.frontier));
 
     let mut search = exact_rows.into_values().collect::<BTreeSet<_>>();
-    let mut receipts_by_observation = BTreeMap::new();
+    let mut receipts_by_observation = BTreeMap::<
+        evertrace_domain::ids::SourceObservationId,
+        &evertrace_domain::evidence::SourceReceipt,
+    >::new();
     for (receipt, _) in receipts.values() {
         receipts_by_observation
             .entry(receipt.source_observation_id)
-            .or_insert(receipt);
+            .or_insert(receipt.as_ref());
     }
     for (observation_id, (surface, seq)) in surfaces {
         let receipt = receipts_by_observation
             .get(&observation_id)
             .ok_or(StoreError::StoreCorrupt)?;
-        search.insert(surface_row(&surface, receipt, seq)?);
+        search.insert(surface_row(surface.as_ref(), receipt, seq)?);
     }
     search.insert(SearchProjectionRow::checkpoint(objects.frontier));
     Ok(L0002ProjectionSnapshot {

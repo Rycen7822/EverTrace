@@ -24,7 +24,7 @@ fn causal_seq(endpoint_seqs: &BTreeMap<String, u64>, source: &str, target: &str)
 }
 
 pub(super) fn index_typed_ids(
-    payload: &JournalPayload,
+    payload: &impl serde::Serialize,
     source_event_seq: u64,
     endpoint_seqs: &mut BTreeMap<String, u64>,
 ) -> Result<(), StoreError> {

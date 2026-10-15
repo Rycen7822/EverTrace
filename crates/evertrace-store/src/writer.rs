@@ -1673,9 +1673,12 @@ impl JournalWriter {
                         return Err(StoreError::StoreCorrupt);
                     }
                     let (search_version, content_proven) = if indexes {
+                        let l0002_source_facts =
+                            source_prefix_proven.then(|| self.admission_state.source_facts());
                         let worker = self.l0002_projection_worker();
-                        let (_, versions, derived) =
-                            worker.catch_up_validated_proof(&snapshot, delta).await?;
+                        let (_, versions, derived) = worker
+                            .catch_up_validated_proof(&snapshot, delta, l0002_source_facts.as_ref())
+                            .await?;
                         if self.physical_stamp()?.relations_epoch != versions[0] {
                             return Err(StoreError::StoreCorrupt);
                         }
