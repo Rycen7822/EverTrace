@@ -290,7 +290,7 @@ impl ProductionSearch {
                         source_ref: row.source_ref.clone().unwrap_or_default(),
                         row_variant,
                         object_kind: row.object_kind.clone(),
-                        text: row.text.clone(),
+                        text: row.text.as_str().to_owned(),
                         source_role: row.source_role.clone(),
                         content_trust: row.content_trust.clone(),
                         capture_completeness: row.capture_completeness.clone(),

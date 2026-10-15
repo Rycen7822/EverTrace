@@ -1674,8 +1674,14 @@ impl JournalWriter {
                     }
                     let (search_version, content_proven) = if indexes {
                         let worker = self.l0002_projection_worker();
-                        let (_, versions, derived) =
-                            worker.catch_up_validated_proof(&snapshot, delta).await?;
+                        let surface_facts = self.admission_state.source_facts();
+                        let (_, versions, derived) = worker
+                            .catch_up_validated_proof_with_source_facts(
+                                &snapshot,
+                                delta,
+                                &surface_facts,
+                            )
+                            .await?;
                         if self.physical_stamp()?.relations_epoch != versions[0] {
                             return Err(StoreError::StoreCorrupt);
                         }

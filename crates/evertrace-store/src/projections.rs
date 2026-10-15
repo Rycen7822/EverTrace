@@ -2440,6 +2440,17 @@ pub(crate) struct SourceFactsRef<'facts> {
     evidence_surfaces: &'facts EvidenceSurfaceFacts,
 }
 
+impl SourceFactsRef<'_> {
+    pub(crate) fn evidence_surface_owner(
+        &self,
+        observation_id: SourceObservationId,
+    ) -> Option<&Arc<EvidenceSurface>> {
+        self.evidence_surfaces
+            .get(&observation_id)
+            .map(|(surface, _)| surface)
+    }
+}
+
 /// A bounded current read, not a complete projection or a reusable reader.
 #[derive(Debug)]
 pub struct CaptureCurrentContext {
@@ -17839,6 +17850,149 @@ mod tests {
             expected.search
         );
         replayed
+    }
+
+    #[tokio::test]
+    async fn expected_search_text_reuses_only_an_exact_surface_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        let initial = r105_command(
+            1,
+            vec![
+                JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+            ],
+        );
+        writer.commit(&initial, 1).await.unwrap();
+        writer.project().await.unwrap();
+
+        let (receipt, observation, surface) =
+            r105_capture("shared-text", 1, &repository, &worktree, true);
+        let surface = surface.unwrap();
+        let capture = r105_command(
+            2,
+            r105_capture_payloads(&receipt, &observation, Some(&surface)),
+        );
+        writer.commit(&capture, 2).await.unwrap();
+        let projected = writer.project().await.unwrap();
+        let full = writer.full_projection().await.unwrap();
+        assert_eq!(projected.frontier, full.frontier);
+
+        let journal_rows = writer.journal_rows().await.unwrap();
+        let admission = JournalAdmissionState::from_journal_rows(&journal_rows).unwrap();
+        let source_facts = admission.source_facts();
+        let owner = source_facts
+            .evidence_surface_owner(observation.source_observation_id)
+            .unwrap();
+        assert_eq!(owner.as_ref(), &surface);
+        let owner_count_before = Arc::strong_count(owner);
+
+        let owned = crate::query::derive_l0002_projections(&full).unwrap();
+        let shared = crate::query::L0002ProjectionWorker::derive_with_source_facts_for_test(
+            &full,
+            &source_facts,
+        )
+        .unwrap();
+        assert_eq!(shared.frontier, owned.frontier);
+        assert_eq!(shared.relations, owned.relations);
+        assert_eq!(shared.search, owned.search);
+        for (shared_row, owned_row) in shared.search.iter().zip(&owned.search) {
+            assert_eq!(shared_row.text.as_str(), owned_row.text.as_str());
+        }
+
+        let shared_row = shared
+            .search
+            .iter()
+            .find(|row| row.row_variant == "evidence_surface")
+            .unwrap();
+        let owned_row = owned
+            .search
+            .iter()
+            .find(|row| row.row_variant == "evidence_surface")
+            .unwrap();
+        assert!(owned_row.text.shared_surface().is_none());
+        assert!(Arc::ptr_eq(
+            owner,
+            shared_row.text.shared_surface().unwrap()
+        ));
+        assert_eq!(Arc::strong_count(owner), owner_count_before + 1);
+        let shared_count = shared
+            .search
+            .iter()
+            .filter(|row| row.text.shared_surface().is_some())
+            .count();
+        let shared_bytes = shared
+            .search
+            .iter()
+            .filter(|row| row.text.shared_surface().is_some())
+            .map(|row| row.text.len())
+            .sum::<usize>();
+        assert_eq!(shared_count, 1);
+        assert_eq!(shared_bytes, surface.protected_text.len());
+        drop(shared);
+        assert_eq!(Arc::strong_count(owner), owner_count_before);
+
+        let mut same_text_different_value = surface.clone();
+        same_text_different_value.recorded_at_us += 1;
+        let mismatched_surfaces = BTreeMap::from([(
+            observation.source_observation_id,
+            (Arc::new(same_text_different_value), surface.source_sequence),
+        )]);
+        let mismatched_facts = SourceFactsRef {
+            source_receipts: source_facts.source_receipts,
+            source_observations: source_facts.source_observations,
+            evidence_surfaces: &mismatched_surfaces,
+        };
+        let mismatched = crate::query::L0002ProjectionWorker::derive_with_source_facts_for_test(
+            &full,
+            &mismatched_facts,
+        )
+        .unwrap();
+        let mismatched_row = mismatched
+            .search
+            .iter()
+            .find(|row| row.row_variant == "evidence_surface")
+            .unwrap();
+        assert!(mismatched_row.text.shared_surface().is_none());
+        assert_eq!(
+            mismatched_row.text.as_str(),
+            surface.protected_text.as_str()
+        );
+        assert_eq!(Arc::strong_count(owner), owner_count_before);
+
+        let native = crate::search::read_search_rows(&r105_search_table(&root).await)
+            .await
+            .unwrap();
+        assert_eq!(native, owned.search);
+        for (native_row, owned_row) in native.iter().zip(&owned.search) {
+            assert_eq!(native_row.text.as_str(), owned_row.text.as_str());
+        }
+        assert!(
+            native
+                .iter()
+                .filter(|row| row.row_variant == "evidence_surface")
+                .all(|row| row.text.shared_surface().is_none())
+        );
+
+        let text = crate::search::SearchText::from(surface.protected_text.clone());
+        let first_owner = crate::search::SearchText::from_evidence_surface(Arc::clone(owner));
+        let second_owner =
+            crate::search::SearchText::from_evidence_surface(Arc::new(surface.clone()));
+        assert_eq!(text, first_owner);
+        assert_eq!(first_owner.cmp(&second_owner), std::cmp::Ordering::Equal);
+        let mut equal_texts = BTreeSet::new();
+        equal_texts.insert(text);
+        equal_texts.insert(first_owner);
+        equal_texts.insert(second_owner);
+        assert_eq!(equal_texts.len(), 1);
+        assert!(crate::search::SearchText::from("alpha") < crate::search::SearchText::from("beta"));
+
+        let owned_string = String::from("move without copying");
+        let original_pointer = owned_string.as_ptr();
+        let moved_string = crate::search::SearchText::from(owned_string).into_string();
+        assert_eq!(moved_string.as_ptr(), original_pointer);
     }
 
     #[tokio::test]

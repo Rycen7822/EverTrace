@@ -75,7 +75,7 @@ pub(super) fn wiki_search_row(
         candidate_id: Some(projection.page_id.to_string()),
         source_ref: Some(projection.page_id.to_string()),
         source_kind: Some("object_projection".into()),
-        text: bounded_search_text(&projection.page_id.to_string(), &fields),
+        text: bounded_search_text(&projection.page_id.to_string(), &fields).into(),
         source_role: None,
         content_trust: None,
         capture_completeness: None,
@@ -152,7 +152,7 @@ pub(super) fn exact_identifier_row(
         ),
         source_ref: Some(source_ref),
         source_kind: Some("object_projection".into()),
-        text,
+        text: text.into(),
         source_role: None,
         content_trust: None,
         capture_completeness: None,
@@ -338,6 +338,7 @@ pub(super) fn surface_row(
     surface: &EvidenceSurface,
     receipt: &SourceReceipt,
     seq: u64,
+    existing_surface: Option<&std::sync::Arc<EvidenceSurface>>,
 ) -> Result<SearchProjectionRow, StoreError> {
     surface.validate().map_err(|_| StoreError::StoreCorrupt)?;
     receipt.validate().map_err(|_| StoreError::StoreCorrupt)?;
@@ -349,6 +350,12 @@ pub(super) fn surface_row(
         receipt,
         DefaultRetrievalSuppressionGeneration::ContentSpanV2,
     )?;
+    let text = match existing_surface {
+        Some(owner) if owner.as_ref() == surface => {
+            crate::search::SearchText::from_evidence_surface(std::sync::Arc::clone(owner))
+        }
+        _ => surface.protected_text.clone().into(),
+    };
     Ok(SearchProjectionRow {
         row_id: format!(
             "search:evidence:{}:{}",
@@ -363,7 +370,7 @@ pub(super) fn surface_row(
         )),
         source_ref: Some(surface.source_observation_revision_ref.to_string()),
         source_kind: Some("evidence_surface".into()),
-        text: surface.protected_text.clone(),
+        text,
         source_role: Some(
             serde_json::to_string(&surface.source_role)
                 .map_err(|_| StoreError::StoreCorrupt)?
