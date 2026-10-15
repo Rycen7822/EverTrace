@@ -1047,7 +1047,7 @@ impl McpActionService {
                 .await
                 .map_err(|_| McpServiceError::Store)?
                 .into_iter()
-                .filter_map(|row| row.candidate_id.map(|id| (id, row.text.into_string())))
+                .filter_map(|row| row.candidate_id.map(|id| (id, row.text)))
                 .collect();
             let refs = current
                 .items

@@ -13,9 +13,8 @@ use lancedb::Table;
 use crate::{
     JournalPayload, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
     projections::{
-        ProjectionJournalDelta, SourceFactsRef, l3_core_projection, procedure_context_effect,
-        recall_need, recall_trigger_contract, synthesis::wiki_render_identity, validate_delta,
-        wiki_projection,
+        ProjectionJournalDelta, l3_core_projection, procedure_context_effect, recall_need,
+        recall_trigger_contract, synthesis::wiki_render_identity, validate_delta, wiki_projection,
     },
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
@@ -151,41 +150,19 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
-        Ok(self
-            .catch_up_inner(objects, None, None, false, false)
-            .await?
-            .0)
+        Ok(self.catch_up_inner(objects, None, false, false).await?.0)
     }
 
     /// The ordinary complete path with its actual-derive flag. Only a run that
     /// really derived and read every persisted row back establishes the
     /// private full-content grade; the checkpoint early return does not.
-    #[cfg(test)]
     pub(crate) async fn catch_up_validated_proof(
         &self,
         objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        self.catch_up_inner(objects, journal_delta, None, false, false)
+        self.catch_up_inner(objects, journal_delta, false, false)
             .await
-    }
-
-    pub(crate) async fn catch_up_validated_proof_with_source_facts(
-        &self,
-        objects: &ProjectionSnapshot,
-        journal_delta: Option<ProjectionJournalDelta>,
-        source_facts: &SourceFactsRef<'_>,
-    ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        self.catch_up_inner(objects, journal_delta, Some(source_facts), false, false)
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn derive_with_source_facts_for_test(
-        objects: &ProjectionSnapshot,
-        source_facts: &SourceFactsRef<'_>,
-    ) -> Result<L0002ProjectionSnapshot, StoreError> {
-        derive_l0002_projections_with_source_facts(objects, Some(source_facts))
     }
 
     /// Complete one confirmed closed capture successor from an already proven
@@ -249,7 +226,6 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
-        source_facts: Option<&SourceFactsRef<'_>>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
@@ -269,7 +245,7 @@ impl L0002ProjectionWorker {
                 false,
             ));
         }
-        let expected = derive_l0002_projections_with_source_facts(objects, source_facts)?;
+        let expected = derive_l0002_projections(objects)?;
         let (snapshot, versions) = self
             .commit_expected(handoff, expected, fail_relation_commit, fail_search_commit)
             .await?;
@@ -427,7 +403,6 @@ impl L0002ProjectionWorker {
             .catch_up_inner(
                 objects,
                 journal_delta,
-                None,
                 fail_relation_commit,
                 fail_search_commit,
             )
@@ -522,7 +497,7 @@ fn capture_delta_search(
         if matching.next().is_some() {
             return Err(StoreError::StoreCorrupt);
         }
-        rows.insert(surface_row(&surface, receipt, seq, None)?);
+        rows.insert(surface_row(&surface, receipt, seq)?);
     }
     rows.insert(SearchProjectionRow::checkpoint(frontier));
     Ok(rows.into_iter().collect())
@@ -530,13 +505,6 @@ fn capture_delta_search(
 
 pub fn derive_l0002_projections(
     objects: &ProjectionSnapshot,
-) -> Result<L0002ProjectionSnapshot, StoreError> {
-    derive_l0002_projections_with_source_facts(objects, None)
-}
-
-fn derive_l0002_projections_with_source_facts(
-    objects: &ProjectionSnapshot,
-    source_facts: Option<&SourceFactsRef<'_>>,
 ) -> Result<L0002ProjectionSnapshot, StoreError> {
     if objects
         .rows
@@ -1087,12 +1055,7 @@ fn derive_l0002_projections_with_source_facts(
         let receipt = receipts_by_observation
             .get(&observation_id)
             .ok_or(StoreError::StoreCorrupt)?;
-        search.insert(surface_row(
-            &surface,
-            receipt,
-            seq,
-            source_facts.and_then(|facts| facts.evidence_surface_owner(observation_id)),
-        )?);
+        search.insert(surface_row(&surface, receipt, seq)?);
     }
     search.insert(SearchProjectionRow::checkpoint(objects.frontier));
     Ok(L0002ProjectionSnapshot {
@@ -1238,7 +1201,7 @@ fn search_values(rows: &[SearchProjectionRow]) -> CanonicalValue {
                     CanonicalValue::String(row.candidate_id.clone().unwrap_or_default()),
                     CanonicalValue::String(row.source_ref.clone().unwrap_or_default()),
                     CanonicalValue::String(row.source_kind.clone().unwrap_or_default()),
-                    CanonicalValue::String(row.text.as_str().to_owned()),
+                    CanonicalValue::String(row.text.clone()),
                     CanonicalValue::String(row.source_role.clone().unwrap_or_default()),
                     CanonicalValue::String(row.content_trust.clone().unwrap_or_default()),
                     CanonicalValue::String(row.capture_completeness.clone().unwrap_or_default()),

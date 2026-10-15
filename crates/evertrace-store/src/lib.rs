@@ -110,7 +110,7 @@ pub use relations::{
 pub use schema::{PROBE_SCHEMA_VERSION, ProbeRow, probe_batch, probe_schema, schema_fingerprint};
 pub use search::{
     SEARCH_CHECKPOINT_ID, SEARCH_PROJECTION_GENERATION, SEARCH_TABLE, SearchHardFilter,
-    SearchIndex, SearchProjectionRow, SearchSnapshot, SearchText, read_search_rows, search_schema,
+    SearchIndex, SearchProjectionRow, SearchSnapshot, read_search_rows, search_schema,
 };
 pub use session_import::*;
 pub use writer::{

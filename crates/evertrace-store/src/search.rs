@@ -37,91 +37,6 @@ pub struct SearchSnapshot {
     _lease: crate::connection::StoreReadLease,
 }
 
-#[derive(Clone)]
-enum SearchTextOwner {
-    Owned(String),
-    EvidenceSurface(Arc<EvidenceSurface>),
-}
-
-/// Search text retained either as its original owned value or by one exact
-/// immutable evidence surface already held by admission state.
-#[derive(Clone)]
-pub struct SearchText(SearchTextOwner);
-
-impl SearchText {
-    pub fn as_str(&self) -> &str {
-        match &self.0 {
-            SearchTextOwner::Owned(value) => value,
-            SearchTextOwner::EvidenceSurface(surface) => &surface.protected_text,
-        }
-    }
-
-    pub fn into_string(self) -> String {
-        match self.0 {
-            SearchTextOwner::Owned(value) => value,
-            SearchTextOwner::EvidenceSurface(surface) => surface.protected_text.clone(),
-        }
-    }
-
-    pub(crate) fn from_evidence_surface(surface: Arc<EvidenceSurface>) -> Self {
-        Self(SearchTextOwner::EvidenceSurface(surface))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shared_surface(&self) -> Option<&Arc<EvidenceSurface>> {
-        match &self.0 {
-            SearchTextOwner::Owned(_) => None,
-            SearchTextOwner::EvidenceSurface(surface) => Some(surface),
-        }
-    }
-}
-
-impl From<String> for SearchText {
-    fn from(value: String) -> Self {
-        Self(SearchTextOwner::Owned(value))
-    }
-}
-
-impl From<&str> for SearchText {
-    fn from(value: &str) -> Self {
-        Self(SearchTextOwner::Owned(value.to_owned()))
-    }
-}
-
-impl std::ops::Deref for SearchText {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl std::fmt::Debug for SearchText {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_str(), formatter)
-    }
-}
-
-impl PartialEq for SearchText {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str().as_bytes() == other.as_str().as_bytes()
-    }
-}
-
-impl Eq for SearchText {}
-
-impl PartialOrd for SearchText {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for SearchText {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_str().as_bytes().cmp(other.as_str().as_bytes())
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct SearchHardFilter {
     /// Current publication eligibility, separate from deletion suppression.
@@ -582,7 +497,7 @@ pub struct SearchProjectionRow {
     pub candidate_id: Option<String>,
     pub source_ref: Option<String>,
     pub source_kind: Option<String>,
-    pub text: SearchText,
+    pub text: String,
     pub source_role: Option<String>,
     pub content_trust: Option<String>,
     pub capture_completeness: Option<String>,
@@ -613,7 +528,7 @@ impl SearchProjectionRow {
             candidate_id: None,
             source_ref: None,
             source_kind: None,
-            text: String::new().into(),
+            text: String::new(),
             source_role: None,
             content_trust: None,
             capture_completeness: None,
