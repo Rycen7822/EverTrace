@@ -128,24 +128,8 @@ pub(crate) fn validate_input(
     through_sequence: u64,
     refs: &[String],
 ) -> Result<(), crate::semantic::SemanticServiceError> {
-    validate_input_rows(
-        &snapshot.rows,
-        source,
-        after_sequence,
-        through_sequence,
-        refs,
-    )
-}
-
-fn validate_input_rows(
-    rows: &[evertrace_store::ObjectRow],
-    source: &SemanticSourceTarget,
-    after_sequence: u64,
-    through_sequence: u64,
-    refs: &[String],
-) -> Result<(), crate::semantic::SemanticServiceError> {
-    crate::session_import::source_summary_receipts_rows(
-        rows,
+    crate::session_import::source_summary_receipts(
+        snapshot,
         source,
         after_sequence,
         through_sequence,
@@ -159,14 +143,7 @@ pub(crate) fn input(
     snapshot: &ProjectionSnapshot,
     job: &DurableJob,
 ) -> Result<SourceInput, crate::semantic::SemanticServiceError> {
-    input_rows(&snapshot.rows, job)
-}
-
-pub(crate) fn input_rows(
-    rows: &[evertrace_store::ObjectRow],
-    job: &DurableJob,
-) -> Result<SourceInput, crate::semantic::SemanticServiceError> {
-    let (first, last) = endpoints_rows(rows, job)?;
+    let (first, last) = endpoints(snapshot, job)?;
     let source = first
         .target()
         .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
@@ -198,9 +175,8 @@ pub(crate) fn input_rows(
     let mut refs = Vec::new();
     // Frozen jobs scan only this source/revision's metadata, retaining <=64
     // interval refs. No all-source grouping, sorting or body decoding.
-    for row in rows.iter().filter(|row| {
-        row.row_kind == evertrace_store::ObjectRowKind::Data
-            && row.object_kind.as_deref() == Some("source_receipt")
+    for row in snapshot.data_rows().filter(|row| {
+        row.object_kind.as_deref() == Some("source_receipt")
             && row.payload_json.as_deref().is_some_and(|json| {
                 json.contains(&source_needle) && json.contains(&revision_needle)
             })
@@ -219,8 +195,8 @@ pub(crate) fn input_rows(
         }
     }
     refs.sort();
-    let receipts = crate::session_import::source_summary_receipts_rows(
-        rows,
+    let receipts = crate::session_import::source_summary_receipts(
+        snapshot,
         &source,
         after_sequence,
         through_sequence,
@@ -240,13 +216,6 @@ fn endpoints(
     snapshot: &ProjectionSnapshot,
     job: &DurableJob,
 ) -> Result<(MessageMetadata, MessageMetadata), crate::semantic::SemanticServiceError> {
-    endpoints_rows(&snapshot.rows, job)
-}
-
-fn endpoints_rows(
-    rows: &[evertrace_store::ObjectRow],
-    job: &DurableJob,
-) -> Result<(MessageMetadata, MessageMetadata), crate::semantic::SemanticServiceError> {
     let SemanticJobTarget::Source {
         first_observation_id,
         last_observation_id,
@@ -257,11 +226,10 @@ fn endpoints_rows(
     };
     let endpoint = |id: evertrace_domain::ids::SourceObservationId| -> Result<MessageMetadata, crate::semantic::SemanticServiceError> {
         let observation_id = id.to_string();
-        let row = rows
-            .iter()
+        let row = snapshot
+            .data_rows()
             .find(|row| {
-                row.row_kind == evertrace_store::ObjectRowKind::Data
-                    && row.object_kind.as_deref() == Some("source_observation")
+                row.object_kind.as_deref() == Some("source_observation")
                     && row.object_id.as_deref() == Some(observation_id.as_str())
             })
             .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
@@ -272,11 +240,10 @@ fn endpoints_rows(
         )
         .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
         let receipt_id = observation.source_receipt_ref.to_string();
-        let row = rows
-            .iter()
+        let row = snapshot
+            .data_rows()
             .find(|row| {
-                row.row_kind == evertrace_store::ObjectRowKind::Data
-                    && row.object_kind.as_deref() == Some("source_receipt")
+                row.object_kind.as_deref() == Some("source_receipt")
                     && row.object_id.as_deref() == Some(receipt_id.as_str())
             })
             .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
@@ -313,49 +280,27 @@ pub(crate) async fn allowed(
     input: &SourceInput,
     config_hash: [u8; 32],
 ) -> Result<bool, crate::semantic::SemanticServiceError> {
-    allowed_rows(writer, report, &snapshot.rows, input, config_hash).await
-}
-
-pub(crate) async fn allowed_rows(
-    writer: &crate::WriterHandle,
-    report: Option<&evertrace_codex::HostProbeReport>,
-    rows: &[evertrace_store::ObjectRow],
-    input: &SourceInput,
-    config_hash: [u8; 32],
-) -> Result<bool, crate::semantic::SemanticServiceError> {
-    validate_input_rows(
-        rows,
+    validate_input(
+        snapshot,
         &input.source,
         input.after_sequence,
         input.through_sequence,
         &input.refs,
     )?;
-    let selected_rows = rows
-        .iter()
+    let rows = snapshot
+        .data_rows()
         .filter(|row| {
-            row.row_kind == evertrace_store::ObjectRowKind::Data
-                && row.object_kind.as_deref() == Some("source_observation")
+            row.object_kind.as_deref() == Some("source_observation")
                 && row
                     .object_id
                     .as_ref()
                     .is_some_and(|id| input.refs.binary_search(id).is_ok())
         })
         .collect::<Vec<_>>();
-    if selected_rows.len() > 64 {
-        return Err(crate::semantic::SemanticServiceError::InvalidInput);
-    }
-    crate::session_import::blocked_source_rows_from_rows_before(
-        writer,
-        report,
-        rows,
-        &selected_rows,
-        config_hash,
-        None,
-        None,
-    )
-    .await
-    .map(|blocked| blocked.is_empty())
-    .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)
+    crate::session_import::blocked_source_rows(writer, report, snapshot, &rows, config_hash)
+        .await
+        .map(|blocked| blocked.is_empty())
+        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)
 }
 
 // A suppressed/unsupported/differently scoped message is an interval boundary,
@@ -764,14 +709,13 @@ impl SynthesisPlanner {
                     .await;
                 let elapsed = started.elapsed();
                 let current = writer
-                    .source_summary_current_context(job)
+                    .project()
                     .await
                     .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
-                if !allowed_rows(writer, report, &current.rows, &input, job.config_hash).await? {
+                if !allowed(writer, report, &current, &input, job.config_hash).await? {
                     return Err(crate::semantic::SemanticServiceError::BaseConflict);
                 }
-                drop(current);
-                self.finish_source_prepared(prepared, derived, elapsed)
+                self.finish_prepared(prepared, &current, derived, elapsed)
                     .await?
             }
         };
@@ -781,166 +725,8 @@ impl SynthesisPlanner {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{PreparedSynthesis, SynthesisPlanner, SynthesisTarget};
     use super::*;
-    use crate::provider::{
-        ProtectedDeltaItem, ProtectedDeltaKind, ProtectedSemanticInput, ProviderDerivation,
-        ProviderSemanticApplication, ProviderSemanticCandidate,
-    };
-    use evertrace_domain::{
-        config::LlmConfig,
-        semantic::{
-            DerivationQuotaUsage, DerivationRunStatus, SemanticCompleteness,
-            SemanticDigestApplication, SemanticDigestStatus, SemanticDigestTrigger,
-            SemanticOmission, SemanticStructuredDelta, source_job_fingerprint,
-        },
-    };
     use evertrace_domain::{evidence::*, ids::*};
-    use evertrace_store::JournalPayload;
-
-    fn prepared_source(
-        planner: &SynthesisPlanner,
-    ) -> (
-        PreparedSynthesis,
-        SemanticSourceTarget,
-        Vec<String>,
-        [u8; 32],
-        CommandId,
-    ) {
-        let message = message(3);
-        let source = message.target().unwrap();
-        let refs = vec![message.source_observation_id.to_string()];
-        let algorithm_revision = "source-finish-test".to_owned();
-        let effective_config_hash = [8; 32];
-        let prompt_hash = crate::provider::source_prompt_hash();
-        let fingerprint = source_job_fingerprint(
-            &source,
-            2,
-            3,
-            &refs,
-            &planner.llm.model,
-            &prompt_hash,
-            crate::provider::SEMANTIC_SCHEMA_VERSION,
-            &algorithm_revision,
-            &effective_config_hash,
-        )
-        .unwrap();
-        let command_id = CommandId::new_v7();
-        let omission = SemanticOmission {
-            category: "source_input_budget".into(),
-            reason: "A protected message tail was omitted.".into(),
-            direct_refs: refs.clone(),
-        };
-        let prepared = PreparedSynthesis {
-            input: ProtectedSemanticInput {
-                episode_id: None,
-                episode_revision_id: None,
-                task_id: None,
-                from_watermark: 2,
-                to_watermark: 3,
-                trigger: "source_messages",
-                direct_delta: vec![ProtectedDeltaItem {
-                    kind: ProtectedDeltaKind::Progress,
-                    value: "bounded protected message".into(),
-                    direct_refs: refs.clone(),
-                }],
-                source_refs: refs.clone(),
-                stage_trace: None,
-                source_target: Some(source.clone()),
-            },
-            fingerprint,
-            prompt_hash,
-            daily: DerivationQuotaUsage::default(),
-            evidence_refs: Vec::new(),
-            input_omission: Some(omission),
-            target: SynthesisTarget::Source {
-                source: source.clone(),
-                after_sequence: 2,
-                through_sequence: 3,
-            },
-            trigger: SemanticDigestTrigger::SourceMessages,
-            command_id,
-            occurred_at_us: 42,
-            algorithm_revision,
-            effective_config_hash,
-        };
-        (prepared, source, refs, fingerprint, command_id)
-    }
-
-    fn source_refs() -> Vec<String> {
-        vec![message(3).source_observation_id.to_string()]
-    }
-
-    fn provider_result(
-        refs: &[String],
-        candidates: Vec<ProviderSemanticCandidate>,
-    ) -> ProviderDerivation {
-        ProviderDerivation {
-            application: ProviderSemanticApplication {
-                progress_delta: vec![SemanticStructuredDelta {
-                    label: "checkpoint".into(),
-                    value: "The protected message records a checkpoint.".into(),
-                    direct_refs: refs.to_vec(),
-                }],
-                decision_delta: Vec::new(),
-                failed_routes: Vec::new(),
-                resolved_items: Vec::new(),
-                open_loops: Vec::new(),
-                outcome_delta: Vec::new(),
-                omissions: Vec::new(),
-                candidates,
-                completeness: SemanticCompleteness::Complete,
-            },
-            input_tokens: 7,
-            output_tokens: 3,
-            wall_time_us: 5,
-        }
-    }
-
-    async fn finish_source_audit(
-        planner: &SynthesisPlanner,
-        derived: Result<ProviderDerivation, crate::provider::ProviderError>,
-        elapsed: std::time::Duration,
-        status: DerivationRunStatus,
-    ) -> evertrace_domain::semantic::SemanticDerivationRun {
-        let (prepared, source, refs, fingerprint, command_id) = prepared_source(planner);
-        let super::super::SynthesisResolution::Audit { run, command } = planner
-            .finish_source_prepared(prepared, derived, elapsed)
-            .await
-            .unwrap()
-        else {
-            panic!("source completion must preserve audit-only outcomes")
-        };
-        assert_eq!(
-            (
-                run.status,
-                run.episode_id,
-                run.episode_revision_id,
-                run.from_watermark,
-                run.to_watermark,
-                run.selected_direct_refs.as_slice(),
-                run.job_fingerprint,
-                run.source_target.as_ref(),
-            ),
-            (
-                status,
-                None,
-                None,
-                2,
-                3,
-                refs.as_slice(),
-                fingerprint,
-                Some(&source),
-            )
-        );
-        assert_eq!(command.command_id(), command_id);
-        assert_eq!(command.events().len(), 1);
-        assert!(matches!(
-            &command.events()[0].payload,
-            JournalPayload::SemanticDerivationRunRecorded(recorded) if recorded.as_ref() == &run
-        ));
-        run
-    }
 
     fn message(index: u8) -> MessageMetadata {
         MessageMetadata {
@@ -1150,209 +936,5 @@ mod tests {
             .unwrap(),
             message.target().unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn source_finish_uses_prepared_metadata_without_a_projection_snapshot() {
-        let planner = SynthesisPlanner::new(LlmConfig {
-            enabled: false,
-            ..LlmConfig::default()
-        });
-
-        let (prepared, source, refs, fingerprint, command_id) = prepared_source(&planner);
-        let result = provider_result(&refs, Vec::new());
-        let resolution = planner
-            .finish_source_prepared(prepared, Ok(result), std::time::Duration::from_micros(19))
-            .await
-            .unwrap();
-        let super::super::SynthesisResolution::Success {
-            digest,
-            run,
-            episode,
-            command,
-        } = resolution
-        else {
-            panic!("a valid source result must materialize a digest and run")
-        };
-        let omission = SemanticOmission {
-            category: "source_input_budget".into(),
-            reason: "A protected message tail was omitted.".into(),
-            direct_refs: refs.clone(),
-        };
-        assert_eq!(
-            (
-                digest.episode_id,
-                digest.episode_revision_id,
-                digest.task_id
-            ),
-            (None, None, None)
-        );
-        assert_eq!(
-            (digest.repository_id, digest.worktree_id),
-            (Some(source.repository_id), Some(source.worktree_id))
-        );
-        assert_eq!(
-            (
-                digest.from_watermark,
-                digest.to_watermark,
-                digest.episode_source_watermark,
-                digest.episode_confirmation_watermark,
-                digest.trigger,
-            ),
-            (2, 3, None, None, SemanticDigestTrigger::SourceMessages)
-        );
-        assert_eq!(digest.selected_direct_refs, refs);
-        assert_eq!(
-            digest.application,
-            SemanticDigestApplication {
-                progress_delta: vec![SemanticStructuredDelta {
-                    label: "checkpoint".into(),
-                    value: "The protected message records a checkpoint.".into(),
-                    direct_refs: refs.clone(),
-                }],
-                decision_delta: Vec::new(),
-                failed_routes: Vec::new(),
-                resolved_items: Vec::new(),
-                open_loops: Vec::new(),
-                outcome_delta: Vec::new(),
-                omissions: vec![omission],
-                candidates: Vec::new(),
-                completeness: SemanticCompleteness::Partial,
-            }
-        );
-        assert_eq!(
-            (
-                digest.model_id.as_str(),
-                digest.prompt_hash,
-                digest.schema_version,
-                digest.algorithm_revision.as_str(),
-                digest.effective_config_hash,
-                digest.job_fingerprint,
-                digest.status,
-                digest.created_at_us,
-                digest.source_target.as_ref(),
-            ),
-            (
-                planner.llm.model.as_str(),
-                crate::provider::source_prompt_hash(),
-                crate::provider::SEMANTIC_SCHEMA_VERSION,
-                "source-finish-test",
-                [8; 32],
-                fingerprint,
-                SemanticDigestStatus::LlmEnriched,
-                42,
-                Some(&source),
-            )
-        );
-        assert!(episode.is_none());
-        assert_eq!(
-            (
-                run.episode_id,
-                run.episode_revision_id,
-                run.from_watermark,
-                run.to_watermark,
-                run.selected_direct_refs.as_slice(),
-                run.job_fingerprint,
-                run.status,
-            ),
-            (
-                None,
-                None,
-                2,
-                3,
-                refs.as_slice(),
-                fingerprint,
-                DerivationRunStatus::Succeeded,
-            )
-        );
-        assert_eq!(
-            (
-                run.quota_usage,
-                run.model_id.as_str(),
-                run.prompt_hash,
-                run.schema_version,
-                run.algorithm_revision.as_str(),
-                run.effective_config_hash,
-                run.created_at_us,
-                run.source_target.as_ref(),
-            ),
-            (
-                DerivationQuotaUsage {
-                    input_tokens: 7,
-                    output_tokens: 3,
-                    calls: 1,
-                    wall_time_us: 5,
-                },
-                planner.llm.model.as_str(),
-                crate::provider::source_prompt_hash(),
-                crate::provider::SEMANTIC_SCHEMA_VERSION,
-                "source-finish-test",
-                [8; 32],
-                42,
-                Some(&source),
-            )
-        );
-        assert_eq!(command.command_id(), command_id);
-        assert_eq!(command.events().len(), 2);
-        assert!(matches!(
-            &command.events()[0].payload,
-            JournalPayload::SemanticDigestRecorded(recorded) if recorded.as_ref() == digest.as_ref()
-        ));
-        assert!(matches!(
-            &command.events()[1].payload,
-            JournalPayload::SemanticDerivationRunRecorded(recorded) if recorded.as_ref() == &run
-        ));
-
-        let run = finish_source_audit(
-            &planner,
-            Err(crate::provider::ProviderError::Transport),
-            std::time::Duration::from_micros(23),
-            DerivationRunStatus::ProviderFailed,
-        )
-        .await;
-        assert_eq!(run.quota_usage.calls, 1);
-        assert_eq!(run.quota_usage.wall_time_us, 23);
-
-        let mut over_budget = provider_result(&source_refs(), Vec::new());
-        over_budget.input_tokens = u64::MAX;
-        let run = finish_source_audit(
-            &planner,
-            Ok(over_budget),
-            std::time::Duration::from_micros(5),
-            DerivationRunStatus::BudgetExhausted,
-        )
-        .await;
-        assert_eq!(run.quota_usage.input_tokens, u64::MAX);
-        assert_eq!(run.quota_usage.calls, 1);
-
-        let run = finish_source_audit(
-            &planner,
-            Ok(provider_result(
-                &source_refs(),
-                vec![ProviderSemanticCandidate::ScenarioPatch {
-                    scenario_revision_id: RevisionId::new_v7(),
-                    current_state_delta: Vec::new(),
-                    open_loop_delta: Vec::new(),
-                    outcome_delta: Vec::new(),
-                }],
-            )),
-            std::time::Duration::from_micros(5),
-            DerivationRunStatus::SchemaRejected,
-        )
-        .await;
-        assert_eq!(run.quota_usage.calls, 1);
-
-        let (mut prepared, _, _, _, _) = prepared_source(&planner);
-        prepared.target = SynthesisTarget::Episode(RevisionId::new_v7());
-        assert!(matches!(
-            planner
-                .finish_source_prepared(
-                    prepared,
-                    Err(crate::provider::ProviderError::Transport),
-                    std::time::Duration::ZERO,
-                )
-                .await,
-            Err(crate::semantic::SemanticServiceError::InvalidInput)
-        ));
     }
 }

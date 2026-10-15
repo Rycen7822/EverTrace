@@ -3129,33 +3129,13 @@ impl BackgroundScheduler {
                     retryable: false,
                 });
             }
-            let context = self
-                .writer
-                .source_summary_current_context(job)
-                .await
-                .map_err(map_writer)?;
-            let jobs = RuntimeSchedulerView::from_rows(context.frontier, &context.rows)
+            let snapshot = self.writer.project().await.map_err(map_writer)?;
+            let jobs = RuntimeSchedulerView::from_snapshot(&snapshot)
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             if !jobs.jobs.iter().any(|current| current == job) {
                 return Ok(BackgroundProgress::default());
             }
-            let allowed = match crate::jobs::synthesis::source::input_rows(&context.rows, job) {
-                Ok(input) => {
-                    let report = self.report.read().await.clone();
-                    crate::jobs::synthesis::source::allowed_rows(
-                        &self.writer,
-                        report.as_ref(),
-                        &context.rows,
-                        &input,
-                        self.runtime.effective_config_hash,
-                    )
-                    .await
-                    .map_err(|_| BackgroundSchedulerError::Store)?
-                }
-                Err(_) => false,
-            };
-            if !allowed {
-                drop(context);
+            if !self.synthesis_repository_allowed(&snapshot, job).await? {
                 let frontier = self.writer.sync_frontier().await.map_err(map_writer)?;
                 self.fail_stale(job, frontier).await?;
                 return Ok(BackgroundProgress {
@@ -3163,11 +3143,9 @@ impl BackgroundScheduler {
                     retryable: false,
                 });
             }
-            let expected_frontier = context.frontier;
-            drop(context);
             let result = self
                 .writer
-                .commit_if_frontier(command.clone(), now_us()?, expected_frontier)
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier)
                 .await;
             if result.is_ok()
                 || self

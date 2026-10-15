@@ -480,12 +480,6 @@ struct ProjectionValidation {
     appended_rows: Option<Vec<crate::JournalRow>>,
 }
 
-enum ProjectionRowsMode {
-    Snapshot,
-    Frontier,
-    SourceSummary,
-}
-
 impl ProjectionValidation {
     fn objects_bound(&self, other: &SqliteStamp) -> bool {
         self.stamp.incarnation == other.incarnation
@@ -543,8 +537,6 @@ pub struct JournalWriter {
     // it and it carries no projection content or state.
     #[cfg(test)]
     capture_delta_selections: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    source_summary_hot_selections: std::sync::atomic::AtomicU64,
     // Declared last: the sibling lock must be released only after the native
     // and SQLite bindings of this writer have been dropped.
     _lock: SiblingWriterLock,
@@ -583,12 +575,6 @@ impl JournalWriter {
             self.physical_stamp()
                 .is_ok_and(|live| stamp.appended_successor_bound(&live))
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn source_summary_hot_selections_for_test(&self) -> u64 {
-        self.source_summary_hot_selections
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Select GC candidates from already validated journal admission state.
@@ -788,8 +774,6 @@ impl JournalWriter {
             projection_validation: Mutex::new([None, None]),
             #[cfg(test)]
             capture_delta_selections: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            source_summary_hot_selections: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -960,8 +944,6 @@ impl JournalWriter {
             projection_validation,
             #[cfg(test)]
                 capture_delta_selections: _,
-            #[cfg(test)]
-                source_summary_hot_selections: _,
             _lock,
         } = self;
         readers.revoke();
@@ -1004,8 +986,6 @@ impl JournalWriter {
             projection_validation,
             #[cfg(test)]
                 capture_delta_selections: _,
-            #[cfg(test)]
-                source_summary_hot_selections: _,
         } = self;
         readers.revoke();
         drop((
@@ -1234,7 +1214,7 @@ impl JournalWriter {
 
     /// Restore and validate current objects without driving unrelated indexes.
     pub async fn project_objects(&self) -> Result<ProjectionSnapshot, StoreError> {
-        self.project_validated(false, ProjectionRowsMode::Snapshot)
+        self.project_validated(false, true)
             .await?
             .1
             .ok_or(StoreError::StoreCorrupt)
@@ -1242,10 +1222,7 @@ impl JournalWriter {
 
     /// Synchronize objects without returning their rows to the caller.
     pub async fn sync_objects_frontier(&self) -> Result<u64, StoreError> {
-        Ok(self
-            .project_validated(false, ProjectionRowsMode::Frontier)
-            .await?
-            .0)
+        Ok(self.project_validated(false, false).await?.0)
     }
 
     pub async fn inbox_current_context(
@@ -1330,8 +1307,7 @@ impl JournalWriter {
             .map_err(|_| StoreError::StoreCorrupt)?[0]
             .is_none()
         {
-            self.project_validated(false, ProjectionRowsMode::Frontier)
-                .await?;
+            self.project_validated(false, false).await?;
         }
         // Route facts are the one bounded Search closure read directly from
         // the persisted objects table. A Procedure candidate can arrive after
@@ -1341,8 +1317,7 @@ impl JournalWriter {
         // stamp this is the existing no-row validation hit; ordinary evidence
         // Search never takes this branch.
         if candidate.is_some_and(|candidate| candidate.include_procedure_route) {
-            self.project_validated(false, ProjectionRowsMode::Frontier)
-                .await?;
+            self.project_validated(false, false).await?;
         }
         let frontier = self.normal_search_admission_frontier()?;
         let scope = self.admission_state.scope_current_context(request)?;
@@ -1425,8 +1400,7 @@ impl JournalWriter {
             &ProjectionValidation,
         ) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        self.project_validated(false, ProjectionRowsMode::Frontier)
-            .await?;
+        self.project_validated(false, false).await?;
         let result = async {
             let stamp = self
                 .projection_validation
@@ -1460,10 +1434,7 @@ impl JournalWriter {
     /// Reserved sequence numbers are not a committed frontier. All projection
     /// validation and per-family commits must succeed before this returns.
     pub async fn sync_frontier(&self) -> Result<u64, StoreError> {
-        Ok(self
-            .project_validated(true, ProjectionRowsMode::Frontier)
-            .await?
-            .0)
+        Ok(self.project_validated(true, false).await?.0)
     }
 
     #[cfg(test)]
@@ -1473,73 +1444,10 @@ impl JournalWriter {
     }
 
     pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
-        self.project_validated(true, ProjectionRowsMode::Snapshot)
+        self.project_validated(true, true)
             .await?
             .1
             .ok_or(StoreError::StoreCorrupt)
-    }
-
-    pub async fn source_summary_current_context(
-        &self,
-        job: &crate::DurableJob,
-    ) -> Result<crate::SourceSummaryCurrentContext, StoreError> {
-        let result = async {
-            let (frontier, snapshot) = self
-                .project_validated(true, ProjectionRowsMode::SourceSummary)
-                .await?;
-            let context = match snapshot {
-                Some(snapshot) => {
-                    crate::SourceSummaryCurrentContext::from_snapshot(&snapshot, job)?
-                }
-                None => {
-                    let job_row_id = format!("runtime:job:{}", job.job_id);
-                    let metadata_rows = {
-                        self.lock_sqlite()?
-                            .source_summary_metadata_rows(&job_row_id)?
-                    };
-                    self.admission_state
-                        .source_facts()
-                        .source_summary_current_context(job, frontier, metadata_rows)?
-                }
-            };
-            self.validate_source_summary_stamp(frontier).await?;
-            Ok(context)
-        }
-        .await;
-        if result.is_err() {
-            *self
-                .projection_validation
-                .lock()
-                .map_err(|_| StoreError::StoreCorrupt)? = [None, None];
-        }
-        result
-    }
-
-    async fn validate_source_summary_stamp(&self, frontier: u64) -> Result<(), StoreError> {
-        self.validate_projection_directories(true)?;
-        let before = self.physical_stamp()?;
-        let search_version = self
-            .search
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let stamp = self
-            .projection_validation
-            .lock()
-            .map_err(|_| StoreError::StoreCorrupt)?[1]
-            .clone()
-            .ok_or(StoreError::StoreCorrupt)?;
-        if stamp.stamp != before
-            || stamp.search_version != search_version
-            || stamp.frontier != frontier
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-        self.validate_projection_directories(true)?;
-        if self.physical_stamp()? != before {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Ok(())
     }
 
     fn validate_projection_directories(&self, indexes: bool) -> Result<(), StoreError> {
@@ -1563,11 +1471,8 @@ impl JournalWriter {
     async fn project_validated(
         &self,
         indexes: bool,
-        mode: ProjectionRowsMode,
+        return_rows: bool,
     ) -> Result<(u64, Option<ProjectionSnapshot>), StoreError> {
-        // SourceSummary retains the original snapshot proof policy even when
-        // an exact, source-proven hit can omit full row materialization.
-        let return_rows = !matches!(mode, ProjectionRowsMode::Frontier);
         let result = async {
             self.validate_projection_directories(indexes)?;
             let before = self.physical_stamp()?;
@@ -1608,14 +1513,6 @@ impl JournalWriter {
                 .flatten()
                 .filter(|stamp| stamp.stamp == before && stamp.search_version == before_search);
             let hit = if indexes { all } else { objects };
-            let source_summary_hot = matches!(mode, ProjectionRowsMode::SourceSummary)
-                && indexes
-                && hit.is_some_and(|stamp| stamp.source_prefix_proven);
-            let source_summary_proof = if source_summary_hot {
-                hit.cloned()
-            } else {
-                None
-            };
             let (
                 frontier,
                 snapshot,
@@ -1624,12 +1521,7 @@ impl JournalWriter {
                 content_proven,
                 source_prefix_proven,
             ) = if let Some(stamp) = hit {
-                let snapshot = if source_summary_hot {
-                    #[cfg(test)]
-                    self.source_summary_hot_selections
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    None
-                } else if return_rows {
+                let snapshot = if return_rows {
                     let rows = {
                         let state = self.lock_sqlite()?;
                         if stamp.source_prefix_proven {
@@ -1831,14 +1723,6 @@ impl JournalWriter {
             } else {
                 search_version
             };
-            if let Some(proof) = &source_summary_proof
-                && (after != proof.stamp
-                    || frontier != proof.frontier
-                    || search_version != proof.search_version
-                    || !proof.source_prefix_proven)
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
             {
                 let stamp = Some(ProjectionValidation {
                     stamp: after,

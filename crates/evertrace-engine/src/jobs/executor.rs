@@ -92,11 +92,6 @@ enum WriterRequest {
         indexes: bool,
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
-    SourceSummaryCurrent {
-        job: evertrace_store::DurableJob,
-        reply:
-            oneshot::Sender<Result<evertrace_store::SourceSummaryCurrentContext, WriterActorError>>,
-    },
     SyncFrontier {
         indexes: bool,
         reply: oneshot::Sender<Result<u64, WriterActorError>>,
@@ -560,21 +555,6 @@ impl WriterHandle {
         self.sender
             .send(WriterRequest::Project {
                 indexes: true,
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
-    pub(crate) async fn source_summary_current_context(
-        &self,
-        job: &evertrace_store::DurableJob,
-    ) -> Result<evertrace_store::SourceSummaryCurrentContext, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::SourceSummaryCurrent {
-                job: job.clone(),
                 reply,
             })
             .await
@@ -1200,21 +1180,6 @@ async fn run_writer(
                         writer.project_objects().await
                     }
                     .map_err(map_store_error);
-                    let fatal = result.is_err();
-                    let _ = reply.send(result);
-                    if fatal {
-                        return Err(WriterActorError::Store);
-                    }
-                }
-                WriterRequest::SourceSummaryCurrent { job, reply } => {
-                    if reply.is_closed() {
-                        continue;
-                    }
-                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
-                    let result = writer
-                        .source_summary_current_context(&job)
-                        .await
-                        .map_err(map_store_error);
                     let fatal = result.is_err();
                     let _ = reply.send(result);
                     if fatal {

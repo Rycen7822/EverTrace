@@ -88,9 +88,8 @@ pub use projections::{
     ReconciliationFrontier, ReconciliationWorkItem, RecoveryEvidenceCurrentView,
     RepositoryReadContext, RuntimeSchedulerView, ScopeCurrentContext, ScopeCurrentRequest,
     SegmentationCurrentState, SegmentationCurrentView, SemanticCurrentView,
-    SessionCatalogCurrentContext, SourceSummaryCurrentContext, WorkBindingCurrentView,
-    WorkIdentityCurrentView, object_deletion_preview, reduce_journal,
-    repository_scope_purge_preview,
+    SessionCatalogCurrentContext, WorkBindingCurrentView, WorkIdentityCurrentView,
+    object_deletion_preview, reduce_journal, repository_scope_purge_preview,
 };
 pub use purge::{
     OBJECT_DELETION_ALGORITHM_REVISION, ObjectDeletionCandidateAdmission,
