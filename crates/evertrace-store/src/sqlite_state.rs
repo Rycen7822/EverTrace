@@ -143,6 +143,7 @@ content_hash, causation_id, correlation_id, effective_config_hash, algorithm_rev
 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)";
 
 const SELECT_OBJECT_ROWS: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows ORDER BY row_id";
+const SELECT_SOURCE_SUMMARY_METADATA_ROWS: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows WHERE row_id = ?1 OR object_kind = 'object_deletion_ledger' ORDER BY row_id";
 const SELECT_OBJECT_ROWS_WITHOUT_SOURCE_FACTS: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows WHERE object_kind IS NULL OR object_kind NOT IN ('source_receipt', 'source_observation', 'evidence_surface') ORDER BY row_id";
 const SELECT_OBJECT_CHECKPOINT: &str = "SELECT row_id, row_kind, row_class, object_family, object_kind, object_id, current_revision_id, lifecycle, epistemic, authority, publication_state, support_state, project_id, repository_id, worktree_id, task_id, workstream_id, session_id, payload_json, source_event_seq, projection_generation FROM object_rows WHERE row_id = ?1";
 const SELECT_BATCH_OBJECT_ROWS: &str = "SELECT o.row_id, o.row_kind, o.row_class, o.object_family, o.object_kind, o.object_id, o.current_revision_id, o.lifecycle, o.epistemic, o.authority, o.publication_state, o.support_state, o.project_id, o.repository_id, o.worktree_id, o.task_id, o.workstream_id, o.session_id, o.payload_json, o.source_event_seq, o.projection_generation FROM object_rows o JOIN projection_batch_ids b ON o.row_id = b.row_id";
@@ -814,6 +815,13 @@ impl SqliteState {
 
     pub(crate) fn object_rows_without_source_facts(&self) -> Result<Vec<ObjectRow>, StoreError> {
         self.with_connection(read_object_rows_without_source_facts)
+    }
+
+    pub(crate) fn source_summary_metadata_rows(
+        &self,
+        job_row_id: &str,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
+        self.with_connection(|connection| read_source_summary_metadata_rows(connection, job_row_id))
     }
 
     #[cfg(test)]
@@ -1641,6 +1649,26 @@ fn read_object_rows_without_source_facts(
     read_object_rows_query(connection, SELECT_OBJECT_ROWS_WITHOUT_SOURCE_FACTS)
 }
 
+fn read_source_summary_metadata_rows(
+    connection: &Connection,
+    job_row_id: &str,
+) -> Result<Vec<ObjectRow>, StoreError> {
+    let mut statement = connection
+        .prepare(SELECT_SOURCE_SUMMARY_METADATA_ROWS)
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut queried = statement
+        .query(params![job_row_id])
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let mut rows = Vec::new();
+    let mut payload_blocks = crate::objects::RowPayloadBlockBuilder::default();
+    while let Some(sql_row) = queried.next().map_err(|_| StoreError::StoreCorrupt)? {
+        payload_blocks.push_row(&mut rows, object_row_from_sql(sql_row)?)?;
+    }
+    payload_blocks.finish(&mut rows)?;
+    rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+    Ok(rows)
+}
+
 fn read_object_rows_query(
     connection: &Connection,
     query: &str,
@@ -2453,6 +2481,62 @@ mod tests {
             vec!["checkpoint:evertrace_objects", "row:c"]
         );
         assert_eq!(state.objects_epoch(), 4);
+    }
+
+    #[test]
+    fn source_summary_metadata_reads_current_job_and_every_deletion_row() {
+        let (_temp, _data_dir, mut state, _) = initialized_state();
+        let row = |row_id: &str, object_kind: &str, lifecycle: &str| ObjectRow {
+            row_id: row_id.into(),
+            row_kind: ObjectRowKind::Data,
+            row_class: Some(ObjectRowClass::Projection),
+            object_family: None,
+            object_kind: Some(object_kind.into()),
+            object_id: None,
+            current_revision_id: None,
+            lifecycle: Some(lifecycle.into()),
+            epistemic: None,
+            authority: None,
+            publication_state: None,
+            support_state: None,
+            project_id: None,
+            repository_id: None,
+            worktree_id: None,
+            task_id: None,
+            workstream_id: None,
+            session_id: None,
+            payload_json: Some("{}".into()),
+            source_event_seq: 1,
+            projection_generation: 1,
+        };
+        for row in [
+            row("runtime:job:source", "durable_job", "queued"),
+            row(
+                "deletion:pending",
+                "object_deletion_ledger",
+                "purge_pending",
+            ),
+            row("deletion:purged", "object_deletion_ledger", "purged"),
+            row("unrelated:receipt", "source_receipt", "active"),
+        ] {
+            state.insert_object_row_for_test(&row).unwrap();
+        }
+
+        let selected = state
+            .source_summary_metadata_rows("runtime:job:source")
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|row| row.row_id.as_str())
+                .collect::<Vec<_>>(),
+            ["deletion:pending", "deletion:purged", "runtime:job:source"]
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|row| row.lifecycle.as_deref() == Some("purge_pending"))
+        );
     }
 
     #[test]
