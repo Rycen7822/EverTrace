@@ -1385,18 +1385,24 @@ pub(crate) fn recorded_daily_usage(
     snapshot: &evertrace_store::ProjectionSnapshot,
     occurred_at_us: i64,
 ) -> Result<DerivationQuotaUsage, crate::semantic::SemanticServiceError> {
-    let current = CurrentFacts::try_from(snapshot.clone())?;
-    recorded_daily_usage_current(&current, occurred_at_us)
+    recorded_daily_usage_rows(&snapshot.rows, occurred_at_us)
 }
 
 pub(crate) fn recorded_daily_usage_current(
     current: &CurrentFacts,
     occurred_at_us: i64,
 ) -> Result<DerivationQuotaUsage, crate::semantic::SemanticServiceError> {
+    recorded_daily_usage_rows(current.other_rows(), occurred_at_us)
+}
+
+fn recorded_daily_usage_rows(
+    rows: &[evertrace_store::ObjectRow],
+    occurred_at_us: i64,
+) -> Result<DerivationQuotaUsage, crate::semantic::SemanticServiceError> {
     if occurred_at_us < 0 {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     }
-    Ok(daily_usage(&prior_runs(current)?, occurred_at_us))
+    Ok(daily_usage(&prior_runs_rows(rows)?, occurred_at_us))
 }
 
 /// Rebuild reservations from the existing claim history. Unacknowledged,
@@ -1553,9 +1559,13 @@ fn daily_usage(prior: &[SemanticDerivationRun], occurred_at_us: i64) -> Derivati
 fn prior_runs(
     current: &CurrentFacts,
 ) -> Result<Vec<SemanticDerivationRun>, crate::semantic::SemanticServiceError> {
-    current
-        .other_rows()
-        .iter()
+    prior_runs_rows(current.other_rows())
+}
+
+fn prior_runs_rows(
+    rows: &[evertrace_store::ObjectRow],
+) -> Result<Vec<SemanticDerivationRun>, crate::semantic::SemanticServiceError> {
+    rows.iter()
         .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
         .filter(|row| row.object_kind.as_deref() == Some("semantic_derivation_run"))
         .map(|row| {
