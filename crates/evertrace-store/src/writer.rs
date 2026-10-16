@@ -21,8 +21,9 @@ use crate::{
     migrations::{L0002, MigrationOutcome},
     objects::{ObjectRow, checkpoint_from_rows},
     projections::{
-        JournalAdmissionState, ProjectionSnapshot, ProjectionWorker,
-        ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier, ReconciliationFrontier,
+        CurrentFacts, JournalAdmissionState, ProjectionOutput, ProjectionSnapshot,
+        ProjectionWorker, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
+        ReconciliationFrontier,
     },
     query::L0002ProjectionWorker,
     search::SEARCH_TABLE,
@@ -518,6 +519,13 @@ impl ProjectionValidation {
             && other.journal_epoch == self.stamp.journal_epoch.saturating_add(1)
             && self.appended_successor_bound(other)
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProjectionReturn {
+    None,
+    Snapshot,
+    CurrentFacts,
 }
 
 pub struct JournalWriter {
@@ -1214,15 +1222,22 @@ impl JournalWriter {
 
     /// Restore and validate current objects without driving unrelated indexes.
     pub async fn project_objects(&self) -> Result<ProjectionSnapshot, StoreError> {
-        self.project_validated(false, true)
+        match self
+            .project_validated(false, ProjectionReturn::Snapshot)
             .await?
             .1
-            .ok_or(StoreError::StoreCorrupt)
+        {
+            Some(ProjectionOutput::Snapshot(snapshot)) => Ok(snapshot),
+            _ => Err(StoreError::StoreCorrupt),
+        }
     }
 
     /// Synchronize objects without returning their rows to the caller.
     pub async fn sync_objects_frontier(&self) -> Result<u64, StoreError> {
-        Ok(self.project_validated(false, false).await?.0)
+        Ok(self
+            .project_validated(false, ProjectionReturn::None)
+            .await?
+            .0)
     }
 
     pub async fn inbox_current_context(
@@ -1307,7 +1322,8 @@ impl JournalWriter {
             .map_err(|_| StoreError::StoreCorrupt)?[0]
             .is_none()
         {
-            self.project_validated(false, false).await?;
+            self.project_validated(false, ProjectionReturn::None)
+                .await?;
         }
         // Route facts are the one bounded Search closure read directly from
         // the persisted objects table. A Procedure candidate can arrive after
@@ -1317,7 +1333,8 @@ impl JournalWriter {
         // stamp this is the existing no-row validation hit; ordinary evidence
         // Search never takes this branch.
         if candidate.is_some_and(|candidate| candidate.include_procedure_route) {
-            self.project_validated(false, false).await?;
+            self.project_validated(false, ProjectionReturn::None)
+                .await?;
         }
         let frontier = self.normal_search_admission_frontier()?;
         let scope = self.admission_state.scope_current_context(request)?;
@@ -1400,7 +1417,8 @@ impl JournalWriter {
             &ProjectionValidation,
         ) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        self.project_validated(false, false).await?;
+        self.project_validated(false, ProjectionReturn::None)
+            .await?;
         let result = async {
             let stamp = self
                 .projection_validation
@@ -1434,7 +1452,10 @@ impl JournalWriter {
     /// Reserved sequence numbers are not a committed frontier. All projection
     /// validation and per-family commits must succeed before this returns.
     pub async fn sync_frontier(&self) -> Result<u64, StoreError> {
-        Ok(self.project_validated(true, false).await?.0)
+        Ok(self
+            .project_validated(true, ProjectionReturn::None)
+            .await?
+            .0)
     }
 
     #[cfg(test)]
@@ -1444,10 +1465,25 @@ impl JournalWriter {
     }
 
     pub async fn project(&self) -> Result<ProjectionSnapshot, StoreError> {
-        self.project_validated(true, true)
+        match self
+            .project_validated(true, ProjectionReturn::Snapshot)
             .await?
             .1
-            .ok_or(StoreError::StoreCorrupt)
+        {
+            Some(ProjectionOutput::Snapshot(snapshot)) => Ok(snapshot),
+            _ => Err(StoreError::StoreCorrupt),
+        }
+    }
+
+    pub async fn project_current(&self, indexes: bool) -> Result<CurrentFacts, StoreError> {
+        match self
+            .project_validated(indexes, ProjectionReturn::CurrentFacts)
+            .await?
+            .1
+        {
+            Some(ProjectionOutput::CurrentFacts(facts)) => Ok(facts),
+            _ => Err(StoreError::StoreCorrupt),
+        }
     }
 
     fn validate_projection_directories(&self, indexes: bool) -> Result<(), StoreError> {
@@ -1471,8 +1507,8 @@ impl JournalWriter {
     async fn project_validated(
         &self,
         indexes: bool,
-        return_rows: bool,
-    ) -> Result<(u64, Option<ProjectionSnapshot>), StoreError> {
+        output_kind: ProjectionReturn,
+    ) -> Result<(u64, Option<ProjectionOutput>), StoreError> {
         let result = async {
             self.validate_projection_directories(indexes)?;
             let before = self.physical_stamp()?;
@@ -1503,7 +1539,9 @@ impl JournalWriter {
                 )
             });
             let capture_input = validated_input.filter(|stamp| {
-                indexes && !return_rows && stamp.capture_successor_bound(&before, before_search)
+                indexes
+                    && output_kind == ProjectionReturn::None
+                    && stamp.capture_successor_bound(&before, before_search)
             });
             let source_facts = validated_input
                 .filter(|stamp| stamp.source_prefix_proven)
@@ -1515,13 +1553,15 @@ impl JournalWriter {
             let hit = if indexes { all } else { objects };
             let (
                 frontier,
-                snapshot,
+                projection,
                 has_failed_job,
                 search_version,
                 content_proven,
                 source_prefix_proven,
             ) = if let Some(stamp) = hit {
-                let snapshot = if return_rows {
+                let projection = if output_kind == ProjectionReturn::None {
+                    None
+                } else if output_kind == ProjectionReturn::Snapshot {
                     let rows = {
                         let state = self.lock_sqlite()?;
                         if stamp.source_prefix_proven {
@@ -1530,7 +1570,7 @@ impl JournalWriter {
                             state.object_rows()?
                         }
                     };
-                    Some(if stamp.source_prefix_proven {
+                    Some(ProjectionOutput::Snapshot(if stamp.source_prefix_proven {
                         self.admission_state
                             .snapshot_with_source_prefix(rows, stamp.frontier)?
                     } else {
@@ -1538,13 +1578,30 @@ impl JournalWriter {
                             frontier: stamp.frontier,
                             rows,
                         }
-                    })
+                    }))
                 } else {
-                    None
+                    let rows = {
+                        let state = self.lock_sqlite()?;
+                        if stamp.source_prefix_proven {
+                            state.object_rows_without_source_facts()?
+                        } else {
+                            state.object_rows()?
+                        }
+                    };
+                    let facts = if stamp.source_prefix_proven {
+                        self.admission_state
+                            .current_facts_with_source_prefix(rows, stamp.frontier)?
+                    } else {
+                        CurrentFacts::from_full_snapshot(ProjectionSnapshot {
+                            frontier: stamp.frontier,
+                            rows,
+                        })?
+                    };
+                    Some(ProjectionOutput::CurrentFacts(facts))
                 };
                 (
                     stamp.frontier,
-                    snapshot,
+                    projection,
                     stamp.has_failed_job,
                     stamp.search_version,
                     stamp.content_proven && (indexes || stamp.stamp == before),
@@ -1620,7 +1677,7 @@ impl JournalWriter {
                         source_prefix_proven,
                     )
                 } else {
-                    let (snapshot, objects_epoch, delta, source_prefix_proven) =
+                    let (projection, objects_epoch, delta, source_prefix_proven) =
                         if let Some(stamp) = objects {
                             let rows = {
                                 let state = self.lock_sqlite()?;
@@ -1630,17 +1687,35 @@ impl JournalWriter {
                                     state.object_rows()?
                                 }
                             };
-                            let snapshot = if stamp.source_prefix_proven {
-                                self.admission_state
-                                    .snapshot_with_source_prefix(rows, stamp.frontier)?
+                            let projection = if stamp.source_prefix_proven {
+                                if output_kind == ProjectionReturn::Snapshot {
+                                    ProjectionOutput::Snapshot(
+                                        self.admission_state
+                                            .snapshot_with_source_prefix(rows, stamp.frontier)?,
+                                    )
+                                } else {
+                                    ProjectionOutput::CurrentFacts(
+                                        self.admission_state.current_facts_with_source_prefix(
+                                            rows,
+                                            stamp.frontier,
+                                        )?,
+                                    )
+                                }
                             } else {
-                                ProjectionSnapshot {
+                                let snapshot = ProjectionSnapshot {
                                     frontier: stamp.frontier,
                                     rows,
+                                };
+                                if output_kind == ProjectionReturn::Snapshot {
+                                    ProjectionOutput::Snapshot(snapshot)
+                                } else {
+                                    ProjectionOutput::CurrentFacts(
+                                        CurrentFacts::from_full_snapshot(snapshot)?,
+                                    )
                                 }
                             };
                             (
-                                snapshot,
+                                Some(projection),
                                 stamp.stamp.objects_epoch,
                                 None,
                                 stamp.source_prefix_proven,
@@ -1649,20 +1724,45 @@ impl JournalWriter {
                             let appended =
                                 validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
                             let worker = self.projection_worker();
-                            let (snapshot, objects_epoch, delta) = worker
-                                .catch_up_validated_with_source_facts(
-                                    validated_current,
-                                    appended,
-                                    source_facts.as_ref(),
+                            if source_facts.is_some() && output_kind != ProjectionReturn::Snapshot {
+                                let (facts, epoch, delta) = worker
+                                    .catch_up_validated_current_facts(
+                                        validated_current,
+                                        appended,
+                                        source_facts.as_ref(),
+                                    )
+                                    .await?;
+                                (
+                                    Some(ProjectionOutput::CurrentFacts(facts)),
+                                    epoch,
+                                    delta,
+                                    true,
                                 )
-                                .await?;
-                            let source_prefix_proven = if source_facts.is_some() {
-                                true
                             } else {
-                                self.admission_state
-                                    .source_prefix_matches_rows(&snapshot.rows, snapshot.frontier)?
-                            };
-                            (snapshot, objects_epoch, delta, source_prefix_proven)
+                                let (snapshot, epoch, delta) = worker
+                                    .catch_up_validated_with_source_facts(
+                                        validated_current,
+                                        appended,
+                                        source_facts.as_ref(),
+                                    )
+                                    .await?;
+                                let source_prefix_proven = if source_facts.is_some() {
+                                    true
+                                } else {
+                                    self.admission_state.source_prefix_matches_rows(
+                                        &snapshot.rows,
+                                        snapshot.frontier,
+                                    )?
+                                };
+                                let projection = if output_kind == ProjectionReturn::Snapshot {
+                                    ProjectionOutput::Snapshot(snapshot)
+                                } else {
+                                    ProjectionOutput::CurrentFacts(
+                                        CurrentFacts::from_full_snapshot(snapshot)?,
+                                    )
+                                };
+                                (Some(projection), epoch, delta, source_prefix_proven)
+                            }
                         };
                     let objects_stamp = self.physical_stamp()?;
                     if objects_stamp.objects_epoch != objects_epoch
@@ -1675,7 +1775,16 @@ impl JournalWriter {
                     let (search_version, content_proven) = if indexes {
                         let worker = self.l0002_projection_worker();
                         let (_, versions, derived) =
-                            worker.catch_up_validated_proof(&snapshot, delta).await?;
+                            match projection.as_ref().ok_or(StoreError::StoreCorrupt)? {
+                                ProjectionOutput::Snapshot(snapshot) => {
+                                    worker.catch_up_validated_proof(snapshot, delta).await?
+                                }
+                                ProjectionOutput::CurrentFacts(facts) => {
+                                    worker
+                                        .catch_up_validated_current_facts_proof(facts, delta)
+                                        .await?
+                                }
+                            };
                         if self.physical_stamp()?.relations_epoch != versions[0] {
                             return Err(StoreError::StoreCorrupt);
                         }
@@ -1692,13 +1801,27 @@ impl JournalWriter {
                         (0, false)
                     };
                     let has_failed_job =
-                        crate::projections::RuntimeSchedulerView::from_snapshot(&snapshot)?
-                            .jobs
-                            .iter()
-                            .any(|job| job.state == crate::JobStatus::Failed);
+                        match projection.as_ref().ok_or(StoreError::StoreCorrupt)? {
+                            ProjectionOutput::Snapshot(snapshot) => {
+                                crate::projections::RuntimeSchedulerView::from_snapshot(snapshot)?
+                            }
+                            ProjectionOutput::CurrentFacts(facts) => {
+                                crate::projections::RuntimeSchedulerView::from_rows(
+                                    facts.frontier(),
+                                    facts.other_rows(),
+                                )?
+                            }
+                        }
+                        .jobs
+                        .iter()
+                        .any(|job| job.state == crate::JobStatus::Failed);
                     (
-                        snapshot.frontier,
-                        return_rows.then_some(snapshot),
+                        match projection.as_ref().ok_or(StoreError::StoreCorrupt)? {
+                            ProjectionOutput::Snapshot(snapshot) => snapshot.frontier,
+                            ProjectionOutput::CurrentFacts(facts) => facts.frontier(),
+                        },
+                        (output_kind != ProjectionReturn::None)
+                            .then_some(projection.ok_or(StoreError::StoreCorrupt)?),
                         has_failed_job,
                         search_version,
                         content_proven,
@@ -1748,7 +1871,7 @@ impl JournalWriter {
                     stamps[1] = None;
                 }
             }
-            Ok((frontier, snapshot))
+            Ok((frontier, projection))
         }
         .await;
         if result.is_err() {

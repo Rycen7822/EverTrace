@@ -23,8 +23,8 @@ fn causal_seq(endpoint_seqs: &BTreeMap<String, u64>, source: &str, target: &str)
         .unwrap_or(0)
 }
 
-pub(super) fn index_typed_ids(
-    payload: &JournalPayload,
+pub(super) fn index_typed_ids<T: serde::Serialize + ?Sized>(
+    payload: &T,
     source_event_seq: u64,
     endpoint_seqs: &mut BTreeMap<String, u64>,
 ) -> Result<(), StoreError> {

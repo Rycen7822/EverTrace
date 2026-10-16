@@ -2230,6 +2230,206 @@ pub(crate) type SourceObservationFacts =
     BTreeMap<SourceObservationId, (Arc<SourceObservation>, u64)>;
 pub(crate) type EvidenceSurfaceFacts = BTreeMap<SourceObservationId, (Arc<EvidenceSurface>, u64)>;
 
+/// The complete logical current objects view, with the three large source
+/// families kept in their validated typed representation.
+pub struct CurrentFacts {
+    frontier: u64,
+    other_rows: Vec<ObjectRow>,
+    source_receipts: SourceReceiptFacts,
+    source_observations: SourceObservationFacts,
+    evidence_surfaces: EvidenceSurfaceFacts,
+}
+
+impl CurrentFacts {
+    pub fn frontier(&self) -> u64 {
+        self.frontier
+    }
+
+    /// All current object rows except source receipts, observations, and
+    /// evidence surfaces. This includes the complete objects checkpoint.
+    pub fn other_rows(&self) -> &[ObjectRow] {
+        &self.other_rows
+    }
+
+    pub fn source_receipts(&self) -> impl Iterator<Item = (&Arc<SourceReceipt>, u64)> + '_ {
+        self.source_receipts
+            .values()
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn source_observations(&self) -> impl Iterator<Item = (&Arc<SourceObservation>, u64)> + '_ {
+        self.source_observations
+            .values()
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn evidence_surfaces(&self) -> impl Iterator<Item = (&Arc<EvidenceSurface>, u64)> + '_ {
+        self.evidence_surfaces
+            .values()
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    /// Explicitly materialize the legacy complete canonical-row output.
+    pub fn into_full_snapshot(self) -> Result<ProjectionSnapshot, StoreError> {
+        SourceFactsRef {
+            source_receipts: &self.source_receipts,
+            source_observations: &self.source_observations,
+            evidence_surfaces: &self.evidence_surfaces,
+        }
+        .snapshot_with_source_prefix(self.other_rows, self.frontier)
+    }
+
+    pub(crate) fn from_full_snapshot(snapshot: ProjectionSnapshot) -> Result<Self, StoreError> {
+        let ProjectionSnapshot { frontier, rows } = snapshot;
+        let mut other_rows = Vec::new();
+        let mut source_receipts = SourceReceiptFacts::new();
+        let mut source_observations = SourceObservationFacts::new();
+        let mut evidence_surfaces = EvidenceSurfaceFacts::new();
+        for row in rows {
+            let Some(kind) = row.object_kind.as_deref() else {
+                other_rows.push(row);
+                continue;
+            };
+            if !matches!(
+                kind,
+                "source_receipt" | "source_observation" | "evidence_surface"
+            ) {
+                other_rows.push(row);
+                continue;
+            }
+            let payload_json = row
+                .payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?;
+            let payload: JournalPayload =
+                serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            if !payload
+                .matches_canonical_json(payload_json)
+                .map_err(|_| StoreError::StoreCorrupt)?
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            match payload {
+                JournalPayload::SourceReceiptRecorded(value) if kind == "source_receipt" => {
+                    let expected = source_receipt_row(&value, row.source_event_seq)?;
+                    if expected != row
+                        || source_receipts
+                            .insert(
+                                value.source_receipt_id,
+                                (Arc::new(*value), row.source_event_seq),
+                            )
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::SourceObservationRecorded(value)
+                    if kind == "source_observation" =>
+                {
+                    let expected = source_observation_row(&value, row.source_event_seq)?;
+                    if expected != row
+                        || source_observations
+                            .insert(
+                                value.source_observation_id,
+                                (Arc::new(*value), row.source_event_seq),
+                            )
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::EvidenceSurfaceRecorded(value) if kind == "evidence_surface" => {
+                    let expected = surface_row(
+                        value.source_observation_revision_ref,
+                        &value,
+                        row.source_event_seq,
+                    )?;
+                    if expected != row
+                        || evidence_surfaces
+                            .insert(
+                                value.source_observation_revision_ref,
+                                (Arc::new(*value), row.source_event_seq),
+                            )
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        let facts = Self {
+            frontier,
+            other_rows,
+            source_receipts,
+            source_observations,
+            evidence_surfaces,
+        };
+        facts.validate_frontier()?;
+        Ok(facts)
+    }
+
+    fn validate_frontier(&self) -> Result<(), StoreError> {
+        let checkpoints = self
+            .other_rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Checkpoint)
+            .collect::<Vec<_>>();
+        if checkpoints.len() != 1
+            || checkpoints[0].row_id != OBJECTS_CHECKPOINT_ID
+            || checkpoints[0].source_event_seq != self.frontier
+            || checkpoints[0].projection_generation != PROJECTION_GENERATION
+            || self
+                .other_rows
+                .iter()
+                .any(|row| row.source_event_seq > self.frontier)
+            || self
+                .source_receipts
+                .values()
+                .any(|(_, seq)| *seq > self.frontier)
+            || self
+                .source_observations
+                .values()
+                .any(|(_, seq)| *seq > self.frontier)
+            || self
+                .evidence_surfaces
+                .values()
+                .any(|(_, seq)| *seq > self.frontier)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+
+    fn source_rows_after(&self, checkpoint: u64) -> Result<Vec<ObjectRow>, StoreError> {
+        let mut rows = Vec::new();
+        for (value, seq) in self
+            .source_receipts
+            .values()
+            .filter(|(_, seq)| *seq > checkpoint)
+        {
+            rows.push(source_receipt_row(value.as_ref(), *seq)?);
+        }
+        for (value, seq) in self
+            .source_observations
+            .values()
+            .filter(|(_, seq)| *seq > checkpoint)
+        {
+            rows.push(source_observation_row(value.as_ref(), *seq)?);
+        }
+        for (id, (value, seq)) in self
+            .evidence_surfaces
+            .iter()
+            .filter(|(_, (_, seq))| *seq > checkpoint)
+        {
+            rows.push(surface_row(*id, value.as_ref(), *seq)?);
+        }
+        rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        Ok(rows)
+    }
+}
+
 #[derive(Clone, Default)]
 struct ReducerState {
     inventory: inventory::InventoryState,
@@ -6002,9 +6202,58 @@ impl JournalAdmissionState {
         self.source_facts()
             .snapshot_with_source_prefix(rows, checkpoint)
     }
+
+    pub(crate) fn current_facts_with_source_prefix(
+        &self,
+        rows: Vec<ObjectRow>,
+        checkpoint: u64,
+    ) -> Result<CurrentFacts, StoreError> {
+        self.source_facts()
+            .current_facts_with_source_prefix(rows, checkpoint)
+    }
 }
 
 impl SourceFactsRef<'_> {
+    fn current_facts_with_source_prefix(
+        &self,
+        mut other_rows: Vec<ObjectRow>,
+        checkpoint: u64,
+    ) -> Result<CurrentFacts, StoreError> {
+        if other_rows.iter().any(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some("source_receipt" | "source_observation" | "evidence_surface")
+            )
+        }) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        other_rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        let facts = CurrentFacts {
+            frontier: checkpoint,
+            other_rows,
+            source_receipts: self
+                .source_receipts
+                .iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .map(|(id, (value, seq))| (*id, (Arc::clone(value), *seq)))
+                .collect(),
+            source_observations: self
+                .source_observations
+                .iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .map(|(id, (value, seq))| (*id, (Arc::clone(value), *seq)))
+                .collect(),
+            evidence_surfaces: self
+                .evidence_surfaces
+                .iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .map(|(id, (value, seq))| (*id, (Arc::clone(value), *seq)))
+                .collect(),
+        };
+        facts.validate_frontier()?;
+        Ok(facts)
+    }
+
     fn snapshot_with_source_prefix(
         &self,
         mut rows: Vec<ObjectRow>,
@@ -13535,7 +13784,66 @@ impl ReducerState {
         Ok(ProjectionSnapshot { frontier, rows })
     }
 
-    fn into_rows(mut self) -> Result<Vec<ObjectRow>, StoreError> {
+    fn can_emit_current_facts(&self) -> bool {
+        self.deletions.events().next().is_none()
+            && self.scope_purges.events().next().is_none()
+            && self.repository_closures.is_empty()
+    }
+
+    fn preserves_source_prefix(&self, facts: &SourceFactsRef<'_>, checkpoint: u64) -> bool {
+        fn preserves<K: Ord, T>(
+            old: &BTreeMap<K, (Arc<T>, u64)>,
+            current: &BTreeMap<K, (Arc<T>, u64)>,
+            checkpoint: u64,
+        ) -> bool {
+            old.iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .all(|(key, (value, seq))| {
+                    current.get(key).is_some_and(|(current, current_seq)| {
+                        current_seq == seq && Arc::ptr_eq(value, current)
+                    })
+                })
+        }
+
+        preserves(facts.source_receipts, &self.source_receipts, checkpoint)
+            && preserves(
+                facts.source_observations,
+                &self.source_observations,
+                checkpoint,
+            )
+            && preserves(facts.evidence_surfaces, &self.evidence_surfaces, checkpoint)
+    }
+
+    fn into_current_facts(mut self, frontier: u64) -> Result<CurrentFacts, StoreError> {
+        self.validate_evidence_relations()?;
+        if !self.can_emit_current_facts() {
+            return Err(StoreError::Projection);
+        }
+        let source_receipts = std::mem::take(&mut self.source_receipts);
+        let source_observations = std::mem::take(&mut self.source_observations);
+        let evidence_surfaces = std::mem::take(&mut self.evidence_surfaces);
+        let mut other_rows = self.into_rows_with_source_rows(false)?;
+        other_rows.push(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION));
+        other_rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        let facts = CurrentFacts {
+            frontier,
+            other_rows,
+            source_receipts,
+            source_observations,
+            evidence_surfaces,
+        };
+        facts.validate_frontier()?;
+        Ok(facts)
+    }
+
+    fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
+        self.into_rows_with_source_rows(true)
+    }
+
+    fn into_rows_with_source_rows(
+        mut self,
+        include_source_rows: bool,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
         self.close_deleted_product_state();
         let repository_closures = self
             .repository_closures
@@ -13653,25 +13961,27 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (_, (value, seq)) in self.source_receipts {
-            let (fields, payload) = source_receipt_parts(value.as_ref());
-            push_canonical_row(
-                &mut rows,
-                &mut payload_blocks,
-                evidence_object_row_fields(fields, seq),
-                &payload,
-                &mut payload_scratch,
-            )?;
-        }
-        for (_, (value, seq)) in self.source_observations {
-            let (fields, payload) = source_observation_parts(value.as_ref());
-            push_canonical_row(
-                &mut rows,
-                &mut payload_blocks,
-                evidence_object_row_fields(fields, seq),
-                &payload,
-                &mut payload_scratch,
-            )?;
+        if include_source_rows {
+            for (_, (value, seq)) in self.source_receipts {
+                let (fields, payload) = source_receipt_parts(value.as_ref());
+                push_canonical_row(
+                    &mut rows,
+                    &mut payload_blocks,
+                    evidence_object_row_fields(fields, seq),
+                    &payload,
+                    &mut payload_scratch,
+                )?;
+            }
+            for (_, (value, seq)) in self.source_observations {
+                let (fields, payload) = source_observation_parts(value.as_ref());
+                push_canonical_row(
+                    &mut rows,
+                    &mut payload_blocks,
+                    evidence_object_row_fields(fields, seq),
+                    &payload,
+                    &mut payload_scratch,
+                )?;
+            }
         }
         for (key, (value, seq)) in self.source_watermarks {
             rows.push(runtime_row(
@@ -13681,15 +13991,17 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.evidence_surfaces {
-            let (row, payload) = surface_row_parts(id, value.as_ref(), seq);
-            push_canonical_row(
-                &mut rows,
-                &mut payload_blocks,
-                row,
-                &payload,
-                &mut payload_scratch,
-            )?;
+        if include_source_rows {
+            for (id, (value, seq)) in self.evidence_surfaces {
+                let (row, payload) = surface_row_parts(id, value.as_ref(), seq);
+                push_canonical_row(
+                    &mut rows,
+                    &mut payload_blocks,
+                    row,
+                    &payload,
+                    &mut payload_scratch,
+                )?;
+            }
         }
         for ((id, revision), (value, seq)) in self.host_occurrence_revisions {
             let mut row = physical_object_row(
@@ -15038,6 +15350,11 @@ pub struct ProjectionWorker {
     sqlite: SqliteHandle,
 }
 
+pub(crate) enum ProjectionOutput {
+    Snapshot(ProjectionSnapshot),
+    CurrentFacts(CurrentFacts),
+}
+
 /// The objects result of one closed capture successor that committed only this
 /// command's changed rows instead of rematerializing every unchanged row. It
 /// is explicitly not a complete `ProjectionSnapshot`.
@@ -15059,7 +15376,10 @@ impl ProjectionWorker {
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(false, None, None, None).await?.0)
+        match self.catch_up_inner(false, None, None, None, false).await?.0 {
+            ProjectionOutput::Snapshot(snapshot) => Ok(snapshot),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
     }
 
     #[cfg(test)]
@@ -15069,8 +15389,13 @@ impl ProjectionWorker {
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_rows, None)
-            .await
+        let (output, epoch, delta) = self
+            .catch_up_inner(false, validated_current, appended_rows, None, false)
+            .await?;
+        match output {
+            ProjectionOutput::Snapshot(snapshot) => Ok((snapshot, epoch, delta)),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
     }
 
     pub(crate) async fn catch_up_validated_with_source_facts(
@@ -15079,8 +15404,28 @@ impl ProjectionWorker {
         appended_rows: Option<&[JournalRow]>,
         source_facts: Option<&SourceFactsRef<'_>>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_rows, source_facts)
-            .await
+        let (output, epoch, delta) = self
+            .catch_up_inner(false, validated_current, appended_rows, source_facts, false)
+            .await?;
+        match output {
+            ProjectionOutput::Snapshot(snapshot) => Ok((snapshot, epoch, delta)),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
+    }
+
+    pub(crate) async fn catch_up_validated_current_facts(
+        &self,
+        validated_current: Option<(u64, u64, u64)>,
+        appended_rows: Option<&[JournalRow]>,
+        source_facts: Option<&SourceFactsRef<'_>>,
+    ) -> Result<(CurrentFacts, u64, Option<ProjectionJournalDelta>), StoreError> {
+        let (output, epoch, delta) = self
+            .catch_up_inner(false, validated_current, appended_rows, source_facts, true)
+            .await?;
+        match output {
+            ProjectionOutput::CurrentFacts(facts) => Ok((facts, epoch, delta)),
+            ProjectionOutput::Snapshot(_) => Err(StoreError::StoreCorrupt),
+        }
     }
 
     /// Try the closed capture successor path. `Ok(None)` means the retained
@@ -15222,7 +15567,8 @@ impl ProjectionWorker {
         validated_current: Option<(u64, u64, u64)>,
         appended_rows: Option<&[JournalRow]>,
         source_facts: Option<&SourceFactsRef<'_>>,
-    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
+        return_current_facts: bool,
+    ) -> Result<(ProjectionOutput, u64, Option<ProjectionJournalDelta>), StoreError> {
         let (current, journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
             let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             let stamp = state.stamp()?;
@@ -15297,7 +15643,12 @@ impl ProjectionWorker {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .objects_epoch();
-            return Ok((expected, committed_epoch, None));
+            let output = if return_current_facts {
+                ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(expected)?)
+            } else {
+                ProjectionOutput::Snapshot(expected)
+            };
+            return Ok((output, committed_epoch, None));
         }
         let mut state = if validated_frontier.is_some() {
             // The writer already validated this exact old input before its
@@ -15319,14 +15670,25 @@ impl ProjectionWorker {
         };
         validate_delta(checkpoint_frontier, journal_frontier, &delta)?;
         if delta.is_empty() {
-            let snapshot = match source_facts {
-                Some(facts) => facts.snapshot_with_source_prefix(current, checkpoint_frontier)?,
-                None => ProjectionSnapshot {
+            let output = match (return_current_facts, source_facts) {
+                (true, Some(facts)) => ProjectionOutput::CurrentFacts(
+                    facts.current_facts_with_source_prefix(current, checkpoint_frontier)?,
+                ),
+                (true, None) => ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(
+                    ProjectionSnapshot {
+                        frontier: checkpoint_frontier,
+                        rows: current,
+                    },
+                )?),
+                (false, Some(facts)) => ProjectionOutput::Snapshot(
+                    facts.snapshot_with_source_prefix(current, checkpoint_frontier)?,
+                ),
+                (false, None) => ProjectionOutput::Snapshot(ProjectionSnapshot {
                     frontier: checkpoint_frontier,
                     rows: current,
-                },
+                }),
             };
-            return Ok((snapshot, current_epoch, None));
+            return Ok((output, current_epoch, None));
         }
         let reconcile_core = delta.iter().any(|row| {
             matches!(
@@ -15372,12 +15734,67 @@ impl ProjectionWorker {
             }
             state.validate_evidence_relations()?;
         }
-        let expected = state.into_snapshot(journal_frontier)?;
         let ordinary_upsert = !reconcile_all
             && !reconcile_recall
             && !reconcile_core
             && !reconcile_wiki
             && !reconcile_procedure_effect;
+        let direct_facts = return_current_facts
+            && ordinary_upsert
+            && source_facts.is_some_and(|facts| {
+                state.can_emit_current_facts()
+                    && state.preserves_source_prefix(facts, checkpoint_frontier)
+            });
+        if direct_facts {
+            let facts = state.into_current_facts(journal_frontier)?;
+            validate_ordinary_upsert_rows(&current, facts.other_rows())?;
+            let current_by_id = current
+                .iter()
+                .map(|row| (row.row_id.as_str(), row))
+                .collect::<BTreeMap<_, _>>();
+            let mut changed = incremental_changed_rows(
+                facts.other_rows(),
+                &current_by_id,
+                reconcile_recall,
+                reconcile_core,
+                reconcile_wiki,
+                reconcile_procedure_effect,
+                None,
+            );
+            changed.extend(facts.source_rows_after(checkpoint_frontier)?);
+            changed.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+            if inject_before_commit_failure {
+                return Err(StoreError::Projection);
+            }
+            self.commit_rows(
+                &changed,
+                ObjectReconcile {
+                    recall: reconcile_recall,
+                    core: reconcile_core,
+                    wiki: reconcile_wiki,
+                    procedure_effect: reconcile_procedure_effect,
+                    all: false,
+                },
+                Some(checkpoint_frontier),
+            )?;
+            let committed_epoch = self
+                .sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .objects_epoch();
+            validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            return Ok((
+                ProjectionOutput::CurrentFacts(facts),
+                committed_epoch,
+                Some(ProjectionJournalDelta {
+                    journal_epoch,
+                    checkpoint: checkpoint_frontier,
+                    rows: delta,
+                }),
+            ));
+        }
+
+        let expected = state.into_snapshot(journal_frontier)?;
         if ordinary_upsert {
             validate_ordinary_upsert_rows(&current, &expected.rows)?;
         }
@@ -15387,7 +15804,7 @@ impl ProjectionWorker {
             .collect::<BTreeMap<_, _>>();
         let changed = (!reconcile_all).then(|| {
             incremental_changed_rows(
-                &expected,
+                &expected.rows,
                 &current_by_id,
                 reconcile_recall,
                 reconcile_core,
@@ -15423,8 +15840,13 @@ impl ProjectionWorker {
             validate_ordinary_commit_version(current_epoch, committed_epoch)?;
             // The validated current rows are retained or replaced by changed
             // rows; the same transaction wrote those rows and the checkpoint.
+            let output = if return_current_facts {
+                ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(expected)?)
+            } else {
+                ProjectionOutput::Snapshot(expected)
+            };
             return Ok((
-                expected,
+                output,
                 committed_epoch,
                 Some(ProjectionJournalDelta {
                     journal_epoch,
@@ -15450,8 +15872,13 @@ impl ProjectionWorker {
         if persisted_snapshot.rows != expected.rows {
             return Err(StoreError::Projection);
         }
+        let output = if return_current_facts {
+            ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(persisted_snapshot)?)
+        } else {
+            ProjectionOutput::Snapshot(persisted_snapshot)
+        };
         Ok((
-            persisted_snapshot,
+            output,
             committed_epoch,
             Some(ProjectionJournalDelta {
                 journal_epoch,
@@ -15463,7 +15890,10 @@ impl ProjectionWorker {
 
     #[cfg(test)]
     async fn catch_up_with_commit_fault(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(true, None, None, None).await?.0)
+        match self.catch_up_inner(true, None, None, None, false).await?.0 {
+            ProjectionOutput::Snapshot(snapshot) => Ok(snapshot),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
@@ -15688,7 +16118,7 @@ fn runtime_rows_with_upserts(
 }
 
 fn incremental_changed_rows(
-    expected: &ProjectionSnapshot,
+    expected: &[ObjectRow],
     current_by_id: &BTreeMap<&str, &ObjectRow>,
     reconcile_recall: bool,
     reconcile_core: bool,
@@ -15697,7 +16127,6 @@ fn incremental_changed_rows(
     source_prefix_checkpoint: Option<u64>,
 ) -> Vec<ObjectRow> {
     expected
-        .rows
         .iter()
         .filter(|row| {
             !source_prefix_checkpoint.is_some_and(|frontier| {
@@ -16529,11 +16958,27 @@ mod tests {
         };
 
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, false, false, false, false, None),
+            incremental_changed_rows(
+                &expected.rows,
+                &current_by_id,
+                false,
+                false,
+                false,
+                false,
+                None,
+            ),
             vec![expected.rows[0].clone()]
         );
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, true, false, false, false, None),
+            incremental_changed_rows(
+                &expected.rows,
+                &current_by_id,
+                true,
+                false,
+                false,
+                false,
+                None,
+            ),
             expected.rows
         );
     }
@@ -17536,6 +17981,10 @@ mod tests {
             writer.project_objects().await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
+        assert!(matches!(
+            writer.project_current(true).await,
+            Err(StoreError::StoreCorrupt | StoreError::Projection)
+        ));
         drop(writer);
     }
 
@@ -17839,6 +18288,84 @@ mod tests {
             expected.search
         );
         replayed
+    }
+
+    #[tokio::test]
+    async fn current_facts_share_source_payloads_and_l0002_matches_full_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    vec![
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                        JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+                    ],
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        let seeded = writer.project().await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+
+        let (receipt, observation, surface) =
+            r105_capture("current-facts", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    2,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let facts = writer.project_current(true).await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 0);
+        assert!(writer.source_prefix_proven_for_test());
+        assert_eq!(facts.source_receipts().count(), 1);
+        assert_eq!(facts.source_observations().count(), 1);
+        assert_eq!(facts.evidence_surfaces().count(), 1);
+        assert!(facts.other_rows().iter().all(|row| {
+            !matches!(
+                row.object_kind.as_deref(),
+                Some("source_receipt" | "source_observation" | "evidence_surface")
+            )
+        }));
+
+        let replayed = writer.full_projection().await.unwrap();
+        assert_eq!(facts.frontier(), replayed.frontier);
+        assert_eq!(facts.into_full_snapshot().unwrap(), replayed);
+        assert_eq!(
+            writer
+                .project_current(true)
+                .await
+                .unwrap()
+                .into_full_snapshot()
+                .unwrap(),
+            replayed
+        );
+        let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
+        let persisted = writer.l0002_projection_worker().current().await.unwrap();
+        assert_eq!(persisted, expected);
+        let surface_seq = replayed
+            .rows
+            .iter()
+            .find(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+            .unwrap()
+            .source_event_seq;
+        assert!(surface_seq > seeded.frontier);
+        assert!(
+            persisted
+                .search
+                .iter()
+                .any(|row| row.source_event_seq == surface_seq)
+        );
     }
 
     #[tokio::test]

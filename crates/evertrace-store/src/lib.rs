@@ -79,7 +79,7 @@ pub use objects::{
 };
 pub use projections::{
     AttemptCurrentView, AutoresearchCurrentView, CaptureCurrentContext, CaptureCurrentItem,
-    CompetingResolutionEvidenceView, EpisodeCurrentView, InventoryCurrentContext,
+    CompetingResolutionEvidenceView, CurrentFacts, EpisodeCurrentView, InventoryCurrentContext,
     MemoriesCurrentContext, NamedCurrentDependency, ObjectDeletionCandidateAdmissionView,
     OperationBurstCurrentView, PassiveSourceCurrentContext, PassiveSourceCurrentItem,
     PassiveSourceSelection, ProjectionSnapshot, ProjectionWorker, RecallCurrentAtom,

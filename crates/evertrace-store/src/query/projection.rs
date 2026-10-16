@@ -11,10 +11,11 @@ use evertrace_domain::{
 use lancedb::Table;
 
 use crate::{
-    JournalPayload, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
+    JournalPayload, JournalPayloadRef, ObjectRow, ObjectRowKind, ProjectionSnapshot, StoreError,
     projections::{
-        ProjectionJournalDelta, l3_core_projection, procedure_context_effect, recall_need,
-        recall_trigger_contract, synthesis::wiki_render_identity, validate_delta, wiki_projection,
+        CurrentFacts, ProjectionJournalDelta, l3_core_projection, procedure_context_effect,
+        recall_need, recall_trigger_contract, synthesis::wiki_render_identity, validate_delta,
+        wiki_projection,
     },
     relations::{
         RelationProjectionRow, build_attempt_relation_rows, build_autoresearch_relation_rows,
@@ -37,6 +38,35 @@ use super::relation_assembly::{
     add_physical, add_recovery, add_repository, add_semantic, add_work_binding, add_work_identity,
     index_typed_ids, update_capture_relations,
 };
+
+#[derive(Clone, Copy)]
+enum ObjectProjectionView<'a> {
+    Snapshot(&'a ProjectionSnapshot),
+    CurrentFacts(&'a CurrentFacts),
+}
+
+impl<'a> ObjectProjectionView<'a> {
+    fn frontier(self) -> u64 {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.frontier,
+            Self::CurrentFacts(facts) => facts.frontier(),
+        }
+    }
+
+    fn rows(self) -> &'a [ObjectRow] {
+        match self {
+            Self::Snapshot(snapshot) => &snapshot.rows,
+            Self::CurrentFacts(facts) => facts.other_rows(),
+        }
+    }
+
+    fn current_facts(self) -> Option<&'a CurrentFacts> {
+        match self {
+            Self::Snapshot(_) => None,
+            Self::CurrentFacts(facts) => Some(facts),
+        }
+    }
+}
 
 /// The validated persisted L0002 base for one journal frontier.
 struct L0002Handoff {
@@ -150,7 +180,10 @@ impl L0002ProjectionWorker {
         &self,
         objects: &ProjectionSnapshot,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(objects, None, false, false).await?.0)
+        Ok(self
+            .catch_up_inner(ObjectProjectionView::Snapshot(objects), None, false, false)
+            .await?
+            .0)
     }
 
     /// The ordinary complete path with its actual-derive flag. Only a run that
@@ -161,8 +194,27 @@ impl L0002ProjectionWorker {
         objects: &ProjectionSnapshot,
         journal_delta: Option<ProjectionJournalDelta>,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        self.catch_up_inner(objects, journal_delta, false, false)
-            .await
+        self.catch_up_inner(
+            ObjectProjectionView::Snapshot(objects),
+            journal_delta,
+            false,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn catch_up_validated_current_facts_proof(
+        &self,
+        facts: &CurrentFacts,
+        journal_delta: Option<ProjectionJournalDelta>,
+    ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
+        self.catch_up_inner(
+            ObjectProjectionView::CurrentFacts(facts),
+            journal_delta,
+            false,
+            false,
+        )
+        .await
     }
 
     /// Complete one confirmed closed capture successor from an already proven
@@ -224,13 +276,13 @@ impl L0002ProjectionWorker {
 
     async fn catch_up_inner(
         &self,
-        objects: &ProjectionSnapshot,
+        objects: ObjectProjectionView<'_>,
         journal_delta: Option<ProjectionJournalDelta>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
         let handoff = self
-            .prepare_handoff(objects.frontier, journal_delta)
+            .prepare_handoff(objects.frontier(), journal_delta)
             .await?;
         if handoff.relation_frontier == handoff.frontier
             && handoff.search_frontier == handoff.frontier
@@ -245,7 +297,11 @@ impl L0002ProjectionWorker {
                 false,
             ));
         }
-        let expected = derive_l0002_projections(objects)?;
+        let expected = derive_l0002_projection_rows(
+            objects.frontier(),
+            objects.rows(),
+            objects.current_facts(),
+        )?;
         let (snapshot, versions) = self
             .commit_expected(handoff, expected, fail_relation_commit, fail_search_commit)
             .await?;
@@ -401,7 +457,7 @@ impl L0002ProjectionWorker {
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
         Ok(self
             .catch_up_inner(
-                objects,
+                ObjectProjectionView::Snapshot(objects),
                 journal_delta,
                 fail_relation_commit,
                 fail_search_commit,
@@ -506,21 +562,24 @@ fn capture_delta_search(
 pub fn derive_l0002_projections(
     objects: &ProjectionSnapshot,
 ) -> Result<L0002ProjectionSnapshot, StoreError> {
-    if objects
-        .rows
+    derive_l0002_projection_rows(objects.frontier, &objects.rows, None)
+}
+
+fn derive_l0002_projection_rows(
+    frontier: u64,
+    rows: &[ObjectRow],
+    source_facts: Option<&CurrentFacts>,
+) -> Result<L0002ProjectionSnapshot, StoreError> {
+    if rows
         .iter()
         .filter(|row| row.row_kind == ObjectRowKind::Checkpoint)
         .count()
         != 1
-        || objects
-            .rows
+        || rows
             .iter()
             .find(|row| row.row_kind == ObjectRowKind::Checkpoint)
-            .is_none_or(|row| row.source_event_seq != objects.frontier)
-        || objects
-            .rows
-            .iter()
-            .any(|row| row.source_event_seq > objects.frontier)
+            .is_none_or(|row| row.source_event_seq != frontier)
+        || rows.iter().any(|row| row.source_event_seq > frontier)
     {
         return Err(StoreError::StoreCorrupt);
     }
@@ -566,8 +625,9 @@ pub fn derive_l0002_projections(
     let mut endpoint_seqs = BTreeMap::<String, u64>::new();
     let mut current_revisions = BTreeMap::<String, (u64, String)>::new();
     let mut wiki_atoms_by_revision = BTreeMap::<RevisionId, Atom>::new();
-    for row in objects
-        .data_rows()
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == ObjectRowKind::Data)
         .filter(|row| row.object_kind.as_deref() == Some("atom_revision"))
     {
         let payload: JournalPayload = serde_json::from_str(
@@ -588,7 +648,10 @@ pub fn derive_l0002_projections(
             return Err(StoreError::StoreCorrupt);
         }
     }
-    for row in objects.data_rows() {
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == ObjectRowKind::Data)
+    {
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
@@ -611,7 +674,10 @@ pub fn derive_l0002_projections(
         }
     }
 
-    for row in objects.data_rows() {
+    for row in rows
+        .iter()
+        .filter(|row| row.row_kind == ObjectRowKind::Data)
+    {
         if recall_trigger_contract(row)?.is_some()
             || recall_need(row)?.is_some()
             || l3_core_projection(row)?
@@ -691,13 +757,13 @@ pub fn derive_l0002_projections(
             JournalPayload::SourceReceiptRecorded(value) => latest(
                 &mut receipts,
                 value.source_receipt_id,
-                *value,
+                std::sync::Arc::new(*value),
                 row.source_event_seq,
             ),
             JournalPayload::EvidenceSurfaceRecorded(value) => latest(
                 &mut surfaces,
                 value.source_observation_revision_ref,
-                *value,
+                std::sync::Arc::new(*value),
                 row.source_event_seq,
             ),
             JournalPayload::HostOccurrenceNormalized(value) => latest(
@@ -893,6 +959,51 @@ pub fn derive_l0002_projections(
         }
     }
 
+    if let Some(source_facts) = source_facts {
+        for (value, seq) in source_facts.source_receipts() {
+            if seq > frontier {
+                return Err(StoreError::StoreCorrupt);
+            }
+            index_typed_ids(
+                &JournalPayloadRef::Receipt(value.as_ref()),
+                seq,
+                &mut endpoint_seqs,
+            )?;
+            latest(
+                &mut receipts,
+                value.source_receipt_id,
+                std::sync::Arc::clone(value),
+                seq,
+            );
+        }
+        for (value, seq) in source_facts.source_observations() {
+            if seq > frontier {
+                return Err(StoreError::StoreCorrupt);
+            }
+            index_typed_ids(
+                &JournalPayloadRef::Observation(value.as_ref()),
+                seq,
+                &mut endpoint_seqs,
+            )?;
+        }
+        for (value, seq) in source_facts.evidence_surfaces() {
+            if seq > frontier {
+                return Err(StoreError::StoreCorrupt);
+            }
+            index_typed_ids(
+                &JournalPayloadRef::Surface(value.as_ref()),
+                seq,
+                &mut endpoint_seqs,
+            )?;
+            latest(
+                &mut surfaces,
+                value.source_observation_revision_ref,
+                std::sync::Arc::clone(value),
+                seq,
+            );
+        }
+    }
+
     let available_atom_revisions = atoms.keys().copied().collect::<BTreeSet<_>>();
     let available_procedure_revisions = procedures.keys().copied().collect::<BTreeSet<_>>();
     let relation_atoms = all_values(&atoms)
@@ -1042,7 +1153,7 @@ pub fn derive_l0002_projections(
         )?,
         &endpoint_seqs,
     );
-    relations.insert(RelationProjectionRow::checkpoint(objects.frontier));
+    relations.insert(RelationProjectionRow::checkpoint(frontier));
 
     let mut search = exact_rows.into_values().collect::<BTreeSet<_>>();
     let mut receipts_by_observation = BTreeMap::new();
@@ -1057,9 +1168,9 @@ pub fn derive_l0002_projections(
             .ok_or(StoreError::StoreCorrupt)?;
         search.insert(surface_row(&surface, receipt, seq)?);
     }
-    search.insert(SearchProjectionRow::checkpoint(objects.frontier));
+    search.insert(SearchProjectionRow::checkpoint(frontier));
     Ok(L0002ProjectionSnapshot {
-        frontier: objects.frontier,
+        frontier,
         relations: relations.into_iter().collect(),
         search: search.into_iter().collect(),
     })
