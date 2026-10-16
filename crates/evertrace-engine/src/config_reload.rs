@@ -132,27 +132,26 @@ impl ConfigReloadService {
         }
         let runtime = crate::recovery::prepare_recovery_runtime(&self.data_dir, &config, None)
             .map_err(|_| ConfigReloadError::Invalid)?;
-        let projection = self
-            .writer
-            .project()
-            .await
-            .map_err(|_| ConfigReloadError::Invalid)?;
-        let previous_hash = match projection
-            .rows
-            .iter()
-            .find(|row| row.row_id == "runtime:config:current")
-        {
-            None => config.hash(),
-            Some(row) => match row
-                .payload_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
-            {
-                Some(JournalPayload::ConfigAudit(audit)) if audit.is_applied() => {
-                    audit.effective_config_hash
-                }
-                _ => return Err(ConfigReloadError::Invalid),
-            },
+        let previous_hash = {
+            // Keep the indexed barrier, but release its facts before auditing.
+            let current = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(|_| ConfigReloadError::Invalid)?;
+            match current.other_row("runtime:config:current") {
+                None => config.hash(),
+                Some(row) => match row
+                    .payload_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+                {
+                    Some(JournalPayload::ConfigAudit(audit)) if audit.is_applied() => {
+                        audit.effective_config_hash
+                    }
+                    _ => return Err(ConfigReloadError::Invalid),
+                },
+            }
         };
         let applied = Self::prepare_audit(
             &config,
