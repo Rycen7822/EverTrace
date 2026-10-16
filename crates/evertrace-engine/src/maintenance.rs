@@ -87,6 +87,7 @@ use evertrace_domain::{
         ProposalStatus,
     },
 };
+use evertrace_store::projections::CurrentFacts;
 use evertrace_store::{
     BackupError, BackupSummary, DirtyTargetKind, DurableJob, EventScope, JobBudget, JobLease,
     JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalCommand,
@@ -1312,8 +1313,8 @@ async fn validate_restore_jobs(
     config: &evertrace_domain::config::EffectiveConfig,
     at: i64,
 ) -> Result<(), evertrace_store::restore::RestoreError> {
-    let snapshot = candidate.full_projection().await?;
-    let view = RuntimeSchedulerView::from_snapshot(&snapshot)?;
+    let snapshot = CurrentFacts::try_from(candidate.full_projection().await?)?;
+    let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
     for mut job in view
         .jobs
         .iter()
@@ -1371,7 +1372,7 @@ async fn validate_restore_jobs(
 }
 
 fn restore_job_is_current(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     view: &RuntimeSchedulerView,
     job: &DurableJob,
     config: &evertrace_domain::config::EffectiveConfig,
@@ -1401,7 +1402,7 @@ fn restore_job_is_current(
 /// Pure authoritative target checks, shared by offline preparation and the
 /// ordinary pre-lease boundary. Host manifests are additionally checked online.
 fn job_target_is_current(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     view: &RuntimeSchedulerView,
     job: &DurableJob,
     config_hash: [u8; 32],
@@ -1415,7 +1416,7 @@ fn job_target_is_current(
     if !source_synthesis
         && !(job.kind == crate::jobs::procedure::KIND
             && crate::jobs::procedure::has_source_target(job))
-        && job.target_watermark > snapshot.frontier
+        && job.target_watermark > snapshot.frontier()
     {
         return Ok(false);
     }
@@ -1450,7 +1451,7 @@ fn job_target_is_current(
                         && dirty.target_kind.as_str() == job.kind
                         && job.idempotency_key == format!("{}:{}", job.kind, dirty.target_id)
                         && snapshot
-                            .row(&format!("runtime:dirty:{}", dirty.stable_key()))
+                            .other_row(&format!("runtime:dirty:{}", dirty.stable_key()))
                             .is_some_and(|row| {
                                 row.source_event_seq == job.target_watermark
                                     && job.target_generation == row.source_event_seq.max(1)
@@ -1492,10 +1493,13 @@ fn job_target_is_current(
             if !valid_job {
                 false
             } else if let Ok(revision) = job.target_revision.parse() {
-                crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(snapshot)
-                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?
-                    .current_procedure_by_revision(revision)
-                    .is_some()
+                crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                    snapshot.frontier(),
+                    snapshot.other_rows(),
+                )
+                .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?
+                .current_procedure_by_revision(revision)
+                .is_some()
             } else {
                 false
             }
@@ -1516,26 +1520,31 @@ fn job_target_is_current(
                 && job.algorithm_revision == evertrace_store::QUIESCED_BACKUP_ALGORITHM_REVISION
         }
         evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND => {
-            evertrace_store::ScopePurgeCurrentView::from_snapshot(snapshot)?
-                .events
-                .values()
-                .any(|progress| {
-                    progress.purge_job_id == job.job_id
-                        && progress.deletion_generation == job.target_generation
-                        && progress.confirmation_frontier == job.target_watermark
-                        && progress.stage != evertrace_domain::purge::ScopePurgeStage::Purged
-                })
+            evertrace_store::ScopePurgeCurrentView::from_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )?
+            .events
+            .values()
+            .any(|progress| {
+                progress.purge_job_id == job.job_id
+                    && progress.deletion_generation == job.target_generation
+                    && progress.confirmation_frontier == job.target_watermark
+                    && progress.stage != evertrace_domain::purge::ScopePurgeStage::Purged
+            })
         }
         _ => return Err(evertrace_store::StoreError::InvalidInput),
     })
 }
 
 fn import_target_is_current(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<bool, evertrace_store::StoreError> {
-    let sessions =
-        evertrace_store::session_import::SessionImportCurrentView::from_snapshot(snapshot)?;
+    let sessions = evertrace_store::session_import::SessionImportCurrentView::from_rows(
+        snapshot.frontier(),
+        snapshot.other_rows(),
+    )?;
     Ok(sessions.sessions.values().any(|session| {
         job.idempotency_key == format!("session_import:{}", session.source_key())
             && job.target_revision == session.metadata.source_revision.as_str()
@@ -1630,7 +1639,7 @@ impl QuiescedBackupRequest {
 }
 
 struct ClaimedJob {
-    snapshot: evertrace_store::ProjectionSnapshot,
+    current: CurrentFacts,
     job: DurableJob,
     report: Option<OwnedRwLockReadGuard<Option<HostProbeReport>>>,
 }
@@ -1841,13 +1850,25 @@ impl BackgroundScheduler {
         // Capture-backlog selection consumes current objects; ingest owns its
         // acknowledgement barrier and executable projection jobs sync below.
         let mut snapshot = if capture_state == CaptureAdmissionState::Normal && ordinary_pending {
-            self.writer.project_objects().await.map_err(map_writer)?
+            self.writer
+                .project_current(false)
+                .await
+                .map_err(map_writer)?
         } else {
-            self.writer.project().await.map_err(map_writer)?
+            self.writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?
         };
         if optional_allowed && let Some(inventory) = &self.inventory {
             match inventory.enqueue_observed(&snapshot).await {
-                Ok(true) => snapshot = self.writer.project().await.map_err(map_writer)?,
+                Ok(true) => {
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?
+                }
                 Ok(false) => {}
                 Err(crate::jobs::InventoryWorkerError::StaleFrontier) => retryable = true,
                 Err(crate::jobs::InventoryWorkerError::Store) => {
@@ -1856,7 +1877,7 @@ impl BackgroundScheduler {
             }
         }
         let recovery_now_us = now_us()?;
-        let recovery = expired_leases(&snapshot.rows, recovery_now_us, snapshot.frontier)
+        let recovery = expired_leases(snapshot.other_rows(), recovery_now_us, snapshot.frontier())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if !recovery.is_empty() {
             let events = recovery
@@ -1884,12 +1905,16 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, recovery_now_us, snapshot.frontier)
+                .commit_if_frontier(command, recovery_now_us, snapshot.frontier())
                 .await
             {
                 Ok(outcome) => {
                     completed += usize::from(!outcome.replayed);
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
                     return Ok(RunOnceOutcome {
@@ -1904,11 +1929,15 @@ impl BackgroundScheduler {
             }
         }
 
-        let mut view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let mut view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if self.seed_capture_artifacts(&snapshot, &view).await? {
-            snapshot = self.writer.project().await.map_err(map_writer)?;
-            view = RuntimeSchedulerView::from_snapshot(&snapshot)
+            snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                 .map_err(|_| BackgroundSchedulerError::Store)?;
         }
         let max_synthesis_wall_time = Duration::from_secs(self.dreaming.max_wall_time.seconds());
@@ -1990,14 +2019,19 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(outcome) => {
                     completed += usize::from(!outcome.replayed);
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
                     return Ok(RunOnceOutcome {
@@ -2013,15 +2047,21 @@ impl BackgroundScheduler {
         }
         if optional_allowed {
             if self.enqueue_procedure_consumers(&snapshot, &view).await? {
-                snapshot = self.writer.project().await.map_err(map_writer)?;
-                view = RuntimeSchedulerView::from_snapshot(&snapshot)
+                snapshot = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
+                view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                     .map_err(|_| BackgroundSchedulerError::Store)?;
             }
             let occurred_at_us = now_us()?;
             let deadline = Instant::now() + Duration::from_millis(250);
-            let usage =
-                crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&snapshot)
-                    .map_err(|_| BackgroundSchedulerError::Store)?;
+            let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
             let cohorts = usage
                 .promotion_cohorts(
                     self.stable_min_outcome_supported,
@@ -2052,8 +2092,8 @@ impl BackgroundScheduler {
                                 "{PROCEDURE_PROMOTION_JOB_KIND}:{target_revision}"
                             ),
                             target_revision,
-                            target_watermark: snapshot.frontier,
-                            target_generation: snapshot.frontier.max(1),
+                            target_watermark: snapshot.frontier(),
+                            target_generation: snapshot.frontier().max(1),
                             kind: PROCEDURE_PROMOTION_JOB_KIND.into(),
                             algorithm_revision: PROCEDURE_PROMOTION_JOB_KIND.into(),
                             model_id: None,
@@ -2074,13 +2114,20 @@ impl BackgroundScheduler {
                     .map_err(|_| BackgroundSchedulerError::Store)?;
                 match self
                     .writer
-                    .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                    .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                     .await
                 {
                     Ok(_) => {
-                        snapshot = self.writer.project().await.map_err(map_writer)?;
-                        view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                            .map_err(|_| BackgroundSchedulerError::Store)?;
+                        snapshot = self
+                            .writer
+                            .project_current(true)
+                            .await
+                            .map_err(map_writer)?;
+                        view = RuntimeSchedulerView::from_rows(
+                            snapshot.frontier(),
+                            snapshot.other_rows(),
+                        )
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
                     }
                     Err(WriterActorError::StaleFrontier) => retryable = true,
                     Err(error) => return Err(map_writer(error)),
@@ -2167,13 +2214,18 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
                 Err(WriterActorError::StaleFrontier) => retryable = true,
                 Err(error) => return Err(map_writer(error)),
@@ -2233,16 +2285,6 @@ impl BackgroundScheduler {
                 })
                 .map(|job| job.target_revision.as_str())
                 .collect::<BTreeSet<_>>();
-            let capture_rows = snapshot
-                .data_rows()
-                .filter(|row| {
-                    matches!(
-                        row.object_kind.as_deref(),
-                        Some("source_observation" | "source_receipt")
-                    )
-                })
-                .map(|row| (row.row_id.as_str(), row))
-                .collect::<BTreeMap<_, _>>();
             capture_candidates
                 .into_values()
                 .filter(|dirty| {
@@ -2265,33 +2307,17 @@ impl BackgroundScheduler {
                     {
                         return Ok(None);
                     }
-                    let read_payload = |id: &str| {
-                        let row = capture_rows
-                            .get(id)
-                            .ok_or(BackgroundSchedulerError::Store)?;
-                        serde_json::from_str::<JournalPayload>(
-                            row.payload_json
-                                .as_deref()
-                                .ok_or(BackgroundSchedulerError::Store)?,
-                        )
-                        .map_err(|_| BackgroundSchedulerError::Store)
-                    };
-                    let JournalPayload::SourceObservationRecorded(observation) = read_payload(
-                        &format!("object:evidence:source_observation:{}", dirty.target_id),
-                    )?
-                    else {
-                        return Err(BackgroundSchedulerError::Store);
-                    };
+                    let observation_id = SourceObservationId::from_str(&dirty.target_id)
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    let (observation, _) = snapshot
+                        .source_observation(observation_id)
+                        .ok_or(BackgroundSchedulerError::Store)?;
                     observation
                         .validate()
                         .map_err(|_| BackgroundSchedulerError::Store)?;
-                    let JournalPayload::SourceReceiptRecorded(receipt) = read_payload(&format!(
-                        "object:evidence:source_receipt:{}",
-                        observation.source_receipt_ref,
-                    ))?
-                    else {
-                        return Err(BackgroundSchedulerError::Store);
-                    };
+                    let (receipt, _) = snapshot
+                        .source_receipt(observation.source_receipt_ref)
+                        .ok_or(BackgroundSchedulerError::Store)?;
                     receipt
                         .validate()
                         .map_err(|_| BackgroundSchedulerError::Store)?;
@@ -2442,13 +2468,18 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
                     self.capture_cursor.lock().await.rescan_pending = true;
@@ -2569,13 +2600,18 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                     idle.refresh(&snapshot, &view)?;
                 }
                 Err(WriterActorError::StaleFrontier) => retryable = true,
@@ -2633,7 +2669,7 @@ impl BackgroundScheduler {
                 match claimed.job.kind.as_str() {
                     "support_closure" => {
                         completed += self
-                            .run_support_closure(&claimed.snapshot, &claimed.job)
+                            .run_support_closure(&claimed.current, &claimed.job)
                             .await?;
                     }
                     "capture_reconciliation" => {
@@ -2676,7 +2712,7 @@ impl BackgroundScheduler {
                 if claimed.job.kind != "objects_projection" {
                     return Err(BackgroundSchedulerError::Store);
                 }
-                if claimed.snapshot.frontier < claimed.job.target_watermark {
+                if claimed.current.frontier() < claimed.job.target_watermark {
                     retryable = true;
                     continue;
                 }
@@ -2704,7 +2740,7 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
                 match self
                     .writer
-                    .commit_if_frontier(command, occurred_at_us, claimed.snapshot.frontier)
+                    .commit_if_frontier(command, occurred_at_us, claimed.current.frontier())
                     .await
                 {
                     Ok(outcome) => completed += usize::from(!outcome.replayed),
@@ -2743,7 +2779,10 @@ impl BackgroundScheduler {
                     let progress = crate::jobs::reconcile_repository_scope_purge_batch(
                         &self.writer,
                         &self.runtime,
-                        claimed.snapshot,
+                        claimed
+                            .current
+                            .into_full_snapshot()
+                            .map_err(|_| BackgroundSchedulerError::Store)?,
                         &claimed.job,
                         &self.repository_purge_plans,
                     )
@@ -2829,7 +2868,7 @@ impl BackgroundScheduler {
                     continue;
                 }
                 if !self
-                    .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
+                    .synthesis_repository_allowed(&claimed.current, &claimed.job)
                     .await?
                 {
                     // Permission revalidation may itself record a revocation.
@@ -2841,7 +2880,7 @@ impl BackgroundScheduler {
                 let occurred_at_us = now_us()?;
                 let daily_wall_time = self
                     .synthesis
-                    .remaining_daily_wall_time(&claimed.snapshot, occurred_at_us)
+                    .remaining_daily_wall_time(&claimed.current, occurred_at_us)
                     .map_err(|_| BackgroundSchedulerError::Store)?;
                 let source_job = matches!(
                     evertrace_domain::semantic::SemanticJobTarget::parse(
@@ -2850,18 +2889,18 @@ impl BackgroundScheduler {
                     Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. })
                 );
                 let ClaimedJob {
-                    snapshot,
+                    current,
                     job,
                     report: claim_report,
                 } = claimed;
                 drop(claim_report);
-                let claim_frontier = snapshot.frontier;
+                let claim_frontier = current.frontier();
                 let execution_future = async {
                     if source_job {
                         let report = self.report.read().await.clone();
                         self.synthesis
                             .execute_source_job(
-                                snapshot,
+                                current,
                                 &job,
                                 self.runtime.effective_config_hash,
                                 occurred_at_us,
@@ -2874,17 +2913,17 @@ impl BackgroundScheduler {
                     } else {
                         self.synthesis
                             .execute_owned_episode_job(
-                                snapshot,
+                                current,
                                 &job,
                                 occurred_at_us,
                                 max_synthesis_wall_time,
                                 &self.writer,
                                 || async {
                                     let current =
-                                        self.writer.project().await.map_err(|_| {
+                                        self.writer.project_current(true).await.map_err(|_| {
                                             crate::provider::ProviderError::Transport
                                         })?;
-                                    if current.frontier == claim_frontier
+                                    if current.frontier() == claim_frontier
                                         && self
                                             .synthesis_repository_allowed(&current, &job)
                                             .await
@@ -2920,9 +2959,13 @@ impl BackgroundScheduler {
                             retryable |= result.retryable;
                             continue;
                         }
-                        let current = self.writer.project().await.map_err(map_writer)?;
+                        let current = self
+                            .writer
+                            .project_current(true)
+                            .await
+                            .map_err(map_writer)?;
                         if !self.synthesis_repository_allowed(&current, &job).await? {
-                            self.fail_stale(&job, current.frontier).await?;
+                            self.fail_stale(&job, current.frontier()).await?;
                             completed += 1;
                             continue;
                         }
@@ -2937,16 +2980,23 @@ impl BackgroundScheduler {
                         }
                     }
                     Ok(Err(_)) => {
-                        let current = self.writer.project().await.map_err(map_writer)?;
-                        if !RuntimeSchedulerView::from_snapshot(&current)
-                            .map_err(|_| BackgroundSchedulerError::Store)?
-                            .jobs
-                            .iter()
-                            .any(|current| current == &job)
+                        let current = self
+                            .writer
+                            .project_current(true)
+                            .await
+                            .map_err(map_writer)?;
+                        if !RuntimeSchedulerView::from_rows(
+                            current.frontier(),
+                            current.other_rows(),
+                        )
+                        .map_err(|_| BackgroundSchedulerError::Store)?
+                        .jobs
+                        .iter()
+                        .any(|current| current == &job)
                         {
                             continue;
                         }
-                        self.fail_stale(&job, current.frontier).await?;
+                        self.fail_stale(&job, current.frontier()).await?;
                         completed += 1;
                     }
                 }
@@ -2967,7 +3017,7 @@ impl BackgroundScheduler {
         remaining: Duration,
     ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
         let ClaimedJob {
-            snapshot,
+            current,
             job,
             report: claim_report,
         } = claimed;
@@ -2979,7 +3029,7 @@ impl BackgroundScheduler {
             crate::jobs::procedure::execute(
                 &self.writer,
                 &self.synthesis,
-                snapshot,
+                current,
                 &job,
                 report.as_ref(),
                 at,
@@ -2993,8 +3043,12 @@ impl BackgroundScheduler {
                 return Err(BackgroundSchedulerError::Store);
             }
             failure => {
-                let current = self.writer.project().await.map_err(map_writer)?;
-                if !RuntimeSchedulerView::from_snapshot(&current)
+                let current = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
+                if !RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows())
                     .map_err(|_| BackgroundSchedulerError::Store)?
                     .jobs
                     .iter()
@@ -3039,8 +3093,12 @@ impl BackgroundScheduler {
                     retryable: false,
                 });
             }
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             if !view.jobs.iter().any(|current| current == &job) {
                 return Ok(BackgroundProgress::default());
@@ -3072,7 +3130,7 @@ impl BackgroundScheduler {
             }
             match self
                 .writer
-                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier)
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
@@ -3129,8 +3187,12 @@ impl BackgroundScheduler {
                     retryable: false,
                 });
             }
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let jobs = RuntimeSchedulerView::from_snapshot(&snapshot)
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let jobs = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             if !jobs.jobs.iter().any(|current| current == job) {
                 return Ok(BackgroundProgress::default());
@@ -3145,7 +3207,7 @@ impl BackgroundScheduler {
             }
             let result = self
                 .writer
-                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier)
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier())
                 .await;
             if result.is_ok()
                 || self
@@ -3174,7 +3236,7 @@ impl BackgroundScheduler {
 
     async fn synthesis_repository_allowed(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         job: &DurableJob,
     ) -> Result<bool, BackgroundSchedulerError> {
         if matches!(
@@ -3196,7 +3258,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store);
         }
         let ids = snapshot
-            .data_rows()
+            .other_data_rows()
             .filter(|row| {
                 row.object_kind.as_deref() == Some("work_episode")
                     && row.current_revision_id.as_deref() == Some(job.target_revision.as_str())
@@ -3379,8 +3441,12 @@ impl BackgroundScheduler {
         leased: DurableJob,
         result: Result<BackupSummary, BackupError>,
     ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let current = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(true)
+            .await
+            .map_err(map_writer)?;
+        let current = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?
             .jobs
             .into_iter()
@@ -3434,7 +3500,7 @@ impl BackgroundScheduler {
         .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
             .await
         {
             Ok(outcome) => Ok(BackgroundProgress {
@@ -3522,8 +3588,12 @@ impl BackgroundScheduler {
         &self,
         retryable: bool,
     ) -> Result<tokio::time::Instant, BackgroundSchedulerError> {
-        let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(false)
+            .await
+            .map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let dreaming = self.dreaming_for_wake().await?;
         let wake_at = tokio::time::Instant::now();
@@ -3646,12 +3716,15 @@ impl BackgroundScheduler {
 
     async fn run_support_closure(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         job: &DurableJob,
     ) -> Result<usize, BackgroundSchedulerError> {
         let (contract, current) = support_context(snapshot, job)?;
-        let semantic = evertrace_store::SemanticCurrentView::from_snapshot(snapshot)
-            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let semantic = evertrace_store::SemanticCurrentView::from_rows(
+            snapshot.frontier(),
+            snapshot.other_rows(),
+        )
+        .map_err(|_| BackgroundSchedulerError::Store)?;
         let current_atom_revisions = semantic
             .atoms
             .values()
@@ -3728,7 +3801,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
             .await
         {
             Ok(outcome) => Ok(usize::from(!outcome.replayed)),
@@ -3753,14 +3826,14 @@ impl BackgroundScheduler {
             _ => return Err(BackgroundSchedulerError::Store),
         };
         let frontier = claimed
-            .snapshot
+            .current
             .reconciliation_frontier_for_observations(&[observation_id])
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if frontier.items.is_empty() {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Succeeded,
                     JobTerminalReason::Completed,
                 )
@@ -3774,7 +3847,7 @@ impl BackgroundScheduler {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Failed,
                     JobTerminalReason::StaleGeneration,
                 )
@@ -3786,7 +3859,7 @@ impl BackgroundScheduler {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Failed,
                     JobTerminalReason::Unsupported,
                 )
@@ -3814,8 +3887,12 @@ impl BackgroundScheduler {
         )
         .await;
         drop(report_guard);
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(true)
+            .await
+            .map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let current = view
             .jobs
@@ -3858,13 +3935,13 @@ impl BackgroundScheduler {
                 ),
             }
         };
-        self.finish_job(&current, snapshot.frontier, outcome, reason)
+        self.finish_job(&current, snapshot.frontier(), outcome, reason)
             .await
     }
 
     async fn enqueue_procedure_consumers(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         runtime: &RuntimeSchedulerView,
     ) -> Result<bool, BackgroundSchedulerError> {
         let at = now_us()?;
@@ -3949,10 +4026,15 @@ impl BackgroundScheduler {
                 .ok_or(BackgroundSchedulerError::Store)?;
             let contextual_watermark = [None, row.workstream_id.as_deref()]
                 .into_iter()
-                .filter_map(|stream| candidates.context_watermarks.get(&(task, stream)).copied())
+                .filter_map(|stream| {
+                    candidates
+                        .context_watermarks
+                        .get(&(task.to_owned(), stream.map(str::to_owned)))
+                        .copied()
+                })
                 .max()
                 .unwrap_or(0);
-            let packet = crate::procedure::ProcedureUsageCurrentView::execution_snapshot(
+            let packet = crate::procedure::ProcedureUsageCurrentView::execution_rows(
                 snapshot,
                 usage.procedure_usage_id,
                 &budget,
@@ -3960,9 +4042,11 @@ impl BackgroundScheduler {
             )
             .map_err(|_| BackgroundSchedulerError::Store)?;
             if let Some(packet) = &packet {
-                let control =
-                    crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(packet)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                let control = crate::procedure::ProcedureUsageCurrentView::from_execution_rows(
+                    snapshot.frontier(),
+                    packet,
+                )
+                .map_err(|_| BackgroundSchedulerError::Store)?;
                 if !control
                     .pending_usage_ids()
                     .any(|id| id == usage.procedure_usage_id)
@@ -3972,7 +4056,7 @@ impl BackgroundScheduler {
             }
             let watermark = packet
                 .as_ref()
-                .map(crate::procedure::procedure_input_watermark)
+                .map(|rows| crate::procedure::procedure_input_watermark_rows(rows))
                 .unwrap_or(contextual_watermark)
                 .max(1);
             if jobs.iter().any(|job| {
@@ -4014,7 +4098,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, at, snapshot.frontier)
+            .commit_if_frontier(command, at, snapshot.frontier())
             .await
         {
             Ok(_) => Ok(true),
@@ -4035,9 +4119,14 @@ impl BackgroundScheduler {
         // The operation clone owns the configuration admitted for this claim.
         // Fresh evidence and authorization are re-read; configuration is not.
         for _ in 0..3 {
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let runtime = RuntimeSchedulerView::from_snapshot(&snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let runtime =
+                RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
             if !runtime.jobs.iter().any(|job| job == &claimed.job) {
                 return Ok(BackgroundProgress::default());
             }
@@ -4055,7 +4144,7 @@ impl BackgroundScheduler {
                     .target_revision
                     .parse()
                     .map_err(|_| BackgroundSchedulerError::Store)?;
-                match crate::procedure::ProcedureUsageCurrentView::execution_snapshot(
+                match crate::procedure::ProcedureUsageCurrentView::execution_rows(
                     &snapshot,
                     id,
                     &claimed.job.budget,
@@ -4065,7 +4154,8 @@ impl BackgroundScheduler {
                 {
                     Some(packet) => {
                         let view =
-                            crate::procedure::ProcedureUsageCurrentView::from_execution_snapshot(
+                            crate::procedure::ProcedureUsageCurrentView::from_execution_rows(
+                                snapshot.frontier(),
                                 &packet,
                             )
                             .map_err(|_| BackgroundSchedulerError::Store)?;
@@ -4148,7 +4238,7 @@ impl BackgroundScheduler {
                 .collect::<Vec<_>>();
             let result = self
                 .writer
-                .commit_if_frontier(command, at, snapshot.frontier)
+                .commit_if_frontier(command, at, snapshot.frontier())
                 .await;
             if result.is_ok()
                 || self
@@ -4193,9 +4283,11 @@ impl BackgroundScheduler {
         );
         let deadline = Instant::now()
             + remaining_lease.min(Duration::from_millis(claimed.job.budget.max_wall_time_ms));
-        let view =
-            crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&claimed.snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+        let view = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+            claimed.current.frontier(),
+            claimed.current.other_rows(),
+        )
+        .map_err(|_| BackgroundSchedulerError::Store)?;
         let mut cohorts = view
             .promotion_cohorts(
                 self.stable_min_outcome_supported,
@@ -4215,7 +4307,7 @@ impl BackgroundScheduler {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Failed,
                     JobTerminalReason::StaleGeneration,
                 )
@@ -4224,15 +4316,22 @@ impl BackgroundScheduler {
         // The exact cohort and threshold belong to this claim. A fresh frontier
         // may admit unrelated writes, but cannot replace a changed usage/revision.
         for _ in 0..3 {
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let runtime = RuntimeSchedulerView::from_snapshot(&snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let runtime =
+                RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
             if !runtime.jobs.iter().any(|job| job == &claimed.job) {
                 return Ok(BackgroundProgress::default());
             }
-            let view =
-                crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&snapshot)
-                    .map_err(|_| BackgroundSchedulerError::Store)?;
+            let view = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
             let occurred_at_us = now_us()?;
             let promotion = crate::procedure::promote_procedure_from_cohort(
                 &view,
@@ -4252,7 +4351,7 @@ impl BackgroundScheduler {
                     return self
                         .finish_job(
                             &claimed.job,
-                            snapshot.frontier,
+                            snapshot.frontier(),
                             JobTerminalOutcome::Failed,
                             JobTerminalReason::StaleGeneration,
                         )
@@ -4288,7 +4387,7 @@ impl BackgroundScheduler {
                 .collect::<Vec<_>>();
             let result = self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await;
             if result.is_ok()
                 || self
@@ -4395,8 +4494,12 @@ impl BackgroundScheduler {
         } else {
             None
         };
-        let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(false)
+            .await
+            .map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let Some(current) = view.jobs.iter().find(|job| job.job_id == selected.job_id) else {
             // A repository purge may remove a queued selection while an earlier
@@ -4438,7 +4541,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) | Err(WriterActorError::StaleFrontier) => {}
@@ -4502,7 +4605,7 @@ impl BackgroundScheduler {
                 return Ok(None);
             }
             if current.attempt >= 6 {
-                fail_exhausted_llm_job(&self.writer, current, snapshot.frontier, occurred_at_us)
+                fail_exhausted_llm_job(&self.writer, current, snapshot.frontier(), occurred_at_us)
                     .await?;
                 return Ok(None);
             }
@@ -4545,15 +4648,20 @@ impl BackgroundScheduler {
         .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
             .await
         {
             Ok(_) => {
                 drop(view);
                 drop(snapshot);
-                let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
-                let view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                    .map_err(|_| BackgroundSchedulerError::Store)?;
+                let current = self
+                    .writer
+                    .project_current(false)
+                    .await
+                    .map_err(map_writer)?;
+                let view =
+                    RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows())
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
                 let job = view
                     .jobs
                     .into_iter()
@@ -4564,7 +4672,7 @@ impl BackgroundScheduler {
                     })
                     .ok_or(BackgroundSchedulerError::Store)?;
                 Ok(Some(ClaimedJob {
-                    snapshot,
+                    current,
                     job,
                     report,
                 }))
@@ -4921,13 +5029,13 @@ fn job_lane(job: &DurableJob) -> BackgroundLane {
 }
 
 fn support_context(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<(GlobalSuccessorSupportContract, GlobalSupportValidationEvent), BackgroundSchedulerError>
 {
     let mut contracts = Vec::new();
     let mut validations = Vec::new();
-    for row in snapshot.data_rows() {
+    for row in snapshot.other_data_rows() {
         if evertrace_store::session_import::restore_current(row)
             .map_err(|_| BackgroundSchedulerError::Store)?
             .is_some()
@@ -5000,7 +5108,7 @@ struct SynthesisIdle {
 impl SynthesisIdle {
     fn refresh(
         &mut self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         runtime: &RuntimeSchedulerView,
     ) -> Result<(), BackgroundSchedulerError> {
         let targets = runtime
@@ -5013,7 +5121,7 @@ impl SynthesisIdle {
             .map(|job| job.target_revision.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         let mut scopes = BTreeMap::new();
-        for row in snapshot.data_rows().filter(|row| {
+        for row in snapshot.other_data_rows().filter(|row| {
             matches!(
                 row.object_kind.as_deref(),
                 Some("revision_proposal_revision" | "procedure_revision")
@@ -5065,7 +5173,7 @@ impl SynthesisIdle {
         }
         self.procedure_scopes = scopes;
         let attribution_rows = snapshot
-            .data_rows()
+            .other_data_rows()
             .filter(|row| {
                 matches!(
                     row.object_kind.as_deref(),
@@ -5075,7 +5183,7 @@ impl SynthesisIdle {
             .map(|row| (row.row_id.clone(), row.source_event_seq))
             .collect::<BTreeMap<_, _>>();
         let episode_rows = snapshot
-            .data_rows()
+            .other_data_rows()
             .filter(|row| row.object_kind.as_deref() == Some("work_episode"))
             .map(|row| (row.row_id.clone(), row.source_event_seq))
             .collect::<BTreeMap<_, _>>();
@@ -5093,15 +5201,17 @@ impl SynthesisIdle {
             self.episode_rows = episode_rows;
         }
         let receipt_rows = snapshot
-            .data_rows()
-            .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-            .map(|row| {
+            .source_receipts()
+            .map(|(receipt, seq)| {
                 (
-                    row.row_id.clone(),
+                    format!(
+                        "object:evidence:source_receipt:{}",
+                        receipt.source_receipt_id
+                    ),
                     (
-                        row.source_event_seq,
-                        row.repository_id.clone(),
-                        row.worktree_id.clone(),
+                        seq,
+                        receipt.repository_instance_id.map(|id| id.to_string()),
+                        receipt.worktree_instance_id.map(|id| id.to_string()),
                     ),
                 )
             })
@@ -5112,11 +5222,14 @@ impl SynthesisIdle {
             .any(|(id, seq)| receipt_rows.get(id) != Some(seq));
         if episode_attribution_changed || attribution_rows != self.attribution_rows {
             let mut observations = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
-            let bindings = evertrace_store::WorkBindingCurrentView::from_snapshot(snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let bindings = evertrace_store::WorkBindingCurrentView::from_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
             let mut operations = BTreeMap::new();
             for row in snapshot
-                .data_rows()
+                .other_data_rows()
                 .filter(|row| row.object_kind.as_deref() == Some("operation"))
             {
                 let JournalPayload::OperationDerived(operation) = serde_json::from_str(
@@ -5180,27 +5293,19 @@ impl SynthesisIdle {
             self.local.clear();
             self.source_scopes.clear();
         }
-        for row in snapshot
-            .data_rows()
-            .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-        {
-            let stamp = (
-                row.source_event_seq,
-                row.repository_id.clone(),
-                row.worktree_id.clone(),
+        for (receipt, seq) in snapshot.source_receipts() {
+            let row_id = format!(
+                "object:evidence:source_receipt:{}",
+                receipt.source_receipt_id
             );
-            if self.receipts.get(&row.row_id) == Some(&stamp) {
+            let stamp = (
+                seq,
+                receipt.repository_instance_id.map(|id| id.to_string()),
+                receipt.worktree_instance_id.map(|id| id.to_string()),
+            );
+            if self.receipts.get(&row_id) == Some(&stamp) {
                 continue;
             }
-            let JournalPayload::SourceReceiptRecorded(receipt) = serde_json::from_str(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(BackgroundSchedulerError::Store)?,
-            )
-            .map_err(|_| BackgroundSchedulerError::Store)?
-            else {
-                return Err(BackgroundSchedulerError::Store);
-            };
             receipt
                 .validate()
                 .map_err(|_| BackgroundSchedulerError::Store)?;
@@ -5221,7 +5326,7 @@ impl SynthesisIdle {
                 receipt.source_observation_id,
                 receipt.recorded_at_us,
             );
-            self.receipts.insert(row.row_id.clone(), stamp);
+            self.receipts.insert(row_id, stamp);
         }
         Ok(())
     }
@@ -5321,7 +5426,7 @@ impl SynthesisIdle {
 
     fn job_ready(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         job: &DurableJob,
         config: &evertrace_domain::config::DreamingConfig,
         now: i64,
@@ -5387,7 +5492,7 @@ impl SynthesisIdle {
 
     fn select(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         view: &RuntimeSchedulerView,
         capture: CaptureAdmissionState,
         ordinary_pending: bool,
@@ -5456,6 +5561,65 @@ fn map_writer(error: WriterActorError) -> BackgroundSchedulerError {
 mod idle_tests {
     use super::*;
     use evertrace_domain::{ids::*, revision::RevisionId, work::*};
+
+    fn empty_current(frontier: u64) -> CurrentFacts {
+        CurrentFacts::try_from(evertrace_store::ProjectionSnapshot {
+            frontier,
+            rows: vec![evertrace_store::ObjectRow::checkpoint(frontier, 1)],
+        })
+        .unwrap()
+    }
+
+    fn current_with_receipt(
+        snapshot: &evertrace_store::ProjectionSnapshot,
+        receipt: &evertrace_domain::evidence::SourceReceipt,
+        receipt_seq: u64,
+        frontier: u64,
+    ) -> Result<CurrentFacts, evertrace_store::StoreError> {
+        use evertrace_store::{ObjectFamily, ObjectRow, ObjectRowClass, ObjectRowKind};
+
+        let mut rows = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                row.row_kind != ObjectRowKind::Checkpoint
+                    && row.object_kind.as_deref() != Some("source_receipt")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let id = receipt.source_receipt_id.to_string();
+        rows.push(ObjectRow {
+            row_id: format!("object:evidence:source_receipt:{id}"),
+            row_kind: ObjectRowKind::Data,
+            row_class: Some(ObjectRowClass::Object),
+            object_family: Some(ObjectFamily::Evidence),
+            object_kind: Some("source_receipt".into()),
+            object_id: Some(id.clone()),
+            current_revision_id: Some(id),
+            lifecycle: Some("immutable".into()),
+            epistemic: Some("observed".into()),
+            authority: Some("none".into()),
+            publication_state: None,
+            support_state: None,
+            project_id: None,
+            repository_id: receipt
+                .repository_instance_id
+                .map(|value| value.to_string()),
+            worktree_id: receipt.worktree_instance_id.map(|value| value.to_string()),
+            task_id: receipt.task_id.map(|value| value.to_string()),
+            workstream_id: None,
+            session_id: None,
+            payload_json: Some(
+                JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone()))
+                    .canonical_json()?
+                    .into(),
+            ),
+            source_event_seq: receipt_seq,
+            projection_generation: 1,
+        });
+        rows.push(ObjectRow::checkpoint(frontier, 1));
+        CurrentFacts::try_from(evertrace_store::ProjectionSnapshot { frontier, rows })
+    }
 
     #[test]
     fn capture_scan_is_finite_and_rescans_notifications_without_starvation() {
@@ -5912,10 +6076,7 @@ mod idle_tests {
         };
         assert_eq!(
             idle.select(
-                &evertrace_store::ProjectionSnapshot {
-                    frontier: 100,
-                    rows: vec![]
-                },
+                &empty_current(100),
                 &view,
                 CaptureAdmissionState::Normal,
                 false,
@@ -5934,10 +6095,7 @@ mod idle_tests {
         stale_view.jobs.push(stale.clone());
         let selected = idle
             .select(
-                &evertrace_store::ProjectionSnapshot {
-                    frontier: 100,
-                    rows: vec![],
-                },
+                &empty_current(100),
                 &stale_view,
                 CaptureAdmissionState::Normal,
                 false,
@@ -5953,15 +6111,7 @@ mod idle_tests {
         );
         // Activity observed at fresh claim makes the formerly selected target busy.
         idle.record((quiet.repository_instance_id, None), observation, now);
-        assert!(!idle.job_ready(
-            &evertrace_store::ProjectionSnapshot {
-                frontier: 100,
-                rows: vec![]
-            },
-            &planned[0],
-            &config,
-            now
-        ));
+        assert!(!idle.job_ready(&empty_current(100), &planned[0], &config, now));
         let tree_a = WorktreeId::new_v7();
         let tree_b = WorktreeId::new_v7();
         quiet.worktree_instance_id = Some(tree_a);
@@ -6097,9 +6247,10 @@ mod idle_tests {
             "receipt".into(),
             JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
         ));
+        let current = current_with_receipt(&snapshot, &receipt, 9, 9).unwrap();
         idle.refresh(
-            &snapshot,
-            &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+            &current,
+            &RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows()).unwrap(),
         )
         .unwrap();
         let config = evertrace_domain::config::DreamingConfig::default();
@@ -6119,44 +6270,25 @@ mod idle_tests {
                 .unwrap()
                 .is_zero()
         );
-        // Deliberately unreadable cached payload proves subsequent claims only
-        // inspect unchanged metadata. A new source event must be decoded.
-        snapshot.rows.last_mut().unwrap().payload_json = Some("invalid".into());
+        // Repeated current facts keep the same typed receipt admission metadata.
         for frontier in 10..13 {
-            snapshot.frontier = frontier;
+            let current = current_with_receipt(&snapshot, &receipt, 9, frontier).unwrap();
             idle.refresh(
-                &snapshot,
-                &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+                &current,
+                &RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows()).unwrap(),
             )
             .unwrap();
         }
         assert_eq!(idle.decoded_receipts, 1);
         let mut future = receipt.clone();
         future.event_time_us = i64::MAX;
-        snapshot.rows.last_mut().unwrap().payload_json = Some(
-            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(future)))
-                .unwrap()
-                .into(),
-        );
-        snapshot.rows.last_mut().unwrap().source_event_seq = 13;
-        assert!(
-            idle.refresh(
-                &snapshot,
-                &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap()
-            )
-            .is_err()
-        );
+        assert!(current_with_receipt(&snapshot, &future, 13, 13).is_err());
         let mut fresh = receipt;
         fresh.recorded_at_us = 2_000_000_000;
-        snapshot.rows.last_mut().unwrap().payload_json = Some(
-            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(fresh)))
-                .unwrap()
-                .into(),
-        );
-        snapshot.rows.last_mut().unwrap().source_event_seq = 14;
+        let current = current_with_receipt(&snapshot, &fresh, 14, 14).unwrap();
         idle.refresh(
-            &snapshot,
-            &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+            &current,
+            &RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows()).unwrap(),
         )
         .unwrap();
         assert_eq!(idle.decoded_receipts, 2);

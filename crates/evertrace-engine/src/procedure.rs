@@ -111,6 +111,158 @@ pub async fn resolve_procedure_coverage(
     draft: &evertrace_domain::procedure::ProcedureDraft,
     source_refs: &[String],
 ) -> Result<VerifiedProcedureCoverage, SemanticServiceError> {
+    let source_facts = procedure_coverage_sources_from_rows(&snapshot.rows, source_refs)?;
+    resolve_procedure_coverage_core(
+        writer,
+        bindings,
+        runtime,
+        (snapshot.frontier, snapshot.rows.as_slice()),
+        source_facts,
+        draft,
+        source_refs,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_procedure_coverage_current(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    current: &evertrace_store::projections::CurrentFacts,
+    draft: &evertrace_domain::procedure::ProcedureDraft,
+    source_refs: &[String],
+) -> Result<VerifiedProcedureCoverage, SemanticServiceError> {
+    let source_facts = procedure_coverage_sources_from_current(current, source_refs)?;
+    resolve_procedure_coverage_core(
+        writer,
+        bindings,
+        runtime,
+        (current.frontier(), current.other_rows()),
+        source_facts,
+        draft,
+        source_refs,
+    )
+    .await
+}
+
+struct ProcedureCoverageSources {
+    observations: Vec<(evertrace_domain::evidence::SourceObservation, u64)>,
+    receipts: Vec<(evertrace_domain::evidence::SourceReceipt, u64)>,
+}
+
+fn procedure_coverage_sources_from_rows(
+    rows: &[evertrace_store::ObjectRow],
+    source_refs: &[String],
+) -> Result<ProcedureCoverageSources, SemanticServiceError> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let refs = source_refs.iter().collect::<BTreeSet<_>>();
+    let mut observations = BTreeMap::new();
+    let mut receipt_ids = BTreeSet::new();
+    for row in rows.iter().filter(|row| {
+        row.object_kind.as_deref() == Some("source_observation")
+            && row.object_id.as_ref().is_some_and(|id| refs.contains(id))
+    }) {
+        let payload: JournalPayload = serde_json::from_str(
+            row.payload_json
+                .as_deref()
+                .ok_or(SemanticServiceError::InvalidInput)?,
+        )
+        .map_err(|_| SemanticServiceError::InvalidInput)?;
+        payload
+            .validate()
+            .map_err(|_| SemanticServiceError::InvalidInput)?;
+        let JournalPayload::SourceObservationRecorded(value) = payload else {
+            return Err(SemanticServiceError::InvalidInput);
+        };
+        receipt_ids.insert(value.source_receipt_ref.to_string());
+        observations.insert(value.source_observation_id, (*value, row.source_event_seq));
+    }
+    let receipts = rows
+        .iter()
+        .filter(|row| {
+            row.object_kind.as_deref() == Some("source_receipt")
+                && row
+                    .object_id
+                    .as_ref()
+                    .is_some_and(|id| refs.contains(id) || receipt_ids.contains(id))
+        })
+        .map(|row| {
+            let payload: JournalPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .ok_or(SemanticServiceError::InvalidInput)?,
+            )
+            .map_err(|_| SemanticServiceError::InvalidInput)?;
+            payload
+                .validate()
+                .map_err(|_| SemanticServiceError::InvalidInput)?;
+            let JournalPayload::SourceReceiptRecorded(value) = payload else {
+                return Err(SemanticServiceError::InvalidInput);
+            };
+            Ok((*value, row.source_event_seq))
+        })
+        .collect::<Result<Vec<_>, SemanticServiceError>>()?;
+    Ok(ProcedureCoverageSources {
+        observations: observations.into_values().collect(),
+        receipts,
+    })
+}
+
+fn procedure_coverage_sources_from_current(
+    current: &evertrace_store::projections::CurrentFacts,
+    source_refs: &[String],
+) -> Result<ProcedureCoverageSources, SemanticServiceError> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut observations = BTreeMap::new();
+    let mut receipt_ids = BTreeSet::new();
+    let mut selected_observations = BTreeSet::new();
+    for reference in source_refs {
+        if let Ok(id) = reference.parse::<evertrace_domain::ids::SourceObservationId>()
+            && id.to_string() == *reference
+        {
+            selected_observations.insert(id);
+        }
+    }
+    for id in selected_observations {
+        if let Some((observation, seq)) = current.source_observation(id) {
+            receipt_ids.insert(observation.source_receipt_ref);
+            observations.insert(
+                observation.source_observation_id,
+                (observation.as_ref().clone(), seq),
+            );
+        }
+    }
+    let mut selected_receipts = BTreeSet::new();
+    for reference in source_refs {
+        if let Ok(id) = reference.parse::<evertrace_domain::ids::SourceReceiptId>() {
+            selected_receipts.insert(id);
+        }
+    }
+    selected_receipts.extend(receipt_ids);
+    let receipts = selected_receipts
+        .into_iter()
+        .filter_map(|id| {
+            current
+                .source_receipt(id)
+                .map(|(receipt, seq)| (receipt.as_ref().clone(), seq))
+        })
+        .collect();
+    Ok(ProcedureCoverageSources {
+        observations: observations.into_values().collect(),
+        receipts,
+    })
+}
+
+async fn resolve_procedure_coverage_core(
+    writer: &crate::WriterHandle,
+    bindings: &crate::McpBindingAuthority,
+    runtime: &evertrace_capture::RuntimeSnapshot,
+    current_rows: (u64, &[evertrace_store::ObjectRow]),
+    source_facts: ProcedureCoverageSources,
+    draft: &evertrace_domain::procedure::ProcedureDraft,
+    source_refs: &[String],
+) -> Result<VerifiedProcedureCoverage, SemanticServiceError> {
+    let (frontier, rows) = current_rows;
     use evertrace_domain::inventory::{
         CapabilityCoverageMatch, CapabilityCoverageOmission as Omission, CapabilityCoverageSummary,
         CapabilityEvidenceLevel,
@@ -132,49 +284,19 @@ pub async fn resolve_procedure_coverage(
     let mut complete_capture = !refs.is_empty();
     let mut receipts = BTreeSet::new();
     let mut resolved_refs = BTreeSet::new();
-    for row in snapshot
-        .data_rows()
-        .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
-    {
-        if row.object_id.as_deref().is_none_or(|id| !refs.contains(id)) {
+    for (value, _) in &source_facts.observations {
+        if !refs.contains(value.source_observation_id.to_string().as_str()) {
             continue;
         }
-        let JournalPayload::SourceObservationRecorded(value) = serde_json::from_str(
-            row.payload_json
-                .as_deref()
-                .ok_or(SemanticServiceError::InvalidInput)?,
-        )
-        .map_err(|_| SemanticServiceError::InvalidInput)?
-        else {
-            return Err(SemanticServiceError::InvalidInput);
-        };
         receipts.insert(value.source_receipt_ref.to_string());
         resolved_refs.insert(value.source_observation_id.to_string());
     }
-    for row in snapshot
-        .data_rows()
-        .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-    {
-        if row
-            .object_id
-            .as_deref()
-            .is_none_or(|id| !refs.contains(id) && !receipts.contains(id))
-        {
+    for (value, seq) in &source_facts.receipts {
+        let receipt_id = value.source_receipt_id.to_string();
+        if !refs.contains(receipt_id.as_str()) && !receipts.contains(&receipt_id) {
             continue;
         }
-        let JournalPayload::SourceReceiptRecorded(value) = serde_json::from_str(
-            row.payload_json
-                .as_deref()
-                .ok_or(SemanticServiceError::InvalidInput)?,
-        )
-        .map_err(|_| SemanticServiceError::InvalidInput)?
-        else {
-            return Err(SemanticServiceError::InvalidInput);
-        };
-        let boundary = (
-            row.source_event_seq,
-            value.event_time_us.min(value.recorded_at_us),
-        );
+        let boundary = (*seq, value.event_time_us.min(value.recorded_at_us));
         if let (Some(repository), Some(worktree)) =
             (value.repository_instance_id, value.worktree_instance_id)
         {
@@ -190,7 +312,7 @@ pub async fn resolve_procedure_coverage(
                 .or_insert(boundary);
         }
         sessions.insert(format!("session:{}", value.source_session_ref));
-        resolved_refs.insert(value.source_receipt_id.to_string());
+        resolved_refs.insert(receipt_id);
         receipts.remove(&value.source_receipt_id.to_string());
         complete_capture &= value.capture_completeness
             == evertrace_domain::evidence::CaptureCompleteness::Complete
@@ -226,8 +348,9 @@ pub async fn resolve_procedure_coverage(
         context: evertrace_domain::inventory::InventoryContext,
     }
     if !sessions.is_empty() {
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
             .filter(|row| row.object_kind.as_deref() == Some("capability_inventory"))
         {
             if std::time::Instant::now() >= inventory_deadline {
@@ -349,7 +472,7 @@ pub async fn resolve_procedure_coverage(
             writer,
             bindings,
             runtime,
-            snapshot,
+            rows,
             fact,
             (
                 session,
@@ -462,8 +585,9 @@ pub async fn resolve_procedure_coverage(
     }
     // Published procedures have their own current/scope evidence and remain
     // comparable even when a file inventory is missing or revoked.
-    let usage = usage::ProcedureUsageCurrentView::from_coverage_snapshot(
-        snapshot,
+    let usage = usage::ProcedureUsageCurrentView::from_coverage_rows(
+        frontier,
+        rows,
         &contexts,
         inventory_deadline,
     )?;
@@ -514,7 +638,7 @@ pub async fn resolve_procedure_coverage(
     }
     Ok(VerifiedProcedureCoverage {
         summary: coverage,
-        frontier: snapshot.frontier,
+        frontier,
         draft: draft.clone(),
         source_refs: source_refs.to_vec(),
         incremental_target,

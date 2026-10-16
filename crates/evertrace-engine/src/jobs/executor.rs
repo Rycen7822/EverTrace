@@ -92,6 +92,11 @@ enum WriterRequest {
         indexes: bool,
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
+    ProjectCurrent {
+        indexes: bool,
+        reply:
+            oneshot::Sender<Result<evertrace_store::projections::CurrentFacts, WriterActorError>>,
+    },
     SyncFrontier {
         indexes: bool,
         reply: oneshot::Sender<Result<u64, WriterActorError>>,
@@ -557,6 +562,18 @@ impl WriterHandle {
                 indexes: true,
                 reply,
             })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn project_current(
+        &self,
+        indexes: bool,
+    ) -> Result<evertrace_store::projections::CurrentFacts, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ProjectCurrent { indexes, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -1180,6 +1197,21 @@ async fn run_writer(
                         writer.project_objects().await
                     }
                     .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::ProjectCurrent { indexes, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
+                    let result = writer
+                        .project_current(indexes)
+                        .await
+                        .map_err(map_store_error);
                     let fatal = result.is_err();
                     let _ = reply.send(result);
                     if fatal {
@@ -1864,9 +1896,15 @@ async fn confirm_procedure_return(
     let Some(original) = original else {
         return Ok(None);
     };
-    let snapshot = writer.project().await.map_err(map_store_error)?;
-    let view = crate::procedure::ProcedureUsageCurrentView::from_snapshot(&snapshot)
-        .map_err(|_| WriterActorError::StoreCorrupt)?;
+    let current = writer
+        .project_current(true)
+        .await
+        .map_err(map_store_error)?;
+    let view = crate::procedure::ProcedureUsageCurrentView::from_rows(
+        current.frontier(),
+        current.other_rows(),
+    )
+    .map_err(|_| WriterActorError::StoreCorrupt)?;
     let command_id = CommandId::from_uuid(acknowledgement.as_uuid())
         .map_err(|_| WriterActorError::InvalidInput)?;
     let now = now_us()?;
@@ -1888,7 +1926,7 @@ async fn confirm_procedure_return(
     }
     let command = JournalCommand::new(command_id, events).map_err(map_store_error)?;
     let outcome = writer
-        .commit_if_frontier(&command, now, snapshot.frontier)
+        .commit_if_frontier(&command, now, current.frontier())
         .await;
     let frontier = match outcome {
         Ok(outcome) => outcome.last_seq,

@@ -156,7 +156,7 @@ impl RuntimeSchedulerView {
     /// The same runtime decode over an explicitly selected row set. Callers
     /// that only merged the current runtime rows with this command's upserts
     /// must not present the result as a complete objects snapshot.
-    pub(crate) fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut dirty = BTreeMap::new();
         let mut outbox = BTreeMap::new();
         let mut jobs = BTreeMap::new();
@@ -548,94 +548,15 @@ impl ProjectionSnapshot {
         &self,
         limit: usize,
     ) -> Result<ReconciliationFrontier, StoreError> {
-        if limit == 0 {
-            return Err(StoreError::InvalidInput);
-        }
-        let mut candidates = self
-            .data_rows()
-            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            left.source_event_seq
-                .cmp(&right.source_event_seq)
-                .then_with(|| left.row_id.cmp(&right.row_id))
-        });
-        let mut items = Vec::new();
-        for row in candidates {
-            let payload = current_payload(row)?;
-            let JournalPayload::DirtyTarget(target) = &payload.payload else {
-                return Err(StoreError::StoreCorrupt);
-            };
-            let target = target.clone();
-            if !matches!(
-                target.target_kind,
-                crate::command::DirtyTargetKind::PhysicalNormalization
-                    | crate::command::DirtyTargetKind::CaptureReconciliation
-            ) {
-                continue;
-            }
-            if let Some(item) = reconciliation_item(self, payload, target)? {
-                items.push(item);
-                if items.len() == limit {
-                    break;
-                }
-            }
-        }
-        Ok(ReconciliationFrontier {
-            frontier: self.frontier,
-            items,
-        })
+        CurrentFacts::try_from(self.clone())?.reconciliation_frontier(limit)
     }
 
     pub fn reconciliation_frontier_for_observations(
         &self,
         observation_ids: &[SourceObservationId],
     ) -> Result<ReconciliationFrontier, StoreError> {
-        if observation_ids.is_empty()
-            || observation_ids.len() > 16
-            || observation_ids
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .len()
-                != observation_ids.len()
-        {
-            return Err(StoreError::InvalidInput);
-        }
-        let selected = observation_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
-        let mut items = Vec::new();
-        for row in self
-            .data_rows()
-            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
-        {
-            let payload = current_payload(row)?;
-            let JournalPayload::DirtyTarget(target) = &payload.payload else {
-                return Err(StoreError::StoreCorrupt);
-            };
-            let target = target.clone();
-            if selected.contains(&target.target_id)
-                && matches!(
-                    target.target_kind,
-                    crate::command::DirtyTargetKind::PhysicalNormalization
-                        | crate::command::DirtyTargetKind::CaptureReconciliation
-                )
-                && let Some(item) = reconciliation_item(self, payload, target)?
-            {
-                items.push(item);
-            }
-        }
-        items.sort_by(|left, right| {
-            left.source_event_seq
-                .cmp(&right.source_event_seq)
-                .then_with(|| left.row_id.cmp(&right.row_id))
-        });
-        Ok(ReconciliationFrontier {
-            frontier: self.frontier,
-            items,
-        })
+        CurrentFacts::try_from(self.clone())?
+            .reconciliation_frontier_for_observations(observation_ids)
     }
 
     pub fn reconciliation_artifact_context(
@@ -643,21 +564,7 @@ impl ProjectionSnapshot {
         descriptors: &[ReconciliationArtifactDescriptor],
         limit: usize,
     ) -> Result<ReconciliationArtifactFrontier, StoreError> {
-        if limit == 0 {
-            return Err(StoreError::InvalidInput);
-        }
-        let mut ordered = descriptors.to_vec();
-        ordered.sort();
-        ordered.truncate(limit);
-        let mut contexts = Vec::with_capacity(ordered.len());
-        for descriptor in ordered {
-            descriptor.validate()?;
-            contexts.push(reconciliation_artifact_item(self, descriptor)?);
-        }
-        Ok(ReconciliationArtifactFrontier {
-            frontier: self.frontier,
-            contexts,
-        })
+        CurrentFacts::try_from(self.clone())?.reconciliation_artifact_context(descriptors, limit)
     }
 }
 
@@ -670,11 +577,18 @@ pub struct WorkIdentityCurrentView {
 
 impl WorkIdentityCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+        {
             match row.object_kind.as_deref() {
                 Some("task") => {
                     let payload: JournalPayload = serde_json::from_str(
@@ -783,14 +697,21 @@ fn current_group_from_lineage(
 
 impl AttemptCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
         let mut attempt_revisions = BTreeMap::<AttemptId, Vec<Attempt>>::new();
         let mut group_revisions =
             BTreeMap::<CompetingAttemptGroupId, Vec<CompetingAttemptGroup>>::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+        {
             match row.object_kind.as_deref() {
                 Some("attempt") => {
                     let payload: JournalPayload = serde_json::from_str(
@@ -1266,9 +1187,14 @@ fn current_binding_lineage<'a>(
 
 impl WorkBindingCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut revisions = Vec::new();
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
             .filter(|row| row.object_kind.as_deref() == Some("work_binding"))
         {
             let payload: JournalPayload = serde_json::from_str(
@@ -1296,10 +1222,7 @@ impl WorkBindingCurrentView {
             .into_iter()
             .map(|(operation_id, binding)| (operation_id, binding.clone()))
             .collect();
-        Ok(Self {
-            frontier: snapshot.frontier,
-            bindings,
-        })
+        Ok(Self { frontier, bindings })
     }
 
     pub fn active_context(&self, operation_id: OperationId) -> Option<ActiveWorkContext> {
@@ -1419,7 +1342,7 @@ pub struct ReconciliationArtifactFrontier {
 }
 
 fn reconciliation_artifact_item(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     descriptor: ReconciliationArtifactDescriptor,
 ) -> Result<ReconciliationArtifactContext, StoreError> {
     let unowned_quarantine = descriptor.kind == ReconciliationArtifactKind::Quarantine
@@ -1464,7 +1387,7 @@ fn reconciliation_artifact_item(
             "object:evidence:capture_outage_interval:{}",
             descriptor.artifact_id
         );
-        if let Some(row) = snapshot.row(&row_id) {
+        if let Some(row) = snapshot.other_row(&row_id) {
             let dependency = current_payload(row)?;
             let JournalPayload::CaptureOutageIntervalRecorded(outage) = &dependency.payload else {
                 return Err(StoreError::StoreCorrupt);
@@ -1509,21 +1432,7 @@ fn reconciliation_artifact_item(
     };
     collect_artifact_outages(snapshot, &session_ref, &source_ref, &mut dependencies)?;
     let mut affected_cohort = false;
-    let needles = [
-        json_field_fragment("source_session_ref", &session_ref)?,
-        serde_json::to_string(&source_ref).map_err(|_| StoreError::Serialization)?,
-    ];
-    for row in snapshot.data_rows().filter(|row| {
-        row.object_kind.as_deref() == Some("source_receipt")
-            && row
-                .payload_json
-                .as_deref()
-                .is_some_and(|json| needles.iter().all(|needle| json.contains(needle)))
-    }) {
-        let dependency = current_payload(row)?;
-        let JournalPayload::SourceReceiptRecorded(receipt) = &dependency.payload else {
-            return Err(StoreError::StoreCorrupt);
-        };
+    for (receipt, _) in snapshot.source_receipts() {
         if receipt.source_session_ref != session_ref
             || receipt.source_ref != source_ref
                 && source_revision_ref(&receipt.source_instance_id, &receipt.source_revision)
@@ -1531,17 +1440,22 @@ fn reconciliation_artifact_item(
         {
             continue;
         }
-        let observation_row_id = format!(
-            "object:evidence:source_observation:{}",
-            receipt.source_observation_id
-        );
-        if let Some(observation) = snapshot.row(&observation_row_id) {
-            dependencies.insert(current_payload(observation)?)?;
+        if snapshot
+            .source_observation(receipt.source_observation_id)
+            .is_some()
+        {
+            dependencies.insert(source_observation_dependency(
+                snapshot,
+                receipt.source_observation_id,
+            )?)?;
         }
         let (_, has_current_lane_receipt) =
-            collect_capture_dependencies(snapshot, &dependency, &mut dependencies)?;
+            collect_capture_dependencies(snapshot, receipt, &mut dependencies)?;
         affected_cohort |= has_current_lane_receipt;
-        dependencies.insert(dependency)?;
+        dependencies.insert(source_receipt_dependency(
+            snapshot,
+            receipt.source_receipt_id,
+        )?)?;
     }
     let ownership = if conflict {
         ReconciliationArtifactOwnership::Conflict
@@ -1558,7 +1472,7 @@ fn reconciliation_artifact_item(
 }
 
 fn matching_gap_rows<'a>(
-    snapshot: &'a ProjectionSnapshot,
+    snapshot: &'a CurrentFacts,
     descriptor: &ReconciliationArtifactDescriptor,
 ) -> Result<Box<dyn Iterator<Item = &'a ObjectRow> + 'a>, StoreError> {
     if let Some(marker_id) = descriptor.marker_id.as_ref().or_else(|| {
@@ -1566,13 +1480,13 @@ fn matching_gap_rows<'a>(
             .then_some(&descriptor.artifact_id)
     }) {
         let row_id = format!("object:evidence:capture_gap_marker:{marker_id}");
-        return Ok(Box::new(snapshot.row(&row_id).into_iter()));
+        return Ok(Box::new(snapshot.other_row(&row_id).into_iter()));
     }
     let Some(fingerprint) = &descriptor.redacted_fingerprint else {
         return Ok(Box::new(std::iter::empty()));
     };
     let needle = json_field_fragment("redacted_fingerprint", fingerprint)?;
-    Ok(Box::new(snapshot.data_rows().filter(move |row| {
+    Ok(Box::new(snapshot.other_data_rows().filter(move |row| {
         row.object_kind.as_deref() == Some("capture_gap_marker")
             && row
                 .payload_json
@@ -1582,7 +1496,7 @@ fn matching_gap_rows<'a>(
 }
 
 fn collect_artifact_outages(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     session_ref: &str,
     source_ref: &str,
     dependencies: &mut DependencyCollector,
@@ -1591,7 +1505,7 @@ fn collect_artifact_outages(
         json_field_fragment("session_ref", session_ref)?,
         json_field_fragment("source_ref", source_ref)?,
     ];
-    for row in snapshot.data_rows().filter(|row| {
+    for row in snapshot.other_data_rows().filter(|row| {
         row.object_kind.as_deref() == Some("capture_outage_interval")
             && row
                 .payload_json
@@ -1610,34 +1524,28 @@ fn collect_artifact_outages(
 }
 
 fn reconciliation_item(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     dirty_row: NamedCurrentDependency,
     target: DirtyTarget,
 ) -> Result<Option<ReconciliationWorkItem>, StoreError> {
-    let observation_row_id = format!("object:evidence:source_observation:{}", target.target_id);
-    let observation = snapshot
-        .row(&observation_row_id)
-        .ok_or(StoreError::StoreCorrupt)
-        .and_then(current_payload)?;
+    let observation_id = target
+        .target_id
+        .parse()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let observation = source_observation_dependency(snapshot, observation_id)?;
     let JournalPayload::SourceObservationRecorded(observation_value) = &observation.payload else {
         return Err(StoreError::StoreCorrupt);
     };
-    let observation_value = observation_value.clone();
-    let receipt_row_id = format!(
-        "object:evidence:source_receipt:{}",
-        observation_value.source_receipt_ref
-    );
-    let source_receipt = snapshot
-        .row(&receipt_row_id)
-        .ok_or(StoreError::StoreCorrupt)
-        .and_then(current_payload)?;
+    let observation_value = observation_value.as_ref().clone();
+    let receipt_id = observation_value.source_receipt_ref;
+    let source_receipt = source_receipt_dependency(snapshot, receipt_id)?;
     let mut dependencies = DependencyCollector::default();
     dependencies.insert(observation)?;
     dependencies.insert(source_receipt.clone())?;
     let active = match target.target_kind {
         crate::command::DirtyTargetKind::PhysicalNormalization => {
             let watermark = format!("runtime:watermark:normalization:{}", target.target_id);
-            if snapshot.row(&watermark).is_some() {
+            if snapshot.other_row(&watermark).is_some() {
                 false
             } else {
                 collect_normalization_dependencies(
@@ -1649,8 +1557,15 @@ fn reconciliation_item(
             }
         }
         crate::command::DirtyTargetKind::CaptureReconciliation => {
-            collect_capture_dependencies(snapshot, &source_receipt, &mut dependencies)?.0
-                < dirty_row.source_event_seq
+            collect_capture_dependencies(
+                snapshot,
+                match &source_receipt.payload {
+                    JournalPayload::SourceReceiptRecorded(receipt) => receipt,
+                    _ => return Err(StoreError::StoreCorrupt),
+                },
+                &mut dependencies,
+            )?
+            .0 < dirty_row.source_event_seq
         }
         _ => false,
     };
@@ -1678,6 +1593,32 @@ fn current_payload(row: &ObjectRow) -> Result<NamedCurrentDependency, StoreError
         row_id: row.row_id.clone(),
         source_event_seq: row.source_event_seq,
         payload,
+    })
+}
+
+fn source_observation_dependency(
+    current: &CurrentFacts,
+    id: SourceObservationId,
+) -> Result<NamedCurrentDependency, StoreError> {
+    let (value, source_event_seq) = current
+        .source_observation(id)
+        .ok_or(StoreError::StoreCorrupt)?;
+    Ok(NamedCurrentDependency {
+        row_id: format!("object:evidence:source_observation:{id}"),
+        source_event_seq,
+        payload: JournalPayload::SourceObservationRecorded(Box::new((**value).clone())),
+    })
+}
+
+fn source_receipt_dependency(
+    current: &CurrentFacts,
+    id: SourceReceiptId,
+) -> Result<NamedCurrentDependency, StoreError> {
+    let (value, source_event_seq) = current.source_receipt(id).ok_or(StoreError::StoreCorrupt)?;
+    Ok(NamedCurrentDependency {
+        row_id: format!("object:evidence:source_receipt:{id}"),
+        source_event_seq,
+        payload: JournalPayload::SourceReceiptRecorded(Box::new((**value).clone())),
     })
 }
 
@@ -1894,7 +1835,7 @@ fn validate_source_local_relations(
 }
 
 fn collect_normalization_dependencies(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     selected: &SourceObservation,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
@@ -1904,24 +1845,8 @@ fn collect_normalization_dependencies(
             SourceLocalEvidence::NativeCall(call) => call,
             SourceLocalEvidence::NamespaceWitness { supported_call, .. } => supported_call,
         };
-        let call_needles = [
-            json_field_fragment("session_id", &call.session_id)?,
-            json_field_fragment("request_id", &call.request_id)?,
-        ];
         let mut ids = BTreeSet::from([selected.source_observation_id]);
-        // Canonical current rows allow a cheap prefilter for both call shapes.
-        // Only the typed comparison below admits a dependency.
-        for row in snapshot.data_rows().filter(|row| {
-            row.object_kind.as_deref() == Some("source_observation")
-                && row.payload_json.as_deref().is_some_and(|json| {
-                    json.contains("\"source_local_evidence\"")
-                        && call_needles.iter().all(|needle| json.contains(needle))
-                })
-        }) {
-            let dependency = current_payload(row)?;
-            let JournalPayload::SourceObservationRecorded(value) = &dependency.payload else {
-                return Err(StoreError::StoreCorrupt);
-            };
+        for (value, _) in snapshot.source_observations() {
             let (other, supported) = match &value.source_local_evidence {
                 Some(SourceLocalEvidence::NativeCall(other)) => (other, &[][..]),
                 Some(SourceLocalEvidence::NamespaceWitness {
@@ -1934,14 +1859,10 @@ fn collect_normalization_dependencies(
             if other.session_id == call.session_id && other.request_id == call.request_id {
                 ids.insert(value.source_observation_id);
                 ids.extend(supported.iter().copied());
-                dependencies.insert(dependency)?;
             }
         }
         for id in &ids {
-            let row = snapshot
-                .row(&format!("object:evidence:source_observation:{id}"))
-                .ok_or(StoreError::StoreCorrupt)?;
-            dependencies.insert(current_payload(row)?)?;
+            dependencies.insert(source_observation_dependency(snapshot, *id)?)?;
         }
         // New dirty facts include already-watermarked predecessors. The new
         // fact's watermark ends this work; no periodic rescan or busy retry.
@@ -1953,36 +1874,8 @@ fn collect_normalization_dependencies(
         .partial_correlation_ref
         .as_deref()
         .filter(|value| !value.is_empty());
-    let correlation_needles = if let Some(key) = &exact_key {
-        vec![
-            json_field_fragment("host_instance_id", &key.host_instance_id)?,
-            json_field_fragment("host_trace_lineage_id", &key.host_trace_lineage_id)?,
-            json_field_fragment("host_lane_key", &key.host_lane_key)?,
-            json_field_fragment("native_request_id", &key.native_request_id)?,
-            json_field_fragment(
-                "physical_execution_ordinal",
-                &key.physical_execution_ordinal,
-            )?,
-        ]
-    } else if let Some(reference) = partial_ref {
-        vec![json_field_fragment("partial_correlation_ref", reference)?]
-    } else {
-        Vec::new()
-    };
     let mut observation_ids = BTreeSet::from([selected.source_observation_id]);
-    for row in snapshot.data_rows().filter(|row| {
-        row.object_kind.as_deref() == Some("source_observation")
-            && !correlation_needles.is_empty()
-            && row.payload_json.as_deref().is_some_and(|json| {
-                correlation_needles
-                    .iter()
-                    .all(|needle| json.contains(needle))
-            })
-    }) {
-        let dependency = current_payload(row)?;
-        let JournalPayload::SourceObservationRecorded(value) = &dependency.payload else {
-            return Err(StoreError::StoreCorrupt);
-        };
+    for (value, _) in snapshot.source_observations() {
         let matches = exact_key
             .as_ref()
             .is_some_and(|key| value.correlation.exact_key().as_ref() == Some(key))
@@ -1991,14 +1884,16 @@ fn collect_normalization_dependencies(
             });
         if matches {
             observation_ids.insert(value.source_observation_id);
-            dependencies.insert(dependency)?;
         }
+    }
+    for id in &observation_ids {
+        dependencies.insert(source_observation_dependency(snapshot, *id)?)?;
     }
     collect_observation_relations(snapshot, &observation_ids, dependencies)
 }
 
 fn collect_observation_relations(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     observation_ids: &BTreeSet<SourceObservationId>,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
@@ -2053,46 +1948,16 @@ fn collect_observation_relations(
 }
 
 fn collect_capture_dependencies(
-    snapshot: &ProjectionSnapshot,
-    selected_receipt: &NamedCurrentDependency,
+    snapshot: &CurrentFacts,
+    selected: &SourceReceipt,
     dependencies: &mut DependencyCollector,
 ) -> Result<(u64, bool), StoreError> {
-    let JournalPayload::SourceReceiptRecorded(selected) = &selected_receipt.payload else {
-        return Err(StoreError::StoreCorrupt);
-    };
     let Some(lifecycle) = selected.lifecycle.as_ref() else {
         return Ok((0, false));
     };
     let incarnation_ref = source_incarnation_ref(selected).ok_or(StoreError::StoreCorrupt)?;
-    let mut source_needles = vec![
-        json_field_fragment("host_session_id", &lifecycle.host_session_id)?,
-        json_field_fragment("agent_id", &lifecycle.agent_id)?,
-        json_field_fragment("host_lane_key", &lifecycle.host_lane_key)?,
-    ];
-    if let Some(value) = lifecycle.incarnation_ref.as_deref() {
-        source_needles.push(json_field_fragment("incarnation_ref", value)?);
-    }
-    let source_rows: Box<dyn Iterator<Item = &ObjectRow>> = if lifecycle.incarnation_ref.is_none() {
-        Box::new(std::iter::once(
-            snapshot
-                .row(&selected_receipt.row_id)
-                .ok_or(StoreError::StoreCorrupt)?,
-        ))
-    } else {
-        Box::new(snapshot.data_rows().filter(|row| {
-            row.object_kind.as_deref() == Some("source_receipt")
-                && row
-                    .payload_json
-                    .as_deref()
-                    .is_some_and(|json| source_needles.iter().all(|needle| json.contains(needle)))
-        }))
-    };
     let mut cohort_observation_ids = BTreeSet::from([selected.source_observation_id]);
-    for row in source_rows {
-        let dependency = current_payload(row)?;
-        let JournalPayload::SourceReceiptRecorded(value) = &dependency.payload else {
-            return Err(StoreError::StoreCorrupt);
-        };
+    for (value, _) in snapshot.source_receipts() {
         if value.lifecycle.as_ref().is_some_and(|candidate| {
             candidate.host_session_id == lifecycle.host_session_id
                 && candidate.agent_id == lifecycle.agent_id
@@ -2100,14 +1965,19 @@ fn collect_capture_dependencies(
                 && source_incarnation_ref(value).as_ref() == Some(&incarnation_ref)
         }) {
             cohort_observation_ids.insert(value.source_observation_id);
-            let observation_row_id = format!(
-                "object:evidence:source_observation:{}",
-                value.source_observation_id
-            );
-            if let Some(observation) = snapshot.row(&observation_row_id) {
-                dependencies.insert(current_payload(observation)?)?;
+            if snapshot
+                .source_observation(value.source_observation_id)
+                .is_some()
+            {
+                dependencies.insert(source_observation_dependency(
+                    snapshot,
+                    value.source_observation_id,
+                )?)?;
             }
-            dependencies.insert(dependency)?;
+            dependencies.insert(source_receipt_dependency(
+                snapshot,
+                value.source_receipt_id,
+            )?)?;
         }
     }
     collect_observation_relations(snapshot, &cohort_observation_ids, dependencies)?;
@@ -2119,7 +1989,7 @@ fn collect_capture_dependencies(
         json_field_fragment("host_lane_key", &lifecycle.host_lane_key)?,
         json_field_fragment("incarnation_ref", &incarnation_ref)?,
     ];
-    for row in snapshot.data_rows().filter(|row| {
+    for row in snapshot.other_data_rows().filter(|row| {
         row.object_kind.as_deref() == Some("execution_lane")
             && row
                 .payload_json
@@ -2138,7 +2008,7 @@ fn collect_capture_dependencies(
             continue;
         }
         let receipt_row_id = format!("object:evidence:capture_receipt:{}", lane.execution_lane_id);
-        if let Some(row) = snapshot.row(&receipt_row_id) {
+        if let Some(row) = snapshot.other_row(&receipt_row_id) {
             let receipt_dependency = current_payload(row)?;
             let JournalPayload::CaptureReceiptRecorded(receipt) = &receipt_dependency.payload
             else {
@@ -2173,7 +2043,7 @@ fn lifecycle_incarnation_ref(
 }
 
 fn collect_receipt_references(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     receipt: &CaptureReceipt,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
@@ -2194,18 +2064,20 @@ fn collect_receipt_references(
                 .map(|reference| format!("runtime:reconciliation:{reference}")),
         );
     for row_id in rows {
-        let row = snapshot.row(&row_id).ok_or(StoreError::StoreCorrupt)?;
+        let row = snapshot
+            .other_row(&row_id)
+            .ok_or(StoreError::StoreCorrupt)?;
         dependencies.insert(current_payload(row)?)?;
     }
     Ok(())
 }
 
 fn rows_referencing<'a>(
-    snapshot: &'a ProjectionSnapshot,
+    snapshot: &'a CurrentFacts,
     object_kind: &'static str,
     needles: &'a [String],
 ) -> impl Iterator<Item = &'a ObjectRow> {
-    snapshot.data_rows().filter(move |row| {
+    snapshot.other_data_rows().filter(move |row| {
         row.object_kind.as_deref() == Some(object_kind)
             && !needles.is_empty()
             && row
@@ -2241,6 +2113,132 @@ pub struct CurrentFacts {
 }
 
 impl CurrentFacts {
+    pub fn other_data_rows(&self) -> impl Iterator<Item = &ObjectRow> {
+        self.other_rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+    }
+
+    pub fn other_row(&self, row_id: &str) -> Option<&ObjectRow> {
+        self.other_rows.iter().find(|row| row.row_id == row_id)
+    }
+
+    pub fn reconciliation_frontier(
+        &self,
+        limit: usize,
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut candidates = self
+            .other_data_rows()
+            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.source_event_seq
+                .cmp(&right.source_event_seq)
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+        let mut items = Vec::new();
+        for row in candidates {
+            let payload = current_payload(row)?;
+            let JournalPayload::DirtyTarget(target) = &payload.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let target = target.clone();
+            if !matches!(
+                target.target_kind,
+                crate::command::DirtyTargetKind::PhysicalNormalization
+                    | crate::command::DirtyTargetKind::CaptureReconciliation
+            ) {
+                continue;
+            }
+            if let Some(item) = reconciliation_item(self, payload, target)? {
+                items.push(item);
+                if items.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(ReconciliationFrontier {
+            frontier: self.frontier,
+            items,
+        })
+    }
+
+    pub fn reconciliation_frontier_for_observations(
+        &self,
+        observation_ids: &[SourceObservationId],
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        if observation_ids.is_empty()
+            || observation_ids.len() > 16
+            || observation_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != observation_ids.len()
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let selected = observation_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut items = Vec::new();
+        for row in self
+            .other_data_rows()
+            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
+        {
+            let payload = current_payload(row)?;
+            let JournalPayload::DirtyTarget(target) = &payload.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let target = target.clone();
+            if selected.contains(&target.target_id)
+                && matches!(
+                    target.target_kind,
+                    crate::command::DirtyTargetKind::PhysicalNormalization
+                        | crate::command::DirtyTargetKind::CaptureReconciliation
+                )
+                && let Some(item) = reconciliation_item(self, payload, target)?
+            {
+                items.push(item);
+            }
+        }
+        items.sort_by(|left, right| {
+            left.source_event_seq
+                .cmp(&right.source_event_seq)
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+        Ok(ReconciliationFrontier {
+            frontier: self.frontier,
+            items,
+        })
+    }
+
+    pub fn reconciliation_artifact_context(
+        &self,
+        descriptors: &[ReconciliationArtifactDescriptor],
+        limit: usize,
+    ) -> Result<ReconciliationArtifactFrontier, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut ordered = descriptors.to_vec();
+        ordered.sort();
+        ordered.truncate(limit);
+        let mut contexts = Vec::with_capacity(ordered.len());
+        for descriptor in ordered {
+            descriptor.validate()?;
+            contexts.push(reconciliation_artifact_item(self, descriptor)?);
+        }
+        Ok(ReconciliationArtifactFrontier {
+            frontier: self.frontier,
+            contexts,
+        })
+    }
+
     pub fn frontier(&self) -> u64 {
         self.frontier
     }
@@ -2267,6 +2265,69 @@ impl CurrentFacts {
         self.evidence_surfaces
             .values()
             .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn source_receipt(&self, id: SourceReceiptId) -> Option<(&Arc<SourceReceipt>, u64)> {
+        self.source_receipts
+            .get(&id)
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn source_observation(
+        &self,
+        id: SourceObservationId,
+    ) -> Option<(&Arc<SourceObservation>, u64)> {
+        self.source_observations
+            .get(&id)
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn evidence_surface(
+        &self,
+        id: SourceObservationId,
+    ) -> Option<(&Arc<EvidenceSurface>, u64)> {
+        self.evidence_surfaces
+            .get(&id)
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    /// Materialize one selected canonical source row for a bounded legacy
+    /// reducer. This does not expose or construct a row view over all facts.
+    pub fn selected_source_row(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        match kind {
+            "source_receipt" => {
+                let id = id
+                    .parse::<SourceReceiptId>()
+                    .map_err(|_| StoreError::InvalidInput)?;
+                self.source_receipts
+                    .get(&id)
+                    .map(|(value, seq)| source_receipt_row(value, *seq))
+                    .transpose()
+            }
+            "source_observation" => {
+                let id = id
+                    .parse::<SourceObservationId>()
+                    .map_err(|_| StoreError::InvalidInput)?;
+                self.source_observations
+                    .get(&id)
+                    .map(|(value, seq)| source_observation_row(value, *seq))
+                    .transpose()
+            }
+            "evidence_surface" => {
+                let id = id
+                    .parse::<SourceObservationId>()
+                    .map_err(|_| StoreError::InvalidInput)?;
+                self.evidence_surfaces
+                    .get(&id)
+                    .map(|(value, seq)| surface_row(id, value, *seq))
+                    .transpose()
+            }
+            _ => Err(StoreError::InvalidInput),
+        }
     }
 
     /// Explicitly materialize the legacy complete canonical-row output.
@@ -2427,6 +2488,14 @@ impl CurrentFacts {
         }
         rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
         Ok(rows)
+    }
+}
+
+impl TryFrom<ProjectionSnapshot> for CurrentFacts {
+    type Error = StoreError;
+
+    fn try_from(snapshot: ProjectionSnapshot) -> Result<Self, Self::Error> {
+        Self::from_full_snapshot(snapshot)
     }
 }
 
@@ -3471,8 +3540,21 @@ pub(crate) struct RepositoryClosureKeys {
 pub struct ObjectDeletionCandidateAdmissionView {
     deletions: Vec<ObjectDeletionLedgerEvent>,
     source_observation_receipts: BTreeMap<SourceObservationId, SourceReceiptId>,
-    source_receipts: BTreeMap<SourceReceiptId, SourceReceipt>,
+    source_receipts: BTreeMap<SourceReceiptId, Arc<SourceReceipt>>,
     source_suppression_refs: BTreeMap<SourceObservationId, BTreeSet<String>>,
+}
+
+fn validate_source_admission_refs(refs: &[String]) -> Result<(), StoreError> {
+    if refs.is_empty()
+        || refs.len() > 64
+        || !refs.windows(2).all(|pair| pair[0] < pair[1])
+        || refs
+            .iter()
+            .any(|reference| reference.parse::<SourceObservationId>().is_err())
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
 }
 
 impl ObjectDeletionCandidateAdmissionView {
@@ -3498,16 +3580,130 @@ impl ObjectDeletionCandidateAdmissionView {
     }
 
     pub fn for_source_refs_rows(rows: &[ObjectRow], refs: &[String]) -> Result<Self, StoreError> {
-        if refs.is_empty()
-            || refs.len() > 64
-            || !refs.windows(2).all(|pair| pair[0] < pair[1])
-            || refs
-                .iter()
-                .any(|reference| reference.parse::<SourceObservationId>().is_err())
-        {
+        validate_source_admission_refs(refs)?;
+        Self::from_selected_rows(rows, Some(refs))
+    }
+
+    /// The same bounded source join over typed current facts. Only selected
+    /// observations, their receipts, and their surfaces are retained.
+    pub fn for_source_refs_current(
+        current: &CurrentFacts,
+        refs: &[String],
+    ) -> Result<Self, StoreError> {
+        validate_source_admission_refs(refs)?;
+        let deletions =
+            crate::purge::ObjectDeletionCurrentView::from_rows(0, current.other_rows().iter())?
+                .events
+                .into_values()
+                .collect::<Vec<_>>();
+        if deletions.is_empty() {
+            return Ok(Self::empty(deletions));
+        }
+
+        let mut source_observation_receipts = BTreeMap::new();
+        let mut selected_receipts = BTreeSet::new();
+        for reference in refs {
+            let observation_id = reference
+                .parse::<SourceObservationId>()
+                .map_err(|_| StoreError::InvalidInput)?;
+            let Some((observation, _)) = current.source_observation(observation_id) else {
+                continue;
+            };
+            if source_observation_receipts
+                .insert(observation_id, observation.source_receipt_ref)
+                .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            selected_receipts.insert(observation.source_receipt_ref);
+        }
+        let mut source_receipts = BTreeMap::new();
+        for receipt_id in selected_receipts {
+            if let Some((receipt, _)) = current.source_receipt(receipt_id)
+                && source_receipts
+                    .insert(receipt_id, Arc::clone(receipt))
+                    .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        let mut surfaces = BTreeMap::new();
+        for reference in refs {
+            let observation_id = reference
+                .parse::<SourceObservationId>()
+                .map_err(|_| StoreError::InvalidInput)?;
+            if let Some((surface, _)) = current.evidence_surface(observation_id)
+                && surfaces
+                    .insert(observation_id, Arc::clone(surface))
+                    .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Self::from_source_inputs(
+            deletions,
+            source_observation_receipts,
+            source_receipts,
+            surfaces,
+        )
+    }
+
+    /// Build the same suppression closure for a bounded candidate cohort that
+    /// may also contain non-source references.
+    pub fn for_candidate_refs_current(
+        current: &CurrentFacts,
+        refs: &[String],
+    ) -> Result<Self, StoreError> {
+        if refs.is_empty() || refs.len() > 256 || !refs.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err(StoreError::InvalidInput);
         }
-        Self::from_selected_rows(rows, Some(refs))
+        let deletions =
+            crate::purge::ObjectDeletionCurrentView::from_rows(0, current.other_rows().iter())?
+                .events
+                .into_values()
+                .collect::<Vec<_>>();
+        if deletions.is_empty() {
+            return Ok(Self::empty(deletions));
+        }
+
+        let mut source_observation_receipts = BTreeMap::new();
+        let mut selected_receipts = BTreeSet::new();
+        for reference in refs {
+            if let Ok(observation_id) = reference.parse::<SourceObservationId>()
+                && let Some((observation, _)) = current.source_observation(observation_id)
+            {
+                source_observation_receipts.insert(observation_id, observation.source_receipt_ref);
+                selected_receipts.insert(observation.source_receipt_ref);
+            }
+            if let Ok(receipt_id) = reference.parse::<SourceReceiptId>()
+                && let Some((receipt, _)) = current.source_receipt(receipt_id)
+            {
+                source_observation_receipts.insert(receipt.source_observation_id, receipt_id);
+                selected_receipts.insert(receipt_id);
+            }
+        }
+        let source_receipts = selected_receipts
+            .into_iter()
+            .filter_map(|id| {
+                current
+                    .source_receipt(id)
+                    .map(|(receipt, _)| (id, Arc::clone(receipt)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let surfaces = source_observation_receipts
+            .keys()
+            .filter_map(|id| {
+                current
+                    .evidence_surface(*id)
+                    .map(|(surface, _)| (*id, Arc::clone(surface)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        Self::from_source_inputs(
+            deletions,
+            source_observation_receipts,
+            source_receipts,
+            surfaces,
+        )
     }
 
     fn from_selected_rows(
@@ -3517,12 +3713,7 @@ impl ObjectDeletionCandidateAdmissionView {
         let ledger = crate::purge::ObjectDeletionCurrentView::from_rows(0, rows.iter())?;
         let deletions = ledger.events.into_values().collect::<Vec<_>>();
         if deletions.is_empty() {
-            return Ok(Self {
-                deletions,
-                source_observation_receipts: BTreeMap::new(),
-                source_receipts: BTreeMap::new(),
-                source_suppression_refs: BTreeMap::new(),
-            });
+            return Ok(Self::empty(deletions));
         }
         let mut source_observation_receipts = BTreeMap::new();
         let mut source_receipts = BTreeMap::new();
@@ -3559,7 +3750,7 @@ impl ObjectDeletionCandidateAdmissionView {
                     JournalPayload::SourceReceiptRecorded(value) => {
                         value.validate().map_err(|_| StoreError::StoreCorrupt)?;
                         if source_receipts
-                            .insert(value.source_receipt_id, *value)
+                            .insert(value.source_receipt_id, Arc::new(*value))
                             .is_some()
                         {
                             return Err(StoreError::StoreCorrupt);
@@ -3576,7 +3767,7 @@ impl ObjectDeletionCandidateAdmissionView {
                 );
             }
         }
-        let mut source_suppression_refs = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
         let mut seen_surfaces = BTreeSet::new();
         for row in rows.iter().filter(|row| {
             row.object_kind.as_deref() == Some("evidence_surface")
@@ -3600,6 +3791,33 @@ impl ObjectDeletionCandidateAdmissionView {
             if !seen_surfaces.insert(observation_id) {
                 return Err(StoreError::StoreCorrupt);
             }
+            surfaces.insert(observation_id, Arc::new(*surface));
+        }
+        Self::from_source_inputs(
+            deletions,
+            source_observation_receipts,
+            source_receipts,
+            surfaces,
+        )
+    }
+
+    fn empty(deletions: Vec<ObjectDeletionLedgerEvent>) -> Self {
+        Self {
+            deletions,
+            source_observation_receipts: BTreeMap::new(),
+            source_receipts: BTreeMap::new(),
+            source_suppression_refs: BTreeMap::new(),
+        }
+    }
+
+    fn from_source_inputs(
+        deletions: Vec<ObjectDeletionLedgerEvent>,
+        source_observation_receipts: BTreeMap<SourceObservationId, SourceReceiptId>,
+        source_receipts: BTreeMap<SourceReceiptId, Arc<SourceReceipt>>,
+        surfaces: BTreeMap<SourceObservationId, Arc<EvidenceSurface>>,
+    ) -> Result<Self, StoreError> {
+        let mut source_suppression_refs = BTreeMap::new();
+        for (observation_id, surface) in surfaces {
             let Some(receipt) = source_observation_receipts
                 .get(&observation_id)
                 .and_then(|receipt_id| source_receipts.get(receipt_id))
@@ -3671,7 +3889,7 @@ enum CandidateSourceLookup<'a> {
     },
     Compact {
         observation_receipts: &'a BTreeMap<SourceObservationId, SourceReceiptId>,
-        receipts: &'a BTreeMap<SourceReceiptId, SourceReceipt>,
+        receipts: &'a BTreeMap<SourceReceiptId, Arc<SourceReceipt>>,
         suppression_refs: &'a BTreeMap<SourceObservationId, BTreeSet<String>>,
     },
 }

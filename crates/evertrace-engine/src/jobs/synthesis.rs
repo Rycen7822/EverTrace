@@ -14,11 +14,11 @@ use evertrace_domain::{
     },
     work::{AssignmentStatus, EpisodeLifecycle, PendingSemanticInterval, WorkEpisode},
 };
+use evertrace_store::projections::CurrentFacts;
 use evertrace_store::{
     DurableJob, EventScope, JobBudget, JobStatus, JobTerminalAudit, JobTerminalOutcome,
     JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
-    ObjectDeletionCandidateAdmissionView, ProjectionSnapshot, SegmentationCurrentView,
-    SemanticCurrentView, SourceKind,
+    ObjectDeletionCandidateAdmissionView, SegmentationCurrentView, SemanticCurrentView, SourceKind,
 };
 
 use crate::{
@@ -36,18 +36,22 @@ use crate::{
 
 const DAY_US: i64 = 86_400_000_000;
 
-struct SnapshotRefIndex {
+struct CurrentRefIndex {
     kinds: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
-impl SnapshotRefIndex {
-    fn new(snapshot: &ProjectionSnapshot, selected_refs: &[String]) -> Self {
+impl CurrentRefIndex {
+    fn new(current: &CurrentFacts, selected_refs: &[String]) -> Self {
         let selected = selected_refs
             .iter()
             .collect::<std::collections::BTreeSet<_>>();
         let mut kinds =
             std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
-        for row in snapshot.data_rows() {
+        for row in current
+            .other_rows()
+            .iter()
+            .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
+        {
             let Some(kind) = row.object_kind.as_ref() else {
                 continue;
             };
@@ -60,6 +64,33 @@ impl SnapshotRefIndex {
                     .entry(reference.clone())
                     .or_default()
                     .insert(kind.clone());
+            }
+        }
+        for reference in selected_refs {
+            if let Ok(id) = reference.parse::<evertrace_domain::ids::SourceReceiptId>()
+                && current.source_receipt(id).is_some()
+                && id.to_string() == *reference
+            {
+                kinds
+                    .entry(reference.clone())
+                    .or_default()
+                    .insert("source_receipt".into());
+            }
+            if let Ok(id) = reference.parse::<evertrace_domain::ids::SourceObservationId>()
+                && id.to_string() == *reference
+            {
+                if current.source_observation(id).is_some() {
+                    kinds
+                        .entry(reference.clone())
+                        .or_default()
+                        .insert("source_observation".into());
+                }
+                if current.evidence_surface(id).is_some() {
+                    kinds
+                        .entry(reference.clone())
+                        .or_default()
+                        .insert("evidence_surface".into());
+                }
             }
         }
         Self { kinds }
@@ -107,7 +138,7 @@ pub enum SynthesisTarget {
 pub(crate) mod source;
 
 pub struct SynthesisRequest<'a> {
-    pub snapshot: &'a ProjectionSnapshot,
+    pub current: &'a CurrentFacts,
     pub target: SynthesisTarget,
     pub trigger: SemanticDigestTrigger,
     pub direct_delta: Vec<ProtectedDeltaItem>,
@@ -233,14 +264,14 @@ impl SynthesisPlanner {
 
     pub fn durable_jobs(
         &self,
-        snapshot: &ProjectionSnapshot,
+        current: &CurrentFacts,
         effective_config_hash: [u8; 32],
         covered: &std::collections::BTreeSet<(String, u64, [u8; 32])>,
         limit: usize,
         max_wall_time: std::time::Duration,
     ) -> Result<Vec<DurableJob>, crate::semantic::SemanticServiceError> {
         self.durable_jobs_for_episodes(
-            current_synthesis_episodes(snapshot)?.into_values(),
+            current_synthesis_episodes(current)?.into_values(),
             effective_config_hash,
             covered,
             limit,
@@ -315,14 +346,14 @@ impl SynthesisPlanner {
 
     pub async fn execute_durable_job(
         &self,
-        snapshot: &ProjectionSnapshot,
+        current: &CurrentFacts,
         job: &DurableJob,
         effective_config_hash: [u8; 32],
         occurred_at_us: i64,
         max_wall_time: std::time::Duration,
     ) -> Result<JournalCommand, crate::semantic::SemanticServiceError> {
         let prepared = self.prepare_episode_job(
-            snapshot,
+            current,
             job,
             effective_config_hash,
             occurred_at_us,
@@ -336,7 +367,7 @@ impl SynthesisPlanner {
             Ok(prepared) => {
                 let started = std::time::Instant::now();
                 let derived = self.derive_prepared(&prepared, || async { Ok(()) }).await;
-                self.finish_prepared(prepared, snapshot, derived, started.elapsed())
+                self.finish_prepared(prepared, current, derived, started.elapsed())
                     .await?
             }
             Err(resolution) => resolution,
@@ -346,7 +377,7 @@ impl SynthesisPlanner {
 
     fn prepare_episode_job(
         &self,
-        snapshot: &ProjectionSnapshot,
+        current: &CurrentFacts,
         job: &DurableJob,
         effective_config_hash: [u8; 32],
         occurred_at_us: i64,
@@ -358,8 +389,7 @@ impl SynthesisPlanner {
         {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let (episode, trigger, direct_delta, selected_direct_refs) =
-            scheduled_input(snapshot, job)?;
+        let (episode, trigger, direct_delta, selected_direct_refs) = scheduled_input(current, job)?;
         if direct_delta.is_empty() {
             let mut terminal = job.clone();
             terminal.state = JobStatus::Failed;
@@ -391,7 +421,7 @@ impl SynthesisPlanner {
         }
         let resolution = self.prepare(
             SynthesisRequest {
-                snapshot,
+                current,
                 target: SynthesisTarget::Episode(episode.revision_id),
                 trigger,
                 direct_delta,
@@ -416,7 +446,7 @@ impl SynthesisPlanner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_owned_episode_job<F, Fut>(
         &self,
-        snapshot: ProjectionSnapshot,
+        current: CurrentFacts,
         job: &DurableJob,
         occurred_at_us: i64,
         max_wall_time: std::time::Duration,
@@ -428,13 +458,13 @@ impl SynthesisPlanner {
         Fut: std::future::Future<Output = Result<(), ProviderError>> + Send,
     {
         let preparation = self.prepare_episode_job(
-            &snapshot,
+            &current,
             job,
             job.config_hash,
             occurred_at_us,
             max_wall_time,
         )?;
-        drop(snapshot);
+        drop(current);
         let (prepared, scope) = match preparation {
             Ok(value) => value,
             Err(command) => return Ok(command),
@@ -445,7 +475,7 @@ impl SynthesisPlanner {
                 let derived = self.derive_prepared(&prepared, admission).await;
                 let elapsed = started.elapsed();
                 let current = writer
-                    .project()
+                    .project_current(true)
                     .await
                     .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
                 self.finish_prepared(prepared, &current, derived, elapsed)
@@ -482,13 +512,13 @@ impl SynthesisPlanner {
 
     pub(crate) fn remaining_daily_wall_time(
         &self,
-        snapshot: &ProjectionSnapshot,
+        current: &CurrentFacts,
         occurred_at_us: i64,
     ) -> Result<std::time::Duration, crate::semantic::SemanticServiceError> {
         if occurred_at_us < 0 {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let used_wall_time_us = recorded_daily_usage(snapshot, occurred_at_us)?.wall_time_us;
+        let used_wall_time_us = recorded_daily_usage_current(current, occurred_at_us)?.wall_time_us;
         Ok(std::time::Duration::from_micros(
             self.llm
                 .daily_wall_time_budget
@@ -516,14 +546,14 @@ impl SynthesisPlanner {
         F: Fn() -> Fut + Sync,
         Fut: std::future::Future<Output = Result<(), ProviderError>> + Send,
     {
-        let snapshot = request.snapshot;
+        let current = request.current;
         let prepared = match self.prepare(request, input_omission)? {
             Ok(prepared) => prepared,
             Err(resolution) => return Ok(resolution),
         };
         let started = std::time::Instant::now();
         let derived = self.derive_prepared(&prepared, admission).await;
-        self.finish_prepared(prepared, snapshot, derived, started.elapsed())
+        self.finish_prepared(prepared, current, derived, started.elapsed())
             .await
     }
 
@@ -559,7 +589,7 @@ impl SynthesisPlanner {
         {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let ref_index = SnapshotRefIndex::new(request.snapshot, &request.selected_direct_refs);
+        let ref_index = CurrentRefIndex::new(request.current, &request.selected_direct_refs);
         let flattened = request
             .direct_delta
             .iter()
@@ -578,7 +608,7 @@ impl SynthesisPlanner {
         }
         let episode = match &request.target {
             SynthesisTarget::Episode(revision) => {
-                Some(current_episode(request.snapshot, *revision)?)
+                Some(current_episode(request.current, *revision)?)
             }
             SynthesisTarget::Source {
                 source,
@@ -589,7 +619,7 @@ impl SynthesisPlanner {
                     return Err(crate::semantic::SemanticServiceError::InvalidInput);
                 }
                 source::validate_input(
-                    request.snapshot,
+                    request.current,
                     source,
                     *after_sequence,
                     *through_sequence,
@@ -647,7 +677,7 @@ impl SynthesisPlanner {
             )
         }
         .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
-        let prior = prior_runs(request.snapshot)?;
+        let prior = prior_runs(request.current)?;
         if prior.iter().any(|run| {
             run.status == DerivationRunStatus::Succeeded
                 && (run.job_fingerprint == fingerprint
@@ -680,7 +710,12 @@ impl SynthesisPlanner {
             source_refs: request.selected_direct_refs.clone(),
             stage_trace: episode
                 .as_ref()
-                .map(|episode| crate::procedure::StageTrace::compile(request.snapshot, episode))
+                .map(|episode| {
+                    crate::procedure::StageTrace::compile_rows(
+                        request.current.other_rows(),
+                        episode,
+                    )
+                })
                 .transpose()?,
             source_target: request.source_target().cloned(),
         };
@@ -775,7 +810,7 @@ impl SynthesisPlanner {
     async fn finish_prepared(
         &self,
         prepared: PreparedSynthesis,
-        snapshot: &ProjectionSnapshot,
+        current: &CurrentFacts,
         derived: Result<crate::provider::ProviderDerivation, ProviderError>,
         elapsed: std::time::Duration,
     ) -> Result<SynthesisResolution, crate::semantic::SemanticServiceError> {
@@ -794,7 +829,7 @@ impl SynthesisPlanner {
             effective_config_hash,
         } = prepared;
         let request = SynthesisRequest {
-            snapshot,
+            current,
             target,
             trigger,
             direct_delta: Vec::new(),
@@ -807,7 +842,7 @@ impl SynthesisPlanner {
         // The revision is immutable. Require that exact claimed base to remain
         // current before using its skeleton for candidates and the successor.
         let episode = match &request.target {
-            SynthesisTarget::Episode(revision) => Some(current_episode(snapshot, *revision)?),
+            SynthesisTarget::Episode(revision) => Some(current_episode(current, *revision)?),
             SynthesisTarget::Source { .. } => None,
         };
         let from_watermark = input.from_watermark;
@@ -905,14 +940,14 @@ impl SynthesisPlanner {
             }
         }
         if let Some(episode) = &episode {
-            isolate_invalid_candidates(&mut application, episode, request.snapshot)?;
+            isolate_invalid_candidates(&mut application, episode, request.current)?;
         }
         // The closed provider result permits at most one candidate. Resolve
         // its cohort's assets once, after schema/protection, not per record.
         let coverage = match (application.candidates.first(), &self.inventory) {
             (Some(SemanticCandidate::ProcedureProposal { payload, .. }), Some(inventory)) => {
                 match inventory
-                    .procedure_coverage(request.snapshot, payload.draft(), &evidence_refs)
+                    .procedure_coverage(request.current, payload.draft(), &evidence_refs)
                     .await
                 {
                     Ok(coverage) => Some(coverage),
@@ -932,7 +967,7 @@ impl SynthesisPlanner {
             coverage.apply_incremental_boundary(candidate);
         }
         if let Some(episode) = &episode {
-            isolate_invalid_candidates(&mut application, episode, request.snapshot)?;
+            isolate_invalid_candidates(&mut application, episode, request.current)?;
         }
         let digest_id = SemanticDigestId::new_v7();
         let mut digest = SemanticDigest {
@@ -998,7 +1033,7 @@ impl SynthesisPlanner {
         let mut payloads = if episode.is_some() {
             proposal_payloads(
                 &mut digest,
-                request.snapshot,
+                request.current,
                 &request,
                 &evidence_refs,
                 coverage.as_ref(),
@@ -1114,15 +1149,17 @@ fn durable_resolution(
 }
 
 pub(crate) fn current_synthesis_episodes(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
 ) -> Result<
     std::collections::BTreeMap<evertrace_domain::ids::WorkEpisodeId, WorkEpisode>,
     crate::semantic::SemanticServiceError,
 > {
-    let mut current =
+    let mut episodes_by_id =
         std::collections::BTreeMap::<evertrace_domain::ids::WorkEpisodeId, WorkEpisode>::new();
-    for row in snapshot
-        .data_rows()
+    for row in current
+        .other_rows()
+        .iter()
+        .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
         .filter(|row| row.object_kind.as_deref() == Some("work_episode"))
     {
         let payload: JournalPayload = serde_json::from_str(
@@ -1134,17 +1171,17 @@ pub(crate) fn current_synthesis_episodes(
         let JournalPayload::WorkEpisodeRecorded(episode) = payload else {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         };
-        match current.get(&episode.episode_id) {
+        match episodes_by_id.get(&episode.episode_id) {
             Some(existing) if existing.revision_generation == episode.revision_generation => {
                 return Err(crate::semantic::SemanticServiceError::ImmutableConflict);
             }
             Some(existing) if existing.revision_generation > episode.revision_generation => {}
             _ => {
-                current.insert(episode.episode_id, *episode);
+                episodes_by_id.insert(episode.episode_id, *episode);
             }
         }
     }
-    Ok(current)
+    Ok(episodes_by_id)
 }
 
 pub(crate) fn synthesis_trigger(episode: &WorkEpisode) -> Option<SemanticDigestTrigger> {
@@ -1199,20 +1236,20 @@ pub(crate) fn synthesis_budget(
     })
 }
 
-pub(crate) fn synthesis_target_is_current(snapshot: &ProjectionSnapshot, job: &DurableJob) -> bool {
+pub(crate) fn synthesis_target_is_current(current: &CurrentFacts, job: &DurableJob) -> bool {
     match evertrace_domain::semantic::SemanticJobTarget::parse(&job.target_revision) {
         Ok(evertrace_domain::semantic::SemanticJobTarget::Episode(_)) => {
-            scheduled_input(snapshot, job).is_ok()
+            scheduled_input(current, job).is_ok()
         }
         Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. }) => {
-            source::input(snapshot, job).is_ok()
+            source::input(current, job).is_ok()
         }
         Err(_) => false,
     }
 }
 
 fn scheduled_input(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<
     (
@@ -1229,7 +1266,7 @@ fn scheduled_input(
     else {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     };
-    let episode = current_episode(snapshot, revision_id)?;
+    let episode = current_episode(current, revision_id)?;
     let trigger =
         synthesis_trigger(&episode).ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
     if job.target_watermark != episode.source_watermark
@@ -1238,25 +1275,13 @@ fn scheduled_input(
         return Err(crate::semantic::SemanticServiceError::BaseConflict);
     }
     let task_id = episode.task_id.to_string();
-    let authority = SegmentationCurrentView::from_snapshot(snapshot)
+    let authority = SegmentationCurrentView::from_rows(current.frontier(), current.other_rows())
         .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
     let mut by_ref = std::collections::BTreeMap::new();
-    for row in snapshot.data_rows().filter(|row| {
-        row.source_event_seq > episode.semantic_watermark
-            && row.source_event_seq <= episode.source_watermark
-    }) {
-        if row.object_kind.as_deref() != Some("evidence_surface") {
-            continue;
-        }
-        let payload: JournalPayload = serde_json::from_str(
-            row.payload_json
-                .as_deref()
-                .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?,
-        )
-        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
-        let JournalPayload::EvidenceSurfaceRecorded(surface) = payload else {
-            return Err(crate::semantic::SemanticServiceError::InvalidInput);
-        };
+    for (surface, _seq) in current
+        .evidence_surfaces()
+        .filter(|(_, seq)| *seq > episode.semantic_watermark && *seq <= episode.source_watermark)
+    {
         surface
             .validate()
             .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
@@ -1318,11 +1343,13 @@ fn bounded_protected_text(protected_text: &str) -> String {
 }
 
 fn current_episode(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     revision_id: RevisionId,
 ) -> Result<WorkEpisode, crate::semantic::SemanticServiceError> {
-    let episodes = snapshot
-        .data_rows()
+    let episodes = current
+        .other_rows()
+        .iter()
+        .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
         .filter(|row| row.object_kind.as_deref() == Some("work_episode"))
         .map(|row| {
             let payload: JournalPayload = serde_json::from_str(
@@ -1355,13 +1382,21 @@ fn current_episode(
 }
 
 pub(crate) fn recorded_daily_usage(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &evertrace_store::ProjectionSnapshot,
+    occurred_at_us: i64,
+) -> Result<DerivationQuotaUsage, crate::semantic::SemanticServiceError> {
+    let current = CurrentFacts::try_from(snapshot.clone())?;
+    recorded_daily_usage_current(&current, occurred_at_us)
+}
+
+pub(crate) fn recorded_daily_usage_current(
+    current: &CurrentFacts,
     occurred_at_us: i64,
 ) -> Result<DerivationQuotaUsage, crate::semantic::SemanticServiceError> {
     if occurred_at_us < 0 {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     }
-    Ok(daily_usage(&prior_runs(snapshot)?, occurred_at_us))
+    Ok(daily_usage(&prior_runs(current)?, occurred_at_us))
 }
 
 /// Rebuild reservations from the existing claim history. Unacknowledged,
@@ -1516,10 +1551,12 @@ fn daily_usage(prior: &[SemanticDerivationRun], occurred_at_us: i64) -> Derivati
 }
 
 fn prior_runs(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
 ) -> Result<Vec<SemanticDerivationRun>, crate::semantic::SemanticServiceError> {
-    snapshot
-        .data_rows()
+    current
+        .other_rows()
+        .iter()
+        .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
         .filter(|row| row.object_kind.as_deref() == Some("semantic_derivation_run"))
         .map(|row| {
             let payload: JournalPayload = serde_json::from_str(
@@ -1539,9 +1576,9 @@ fn prior_runs(
 fn isolate_invalid_candidates(
     application: &mut SemanticDigestApplication,
     episode: &WorkEpisode,
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
 ) -> Result<(), crate::semantic::SemanticServiceError> {
-    match validate_candidates(&application.candidates, episode, snapshot) {
+    match validate_candidates(&application.candidates, episode, current) {
         Ok(()) => Ok(()),
         Err(
             crate::semantic::SemanticServiceError::InvalidInput
@@ -1557,12 +1594,12 @@ fn isolate_invalid_candidates(
 fn validate_candidates(
     candidates: &[SemanticCandidate],
     episode: &WorkEpisode,
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
 ) -> Result<(), crate::semantic::SemanticServiceError> {
     if candidates.len() > 1 {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     }
-    let semantic = SemanticCurrentView::from_snapshot(snapshot)?;
+    let semantic = SemanticCurrentView::from_rows(current.frontier(), current.other_rows())?;
     for candidate in candidates {
         candidate
             .validate()
@@ -1578,7 +1615,7 @@ fn validate_candidates(
                 if task_id != &episode.task_id
                     || repository_id != &episode.repository_instance_id
                     || worktree_id != &episode.worktree_instance_id
-                    || !snapshot.data_rows().any(|row| {
+                    || !current.other_rows().iter().any(|row| {
                         row.object_kind.as_deref() == Some("scenario")
                             && row.current_revision_id.as_deref()
                                 == Some(&scenario_revision_id.to_string())
@@ -1631,10 +1668,10 @@ fn validate_candidates(
                     return Err(crate::semantic::SemanticServiceError::InvalidInput);
                 }
                 if let Some(target_id) = target_id {
-                    let current =
-                        crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(
-                            snapshot,
-                        )?;
+                    let current = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                        current.frontier(),
+                        current.other_rows(),
+                    )?;
                     if base_revision_id
                         .and_then(|revision| current.current_procedure_by_revision(revision))
                         .is_none_or(|procedure| {
@@ -1810,13 +1847,14 @@ fn atom_payload_scopes(
 
 fn proposal_payloads(
     digest: &mut SemanticDigest,
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     request: &SynthesisRequest<'_>,
     evidence_refs: &[String],
     coverage: Option<&crate::procedure::VerifiedProcedureCoverage>,
 ) -> Result<Vec<JournalPayload>, crate::semantic::SemanticServiceError> {
-    let view = SemanticCurrentView::from_snapshot(snapshot)?;
-    let deletion_admission = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
+    let view = SemanticCurrentView::from_rows(current.frontier(), current.other_rows())?;
+    let deletion_admission =
+        ObjectDeletionCandidateAdmissionView::for_candidate_refs_current(current, evidence_refs)?;
     let service = RevisionProposalService;
     let mut payloads = Vec::new();
     let mut retained = Vec::new();

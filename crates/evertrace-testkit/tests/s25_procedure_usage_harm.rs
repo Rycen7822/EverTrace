@@ -5624,11 +5624,13 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         )
         .await
         .unwrap();
-    let snapshot = handle.project().await.unwrap();
+    let snapshot =
+        evertrace_store::projections::CurrentFacts::try_from(handle.project().await.unwrap())
+            .unwrap();
     // This is a synthetic provider, not an authenticated model. The candidate
     // still traverses the real provider DTO, synthesis, proposal and acceptance.
     let current_episode = snapshot
-        .data_rows()
+        .other_data_rows()
         .filter_map(|row| {
             let payload: JournalPayload =
                 serde_json::from_str(row.payload_json.as_deref()?).ok()?;
@@ -5725,7 +5727,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         });
     let generated = planner
         .execute(evertrace_engine::jobs::SynthesisRequest {
-            snapshot: &snapshot,
+            current: &snapshot,
             target: evertrace_engine::jobs::SynthesisTarget::Episode(current_episode.revision_id),
             trigger: evertrace_domain::semantic::SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![evertrace_engine::provider::ProtectedDeltaItem {

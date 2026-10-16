@@ -44,9 +44,16 @@ pub struct SemanticCurrentView {
 
 impl SemanticCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[crate::ObjectRow]) -> Result<Self, StoreError> {
         let mut atom_revisions = BTreeMap::new();
         let mut proposal_revisions = BTreeMap::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == crate::ObjectRowKind::Data)
+        {
             let Some(kind) = row.object_kind.as_deref() else {
                 continue;
             };
@@ -101,7 +108,7 @@ impl SemanticCurrentView {
         rebuild_atoms(&mut atoms, &atom_revisions)?;
         rebuild_proposals(&mut proposals, &proposal_revisions)?;
         Ok(Self {
-            frontier: snapshot.frontier,
+            frontier,
             atoms: atoms
                 .into_iter()
                 .map(|(id, (value, _))| (id, value))

@@ -1887,7 +1887,9 @@ impl JournalWriter {
         &self,
         limit: usize,
     ) -> Result<ReconciliationFrontier, StoreError> {
-        self.project_objects().await?.reconciliation_frontier(limit)
+        self.project_current(false)
+            .await?
+            .reconciliation_frontier(limit)
     }
 
     pub async fn reconciliation_artifact_context(
@@ -1895,7 +1897,7 @@ impl JournalWriter {
         descriptors: &[ReconciliationArtifactDescriptor],
         limit: usize,
     ) -> Result<ReconciliationArtifactFrontier, StoreError> {
-        self.project_objects()
+        self.project_current(false)
             .await?
             .reconciliation_artifact_context(descriptors, limit)
     }

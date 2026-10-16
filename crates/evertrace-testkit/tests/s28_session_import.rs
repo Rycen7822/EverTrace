@@ -18,7 +18,7 @@ use evertrace_engine::{
     spawn_writer,
 };
 use evertrace_store::{
-    JobStatus, JournalPayload, JournalWriter, SemanticCurrentView, SessionBodyState,
+    CurrentFacts, JobStatus, JournalPayload, JournalWriter, SemanticCurrentView, SessionBodyState,
     SessionImportCurrentView,
 };
 use tempfile::TempDir;
@@ -1349,10 +1349,11 @@ async fn imported_messages_scenario(
         replacement.source_observation_id.to_string(),
     ];
     mixed.sort();
+    let current = CurrentFacts::try_from(rewritten_snapshot.clone()).unwrap();
     assert!(
         Box::pin(SynthesisPlanner::new(llm.clone())
             .execute(evertrace_engine::jobs::SynthesisRequest {
-                snapshot: &rewritten_snapshot,
+                current: &current,
                 target: evertrace_engine::jobs::SynthesisTarget::Source {
                     source: target,
                     after_sequence: 0,

@@ -3,25 +3,8 @@ use evertrace_domain::{
     evidence::{EvidenceSourceKind, ObservationRole, SourceReceipt},
     semantic::{SemanticJobTarget, SemanticSourceTarget},
 };
+use evertrace_store::projections::CurrentFacts;
 use std::collections::BTreeMap;
-
-// Read selection metadata only. In particular serde skips protected_presentation
-// before allocation; body loading remains bounded to the claimed archive refs.
-#[derive(serde::Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum ReceiptProjection {
-    SourceReceiptRecorded(MessageMetadata),
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum ObservationProjection {
-    SourceObservationRecorded(ObservationEndpoint),
-}
-#[derive(serde::Deserialize)]
-struct ObservationEndpoint {
-    source_receipt_ref: evertrace_domain::ids::SourceReceiptId,
-}
 
 #[derive(Clone, serde::Deserialize)]
 struct MessageMetadata {
@@ -55,16 +38,19 @@ impl MessageMetadata {
     }
 }
 
-fn metadata(
-    row: &evertrace_store::ObjectRow,
-) -> Result<MessageMetadata, crate::semantic::SemanticServiceError> {
-    let ReceiptProjection::SourceReceiptRecorded(receipt) = serde_json::from_str(
-        row.payload_json
-            .as_deref()
-            .ok_or(evertrace_store::StoreError::StoreCorrupt)?,
-    )
-    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
-    Ok(receipt)
+fn metadata(receipt: &SourceReceipt) -> MessageMetadata {
+    MessageMetadata {
+        source_observation_id: receipt.source_observation_id,
+        source_instance_id: receipt.source_instance_id.clone(),
+        source_revision: receipt.source_revision.clone(),
+        source_kind: receipt.source_kind,
+        observation_role: receipt.observation_role,
+        unsupported_record_classification: receipt.unsupported_record_classification,
+        repository_instance_id: receipt.repository_instance_id,
+        worktree_instance_id: receipt.worktree_instance_id,
+        source_sequence: receipt.source_sequence,
+        protected_length: receipt.protected_length,
+    }
 }
 
 pub(crate) struct SourceInput {
@@ -76,7 +62,7 @@ pub(crate) struct SourceInput {
 }
 
 fn message_groups(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
 ) -> Result<
     BTreeMap<
         (
@@ -88,11 +74,8 @@ fn message_groups(
     crate::semantic::SemanticServiceError,
 > {
     let mut groups = BTreeMap::<_, Vec<_>>::new();
-    for row in snapshot
-        .data_rows()
-        .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-    {
-        let receipt = metadata(row)?;
+    for (receipt, _) in current.source_receipts() {
+        let receipt = metadata(receipt);
         if receipt.source_kind != EvidenceSourceKind::CodexSessionJsonl
             || receipt.observation_role != ObservationRole::Message
             || !evertrace_store::is_session_import_source(receipt.source_instance_id.as_str())
@@ -122,14 +105,14 @@ fn message_groups(
 }
 
 pub(crate) fn validate_input(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     source: &SemanticSourceTarget,
     after_sequence: u64,
     through_sequence: u64,
     refs: &[String],
 ) -> Result<(), crate::semantic::SemanticServiceError> {
     crate::session_import::source_summary_receipts(
-        snapshot,
+        current,
         source,
         after_sequence,
         through_sequence,
@@ -140,10 +123,10 @@ pub(crate) fn validate_input(
 }
 
 pub(crate) fn input(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<SourceInput, crate::semantic::SemanticServiceError> {
-    let (first, last) = endpoints(snapshot, job)?;
+    let (first, last) = endpoints(current, job)?;
     let source = first
         .target()
         .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
@@ -162,32 +145,17 @@ pub(crate) fn input(
     {
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     }
-    let source_needle = format!(
-        "\"source_instance_id\":{}",
-        serde_json::to_string(source.source_instance_id.as_str())
-            .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?
-    );
-    let revision_needle = format!(
-        "\"source_revision\":{}",
-        serde_json::to_string(source.source_revision.as_str())
-            .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?
-    );
     let mut refs = Vec::new();
     // Frozen jobs scan only this source/revision's metadata, retaining <=64
     // interval refs. No all-source grouping, sorting or body decoding.
-    for row in snapshot.data_rows().filter(|row| {
-        row.object_kind.as_deref() == Some("source_receipt")
-            && row.payload_json.as_deref().is_some_and(|json| {
-                json.contains(&source_needle) && json.contains(&revision_needle)
-            })
-    }) {
-        let receipt = metadata(row)?;
+    for (receipt, _) in current.source_receipts() {
         if receipt.source_instance_id == source.source_instance_id
             && receipt.source_revision == source.source_revision
             && receipt.observation_role == ObservationRole::Message
             && receipt.source_sequence > after_sequence
             && receipt.source_sequence <= through_sequence
         {
+            let receipt = metadata(receipt);
             if receipt.target().as_ref() != Some(&source) || refs.len() == 64 {
                 return Err(crate::semantic::SemanticServiceError::InvalidInput);
             }
@@ -196,7 +164,7 @@ pub(crate) fn input(
     }
     refs.sort();
     let receipts = crate::session_import::source_summary_receipts(
-        snapshot,
+        current,
         &source,
         after_sequence,
         through_sequence,
@@ -213,7 +181,7 @@ pub(crate) fn input(
 }
 
 fn endpoints(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<(MessageMetadata, MessageMetadata), crate::semantic::SemanticServiceError> {
     let SemanticJobTarget::Source {
@@ -225,33 +193,16 @@ fn endpoints(
         return Err(crate::semantic::SemanticServiceError::InvalidInput);
     };
     let endpoint = |id: evertrace_domain::ids::SourceObservationId| -> Result<MessageMetadata, crate::semantic::SemanticServiceError> {
-        let observation_id = id.to_string();
-        let row = snapshot
-            .data_rows()
-            .find(|row| {
-                row.object_kind.as_deref() == Some("source_observation")
-                    && row.object_id.as_deref() == Some(observation_id.as_str())
-            })
+        let (observation, _) = current
+            .source_observation(id)
             .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
-        let ObservationProjection::SourceObservationRecorded(observation) = serde_json::from_str(
-            row.payload_json
-                .as_deref()
-                .ok_or(evertrace_store::StoreError::StoreCorrupt)?,
-        )
-        .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
-        let receipt_id = observation.source_receipt_ref.to_string();
-        let row = snapshot
-            .data_rows()
-            .find(|row| {
-                row.object_kind.as_deref() == Some("source_receipt")
-                    && row.object_id.as_deref() == Some(receipt_id.as_str())
-            })
+        let (receipt, _) = current
+            .source_receipt(observation.source_receipt_ref)
             .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
-        let receipt = metadata(row)?;
         if receipt.source_observation_id != id {
             return Err(evertrace_store::StoreError::StoreCorrupt.into());
         }
-        Ok(receipt)
+        Ok(metadata(receipt))
     };
     Ok((
         endpoint(first_observation_id)?,
@@ -260,10 +211,10 @@ fn endpoints(
 }
 
 pub(crate) fn job_scope(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<SemanticSourceTarget, crate::semantic::SemanticServiceError> {
-    let (first, last) = endpoints(snapshot, job)?;
+    let (first, last) = endpoints(current, job)?;
     let source = first
         .target()
         .ok_or(crate::semantic::SemanticServiceError::InvalidInput)?;
@@ -276,31 +227,27 @@ pub(crate) fn job_scope(
 pub(crate) async fn allowed(
     writer: &crate::WriterHandle,
     report: Option<&evertrace_codex::HostProbeReport>,
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     input: &SourceInput,
     config_hash: [u8; 32],
 ) -> Result<bool, crate::semantic::SemanticServiceError> {
     validate_input(
-        snapshot,
+        current,
         &input.source,
         input.after_sequence,
         input.through_sequence,
         &input.refs,
     )?;
-    let rows = snapshot
-        .data_rows()
-        .filter(|row| {
-            row.object_kind.as_deref() == Some("source_observation")
-                && row
-                    .object_id
-                    .as_ref()
-                    .is_some_and(|id| input.refs.binary_search(id).is_ok())
-        })
-        .collect::<Vec<_>>();
-    crate::session_import::blocked_source_rows(writer, report, snapshot, &rows, config_hash)
-        .await
-        .map(|blocked| blocked.is_empty())
-        .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)
+    crate::session_import::blocked_source_observations(
+        writer,
+        report,
+        current,
+        &input.refs,
+        config_hash,
+    )
+    .await
+    .map(|blocked| blocked.is_empty())
+    .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)
 }
 
 // A suppressed/unsupported/differently scoped message is an interval boundary,
@@ -336,7 +283,7 @@ fn next_segment<'a>(
 }
 
 fn selected_input(
-    snapshot: &ProjectionSnapshot,
+    current: &CurrentFacts,
     source: SemanticSourceTarget,
     selected: &[MessageMetadata],
 ) -> Result<SourceInput, crate::semantic::SemanticServiceError> {
@@ -354,7 +301,7 @@ fn selected_input(
         .collect::<Vec<_>>();
     refs.sort();
     let receipts = crate::session_import::source_summary_receipts(
-        snapshot,
+        current,
         &source,
         after_sequence,
         through_sequence,
@@ -444,7 +391,7 @@ impl SynthesisPlanner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn durable_source_jobs(
         &self,
-        snapshot: &ProjectionSnapshot,
+        current: &CurrentFacts,
         writer: &crate::WriterHandle,
         report: Option<&evertrace_codex::HostProbeReport>,
         effective_config_hash: [u8; 32],
@@ -456,20 +403,36 @@ impl SynthesisPlanner {
         if !self.llm.enabled || limit == 0 {
             return Ok(Vec::new());
         }
-        let groups = message_groups(snapshot)?;
-        let prior = prior_runs(snapshot)?;
-        let jobs = evertrace_store::RuntimeSchedulerView::from_snapshot(snapshot)?;
-        let suppression =
-            evertrace_store::ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
+        let groups = message_groups(current)?;
+        let prior = prior_runs(current)?;
+        let jobs = evertrace_store::RuntimeSchedulerView::from_rows(
+            current.frontier(),
+            current.other_rows(),
+        )?;
         let mut output = Vec::new();
         for ((instance, revision), receipts) in groups {
             let mut unavailable = std::collections::BTreeSet::new();
-            for receipt in &receipts {
-                if receipt.target().is_none()
-                    || suppression
-                        .source_refs_suppressed(&[receipt.source_observation_id.to_string()])?
-                {
-                    unavailable.insert(receipt.source_observation_id);
+            for chunk in receipts.chunks(64) {
+                let mut refs = chunk
+                    .iter()
+                    .map(|receipt| receipt.source_observation_id.to_string())
+                    .collect::<Vec<_>>();
+                refs.sort();
+                let suppression =
+                    evertrace_store::ObjectDeletionCandidateAdmissionView::for_source_refs_current(
+                        current, &refs,
+                    )?;
+                for reference in &refs {
+                    let observation_id = reference
+                        .parse::<evertrace_domain::ids::SourceObservationId>()
+                        .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
+                    if chunk.iter().any(|receipt| {
+                        receipt.source_observation_id == observation_id
+                            && receipt.target().is_none()
+                    }) || suppression.source_refs_suppressed(std::slice::from_ref(reference))?
+                    {
+                        unavailable.insert(observation_id);
+                    }
                 }
             }
             // Successful input alone is permanently covered. Runtime attempts
@@ -547,8 +510,8 @@ impl SynthesisPlanner {
                 {
                     continue;
                 }
-                let selected = selected_input(snapshot, source, selected)?;
-                if allowed(writer, report, snapshot, &selected, effective_config_hash).await? {
+                let selected = selected_input(current, source, selected)?;
+                if allowed(writer, report, current, &selected, effective_config_hash).await? {
                     output.push(retry);
                     if output.len() == limit {
                         return Ok(output);
@@ -566,8 +529,8 @@ impl SynthesisPlanner {
                 if !ready(&source) {
                     continue;
                 }
-                let selected = selected_input(snapshot, source, selected)?;
-                if !allowed(writer, report, snapshot, &selected, effective_config_hash).await? {
+                let selected = selected_input(current, source, selected)?;
+                if !allowed(writer, report, current, &selected, effective_config_hash).await? {
                     break;
                 }
                 let target = SemanticJobTarget::Source {
@@ -608,7 +571,7 @@ impl SynthesisPlanner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_source_job(
         &self,
-        snapshot: ProjectionSnapshot,
+        current: CurrentFacts,
         job: &DurableJob,
         effective_config_hash: [u8; 32],
         occurred_at_us: i64,
@@ -626,7 +589,7 @@ impl SynthesisPlanner {
         {
             return Err(crate::semantic::SemanticServiceError::InvalidInput);
         }
-        let mut input = input(&snapshot, job)?;
+        let mut input = input(&current, job)?;
         let cas = evertrace_capture::CasStore::open(runtime.cas_dir.clone())
             .map_err(|_| crate::semantic::SemanticServiceError::InvalidInput)?;
         let mut direct_delta = Vec::new();
@@ -668,7 +631,7 @@ impl SynthesisPlanner {
         });
         let prepared = self.prepare(
             SynthesisRequest {
-                snapshot: &snapshot,
+                current: &current,
                 target: SynthesisTarget::Source {
                     source: input.source.clone(),
                     after_sequence: input.after_sequence,
@@ -684,7 +647,7 @@ impl SynthesisPlanner {
             },
             omission,
         )?;
-        drop(snapshot);
+        drop(current);
         drop(cas);
         input.receipts.clear();
         let resolution = match prepared {
@@ -694,7 +657,7 @@ impl SynthesisPlanner {
                 let derived = self
                     .derive_prepared(&prepared, || async {
                         let current = writer
-                            .project()
+                            .project_current(true)
                             .await
                             .map_err(|_| ProviderError::Disabled)?;
                         if allowed(writer, report, &current, &input, job.config_hash)
@@ -709,7 +672,7 @@ impl SynthesisPlanner {
                     .await;
                 let elapsed = started.elapsed();
                 let current = writer
-                    .project()
+                    .project_current(true)
                     .await
                     .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
                 if !allowed(writer, report, &current, &input, job.config_hash).await? {
@@ -884,57 +847,18 @@ mod tests {
     }
 
     #[test]
-    fn frozen_scope_reads_only_endpoint_metadata_not_other_sources_or_bodies() {
+    fn eligible_message_target_uses_its_endpoint_scope() {
         let message = message(1);
-        let id = message.source_observation_id;
-        let receipt = SourceReceiptId::from_digest([9; 32]);
-        let row = |kind: &str, id: String, json: serde_json::Value| {
-            let mut row = evertrace_store::ObjectRow::checkpoint(1, 1);
-            row.row_kind = evertrace_store::ObjectRowKind::Data;
-            row.object_kind = Some(kind.into());
-            row.object_id = Some(id);
-            row.payload_json = Some(json.to_string().into());
-            row
+        let expected = SemanticSourceTarget {
+            source_instance_id: SourceInstanceId::parse("session-rollout:test:one").unwrap(),
+            source_revision: SourceRevision::parse("revision-one").unwrap(),
+            repository_id: "repo:019d0000-0000-7000-8000-000000000001".parse().unwrap(),
+            worktree_id: "wt:019d0000-0000-7000-8000-000000000002".parse().unwrap(),
         };
-        let observation = row(
-            "source_observation",
-            id.to_string(),
-            serde_json::json!({"kind":"source_observation_recorded","value":{"source_receipt_ref":receipt, "scope_effect_claims":"not decoded here"}}),
-        );
-        let receipt_row = row(
-            "source_receipt",
-            receipt.to_string(),
-            serde_json::json!({"kind":"source_receipt_recorded","value": {
-                "source_observation_id":id, "source_instance_id":message.source_instance_id, "source_revision":message.source_revision,
-                "source_kind":"codex_session_jsonl", "observation_role":"message", "unsupported_record_classification":null,
-                "repository_instance_id":message.repository_instance_id, "worktree_instance_id":message.worktree_instance_id,
-                "source_sequence":1, "protected_length":64, "protected_presentation":"not decoded here"
-            }}),
-        );
-        let unrelated = row(
-            "source_receipt",
-            SourceReceiptId::from_digest([10; 32]).to_string(),
-            serde_json::json!("unrelated payload must not be decoded"),
-        );
-        let target = SemanticJobTarget::Source {
-            first_observation_id: id,
-            last_observation_id: id,
-        }
-        .encode()
-        .unwrap();
-        // Only fields used to locate the frozen endpoints matter to this narrow
-        // metadata check; full input admission remains covered by S28.
-        let job: DurableJob = serde_json::from_value(serde_json::json!({"job_id":JobId::new_v7(),"idempotency_key":"unused","target_revision":target,"target_watermark":1,"target_generation":1,"kind":"semantic_synthesis_v1","algorithm_revision":"semantic_synthesis_v1","model_id":"test","priority":10,"state":"queued","attempt":1,"backoff_until_us":null,"config_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"budget":{"max_items":1,"max_wall_time_ms":1000,"max_bytes":1,"max_input_tokens":1,"max_output_tokens":1,"max_calls":1},"terminal":null,"lease_until_us":null})).unwrap();
-        assert_eq!(
-            job_scope(
-                &ProjectionSnapshot {
-                    frontier: 1,
-                    rows: vec![unrelated, observation, receipt_row]
-                },
-                &job
-            )
-            .unwrap(),
-            message.target().unwrap()
-        );
+        assert_eq!(message.target(), Some(expected));
+        let mut ineligible = message;
+        ineligible.unsupported_record_classification =
+            Some(evertrace_domain::evidence::UnsupportedRecordClassification::UnknownRecordType);
+        assert!(ineligible.target().is_none());
     }
 }

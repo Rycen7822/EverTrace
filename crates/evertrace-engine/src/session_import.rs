@@ -477,8 +477,12 @@ impl SessionImportAdminService {
             };
         }
         let report = Arc::clone(&self.report).read_owned().await;
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let sessions = SessionImportCurrentView::from_snapshot(&snapshot)
+        let facts = self
+            .writer
+            .project_current(true)
+            .await
+            .map_err(map_writer)?;
+        let sessions = SessionImportCurrentView::from_rows(facts.frontier(), facts.other_rows())
             .map_err(|_| SessionImportServiceError::Corrupt)?;
         if !sessions
             .sessions
@@ -502,10 +506,13 @@ impl SessionImportAdminService {
                     }
                 }
         });
-        let repositories = RepositoryCurrentView::from_snapshot(&snapshot)
+        let repositories = RepositoryCurrentView::from_rows(facts.frontier(), facts.other_rows())
             .map_err(|_| SessionImportServiceError::Corrupt)?;
-        let purges = evertrace_store::purge::ScopePurgeCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        let purges = evertrace_store::purge::ScopePurgeCurrentView::from_rows(
+            facts.frontier(),
+            facts.other_rows(),
+        )
+        .map_err(|_| SessionImportServiceError::Corrupt)?;
         let mut events = Vec::new();
         let mut unavailable = 0;
         let mut changed = 0;
@@ -646,7 +653,7 @@ impl SessionImportAdminService {
                     revoke_command(
                         request_id,
                         &prepared_current,
-                        active_import_job(&snapshot, &current.source_key())?,
+                        active_import_job(facts.other_rows(), &current.source_key())?,
                         occurred_at_us,
                         self.effective_config_hash,
                     )?
@@ -663,7 +670,7 @@ impl SessionImportAdminService {
             )
             .map_err(|_| SessionImportServiceError::Corrupt)?;
             self.writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, facts.frontier())
                 .await
                 .map_err(map_writer)?;
         }
@@ -1678,18 +1685,52 @@ pub(crate) async fn preflight_import_context(
 /// Validate only selected archived message records; never reopen a source path
 /// or require its historical revision to equal today's catalog revision.
 pub(crate) fn source_summary_receipts(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    current: &evertrace_store::projections::CurrentFacts,
     source: &evertrace_domain::semantic::SemanticSourceTarget,
     after_sequence: u64,
     through_sequence: u64,
     refs: &[String],
 ) -> Result<Vec<evertrace_domain::evidence::SourceReceipt>, SessionImportServiceError> {
-    source_summary_receipts_rows(
-        &snapshot.rows,
+    if refs.is_empty()
+        || refs.len() > 64
+        || !refs.windows(2).all(|pair| pair[0] < pair[1])
+        || !evertrace_store::is_session_import_source(source.source_instance_id.as_str())
+    {
+        return Err(SessionImportServiceError::Corrupt);
+    }
+    let mut observations = BTreeMap::new();
+    let mut receipts = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let observation_id = reference
+            .parse::<evertrace_domain::ids::SourceObservationId>()
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        let (observation, _) = current
+            .source_observation(observation_id)
+            .ok_or(SessionImportServiceError::Corrupt)?;
+        let receipt_id = observation.source_receipt_ref;
+        observations.insert(
+            receipt_id.to_string(),
+            Box::new(observation.as_ref().clone()),
+        );
+        let (receipt, _) = current
+            .source_receipt(receipt_id)
+            .ok_or(SessionImportServiceError::Corrupt)?;
+        receipts.push(receipt.as_ref().clone());
+    }
+    let suppressed =
+        evertrace_store::ObjectDeletionCandidateAdmissionView::for_source_refs_current(
+            current, refs,
+        )
+        .and_then(|view| view.source_refs_suppressed(refs))
+        .map_err(|_| SessionImportServiceError::Corrupt)?;
+    validate_source_summary_receipts(
         source,
         after_sequence,
         through_sequence,
         refs,
+        observations,
+        receipts,
+        suppressed,
     )
 }
 
@@ -1837,6 +1878,34 @@ pub(crate) async fn blocked_source_rows_before(
         deadline,
     )
     .await
+}
+
+/// Typed background admission for a bounded source observation cohort. Search
+/// and detail readers continue to use the row-based path below.
+pub(crate) async fn blocked_source_observations(
+    writer: &WriterHandle,
+    report: Option<&HostProbeReport>,
+    current: &evertrace_store::projections::CurrentFacts,
+    refs: &[String],
+    config_hash: [u8; 32],
+) -> Result<std::collections::BTreeSet<String>, SessionImportServiceError> {
+    if refs.len() > 64 || !refs.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(SessionImportServiceError::Unavailable);
+    }
+    let mut sources = BTreeMap::new();
+    for reference in refs {
+        let id = reference
+            .parse::<evertrace_domain::ids::SourceObservationId>()
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        let (observation, _) = current
+            .source_observation(id)
+            .ok_or(SessionImportServiceError::Corrupt)?;
+        sources.insert(
+            reference.clone(),
+            observation.source_instance_id.as_str().to_owned(),
+        );
+    }
+    blocked_source_instances(writer, report, sources, config_hash, None).await
 }
 
 /// The source gate over a named request-local closure.  It intentionally
@@ -2361,18 +2430,22 @@ pub(crate) fn session_import_job_budget() -> JobBudget {
 }
 
 pub(crate) fn active_import_job(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    rows: &[evertrace_store::ObjectRow],
     session_id: &str,
 ) -> Result<Option<DurableJob>, SessionImportServiceError> {
     let key = format!("session_import:{session_id}");
-    let mut jobs = snapshot.data_rows().filter_map(|row| {
-        let json = row.payload_json.as_deref()?;
-        let Ok(JournalPayload::JobState(job)) = serde_json::from_str(json) else {
-            return None;
-        };
-        (job.idempotency_key == key && matches!(job.state, JobStatus::Queued | JobStatus::Leased))
+    let mut jobs = rows
+        .iter()
+        .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
+        .filter_map(|row| {
+            let json = row.payload_json.as_deref()?;
+            let Ok(JournalPayload::JobState(job)) = serde_json::from_str(json) else {
+                return None;
+            };
+            (job.idempotency_key == key
+                && matches!(job.state, JobStatus::Queued | JobStatus::Leased))
             .then_some(job)
-    });
+        });
     let job = jobs.next();
     if jobs.next().is_some() {
         return Err(SessionImportServiceError::Corrupt);
@@ -2562,6 +2635,28 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("evertrace-s28-{}-{nonce}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn empty_typed_source_permission_set_is_a_noop() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = crate::open_writer(&root).await.unwrap();
+        let (writer, task) = crate::spawn_writer(journal, 8).unwrap();
+        let current = writer.project_current(true).await.unwrap();
+        let typed = blocked_source_observations(&writer, None, &current, &[], [0; 32])
+            .await
+            .unwrap();
+        let snapshot = writer.project().await.unwrap();
+        let rows = blocked_source_rows(&writer, None, &snapshot, &[], [0; 32])
+            .await
+            .unwrap();
+        assert_eq!(typed, rows);
+        assert!(typed.is_empty());
+        task.shutdown_and_join().await.unwrap();
+        drop(writer);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

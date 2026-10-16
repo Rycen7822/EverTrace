@@ -181,9 +181,14 @@ impl SegmentationCurrentState {
 
 impl OperationBurstCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[super::ObjectRow]) -> Result<Self, StoreError> {
         let mut revisions = BTreeMap::<OperationBurstId, Vec<OperationBurst>>::new();
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == super::ObjectRowKind::Data)
             .filter(|row| row.object_kind.as_deref() == Some("operation_burst"))
         {
             let payload: JournalPayload = serde_json::from_str(
@@ -225,10 +230,7 @@ impl OperationBurstCurrentView {
             }
             bursts.insert(id, values.pop().ok_or(StoreError::StoreCorrupt)?);
         }
-        Ok(Self {
-            frontier: snapshot.frontier,
-            bursts,
-        })
+        Ok(Self { frontier, bursts })
     }
 
     pub const fn frontier(&self) -> u64 {
@@ -260,12 +262,19 @@ impl OperationBurstCurrentView {
 
 impl EpisodeCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[super::ObjectRow]) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
         let mut revisions = BTreeMap::<WorkEpisodeId, Vec<WorkEpisode>>::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == super::ObjectRowKind::Data)
+        {
             match row.object_kind.as_deref() {
                 Some("work_episode") => {
                     let payload: JournalPayload = serde_json::from_str(
@@ -348,12 +357,16 @@ pub struct SegmentationCurrentView {
 
 impl SegmentationCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
-        let binding_view = WorkBindingCurrentView::from_snapshot(snapshot)?;
-        let attempt_view = AttemptCurrentView::from_snapshot(snapshot)?;
-        let episode_view = EpisodeCurrentView::from_snapshot(snapshot)?;
-        let work_view = WorkIdentityCurrentView::from_snapshot(snapshot)?;
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[super::ObjectRow]) -> Result<Self, StoreError> {
+        let binding_view = WorkBindingCurrentView::from_rows(frontier, rows)?;
+        let attempt_view = AttemptCurrentView::from_rows(frontier, rows)?;
+        let episode_view = EpisodeCurrentView::from_rows(frontier, rows)?;
+        let work_view = WorkIdentityCurrentView::from_rows(frontier, rows)?;
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             occurrences: BTreeMap::new(),
             operations: BTreeMap::new(),
             bindings: binding_view.bindings,
@@ -368,7 +381,10 @@ impl SegmentationCurrentView {
         let mut occurrence_revisions = BTreeMap::<HostOccurrenceId, Vec<HostOccurrence>>::new();
         let mut operation_revisions = BTreeMap::<OperationId, Vec<Operation>>::new();
         let mut lane_revisions = BTreeMap::<ExecutionLaneId, Vec<ExecutionLane>>::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == super::ObjectRowKind::Data)
+        {
             let Some(kind) = row.object_kind.as_deref() else {
                 continue;
             };

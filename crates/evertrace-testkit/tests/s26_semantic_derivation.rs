@@ -52,15 +52,19 @@ use evertrace_engine::{
     work::new_episode,
 };
 use evertrace_store::{
-    DirtyTarget, DirtyTargetKind, DurableJob, JobBudget, JobLease, JobStatus, JobTerminalAudit,
-    JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
-    JournalWriter, ProjectionSnapshot, SearchIndex, SemanticCurrentView, SourceIngestWatermark,
-    StoreError, derive_l0002_projections,
+    CurrentFacts, DirtyTarget, DirtyTargetKind, DurableJob, JobBudget, JobLease, JobStatus,
+    JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft,
+    JournalPayload, JournalWriter, ProjectionSnapshot, SearchIndex, SemanticCurrentView,
+    SourceIngestWatermark, StoreError, derive_l0002_projections,
 };
 use provider_stub::ProviderStub;
 use tempfile::TempDir;
 
 const CONFIG: [u8; 32] = [0x26; 32];
+
+fn current_facts(snapshot: &ProjectionSnapshot) -> CurrentFacts {
+    CurrentFacts::try_from(snapshot.clone()).unwrap()
+}
 
 #[test]
 fn episode_digest_run_wire_and_fingerprint_remain_fixed_and_targets_are_exclusive() {
@@ -1238,7 +1242,7 @@ async fn planner_commits_one_atomic_digest_run_and_semantic_episode_successor() 
     let planner = SynthesisPlanner::new(llm);
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current_facts(&snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1369,7 +1373,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let planner = SynthesisPlanner::new(llm);
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current_facts(&snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1470,7 +1474,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let recovered_planner = SynthesisPlanner::new(config(&recovered_stub.base_url));
     let retry = recovered_planner
         .execute(SynthesisRequest {
-            snapshot: &after,
+            current: &current_facts(&after),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1497,7 +1501,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
 
     let shared_ref = planner
         .execute(SynthesisRequest {
-            snapshot: &after,
+            current: &current_facts(&after),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![
@@ -1526,7 +1530,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
         .collect::<Vec<_>>();
     let bounded = planner
         .execute(SynthesisRequest {
-            snapshot: &after,
+            current: &current_facts(&after),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![
@@ -1639,7 +1643,7 @@ async fn plan_frozen_source_summary(
     let planner = SynthesisPlanner::new(config(&stub.base_url));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot,
+            current: &current_facts(snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Source {
                 source,
                 after_sequence: 0,
@@ -2147,7 +2151,7 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
 
     let first_resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &first.snapshot,
+            current: &current_facts(&first.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(first.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -2166,7 +2170,7 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
     let second_refs = second.direct_refs();
     let second_resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &second.snapshot,
+            current: &current_facts(&second.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(second.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -2672,7 +2676,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     let planner = SynthesisPlanner::new(config(&stub.base_url)).with_inventory(Some(inventory));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &seed.snapshot,
+            current: &current_facts(&seed.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -3264,7 +3268,7 @@ async fn scenario_patch_scope_is_filled_from_the_current_episode() {
     let planner = SynthesisPlanner::new(config(&stub.base_url));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current_facts(&snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -3382,8 +3386,9 @@ async fn separable_candidate_failure_and_rejection_preserve_reopenable_summary()
         }
         let stub = ProviderStub::once(200, response(serde_json::to_value(output).unwrap())).await;
         let planner = SynthesisPlanner::new(config(&stub.base_url));
+        let current = current_facts(&snapshot);
         let request = SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current,
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -3401,7 +3406,7 @@ async fn separable_candidate_failure_and_rejection_preserve_reopenable_summary()
             digest, command, ..
         } = planner
             .execute(SynthesisRequest {
-                snapshot: request.snapshot,
+                current: request.current,
                 target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
                 trigger: request.trigger,
                 direct_delta: request.direct_delta.clone(),
@@ -3433,7 +3438,7 @@ async fn separable_candidate_failure_and_rejection_preserve_reopenable_summary()
         assert!(
             planner
                 .durable_jobs(
-                    &reopened,
+                    &current_facts(&reopened),
                     CONFIG,
                     &Default::default(),
                     1,
@@ -3518,7 +3523,7 @@ async fn existing_exact_proposal_skips_a_new_revision_but_commits_digest_run_and
     let planner = SynthesisPlanner::new(config(&stub.base_url));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &before,
+            current: &current_facts(&before),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -3652,7 +3657,7 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
     let planner = SynthesisPlanner::new(config(&stub.base_url));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &seed.snapshot,
+            current: &current_facts(&seed.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::EpisodeFinalization,
             direct_delta: vec![ProtectedDeltaItem {

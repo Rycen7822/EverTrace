@@ -95,6 +95,15 @@ fn job(kind: &str, key: &str, generation: u64, priority: i16) -> DurableJob {
     }
 }
 
+fn current_facts(mut snapshot: ProjectionSnapshot) -> evertrace_store::projections::CurrentFacts {
+    let frontier = snapshot.frontier;
+    snapshot
+        .rows
+        .retain(|row| row.row_kind != ObjectRowKind::Checkpoint);
+    snapshot.rows.push(ObjectRow::checkpoint(frontier, 1));
+    snapshot.try_into().unwrap()
+}
+
 fn runtime(root: &Path) -> RuntimeSnapshot {
     RuntimeSnapshot {
         snapshot_version: RUNTIME_SNAPSHOT_VERSION,
@@ -1914,10 +1923,10 @@ async fn capture_scan_retained_report_does_not_hide_coexisting_physical_dirty() 
 #[test]
 fn synthesis_filters_covered_tuples_before_the_queue_limit() {
     let rows = (1..=9).map(synthesis_episode_row).collect::<Vec<_>>();
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 100,
         rows,
-    };
+    });
     let planner = SynthesisPlanner::new(LlmConfig::default());
     let first = planner
         .durable_jobs(
@@ -1993,10 +2002,10 @@ async fn synthesis_uses_only_validated_evidence_surface_text_for_provider_input(
         .into(),
     );
     raw.source_event_seq = 8;
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 9,
         rows: vec![episode, raw, surface, bound[0].clone(), bound[1].clone()],
-    };
+    });
     let stub = ProviderStub::once(200, provider_response()).await;
     let planner = SynthesisPlanner::new(provider_config(&stub.base_url));
     let mut durable = planner
@@ -2047,10 +2056,10 @@ async fn synthesis_without_eligible_surface_fails_without_calling_provider_or_re
             .into(),
     );
     raw.source_event_seq = 8;
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 9,
         rows: vec![episode, raw],
-    };
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let planner = SynthesisPlanner::new(provider_config(&base_url));
@@ -2123,7 +2132,7 @@ async fn synthesis_rejects_same_task_surface_bound_to_a_different_episode() {
     let other_episode = synthesis_episode_row_for_task(9, task_id);
     let other_surface = evidence_surface_row(&other_episode, "wrong-episode-canary", 9);
     let other_bound = bound_operation_rows(&other_episode, &other_surface);
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 9,
         rows: vec![
             episode.clone(),
@@ -2132,7 +2141,7 @@ async fn synthesis_rejects_same_task_surface_bound_to_a_different_episode() {
             other_bound[0].clone(),
             other_bound[1].clone(),
         ],
-    };
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let planner = SynthesisPlanner::new(provider_config(&base_url));
@@ -2199,7 +2208,7 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
     };
     let jobs = planner
         .durable_jobs(
-            &initial,
+            &current_facts(initial.clone()),
             CONFIG,
             &Default::default(),
             8,
@@ -2285,7 +2294,7 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
     });
     let recreated = planner
         .durable_jobs(
-            &used,
+            &current_facts(used.clone()),
             CONFIG,
             &Default::default(),
             8,
@@ -2301,7 +2310,7 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
     second.lease_until_us = Some(100);
     let command = planner
         .execute_durable_job(
-            &used,
+            &current_facts(used.clone()),
             &second,
             CONFIG,
             2,
@@ -2328,10 +2337,10 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
 async fn zero_llm_tasks_per_run_never_claims_or_calls_the_provider() {
     for (max_llm_tasks_per_run, idle_enabled) in [(0, true), (2, false), (2, true)] {
         let episode = synthesis_episode_row(9);
-        let planning_snapshot = ProjectionSnapshot {
+        let planning_snapshot = current_facts(ProjectionSnapshot {
             frontier: 9,
             rows: vec![episode],
-        };
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         let planner = SynthesisPlanner::new(provider_config(&base_url));

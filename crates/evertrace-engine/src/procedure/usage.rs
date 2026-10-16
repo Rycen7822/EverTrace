@@ -643,12 +643,12 @@ impl ProcedureUsageCurrentView {
     /// is subsequently decoded and checked by the normal physical validator.
     /// Retain all successors of a selected Operation's binding, including a
     /// correction that assigns it to another Task.
-    pub(crate) fn execution_snapshot(
-        snapshot: &ProjectionSnapshot,
+    pub(crate) fn execution_rows(
+        current: &evertrace_store::projections::CurrentFacts,
         usage_id: evertrace_domain::ids::ProcedureUsageId,
         budget: &evertrace_store::JobBudget,
         deadline: std::time::Instant,
-    ) -> Result<Option<ProjectionSnapshot>, SemanticServiceError> {
+    ) -> Result<Option<Vec<evertrace_store::ObjectRow>>, SemanticServiceError> {
         use std::collections::BTreeSet;
         let usage_key = usage_id.to_string();
         let mut task = None;
@@ -660,15 +660,28 @@ impl ProcedureUsageCurrentView {
         let mut negative_ids = BTreeSet::new();
         let mut selected = BTreeSet::new();
         let mut bytes = 0usize;
-        let mut packet = ProjectionSnapshot {
-            frontier: snapshot.frontier,
-            rows: Vec::new(),
+        let mut rows = Vec::new();
+        let append_source_row = |selected: &mut BTreeSet<String>,
+                                 rows: &mut Vec<evertrace_store::ObjectRow>,
+                                 bytes: &mut usize,
+                                 selected_key: String,
+                                 row: evertrace_store::ObjectRow| {
+            let size = row.payload_json.as_ref().map_or(0, |payload| payload.len());
+            *bytes = bytes.saturating_add(size);
+            if budget.max_bytes.is_some_and(|limit| *bytes as u64 > limit)
+                || rows.len() >= budget.max_items as usize
+            {
+                return false;
+            }
+            selected.insert(selected_key);
+            rows.push(row);
+            true
         };
         // A finite closure over these concrete Work/L0 types, not a persistent
         // cursor or a general dependency registry. Large traces remain pending.
         for _ in 0..8 {
             let mut changed = false;
-            for row in snapshot.data_rows() {
+            for row in current.other_data_rows() {
                 if std::time::Instant::now() >= deadline {
                     return Ok(None);
                 }
@@ -697,10 +710,7 @@ impl ProcedureUsageCurrentView {
                         | "work_checkpoint"
                         | "host_occurrence"
                         | "operation"
-                        | "source_observation"
-                        | "source_receipt"
                         | "scope_effect"
-                        | "evidence_surface"
                 ) {
                     continue;
                 }
@@ -741,7 +751,7 @@ impl ProcedureUsageCurrentView {
                 }
                 bytes = bytes.saturating_add(json.len());
                 if budget.max_bytes.is_some_and(|limit| bytes as u64 > limit)
-                    || packet.rows.len() >= budget.max_items as usize
+                    || rows.len() >= budget.max_items as usize
                 {
                     return Ok(None);
                 }
@@ -827,26 +837,106 @@ impl ProcedureUsageCurrentView {
                                 .map(ToString::to_string),
                         );
                     }
-                    JournalPayload::SourceObservationRecorded(value) => {
-                        wanted.insert(value.source_receipt_ref.to_string());
-                    }
                     _ => {}
                 }
                 selected.insert(row.row_id.clone());
-                packet.rows.push(row.clone());
+                rows.push(row.clone());
+                changed = true;
+            }
+            // Source objects are selected by their typed identities. Only a
+            // selected source row crosses the canonical-row boundary used by
+            // the existing reducer.
+            let observation_ids = wanted
+                .iter()
+                .filter_map(|reference| {
+                    reference
+                        .parse::<evertrace_domain::ids::SourceObservationId>()
+                        .ok()
+                        .filter(|id| id.to_string() == *reference)
+                })
+                .collect::<BTreeSet<_>>();
+            for &id in &observation_ids {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                let reference = id.to_string();
+                let selected_key = format!("source_observation:{reference}");
+                if selected.contains(&selected_key) {
+                    continue;
+                }
+                let Some((observation, _)) = current.source_observation(id) else {
+                    continue;
+                };
+                let receipt_id = observation.source_receipt_ref;
+                let row = current
+                    .selected_source_row("source_observation", &reference)
+                    .map_err(|_| SemanticServiceError::InvalidInput)?
+                    .ok_or(SemanticServiceError::InvalidInput)?;
+                if !append_source_row(&mut selected, &mut rows, &mut bytes, selected_key, row) {
+                    return Ok(None);
+                }
+                wanted.insert(receipt_id.to_string());
+                changed = true;
+            }
+            let receipt_ids = wanted
+                .iter()
+                .filter_map(|reference| {
+                    reference
+                        .parse::<evertrace_domain::ids::SourceReceiptId>()
+                        .ok()
+                        .filter(|id| id.to_string() == *reference)
+                })
+                .collect::<BTreeSet<_>>();
+            for id in receipt_ids {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                let reference = id.to_string();
+                let selected_key = format!("source_receipt:{reference}");
+                if selected.contains(&selected_key) || current.source_receipt(id).is_none() {
+                    continue;
+                }
+                let row = current
+                    .selected_source_row("source_receipt", &reference)
+                    .map_err(|_| SemanticServiceError::InvalidInput)?
+                    .ok_or(SemanticServiceError::InvalidInput)?;
+                if !append_source_row(&mut selected, &mut rows, &mut bytes, selected_key, row) {
+                    return Ok(None);
+                }
+                changed = true;
+            }
+            // Only receipt IDs were added above; surfaces use the same
+            // observation identities selected in this pass.
+            for id in observation_ids {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                let reference = id.to_string();
+                let selected_key = format!("evidence_surface:{reference}");
+                if selected.contains(&selected_key) || current.evidence_surface(id).is_none() {
+                    continue;
+                }
+                let row = current
+                    .selected_source_row("evidence_surface", &reference)
+                    .map_err(|_| SemanticServiceError::InvalidInput)?
+                    .ok_or(SemanticServiceError::InvalidInput)?;
+                if !append_source_row(&mut selected, &mut rows, &mut bytes, selected_key, row) {
+                    return Ok(None);
+                }
                 changed = true;
             }
             if !changed && std::time::Instant::now() < deadline {
-                return Ok(Some(packet));
+                return Ok(Some(rows));
             }
         }
         Ok(None)
     }
 
-    pub(crate) fn from_execution_snapshot(
-        snapshot: &ProjectionSnapshot,
+    pub(crate) fn from_execution_rows(
+        frontier: u64,
+        rows: &[evertrace_store::ObjectRow],
     ) -> Result<Self, SemanticServiceError> {
-        Self::from_snapshot_input(snapshot, false, true)
+        Self::from_rows_input(frontier, rows, false, true)
     }
 
     /// Promotion consumes existing, validated usage outcomes, not the execution
@@ -865,8 +955,9 @@ impl ProcedureUsageCurrentView {
         Self::from_rows_input(frontier, rows, true, false)
     }
 
-    pub(crate) fn from_coverage_snapshot(
-        snapshot: &ProjectionSnapshot,
+    pub(crate) fn from_coverage_rows(
+        frontier: u64,
+        rows: &[evertrace_store::ObjectRow],
         contexts: &std::collections::BTreeSet<(
             evertrace_domain::ids::RepositoryId,
             evertrace_domain::ids::WorktreeId,
@@ -881,12 +972,12 @@ impl ProcedureUsageCurrentView {
             .iter()
             .map(|(_, worktree)| worktree.to_string())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut selected = ProjectionSnapshot {
-            frontier: snapshot.frontier,
-            rows: Vec::new(),
-        };
+        let mut selected = Vec::new();
         let mut bytes = 0;
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
+        {
             if std::time::Instant::now() >= deadline {
                 return Ok(None);
             }
@@ -905,12 +996,12 @@ impl ProcedureUsageCurrentView {
                 continue;
             }
             bytes += row.payload_json.as_ref().map_or(0, |payload| payload.len());
-            if selected.rows.len() == 512 || bytes > 2 * 1024 * 1024 {
+            if selected.len() == 512 || bytes > 2 * 1024 * 1024 {
                 return Ok(None);
             }
-            selected.rows.push(row.clone());
+            selected.push(row.clone());
         }
-        Self::from_promotion_snapshot(&selected).map(Some)
+        Self::from_promotion_rows(frontier, &selected).map(Some)
     }
 
     fn from_snapshot_input(
@@ -2972,9 +3063,9 @@ pub(crate) const PROCEDURE_USAGE_JOB_KIND: &str = "procedure_usage_evaluation_v1
 /// Job/lease/audit writes are deliberately outside this input frontier. An
 /// incomplete evaluation sleeps until evidence changes, including late bindings
 /// and checkpoints; completing its own job cannot wake it again.
-pub(crate) fn procedure_input_watermark(snapshot: &ProjectionSnapshot) -> u64 {
-    snapshot
-        .data_rows()
+pub(crate) fn procedure_input_watermark_rows(rows: &[evertrace_store::ObjectRow]) -> u64 {
+    rows.iter()
+        .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
         .filter(|row| {
             matches!(
                 row.object_kind.as_deref(),
@@ -3009,23 +3100,23 @@ pub(crate) fn procedure_input_watermark(snapshot: &ProjectionSnapshot) -> u64 {
 /// copying every Procedure, Task and usage body before the selection deadline.
 pub(crate) struct ProcedureUsageCandidates<'a> {
     pub(crate) rows: Vec<&'a evertrace_store::ObjectRow>,
-    pub(crate) context_watermarks: std::collections::BTreeMap<(&'a str, Option<&'a str>), u64>,
+    pub(crate) context_watermarks: std::collections::BTreeMap<(String, Option<String>), u64>,
 }
 
 pub(crate) fn procedure_usage_candidates(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &evertrace_store::projections::CurrentFacts,
     deadline: std::time::Instant,
 ) -> Option<ProcedureUsageCandidates<'_>> {
     let mut current = std::collections::BTreeMap::<&str, &evertrace_store::ObjectRow>::new();
     let mut context_watermarks = std::collections::BTreeMap::new();
-    for row in snapshot.data_rows() {
+    for row in snapshot.other_data_rows() {
         if std::time::Instant::now() >= deadline {
             return None;
         }
         if row.object_kind.as_deref() != Some("procedure_usage_revision") {
             if let Some(task) = row.task_id.as_deref() {
                 let watermark = context_watermarks
-                    .entry((task, row.workstream_id.as_deref()))
+                    .entry((task.to_owned(), row.workstream_id.clone()))
                     .or_insert(0);
                 *watermark = (*watermark).max(row.source_event_seq);
             }
@@ -3037,6 +3128,28 @@ pub(crate) fn procedure_usage_candidates(
             .is_none_or(|prior| prior.source_event_seq < row.source_event_seq)
         {
             current.insert(id, row);
+        }
+    }
+    // These source families carry task metadata in their canonical rows too.
+    // Keep their original contribution when the finite execution closure is
+    // unavailable and the scheduler uses this contextual fallback watermark.
+    for (task, seq) in snapshot
+        .source_receipts()
+        .map(|(receipt, seq)| (receipt.task_id, seq))
+        .chain(
+            snapshot
+                .evidence_surfaces()
+                .map(|(surface, seq)| (surface.task_id, seq)),
+        )
+    {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        if let Some(task) = task {
+            let watermark = context_watermarks
+                .entry((task.to_string(), None))
+                .or_insert(0);
+            *watermark = (*watermark).max(seq);
         }
     }
     Some(ProcedureUsageCandidates {
@@ -3334,7 +3447,7 @@ impl ProcedureUsageCurrentView {
 
     pub(crate) fn compile_usage_command(
         &self,
-        snapshot: &ProjectionSnapshot,
+        rows: &[evertrace_store::ObjectRow],
         cas: &evertrace_capture::CasStore,
         context: ProposalCommandContext,
         usage_id: evertrace_domain::ids::ProcedureUsageId,
@@ -3378,7 +3491,7 @@ impl ProcedureUsageCurrentView {
                 return Ok(None);
             }
             let Some((request, trace)) =
-                self.compile_attempt_usage(snapshot, cas, usage, attempt, deadline)?
+                self.compile_attempt_usage(rows, cas, usage, attempt, deadline)?
             else {
                 continue;
             };
@@ -3443,7 +3556,7 @@ impl ProcedureUsageCurrentView {
 
     fn compile_attempt_usage(
         &self,
-        snapshot: &ProjectionSnapshot,
+        rows: &[evertrace_store::ObjectRow],
         cas: &evertrace_capture::CasStore,
         usage: &evertrace_domain::procedure::ProcedureUsageRevision,
         attempt: &evertrace_domain::work::Attempt,
@@ -3460,8 +3573,8 @@ impl ProcedureUsageCurrentView {
         else {
             return Ok(None);
         };
-        let trace = super::alignment::StageTrace::compile_for_attempt(
-            snapshot,
+        let trace = super::alignment::StageTrace::compile_rows_for_attempt(
+            rows,
             episode,
             attempt.attempt_id,
         )?;
@@ -3983,7 +4096,7 @@ mod negative_review_selection_tests {
             + second.payload_json.as_ref().unwrap().len();
         let mut snapshot = ProjectionSnapshot {
             frontier: 99,
-            rows: vec![first, second],
+            rows: vec![evertrace_store::ObjectRow::checkpoint(99, 1), first, second],
         };
         // These controls are intentionally undecodable: no unrelated body is
         // copied or consumed while collecting this target's historical closure.
@@ -4012,8 +4125,10 @@ mod negative_review_selection_tests {
             max_wall_time_ms: 5000,
         };
         let select = |budget: &evertrace_store::JobBudget| {
-            ProcedureUsageCurrentView::execution_snapshot(
-                &snapshot,
+            let current =
+                evertrace_store::projections::CurrentFacts::try_from(snapshot.clone()).unwrap();
+            ProcedureUsageCurrentView::execution_rows(
+                &current,
                 usage.procedure_usage_id,
                 budget,
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
@@ -4022,12 +4137,15 @@ mod negative_review_selection_tests {
         };
         assert!(select(&budget).is_none());
         budget.max_items = 2;
-        assert_eq!(select(&budget).unwrap().rows.len(), 2);
+        assert_eq!(select(&budget).unwrap().len(), 2);
         budget.max_bytes = Some(bytes as u64 - 1);
         assert!(select(&budget).is_none());
+        let _ = select;
+        let current =
+            evertrace_store::projections::CurrentFacts::try_from(snapshot.clone()).unwrap();
         assert!(
-            ProcedureUsageCurrentView::execution_snapshot(
-                &snapshot,
+            ProcedureUsageCurrentView::execution_rows(
+                &current,
                 usage.procedure_usage_id,
                 &budget,
                 std::time::Instant::now()
@@ -4060,15 +4178,17 @@ mod negative_review_selection_tests {
         ));
         budget.max_items = 4;
         budget.max_bytes = Some(1_000_000);
-        let packet = ProcedureUsageCurrentView::execution_snapshot(
-            &snapshot,
+        let current =
+            evertrace_store::projections::CurrentFacts::try_from(snapshot.clone()).unwrap();
+        let packet = ProcedureUsageCurrentView::execution_rows(
+            &current,
             usage.procedure_usage_id,
             &budget,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
         )
         .unwrap()
         .unwrap();
-        assert_eq!(procedure_input_watermark(&packet), 3);
+        assert_eq!(procedure_input_watermark_rows(&packet), 3);
         let mut corrected = binding;
         corrected.predecessor_revision_id = Some(corrected.work_binding_revision_id);
         corrected.work_binding_revision_id = evertrace_domain::ids::WorkBindingRevisionId::new_v7();
@@ -4080,8 +4200,10 @@ mod negative_review_selection_tests {
             JournalPayload::WorkBindingRecorded(Box::new(corrected)),
             4,
         ));
-        let packet = ProcedureUsageCurrentView::execution_snapshot(
-            &snapshot,
+        let current =
+            evertrace_store::projections::CurrentFacts::try_from(snapshot.clone()).unwrap();
+        let packet = ProcedureUsageCurrentView::execution_rows(
+            &current,
             usage.procedure_usage_id,
             &budget,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
@@ -4089,7 +4211,7 @@ mod negative_review_selection_tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            procedure_input_watermark(&packet),
+            procedure_input_watermark_rows(&packet),
             4,
             "a reassigned binding must wake and invalidate its old target"
         );
