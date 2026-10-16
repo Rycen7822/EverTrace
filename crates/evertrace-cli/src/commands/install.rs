@@ -31,6 +31,7 @@ pub async fn run(
     let package = cli
         .parent()
         .ok_or("installation package directory unavailable")?;
+    let mcp = package.join("evertrace-mcp");
     let paths = evertrace_codex::install::ManagedInstallPaths {
         data_root: evertrace_protocol::resolve_data_dir(
             &effective.config().runtime.data_dir,
@@ -42,6 +43,7 @@ pub async fn run(
         hook: package.join("evertrace-hook"),
         daemon: package.join("evertraced"),
         cli,
+        mcp,
         config,
         systemctl: PathBuf::from("/usr/bin/systemctl"),
         host_executable: host_executable.unwrap_or_default(),

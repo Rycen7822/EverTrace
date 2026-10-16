@@ -281,7 +281,7 @@ impl CanaryIdentity {
         let (cli, wiring_hash, wiring) = if let Some(package) = candidate_package {
             let arguments = evertrace_codex::install::candidate_host_arguments();
             (
-                package.join("evertrace"),
+                package.join("evertrace-mcp"),
                 evertrace_codex::install::candidate_wiring_hash(&arguments),
                 CanaryWiring::Candidate(arguments),
             )
@@ -327,7 +327,11 @@ impl CanaryIdentity {
             evertrace_capture::RuntimeSnapshot::snapshot_path(data),
         ]);
         if let Some(package) = candidate_package {
-            paths.extend([package.join("evertraced"), package.join("evertrace-hook")]);
+            paths.extend([
+                package.join("evertrace"),
+                package.join("evertraced"),
+                package.join("evertrace-hook"),
+            ]);
         }
         for path in &paths {
             let parent = path.parent()?;
@@ -534,7 +538,7 @@ impl HostCanaryService {
         }
         evertrace_capture::ConfinedRoot::open_owned_private(&self.data_root)
             .map_err(|_| "invalid candidate root")?;
-        for name in ["evertrace", "evertrace-hook", "evertraced"] {
+        for name in ["evertrace", "evertrace-mcp", "evertrace-hook", "evertraced"] {
             let path = package.join(name);
             let identity = canary_file_identity(&path).ok_or("invalid candidate package")?;
             self.candidate_assets.push((path, identity));

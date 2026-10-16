@@ -46,6 +46,7 @@ fn fixture() -> (TempDir, ManagedInstallPaths, EffectiveConfig) {
         unit: root.path().join("systemd/evertraced.service"),
         config: config_path,
         cli: package.join("evertrace"),
+        mcp: package.join("evertrace-mcp"),
         hook: package.join("evertrace-hook"),
         daemon: package.join("evertraced"),
         systemctl: root.path().join("systemctl"),
@@ -1214,7 +1215,7 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
             requests.push(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"evertrace","arguments":{"action":action,"workspace":repository_id.to_string(),"input":input,"refs":[]}}}));
         }
         let run_mcp = || {
-            let mut cli = Command::new(&paths.cli)
+            let mut cli = Command::new(&paths.mcp)
                 .arg("--config")
                 .arg(&paths.config)
                 .arg("mcp")
@@ -2240,7 +2241,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     }
     fs::create_dir(&package).unwrap();
     fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
-    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+    for name in ["evertrace", "evertrace-mcp", "evertrace-hook", "evertraced"] {
         fs::copy(paths.cli.parent().unwrap().join(name), package.join(name)).unwrap();
         fs::set_permissions(package.join(name), fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -2520,7 +2521,7 @@ async fn package_prepare_failure_restores_service_only_with_verified_old_side() 
     fs::create_dir(&package).unwrap();
     fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
     // Only preflight is reached: these small scripts are not candidate proof.
-    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+    for name in ["evertrace", "evertrace-mcp", "evertrace-hook", "evertraced"] {
         let path = package.join(name);
         fs::write(&path, "#!/bin/sh\necho 'configuration is valid'\n").unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2679,7 +2680,7 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
                 .unwrap()
                 .starts_with("@bound:")
         );
-        let mut cli = Command::new(&paths.cli)
+        let mut cli = Command::new(&paths.mcp)
             .arg("--config")
             .arg(&paths.config)
             .arg("mcp")
@@ -3480,7 +3481,7 @@ async fn installed_native_capture_is_weak_durable_and_replay_safe() {
 
 #[test]
 fn owned_merge_idempotence_uninstall_and_unknown_owner() {
-    let (_root, paths, _) = fixture();
+    let (root, paths, _) = fixture();
     fs::create_dir(paths.host_config.parent().unwrap()).unwrap();
     let original = "# user comment\nmodel = 'user-choice'\n[mcp_servers.other]\ncommand = 'other'\n[hooks]\n[[hooks.SessionStart]]\nmatcher = '*'\nhooks = [{type = 'command', command = 'user-hook'}]\n";
     fs::write(&paths.host_config, original).unwrap();
@@ -3493,6 +3494,34 @@ fn owned_merge_idempotence_uninstall_and_unknown_owner() {
             .starts_with(original)
     );
     let installed = fs::read(&paths.host_config).unwrap();
+    assert_eq!(
+        evertrace_codex::install::validate_installed_wiring(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config
+        )
+        .unwrap(),
+        paths.mcp
+    );
+    let unknown_command = String::from_utf8(installed.clone())
+        .unwrap()
+        .replace(paths.mcp.to_str().unwrap(), "/tmp/unknown-evertrace-mcp");
+    fs::write(&paths.host_config, &unknown_command).unwrap();
+    assert!(install_offline(&paths, false).is_err());
+    assert_eq!(
+        fs::read_to_string(&paths.host_config).unwrap(),
+        unknown_command
+    );
+    let tampered_args = String::from_utf8(installed.clone())
+        .unwrap()
+        .replace(paths.config.to_str().unwrap(), "/tmp/other-evertrace.toml");
+    fs::write(&paths.host_config, &tampered_args).unwrap();
+    assert!(install_offline(&paths, false).is_err());
+    assert_eq!(
+        fs::read_to_string(&paths.host_config).unwrap(),
+        tampered_args
+    );
+    fs::write(&paths.host_config, &installed).unwrap();
     let launcher = evertrace_codex::install::StableLauncher::open(&paths.data_root).unwrap();
     let wiring_hash = || {
         evertrace_codex::install::installed_wiring_hash(
@@ -3597,8 +3626,17 @@ enabled_tools = ["evertrace"]
     );
     install_offline(&paths, false).unwrap();
     assert_eq!(wiring_hash(), hash);
+    assert_eq!(
+        evertrace_codex::install::validate_installed_wiring(
+            &paths.data_root,
+            &paths.config,
+            &paths.host_config
+        )
+        .unwrap(),
+        paths.mcp
+    );
     let upgraded = fs::read_to_string(&paths.host_config).unwrap();
-    // Only the owned MCP args change while the new submission hook is appended.
+    // The owned MCP command and args change while the new submission hook is appended.
     // Keep the historical literal independent of the current wiring generator.
     let old_args = format!(
         "args = [\"--config\", \"{}\", \"mcp\"]",
@@ -3610,6 +3648,8 @@ enabled_tools = ["evertrace"]
         paths.host_executable.display(),
         paths.host_config.display()
     );
+    let old_command = format!("command = \"{}\"", paths.cli.display());
+    let current_command = format!("command = \"{}\"", paths.mcp.display());
     assert!(
         upgraded.starts_with(&format!(
             "{original}{}",
@@ -3618,6 +3658,7 @@ enabled_tools = ["evertrace"]
                 .next()
                 .unwrap()
                 .replace(&old_args, &current_args)
+                .replace(&old_command, &current_command)
         )),
         "actual upgraded config={upgraded}"
     ); // Existing array positions survive adding the submission declaration.
@@ -3667,6 +3708,46 @@ enabled_tools = ["evertrace"]
         fs::read_to_string(&paths.unit).unwrap(),
         "# another installation\n"
     );
+
+    let missing_mcp = root.path().join("missing-package/evertrace-mcp");
+    let missing_host = root.path().join("missing-thin-host/config.toml");
+    let missing_unit = root.path().join("missing-thin-service/evertraced.service");
+    fs::create_dir_all(missing_host.parent().unwrap()).unwrap();
+    let missing_owned = String::from_utf8(installed)
+        .unwrap()
+        .replace(paths.mcp.to_str().unwrap(), missing_mcp.to_str().unwrap())
+        .replace(
+            paths.host_config.to_str().unwrap(),
+            missing_host.to_str().unwrap(),
+        );
+    fs::write(&missing_host, missing_owned).unwrap();
+    let missing_paths = ManagedInstallPaths {
+        data_root: paths.data_root.clone(),
+        host_config: missing_host.clone(),
+        unit: missing_unit,
+        config: paths.config.clone(),
+        cli: paths.cli.clone(),
+        mcp: missing_mcp.clone(),
+        hook: paths.hook.clone(),
+        daemon: paths.daemon.clone(),
+        systemctl: root.path().join("missing-systemctl"),
+        host_executable: paths.host_executable.clone(),
+    };
+    assert!(
+        evertrace_codex::install::validate_installed_wiring(
+            &missing_paths.data_root,
+            &missing_paths.config,
+            &missing_paths.host_config
+        )
+        .is_err()
+    );
+    install_offline(&missing_paths, true).unwrap();
+    assert!(
+        !fs::read_to_string(&missing_host)
+            .unwrap()
+            .contains("mcp_servers.evertrace")
+    );
+    assert!(!missing_mcp.exists());
 }
 
 #[tokio::test]
@@ -4507,7 +4588,7 @@ fn next_package(root: &std::path::Path, paths: &ManagedInstallPaths) -> std::pat
     let package = root.join("next-package");
     fs::create_dir(&package).unwrap();
     fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
-    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+    for name in ["evertrace", "evertrace-mcp", "evertrace-hook", "evertraced"] {
         let destination = package.join(name);
         fs::copy(paths.cli.parent().unwrap().join(name), &destination).unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();

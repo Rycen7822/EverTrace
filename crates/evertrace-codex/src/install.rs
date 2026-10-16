@@ -41,6 +41,7 @@ pub struct ManagedInstallPaths {
     pub unit: PathBuf,
     pub config: PathBuf,
     pub cli: PathBuf,
+    pub mcp: PathBuf,
     pub hook: PathBuf,
     pub daemon: PathBuf,
     pub systemctl: PathBuf,
@@ -1019,9 +1020,31 @@ pub fn managed_install(
             .as_ref()
             .map_or(&[][..], |(_, bytes)| bytes.as_slice());
         let previous_locator = wiring_host_locator(original_host)?;
+        let original_host_text =
+            std::str::from_utf8(original_host).map_err(|_| InstallError::InvalidType)?;
+        let expected_mcp = if original_host_text.contains(OWNED_BEGIN) {
+            let original: toml::Value =
+                toml::from_str(original_host_text).map_err(|_| InstallError::InvalidType)?;
+            let command = original
+                .get("mcp_servers")
+                .and_then(|value| value.get("evertrace"))
+                .and_then(|value| value.get("command"))
+                .and_then(toml::Value::as_str)
+                .ok_or(InstallError::InvalidType)?;
+            let command = Path::new(command);
+            if command == paths.cli.as_path() {
+                &paths.cli
+            } else if command == paths.mcp.as_path() {
+                &paths.mcp
+            } else {
+                return Err(InstallError::InvalidType);
+            }
+        } else {
+            &paths.mcp
+        };
         let expected = wiring_with_host(
             &paths.data_root,
-            &paths.cli,
+            expected_mcp,
             &paths.config,
             previous_locator
                 .as_ref()
@@ -1032,7 +1055,7 @@ pub fn managed_install(
         } else {
             Some(wiring_with_host(
                 &paths.data_root,
-                &paths.cli,
+                &paths.mcp,
                 &paths.config,
                 Some((&paths.host_executable, &paths.host_config)),
             )?)
@@ -1109,6 +1132,7 @@ pub fn managed_install(
         if !uninstall {
             stage = "package assets";
             package_metadata(&paths.cli)?;
+            package_metadata(&paths.mcp)?;
             package_metadata(&paths.daemon)?;
             let bytes = package_bytes(&paths.hook)?;
             ensure_install_parent(&paths.data_root)?;
@@ -1898,7 +1922,7 @@ pub fn candidate_host_arguments() -> [String; 6] {
         format!("hooks.UserPromptSubmit=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         "mcp_servers.evertrace.command=\"/bin/sh\"".into(),
         "mcp_servers.evertrace.env_vars=[\"EVERTRACE_CANDIDATE_PACKAGE\",\"EVERTRACE_CANDIDATE_CONFIG\"]".into(),
-        format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),
+        format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace-mcp\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),
     ]
 }
 
@@ -1954,6 +1978,7 @@ pub fn preflight_package_check(
 ) -> Result<PackageCheckPreflight, InstallError> {
     let old_cli = validate_installed_wiring(data, config, host_config)?;
     let old_package = old_cli.parent().ok_or(InstallError::InvalidType)?;
+    let old_uses_mcp = old_cli == old_package.join("evertrace-mcp");
     if !package.is_absolute()
         || package.starts_with(old_package)
         || old_package.starts_with(package)
@@ -1983,12 +2008,14 @@ pub fn preflight_package_check(
         return Err(InstallError::InvalidType);
     }
     let mut assets = Vec::new();
-    for name in ["evertrace", "evertrace-hook", "evertraced"] {
+    for name in ["evertrace", "evertrace-mcp", "evertrace-hook", "evertraced"] {
         let source = package.join(name);
         let identity = hook_file_identity(&package_metadata(&source)?);
-        let previous = package_metadata(&old_package.join(name))?;
-        if (identity.device, identity.inode) == (previous.dev(), previous.ino()) {
-            return Err(InstallError::InvalidType);
+        if name != "evertrace-mcp" || old_uses_mcp {
+            let previous = package_metadata(&old_package.join(name))?;
+            if (identity.device, identity.inode) == (previous.dev(), previous.ino()) {
+                return Err(InstallError::InvalidType);
+            }
         }
         assets.push((source, identity));
     }
@@ -2016,7 +2043,7 @@ pub fn preflight_package_check(
         &wiring_with_host(data, &old_cli, config, host_locator)?,
         Some(&wiring_with_host(
             data,
-            &package.join("evertrace"),
+            &package.join("evertrace-mcp"),
             config,
             host_locator,
         )?),
@@ -3217,6 +3244,12 @@ mod package_publication_tests {
                     .unwrap();
                 }
             }
+            atomic_write(
+                &new.join("evertrace-mcp"),
+                b"#!/bin/sh\necho 'configuration is valid'\n",
+                0o700,
+            )
+            .unwrap();
             let config = root.join("config.toml");
             let host = root.join("host.toml");
             let unit = root.join("evertraced.service");
@@ -3244,6 +3277,32 @@ mod package_publication_tests {
                 0o600,
             )
             .unwrap();
+            if failure == 0 {
+                let host_before = fs::read(&host).unwrap();
+                let mcp = new.join("evertrace-mcp");
+                let mcp_bytes = fs::read(&mcp).unwrap();
+                fs::remove_file(&mcp).unwrap();
+                assert!(preflight_package_check(&data, &config, &host, &unit, &new).is_err());
+                assert_eq!(fs::read(&host).unwrap(), host_before);
+                atomic_write(&mcp, &mcp_bytes, 0o700).unwrap();
+
+                let preflight =
+                    preflight_package_check(&data, &config, &host, &unit, &new).unwrap();
+                fs::write(&mcp, b"#!/bin/sh\nexit 0\n").unwrap();
+                let tampered_candidate = root.join("tampered-candidate");
+                DirBuilder::new()
+                    .mode(0o700)
+                    .create(&tampered_candidate)
+                    .unwrap();
+                assert!(
+                    prepare_package_check(preflight, &tampered_candidate, |path| {
+                        atomic_write(path, b"tampered runtime", 0o600)
+                    })
+                    .is_err()
+                );
+                assert_eq!(fs::read(&host).unwrap(), host_before);
+                atomic_write(&mcp, &mcp_bytes, 0o700).unwrap();
+            }
             let original = [
                 host.clone(),
                 unit.clone(),
