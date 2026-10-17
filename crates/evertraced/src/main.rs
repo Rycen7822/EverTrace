@@ -612,7 +612,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 &source_reference,
                             )
                             .await
-                            .map_err(|_| ErrorCode::Untrusted)?;
+                            .map_err(|reason| {
+                                tracing::warn!(target: "evertrace_lifecycle", ?reason, "native source observation rejected");
+                                ErrorCode::Untrusted
+                            })?;
                         *session_catalog_report.write().await = Some(report);
                         let next = (*session_import_wakeup.borrow()).wrapping_add(1);
                         session_import_wakeup.send_replace(next);
