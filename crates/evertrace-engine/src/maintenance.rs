@@ -1959,7 +1959,9 @@ impl BackgroundScheduler {
                         && !import_job_is_current(job, self.runtime.effective_config_hash)
                         || matches!(
                             job.kind.as_str(),
-                            PROCEDURE_PROMOTION_JOB_KIND | PROCEDURE_USAGE_JOB_KIND
+                            PROCEDURE_PROMOTION_JOB_KIND
+                                | PROCEDURE_USAGE_JOB_KIND
+                                | crate::jobs::procedure::KIND
                         ) && job.state == JobStatus::Queued
                             && job.config_hash != self.runtime.effective_config_hash
                         || job.kind == "semantic_synthesis_v1"

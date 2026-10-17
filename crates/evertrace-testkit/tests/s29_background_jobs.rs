@@ -1041,13 +1041,21 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
     let (handle, task) = spawn_writer(writer, 16).unwrap();
     let import = job("session_import_v1", "session_import:old", 1, 0);
     let synthesis = job("semantic_synthesis_v1", "semantic_synthesis:old", 1, 0);
+    let mut procedure = job("procedure_review_v1", "procedure_review:old", 1, 5);
+    procedure.algorithm_revision = "procedure_review_v1".into();
+    procedure.model_id = Some("model-a".into());
+    procedure.budget.max_input_tokens = Some(1024);
+    procedure.budget.max_output_tokens = Some(1024);
+    procedure.budget.max_calls = Some(1);
     let import_id = import.job_id;
     let synthesis_id = synthesis.job_id;
+    let procedure_id = procedure.job_id;
+    let old_ids = [import_id, synthesis_id, procedure_id];
     handle
         .commit(
             JournalCommand::new(
                 CommandId::new_v7(),
-                [import, synthesis]
+                [import, synthesis, procedure]
                     .into_iter()
                     .map(|job| {
                         JournalEventDraft::runtime(
@@ -1069,7 +1077,7 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
     let jobs = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
         .unwrap()
         .jobs;
-    for old_id in [import_id, synthesis_id] {
+    for old_id in old_ids {
         let old = jobs.iter().find(|job| job.job_id == old_id).unwrap();
         assert_eq!(old.state, JobStatus::Failed);
         assert_eq!(old.attempt, 1);
@@ -1100,12 +1108,9 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
         .into_iter()
         .filter_map(|row| {
             let relevant = match row.payload().unwrap() {
-                JournalPayload::JobLease(lease) => {
-                    lease.job_id == import_id || lease.job_id == synthesis_id
-                }
+                JournalPayload::JobLease(lease) => old_ids.contains(&lease.job_id),
                 JournalPayload::JobState(job) => {
-                    (job.job_id == import_id || job.job_id == synthesis_id)
-                        && job.state == JobStatus::Failed
+                    old_ids.contains(&job.job_id) && job.state == JobStatus::Failed
                         || job.job_id == replacement_id
                 }
                 _ => false,
@@ -1116,7 +1121,7 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
     assert_eq!(command_ids.len(), 1);
     assert!(reopened.journal_rows().await.unwrap().into_iter().all(
         |row| !matches!(row.payload().unwrap(), JournalPayload::JobLease(lease)
-                if lease.job_id == import_id || lease.job_id == synthesis_id)
+                if old_ids.contains(&lease.job_id))
     ));
 }
 
