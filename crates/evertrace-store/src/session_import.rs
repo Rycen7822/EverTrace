@@ -534,7 +534,10 @@ fn prospective_origin_transition_is_valid(
     }
     match (&old.prospective_origin, &next.prospective_origin) {
         (None, None) => true,
-        (None, Some(_)) => body_state == SessionBodyState::NotImported,
+        (None, Some(_)) => matches!(
+            body_state,
+            SessionBodyState::NotImported | SessionBodyState::SourceReplaced
+        ),
         (Some(_), None) => false,
         (Some(previous), Some(current)) => {
             previous.snapshot_ref == current.snapshot_ref
@@ -834,6 +837,10 @@ fn reason_matches(state: SessionBodyState, reason: BodyStateReason) -> bool {
                 BodyStateReason::ScopeUnresolved
             )
             | (SessionBodyState::Partial, BodyStateReason::BudgetExhausted)
+            | (
+                SessionBodyState::Partial,
+                BodyStateReason::ApprovalUnavailable
+            )
             | (SessionBodyState::Failed, BodyStateReason::ImportFailed)
             | (
                 SessionBodyState::SourceReplaced,
@@ -1016,6 +1023,34 @@ mod tests {
         assert_eq!(queued.metadata.resolved_repository_instance_id, None);
         assert_eq!(queued.metadata.resolved_worktree_instance_id, None);
         queued.validate().unwrap();
+
+        let importing = apply_session_event(
+            Some(&queued),
+            &event(
+                5,
+                SessionImportEventKind::BodyStateAdvanced {
+                    body_state: SessionBodyState::Importing,
+                    reason: BodyStateReason::Started,
+                },
+            ),
+            5,
+        )
+        .unwrap();
+        let suffix_only = apply_session_event(
+            Some(&importing),
+            &event(
+                6,
+                SessionImportEventKind::BodyStateAdvanced {
+                    body_state: SessionBodyState::Partial,
+                    reason: BodyStateReason::ApprovalUnavailable,
+                },
+            ),
+            6,
+        )
+        .unwrap();
+        assert_eq!(suffix_only.access_decision, None);
+        assert_eq!(suffix_only.body_state, SessionBodyState::Partial);
+        suffix_only.validate().unwrap();
 
         let earlier = evertrace_domain::evidence::EvidenceByteRange { start: 0, end: 2 };
         assert!(resolved.import_scope(&earlier, None, None).is_err());

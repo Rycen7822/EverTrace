@@ -1837,10 +1837,15 @@ impl BackgroundScheduler {
         let mut completed = 0;
         completed += self.run_gc_round().await?;
         let mut retryable = false;
-        if optional_allowed && self.import_settings.historical_metadata_backfill {
+        if optional_allowed {
             let report = self.report.read().await.clone();
             if let Some(report) = report.as_ref() {
-                match self.catalog.refresh(report).await {
+                let refresh = if self.import_settings.historical_metadata_backfill {
+                    self.catalog.refresh(report).await
+                } else {
+                    self.catalog.refresh_active(report).await
+                };
+                match refresh {
                     Ok(changed) => completed += changed,
                     Err(_) => retryable = true,
                 }

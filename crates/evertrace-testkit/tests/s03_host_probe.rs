@@ -927,7 +927,13 @@ fn fixtures_and_packaging_are_content_free_minimal_inputs() {
     )
     .unwrap();
     assert_eq!(hooks.as_object().unwrap().len(), 1);
-    assert_eq!(hooks["hooks"].as_object().unwrap().len(), 3);
+    assert_eq!(hooks["hooks"].as_object().unwrap().len(), 4);
+    assert_eq!(
+        hooks["hooks"]["SessionStart"],
+        serde_json::json!([
+            {"matcher":"startup", "hooks":[{"type":"command", "command":"@HOOK_COMMAND@", "timeout":3}]}
+        ])
+    );
     assert_eq!(
         hooks["hooks"]["UserPromptSubmit"],
         serde_json::json!([

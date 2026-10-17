@@ -14,8 +14,8 @@ use evertrace_domain::{
 };
 use evertrace_store::{
     DirtyTarget, DirtyTargetKind, EventScope, JournalCommand, JournalEventDraft, JournalPayload,
-    ProjectionSnapshot, ScopePurgeCurrentView, SourceIngestWatermark, SourceKind,
-    SourceRevisionRecorded,
+    ProjectionSnapshot, ScopePurgeCurrentView, SourceImportEarlierPrefix, SourceIngestWatermark,
+    SourceKind, SourceRevisionRecorded,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -536,90 +536,118 @@ impl EvidenceIngestor {
                 )?;
                 let surface_count = usize::from(verified.surface.is_some());
                 let recorded_at_us = verified.body.recorded_at_us;
-                let digest = if evertrace_store::session_import::is_session_import_source(
-                    verified.body.source_instance_id.as_str(),
-                ) {
-                    let range = verified
-                        .receipt
-                        .source_byte_range
-                        .as_ref()
-                        .ok_or(IngestError::InvalidRecord)?;
-                    if range.end != verified.body.source_sequence || range.end <= range.start {
-                        return Err(IngestError::InvalidRecord);
-                    }
-                    let key = (
-                        verified.body.source_instance_id.as_str().to_owned(),
-                        verified.body.source_revision.as_str().to_owned(),
-                    );
-                    if !prefix_states.contains_key(&key) {
-                        if prefix_projection.is_none() {
-                            prefix_projection = Some(
-                                self.writer
-                                    .project_objects()
-                                    .await
-                                    .map_err(map_writer_error)?,
-                            );
+                let (digest, watermark) =
+                    if evertrace_store::session_import::is_session_import_source(
+                        verified.body.source_instance_id.as_str(),
+                    ) {
+                        let range = verified
+                            .receipt
+                            .source_byte_range
+                            .as_ref()
+                            .ok_or(IngestError::InvalidRecord)?;
+                        if range.end != verified.body.source_sequence || range.end <= range.start {
+                            return Err(IngestError::InvalidRecord);
                         }
-                        let projected = projected_confirmed_prefix(
-                            prefix_projection
-                                .as_ref()
-                                .ok_or(IngestError::StoreCorrupt)?,
-                            &verified.body.source_instance_id,
-                            &verified.body.source_revision,
-                        )?;
-                        prefix_states.insert(key.clone(), projected);
-                    }
-                    let state = prefix_states.get(&key).ok_or(IngestError::StoreCorrupt)?;
-                    if verified.body.source_sequence <= state.committed_end {
-                        if state.exact.is_none() {
-                            let exact = projected_exact_prefixes(
+                        let key = (
+                            verified.body.source_instance_id.as_str().to_owned(),
+                            verified.body.source_revision.as_str().to_owned(),
+                        );
+                        if !prefix_states.contains_key(&key) {
+                            if prefix_projection.is_none() {
+                                prefix_projection = Some(
+                                    self.writer
+                                        .project_objects()
+                                        .await
+                                        .map_err(map_writer_error)?,
+                                );
+                            }
+                            let context = self
+                                .writer
+                                .session_import_context(&key.0)
+                                .await
+                                .map_err(map_writer_error)?;
+                            let origin_fence = context
+                                .filter(|context| {
+                                    context.current.metadata.source_revision.as_str() == key.1
+                                })
+                                .and_then(|context| context.current.metadata.prospective_origin)
+                                .and_then(|origin| origin.record_start);
+                            let projected = projected_confirmed_prefix(
                                 prefix_projection
                                     .as_ref()
                                     .ok_or(IngestError::StoreCorrupt)?,
-                                &key.0,
-                                &key.1,
-                                state.committed_end,
-                                state.committed_digest.as_deref(),
+                                &verified.body.source_instance_id,
+                                &verified.body.source_revision,
+                                origin_fence,
                             )?;
-                            prefix_states
+                            prefix_states.insert(key.clone(), projected);
+                        }
+                        let state = prefix_states.get(&key).ok_or(IngestError::StoreCorrupt)?;
+                        let local_exact = state.local_exact.get(&range.end).cloned();
+                        let is_committed =
+                            state.committed_watermark.as_ref().is_some_and(|value| {
+                                match value.earlier_prefix.as_ref() {
+                                    Some(prefix) if range.end <= prefix.fence_byte => {
+                                        range.end <= prefix.through_byte
+                                    }
+                                    Some(prefix) => {
+                                        range.start >= prefix.fence_byte
+                                            && value.confirmed_prefix_digest.is_some()
+                                            && range.end <= value.source_sequence
+                                    }
+                                    None => range.end <= value.source_sequence,
+                                }
+                            });
+                        if let Some(exact) = local_exact {
+                            if exact.start != range.start
+                                || exact.end != range.end
+                                || exact.cas_ref != verified.receipt.cas_ref
+                            {
+                                return Err(IngestError::StoreCorrupt);
+                            }
+                            (Some(exact.digest), None)
+                        } else if is_committed {
+                            if state.exact.is_none() {
+                                let watermark = state
+                                    .committed_watermark
+                                    .as_ref()
+                                    .ok_or(IngestError::StoreCorrupt)?;
+                                let exact = projected_exact_prefixes(
+                                    prefix_projection
+                                        .as_ref()
+                                        .ok_or(IngestError::StoreCorrupt)?,
+                                    &key.0,
+                                    &key.1,
+                                    state.origin_fence,
+                                    watermark,
+                                )?;
+                                prefix_states
+                                    .get_mut(&key)
+                                    .ok_or(IngestError::StoreCorrupt)?
+                                    .exact = Some(exact);
+                            }
+                            let exact = prefix_states
+                                .get(&key)
+                                .and_then(|state| state.exact.as_ref())
+                                .and_then(|exact| exact.get(&range.end))
+                                .ok_or(IngestError::StoreCorrupt)?;
+                            if exact.start != range.start
+                                || exact.end != range.end
+                                || exact.cas_ref != verified.receipt.cas_ref
+                            {
+                                return Err(IngestError::StoreCorrupt);
+                            }
+                            (Some(exact.digest.clone()), None)
+                        } else {
+                            let state = prefix_states
                                 .get_mut(&key)
-                                .ok_or(IngestError::StoreCorrupt)?
-                                .exact = Some(exact);
+                                .ok_or(IngestError::StoreCorrupt)?;
+                            let next = state.advance(&verified.receipt)?;
+                            (next.confirmed_prefix_digest.clone(), Some(next))
                         }
-                        let exact = prefix_states
-                            .get(&key)
-                            .and_then(|state| state.exact.as_ref())
-                            .and_then(|exact| exact.get(&verified.body.source_sequence))
-                            .ok_or(IngestError::StoreCorrupt)?;
-                        if exact.start != range.start
-                            || exact.end != range.end
-                            || exact.cas_ref != verified.receipt.cas_ref
-                        {
-                            return Err(IngestError::StoreCorrupt);
-                        }
-                        Some(exact.digest.clone())
                     } else {
-                        if range.start != state.local_end {
-                            return Err(IngestError::InvalidRecord);
-                        }
-                        let digest = confirmed_prefix_digest(
-                            &key.0,
-                            &key.1,
-                            range.start,
-                            range.end,
-                            state.local_digest.as_deref(),
-                            &verified.receipt.cas_ref,
-                        )?;
-                        let state = prefix_states
-                            .get_mut(&key)
-                            .ok_or(IngestError::StoreCorrupt)?;
-                        state.local_end = range.end;
-                        state.local_digest = Some(digest.clone());
-                        Some(digest)
-                    }
-                } else {
-                    None
-                };
+                        (None, None)
+                    };
                 // The journal validates the original whole command before
                 // returning it. Preserve its first presentation across lost ack
                 // and reload; verify every payload against this same frame/CAS.
@@ -656,11 +684,22 @@ impl EvidenceIngestor {
                             _ => None,
                         })
                         .ok_or(IngestError::StoreCorrupt)?;
-                    let expected = capture_event_drafts(
+                    let original_watermark =
+                        committed_command
+                            .payloads
+                            .iter()
+                            .find_map(|payload| match payload {
+                                JournalPayload::SourceIngestWatermark(watermark) => {
+                                    Some(watermark.clone())
+                                }
+                                _ => None,
+                            });
+                    let expected = capture_event_drafts_with_watermark(
                         &verified,
                         digest,
                         effective_config_hash,
                         original_algorithm,
+                        original_watermark,
                     )?
                     .into_iter()
                     .map(|event| event.payload)
@@ -699,11 +738,12 @@ impl EvidenceIngestor {
                 }
                 let command = JournalCommand::new(
                     verified.body.command_id,
-                    capture_event_drafts(
+                    capture_event_drafts_with_watermark(
                         &verified,
                         digest,
                         effective_config_hash,
                         &self.algorithm_revision,
+                        watermark,
                     )?,
                 )
                 .map_err(|_| IngestError::InvalidRecord)?;
@@ -840,6 +880,22 @@ pub(crate) fn capture_event_drafts(
     effective_config_hash: [u8; 32],
     algorithm_revision: &str,
 ) -> Result<Vec<JournalEventDraft>, IngestError> {
+    capture_event_drafts_with_watermark(
+        verified,
+        confirmed_prefix_digest,
+        effective_config_hash,
+        algorithm_revision,
+        None,
+    )
+}
+
+fn capture_event_drafts_with_watermark(
+    verified: &crate::capture::VerifiedCapture,
+    confirmed_prefix_digest: Option<String>,
+    effective_config_hash: [u8; 32],
+    algorithm_revision: &str,
+    watermark: Option<SourceIngestWatermark>,
+) -> Result<Vec<JournalEventDraft>, IngestError> {
     let scope = EventScope {
         repository_id: verified
             .body
@@ -877,15 +933,19 @@ pub(crate) fn capture_event_drafts(
     payloads.push(JournalPayload::SourceObservationRecorded(Box::new(
         verified.observation.clone(),
     )));
-    payloads.push(JournalPayload::SourceIngestWatermark(
-        SourceIngestWatermark {
-            source_instance_id: verified.body.source_instance_id.clone(),
-            source_revision: verified.body.source_revision.clone(),
-            source_sequence: verified.body.source_sequence,
-            confirmed_prefix_digest,
-            earlier_prefix: None,
-        },
-    ));
+    let watermark = watermark.unwrap_or(SourceIngestWatermark {
+        source_instance_id: verified.body.source_instance_id.clone(),
+        source_revision: verified.body.source_revision.clone(),
+        source_sequence: verified.body.source_sequence,
+        confirmed_prefix_digest,
+        earlier_prefix: None,
+    });
+    if watermark.source_instance_id != verified.body.source_instance_id
+        || watermark.source_revision != verified.body.source_revision
+    {
+        return Err(IngestError::InvalidRecord);
+    }
+    payloads.push(JournalPayload::SourceIngestWatermark(watermark));
     if let Some(surface) = verified.surface.clone() {
         payloads.push(JournalPayload::EvidenceSurfaceRecorded(Box::new(surface)));
     }
@@ -927,11 +987,72 @@ pub(crate) fn capture_event_drafts(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfirmedPrefixState {
-    committed_end: u64,
-    committed_digest: Option<String>,
+    origin_fence: Option<u64>,
+    committed_watermark: Option<SourceIngestWatermark>,
     exact: Option<BTreeMap<u64, ProjectedExactPrefix>>,
+    local_exact: BTreeMap<u64, ProjectedExactPrefix>,
     local_end: u64,
     local_digest: Option<String>,
+    prefix_end: u64,
+    prefix_digest: Option<String>,
+}
+
+impl ConfirmedPrefixState {
+    fn advance(
+        &mut self,
+        receipt: &evertrace_domain::evidence::SourceReceipt,
+    ) -> Result<SourceIngestWatermark, IngestError> {
+        let range = receipt
+            .source_byte_range
+            .as_ref()
+            .ok_or(IngestError::InvalidRecord)?;
+        if self
+            .origin_fence
+            .is_some_and(|fence| range.start < fence && range.end > fence)
+        {
+            return Err(IngestError::InvalidRecord);
+        }
+        let (end, previous) = if self.origin_fence.is_some_and(|fence| range.end <= fence) {
+            (&mut self.prefix_end, &mut self.prefix_digest)
+        } else {
+            (&mut self.local_end, &mut self.local_digest)
+        };
+        if range.start != *end {
+            return Err(IngestError::InvalidRecord);
+        }
+        let digest = confirmed_prefix_digest(
+            receipt.source_instance_id.as_str(),
+            receipt.source_revision.as_str(),
+            range.start,
+            range.end,
+            previous.as_deref(),
+            &receipt.cas_ref,
+        )?;
+        *end = range.end;
+        *previous = Some(digest.clone());
+        self.local_exact.insert(
+            range.end,
+            ProjectedExactPrefix {
+                start: range.start,
+                end: range.end,
+                cas_ref: receipt.cas_ref.clone(),
+                digest,
+            },
+        );
+        Ok(SourceIngestWatermark {
+            source_instance_id: receipt.source_instance_id.clone(),
+            source_revision: receipt.source_revision.clone(),
+            source_sequence: self.local_end,
+            confirmed_prefix_digest: self.local_digest.clone(),
+            earlier_prefix: self
+                .origin_fence
+                .map(|fence_byte| SourceImportEarlierPrefix {
+                    fence_byte,
+                    through_byte: self.prefix_end,
+                    digest: self.prefix_digest.clone(),
+                }),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -946,6 +1067,7 @@ fn projected_confirmed_prefix(
     snapshot: &ProjectionSnapshot,
     source_instance: &SourceInstanceId,
     source_revision: &SourceRevision,
+    origin_fence: Option<u64>,
 ) -> Result<ConfirmedPrefixState, IngestError> {
     let key = SourceIngestWatermark {
         source_instance_id: source_instance.clone(),
@@ -957,11 +1079,14 @@ fn projected_confirmed_prefix(
     .stable_key();
     let Some(row) = snapshot.row(&format!("runtime:watermark:source:{key}")) else {
         return Ok(ConfirmedPrefixState {
-            committed_end: 0,
-            committed_digest: None,
+            origin_fence,
+            committed_watermark: None,
             exact: None,
-            local_end: 0,
+            local_exact: BTreeMap::new(),
+            local_end: origin_fence.unwrap_or(0),
             local_digest: None,
+            prefix_end: 0,
+            prefix_digest: None,
         });
     };
     let payload: JournalPayload = serde_json::from_str(
@@ -975,20 +1100,64 @@ fn projected_confirmed_prefix(
     };
     if &watermark.source_instance_id != source_instance
         || &watermark.source_revision != source_revision
-        || watermark.source_sequence == 0
     {
         return Err(IngestError::StoreCorrupt);
     }
-    let digest = watermark
-        .confirmed_prefix_digest
-        .clone()
-        .ok_or(IngestError::StoreCorrupt)?;
+    // A persisted fence describes admitted history even after its live origin
+    // closes or metadata advances to another revision. It grants no new reads.
+    let origin_fence = match (&watermark.earlier_prefix, origin_fence) {
+        (Some(prefix), Some(fence)) if prefix.fence_byte != fence => {
+            return Err(IngestError::StoreCorrupt);
+        }
+        (Some(prefix), _) => Some(prefix.fence_byte),
+        (None, value) => value,
+    };
+    let (local_end, local_digest, prefix_end, prefix_digest) = match origin_fence {
+        Some(fence) => {
+            let prefix = watermark
+                .earlier_prefix
+                .as_ref()
+                .filter(|prefix| prefix.fence_byte == fence)
+                .ok_or(IngestError::StoreCorrupt)?;
+            let suffix_end = if watermark.confirmed_prefix_digest.is_some() {
+                if watermark.source_sequence <= fence {
+                    return Err(IngestError::StoreCorrupt);
+                }
+                watermark.source_sequence
+            } else {
+                if watermark.source_sequence != fence {
+                    return Err(IngestError::StoreCorrupt);
+                }
+                fence
+            };
+            (
+                suffix_end,
+                watermark.confirmed_prefix_digest.clone(),
+                prefix.through_byte,
+                prefix.digest.clone(),
+            )
+        }
+        None => {
+            if watermark.earlier_prefix.is_some() || watermark.confirmed_prefix_digest.is_none() {
+                return Err(IngestError::StoreCorrupt);
+            }
+            (
+                watermark.source_sequence,
+                watermark.confirmed_prefix_digest.clone(),
+                0,
+                None,
+            )
+        }
+    };
     Ok(ConfirmedPrefixState {
-        committed_end: watermark.source_sequence,
-        committed_digest: Some(digest.clone()),
+        origin_fence,
+        committed_watermark: Some(watermark),
         exact: None,
-        local_end: watermark.source_sequence,
-        local_digest: Some(digest),
+        local_exact: BTreeMap::new(),
+        local_end,
+        local_digest,
+        prefix_end,
+        prefix_digest,
     })
 }
 
@@ -996,10 +1165,9 @@ fn projected_exact_prefixes(
     snapshot: &ProjectionSnapshot,
     source_instance: &str,
     source_revision: &str,
-    committed_end: u64,
-    expected: Option<&str>,
+    origin_fence: Option<u64>,
+    watermark: &SourceIngestWatermark,
 ) -> Result<BTreeMap<u64, ProjectedExactPrefix>, IngestError> {
-    let expected = expected.ok_or(IngestError::StoreCorrupt)?;
     let mut receipts = Vec::new();
     for row in snapshot
         .data_rows()
@@ -1032,21 +1200,32 @@ fn projected_exact_prefixes(
         return Err(IngestError::StoreCorrupt);
     }
     receipts.sort_by_key(|(start, end, _)| (*end, *start));
-    let mut cursor = 0_u64;
-    let mut digest = None;
+    let mut prefix_cursor = 0_u64;
+    let mut prefix_digest = None;
+    let mut main_cursor = origin_fence.unwrap_or(0);
+    let mut main_digest = None;
     let mut exact = BTreeMap::new();
     for (start, end, cas_ref) in receipts {
-        if start != cursor || end > committed_end {
+        let (cursor, previous) = match origin_fence {
+            Some(fence) if end <= fence => (&mut prefix_cursor, &mut prefix_digest),
+            Some(fence) if start >= fence => (&mut main_cursor, &mut main_digest),
+            Some(_) => return Err(IngestError::StoreCorrupt),
+            None if end <= watermark.source_sequence => (&mut main_cursor, &mut main_digest),
+            None => return Err(IngestError::StoreCorrupt),
+        };
+        if start != *cursor {
             return Err(IngestError::StoreCorrupt);
         }
-        let next_digest = confirmed_prefix_digest(
+        let digest = confirmed_prefix_digest(
             source_instance,
             source_revision,
             start,
             end,
-            digest.as_deref(),
+            previous.as_deref(),
             &cas_ref,
         )?;
+        *cursor = end;
+        *previous = Some(digest.clone());
         if exact
             .insert(
                 end,
@@ -1054,18 +1233,41 @@ fn projected_exact_prefixes(
                     start,
                     end,
                     cas_ref,
-                    digest: next_digest.clone(),
+                    digest: digest.clone(),
                 },
             )
             .is_some()
         {
             return Err(IngestError::StoreCorrupt);
         }
-        digest = Some(next_digest);
-        cursor = end;
     }
-    if cursor != committed_end || digest.as_deref() != Some(expected) {
-        return Err(IngestError::StoreCorrupt);
+    match origin_fence {
+        Some(fence) => {
+            let prefix = watermark
+                .earlier_prefix
+                .as_ref()
+                .filter(|prefix| prefix.fence_byte == fence)
+                .ok_or(IngestError::StoreCorrupt)?;
+            let suffix_end = if watermark.confirmed_prefix_digest.is_some() {
+                watermark.source_sequence
+            } else {
+                fence
+            };
+            if prefix_cursor != prefix.through_byte
+                || prefix_digest != prefix.digest
+                || main_cursor != suffix_end
+                || main_digest != watermark.confirmed_prefix_digest
+            {
+                return Err(IngestError::StoreCorrupt);
+            }
+        }
+        None => {
+            if main_cursor != watermark.source_sequence
+                || main_digest != watermark.confirmed_prefix_digest
+            {
+                return Err(IngestError::StoreCorrupt);
+            }
+        }
     }
     Ok(exact)
 }

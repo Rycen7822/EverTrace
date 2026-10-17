@@ -318,7 +318,12 @@ fn wiring_with_host(
         "../../../packaging/codex/hooks.v1.template.json"
     ))
     .map_err(|_| InstallError::InvalidType)?;
-    for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit"] {
+    for event in [
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse",
+        "UserPromptSubmit",
+    ] {
         hooks["hooks"][event][0]["hooks"][0]["command"] = command.clone().into();
     }
     mcp.as_table_mut().ok_or(InstallError::InvalidType)?.insert(
@@ -360,6 +365,8 @@ struct WiringLocations {
 
 #[derive(Default, Deserialize)]
 struct HookLocations {
+    #[serde(default, rename = "SessionStart")]
+    start: Vec<toml::Spanned<LocatedHook>>,
     #[serde(default, rename = "PreToolUse")]
     pre: Vec<toml::Spanned<LocatedHook>>,
     #[serde(default, rename = "PostToolUse")]
@@ -434,6 +441,7 @@ fn wiring_declarations(bytes: &[u8]) -> Result<WiringDeclarations, InstallError>
     let mut values = BTreeMap::new();
     let mut removals = vec![begin.clone(), end.clone()];
     for (event, entries) in [
+        ("SessionStart", locations.hooks.start),
         ("PreToolUse", locations.hooks.pre),
         ("PostToolUse", locations.hooks.post),
         ("UserPromptSubmit", locations.hooks.submit),
@@ -443,7 +451,7 @@ fn wiring_declarations(bytes: &[u8]) -> Result<WiringDeclarations, InstallError>
             .enumerate()
             .filter(|(_, item)| within(&item.span()))
             .collect();
-        if selected.is_empty() && event == "UserPromptSubmit" {
+        if selected.is_empty() && matches!(event, "SessionStart" | "UserPromptSubmit") {
             continue;
         }
         let [(index, entry)] = selected.as_slice() else {
@@ -565,7 +573,13 @@ fn replace_wiring(
         let old = previous_tool_wiring(
             std::str::from_utf8(&expected.canonical).map_err(|_| InstallError::InvalidType)?,
         )?;
-        if actual.canonical != expected.canonical && actual.canonical != old.as_bytes() {
+        let prior_source = previous_source_wiring(
+            std::str::from_utf8(&expected.canonical).map_err(|_| InstallError::InvalidType)?,
+        )?;
+        if actual.canonical != expected.canonical
+            && actual.canonical != old.as_bytes()
+            && actual.canonical != prior_source.as_bytes()
+        {
             return Err(InstallError::InvalidType);
         }
         unowned = actual.unowned;
@@ -577,20 +591,19 @@ fn replace_wiring(
                     edits.push((range.clone(), desired.to_string()));
                 }
             }
-            if !actual.values.contains_key("UserPromptSubmit.command") {
-                let value: toml::Value = toml::from_str(
-                    std::str::from_utf8(&target.canonical)
-                        .map_err(|_| InstallError::InvalidType)?,
-                )
-                .map_err(|_| InstallError::InvalidType)?;
+            let mut missing_hooks = toml::Table::new();
+            let value: toml::Value = toml::from_str(
+                std::str::from_utf8(&target.canonical).map_err(|_| InstallError::InvalidType)?,
+            )
+            .map_err(|_| InstallError::InvalidType)?;
+            for event in ["SessionStart", "UserPromptSubmit"] {
+                if !actual.values.contains_key(&format!("{event}.command")) {
+                    missing_hooks.insert(event.into(), value["hooks"][event].clone());
+                }
+            }
+            if !missing_hooks.is_empty() {
                 let mut extra = toml::Table::new();
-                extra.insert(
-                    "hooks".into(),
-                    toml::Value::Table(toml::Table::from_iter([(
-                        "UserPromptSubmit".into(),
-                        value["hooks"]["UserPromptSubmit"].clone(),
-                    )])),
-                );
+                extra.insert("hooks".into(), toml::Value::Table(missing_hooks));
                 edits.push((
                     actual.end..actual.end,
                     toml::to_string(&extra).map_err(|_| InstallError::InvalidType)?,
@@ -665,11 +678,33 @@ fn previous_tool_wiring(owned: &str) -> Result<String, InstallError> {
         .and_then(|value| value.strip_suffix(OWNED_END))
         .ok_or(InstallError::InvalidType)?;
     let mut value: toml::Value = toml::from_str(body).map_err(|_| InstallError::InvalidType)?;
+    let hooks = value
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or(InstallError::InvalidType)?;
+    hooks
+        .remove("UserPromptSubmit")
+        .ok_or(InstallError::InvalidType)?;
+    hooks
+        .remove("SessionStart")
+        .ok_or(InstallError::InvalidType)?;
+    Ok(format!(
+        "{OWNED_BEGIN}{}{OWNED_END}",
+        toml::to_string(&value).map_err(|_| InstallError::InvalidType)?
+    ))
+}
+
+fn previous_source_wiring(owned: &str) -> Result<String, InstallError> {
+    let body = owned
+        .strip_prefix(OWNED_BEGIN)
+        .and_then(|value| value.strip_suffix(OWNED_END))
+        .ok_or(InstallError::InvalidType)?;
+    let mut value: toml::Value = toml::from_str(body).map_err(|_| InstallError::InvalidType)?;
     value
         .get_mut("hooks")
         .and_then(toml::Value::as_table_mut)
         .ok_or(InstallError::InvalidType)?
-        .remove("UserPromptSubmit")
+        .remove("SessionStart")
         .ok_or(InstallError::InvalidType)?;
     Ok(format!(
         "{OWNED_BEGIN}{}{OWNED_END}",

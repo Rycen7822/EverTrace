@@ -30,9 +30,9 @@ use evertrace_domain::{
 use evertrace_store::{
     BodyStateReason, DurableJob, EventScope, JobBudget, JobStatus, JobTerminalAudit,
     JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
-    MetadataState, SessionAccessDecision, SessionBodyState, SessionImportCurrent,
-    SessionImportCurrentView, SessionImportEvent, SessionImportEventKind, SessionMetadata,
-    SourceKind, WorkspaceResolutionKind, repository::RepositoryCurrentView,
+    MetadataState, ProspectiveSourceOrigin, SessionAccessDecision, SessionBodyState,
+    SessionImportCurrent, SessionImportCurrentView, SessionImportEvent, SessionImportEventKind,
+    SessionMetadata, SourceKind, WorkspaceResolutionKind, repository::RepositoryCurrentView,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -117,6 +117,7 @@ pub struct SessionCatalogService {
 #[derive(Clone, Default)]
 struct CatalogCursor {
     after: Option<String>,
+    live_after: Option<String>,
     round_root: Option<(u64, u64)>,
     recovery: BTreeMap<String, SourceObservation>,
     recovery_after: Option<String>,
@@ -203,6 +204,320 @@ impl SessionCatalogService {
         }
     }
 
+    pub async fn observe_native_session_source(
+        &self,
+        request_id: RequestId,
+        report: &HostProbeReport,
+        session_id: &str,
+        transcript_path: &str,
+        source_reference: &str,
+    ) -> Result<bool, SessionImportServiceError> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let (expected_root, relative) =
+            evertrace_codex::session_import::native_session_path(transcript_path)
+                .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let qualified = qualify_requested_session_root(
+            report,
+            SessionCatalogRootKind::CodexSessions,
+            &expected_root,
+        )
+        .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let catalog = self
+            .writer
+            .session_catalog_current_context()
+            .await
+            .map_err(map_writer)?;
+        let frontier = catalog.frontier;
+        let mut repositories = catalog.repositories;
+        let mut page = CatalogPage {
+            root: ConfinedRoot::open_external_source(qualified.path())
+                .map_err(|_| SessionImportServiceError::Unavailable)?,
+            sessions: Vec::new(),
+            last_scanned: None,
+            has_more: false,
+            unavailable: false,
+            remaining: SessionCatalogBudget {
+                max_entries: 8,
+                max_metadata_bytes: 4 * 1024 * 1024,
+                deadline,
+            },
+        };
+        let relative = relative.to_string_lossy().into_owned();
+        let item = page
+            .probe(&relative, &repositories)
+            .map_err(|_| SessionImportServiceError::Unavailable)?
+            .filter(|candidate| {
+                candidate.session_id == session_id
+                    && Path::new(&candidate.metadata.source_path) == Path::new(&relative)
+            })
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        let old = current_catalog_source(&catalog.sessions, &item).cloned();
+        if let Some(old) = &old {
+            if !matches!(
+                old.body_state,
+                SessionBodyState::NotImported | SessionBodyState::SourceReplaced
+            ) || old.access_decision == Some(SessionAccessDecision::Revoked)
+                || old.metadata.prospective_origin.is_some()
+            {
+                return Ok(false);
+            }
+            let context = self
+                .writer
+                .session_import_context(&old.source_key())
+                .await
+                .map_err(map_writer)?
+                .ok_or(SessionImportServiceError::Corrupt)?;
+            if context.watermark.is_some() || context.recorded_prefix_end.is_some() {
+                return Ok(false);
+            }
+        }
+
+        let mut metadata = item.metadata.clone();
+        let location = workspace_location(&metadata, deadline)
+            .map_err(|_| SessionImportServiceError::Unavailable)?
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        if crate::repository::read_report_path_trust_before(
+            report,
+            location.worktree_path.to_str(),
+            deadline,
+        )
+        .state
+            != RepositoryTrustState::Trusted
+        {
+            return Ok(false);
+        }
+        let occurred_at_us = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
+        let mut payloads = Vec::new();
+        discover_source_repository(
+            &metadata,
+            &item.source_instance_id,
+            RepositoryDiscoveryContext {
+                current: &mut repositories,
+                incomplete_history: &[],
+                occurred_at_us,
+                deadline,
+                payloads: &mut payloads,
+                location: Some(&location),
+                source_reference: Some(source_reference),
+            },
+        )?;
+        let snapshot = payloads.iter().find_map(|payload| match payload {
+            JournalPayload::WorktreeSnapshotRecorded(snapshot)
+                if snapshot.captured_at_us == occurred_at_us
+                    && snapshot
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| reference == source_reference) =>
+            {
+                Some(snapshot.as_ref().clone())
+            }
+            _ => None,
+        });
+        let Some(snapshot) = snapshot else {
+            return Ok(false);
+        };
+        let Some(snapshot_worktree) = repositories
+            .worktrees
+            .get(&snapshot.worktree_instance_id)
+            .filter(|worktree| {
+                worktree.lifecycle == evertrace_domain::repository::WorktreeLifecycle::Active
+                    && worktree.current_path.as_deref() == location.worktree_path.to_str()
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if crate::repository::read_report_path_trust_before(
+            report,
+            location.worktree_path.to_str(),
+            deadline,
+        )
+        .state
+            != RepositoryTrustState::Trusted
+        {
+            return Ok(false);
+        }
+        let expected_source_instance = item.source_instance_id.clone();
+        let final_item = page
+            .probe(&relative, &repositories)
+            .map_err(|_| SessionImportServiceError::Unavailable)?
+            .filter(|candidate| {
+                candidate.session_id == session_id
+                    && candidate.source_instance_id == expected_source_instance
+            })
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        if final_item.source_instance_id != item.source_instance_id
+            || final_item.metadata.source_path != item.metadata.source_path
+        {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+        qualified
+            .revalidate()
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let identity = page
+            .root
+            .probe_regular_file(Path::new(&relative), deadline)
+            .map_err(|_| SessionImportServiceError::Unavailable)?
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        // Do not combine a header/S11 observation with a replacement file's
+        // identity. A transient race may be observed again; it grants nothing.
+        if final_item.metadata.source_revision != item.metadata.source_revision
+            || final_item.metadata.workspace_hint != item.metadata.workspace_hint
+            || final_item.metadata.source_fingerprint
+                != session_source_fingerprint(identity).to_string()
+        {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+        metadata = final_item.metadata;
+        metadata.source_fingerprint = session_source_fingerprint(identity).to_string();
+        metadata.source_revision = session_source_revision(identity)
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        metadata.file_size = identity.size;
+        metadata.file_mtime_us = identity
+            .mtime_seconds
+            .checked_mul(1_000_000)
+            .and_then(|value| {
+                value.checked_add(i64::try_from(identity.mtime_nanoseconds / 1_000).ok()?)
+            })
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        if let Some(old) = &old {
+            reconcile_source_revision(&old.metadata, &mut metadata)
+                .map_err(|_| SessionImportServiceError::Unavailable)?;
+            if metadata.source_revision == old.metadata.source_revision {
+                metadata.workspace_resolution_kind = old.metadata.workspace_resolution_kind;
+                metadata.resolved_repository_instance_id =
+                    old.metadata.resolved_repository_instance_id;
+                metadata.resolved_worktree_instance_id = old.metadata.resolved_worktree_instance_id;
+            }
+        }
+        retain_read_restrictions(
+            &mut metadata,
+            old.as_ref().map(|current| &current.metadata),
+            &repositories,
+            Some(&location),
+        )?;
+        let record_start =
+            prospective_record_start(&page.root, &relative, identity, identity.size, deadline)?;
+        metadata.prospective_origin = Some(ProspectiveSourceOrigin {
+            snapshot_ref: snapshot.worktree_snapshot_id,
+            observed_end: identity.size,
+            record_start,
+            closed: false,
+        });
+        let final_location = workspace_location(&metadata, deadline)
+            .map_err(|_| SessionImportServiceError::Unavailable)?
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        let selected_repository = repositories
+            .repositories
+            .get(&snapshot_worktree.repository_instance_id)
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        if final_location.common_dir_filesystem != location.common_dir_filesystem
+            || final_location.git_dir != location.git_dir
+            || final_location.worktree_path != location.worktree_path
+            || selected_repository.common_dir_filesystem
+                != Some(final_location.common_dir_filesystem)
+            || snapshot_worktree
+                .git_admin_path_history
+                .last()
+                .is_none_or(|path| Path::new(&path.path) != final_location.git_dir)
+            || crate::repository::read_report_path_trust_before(
+                report,
+                final_location.worktree_path.to_str(),
+                deadline,
+            )
+            .state
+                != RepositoryTrustState::Trusted
+        {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+        page.root
+            .revalidate_file(Path::new(&relative), identity)
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        if old.as_ref().is_some_and(|old| old.metadata == metadata) {
+            return Ok(false);
+        }
+        metadata_events(
+            old.as_ref(),
+            item.session_id.clone(),
+            Some(item.source_instance_id.clone()),
+            metadata.clone(),
+            occurred_at_us,
+            &mut payloads,
+        )?;
+        // N is this file's observed EOF: no eligible suffix exists yet.
+        // A later bounded live refresh queues the first complete new record.
+        let command = command(
+            request_id,
+            &item.session_id,
+            occurred_at_us,
+            self.effective_config_hash,
+            SourceKind::System,
+            payloads,
+        )?;
+        self.writer
+            .commit_if_frontier(command, occurred_at_us, frontier)
+            .await
+            .map_err(map_writer)?;
+        Ok(true)
+    }
+
+    pub async fn native_session_source_observed(
+        &self,
+        session_id: &str,
+        transcript_path: &str,
+        report: Option<&HostProbeReport>,
+    ) -> Result<bool, SessionImportServiceError> {
+        let (root, relative) =
+            evertrace_codex::session_import::native_session_path(transcript_path)
+                .map_err(|_| SessionImportServiceError::Unavailable)?;
+        // An immutable origin cannot substitute for the daemon's transient
+        // current namespace evidence after restart or a root change.
+        let Some(report) = report else {
+            return Ok(false);
+        };
+        let qualified = match qualify_requested_session_root(
+            report,
+            SessionCatalogRootKind::CodexSessions,
+            &root,
+        ) {
+            Ok(qualified) => qualified,
+            Err(_) => return Ok(false),
+        };
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        let (thread, rollout) = evertrace_codex::session_import::rollout_ids_from_name(name)
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        if thread != session_id {
+            return Ok(false);
+        }
+        let source_key = format!("session-rollout:{thread}:{rollout}");
+        let Some(context) = self
+            .writer
+            .session_import_context(&source_key)
+            .await
+            .map_err(map_writer)?
+        else {
+            return Ok(false);
+        };
+        qualified
+            .revalidate()
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        // This shortcut establishes no new origin or scope. Check the actual
+        // known header/file against this one source; do not materialize the
+        // complete catalog and repository history on every normal prompt.
+        Ok(context.current.session_id == session_id
+            && Path::new(&context.current.metadata.source_path) == relative
+            && context.current.metadata.prospective_origin.is_some()
+            && source_header_current(
+                report,
+                &context.current,
+                Instant::now() + std::time::Duration::from_millis(250),
+            )
+            .is_some())
+    }
+
     pub async fn refresh(
         &self,
         report: &HostProbeReport,
@@ -250,20 +565,53 @@ impl SessionCatalogService {
         let preflight_deadline = Instant::now() + std::time::Duration::from_millis(250);
         for (source_key, mut item) in updates {
             let old = current.sessions.get(&source_key);
+            if let Some(old) = old
+                && old.metadata.source_revision == item.metadata.source_revision
+            {
+                item.metadata.workspace_resolution_kind = old.metadata.workspace_resolution_kind;
+                item.metadata.resolved_repository_instance_id =
+                    old.metadata.resolved_repository_instance_id;
+                item.metadata.resolved_worktree_instance_id =
+                    old.metadata.resolved_worktree_instance_id;
+                item.metadata.repository_read_restrictions =
+                    old.metadata.repository_read_restrictions.clone();
+                item.metadata.prospective_origin = old.metadata.prospective_origin.clone();
+                if let Some(origin) = item.metadata.prospective_origin.as_mut()
+                    && !origin.closed
+                    && origin.record_start.is_none()
+                {
+                    let identity = page
+                        .root
+                        .probe_regular_file(
+                            Path::new(&item.metadata.source_path),
+                            preflight_deadline,
+                        )
+                        .map_err(|_| SessionImportServiceError::Unavailable)?
+                        .ok_or(SessionImportServiceError::Unavailable)?;
+                    origin.record_start = prospective_record_start(
+                        &page.root,
+                        &item.metadata.source_path,
+                        identity,
+                        origin.observed_end,
+                        preflight_deadline,
+                    )?;
+                }
+            }
             let location = workspace_location(&item.metadata, preflight_deadline)
                 .ok()
                 .flatten();
             discover_source_repository(
                 &item.metadata,
                 &item.source_instance_id,
-                RepositoryDiscoveryView {
+                RepositoryDiscoveryContext {
                     current: &mut repositories,
                     incomplete_history: &[],
+                    occurred_at_us,
+                    deadline: preflight_deadline,
+                    payloads: &mut payloads,
+                    location: location.as_ref(),
+                    source_reference: None,
                 },
-                occurred_at_us,
-                preflight_deadline,
-                &mut payloads,
-                location.as_ref(),
             )?;
             retain_read_restrictions(
                 &mut item.metadata,
@@ -274,7 +622,50 @@ impl SessionCatalogService {
             if old.is_some_and(|old| old.metadata == item.metadata) {
                 continue;
             }
-            metadata_events(
+            let complete_live_append = old.is_some_and(|old| {
+                let Some(origin) = old.metadata.prospective_origin.as_ref() else {
+                    return false;
+                };
+                if origin.closed
+                    || item.metadata.source_revision != old.metadata.source_revision
+                    || item.metadata.file_size <= old.metadata.file_size
+                {
+                    return false;
+                }
+                let Some(start) = item
+                    .metadata
+                    .prospective_origin
+                    .as_ref()
+                    .and_then(|origin| origin.record_start)
+                else {
+                    return false;
+                };
+                let Ok(Some(identity)) = page
+                    .root
+                    .probe_regular_file(Path::new(&item.metadata.source_path), preflight_deadline)
+                else {
+                    return false;
+                };
+                item.metadata.file_size == identity.size
+                    && has_complete_record_after(
+                        &page.root,
+                        &item.metadata.source_path,
+                        identity,
+                        start.max(old.metadata.file_size),
+                        preflight_deadline,
+                    )
+            });
+            let active_job = if let Some(old) = old {
+                self.writer
+                    .session_import_context(&old.source_key())
+                    .await
+                    .map_err(map_writer)?
+                    .and_then(|current| current.job)
+                    .is_some_and(|job| matches!(job.state, JobStatus::Queued | JobStatus::Leased))
+            } else {
+                false
+            };
+            metadata_events_internal(
                 old,
                 item.session_id,
                 old.map_or_else(
@@ -283,6 +674,7 @@ impl SessionCatalogService {
                 ),
                 item.metadata,
                 occurred_at_us,
+                complete_live_append && !active_job,
                 &mut payloads,
             )?;
         }
@@ -338,47 +730,7 @@ impl SessionCatalogService {
                 payloads.push(JournalPayload::JobState(job));
             }
         }
-        let requeued = payloads
-            .iter()
-            .filter_map(|payload| match payload {
-                JournalPayload::SessionImportEventRecorded(event)
-                    if matches!(
-                        event.event,
-                        SessionImportEventKind::BodyStateAdvanced {
-                            body_state: SessionBodyState::Queued,
-                            ..
-                        }
-                    ) =>
-                {
-                    Some((event.source_key(), event.revision))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for (session_id, generation) in requeued {
-            let current = current
-                .sessions
-                .get(&session_id)
-                .ok_or(SessionImportServiceError::Corrupt)?;
-            payloads.push(JournalPayload::JobState(DurableJob {
-                job_id: JobId::new_v7(),
-                idempotency_key: format!("session_import:{session_id}"),
-                target_revision: current.metadata.source_revision.as_str().to_owned(),
-                target_watermark: current.source_event_seq,
-                target_generation: generation,
-                kind: "session_import_v1".into(),
-                algorithm_revision: "session_import_v1".into(),
-                model_id: None,
-                priority: 0,
-                state: JobStatus::Queued,
-                attempt: 1,
-                backoff_until_us: None,
-                config_hash: self.effective_config_hash,
-                budget: session_import_job_budget(),
-                terminal: None,
-                lease_until_us: None,
-            }));
-        }
+        append_queued_import_jobs(&mut payloads, frontier, self.effective_config_hash)?;
         let count = payloads
             .iter()
             .filter(|payload| {
@@ -408,6 +760,244 @@ impl SessionCatalogService {
         } else {
             Ok(count)
         }
+    }
+
+    pub async fn refresh_active(
+        &self,
+        report: &HostProbeReport,
+    ) -> Result<usize, SessionImportServiceError> {
+        let mut cursor = self.cursor.lock().await;
+        let catalog = self
+            .writer
+            .session_catalog_current_context()
+            .await
+            .map_err(map_writer)?;
+        let frontier = catalog.frontier;
+        let root_path = report
+            .session_catalog_roots()
+            .iter()
+            .find(|root| root.root_kind == SessionCatalogRootKind::CodexSessions)
+            .and_then(|root| root.canonical_absolute_path.as_deref())
+            .map(PathBuf::from)
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        let qualified = qualify_requested_session_root(
+            report,
+            SessionCatalogRootKind::CodexSessions,
+            &root_path,
+        )
+        .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(250);
+        let mut page = CatalogPage {
+            root: ConfinedRoot::open_external_source(qualified.path())
+                .map_err(|_| SessionImportServiceError::Unavailable)?,
+            sessions: Vec::new(),
+            last_scanned: None,
+            has_more: false,
+            unavailable: false,
+            remaining: SessionCatalogBudget {
+                max_entries: 4096,
+                max_metadata_bytes: 4 * 1024 * 1024,
+                deadline,
+            },
+        };
+        let eligible = catalog.sessions.sessions.iter().filter(|(_, current)| {
+            current
+                .metadata
+                .prospective_origin
+                .as_ref()
+                .is_some_and(|origin| {
+                    !origin.closed
+                        && matches!(
+                            current.body_state,
+                            SessionBodyState::NotImported
+                                | SessionBodyState::Imported
+                                | SessionBodyState::Partial
+                                | SessionBodyState::SourceReplaced
+                        )
+                        && current.access_decision != Some(SessionAccessDecision::Revoked)
+                })
+        });
+        let live_after = cursor.live_after.clone();
+        let selected = eligible
+            .clone()
+            .filter(|(key, _)| live_after.as_ref().is_none_or(|after| *key > after))
+            .chain(
+                eligible.filter(|(key, _)| live_after.as_ref().is_some_and(|after| *key <= after)),
+            )
+            .take(64)
+            .map(|(key, current)| (key.clone(), current.clone()))
+            .collect::<Vec<_>>();
+        let mut payloads = Vec::new();
+        let occurred_at_us = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
+        for (source_key, old) in selected {
+            if Instant::now() >= deadline {
+                break;
+            }
+            // Selection is not progress: do not skip the unattempted tail
+            // when the shared quantum expires partway through this page.
+            cursor.live_after = Some(source_key.clone());
+            let context = self
+                .writer
+                .session_import_context(&source_key)
+                .await
+                .map_err(map_writer)?;
+            let Some(context) = context else {
+                continue;
+            };
+            if context.repository_purged
+                || context.current != old
+                || context.current.access_decision == Some(SessionAccessDecision::Revoked)
+            {
+                continue;
+            }
+            let Some(mut item) = page
+                .probe(&old.metadata.source_path, &catalog.repositories)
+                .map_err(|_| SessionImportServiceError::Unavailable)?
+            else {
+                continue;
+            };
+            if item.source_instance_id != old.source_instance() {
+                continue;
+            }
+            reconcile_source_revision(&old.metadata, &mut item.metadata)
+                .map_err(|_| SessionImportServiceError::Unavailable)?;
+            let same_revision = old.metadata.source_revision == item.metadata.source_revision;
+            if same_revision {
+                item.metadata.workspace_resolution_kind = old.metadata.workspace_resolution_kind;
+                item.metadata.resolved_repository_instance_id =
+                    old.metadata.resolved_repository_instance_id;
+                item.metadata.resolved_worktree_instance_id =
+                    old.metadata.resolved_worktree_instance_id;
+                item.metadata.repository_read_restrictions =
+                    old.metadata.repository_read_restrictions.clone();
+                item.metadata.prospective_origin = old.metadata.prospective_origin.clone();
+                if let Some(origin) = item.metadata.prospective_origin.as_mut()
+                    && origin.record_start.is_none()
+                {
+                    let identity = page
+                        .root
+                        .probe_regular_file(Path::new(&item.metadata.source_path), deadline)
+                        .map_err(|_| SessionImportServiceError::Unavailable)?
+                        .ok_or(SessionImportServiceError::Unavailable)?;
+                    origin.record_start = prospective_record_start(
+                        &page.root,
+                        &item.metadata.source_path,
+                        identity,
+                        origin.observed_end,
+                        deadline,
+                    )?;
+                }
+            }
+            let origin = old.metadata.prospective_origin.as_ref();
+            let has_complete_append = same_revision
+                && origin.is_some_and(|origin| !origin.closed)
+                && item
+                    .metadata
+                    .prospective_origin
+                    .as_ref()
+                    .and_then(|origin| origin.record_start)
+                    .is_some_and(|start| {
+                        let identity = page
+                            .root
+                            .probe_regular_file(Path::new(&item.metadata.source_path), deadline)
+                            .ok()
+                            .flatten();
+                        identity.is_some_and(|identity| {
+                            let after = start.max(old.metadata.file_size);
+                            identity.size == item.metadata.file_size
+                                && item.metadata.file_size > old.metadata.file_size
+                                && has_complete_record_after(
+                                    &page.root,
+                                    &item.metadata.source_path,
+                                    identity,
+                                    after,
+                                    deadline,
+                                )
+                        })
+                    });
+            if old.metadata == item.metadata && !has_complete_append {
+                continue;
+            }
+            let has_active_job = context
+                .job
+                .as_ref()
+                .is_some_and(|job| matches!(job.state, JobStatus::Queued | JobStatus::Leased));
+            metadata_events_internal(
+                Some(&old),
+                item.session_id,
+                old.source_instance_id.clone(),
+                item.metadata,
+                occurred_at_us,
+                !has_active_job && has_complete_append,
+                &mut payloads,
+            )?;
+        }
+        qualified
+            .revalidate()
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        if payloads.is_empty() {
+            return Ok(0);
+        }
+        append_queued_import_jobs(&mut payloads, frontier, self.effective_config_hash)?;
+        let terminal_sessions = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                JournalPayload::SessionImportEventRecorded(event)
+                    if matches!(
+                        event.event,
+                        SessionImportEventKind::BodyStateAdvanced { .. }
+                    ) =>
+                {
+                    match &event.event {
+                        SessionImportEventKind::BodyStateAdvanced {
+                            body_state: SessionBodyState::SourceReplaced,
+                            ..
+                        } => Some((event.source_key(), JobTerminalReason::SourceReplaced)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (session_id, reason) in terminal_sessions {
+            if let Some(mut job) = self
+                .writer
+                .session_import_context(&session_id)
+                .await
+                .map_err(map_writer)?
+                .and_then(|current| current.job)
+                .filter(|job| matches!(job.state, JobStatus::Queued | JobStatus::Leased))
+            {
+                job.state = JobStatus::Failed;
+                job.lease_until_us = None;
+                job.terminal = Some(Box::new(JobTerminalAudit {
+                    outcome: JobTerminalOutcome::Failed,
+                    reason,
+                    result_ref: Some(format!("session_import:{session_id}")),
+                }));
+                payloads.push(JournalPayload::JobState(job));
+            }
+        }
+        let count = payloads
+            .iter()
+            .filter(|payload| {
+                matches!(payload, JournalPayload::SessionImportEventRecorded(event)
+                    if matches!(event.event, SessionImportEventKind::MetadataObserved { .. }))
+            })
+            .count();
+        let command = command(
+            RequestId::new_v7(),
+            "session_catalog_live_refresh",
+            occurred_at_us,
+            self.effective_config_hash,
+            SourceKind::System,
+            payloads,
+        )?;
+        self.writer
+            .commit_if_frontier(command, occurred_at_us, frontier)
+            .await
+            .map_err(map_writer)?;
+        Ok(count)
     }
 }
 
@@ -499,7 +1089,6 @@ impl SessionImportAdminService {
                         SessionBodyState::Queued
                             | SessionBodyState::Importing
                             | SessionBodyState::Imported
-                            | SessionBodyState::Partial
                     ),
                     SessionImportAdminAction::RevokeAccess => {
                         current.access_decision != Some(SessionAccessDecision::Revoked)
@@ -530,7 +1119,6 @@ impl SessionImportAdminService {
                         SessionBodyState::Queued
                             | SessionBodyState::Importing
                             | SessionBodyState::Imported
-                            | SessionBodyState::Partial
                     ) {
                         continue;
                     }
@@ -607,14 +1195,18 @@ impl SessionImportAdminService {
                 }
                 SessionImportAdminAction::RevokeAccess => {
                     if current.access_decision.is_none() {
-                        let archived = self
-                            .writer
-                            .session_import_context(&current.source_key())
-                            .await
-                            .map_err(map_writer)?
-                            .is_some_and(|context| {
-                                context.watermark.is_some() || context.previous_revision.is_some()
-                            });
+                        let has_prospective_admission =
+                            current.metadata.prospective_origin.is_some();
+                        let archived = has_prospective_admission
+                            || self
+                                .writer
+                                .session_import_context(&current.source_key())
+                                .await
+                                .map_err(map_writer)?
+                                .is_some_and(|context| {
+                                    context.watermark.is_some()
+                                        || context.previous_revision.is_some()
+                                });
                         if !archived {
                             unavailable += 1;
                             continue;
@@ -856,6 +1448,82 @@ impl CatalogPage {
     }
 }
 
+fn prospective_record_start(
+    root: &ConfinedRoot,
+    relative: &str,
+    identity: ConfinedFileIdentity,
+    observed_end: u64,
+    deadline: Instant,
+) -> Result<Option<u64>, SessionImportServiceError> {
+    if observed_end > identity.size {
+        return Err(SessionImportServiceError::Unavailable);
+    }
+    if observed_end == 0 {
+        return Ok(Some(0));
+    }
+    let previous = root
+        .read_range(Path::new(relative), identity, observed_end - 1, 1, deadline)
+        .map_err(|_| SessionImportServiceError::Unavailable)?;
+    if previous.bytes.as_slice() == b"\n" {
+        return Ok(Some(observed_end));
+    }
+    let mut offset = observed_end;
+    let mut remaining = usize::try_from(identity.size.saturating_sub(observed_end))
+        .unwrap_or(usize::MAX)
+        .min(MAX_RECORD_BYTES + 1);
+    while remaining > 0 && Instant::now() < deadline {
+        let count = remaining.min(16 * 1024);
+        let chunk = root
+            .read_range(Path::new(relative), identity, offset, count, deadline)
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        if let Some(index) = chunk.bytes.iter().position(|byte| *byte == b'\n') {
+            return Ok(Some(
+                offset
+                    .checked_add(
+                        u64::try_from(index + 1).map_err(|_| SessionImportServiceError::Corrupt)?,
+                    )
+                    .ok_or(SessionImportServiceError::Corrupt)?,
+            ));
+        }
+        if chunk.bytes.is_empty() {
+            break;
+        }
+        let consumed = chunk.bytes.len();
+        offset = chunk.next_offset;
+        remaining = remaining.saturating_sub(consumed);
+    }
+    Ok(None)
+}
+
+fn has_complete_record_after(
+    root: &ConfinedRoot,
+    relative: &str,
+    identity: ConfinedFileIdentity,
+    start: u64,
+    deadline: Instant,
+) -> bool {
+    let mut offset = start;
+    let mut remaining = usize::try_from(identity.size.saturating_sub(start))
+        .unwrap_or(usize::MAX)
+        .min(MAX_RECORD_BYTES + 1);
+    while remaining > 0 && Instant::now() < deadline {
+        let count = remaining.min(16 * 1024);
+        let Ok(chunk) = root.read_range(Path::new(relative), identity, offset, count, deadline)
+        else {
+            return false;
+        };
+        if chunk.bytes.contains(&b'\n') {
+            return true;
+        }
+        if chunk.bytes.is_empty() {
+            return false;
+        }
+        remaining = remaining.saturating_sub(chunk.bytes.len());
+        offset = chunk.next_offset;
+    }
+    false
+}
+
 fn reconcile_catalog_page(
     page: &mut CatalogPage,
     repositories: &RepositoryCurrentView,
@@ -953,18 +1621,10 @@ fn reconcile_catalog_page(
             let metadata = &mut item.metadata;
             if metadata.workspace_resolution_kind == WorkspaceResolutionKind::Unavailable {
                 *metadata = unavailable_metadata(&old.metadata);
-            } else if metadata.source_fingerprint == old.metadata.source_fingerprint
-                || metadata.file_size > old.metadata.file_size
-                || (metadata.source_path != old.metadata.source_path
-                    && metadata.file_size == old.metadata.file_size)
-            {
-                // A verified relocation retains the logical revision. The body
-                // worker still validates the original protected prefix.
-                metadata.source_revision = old.metadata.source_revision.clone();
             } else {
-                metadata.source_revision =
-                    SourceRevision::parse(metadata.source_fingerprint.clone())
-                        .map_err(|_| SessionCatalogError::Unsupported)?;
+                // A verified relocation/append retains the logical revision.
+                // The body worker still validates the protected prefix.
+                reconcile_source_revision(&old.metadata, metadata)?;
             }
         }
     }
@@ -978,6 +1638,22 @@ fn reconcile_catalog_page(
         cursor.invalidate();
     }
     Ok(updates)
+}
+
+fn reconcile_source_revision(
+    old: &SessionMetadata,
+    candidate: &mut SessionMetadata,
+) -> Result<(), SessionCatalogError> {
+    if candidate.source_fingerprint == old.source_fingerprint
+        || candidate.file_size > old.file_size
+        || (candidate.source_path != old.source_path && candidate.file_size == old.file_size)
+    {
+        candidate.source_revision = old.source_revision.clone();
+    } else {
+        candidate.source_revision = SourceRevision::parse(candidate.source_fingerprint.clone())
+            .map_err(|_| SessionCatalogError::Unsupported)?;
+    }
+    Ok(())
 }
 
 impl CatalogReader<'_> {
@@ -1243,6 +1919,49 @@ fn workspace_registered<'a>(
         })
 }
 
+fn prospective_origin_matches_current_instance<'a>(
+    metadata: &SessionMetadata,
+    location: &crate::repository::WorkspaceGitLocation,
+    repository: impl Fn(
+        &evertrace_domain::ids::RepositoryId,
+    ) -> Option<&'a evertrace_domain::repository::RepositoryInstance>,
+    worktree: impl Fn(
+        &evertrace_domain::ids::WorktreeId,
+    ) -> Option<&'a evertrace_domain::repository::WorktreeInstance>,
+    snapshot: impl Fn(
+        &evertrace_domain::ids::WorktreeSnapshotId,
+    ) -> Option<&'a evertrace_domain::repository::WorktreeSnapshot>,
+    worktrees: impl Iterator<Item = &'a evertrace_domain::repository::WorktreeInstance>,
+) -> Option<bool> {
+    let origin = metadata.prospective_origin.as_ref()?;
+    let snapshot = snapshot(&origin.snapshot_ref)?;
+    let saved_worktree = worktree(&snapshot.worktree_instance_id)?;
+    let saved_repository = repository(&saved_worktree.repository_instance_id)?;
+    if saved_repository.common_dir_filesystem != Some(location.common_dir_filesystem) {
+        return Some(false);
+    }
+    let mut current = worktrees.filter(|worktree| {
+        worktree.lifecycle == evertrace_domain::repository::WorktreeLifecycle::Active
+            && worktree.current_path.as_deref().map(Path::new)
+                == Some(location.worktree_path.as_path())
+            && worktree
+                .git_admin_path_history
+                .last()
+                .is_some_and(|path| Path::new(&path.path) == location.git_dir)
+            && repository(&worktree.repository_instance_id).is_some_and(|repository| {
+                repository.common_dir_filesystem == Some(location.common_dir_filesystem)
+            })
+    });
+    let actual = current.next()?;
+    if current.next().is_some() {
+        return None;
+    }
+    Some(
+        actual.worktree_instance_id == snapshot.worktree_instance_id
+            && actual.repository_instance_id == saved_worktree.repository_instance_id,
+    )
+}
+
 fn repository_trust_path<'a>(
     metadata: &SessionMetadata,
     repository: &'a evertrace_domain::repository::RepositoryInstance,
@@ -1263,24 +1982,30 @@ fn repository_trust_path<'a>(
         .map_or(repository.current_path.as_str(), |path| path.path.as_str())
 }
 
-struct RepositoryDiscoveryView<'a> {
+struct RepositoryDiscoveryContext<'a> {
     current: &'a mut RepositoryCurrentView,
     incomplete_history: &'a [evertrace_domain::ids::RepositoryId],
+    occurred_at_us: i64,
+    deadline: Instant,
+    payloads: &'a mut Vec<JournalPayload>,
+    location: Option<&'a crate::repository::WorkspaceGitLocation>,
+    source_reference: Option<&'a str>,
 }
 
 fn discover_source_repository(
     metadata: &SessionMetadata,
     source: &str,
-    repositories: RepositoryDiscoveryView<'_>,
-    occurred_at_us: i64,
-    deadline: Instant,
-    payloads: &mut Vec<JournalPayload>,
-    location: Option<&crate::repository::WorkspaceGitLocation>,
+    context: RepositoryDiscoveryContext<'_>,
 ) -> Result<(), SessionImportServiceError> {
-    let RepositoryDiscoveryView {
+    let RepositoryDiscoveryContext {
         current: repositories,
         incomplete_history,
-    } = repositories;
+        occurred_at_us,
+        deadline,
+        payloads,
+        location,
+        source_reference,
+    } = context;
     let Some(workspace) = metadata.workspace_hint.as_deref() else {
         return Ok(());
     };
@@ -1288,9 +2013,10 @@ fn discover_source_repository(
         return Ok(());
     };
     if Instant::now() >= deadline
-        || repositories.repositories.values().any(|repository| {
-            workspace_registered(location, repository, repositories.worktrees.values())
-        })
+        || (source_reference.is_none()
+            && repositories.repositories.values().any(|repository| {
+                workspace_registered(location, repository, repositories.worktrees.values())
+            }))
     {
         return Ok(());
     }
@@ -1331,32 +2057,47 @@ fn discover_source_repository(
             incomplete_history.insert(tree.repository_instance_id);
         }
     }
-    let evidence = crate::repository::probe_repository_identity(
-        Path::new(workspace),
-        &[format!("session_import_preflight:{source}")],
-        occurred_at_us,
-        deadline,
-        &heads,
-    )
+    let evidence_refs = source_reference.map_or_else(
+        || vec![format!("session_import_preflight:{source}")],
+        |reference| vec![reference.to_owned()],
+    );
+    let evidence = if source_reference.is_some() {
+        crate::repository::probe_repository(
+            Path::new(workspace),
+            crate::repository::HostTrustDecision::Trusted,
+            &evidence_refs,
+            occurred_at_us,
+            &crate::repository::ProbeLimits::default(),
+            &repositories.known_admin_paths(),
+            &heads,
+        )
+    } else {
+        crate::repository::probe_repository_identity(
+            Path::new(workspace),
+            &evidence_refs,
+            occurred_at_us,
+            deadline,
+            &heads,
+        )
+    }
     .map_err(|_| SessionImportServiceError::Unavailable)?;
     if root.revalidate().is_err()
         || evidence.unavailable_reason.is_some()
         || evidence.common_dir_filesystem != Some(location.common_dir_filesystem)
         || evidence.git_dir.as_deref().map(Path::new) != Some(location.git_dir.as_path())
-        || workspace_location(metadata, deadline)
-            .ok()
-            .flatten()
-            .as_ref()
-            != Some(location)
     {
         return Ok(());
     }
-    let resolution = crate::repository::RepositoryResolveInput {
+    let input = crate::repository::RepositoryResolveInput {
         view: repositories,
         evidence: &evidence,
         derived_from_hint: None,
+    };
+    let resolution = if let Some(reference) = source_reference {
+        crate::repository::resolve_repository_source_start(&input, reference)
+    } else {
+        input.resolve_with_incomplete_history(&incomplete_history)
     }
-    .resolve_with_incomplete_history(&incomplete_history)
     .map_err(|_| SessionImportServiceError::Unavailable)?;
     payloads.extend(resolution.payloads());
     for repository in resolution.repositories {
@@ -1470,10 +2211,54 @@ pub(crate) fn source_ingest_read_allowed(
     if current.metadata.repository_read_restrictions.is_none()
         || current.metadata.metadata_state != MetadataState::Indexed
         || (current.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
-            && current.access_decision != Some(SessionAccessDecision::Approved))
+            && current.access_decision != Some(SessionAccessDecision::Approved)
+            && !current
+                .metadata
+                .prospective_origin
+                .as_ref()
+                .is_some_and(|origin| !origin.closed && origin.record_start.is_some()))
         || !source_read_allowed(report, context, deadline)
     {
         return false;
+    }
+    // Only new automatic future reads require a positively matching current
+    // instance. Unknown evidence defers; it neither grants nor closes origin.
+    // Closed-origin historical reads retain their original permission gate.
+    if current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .is_some_and(|origin| !origin.closed)
+    {
+        let Ok(Some(location)) = workspace_location(&current.metadata, deadline) else {
+            return false;
+        };
+        if prospective_origin_matches_current_instance(
+            &current.metadata,
+            &location,
+            |id| {
+                context
+                    .read_repositories
+                    .iter()
+                    .find(|value| &value.repository_id == id)
+            },
+            |id| {
+                context
+                    .read_worktrees
+                    .iter()
+                    .find(|value| &value.worktree_instance_id == id)
+            },
+            |id| {
+                context
+                    .read_snapshots
+                    .iter()
+                    .find(|value| &value.worktree_snapshot_id == id)
+            },
+            context.read_worktrees.iter(),
+        ) != Some(true)
+        {
+            return false;
+        }
     }
     source_header_current(report, current, deadline).is_some_and(|header| {
         !matches!(header.payload.git, SessionGit::Object(_))
@@ -1607,25 +2392,92 @@ pub(crate) async fn preflight_import_context(
         &repositories,
         location.as_ref(),
     )?;
-    if !needs_discovery && metadata == current.metadata {
+    let has_historical_permission = (current.metadata.workspace_resolution_kind
+        == WorkspaceResolutionKind::Repository
+        || current.access_decision == Some(SessionAccessDecision::Approved))
+        && source_read_allowed(report, context, deadline);
+    let resolve_closed_fence = has_historical_permission
+        && metadata
+            .prospective_origin
+            .as_ref()
+            .is_some_and(|origin| origin.closed && origin.record_start.is_none());
+    if !needs_discovery && metadata == current.metadata && !resolve_closed_fence {
         return Ok(false);
     }
     let header = source_header_current(report, current, deadline)
         .ok_or(SessionImportServiceError::Unavailable)?;
+    if resolve_closed_fence {
+        let root_path = report
+            .session_catalog_roots()
+            .iter()
+            .find(|root| root.root_kind == SessionCatalogRootKind::CodexSessions)
+            .and_then(|root| root.canonical_absolute_path.as_deref())
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        let qualified = qualify_requested_session_root(
+            report,
+            SessionCatalogRootKind::CodexSessions,
+            Path::new(root_path),
+        )
+        .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let source_root = ConfinedRoot::open_external_source(qualified.path())
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let relative = Path::new(&current.metadata.source_path);
+        let identity = source_root
+            .probe_regular_file(relative, deadline)
+            .map_err(|_| SessionImportServiceError::Unavailable)?
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        if session_source_fingerprint(identity).to_string() != current.metadata.source_fingerprint
+            || header.payload.id != current.session_id
+        {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+        let origin = metadata
+            .prospective_origin
+            .as_mut()
+            .ok_or(SessionImportServiceError::Unavailable)?;
+        if let Some(fence) = prospective_record_start(
+            &source_root,
+            current.metadata.source_path.as_str(),
+            identity,
+            origin.observed_end,
+            deadline,
+        )? {
+            source_root
+                .revalidate_file(relative, identity)
+                .map_err(|_| SessionImportServiceError::Unavailable)?;
+            origin.record_start = Some(fence);
+        } else {
+            return Ok(false);
+        }
+    }
     let occurred = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
     let mut payloads = Vec::new();
     discover_source_repository(
         &metadata,
         &current.source_instance(),
-        RepositoryDiscoveryView {
+        RepositoryDiscoveryContext {
             current: &mut repositories,
             incomplete_history: &context.incomplete_repository_history,
+            occurred_at_us: occurred,
+            deadline,
+            payloads: &mut payloads,
+            location: location.as_ref(),
+            source_reference: None,
         },
-        occurred,
-        deadline,
-        &mut payloads,
-        location.as_ref(),
     )?;
+    if let Some(location) = location.as_ref()
+        && prospective_origin_matches_current_instance(
+            &metadata,
+            location,
+            |id| repositories.repositories.get(id),
+            |id| repositories.worktrees.get(id),
+            |id| repositories.snapshots.get(id),
+            repositories.worktrees.values(),
+        ) == Some(false)
+        && let Some(origin) = metadata.prospective_origin.as_mut()
+    {
+        origin.closed = true;
+    }
     retain_read_restrictions(
         &mut metadata,
         Some(&current.metadata),
@@ -2500,6 +3352,26 @@ fn metadata_events(
     occurred_at_us: i64,
     payloads: &mut Vec<JournalPayload>,
 ) -> Result<(), SessionImportServiceError> {
+    metadata_events_internal(
+        old,
+        session_id,
+        source_instance_id,
+        metadata,
+        occurred_at_us,
+        false,
+        payloads,
+    )
+}
+
+fn metadata_events_internal(
+    old: Option<&SessionImportCurrent>,
+    session_id: String,
+    source_instance_id: Option<String>,
+    metadata: SessionMetadata,
+    occurred_at_us: i64,
+    complete_live_append: bool,
+    payloads: &mut Vec<JournalPayload>,
+) -> Result<(), SessionImportServiceError> {
     let mut revision = old.map_or(0, |value| value.revision);
     if let Some(old) = old {
         let source_changed = old.metadata.source_revision != metadata.source_revision
@@ -2523,6 +3395,10 @@ fn metadata_events(
         } else if scope_unavailable
             && (metadata.repository_read_restrictions.is_none()
                 || old.access_decision != Some(SessionAccessDecision::Approved))
+            && !metadata
+                .prospective_origin
+                .as_ref()
+                .is_some_and(|origin| origin.record_start.is_some())
             && !matches!(
                 old.body_state,
                 SessionBodyState::NotImported
@@ -2555,7 +3431,20 @@ fn metadata_events(
     let append_arrived = old.is_some_and(|old| {
         old.metadata.source_revision == metadata.source_revision
             && metadata.file_size > old.metadata.file_size
-            && old.body_state == SessionBodyState::Imported
+            && match old.metadata.prospective_origin.as_ref() {
+                Some(origin) if origin.closed => false,
+                Some(_) => {
+                    complete_live_append
+                        && matches!(
+                            old.body_state,
+                            SessionBodyState::NotImported
+                                | SessionBodyState::Partial
+                                | SessionBodyState::Imported
+                                | SessionBodyState::SourceReplaced
+                        )
+                }
+                None => old.body_state == SessionBodyState::Imported,
+            }
     });
     revision += 1;
     payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
@@ -2585,6 +3474,81 @@ fn metadata_events(
                 },
             },
         )));
+    }
+    Ok(())
+}
+
+fn append_queued_import_jobs(
+    payloads: &mut Vec<JournalPayload>,
+    frontier: u64,
+    config_hash: [u8; 32],
+) -> Result<(), SessionImportServiceError> {
+    let mut queued = Vec::new();
+    for (queued_index, payload) in payloads.iter().enumerate() {
+        let JournalPayload::SessionImportEventRecorded(event) = payload else {
+            continue;
+        };
+        if !matches!(
+            event.event,
+            SessionImportEventKind::BodyStateAdvanced {
+                body_state: SessionBodyState::Queued,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let source_key = event.source_key();
+        let metadata = payloads
+            .iter()
+            .take(queued_index)
+            .rev()
+            .find_map(|previous| match previous {
+                JournalPayload::SessionImportEventRecorded(previous)
+                    if previous.source_key() == source_key =>
+                {
+                    match &previous.event {
+                        SessionImportEventKind::MetadataObserved { metadata } => {
+                            Some(metadata.as_ref().clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .ok_or(SessionImportServiceError::Corrupt)?;
+        let event_offset = u64::try_from(queued_index)
+            .map_err(|_| SessionImportServiceError::Corrupt)?
+            .checked_add(1)
+            .ok_or(SessionImportServiceError::Corrupt)?;
+        let target_watermark = frontier
+            .checked_add(event_offset)
+            .ok_or(SessionImportServiceError::Corrupt)?;
+        queued.push((
+            source_key,
+            event.revision,
+            metadata.source_revision.as_str().to_owned(),
+            target_watermark,
+        ));
+    }
+    for (source_key, generation, target_revision, target_watermark) in queued {
+        payloads.push(JournalPayload::JobState(DurableJob {
+            job_id: JobId::new_v7(),
+            idempotency_key: format!("session_import:{source_key}"),
+            target_revision,
+            target_watermark,
+            target_generation: generation,
+            kind: "session_import_v1".into(),
+            algorithm_revision: "session_import_v1".into(),
+            model_id: None,
+            priority: 0,
+            state: JobStatus::Queued,
+            attempt: 1,
+            backoff_until_us: None,
+            config_hash,
+            budget: session_import_job_budget(),
+            terminal: None,
+            lease_until_us: None,
+        }));
     }
     Ok(())
 }
@@ -2658,6 +3622,84 @@ mod tests {
         task.shutdown_and_join().await.unwrap();
         drop(writer);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn closed_prospective_origin_never_auto_queues_an_imported_session_append() {
+        let source = "session-rollout:019d0000-0000-7000-8000-000000000001:019d0000-0000-7000-8000-000000000001";
+        let origin = ProspectiveSourceOrigin {
+            snapshot_ref: evertrace_domain::ids::WorktreeSnapshotId::new_v7(),
+            observed_end: 100,
+            record_start: Some(100),
+            closed: true,
+        };
+        let metadata = SessionMetadata {
+            source_path: "2026/10/06/rollout-2026-10-06T00-00-00-session.jsonl".into(),
+            source_format: SOURCE_FORMAT.into(),
+            started_at_us: None,
+            ended_at_us: None,
+            host: None,
+            model_profile: None,
+            workspace_hint: None,
+            repository_hint: None,
+            worktree_hint: None,
+            workspace_resolution_kind: WorkspaceResolutionKind::Ambiguous,
+            resolved_repository_instance_id: None,
+            resolved_worktree_instance_id: None,
+            repository_read_restrictions: Some(Vec::new()),
+            prospective_origin: Some(origin),
+            file_size: 100,
+            file_mtime_us: 1,
+            source_fingerprint: "fingerprint-before-append".into(),
+            source_revision: SourceRevision::parse("same-logical-revision").unwrap(),
+            parser_version: 1,
+            metadata_state: MetadataState::Indexed,
+        };
+        let old = SessionImportCurrent {
+            session_id: "019d0000-0000-7000-8000-000000000001".into(),
+            source_instance_id: Some(source.into()),
+            revision: 1,
+            metadata: metadata.clone(),
+            access_decision: Some(SessionAccessDecision::Approved),
+            body_state: SessionBodyState::Imported,
+            source_event_seq: 1,
+        };
+        let mut appended = metadata;
+        appended.file_size = 200;
+        appended.file_mtime_us = 2;
+        appended.source_fingerprint = "fingerprint-after-append".into();
+        let mut payloads = Vec::new();
+        metadata_events_internal(
+            Some(&old),
+            old.session_id.clone(),
+            old.source_instance_id.clone(),
+            appended,
+            2,
+            true,
+            &mut payloads,
+        )
+        .unwrap();
+        assert!(!payloads.iter().any(|payload| matches!(
+            payload,
+            JournalPayload::SessionImportEventRecorded(event)
+                if matches!(event.event, SessionImportEventKind::BodyStateAdvanced {
+                    body_state: SessionBodyState::Queued,
+                    ..
+                })
+        )));
+        append_queued_import_jobs(&mut payloads, 0, [0; 32]).unwrap();
+        assert!(
+            !payloads
+                .iter()
+                .any(|payload| matches!(payload, JournalPayload::JobState(_)))
+        );
+        assert!(payloads.iter().any(|payload| matches!(
+            payload,
+            JournalPayload::SessionImportEventRecorded(event)
+                if matches!(&event.event, SessionImportEventKind::MetadataObserved { metadata }
+                    if metadata.prospective_origin.as_ref().is_some_and(|origin|
+                        origin.closed && origin.record_start == Some(100)))
+        )));
     }
 
     #[test]

@@ -29,7 +29,8 @@ use evertrace_store::{
     BodyStateReason, DurableJob, EventScope, JobLease, JobStatus, JobTerminalAudit,
     JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
     SessionBodyState, SessionImportContext, SessionImportCurrent, SessionImportEvent,
-    SessionImportEventKind, SessionImportPrefixRecord, SessionImportPrefixRequest, SourceKind,
+    SessionImportEventKind, SessionImportPrefixRecord, SessionImportPrefixRequest,
+    SourceIngestWatermark, SourceKind,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -59,6 +60,13 @@ pub struct SessionImportProgress {
     pub completed: bool,
 }
 
+struct ImportHandoffTarget {
+    watermark: Option<SourceIngestWatermark>,
+    body_state: SessionBodyState,
+    reason: BodyStateReason,
+    synced_frontier: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SessionImportError {
     #[error("session import authority is unavailable")]
@@ -84,6 +92,8 @@ pub struct SessionImportWorker {
     config: Option<Arc<crate::ConfigReloadService>>,
     #[cfg(test)]
     claim_delay: Duration,
+    #[cfg(test)]
+    terminal_handoff_pause: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[derive(Clone)]
@@ -99,10 +109,71 @@ struct VerifiedPrefix {
     identity: ConfinedFileIdentity,
     protection_key: DeviceKey,
     config_hash: [u8; 32],
+    main: Option<VerifiedRangeProof>,
+    earlier: Option<VerifiedRangeProof>,
+    next_body: ImportRangeKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedRangeProof {
+    chain_start: u64,
     target_end: u64,
     target_digest: String,
     end: u64,
     digest: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImportRangeKind {
+    Whole,
+    HistoricalPrefix,
+    ProspectiveSuffix,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProofLeg {
+    Main,
+    Earlier,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImportRange {
+    kind: ImportRangeKind,
+    start: u64,
+    end: u64,
+    chain_start: u64,
+    committed_end: u64,
+    committed_digest: Option<String>,
+}
+
+fn proof_leg(kind: ImportRangeKind) -> ProofLeg {
+    if kind == ImportRangeKind::HistoricalPrefix {
+        ProofLeg::Earlier
+    } else {
+        ProofLeg::Main
+    }
+}
+
+fn verified_leg(slot: &VerifiedPrefix, leg: ProofLeg) -> &Option<VerifiedRangeProof> {
+    match leg {
+        ProofLeg::Main => &slot.main,
+        ProofLeg::Earlier => &slot.earlier,
+    }
+}
+
+fn verified_leg_mut(slot: &mut VerifiedPrefix, leg: ProofLeg) -> &mut Option<VerifiedRangeProof> {
+    match leg {
+        ProofLeg::Main => &mut slot.main,
+        ProofLeg::Earlier => &mut slot.earlier,
+    }
+}
+
+fn default_body_turn(current: &SessionImportCurrent) -> ImportRangeKind {
+    if current.metadata.prospective_origin.is_some() {
+        ImportRangeKind::HistoricalPrefix
+    } else {
+        ImportRangeKind::Whole
+    }
 }
 
 impl SessionImportWorker {
@@ -137,6 +208,8 @@ impl SessionImportWorker {
             verified_prefix: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             claim_delay: Duration::ZERO,
+            #[cfg(test)]
+            terminal_handoff_pause: None,
             next_session: Arc::new(Mutex::new(None)),
             operation_config: None,
             config: None,
@@ -195,6 +268,16 @@ impl SessionImportWorker {
                 completed: false,
             });
         }
+        let proofs = required_import_proofs(&context)?;
+        let pending_ranges = import_ranges(&context)?;
+        let terminal = finished_import_state(&context)?;
+        if proofs.is_empty() && pending_ranges.is_empty() && terminal.is_none() {
+            return Ok(SessionImportProgress {
+                records: 0,
+                bytes: 0,
+                completed: false,
+            });
+        }
         let (root, relative, identity) = match self.authorized_source(
             &report,
             &context,
@@ -218,26 +301,114 @@ impl SessionImportWorker {
         let key = DeviceKeyStore::new(self.runtime.device_key_dir.clone())
             .load()
             .map_err(|_| SessionImportError::Persistence)?;
-        let (ready, prefix_bytes) = match self
-            .verify_confirmed_prefix(&context, (&root, &relative, identity), &key, budget)
-            .await
-        {
-            Ok(value) => value,
-            Err(SessionImportError::Changed) => {
-                self.mark_source_replaced(current, identity).await?;
-                return Err(SessionImportError::Changed);
+        for proof in &proofs {
+            let (ready, proof_bytes) = match self
+                .verify_confirmed_range(&context, (&root, &relative, identity), &key, budget, proof)
+                .await
+            {
+                Ok(value) => value,
+                Err(SessionImportError::Changed) => {
+                    self.mark_source_replaced(current, identity).await?;
+                    return Err(SessionImportError::Changed);
+                }
+                Err(error) => return Err(error),
+            };
+            // One proof page is one read-only quantum, even if it finishes the
+            // selected leg. The next call continues with the other saved leg.
+            if !ready || proof_bytes != 0 {
+                return Ok(SessionImportProgress {
+                    records: 0,
+                    bytes: proof_bytes,
+                    completed: false,
+                });
             }
-            Err(error) => return Err(error),
+        }
+        let import_range = if pending_ranges.is_empty() {
+            None
+        } else {
+            Some(
+                self.choose_import_range(&context, identity, &key, &pending_ranges)
+                    .await?,
+            )
         };
-        // A prefix page is its own read-only quantum: no body, watermark or
-        // empty lease is produced, even when this page finishes the proof.
-        if !ready || prefix_bytes != 0 {
+        let Some(import_range) = import_range else {
+            let Some((body_state, reason)) = terminal else {
+                return Ok(SessionImportProgress {
+                    records: 0,
+                    bytes: 0,
+                    completed: false,
+                });
+            };
+            // An already-terminal job is never handed off twice.
+            if context
+                .job
+                .as_ref()
+                .is_none_or(|job| matches!(job.state, JobStatus::Succeeded | JobStatus::Failed))
+            {
+                return Ok(SessionImportProgress {
+                    records: 0,
+                    bytes: 0,
+                    completed: true,
+                });
+            }
+            let fresh = self.context(session_id).await?;
+            let fresh_report = self
+                .report
+                .read()
+                .await
+                .clone()
+                .ok_or(SessionImportError::Unavailable)?;
+            let (fresh_root, fresh_relative, fresh_identity) = self.authorized_source(
+                &fresh_report,
+                &fresh,
+                Instant::now() + SESSION_ROOT_PROBE_BUDGET,
+            )?;
+            let fresh_key = DeviceKeyStore::new(self.runtime.device_key_dir.clone())
+                .load()
+                .map_err(|_| SessionImportError::Persistence)?;
+            if fresh.current.metadata != current.metadata
+                || fresh.watermark != context.watermark
+                || fresh_identity != identity
+                || fresh_key != key
+                || !import_ranges(&fresh)?.is_empty()
+                || finished_import_state(&fresh)? != Some((body_state, reason))
+            {
+                return Err(SessionImportError::Budget);
+            }
+            let lease = self.claim_job(&fresh).await?;
+            if matches!(
+                fresh.current.body_state,
+                SessionBodyState::Queued | SessionBodyState::Partial
+            ) {
+                self.advance(
+                    &fresh.current,
+                    SessionBodyState::Importing,
+                    BodyStateReason::Started,
+                )
+                .await?;
+            }
+            self.finish_import_handoff(
+                &fresh.current,
+                (&fresh_relative, fresh_identity),
+                ImportHandoffTarget {
+                    watermark: fresh.watermark.clone(),
+                    body_state,
+                    reason,
+                    synced_frontier: None,
+                },
+                self.writer.subscribe_background_frontier(),
+                &lease,
+            )
+            .await?;
+            fresh_root
+                .revalidate_file(&fresh_relative, fresh_identity)
+                .map_err(map_source_read)?;
             return Ok(SessionImportProgress {
                 records: 0,
-                bytes: prefix_bytes,
-                completed: false,
+                bytes: 0,
+                completed: true,
             });
-        }
+        };
         // No report/cache lock crosses a quantum. Re-read all mutable authority
         // and the exact claim frontier after the read-only proof.
         let fresh = self.context(session_id).await?;
@@ -252,20 +423,27 @@ impl SessionImportWorker {
         let fresh_key = DeviceKeyStore::new(self.runtime.device_key_dir.clone())
             .load()
             .map_err(|_| SessionImportError::Persistence)?;
+        let fresh_pending = import_ranges(&fresh)?;
+        let fresh_range = if fresh_pending.is_empty() {
+            None
+        } else {
+            Some(
+                self.choose_import_range(&fresh, fresh_identity, &fresh_key, &fresh_pending)
+                    .await?,
+            )
+        };
         if fresh.current.metadata != current.metadata
             || fresh.watermark != context.watermark
             || fresh_identity != identity
             || fresh_key != key
+            || fresh_range.as_ref() != Some(&import_range)
         {
             self.verified_prefix.lock().await.remove(session_id);
             return Err(SessionImportError::Budget);
         }
         let lease = self.claim_job(&fresh).await?;
         let current = &fresh.current;
-        let offset = fresh
-            .watermark
-            .as_ref()
-            .map_or(0, |value| value.source_sequence);
+        let offset = import_range.start;
         let previous_revision = fresh.previous_revision.clone();
         if matches!(
             current.body_state,
@@ -297,7 +475,20 @@ impl SessionImportWorker {
         let mut observations = Vec::new();
         let mut eof = false;
         let deadline = Instant::now() + budget.max_work_time;
-        while consumed < budget.max_bytes && observations.len() < budget.max_records {
+        // The body turn is consumed only after the fresh claim succeeds and
+        // immediately before the first source-body read attempt.
+        self.consume_body_turn(
+            &fresh,
+            fresh_identity,
+            &fresh_key,
+            import_range.kind,
+            &fresh_pending,
+        )
+        .await;
+        while consumed < budget.max_bytes
+            && observations.len() < budget.max_records
+            && cursor < import_range.end
+        {
             if Instant::now() >= deadline {
                 break;
             }
@@ -307,7 +498,10 @@ impl SessionImportWorker {
                     &relative,
                     identity,
                     cursor,
-                    CHUNK_BYTES.min(remaining),
+                    CHUNK_BYTES.min(remaining).min(
+                        usize::try_from(import_range.end - cursor)
+                            .map_err(|_| SessionImportError::Budget)?,
+                    ),
                     deadline,
                 )
                 .map_err(map_source_read)?;
@@ -374,23 +568,34 @@ impl SessionImportWorker {
                     used = end + 1;
                     continue;
                 }
-                let mode = if offset == 0 && observations.is_empty() && previous_revision.is_some()
+                let mode = if fresh.watermark.is_none()
+                    && observations.is_empty()
+                    && previous_revision.is_some()
                 {
                     SourceRevisionMode::Replacement
                 } else {
                     SourceRevisionMode::Append
                 };
+                let byte_range = EvidenceByteRange {
+                    start: line_start,
+                    end: line_end,
+                };
+                let (repository_instance_id, worktree_instance_id) =
+                    import_scope_for_range(&fresh, &byte_range)?;
+                let mut input = capture_input(
+                    current,
+                    line,
+                    line_start,
+                    line_end,
+                    mode,
+                    previous_revision.as_ref(),
+                    visibility,
+                );
+                input.repository_instance_id = repository_instance_id;
+                input.worktree_instance_id = worktree_instance_id;
                 let outcome = CaptureRuntime::open(self.runtime.clone())
                     .map_err(|_| SessionImportError::Persistence)?
-                    .capture(capture_input(
-                        current,
-                        line,
-                        line_start,
-                        line_end,
-                        mode,
-                        previous_revision.as_ref(),
-                        visibility,
-                    ))
+                    .capture(input)
                     .map_err(|_| SessionImportError::Persistence)?;
                 if !matches!(outcome, CaptureOutcome::Durable { .. }) {
                     return Err(SessionImportError::Persistence);
@@ -405,26 +610,44 @@ impl SessionImportWorker {
             pending_start = pending_start
                 .checked_add(u64::try_from(used).map_err(|_| SessionImportError::Budget)?)
                 .ok_or(SessionImportError::Budget)?;
-            eof = chunk.eof;
+            if chunk.eof && cursor < import_range.end {
+                return Err(SessionImportError::Changed);
+            }
+            eof = cursor == import_range.end;
             if eof || observations.len() == budget.max_records {
                 break;
             }
         }
         if observations.is_empty() {
             if eof && pending.is_empty() {
-                self.finish_import_handoff(
-                    current,
-                    (&relative, identity),
-                    offset,
-                    None,
-                    self.writer.subscribe_background_frontier(),
-                    &lease,
-                )
-                .await?;
+                let confirmed = self.context(session_id).await?;
+                let terminal = finished_import_state(&confirmed)?;
+                if let Some((body_state, reason)) = terminal {
+                    self.finish_import_handoff(
+                        current,
+                        (&relative, identity),
+                        ImportHandoffTarget {
+                            watermark: confirmed.watermark.clone(),
+                            body_state,
+                            reason,
+                            synced_frontier: None,
+                        },
+                        self.writer.subscribe_background_frontier(),
+                        &lease,
+                    )
+                    .await?;
+                } else {
+                    self.advance(
+                        &confirmed.current,
+                        SessionBodyState::Partial,
+                        BodyStateReason::BudgetExhausted,
+                    )
+                    .await?;
+                }
                 return Ok(SessionImportProgress {
                     records: 0,
                     bytes: consumed,
-                    completed: true,
+                    completed: terminal.is_some(),
                 });
             }
             return Err(SessionImportError::Budget);
@@ -434,30 +657,42 @@ impl SessionImportWorker {
             .drain_observations_once(&observations)
             .await
             .map_err(|_| SessionImportError::Persistence)?;
-        let completed = eof && pending.is_empty();
-        if completed {
+        let confirmed = self.context(session_id).await?;
+        let (confirmed_end, confirmed_digest) = imported_range_progress(&confirmed, &import_range)?;
+        if confirmed_end != pending_start || confirmed_digest.is_none() {
+            return Err(SessionImportError::Persistence);
+        }
+        root.revalidate_file(&relative, identity)
+            .map_err(map_source_read)?;
+        #[cfg(test)]
+        if eof
+            && pending.is_empty()
+            && finished_import_state(&confirmed)?.is_some()
+            && let Some(pause) = self.terminal_handoff_pause.as_ref()
+        {
+            pause.notify_one();
+            std::future::pending::<()>().await;
+        }
+        let terminal = if eof && pending.is_empty() {
+            finished_import_state(&confirmed)?
+        } else {
+            None
+        };
+        if let Some((body_state, reason)) = terminal {
             self.finish_import_handoff(
                 current,
                 (&relative, identity),
-                pending_start,
-                progress.synced_frontier,
+                ImportHandoffTarget {
+                    watermark: confirmed.watermark.clone(),
+                    body_state,
+                    reason,
+                    synced_frontier: progress.synced_frontier,
+                },
                 background,
                 &lease,
             )
             .await?;
         } else {
-            let confirmed = self.context(session_id).await?;
-            let watermark = confirmed
-                .watermark
-                .as_ref()
-                .filter(|watermark| watermark.source_sequence == pending_start)
-                .ok_or(SessionImportError::Persistence)?;
-            let confirmed_digest = watermark
-                .confirmed_prefix_digest
-                .clone()
-                .ok_or(SessionImportError::Persistence)?;
-            root.revalidate_file(&relative, identity)
-                .map_err(map_source_read)?;
             self.advance(
                 &confirmed.current,
                 SessionBodyState::Partial,
@@ -466,23 +701,20 @@ impl SessionImportWorker {
             .await?;
             root.revalidate_file(&relative, identity)
                 .map_err(map_source_read)?;
-            self.remember_prefix(VerifiedPrefix {
-                source_key: current.source_key(),
-                source_revision: current.metadata.source_revision.clone(),
+            self.remember_committed_range(
+                &confirmed,
                 identity,
-                protection_key: key,
-                config_hash: self.runtime.effective_config_hash,
-                target_end: pending_start,
-                target_digest: confirmed_digest.clone(),
-                end: pending_start,
-                digest: Some(confirmed_digest),
-            })
+                &key,
+                &import_range,
+                confirmed_end,
+                confirmed_digest,
+            )
             .await;
         }
         Ok(SessionImportProgress {
             records: observations.len(),
             bytes: consumed,
-            completed,
+            completed: terminal.is_some(),
         })
     }
 
@@ -562,7 +794,7 @@ impl SessionImportWorker {
     fn handoff_target_ready(
         context: &SessionImportContext,
         expected: &SessionImportCurrent,
-        target_end: u64,
+        target_watermark: &Option<SourceIngestWatermark>,
         lease: &ClaimedImportLease,
     ) -> Result<bool, SessionImportError> {
         let current = &context.current;
@@ -592,32 +824,20 @@ impl SessionImportWorker {
         if Instant::now() >= lease.deadline || now_us()? >= lease.lease.lease_until_us {
             return Err(SessionImportError::Budget);
         }
-        match context.watermark.as_ref() {
-            Some(watermark) => {
-                if watermark.source_instance_id.as_str() != current.source_instance()
-                    || watermark.source_revision != current.metadata.source_revision
-                    || watermark.source_sequence > target_end
-                {
-                    return Err(SessionImportError::Changed);
-                }
-                if watermark.source_sequence < target_end {
-                    return Ok(false);
-                }
-                if target_end != 0 && watermark.confirmed_prefix_digest.is_none() {
-                    return Err(SessionImportError::Persistence);
-                }
-                Ok(true)
-            }
-            None => Ok(target_end == 0),
+        if let Some(watermark) = &context.watermark
+            && (watermark.source_instance_id.as_str() != current.source_instance()
+                || watermark.source_revision != current.metadata.source_revision)
+        {
+            return Err(SessionImportError::Changed);
         }
+        Ok(&context.watermark == target_watermark)
     }
 
     async fn finish_import_handoff(
         &self,
         expected: &SessionImportCurrent,
         source: (&std::path::Path, ConfinedFileIdentity),
-        target_end: u64,
-        synced_frontier: Option<u64>,
+        target: ImportHandoffTarget,
         mut background: tokio::sync::watch::Receiver<u64>,
         lease: &ClaimedImportLease,
     ) -> Result<(), SessionImportError> {
@@ -626,7 +846,8 @@ impl SessionImportWorker {
         let (frontier, watermark) = loop {
             let _ = *background.borrow_and_update();
             let context = self.context(&expected.source_key()).await?;
-            if Self::handoff_target_ready(&context, expected, target_end, lease)? {
+            let ready = Self::handoff_target_ready(&context, expected, &target.watermark, lease)?;
+            if ready {
                 break (context.frontier, context.watermark);
             }
             tokio::time::timeout_at(
@@ -637,8 +858,10 @@ impl SessionImportWorker {
             .map_err(|_| SessionImportError::Budget)?
             .map_err(|_| SessionImportError::Unavailable)?;
         };
-
-        if synced_frontier.is_none_or(|synced| synced < frontier) {
+        if target
+            .synced_frontier
+            .is_none_or(|synced| synced < frontier)
+        {
             if Instant::now() >= lease.deadline {
                 return Err(SessionImportError::Budget);
             }
@@ -658,7 +881,7 @@ impl SessionImportWorker {
             .clone()
             .ok_or(SessionImportError::Unavailable)?;
         let checked = self.context(&expected.source_key()).await?;
-        if !Self::handoff_target_ready(&checked, expected, target_end, lease)?
+        if !Self::handoff_target_ready(&checked, expected, &target.watermark, lease)?
             || checked.watermark != watermark
         {
             return Err(SessionImportError::Changed);
@@ -682,8 +905,8 @@ impl SessionImportWorker {
         let command = self.body_state_command(
             &checked.current,
             checked.job,
-            SessionBodyState::Imported,
-            BodyStateReason::Completed,
+            target.body_state,
+            target.reason,
             occurred_at_us,
         )?;
         if Instant::now() >= lease.deadline || occurred_at_us >= lease.lease.lease_until_us {
@@ -702,57 +925,61 @@ impl SessionImportWorker {
         Ok(())
     }
 
-    async fn verify_confirmed_prefix(
+    async fn verify_confirmed_range(
         &self,
         context: &SessionImportContext,
         source: (&ConfinedRoot, &std::path::Path, ConfinedFileIdentity),
         key: &DeviceKey,
         budget: SessionImportBudget,
+        range: &ImportRange,
     ) -> Result<(bool, usize), SessionImportError> {
         let current = &context.current;
         let (root, relative, identity) = source;
-        let end = context
-            .watermark
-            .as_ref()
-            .map_or(0, |value| value.source_sequence);
-        if end == 0 {
-            if context.recorded_prefix_end.is_some_and(|value| value != 0) {
+        let end = range.committed_end;
+        if end < range.chain_start || end > range.end {
+            return Err(SessionImportError::Changed);
+        }
+        if end == range.chain_start {
+            if range.committed_digest.is_some() {
                 return Err(SessionImportError::Changed);
             }
             return Ok((true, 0));
         }
-        let target_digest = context
-            .watermark
-            .as_ref()
-            .and_then(|value| value.confirmed_prefix_digest.clone())
+        let target_digest = range
+            .committed_digest
+            .clone()
             .ok_or(SessionImportError::Changed)?;
-        let mut cached = self
-            .verified_prefix
-            .lock()
-            .await
-            .get(&current.source_key())
-            .cloned()
-            .filter(|cached| {
-                cached.source_revision == current.metadata.source_revision
-                    && cached.identity == identity
-                    && &cached.protection_key == key
-                    && cached.config_hash == self.runtime.effective_config_hash
-                    && cached.target_end <= end
-                    && (cached.target_end != end || cached.target_digest == target_digest)
-            })
-            .unwrap_or_else(|| VerifiedPrefix {
-                source_key: current.source_key(),
-                source_revision: current.metadata.source_revision.clone(),
-                identity,
-                protection_key: key.clone(),
-                config_hash: self.runtime.effective_config_hash,
+        let source_key = current.source_key();
+        let slot = self.verified_slot(current, identity, key).await?;
+        let leg = proof_leg(range.kind);
+        let mut proof = verified_leg(&slot, leg).clone();
+        if proof
+            .as_ref()
+            .is_some_and(|proof| proof.chain_start != range.chain_start)
+        {
+            self.clear_verified_leg(current, identity, key, leg).await;
+            proof = None;
+        }
+        let mut cached = match proof {
+            Some(mut proof) => {
+                if proof.target_end > end {
+                    return Err(SessionImportError::Budget);
+                }
+                if proof.target_end == end && proof.target_digest != target_digest {
+                    return Err(SessionImportError::Changed);
+                }
+                proof.target_end = end;
+                proof.target_digest = target_digest;
+                proof
+            }
+            None => VerifiedRangeProof {
+                chain_start: range.chain_start,
                 target_end: end,
-                target_digest: target_digest.clone(),
-                end: 0,
+                target_digest,
+                end: range.chain_start,
                 digest: None,
-            });
-        cached.target_end = end;
-        cached.target_digest = target_digest;
+            },
+        };
         if cached.end == end {
             return if cached.digest.as_ref() == Some(&cached.target_digest) {
                 Ok((true, 0))
@@ -760,16 +987,13 @@ impl SessionImportWorker {
                 Err(SessionImportError::Changed)
             };
         }
-        if !self.reserve_prefix_slot(&cached.source_key).await? {
-            return Err(SessionImportError::Budget);
-        }
         // Actor queue time is preparation, not file work. The returned page is
         // bounded by the same item/byte caps as this single reading quantum.
         let page = self
             .writer
             .session_import_prefix_page(SessionImportPrefixRequest {
-                source: cached.source_key.clone(),
-                revision: cached.source_revision.clone(),
+                source: source_key.clone(),
+                revision: current.metadata.source_revision.clone(),
                 after: cached.end,
                 end,
                 max_records: budget.max_records,
@@ -837,8 +1061,182 @@ impl SessionImportWorker {
             return Err(SessionImportError::Changed);
         }
         let ready = cached.end == end;
-        self.remember_prefix(cached).await;
+        let accepted = self
+            .merge_verified_leg(current, identity, key, leg, cached)
+            .await;
+        if !accepted {
+            return Ok((false, bytes));
+        }
         Ok((ready, bytes))
+    }
+
+    async fn verified_slot(
+        &self,
+        current: &SessionImportCurrent,
+        identity: ConfinedFileIdentity,
+        key: &DeviceKey,
+    ) -> Result<VerifiedPrefix, SessionImportError> {
+        let source_key = current.source_key();
+        if let Some(slot) = self.verified_prefix.lock().await.get(&source_key).cloned()
+            && slot.source_revision == current.metadata.source_revision
+            && slot.identity == identity
+            && slot.protection_key == *key
+            && slot.config_hash == self.runtime.effective_config_hash
+        {
+            return Ok(slot);
+        }
+        if !self.reserve_prefix_slot(&source_key).await? {
+            return Err(SessionImportError::Budget);
+        }
+        let mut cache = self.verified_prefix.lock().await;
+        if let Some(slot) = cache.get(&source_key)
+            && slot.source_revision == current.metadata.source_revision
+            && slot.identity == identity
+            && slot.protection_key == *key
+            && slot.config_hash == self.runtime.effective_config_hash
+        {
+            return Ok(slot.clone());
+        }
+        let next_body = cache
+            .get(&source_key)
+            .filter(|slot| slot.source_revision == current.metadata.source_revision)
+            .map_or_else(|| default_body_turn(current), |slot| slot.next_body);
+        let slot = VerifiedPrefix {
+            source_key: source_key.clone(),
+            source_revision: current.metadata.source_revision.clone(),
+            identity,
+            protection_key: key.clone(),
+            config_hash: self.runtime.effective_config_hash,
+            main: None,
+            earlier: None,
+            next_body,
+        };
+        cache.insert(source_key, slot.clone());
+        Ok(slot)
+    }
+
+    async fn merge_verified_leg(
+        &self,
+        current: &SessionImportCurrent,
+        identity: ConfinedFileIdentity,
+        key: &DeviceKey,
+        leg: ProofLeg,
+        mut proof: VerifiedRangeProof,
+    ) -> bool {
+        let mut cache = self.verified_prefix.lock().await;
+        let Some(slot) = cache.get_mut(&current.source_key()) else {
+            return false;
+        };
+        if slot.source_revision != current.metadata.source_revision
+            || slot.identity != identity
+            || slot.protection_key != *key
+            || slot.config_hash != self.runtime.effective_config_hash
+        {
+            return false;
+        }
+        let target = verified_leg_mut(slot, leg);
+        if let Some(old) = target {
+            if old.chain_start != proof.chain_start
+                || old.target_end > proof.target_end
+                || (old.target_end == proof.target_end && old.target_digest != proof.target_digest)
+            {
+                return false;
+            }
+            if old.end > proof.end {
+                if old.end > proof.target_end {
+                    return false;
+                }
+                proof.end = old.end;
+                proof.digest = old.digest.clone();
+            }
+        }
+        *target = Some(proof);
+        true
+    }
+
+    async fn clear_verified_leg(
+        &self,
+        current: &SessionImportCurrent,
+        identity: ConfinedFileIdentity,
+        key: &DeviceKey,
+        leg: ProofLeg,
+    ) {
+        let mut cache = self.verified_prefix.lock().await;
+        if let Some(slot) = cache.get_mut(&current.source_key())
+            && slot.source_revision == current.metadata.source_revision
+            && slot.identity == identity
+            && slot.protection_key == *key
+            && slot.config_hash == self.runtime.effective_config_hash
+        {
+            *verified_leg_mut(slot, leg) = None;
+        }
+    }
+
+    async fn choose_import_range(
+        &self,
+        context: &SessionImportContext,
+        identity: ConfinedFileIdentity,
+        key: &DeviceKey,
+        pending: &[ImportRange],
+    ) -> Result<ImportRange, SessionImportError> {
+        let slot = self.verified_slot(&context.current, identity, key).await?;
+        let preferred = pending
+            .iter()
+            .find(|range| range.kind == slot.next_body)
+            .or_else(|| pending.first())
+            .ok_or(SessionImportError::Unavailable)?;
+        Ok(preferred.clone())
+    }
+
+    async fn consume_body_turn(
+        &self,
+        context: &SessionImportContext,
+        identity: ConfinedFileIdentity,
+        key: &DeviceKey,
+        selected: ImportRangeKind,
+        pending: &[ImportRange],
+    ) {
+        let Some(other) = pending
+            .iter()
+            .find(|range| range.kind != selected)
+            .map(|range| range.kind)
+        else {
+            return;
+        };
+        let mut cache = self.verified_prefix.lock().await;
+        if let Some(slot) = cache.get_mut(&context.current.source_key())
+            && slot.source_revision == context.current.metadata.source_revision
+            && slot.identity == identity
+            && slot.protection_key == *key
+            && slot.config_hash == self.runtime.effective_config_hash
+        {
+            slot.next_body = other;
+        }
+    }
+
+    async fn remember_committed_range(
+        &self,
+        context: &SessionImportContext,
+        identity: ConfinedFileIdentity,
+        key: &DeviceKey,
+        range: &ImportRange,
+        end: u64,
+        digest: Option<String>,
+    ) {
+        if end <= range.chain_start || digest.is_none() {
+            return;
+        }
+        let leg = proof_leg(range.kind);
+        let proof = VerifiedRangeProof {
+            chain_start: range.chain_start,
+            target_end: end,
+            target_digest: digest.clone().unwrap_or_default(),
+            end,
+            digest,
+        };
+        let _ = self
+            .merge_verified_leg(&context.current, identity, key, leg, proof)
+            .await;
     }
 
     async fn reserve_prefix_slot(&self, source: &str) -> Result<bool, SessionImportError> {
@@ -858,6 +1256,11 @@ impl SessionImportWorker {
                 .map_err(|_| SessionImportError::Persistence)?;
             if context.is_none_or(|context| {
                 context.repository_purged
+                    || context.current.access_decision
+                        == Some(evertrace_store::SessionAccessDecision::Revoked)
+                    || context.job.as_ref().is_none_or(|job| {
+                        matches!(job.state, JobStatus::Succeeded | JobStatus::Failed)
+                    })
                     || !matches!(
                         context.current.body_state,
                         SessionBodyState::Queued
@@ -869,26 +1272,6 @@ impl SessionImportWorker {
             }
         }
         Ok(self.verified_prefix.lock().await.len() < crate::maintenance::PER_LANE_LIMIT)
-    }
-
-    async fn remember_prefix(&self, prefix: VerifiedPrefix) {
-        let mut cache = self.verified_prefix.lock().await;
-        if cache.get(&prefix.source_key).is_some_and(|old| {
-            old.source_revision == prefix.source_revision
-                && old.identity == prefix.identity
-                && old.protection_key == prefix.protection_key
-                && old.config_hash == prefix.config_hash
-                && old.target_end == prefix.target_end
-                && old.target_digest == prefix.target_digest
-                && old.end > prefix.end
-        }) {
-            return;
-        }
-        if cache.contains_key(&prefix.source_key)
-            || cache.len() < crate::maintenance::PER_LANE_LIMIT
-        {
-            cache.insert(prefix.source_key.clone(), prefix);
-        }
     }
 
     async fn claim_job(
@@ -969,6 +1352,22 @@ impl SessionImportWorker {
         metadata.source_fingerprint = session_source_fingerprint(identity).to_string();
         metadata.source_revision = SourceRevision::parse(metadata.source_fingerprint.clone())
             .map_err(|_| SessionImportError::Persistence)?;
+        metadata.file_size = identity.size;
+        metadata.file_mtime_us = identity
+            .mtime_seconds
+            .checked_mul(1_000_000)
+            .and_then(|value| {
+                value.checked_add(i64::try_from(identity.mtime_nanoseconds / 1_000).ok()?)
+            })
+            .ok_or(SessionImportError::Persistence)?;
+        if metadata.source_revision != current.metadata.source_revision {
+            metadata.prospective_origin = None;
+        } else if let Some(origin) = metadata.prospective_origin.as_mut() {
+            // If the physical identity contradicted the protected chain but
+            // yielded the same logical revision, fail closed instead of
+            // grafting a replacement origin onto that revision.
+            origin.closed = true;
+        }
         let mut payloads = vec![JournalPayload::SessionImportEventRecorded(Box::new(
             SessionImportEvent {
                 source_instance_id: current.source_instance_id.clone(),
@@ -1089,7 +1488,20 @@ impl SessionImportWorker {
             event: SessionImportEventKind::BodyStateAdvanced { body_state, reason },
         };
         let mut payloads = vec![JournalPayload::SessionImportEventRecorded(Box::new(event))];
-        if body_state == SessionBodyState::Partial {
+        let completed_partial = body_state == SessionBodyState::Partial
+            && reason == BodyStateReason::ApprovalUnavailable;
+        if completed_partial {
+            if let Some(mut job) = job {
+                job.state = JobStatus::Succeeded;
+                job.lease_until_us = None;
+                job.terminal = Some(Box::new(terminal_audit(
+                    JobTerminalOutcome::Succeeded,
+                    JobTerminalReason::Completed,
+                    &current.source_key(),
+                )));
+                payloads.push(JournalPayload::JobState(job));
+            }
+        } else if body_state == SessionBodyState::Partial {
             if let Some(mut job) = job {
                 job.state = JobStatus::Queued;
                 job.lease_until_us = None;
@@ -1228,6 +1640,281 @@ impl SessionImportWorker {
         }
         Ok((root, relative, identity))
     }
+}
+
+fn import_ranges(context: &SessionImportContext) -> Result<Vec<ImportRange>, SessionImportError> {
+    let current = &context.current;
+    let watermark = context.watermark.as_ref();
+    if let Some(origin) = current.metadata.prospective_origin.as_ref() {
+        // Closing future admission does not revoke independent historical
+        // permission. Preflight and each record's import_scope still apply.
+        let Some(fence) = origin.record_start else {
+            return Ok(Vec::new());
+        };
+        if fence > current.metadata.file_size
+            || origin.observed_end > fence
+            || watermark.is_some_and(|value| {
+                value
+                    .earlier_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| prefix.fence_byte != fence)
+            })
+        {
+            return Err(SessionImportError::Changed);
+        }
+        let (suffix_end, suffix_digest, prefix_end, prefix_digest) = match watermark {
+            Some(value) => {
+                let prefix = value
+                    .earlier_prefix
+                    .as_ref()
+                    .ok_or(SessionImportError::Changed)?;
+                let suffix_end = if value.confirmed_prefix_digest.is_some() {
+                    if value.source_sequence <= fence {
+                        return Err(SessionImportError::Changed);
+                    }
+                    value.source_sequence
+                } else {
+                    if value.source_sequence != fence {
+                        return Err(SessionImportError::Changed);
+                    }
+                    fence
+                };
+                (
+                    suffix_end,
+                    value.confirmed_prefix_digest.clone(),
+                    prefix.through_byte,
+                    prefix.digest.clone(),
+                )
+            }
+            None => (fence, None, 0, None),
+        };
+        if suffix_end > current.metadata.file_size || prefix_end > fence {
+            return Err(SessionImportError::Changed);
+        }
+        let mut ranges = Vec::new();
+        if suffix_end < current.metadata.file_size && !origin.closed {
+            ranges.push(ImportRange {
+                kind: ImportRangeKind::ProspectiveSuffix,
+                start: suffix_end,
+                end: current.metadata.file_size,
+                chain_start: fence,
+                committed_end: suffix_end,
+                committed_digest: suffix_digest,
+            });
+        }
+        if prefix_end < fence && prefix_accessible(current, fence) {
+            ranges.push(ImportRange {
+                kind: ImportRangeKind::HistoricalPrefix,
+                start: prefix_end,
+                end: fence,
+                chain_start: 0,
+                committed_end: prefix_end,
+                committed_digest: prefix_digest,
+            });
+        }
+        return Ok(ranges);
+    }
+    if watermark.is_some_and(|value| value.earlier_prefix.is_some()) {
+        return Err(SessionImportError::Changed);
+    }
+    let committed_end = watermark.map_or(0, |value| value.source_sequence);
+    if committed_end > current.metadata.file_size {
+        return Err(SessionImportError::Changed);
+    }
+    if committed_end == current.metadata.file_size {
+        return Ok(Vec::new());
+    }
+    Ok(vec![ImportRange {
+        kind: ImportRangeKind::Whole,
+        start: committed_end,
+        end: current.metadata.file_size,
+        chain_start: 0,
+        committed_end,
+        committed_digest: watermark.and_then(|value| value.confirmed_prefix_digest.clone()),
+    }])
+}
+
+fn required_import_proofs(
+    context: &SessionImportContext,
+) -> Result<Vec<ImportRange>, SessionImportError> {
+    let current = &context.current;
+    let Some(watermark) = context.watermark.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(origin) = current.metadata.prospective_origin.as_ref() else {
+        if watermark.earlier_prefix.is_some() {
+            return Err(SessionImportError::Changed);
+        }
+        return Ok((watermark.source_sequence > 0)
+            .then(|| ImportRange {
+                kind: ImportRangeKind::Whole,
+                start: 0,
+                end: watermark.source_sequence,
+                chain_start: 0,
+                committed_end: watermark.source_sequence,
+                committed_digest: watermark.confirmed_prefix_digest.clone(),
+            })
+            .into_iter()
+            .collect());
+    };
+    let fence = origin.record_start.ok_or(SessionImportError::Unavailable)?;
+    let prefix = watermark
+        .earlier_prefix
+        .as_ref()
+        .ok_or(SessionImportError::Changed)?;
+    if prefix.fence_byte != fence {
+        return Err(SessionImportError::Changed);
+    }
+    let mut proofs = Vec::with_capacity(2);
+    // Fixed proof order is earlier-first. Do not read this range unless the
+    // original historical permission is currently available.
+    if prefix.through_byte > 0 && prefix_accessible(current, fence) {
+        proofs.push(ImportRange {
+            kind: ImportRangeKind::HistoricalPrefix,
+            start: 0,
+            end: prefix.through_byte,
+            chain_start: 0,
+            committed_end: prefix.through_byte,
+            committed_digest: prefix.digest.clone(),
+        });
+    }
+    let suffix_end = if watermark.confirmed_prefix_digest.is_some() {
+        watermark.source_sequence
+    } else {
+        fence
+    };
+    if suffix_end > fence
+        && (current.access_decision == Some(evertrace_store::SessionAccessDecision::Approved)
+            || (!origin.closed && origin.record_start.is_some()))
+    {
+        proofs.push(ImportRange {
+            kind: ImportRangeKind::ProspectiveSuffix,
+            start: fence,
+            end: suffix_end,
+            chain_start: fence,
+            committed_end: suffix_end,
+            committed_digest: watermark.confirmed_prefix_digest.clone(),
+        });
+    }
+    Ok(proofs)
+}
+
+fn prefix_accessible(current: &SessionImportCurrent, fence: u64) -> bool {
+    fence != 0
+        && current
+            .import_scope(&EvidenceByteRange { start: 0, end: 1 }, None, None)
+            .is_ok()
+}
+
+fn import_scope_for_range(
+    context: &SessionImportContext,
+    range: &EvidenceByteRange,
+) -> Result<(Option<String>, Option<String>), SessionImportError> {
+    let current = &context.current;
+    let origin = current.metadata.prospective_origin.as_ref();
+    let snapshot = origin.and_then(|origin| {
+        context
+            .read_snapshots
+            .iter()
+            .find(|snapshot| snapshot.worktree_snapshot_id == origin.snapshot_ref)
+    });
+    let worktree = snapshot.and_then(|snapshot| {
+        context
+            .read_worktrees
+            .iter()
+            .find(|worktree| worktree.worktree_instance_id == snapshot.worktree_instance_id)
+    });
+    let (repository, worktree) = current
+        .import_scope(range, snapshot, worktree)
+        .map_err(|_| SessionImportError::Unavailable)?;
+    Ok((
+        repository.map(|value| value.to_string()),
+        worktree.map(|value| value.to_string()),
+    ))
+}
+
+fn imported_range_progress(
+    context: &SessionImportContext,
+    range: &ImportRange,
+) -> Result<(u64, Option<String>), SessionImportError> {
+    let Some(watermark) = context.watermark.as_ref() else {
+        return Ok((0, None));
+    };
+    match range.kind {
+        ImportRangeKind::Whole => Ok((
+            watermark.source_sequence,
+            watermark.confirmed_prefix_digest.clone(),
+        )),
+        ImportRangeKind::ProspectiveSuffix => {
+            let prefix = watermark
+                .earlier_prefix
+                .as_ref()
+                .filter(|prefix| prefix.fence_byte == range.chain_start)
+                .ok_or(SessionImportError::Changed)?;
+            if watermark.confirmed_prefix_digest.is_some() {
+                Ok((
+                    watermark.source_sequence,
+                    watermark.confirmed_prefix_digest.clone(),
+                ))
+            } else if watermark.source_sequence == range.chain_start {
+                Ok((range.chain_start, None))
+            } else {
+                let _ = prefix;
+                Err(SessionImportError::Changed)
+            }
+        }
+        ImportRangeKind::HistoricalPrefix => {
+            let prefix = watermark
+                .earlier_prefix
+                .as_ref()
+                .filter(|prefix| prefix.fence_byte == range.end)
+                .ok_or(SessionImportError::Changed)?;
+            Ok((prefix.through_byte, prefix.digest.clone()))
+        }
+    }
+}
+
+fn finished_import_state(
+    context: &SessionImportContext,
+) -> Result<Option<(SessionBodyState, BodyStateReason)>, SessionImportError> {
+    let current = &context.current;
+    let watermark = context.watermark.as_ref();
+    let Some(origin) = current.metadata.prospective_origin.as_ref() else {
+        let end = watermark.map_or(0, |value| value.source_sequence);
+        return Ok((end == current.metadata.file_size)
+            .then_some((SessionBodyState::Imported, BodyStateReason::Completed)));
+    };
+    let Some(fence) = origin.record_start else {
+        return Ok(None);
+    };
+    let suffix_end = watermark.map_or(fence, |value| {
+        if value.confirmed_prefix_digest.is_some() {
+            value.source_sequence
+        } else {
+            fence
+        }
+    });
+    let prefix_end = watermark
+        .and_then(|value| value.earlier_prefix.as_ref())
+        .map_or(0, |prefix| prefix.through_byte);
+    let suffix_complete = origin.closed || suffix_end == current.metadata.file_size;
+    let prefix_complete = prefix_end == fence;
+    if suffix_complete && (prefix_complete || !prefix_accessible(current, fence)) {
+        let imported = prefix_complete && !origin.closed;
+        return Ok(Some((
+            if imported {
+                SessionBodyState::Imported
+            } else {
+                SessionBodyState::Partial
+            },
+            if imported {
+                BodyStateReason::Completed
+            } else {
+                BodyStateReason::ApprovalUnavailable
+            },
+        )));
+    }
+    Ok(None)
 }
 
 fn map_source_read(error: evertrace_capture::ConfinedReadError) -> SessionImportError {
@@ -1508,13 +2195,145 @@ mod tests {
             );
         }
         assert_eq!(worker.verified_prefix.lock().await.len(), 2);
+        let overflow_sessions = (0..7)
+            .map(|offset| format!("019d0000-0000-7000-8000-{:012x}", 0x2b + offset))
+            .collect::<Vec<_>>();
+        let overflow_sources = overflow_sessions
+            .iter()
+            .map(|id| format!("session-rollout:{id}:{id}"))
+            .collect::<Vec<_>>();
+        for (index, id) in overflow_sessions.iter().enumerate() {
+            let path = dated.join(format!("rollout-2026-08-30T00-00-00-{id}.jsonl"));
+            let overflow_header = serde_json::json!({
+                "timestamp":"2026-08-30T00:00:00Z",
+                "type":"session_meta",
+                "payload":{"id":id,"session_id":id,"originator":"codex_cli_rs","model_provider":"openai","cwd":"/non-repository","git":null}
+            });
+            let overflow_line = serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"item_completed","thread_id":id,"turn_id":format!("turn-overflow-{index}"),"item":{"type":"UserMessage","id":format!("message-overflow-{index}"),"content":[{"type":"text","text":"slot-cap work"}]}}
+            });
+            let overflow_content = format!(
+                "{overflow_header}\n{}",
+                format!("{overflow_line}\n").repeat(6)
+            );
+            fs::write(path, overflow_content).unwrap();
+        }
+        let catalog_report = report.read().await.clone().unwrap();
+        SessionCatalogService::new(writer.clone(), [28; 32])
+            .refresh(&catalog_report)
+            .await
+            .unwrap();
+        for (index, id) in overflow_sessions.iter().enumerate() {
+            admin
+                .handle(
+                    RequestId::new_v7(),
+                    id,
+                    SessionImportAdminAction::QueueImport,
+                    19 + index as i64,
+                )
+                .await
+                .unwrap();
+            let queued = writer
+                .session_import_context(&overflow_sources[index])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(queued.job.as_ref().unwrap().state, JobStatus::Queued);
+            assert_eq!(queued.watermark, None);
+        }
+        let preparation_worker =
+            SessionImportWorker::new(writer.clone(), test_runtime(&temp), Arc::clone(&report))
+                .unwrap();
+        for source in &overflow_sources {
+            let progress = preparation_worker
+                .process_checkpoint(
+                    source,
+                    SessionImportBudget {
+                        max_records: 1,
+                        ..budget
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(progress.records, 1);
+            assert!(!progress.completed);
+        }
+        let capacity_worker =
+            SessionImportWorker::new(writer.clone(), test_runtime(&temp), Arc::clone(&report))
+                .unwrap();
+        for source in sources.iter().chain(overflow_sources.iter().take(6)) {
+            let progress = capacity_worker
+                .process_checkpoint(source, budget)
+                .await
+                .unwrap();
+            assert!(!progress.completed);
+        }
+        assert_eq!(
+            capacity_worker.verified_prefix.lock().await.len(),
+            crate::maintenance::PER_LANE_LIMIT
+        );
+        let overflow_watermark = writer
+            .session_import_context(overflow_sources.last().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .watermark
+            .unwrap();
+        assert!(overflow_watermark.source_sequence > 0);
+        assert_eq!(
+            capacity_worker
+                .process_checkpoint(overflow_sources.last().unwrap(), budget)
+                .await,
+            Err(SessionImportError::Budget),
+            "the eighth active source slot must reject a ninth source"
+        );
+        assert_eq!(
+            capacity_worker.verified_prefix.lock().await.len(),
+            crate::maintenance::PER_LANE_LIMIT
+        );
+        let overflow_after = writer
+            .session_import_context(overflow_sources.last().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overflow_after.job.as_ref().unwrap().state,
+            JobStatus::Queued
+        );
+        assert_eq!(overflow_after.watermark.as_ref(), Some(&overflow_watermark));
+        for source in &overflow_sources {
+            for _ in 0..5 {
+                let progress = preparation_worker
+                    .process_checkpoint(
+                        source,
+                        SessionImportBudget {
+                            max_records: 1,
+                            ..budget
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(progress.records, 1);
+                assert!(!progress.completed);
+            }
+            assert!(
+                preparation_worker
+                    .process_checkpoint(source, budget)
+                    .await
+                    .unwrap()
+                    .completed,
+                "the independent worker completes one source and releases its slot"
+            );
+        }
+        assert!(preparation_worker.verified_prefix.lock().await.is_empty());
         // Revoke after the proof is complete but before a new body claim.
         admin
             .handle(
                 RequestId::new_v7(),
                 session,
                 SessionImportAdminAction::RevokeAccess,
-                20,
+                30,
             )
             .await
             .unwrap();
@@ -1539,7 +2358,7 @@ mod tests {
                 RequestId::new_v7(),
                 session,
                 SessionImportAdminAction::QueueImport,
-                21,
+                31,
             )
             .await
             .unwrap();
@@ -1570,6 +2389,695 @@ mod tests {
         task.await.unwrap().unwrap();
         fs::remove_dir_all(&temp).unwrap();
         fs::remove_file(temp.with_extension("maintenance.lock")).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_last_receipt_recovers_terminal_after_cancel_without_duplicate_commit() {
+        use crate::session_import::{
+            SessionCatalogService, SessionImportAdminAction, SessionImportAdminService,
+        };
+        use std::{fs, os::unix::fs::PermissionsExt, time::SystemTime};
+
+        let root =
+            std::env::temp_dir().join(format!("evertrace-import-terminal-{}", RequestId::new_v7()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let adapter = root.join("adapter");
+        let dated = adapter.join("sessions/2026/08/30");
+        fs::create_dir_all(&dated).unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+        let session = "019d0000-0000-7000-8000-00000000002a";
+        let source = format!("session-rollout:{session}:{session}");
+        let transcript = dated.join(format!("rollout-2026-08-30T00-00-00-{session}.jsonl"));
+        let header = serde_json::json!({
+            "timestamp":"2026-08-30T00:00:00Z",
+            "type":"session_meta",
+            "payload":{"id":session,"session_id":session,"originator":"codex_cli_rs","model_provider":"openai","cwd":"/non-repository","git":null}
+        });
+        let message = |id: &str| {
+            serde_json::json!({
+                "timestamp":"2026-08-30T00:00:01Z",
+                "type":"event_msg",
+                "payload":{"type":"item_completed","thread_id":session,"turn_id":id,"item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":format!("terminal handoff recovery {id}")}]}}
+            })
+        };
+        let content = format!("{}\n{}\n{}\n", header, message("last-1"), message("last-2"));
+        fs::write(&transcript, &content).unwrap();
+        let report = crate::repository::observe_session_catalog_report(
+            transcript.to_str(),
+            session,
+            "terminal-recovery-test",
+            None,
+        )
+        .unwrap();
+        let (writer, actor) =
+            crate::spawn_writer(crate::open_writer(&root.join("data")).await.unwrap(), 16).unwrap();
+        let catalog = SessionCatalogService::new(writer.clone(), [28; 32]);
+        catalog.refresh(&report).await.unwrap();
+        let report = Arc::new(RwLock::new(Some(report)));
+        let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), [28; 32]);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                SessionImportAdminAction::QueueImport,
+                now,
+            )
+            .await
+            .unwrap();
+        DeviceKeyStore::new(root.join("keys"))
+            .load_or_create()
+            .unwrap();
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let mut worker =
+            SessionImportWorker::new(writer.clone(), test_runtime(&root), Arc::clone(&report))
+                .unwrap();
+        worker.terminal_handoff_pause = Some(Arc::clone(&reached));
+        let running_worker = worker.clone();
+        let budget = SessionImportBudget {
+            max_bytes: 64 * 1024,
+            max_records: 8,
+            max_work_time: Duration::from_millis(250),
+        };
+        let running =
+            tokio::spawn(async move { running_worker.process_checkpoint(&source, budget).await });
+        tokio::time::timeout(Duration::from_secs(10), reached.notified())
+            .await
+            .expect("worker did not stop after its final durable receipt");
+        assert!(
+            !running.is_finished(),
+            "terminal handoff pause must be in flight"
+        );
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+
+        let interrupted = writer
+            .session_import_context(&format!("session-rollout:{session}:{session}"))
+            .await
+            .unwrap()
+            .unwrap();
+        let committed_watermark = interrupted.watermark.clone().unwrap();
+        assert_eq!(committed_watermark.source_sequence, content.len() as u64);
+        assert_eq!(interrupted.current.body_state, SessionBodyState::Importing);
+        let leased = interrupted.job.as_ref().unwrap();
+        assert_eq!(leased.state, JobStatus::Leased);
+        assert!(leased.terminal.is_none());
+        let interrupted_job_id = leased.job_id;
+        let interrupted_attempt = leased.attempt;
+        let lease_until_us = leased.lease_until_us.unwrap();
+        let durable_payloads = writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::SourceReceiptRecorded(receipt)
+                        if receipt.source_instance_id.as_str()
+                            == format!("session-rollout:{session}:{session}") =>
+                    {
+                        Some(serde_json::to_string(&receipt).unwrap())
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(durable_payloads.len(), 3);
+        let synced_frontier = writer.sync_frontier().await.unwrap();
+        assert!(synced_frontier >= interrupted.frontier);
+        drop(admin);
+        drop(catalog);
+        drop(worker);
+        writer.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        if lease_until_us > now {
+            tokio::time::sleep(Duration::from_micros(
+                (lease_until_us - now) as u64 + 100_000,
+            ))
+            .await;
+        }
+        let (writer, actor) =
+            crate::spawn_writer(crate::open_writer(&root.join("data")).await.unwrap(), 16).unwrap();
+        let resumed_worker =
+            SessionImportWorker::new(writer.clone(), test_runtime(&root), Arc::clone(&report))
+                .unwrap();
+        let recovery_catalog = SessionCatalogService::new(writer.clone(), [28; 32]);
+        let recovery_scheduler = crate::BackgroundScheduler::new(
+            writer.clone(),
+            recovery_catalog,
+            resumed_worker.clone(),
+            Arc::clone(&report),
+            test_runtime(&root),
+            crate::SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+                enabled: false,
+                ..evertrace_domain::config::LlmConfig::default()
+            }),
+            evertrace_domain::config::DreamingConfig::default(),
+        );
+        let mut completed = false;
+        for _ in 0..32 {
+            recovery_scheduler.run_once().await.unwrap();
+            let context = writer
+                .session_import_context(&format!("session-rollout:{session}:{session}"))
+                .await
+                .unwrap()
+                .unwrap();
+            if context.current.body_state == SessionBodyState::Imported {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "restart must finish the durable terminal handoff"
+        );
+        let recovered = writer
+            .session_import_context(&format!("session-rollout:{session}:{session}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.watermark, Some(committed_watermark));
+        assert_eq!(recovered.current.body_state, SessionBodyState::Imported);
+        let terminal = writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter_map(|row| row.payload_json.as_deref())
+            .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+            .filter_map(|payload| match payload {
+                JournalPayload::JobState(job) if job.job_id == interrupted_job_id => Some(job),
+                _ => None,
+            })
+            .last()
+            .expect("terminal job state is durable in the journal");
+        assert_eq!(terminal.job_id, interrupted_job_id);
+        assert!(terminal.attempt > interrupted_attempt);
+        assert_eq!(terminal.state, JobStatus::Succeeded);
+        assert!(terminal.lease_until_us.is_none());
+        assert!(terminal.terminal.is_some());
+        let recovered_project = writer.project().await.unwrap();
+        let recovered_payloads = recovered_project
+            .data_rows()
+            .filter_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::SourceReceiptRecorded(receipt)
+                        if receipt.source_instance_id.as_str()
+                            == format!("session-rollout:{session}:{session}") =>
+                    {
+                        Some(serde_json::to_string(&receipt).unwrap())
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered_payloads, durable_payloads);
+        let completed_frontier = recovered.frontier;
+        let successful_job_events = recovered_project
+            .data_rows()
+            .filter_map(|row| row.payload_json.as_deref())
+            .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+            .filter(|payload| {
+                matches!(payload, JournalPayload::JobState(job)
+                    if job.job_id == interrupted_job_id && job.state == JobStatus::Succeeded)
+            })
+            .count();
+        assert_eq!(successful_job_events, 1);
+        recovery_scheduler.run_once().await.unwrap();
+        let idempotent_project = writer.project().await.unwrap();
+        assert_eq!(idempotent_project.frontier, completed_frontier);
+        assert_eq!(
+            idempotent_project
+                .data_rows()
+                .filter_map(|row| row.payload_json.as_deref())
+                .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+                .filter(|payload| {
+                    matches!(payload, JournalPayload::JobState(job)
+                        if job.job_id == interrupted_job_id && job.state == JobStatus::Succeeded)
+                })
+                .count(),
+            successful_job_events
+        );
+        writer.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_file(root.with_extension("maintenance.lock")).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_partial_last_receipt_recovers_terminal_after_cancel_without_duplicate_commit() {
+        use crate::repository::{
+            HostTrustDecision, ProbeLimits, RepositoryResolveInput, ResolutionKind,
+            probe_repository, resolve_repository, resolve_repository_source_start,
+        };
+        use crate::session_import::SessionCatalogService;
+        use evertrace_store::repository::RepositoryCurrentView;
+        use std::{
+            fs, io::Write as _, os::unix::fs::PermissionsExt, process::Command, time::SystemTime,
+        };
+
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("evertrace-split-terminal-{}", RequestId::new_v7()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        git(&workspace, &["init", "-q", "-b", "main"]);
+        git(
+            &workspace,
+            &["commit", "--allow-empty", "-qm", "split terminal"],
+        );
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let head = git(&workspace, &["rev-parse", "HEAD"]);
+        let adapter = root.join("adapter");
+        let dated = adapter.join("sessions/2026/10/06");
+        fs::create_dir_all(&dated).unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&dated, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            adapter.join("config.toml"),
+            format!(
+                "[projects.{}]\ntrust_level = \"trusted\"\n",
+                serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let session = "019d0000-0000-7000-8000-00000000002c";
+        let source = format!("session-rollout:{session}:{session}");
+        let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+        let header = serde_json::json!({
+            "timestamp":"2026-10-06T00:01:01Z",
+            "type":"session_meta",
+            "payload":{"id":session,"session_id":session,"cwd":workspace,"git":{"commit_hash":head}}
+        });
+        fs::write(&transcript, format!("{header}\n")).unwrap();
+
+        let at = 1_791_244_801_000_000;
+        let (writer, actor) =
+            crate::spawn_writer(crate::open_writer(&root.join("data")).await.unwrap(), 16).unwrap();
+        let registration_evidence = probe_repository(
+            &workspace,
+            HostTrustDecision::Trusted,
+            &["register:split-terminal-recovery".into()],
+            at - 1_000_000,
+            &ProbeLimits::default(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let registration = resolve_repository(&RepositoryResolveInput {
+            view: &RepositoryCurrentView::default(),
+            evidence: &registration_evidence,
+            derived_from_hint: None,
+        })
+        .unwrap();
+        assert_eq!(registration.kind, Some(ResolutionKind::Create));
+        writer
+            .commit(
+                registration
+                    .journal_command(at - 1_000_000, [28; 32], "split-terminal-registration")
+                    .unwrap()
+                    .unwrap(),
+                at - 1_000_000,
+            )
+            .await
+            .unwrap();
+        let repository_view =
+            RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+        let source_evidence = probe_repository(
+            &workspace,
+            HostTrustDecision::Trusted,
+            std::slice::from_ref(&source),
+            at,
+            &ProbeLimits::default(),
+            &repository_view.known_admin_paths(),
+            &[],
+        )
+        .unwrap();
+        let source_start = resolve_repository_source_start(
+            &RepositoryResolveInput {
+                view: &repository_view,
+                evidence: &source_evidence,
+                derived_from_hint: None,
+            },
+            &source,
+        )
+        .unwrap();
+        assert_eq!(source_start.kind, Some(ResolutionKind::Successor));
+        writer
+            .commit_if_frontier(
+                source_start
+                    .journal_command(at, [28; 32], "split-terminal-source-start")
+                    .unwrap()
+                    .unwrap(),
+                at,
+                repository_view.frontier,
+            )
+            .await
+            .unwrap();
+
+        let catalog = SessionCatalogService::new(writer.clone(), [28; 32]);
+        let catalog_report = crate::repository::observe_session_catalog_report(
+            transcript.to_str(),
+            session,
+            "split-terminal-catalog",
+            None,
+        )
+        .unwrap();
+        catalog.refresh(&catalog_report).await.unwrap();
+        let observation_request = RequestId::new_v7();
+        let observation_ref = format!("native_session_source_observation:{observation_request}");
+        let source_report = crate::repository::observe_session_source_report(
+            transcript.to_str().unwrap(),
+            session,
+            None,
+            &observation_ref,
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .observe_native_session_source(
+                    observation_request,
+                    &source_report,
+                    session,
+                    transcript.to_str().unwrap(),
+                    &observation_ref,
+                )
+                .await
+                .unwrap()
+        );
+        let report = Arc::new(RwLock::new(Some(source_report.clone())));
+        let started = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        let origin = started
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap();
+        let fence = origin.record_start.unwrap();
+        assert!(!origin.closed);
+        assert_eq!(origin.observed_end, fence);
+        assert_eq!(started.current.access_decision, None);
+        assert_eq!(
+            started.current.metadata.workspace_resolution_kind,
+            evertrace_store::WorkspaceResolutionKind::Ambiguous
+        );
+        assert_eq!(started.watermark, None);
+
+        let suffix = ["split-last-1", "split-last-2"]
+            .map(|id| {
+                serde_json::json!({
+                    "timestamp":"2026-10-06T00:01:02Z",
+                    "type":"event_msg",
+                    "payload":{"type":"item_completed","thread_id":session,"turn_id":id,"item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":format!("split recovery {id}")}]},"completed_at_ms":1_791_244_862_000_i64}
+                })
+                .to_string()
+            })
+            .join("\n");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(file, "{suffix}").unwrap();
+        drop(file);
+        let end = fs::metadata(&transcript).unwrap().len();
+        assert!(catalog.refresh_active(&source_report).await.unwrap() > 0);
+        let queued = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.current.access_decision, None);
+        assert_eq!(queued.job.as_ref().unwrap().state, JobStatus::Queued);
+        assert_eq!(queued.current.body_state, SessionBodyState::Queued);
+
+        DeviceKeyStore::new(root.join("keys"))
+            .load_or_create()
+            .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let mut worker =
+            SessionImportWorker::new(writer.clone(), test_runtime(&root), Arc::clone(&report))
+                .unwrap();
+        worker.terminal_handoff_pause = Some(Arc::clone(&reached));
+        let running_worker = worker.clone();
+        let budget = SessionImportBudget {
+            max_bytes: 64 * 1024,
+            max_records: 8,
+            max_work_time: Duration::from_millis(250),
+        };
+        let running_source = source.clone();
+        let running = tokio::spawn(async move {
+            for _ in 0..16 {
+                let progress = running_worker
+                    .process_checkpoint(&running_source, budget)
+                    .await?;
+                if progress.completed {
+                    return Ok(progress);
+                }
+                tokio::task::yield_now().await;
+            }
+            Err(SessionImportError::Budget)
+        });
+        if tokio::time::timeout(Duration::from_secs(10), reached.notified())
+            .await
+            .is_err()
+        {
+            let context = writer
+                .session_import_context(&source)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = if running.is_finished() {
+                Some(format!("{:?}", running.await))
+            } else {
+                None
+            };
+            panic!(
+                "split terminal pause missing: worker={result:?} body={:?} job={:?} watermark={:?} origin={:?}",
+                context.current.body_state,
+                context.job,
+                context.watermark,
+                context.current.metadata.prospective_origin
+            );
+        }
+        assert!(!running.is_finished(), "terminal handoff must be paused");
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+
+        let interrupted = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        let committed_watermark = interrupted.watermark.clone().unwrap();
+        assert_eq!(committed_watermark.source_sequence, end);
+        assert_eq!(
+            committed_watermark
+                .earlier_prefix
+                .as_ref()
+                .map(|prefix| prefix.through_byte),
+            Some(0)
+        );
+        assert_eq!(interrupted.current.body_state, SessionBodyState::Importing);
+        assert_eq!(interrupted.current.access_decision, None);
+        let leased = interrupted.job.as_ref().unwrap();
+        assert_eq!(leased.state, JobStatus::Leased);
+        assert!(leased.terminal.is_none());
+        let interrupted_job_id = leased.job_id;
+        let interrupted_attempt = leased.attempt;
+        let lease_until_us = leased.lease_until_us.unwrap();
+        let durable_payloads = writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::SourceReceiptRecorded(receipt)
+                        if receipt.source_instance_id.as_str() == source =>
+                    {
+                        Some(serde_json::to_string(&receipt).unwrap())
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            durable_payloads.len(),
+            2,
+            "only the two suffix records commit"
+        );
+        let synced_frontier = writer.sync_frontier().await.unwrap();
+        assert!(synced_frontier >= interrupted.frontier);
+        drop(catalog);
+        drop(worker);
+        writer.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        if lease_until_us > now {
+            tokio::time::sleep(Duration::from_micros(
+                (lease_until_us - now) as u64 + 100_000,
+            ))
+            .await;
+        }
+        let (writer, actor) =
+            crate::spawn_writer(crate::open_writer(&root.join("data")).await.unwrap(), 16).unwrap();
+        let resumed_worker =
+            SessionImportWorker::new(writer.clone(), test_runtime(&root), Arc::clone(&report))
+                .unwrap();
+        let recovery_catalog = SessionCatalogService::new(writer.clone(), [28; 32]);
+        let recovery_scheduler = crate::BackgroundScheduler::new(
+            writer.clone(),
+            recovery_catalog,
+            resumed_worker,
+            Arc::clone(&report),
+            test_runtime(&root),
+            crate::SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+                enabled: false,
+                ..evertrace_domain::config::LlmConfig::default()
+            }),
+            evertrace_domain::config::DreamingConfig::default(),
+        );
+        let mut recovered_partial = false;
+        for _ in 0..4 {
+            recovery_scheduler.run_once().await.unwrap();
+            let context = writer
+                .session_import_context(&source)
+                .await
+                .unwrap()
+                .unwrap();
+            if context.current.body_state == SessionBodyState::Partial
+                && context
+                    .job
+                    .as_ref()
+                    .is_none_or(|job| job.state == JobStatus::Succeeded)
+            {
+                recovered_partial = true;
+                break;
+            }
+        }
+        assert!(
+            recovered_partial,
+            "restart must finish the split Partial handoff: {:?}",
+            writer.session_import_context(&source).await.unwrap()
+        );
+        let recovered = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.watermark, Some(committed_watermark));
+        assert_eq!(recovered.current.body_state, SessionBodyState::Partial);
+        assert_eq!(recovered.current.access_decision, None);
+        let terminal = writer
+            .project()
+            .await
+            .unwrap()
+            .data_rows()
+            .filter_map(|row| row.payload_json.as_deref())
+            .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+            .filter_map(|payload| match payload {
+                JournalPayload::JobState(job) if job.job_id == interrupted_job_id => Some(job),
+                _ => None,
+            })
+            .last()
+            .expect("split source terminal state is durable");
+        assert!(terminal.attempt > interrupted_attempt);
+        assert_eq!(terminal.state, JobStatus::Succeeded);
+        assert!(terminal.lease_until_us.is_none());
+        assert_eq!(
+            terminal.terminal.as_ref().unwrap().reason,
+            JobTerminalReason::Completed
+        );
+        let recovered_project = writer.project().await.unwrap();
+        let recovered_payloads = recovered_project
+            .data_rows()
+            .filter_map(|row| {
+                match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                    JournalPayload::SourceReceiptRecorded(receipt)
+                        if receipt.source_instance_id.as_str() == source =>
+                    {
+                        Some(serde_json::to_string(&receipt).unwrap())
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered_payloads, durable_payloads);
+        assert!(writer.sync_frontier().await.unwrap() >= recovered.frontier);
+        let completed_frontier = recovered.frontier;
+        let succeeded_events = recovered_project
+            .data_rows()
+            .filter_map(|row| row.payload_json.as_deref())
+            .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+            .filter(|payload| {
+                matches!(payload, JournalPayload::JobState(job)
+                    if job.job_id == interrupted_job_id && job.state == JobStatus::Succeeded)
+            })
+            .count();
+        assert_eq!(succeeded_events, 1);
+        recovery_scheduler.run_once().await.unwrap();
+        let idempotent_project = writer.project().await.unwrap();
+        assert_eq!(idempotent_project.frontier, completed_frontier);
+        assert_eq!(
+            idempotent_project
+                .data_rows()
+                .filter_map(|row| row.payload_json.as_deref())
+                .filter_map(|json| serde_json::from_str::<JournalPayload>(json).ok())
+                .filter(|payload| {
+                    matches!(payload, JournalPayload::JobState(job)
+                        if job.job_id == interrupted_job_id && job.state == JobStatus::Succeeded)
+                })
+                .count(),
+            succeeded_events
+        );
+        writer.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_file(root.with_extension("maintenance.lock")).unwrap();
     }
 
     #[test]

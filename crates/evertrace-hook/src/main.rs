@@ -17,8 +17,8 @@ use evertrace_capture::{
 use evertrace_codex::{
     binding::{
         BINDING_PROTOCOL_REVISION, CanonicalBindingCall, NativeHookSpecificOutput,
-        NativePermissionDecision, NativePreToolUseOutput, NativeToolUse, NativeToolUseEvent,
-        PublicWorkspace, validated_bound_workspace,
+        NativePermissionDecision, NativePreToolUseOutput, NativeSessionStart, NativeToolUse,
+        NativeToolUseEvent, PublicWorkspace, validated_bound_workspace,
     },
     hook_input::{CaptureHookInput, HookEventKind, MAX_CAPTURE_HOOK_INPUT},
     install::StableLauncher,
@@ -37,6 +37,7 @@ use evertrace_protocol::{
     command::{McpBindingIssueCommand, RecoveryBarrierLocator},
     mcp::McpToolInput,
     request_mcp_binding_sync, request_recall_cue_sync, request_recovery_barrier_sync,
+    request_session_source_observation_sync,
 };
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(2);
@@ -124,6 +125,7 @@ fn freeze_native_namespace(
 
 fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> Result<(), ()> {
     let snapshot = RuntimeSnapshot::load(snapshot_path).map_err(|_| ())?;
+    let source_observation = source_observation_request(&input);
     // External metadata is frozen before opening/locking the capture spool.
     let source_local_evidence = input.native_source_call().map(|mut call| {
         call.namespace_witness =
@@ -205,12 +207,13 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
     }
     .map_err(|_| ())?;
     drop(runtime);
+    let durable = matches!(&outcome, CaptureOutcome::Durable { .. });
     if gate == RecoveryGateMode::Active
         && let CaptureOutcome::Durable {
             spool_record_id,
             recovery_preflight: Some(pending),
             ..
-        } = outcome
+        } = &outcome
     {
         let remaining = recovery_barrier_budget(
             configured_timeout,
@@ -233,6 +236,17 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
         if barrier_failed && let Ok(runtime) = CaptureRuntime::open_for_admission(snapshot.clone())
         {
             let _ = runtime.record_recovery_unavailable(&recovery_gap_record);
+        }
+    }
+    if durable && let Some(request) = source_observation {
+        let timeout = CHILD_TIMEOUT.saturating_sub(started.elapsed());
+        if timeout >= Duration::from_millis(1) {
+            let _ = request_session_source_observation_sync(
+                &snapshot.recovery_socket_path,
+                env!("CARGO_PKG_VERSION"),
+                request,
+                timeout,
+            );
         }
     }
     if let Some(cue) = select_recall_cue(
@@ -283,6 +297,31 @@ fn select_recall_cue(
     });
     let cue = matches.next()?.clone();
     matches.next().is_none().then_some(cue)
+}
+
+fn source_observation_request(
+    input: &CaptureHookInput,
+) -> Option<evertrace_protocol::command::ObserveSessionSourceCommand> {
+    let (session_id, transcript_path, agent_id) = match input.event_kind {
+        HookEventKind::SessionStarted => {
+            let native = NativeSessionStart::from_json(input.payload.as_bytes()).ok()?;
+            (native.session_id, native.transcript_path?, None)
+        }
+        HookEventKind::InputSubmitted => {
+            let native = evertrace_codex::binding::NativeInputSubmission::from_json(
+                input.payload.as_bytes(),
+            )
+            .ok()?;
+            (native.session_id, native.transcript_path?, native.agent_id)
+        }
+        _ => return None,
+    };
+    let request = evertrace_protocol::command::ObserveSessionSourceCommand {
+        session_id,
+        transcript_path,
+        agent_id,
+    };
+    request.validate().then_some(request)
 }
 
 #[cfg(test)]
@@ -399,15 +438,19 @@ fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
     let capture_input = CaptureHookInput::from_json(bytes).ok();
     let native_input = NativeToolUse::from_json(bytes).ok();
     let submission = evertrace_codex::binding::NativeInputSubmission::from_json(bytes).ok();
-    let (session_id, binding_mode) = match (&capture_input, &native_input, &submission) {
-        (Some(input), None, None) => (input.session_id.as_str(), false),
-        (None, None, Some(input)) => (input.session_id.as_str(), false),
-        (None, Some(input), None) => (
-            input.session_id.as_str(),
-            input.hook_event_name == NativeToolUseEvent::PreToolUse && input.targets_evertrace(),
-        ),
-        _ => return Err(()),
-    };
+    let session_start = NativeSessionStart::from_json(bytes).ok();
+    let (session_id, binding_mode) =
+        match (&capture_input, &native_input, &submission, &session_start) {
+            (Some(input), None, None, None) => (input.session_id.as_str(), false),
+            (None, None, Some(input), None) => (input.session_id.as_str(), false),
+            (None, None, None, Some(input)) => (input.session_id.as_str(), false),
+            (None, Some(input), None, None) => (
+                input.session_id.as_str(),
+                input.hook_event_name == NativeToolUseEvent::PreToolUse
+                    && input.targets_evertrace(),
+            ),
+            _ => return Err(()),
+        };
     let launcher = StableLauncher::open(root).map_err(|_| ())?;
     let generation = launcher.resolve_for_session(session_id).map_err(|_| ())?;
     evertrace_capture::CasStore::open(root.join("cas")).map_err(|_| ())?;
@@ -443,6 +486,12 @@ fn launch(root: &Path, bytes: &[u8], started: Instant) -> Result<(), ()> {
         normalized.as_slice()
     } else if let Some(submission) = submission {
         normalized = CaptureHookInput::from_submission(submission, generation.generation)
+            .map_err(|_| ())?
+            .to_json()
+            .map_err(|_| ())?;
+        normalized.as_slice()
+    } else if let Some(session_start) = session_start {
+        normalized = CaptureHookInput::from_session_start(session_start, generation.generation)
             .map_err(|_| ())?
             .to_json()
             .map_err(|_| ())?;
@@ -524,6 +573,7 @@ fn recovery_barrier_budget(
 
 const fn observation_role(kind: HookEventKind) -> ObservationRole {
     match kind {
+        HookEventKind::SessionStarted => ObservationRole::StateProbe,
         HookEventKind::InputSubmitted => ObservationRole::Message,
         HookEventKind::PreToolUse => ObservationRole::Intent,
         HookEventKind::PostToolUse => ObservationRole::Result,
@@ -539,7 +589,8 @@ const fn observation_role(kind: HookEventKind) -> ObservationRole {
 const fn source_role(kind: HookEventKind) -> SourceRole {
     match kind {
         HookEventKind::PreToolUse | HookEventKind::PostToolUse => SourceRole::Tool,
-        HookEventKind::InputSubmitted
+        HookEventKind::SessionStarted
+        | HookEventKind::InputSubmitted
         | HookEventKind::SubagentStart
         | HookEventKind::SubagentTerminal
         | HookEventKind::Compact
@@ -589,6 +640,40 @@ mod budget_proof {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn native_session_start_is_a_source_only_state_probe() {
+        let input = CaptureHookInput::from_session_start(
+            NativeSessionStart {
+                cwd: "/workspace/project".into(),
+                hook_event_name: "SessionStart".into(),
+                model: "gpt-5".into(),
+                permission_mode: evertrace_codex::binding::NativePermissionMode::Default,
+                session_id: "session-a".into(),
+                source: "startup".into(),
+                transcript_path: Some("/home/test/.codex/sessions/session-a.jsonl".into()),
+            },
+            7,
+        )
+        .unwrap();
+        assert_eq!(input.event_kind, HookEventKind::SessionStarted);
+        assert_eq!(input.turn_id, None);
+        assert_eq!(input.tool_use_id, None);
+        assert_eq!(
+            observation_role(input.event_kind),
+            ObservationRole::StateProbe
+        );
+        assert_eq!(source_role(input.event_kind), SourceRole::Host);
+        let request = source_observation_request(&input).unwrap();
+        assert_eq!(request.session_id, "session-a");
+        assert_eq!(
+            request.transcript_path,
+            "/home/test/.codex/sessions/session-a.jsonl"
+        );
+        assert_eq!(request.agent_id, None);
+        assert!(!input.payload.contains("\"turn_id\""));
+        assert!(!input.payload.contains("\"tool_use_id\""));
     }
 
     #[test]

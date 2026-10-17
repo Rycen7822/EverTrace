@@ -1333,6 +1333,210 @@ async fn package_health(socket: std::path::PathBuf) -> bool {
 }
 
 #[tokio::test]
+async fn daemon_routes_root_and_child_session_source_locators_to_their_own_transcripts() {
+    use evertrace_domain::ids::RequestId;
+    use evertrace_protocol::{
+        LocalClient,
+        command::{Command as Rpc, ObserveSessionSourceCommand},
+        dto::ClientKind,
+        response::Response,
+    };
+    use std::time::{Duration, Instant};
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    let (root, paths, _) = fixture();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let codex_home = root.path().join("codex");
+    let sessions = codex_home.join("sessions/2026/10/17");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q", "-b", "main"]);
+    git(
+        &workspace,
+        &["commit", "--allow-empty", "-qm", "source locator"],
+    );
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let head = git(&workspace, &["rev-parse", "HEAD"]);
+    fs::write(
+        paths.host_config.parent().unwrap().join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let root_thread = "019d0000-0000-7000-8000-0000000000c1";
+    let child_thread = "019d0000-0000-7000-8000-0000000000c2";
+    let mut transcripts = Vec::new();
+    let root_transcript = sessions.join(format!("rollout-2026-10-17T00-00-00-{root_thread}.jsonl"));
+    let root_header = serde_json::json!({
+        "timestamp":"2026-10-17T00:00:00Z",
+        "type":"session_meta",
+        "payload":{"id":root_thread,"session_id":root_thread,"cwd":workspace,"git":{"commit_hash":head}}
+    });
+    fs::write(&root_transcript, format!("{root_header}\n")).unwrap();
+    transcripts.push((root_thread, root_thread, root_transcript.clone()));
+    let child_transcript =
+        sessions.join(format!("rollout-2026-10-17T00-00-00-{child_thread}.jsonl"));
+
+    install_offline(&paths, false).unwrap();
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn_daemon = || {
+        Daemon(
+            Command::new(&paths.daemon)
+                .env_clear()
+                .env("HOME", root.path())
+                .env("CODEX_HOME", &codex_home)
+                .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+                .arg("--config")
+                .arg(&paths.config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(root.path().join("source-routing-daemon.log")).unwrap())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut daemon = spawn_daemon();
+    let socket = paths.data_root.join("runtime/evertraced-v1.sock");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut client = LocalClient::connect(
+        &socket,
+        "s34-source-routing",
+        ClientKind::Hook,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let response = client
+        .request(
+            RequestId::new_v7(),
+            Rpc::ObserveSessionSource(ObserveSessionSourceCommand {
+                session_id: root_thread.to_owned(),
+                transcript_path: root_transcript.to_str().unwrap().to_owned(),
+                agent_id: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("root thread {root_thread}: {error:?}"));
+    assert!(
+        matches!(response, Response::SessionSourceObserved(value) if value.changed),
+        "root thread {root_thread}: {response:?}"
+    );
+    drop(client);
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+
+    daemon = spawn_daemon();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !package_health(socket.clone()).await {
+        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let child_header = serde_json::json!({
+        "timestamp":"2026-10-17T00:00:00Z",
+        "type":"session_meta",
+        "payload":{"id":child_thread,"session_id":root_thread,"cwd":workspace,"git":{"commit_hash":head}}
+    });
+    fs::write(&child_transcript, format!("{child_header}\n")).unwrap();
+    transcripts.push((child_thread, root_thread, child_transcript.clone()));
+    let mut client = LocalClient::connect(
+        &socket,
+        "s34-child-source-routing",
+        ClientKind::Hook,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let response = client
+        .request(
+            RequestId::new_v7(),
+            Rpc::ObserveSessionSource(ObserveSessionSourceCommand {
+                session_id: root_thread.to_owned(),
+                transcript_path: child_transcript.to_str().unwrap().to_owned(),
+                agent_id: Some(child_thread.to_owned()),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("child thread {child_thread}: {error:?}"));
+    assert!(
+        matches!(response, Response::SessionSourceObserved(value) if value.changed),
+        "child thread {child_thread}: {response:?}"
+    );
+    drop(client);
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+
+    let writer = JournalWriter::open(&paths.data_root).await.unwrap();
+    let (writer, actor) = spawn_writer(writer, 16).unwrap();
+    for (thread, _, transcript) in transcripts {
+        let source = format!("session-rollout:{thread}:{thread}");
+        let context = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .expect("daemon observation must reach the catalog consumer");
+        let origin = context
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .expect("source observation must establish its own origin");
+        assert!(!origin.closed);
+        assert_eq!(
+            origin.observed_end,
+            fs::metadata(&transcript).unwrap().len()
+        );
+        assert_eq!(
+            context.current.session_id, thread,
+            "child routing must use the filename thread, not the root session"
+        );
+        assert_eq!(
+            std::path::Path::new(&context.current.metadata.source_path)
+                .file_name()
+                .unwrap(),
+            transcript.file_name().unwrap()
+        );
+    }
+    writer.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn candidate_native_binary_validates_without_starting_or_repairing() {
     let (root, paths, _) = fixture();
     drop(JournalWriter::open(&paths.data_root).await.unwrap());
@@ -1415,7 +1619,13 @@ async fn ordinary_daemon_keeps_explorer_and_doctor_readable_with_unowned_spool_f
     let mut daemon = spawn();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !package_health(socket.clone()).await {
-        assert!(Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none());
+        let status = daemon.0.try_wait().unwrap();
+        assert!(status.is_none(), "daemon exited before health: {status:?}");
+        assert!(
+            Instant::now() < deadline,
+            "live daemon health exceeded the original deadline; socket_exists={}",
+            socket.exists()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let mut client = LocalClient::connect(
@@ -1731,8 +1941,15 @@ async fn ordinary_daemon_imports_offline_active_and_replay_but_never_acks_bad_ca
                     break;
                 }
             }
+            let status = daemon.0.try_wait().unwrap();
             assert!(
-                tokio::time::Instant::now() < deadline && daemon.0.try_wait().unwrap().is_none()
+                status.is_none(),
+                "daemon exited before spool ingest; replay={replay}, status={status:?}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "live daemon spool ingest exceeded the original deadline; replay={replay}, socket_exists={}",
+                paths.data_root.join("runtime/evertraced-v1.sock").exists()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -3494,6 +3711,9 @@ fn owned_merge_idempotence_uninstall_and_unknown_owner() {
             .starts_with(original)
     );
     let installed = fs::read(&paths.host_config).unwrap();
+    let installed_text = String::from_utf8(installed.clone()).unwrap();
+    assert_eq!(installed_text.matches("[[hooks.SessionStart]]").count(), 2);
+    assert!(installed_text.contains("matcher = \"startup\""));
     assert_eq!(
         evertrace_codex::install::validate_installed_wiring(
             &paths.data_root,

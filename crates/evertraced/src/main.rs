@@ -39,7 +39,7 @@ use evertrace_engine::{
     RecoveryError, RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason,
     RuntimeMode, SessionImportWorker, open_writer,
     recall::spawn_recall_worker_with_config,
-    repository::observe_session_catalog_report,
+    repository::{observe_session_catalog_report, observe_session_source_report},
     session_import::{
         SessionCatalogService, SessionImportAdminAction as EngineSessionImportAdminAction,
         SessionImportAdminOutcome, SessionImportAdminService,
@@ -257,6 +257,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
             runtime_snapshot.effective_config_hash,
         );
+        let handler_session_catalog_service = session_catalog.clone();
         let session_import_worker = SessionImportWorker::new(
             writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
             runtime_snapshot.clone(),
@@ -277,7 +278,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let dispatch_gate = Arc::new(RwLock::new(()));
         let scheduler = BackgroundScheduler::new(
             writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
-            session_catalog,
+            session_catalog.clone(),
             session_import_worker,
             Arc::clone(&current_session_catalog_report),
             runtime_snapshot.clone(),
@@ -336,6 +337,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config_reload,
             runtime_snapshot,
             current_session_catalog_report,
+            handler_session_catalog_service,
             mcp_bindings,
             host_canary,
             session_import_admin,
@@ -360,6 +362,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_reload,
         runtime_snapshot,
         current_session_catalog_report,
+        handler_session_catalog_service,
         mcp_bindings,
         host_canary,
         session_import_admin,
@@ -405,6 +408,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let handler_mcp_bindings = mcp_bindings;
     let handler_mcp_service = mcp_service;
     let handler_session_catalog_report = Arc::clone(&current_session_catalog_report);
+    let handler_session_catalog = handler_session_catalog_service;
     let handler_session_import_admin = session_import_admin;
     let handler_human_governance = human_governance;
     let handler_session_import_wakeup = session_import_wakeup_tx.clone();
@@ -425,6 +429,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mcp_service = handler_mcp_service.clone();
             let recall_cue_service = recall_cue_service.clone();
             let session_catalog_report = Arc::clone(&handler_session_catalog_report);
+            let session_catalog = handler_session_catalog.clone();
             let session_import_admin = handler_session_import_admin.clone();
             let human_governance = handler_human_governance.clone();
             let session_import_wakeup = handler_session_import_wakeup.clone();
@@ -457,6 +462,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let recovery_action_service = recovery_action_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recall_cue_service = recall_cue_service.for_config(&config_snapshot);
                 let session_import_admin = session_import_admin.for_config(&config_snapshot);
+                let session_catalog = session_catalog.for_config(&config_snapshot);
                 let host_canary = host_canary.for_config(&config_snapshot);
                 match command {
                     ProtocolCommand::RunHostCanary(request) => {
@@ -560,6 +566,59 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             bound_workspace: grant.bound_workspace,
                             expires_at_us: grant.expires_at_us,
                         }))
+                    }
+                    ProtocolCommand::ObserveSessionSource(observation) => {
+                        if context.client_kind != ClientKind::Hook || !observation.validate() {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        let thread_locator = observation
+                            .agent_id
+                            .as_deref()
+                            .unwrap_or(&observation.session_id)
+                            .to_owned();
+                        let current_report = session_catalog_report.read().await.clone();
+                        if session_catalog
+                            .native_session_source_observed(
+                                &thread_locator,
+                                &observation.transcript_path,
+                                current_report.as_ref(),
+                            )
+                            .await
+                            .map_err(|_| ErrorCode::Untrusted)?
+                        {
+                            let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                            session_import_wakeup.send_replace(next);
+                            return Ok(Response::SessionSourceObserved(
+                                evertrace_protocol::response::SessionSourceObservedResponse {
+                                    changed: false,
+                                },
+                            ));
+                        }
+                        let source_reference =
+                            format!("native_session_source_observation:{request_id}");
+                        let report = observe_session_source_report(
+                            &observation.transcript_path,
+                            &observation.session_id,
+                            observation.agent_id.as_deref(),
+                            &source_reference,
+                        )
+                        .map_err(|_| ErrorCode::Untrusted)?;
+                        let changed = session_catalog
+                            .observe_native_session_source(
+                                request_id,
+                                &report,
+                                &thread_locator,
+                                &observation.transcript_path,
+                                &source_reference,
+                            )
+                            .await
+                            .map_err(|_| ErrorCode::Untrusted)?;
+                        *session_catalog_report.write().await = Some(report);
+                        let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                        session_import_wakeup.send_replace(next);
+                        Ok(Response::SessionSourceObserved(
+                            evertrace_protocol::response::SessionSourceObservedResponse { changed },
+                        ))
                     }
                     ProtocolCommand::ConfigRead => {
                         if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
