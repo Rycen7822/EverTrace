@@ -587,6 +587,7 @@ mod controlled_projection_proof {
                                 source_revision: receipt.source_revision.clone(),
                                 source_sequence: 1,
                                 confirmed_prefix_digest: None,
+                                earlier_prefix: None,
                             },
                         ),
                         JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {

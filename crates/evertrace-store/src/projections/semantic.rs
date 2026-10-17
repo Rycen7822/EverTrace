@@ -916,6 +916,7 @@ fn validate_accepted_edit_boundary(
         source_revision: receipt.1.source_revision.clone(),
         source_sequence: 1,
         confirmed_prefix_digest: None,
+        earlier_prefix: None,
     };
     let watermarks = payloads
         .iter()

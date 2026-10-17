@@ -636,6 +636,7 @@ async fn persist_source(
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -746,6 +747,7 @@ async fn persist_session_message(
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: Some(confirmed_prefix_digest.clone()),
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -821,6 +823,7 @@ async fn persist_direct_source_message(
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -942,6 +945,7 @@ async fn seed_store_with_lifecycle(path: &std::path::Path, lifecycle: EpisodeLif
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -2443,6 +2447,7 @@ async fn scheduler_discards_episode_result_when_base_changes_inflight() {
                     source_revision: receipt.source_revision,
                     source_sequence: receipt.source_sequence,
                     confirmed_prefix_digest: None,
+                    earlier_prefix: None,
                 }),
                 JournalPayload::DirtyTarget(DirtyTarget {
                     target_kind: DirtyTargetKind::EvidenceSurface,
@@ -2921,6 +2926,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
                             source_revision: receipt.source_revision.clone(),
                             source_sequence: 1,
                             confirmed_prefix_digest: None,
+                            earlier_prefix: None,
                         }),
                         JournalPayload::DirtyTarget(DirtyTarget {
                             target_kind: DirtyTargetKind::EvidenceSurface,
@@ -3079,6 +3085,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
                     source_revision: receipt.source_revision.clone(),
                     source_sequence: 1,
                     confirmed_prefix_digest: None,
+                    earlier_prefix: None,
                 }),
                 JournalPayload::DirtyTarget(DirtyTarget {
                     target_kind: DirtyTargetKind::EvidenceSurface,

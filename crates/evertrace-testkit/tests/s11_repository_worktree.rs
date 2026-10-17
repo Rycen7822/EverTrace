@@ -2876,6 +2876,7 @@ fn evidence_command(
         source_revision: receipt.source_revision.clone(),
         source_sequence: receipt.source_sequence,
         confirmed_prefix_digest: None,
+        earlier_prefix: None,
     };
     let target = observation.source_observation_id.to_string();
     let payloads = vec![

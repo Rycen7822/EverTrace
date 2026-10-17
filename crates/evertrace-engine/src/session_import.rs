@@ -1134,6 +1134,7 @@ impl CatalogReader<'_> {
                 resolved_repository_instance_id: repository_id,
                 resolved_worktree_instance_id: worktree_id,
                 repository_read_restrictions: None,
+                prospective_origin: None,
                 file_size: identity.size,
                 file_mtime_us: identity
                     .mtime_seconds

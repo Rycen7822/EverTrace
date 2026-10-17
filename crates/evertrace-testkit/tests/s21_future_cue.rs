@@ -375,6 +375,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -442,6 +443,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: acceptance_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -696,6 +698,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: reschedule_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -789,6 +792,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: deprecation_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,

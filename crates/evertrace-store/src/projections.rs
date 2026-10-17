@@ -5987,6 +5987,32 @@ impl JournalAdmissionState {
                 .map_err(|_| StoreError::StoreCorrupt)?,
             &current.metadata.source_revision,
         );
+        validate_prospective_origin_context(
+            &current.metadata,
+            &self.worktree_snapshots,
+            &self.worktrees,
+            &self.repositories,
+        )?;
+        let origin_snapshot = current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .map(|origin| {
+                self.worktree_snapshots
+                    .get(&origin.snapshot_ref)
+                    .map(|(snapshot, _)| snapshot.clone())
+                    .ok_or(StoreError::StoreCorrupt)
+            })
+            .transpose()?;
+        let origin_worktree = origin_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                self.worktrees
+                    .get(&snapshot.worktree_instance_id)
+                    .map(|(worktree, _)| worktree.clone())
+                    .ok_or(StoreError::StoreCorrupt)
+            })
+            .transpose()?;
         let repository = current
             .metadata
             .resolved_repository_instance_id
@@ -6022,7 +6048,11 @@ impl JournalAdmissionState {
                 .then_some(repository.repository_id)
         });
         let mut read_ids = BTreeSet::new();
-        for id in candidates.chain(located) {
+        for id in candidates.chain(located).chain(
+            origin_worktree
+                .as_ref()
+                .map(|value| value.repository_instance_id),
+        ) {
             read_ids.insert(id);
             if read_ids.len() > crate::session_import::MAX_REPOSITORY_READ_RESTRICTIONS {
                 return Err(StoreError::InvalidInput);
@@ -6037,25 +6067,42 @@ impl JournalAdmissionState {
                     .ok_or(StoreError::StoreCorrupt)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let read_worktrees = self
+        let mut read_worktrees = BTreeMap::new();
+        if let Some(worktree) = origin_worktree {
+            read_worktrees.insert(worktree.worktree_instance_id, worktree);
+        }
+        for (worktree, _) in self
             .worktrees
             .values()
             .filter(|(worktree, _)| read_ids.contains(&worktree.repository_instance_id))
-            .take(65)
-            .map(|(worktree, _)| worktree.clone())
-            .collect::<Vec<_>>();
+        {
+            read_worktrees.insert(worktree.worktree_instance_id, worktree.clone());
+            if read_worktrees.len() > 64 {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let read_worktrees = read_worktrees.into_values().collect::<Vec<_>>();
         if read_worktrees.len() > 64 {
             return Err(StoreError::InvalidInput);
         }
         // Current snapshots are always present, regardless of historical size.
         // One additional snapshot per repository/HEAD suffices for continuity;
         // an omitted HEAD is explicitly unknown, never a negative proof.
-        let mut read_snapshots = read_worktrees
+        let mut snapshots_by_id = BTreeMap::new();
+        if let Some(snapshot) = origin_snapshot {
+            snapshots_by_id.insert(snapshot.worktree_snapshot_id, snapshot);
+        }
+        for snapshot in read_worktrees
             .iter()
             .filter_map(|worktree| worktree.current_snapshot_id)
             .filter_map(|id| self.worktree_snapshots.get(&id))
             .map(|(snapshot, _)| snapshot.clone())
-            .collect::<Vec<_>>();
+        {
+            snapshots_by_id.insert(snapshot.worktree_snapshot_id, snapshot);
+        }
+        if snapshots_by_id.len() > 64 {
+            return Err(StoreError::InvalidInput);
+        }
         let mut incomplete_history = BTreeSet::new();
         if repository_locator.is_some() {
             let related_worktrees = read_worktrees
@@ -6083,14 +6130,19 @@ impl JournalAdmissionState {
                 if represented_heads.contains(&head) {
                     continue;
                 }
-                if read_snapshots.len() < 64 {
+                if snapshots_by_id.contains_key(&snapshot.worktree_snapshot_id) {
                     represented_heads.insert(head);
-                    read_snapshots.push(snapshot.clone());
+                    continue;
+                }
+                if snapshots_by_id.len() < 64 {
+                    represented_heads.insert(head);
+                    snapshots_by_id.insert(snapshot.worktree_snapshot_id, snapshot.clone());
                 } else {
                     incomplete_history.insert(*repository_id);
                 }
             }
         }
+        let read_snapshots = snapshots_by_id.into_values().collect::<Vec<_>>();
         let repository_purged = read_repositories.iter().any(|repository| {
             current
                 .metadata
@@ -9570,6 +9622,9 @@ impl JournalAdmissionState {
         .map_err(|_| StoreError::StoreCorrupt)?;
         let mut next = self;
         for (payload, seq, _) in parsed {
+            if let JournalPayload::SourceIngestWatermark(watermark) = &payload {
+                validate_source_ingest_watermark_admission(&next, watermark, rows)?;
+            }
             next.apply_payload(payload, seq)?;
         }
         if let Some(closure) = pending_repository_closure {
@@ -10684,6 +10739,26 @@ impl JournalAdmissionState {
                 {
                     return Err(StoreError::InvalidInput);
                 }
+                if let crate::SessionImportEventKind::MetadataObserved { metadata } = &value.event {
+                    validate_prospective_origin_context(
+                        metadata,
+                        &self.worktree_snapshots,
+                        &self.worktrees,
+                        &self.repositories,
+                    )?;
+                    let current = self.session_imports.get(&value.source_key());
+                    if prospective_origin_is_new_for_revision(current, metadata) {
+                        let source = session_import_source_instance(&value)?;
+                        if session_import_revision_has_facts(
+                            &self.source_watermarks,
+                            &self.source_ranges,
+                            &source,
+                            &metadata.source_revision,
+                        ) {
+                            return Err(StoreError::InvalidInput);
+                        }
+                    }
+                }
                 let next = crate::session_import::apply_session_event(
                     self.session_imports.get(&value.source_key()),
                     &value,
@@ -10701,6 +10776,14 @@ impl JournalAdmissionState {
     fn validate_relations(&self) -> Result<(), StoreError> {
         self.inventory
             .validate_relations(&self.repositories, &self.worktrees)?;
+        for current in self.session_imports.values() {
+            validate_prospective_origin_context(
+                &current.metadata,
+                &self.worktree_snapshots,
+                &self.worktrees,
+                &self.repositories,
+            )?;
+        }
         self.inventory
             .validate_procedure_refs(self.proposal_revisions.values().map(|(value, _)| value))?;
         validate_source_local_relations(
@@ -11405,11 +11488,13 @@ fn apply_event(
         JournalPayload::SourceIngestWatermark(value) => {
             validate_source_ingest_watermark(state, &value, command)?;
             let key = value.stable_key();
-            if state
+            let replace = state
                 .source_watermarks
                 .get(&key)
-                .is_none_or(|(current, _)| value.source_sequence >= current.source_sequence)
-            {
+                .is_none_or(|(current, _)| {
+                    current != &value && value.source_sequence >= current.source_sequence
+                });
+            if replace {
                 state.source_watermarks.insert(key, (value, row.seq));
             }
         }
@@ -11688,6 +11773,41 @@ fn apply_event(
             {
                 return Err(StoreError::StoreCorrupt);
             }
+            if let crate::SessionImportEventKind::MetadataObserved { metadata } = &value.event {
+                validate_prospective_origin_context(
+                    metadata,
+                    &state.worktree_snapshots,
+                    &state.worktrees,
+                    &state.repositories,
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+                let current = state.session_imports.get(&value.source_key());
+                if prospective_origin_is_new_for_revision(current, metadata) {
+                    let source = session_import_source_instance(&value)
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    let mut prior_receipt = false;
+                    for candidate in command.iter().filter(|candidate| candidate.seq < row.seq) {
+                        match candidate.payload()? {
+                            JournalPayload::SourceReceiptRecorded(receipt)
+                                if receipt.source_instance_id == source
+                                    && receipt.source_revision == metadata.source_revision =>
+                            {
+                                prior_receipt = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if session_import_revision_has_watermark(
+                        &state.source_watermarks,
+                        &source,
+                        &metadata.source_revision,
+                    ) || prior_receipt
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+            }
             let next = crate::session_import::apply_session_event(
                 state.session_imports.get(&value.source_key()),
                 &value,
@@ -11770,14 +11890,156 @@ fn validate_job_successor(
     Ok(())
 }
 
+fn session_import_source_instance(
+    event: &crate::SessionImportEvent,
+) -> Result<SourceInstanceId, StoreError> {
+    SourceInstanceId::parse(
+        event
+            .source_instance_id
+            .clone()
+            .unwrap_or_else(|| format!("codex-session:{}", event.session_id)),
+    )
+    .map_err(|_| StoreError::InvalidInput)
+}
+
+fn session_import_current_for_source<'a>(
+    current: &'a BTreeMap<String, crate::session_import::SessionImportCurrent>,
+    source: &str,
+) -> Option<&'a crate::session_import::SessionImportCurrent> {
+    let key = source.strip_prefix("codex-session:").unwrap_or(source);
+    current
+        .get(key)
+        .filter(|value| value.source_instance() == source)
+}
+
+fn prospective_origin_is_new_for_revision(
+    current: Option<&crate::session_import::SessionImportCurrent>,
+    metadata: &crate::session_import::SessionMetadata,
+) -> bool {
+    metadata.prospective_origin.is_some()
+        && current.is_none_or(|value| {
+            value.metadata.source_revision != metadata.source_revision
+                || value.metadata.prospective_origin.is_none()
+        })
+}
+
+fn session_import_revision_has_facts(
+    watermarks: &BTreeMap<String, SourceWatermarks>,
+    ranges: &BTreeMap<String, KnownSourceRange>,
+    source: &SourceInstanceId,
+    revision: &SourceRevision,
+) -> bool {
+    let source_ref = source_revision_ref(source, revision);
+    watermarks
+        .get(source.as_str())
+        .is_some_and(|state| state.revisions.contains_key(revision))
+        || ranges
+            .get(&source_ref)
+            .is_some_and(|range| !range.sequences.is_empty())
+}
+
+fn session_import_revision_has_watermark(
+    watermarks: &BTreeMap<String, (SourceIngestWatermark, u64)>,
+    source: &SourceInstanceId,
+    revision: &SourceRevision,
+) -> bool {
+    let key = SourceIngestWatermark {
+        source_instance_id: source.clone(),
+        source_revision: revision.clone(),
+        source_sequence: 0,
+        confirmed_prefix_digest: None,
+        earlier_prefix: None,
+    }
+    .stable_key();
+    watermarks.contains_key(&key)
+}
+
+fn validate_prospective_origin_context(
+    metadata: &crate::session_import::SessionMetadata,
+    snapshots: &BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    repositories: &BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+) -> Result<(), StoreError> {
+    let Some(origin) = &metadata.prospective_origin else {
+        return Ok(());
+    };
+    let snapshot = snapshots
+        .get(&origin.snapshot_ref)
+        .map(|(value, _)| value)
+        .ok_or(StoreError::InvalidInput)?;
+    let worktree = worktrees
+        .get(&snapshot.worktree_instance_id)
+        .map(|(value, _)| value)
+        .ok_or(StoreError::InvalidInput)?;
+    let repository = repositories
+        .get(&worktree.repository_instance_id)
+        .map(|(value, _)| value)
+        .ok_or(StoreError::InvalidInput)?;
+    // These are durable references, not a new live path attestation. Normal
+    // S11 moves/removal must not corrupt already admitted source metadata.
+    if repository.repository_id != worktree.repository_instance_id
+        || !metadata
+            .repository_read_restrictions
+            .as_ref()
+            .is_some_and(|ids| ids.binary_search(&repository.repository_id).is_ok())
+        || !metadata.repository_candidate(repository)
+        || !worktree
+            .path_history
+            .iter()
+            .any(|path| metadata.workspace_matches_path(&path.path))
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_split_receipt_scope(
+    watermark: &SourceIngestWatermark,
+    receipt: Option<&SourceReceipt>,
+    current: Option<&crate::SessionImportCurrent>,
+    snapshots: &BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+) -> Result<(), StoreError> {
+    let Some(receipt) = receipt.filter(|_| watermark.earlier_prefix.is_some()) else {
+        return Ok(());
+    };
+    let current = current
+        .filter(|value| value.metadata.source_revision == watermark.source_revision)
+        .ok_or(StoreError::StoreCorrupt)?;
+    let snapshot = current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .and_then(|origin| snapshots.get(&origin.snapshot_ref))
+        .map(|(value, _)| value);
+    let worktree = snapshot
+        .and_then(|value| worktrees.get(&value.worktree_instance_id))
+        .map(|(value, _)| value);
+    let scope = current
+        .import_scope(
+            receipt
+                .source_byte_range
+                .as_ref()
+                .ok_or(StoreError::StoreCorrupt)?,
+            snapshot,
+            worktree,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    if (receipt.repository_instance_id, receipt.worktree_instance_id) != scope {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
 fn validate_source_ingest_watermark(
     state: &ReducerState,
     watermark: &SourceIngestWatermark,
     command: &[&JournalRow],
 ) -> Result<(), StoreError> {
-    let codex = validate_confirmed_session_prefix(watermark)?;
-    let key = watermark.stable_key();
-    let current = state.source_watermarks.get(&key).map(|(value, _)| value);
+    let current = state
+        .source_watermarks
+        .get(&watermark.stable_key())
+        .map(|(value, _)| value);
     let mut receipt = None;
     for row in command {
         let JournalPayload::SourceReceiptRecorded(value) = row.payload()? else {
@@ -11790,51 +12052,231 @@ fn validate_source_ingest_watermark(
             return Err(StoreError::StoreCorrupt);
         }
     }
+    let metadata = session_import_current_for_source(
+        &state.session_imports,
+        watermark.source_instance_id.as_str(),
+    );
+    validate_split_receipt_scope(
+        watermark,
+        receipt.as_ref(),
+        metadata,
+        &state.worktree_snapshots,
+        &state.worktrees,
+    )?;
+    validate_source_ingest_watermark_transition(current, watermark, receipt.as_ref(), metadata)
+}
+
+fn validate_source_ingest_watermark_admission(
+    state: &JournalAdmissionState,
+    watermark: &SourceIngestWatermark,
+    command: &[&JournalRow],
+) -> Result<(), StoreError> {
+    let current = state
+        .source_watermarks
+        .get(watermark.source_instance_id.as_str())
+        .and_then(|values| values.revisions.get(&watermark.source_revision));
+    let mut receipt = None;
+    for row in command {
+        let JournalPayload::SourceReceiptRecorded(value) = row.payload()? else {
+            continue;
+        };
+        if value.source_instance_id == watermark.source_instance_id
+            && value.source_revision == watermark.source_revision
+            && receipt.replace(*value).is_some()
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    let metadata = session_import_current_for_source(
+        &state.session_imports,
+        watermark.source_instance_id.as_str(),
+    );
+    validate_split_receipt_scope(
+        watermark,
+        receipt.as_ref(),
+        metadata,
+        &state.worktree_snapshots,
+        &state.worktrees,
+    )?;
+    validate_source_ingest_watermark_transition(current, watermark, receipt.as_ref(), metadata)
+}
+
+fn validate_source_ingest_watermark_transition(
+    current: Option<&SourceIngestWatermark>,
+    watermark: &SourceIngestWatermark,
+    receipt: Option<&SourceReceipt>,
+    metadata: Option<&crate::session_import::SessionImportCurrent>,
+) -> Result<(), StoreError> {
+    let codex = validate_confirmed_session_prefix(watermark)?;
     if let Some(current) = current {
-        match watermark.source_sequence.cmp(&current.source_sequence) {
-            std::cmp::Ordering::Less if codex => return Err(StoreError::StoreCorrupt),
-            std::cmp::Ordering::Less => {}
-            std::cmp::Ordering::Equal => {
-                if watermark == current && receipt.is_none() {
-                    return Ok(());
-                }
-                if codex {
-                    return Err(StoreError::StoreCorrupt);
-                }
+        validate_confirmed_session_prefix(current)?;
+        if current.source_instance_id != watermark.source_instance_id
+            || current.source_revision != watermark.source_revision
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if codex && (current.earlier_prefix.is_some() || watermark.earlier_prefix.is_some()) {
+            if watermark.source_sequence < current.source_sequence {
+                return Err(StoreError::StoreCorrupt);
             }
-            std::cmp::Ordering::Greater => {}
+            if watermark == current && receipt.is_none() {
+                return Ok(());
+            }
+        } else {
+            match watermark.source_sequence.cmp(&current.source_sequence) {
+                std::cmp::Ordering::Less if codex => return Err(StoreError::StoreCorrupt),
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    if watermark == current && receipt.is_none() {
+                        return Ok(());
+                    }
+                    if codex {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                std::cmp::Ordering::Greater => {}
+            }
         }
     }
     let receipt = receipt.ok_or(StoreError::StoreCorrupt)?;
-    if receipt.source_sequence != watermark.source_sequence {
+    if receipt.source_instance_id != watermark.source_instance_id
+        || receipt.source_revision != watermark.source_revision
+    {
         return Err(StoreError::StoreCorrupt);
     }
     if !codex {
+        if receipt.source_sequence != watermark.source_sequence {
+            return Err(StoreError::StoreCorrupt);
+        }
         return Ok(());
     }
     let range = receipt
         .source_byte_range
         .as_ref()
         .ok_or(StoreError::StoreCorrupt)?;
-    let previous = if let Some(current) = current {
-        if range.start != current.source_sequence {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Some(
-            current
-                .confirmed_prefix_digest
-                .clone()
-                .ok_or(StoreError::StoreCorrupt)?,
-        )
-    } else {
-        if range.start != 0 {
-            return Err(StoreError::StoreCorrupt);
-        }
-        None
-    };
-    if range.end != watermark.source_sequence || range.end <= range.start {
+    if receipt.source_sequence != range.end || range.end <= range.start {
         return Err(StoreError::StoreCorrupt);
     }
+    let source_is_current =
+        metadata.is_some_and(|value| value.metadata.source_revision == watermark.source_revision);
+    let origin = metadata
+        .filter(|value| value.metadata.source_revision == watermark.source_revision)
+        .and_then(|value| value.metadata.prospective_origin.as_ref());
+    let (previous_digest, expected_digest) = match (
+        &watermark.earlier_prefix,
+        current.and_then(|value| value.earlier_prefix.as_ref()),
+    ) {
+        (None, None) => {
+            if origin.is_some() || current.is_some_and(|value| value.earlier_prefix.is_some()) {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let previous = if let Some(current) = current {
+                if range.start != current.source_sequence {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                Some(
+                    current
+                        .confirmed_prefix_digest
+                        .clone()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+            } else {
+                if range.start != 0 {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                None
+            };
+            if range.end != watermark.source_sequence {
+                return Err(StoreError::StoreCorrupt);
+            }
+            (previous, watermark.confirmed_prefix_digest.as_deref())
+        }
+        (Some(prefix), None) => {
+            if current.is_some()
+                || !source_is_current
+                || !origin.is_some_and(|value| value.record_start == Some(prefix.fence_byte))
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if range.start == prefix.fence_byte && range.end > range.start {
+                if prefix.through_byte != 0
+                    || prefix.digest.is_some()
+                    || watermark.source_sequence != range.end
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (None, watermark.confirmed_prefix_digest.as_deref())
+            } else if range.start == 0 && range.end <= prefix.fence_byte {
+                if watermark.source_sequence != prefix.fence_byte
+                    || prefix.through_byte != range.end
+                    || prefix.digest.is_none()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                if watermark.confirmed_prefix_digest.is_some() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (None, prefix.digest.as_deref())
+            } else {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        (Some(next_prefix), Some(previous_prefix)) => {
+            if !source_is_current
+                || !origin
+                    .is_some_and(|value| value.record_start == Some(previous_prefix.fence_byte))
+                || next_prefix.fence_byte != previous_prefix.fence_byte
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let suffix_advanced = watermark.source_sequence > current.unwrap().source_sequence;
+            let prefix_advanced = next_prefix.through_byte > previous_prefix.through_byte;
+            if suffix_advanced == prefix_advanced {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if suffix_advanced {
+                if range.start != current.unwrap().source_sequence
+                    || range.start < previous_prefix.fence_byte
+                    || range.end != watermark.source_sequence
+                    || next_prefix.through_byte != previous_prefix.through_byte
+                    || next_prefix.digest != previous_prefix.digest
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (
+                    current.unwrap().confirmed_prefix_digest.clone(),
+                    watermark.confirmed_prefix_digest.as_deref(),
+                )
+            } else {
+                if range.start != previous_prefix.through_byte
+                    || range.end != next_prefix.through_byte
+                    || range.end > previous_prefix.fence_byte
+                    || watermark.source_sequence != current.unwrap().source_sequence
+                    || watermark.confirmed_prefix_digest != current.unwrap().confirmed_prefix_digest
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (
+                    previous_prefix.digest.clone(),
+                    next_prefix.digest.as_deref(),
+                )
+            }
+        }
+        (None, Some(_)) => return Err(StoreError::StoreCorrupt),
+    };
+    let digest = session_import_prefix_digest(watermark, range, previous_digest, &receipt.cas_ref)?;
+    if expected_digest != Some(digest.as_str()) {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
+fn session_import_prefix_digest(
+    watermark: &SourceIngestWatermark,
+    range: &evertrace_domain::evidence::EvidenceByteRange,
+    previous: Option<String>,
+    cas_ref: &str,
+) -> Result<String, StoreError> {
     let digest = sha256(
         "session_import_confirmed_prefix",
         1,
@@ -11844,24 +12286,50 @@ fn validate_source_ingest_watermark(
             CanonicalValue::Integer(i128::from(range.start)),
             CanonicalValue::Integer(i128::from(range.end)),
             previous.map_or(CanonicalValue::Null, CanonicalValue::String),
-            CanonicalValue::String(receipt.cas_ref),
+            CanonicalValue::String(cas_ref.to_owned()),
         ]),
     )
     .map_err(|_| StoreError::StoreCorrupt)?;
-    let digest = hex(&digest);
-    if watermark.confirmed_prefix_digest.as_deref() != Some(digest.as_str()) {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok(())
+    Ok(hex(&digest))
 }
 
 fn validate_confirmed_session_prefix(
     watermark: &SourceIngestWatermark,
 ) -> Result<bool, StoreError> {
-    let instance = watermark.source_instance_id.as_str();
-    let codex = crate::session_import::is_session_import_source(instance);
-    match (codex, watermark.confirmed_prefix_digest.is_some()) {
-        (true, true) | (false, false) => Ok(codex),
+    let codex =
+        crate::session_import::is_session_import_source(watermark.source_instance_id.as_str());
+    let valid_digest = |digest: &str| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    if watermark
+        .confirmed_prefix_digest
+        .as_deref()
+        .is_some_and(|digest| !valid_digest(digest))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    match (codex, watermark.earlier_prefix.as_ref()) {
+        (false, None) if watermark.confirmed_prefix_digest.is_none() => Ok(false),
+        (false, _) => Err(StoreError::StoreCorrupt),
+        (true, None) if watermark.confirmed_prefix_digest.is_some() => Ok(true),
+        (true, Some(prefix)) => {
+            if prefix.through_byte > prefix.fence_byte
+                || prefix.fence_byte > watermark.source_sequence
+                || prefix
+                    .digest
+                    .as_deref()
+                    .is_some_and(|digest| !valid_digest(digest))
+                || (prefix.through_byte == 0) != prefix.digest.is_none()
+                || (prefix.fence_byte == watermark.source_sequence)
+                    != watermark.confirmed_prefix_digest.is_none()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok(true)
+        }
         _ => Err(StoreError::StoreCorrupt),
     }
 }
@@ -14629,6 +15097,15 @@ impl ReducerState {
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
         self.inventory
             .validate_relations(&self.repositories, &self.worktrees)?;
+        for current in self.session_imports.values() {
+            validate_prospective_origin_context(
+                &current.metadata,
+                &self.worktree_snapshots,
+                &self.worktrees,
+                &self.repositories,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        }
         self.inventory
             .validate_procedure_refs(self.proposal_revisions.values().map(|(value, _)| value))?;
         validate_source_local_relations(
@@ -16522,6 +16999,7 @@ mod tests {
                         source_revision: SourceRevision::parse("revision-1").unwrap(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     1,
                 )
@@ -16557,6 +17035,677 @@ mod tests {
         assert_eq!(interrupted.contexts[0].frontier, 900);
     }
 
+    fn split_test_current(
+        record_start: Option<u64>,
+        closed: bool,
+        with_origin: bool,
+    ) -> crate::SessionImportCurrent {
+        let mut metadata = serde_json::from_value::<crate::SessionMetadata>(serde_json::json!({
+            "source_path":"session.jsonl", "source_format":"codex_rollout_jsonl_v1",
+            "workspace_resolution_kind":"non_repository", "resolved_repository_instance_id":null,
+            "resolved_worktree_instance_id":null, "file_size":20, "file_mtime_us":1,
+            "source_fingerprint":"1".repeat(64), "source_revision":"revision-a",
+            "parser_version":1, "metadata_state":"indexed"
+        }))
+        .unwrap();
+        if with_origin {
+            metadata.repository_read_restrictions = Some(Vec::new());
+            metadata.prospective_origin = Some(crate::ProspectiveSourceOrigin {
+                snapshot_ref: WorktreeSnapshotId::new_v7(),
+                observed_end: 5,
+                record_start,
+                closed,
+            });
+        }
+        crate::SessionImportCurrent {
+            session_id: "session-a".into(),
+            source_instance_id: None,
+            revision: 1,
+            metadata,
+            access_decision: None,
+            body_state: crate::SessionBodyState::NotImported,
+            source_event_seq: 1,
+        }
+    }
+
+    fn split_test_receipt(start: u64, end: u64) -> SourceReceipt {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (mut receipt, _, _) = r105_capture("split-session", end, &repository, &worktree, false);
+        let source = SourceInstanceId::parse("codex-session:session-a").unwrap();
+        let revision = SourceRevision::parse("revision-a").unwrap();
+        let record = SourceRecordIdentity::parse(format!("split-session-{start}-{end}")).unwrap();
+        receipt.source_instance_id = source.clone();
+        receipt.source_revision = revision.clone();
+        receipt.source_record_identity = record.clone();
+        receipt.source_sequence = end;
+        receipt.source_sequence_origin = Some(0);
+        receipt.source_byte_range = Some(EvidenceByteRange { start, end });
+        receipt.source_receipt_id =
+            evertrace_domain::evidence::source_receipt_id(&source, &revision, &record).unwrap();
+        receipt.source_observation_id =
+            evertrace_domain::evidence::source_observation_id(&source, &revision, &record).unwrap();
+        receipt.validate().unwrap();
+        receipt
+    }
+
+    fn split_test_observation(receipt: &SourceReceipt) -> SourceObservation {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (_, mut observation, _) = r105_capture(
+            "split-session",
+            receipt.source_sequence,
+            &repository,
+            &worktree,
+            false,
+        );
+        observation.source_instance_id = receipt.source_instance_id.clone();
+        observation.source_revision = receipt.source_revision.clone();
+        observation.source_record_identity = receipt.source_record_identity.clone();
+        observation.source_observation_id = receipt.source_observation_id;
+        observation.source_receipt_ref = receipt.source_receipt_id;
+        observation.validate().unwrap();
+        observation
+    }
+
+    fn split_test_command(
+        receipt: &SourceReceipt,
+        observation: &SourceObservation,
+        watermark: &SourceIngestWatermark,
+    ) -> JournalCommand {
+        let observation_id = observation.source_observation_id.to_string();
+        r105_command(
+            2,
+            vec![
+                JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                JournalPayload::SourceIngestWatermark(watermark.clone()),
+                JournalPayload::DirtyTarget(crate::command::DirtyTarget {
+                    target_kind: DirtyTargetKind::EvidenceSurface,
+                    target_id: observation_id.clone(),
+                    algorithm_revision: "r479-test-v1".into(),
+                    source_watermark: receipt.source_sequence,
+                }),
+                JournalPayload::DirtyTarget(crate::command::DirtyTarget {
+                    target_kind: DirtyTargetKind::PhysicalNormalization,
+                    target_id: observation_id,
+                    algorithm_revision: "r479-test-v1".into(),
+                    source_watermark: receipt.source_sequence,
+                }),
+            ],
+        )
+    }
+
+    fn split_test_watermark(
+        source_sequence: u64,
+        fence_byte: u64,
+        through_byte: u64,
+        prefix_digest: Option<String>,
+        confirmed_prefix_digest: Option<String>,
+    ) -> SourceIngestWatermark {
+        SourceIngestWatermark {
+            source_instance_id: SourceInstanceId::parse("codex-session:session-a").unwrap(),
+            source_revision: SourceRevision::parse("revision-a").unwrap(),
+            source_sequence,
+            confirmed_prefix_digest,
+            earlier_prefix: Some(crate::command::SourceImportEarlierPrefix {
+                fence_byte,
+                through_byte,
+                digest: prefix_digest,
+            }),
+        }
+    }
+
+    #[test]
+    fn prospective_origin_admission_uses_exact_snapshot_and_rejects_ingested_revision() {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let repository_id = repository.repository_id;
+        let worktree_id = worktree.worktree_instance_id;
+        let snapshot = evertrace_domain::repository::WorktreeSnapshot {
+            worktree_snapshot_id: WorktreeSnapshotId::new_v7(),
+            worktree_instance_id: worktree.worktree_instance_id,
+            head_oid: None,
+            tree_oid: None,
+            branch_ref: None,
+            detached_head: false,
+            tracked_diff_digest: None,
+            index_digest: None,
+            untracked_manifest_digest: None,
+            relevant_anchor_digests: vec![],
+            dependency_fingerprints: vec![],
+            toolchain_fingerprint: None,
+            git_operation: evertrace_domain::repository::GitOperation::None,
+            captured_at_us: 1,
+            evidence_refs: vec![],
+            capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Unavailable,
+            omission_reasons: vec![],
+        };
+        let snapshots = BTreeMap::from([(snapshot.worktree_snapshot_id, (snapshot.clone(), 3))]);
+        let worktrees = BTreeMap::from([(worktree.worktree_instance_id, (worktree.clone(), 2))]);
+        let repositories = BTreeMap::from([(repository.repository_id, (repository.clone(), 1))]);
+        let mut metadata = split_test_current(Some(5), false, true).metadata;
+        metadata.workspace_hint = Some(repository.current_path.clone());
+        metadata.repository_read_restrictions = Some(vec![repository.repository_id]);
+        metadata.prospective_origin.as_mut().unwrap().snapshot_ref = snapshot.worktree_snapshot_id;
+        assert_eq!(
+            validate_prospective_origin_context(&metadata, &snapshots, &worktrees, &repositories,),
+            Ok(())
+        );
+        let mut invalid = metadata.clone();
+        invalid.repository_read_restrictions = Some(Vec::new());
+        assert_eq!(
+            validate_prospective_origin_context(&invalid, &snapshots, &worktrees, &repositories,),
+            Err(StoreError::InvalidInput)
+        );
+        let mut invalid = metadata.clone();
+        invalid.workspace_hint = Some("/outside".into());
+        assert_eq!(
+            validate_prospective_origin_context(&invalid, &snapshots, &worktrees, &repositories,),
+            Err(StoreError::InvalidInput)
+        );
+
+        let mut removed = worktree.clone();
+        removed.worktree_revision += 1;
+        removed.predecessor_revision = Some(worktree.worktree_revision);
+        removed.lifecycle = evertrace_domain::repository::WorktreeLifecycle::Removed;
+        removed.current_path = None;
+        removed.terminal_event_ref = Some("removed-worktree".into());
+        removed.validate().unwrap();
+        let removed_worktrees = BTreeMap::from([(removed.worktree_instance_id, (removed, 5))]);
+        assert_eq!(
+            validate_prospective_origin_context(
+                &metadata,
+                &snapshots,
+                &removed_worktrees,
+                &repositories
+            ),
+            Ok(())
+        );
+
+        let mut baseline = JournalAdmissionState::default();
+        baseline
+            .repositories
+            .insert(repository.repository_id, (repository, 1));
+        baseline
+            .worktrees
+            .insert(worktree.worktree_instance_id, (worktree, 2));
+        baseline
+            .worktree_snapshots
+            .insert(snapshot.worktree_snapshot_id, (snapshot, 3));
+        baseline
+            .session_imports
+            .insert("session-a".into(), split_test_current(None, false, false));
+        let event = crate::SessionImportEvent {
+            session_id: "session-a".into(),
+            source_instance_id: None,
+            revision: 2,
+            predecessor_revision: Some(1),
+            occurred_at_us: 4,
+            event: crate::SessionImportEventKind::MetadataObserved {
+                metadata: Box::new(metadata),
+            },
+        };
+        let mut race_winner = baseline.clone();
+        race_winner
+            .apply_payload(
+                JournalPayload::SessionImportEventRecorded(Box::new(event.clone())),
+                4,
+            )
+            .unwrap();
+        let observed = &race_winner.session_imports["session-a"];
+        assert_eq!(observed.metadata.resolved_repository_instance_id, None);
+        assert_eq!(observed.metadata.resolved_worktree_instance_id, None);
+        assert!(observed.metadata.prospective_origin.is_some());
+
+        let suffix_receipt = split_test_receipt(5, 8);
+        let mut suffix = split_test_watermark(8, 5, 0, None, None);
+        suffix.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &suffix,
+                suffix_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &suffix_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        let history_receipt = split_test_receipt(0, 2);
+        let mut history = split_test_watermark(5, 5, 2, None, None);
+        history.earlier_prefix.as_mut().unwrap().digest = Some(
+            session_import_prefix_digest(
+                &history,
+                history_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &history_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        for (mut receipt, watermark) in [(suffix_receipt, suffix), (history_receipt, history)] {
+            let historical_prefix = receipt.source_byte_range.as_ref().unwrap().start == 0;
+            let mut input = race_winner.clone();
+            receipt.repository_instance_id = (!historical_prefix).then_some(repository_id);
+            receipt.worktree_instance_id = (!historical_prefix).then_some(worktree_id);
+            receipt.validate().unwrap();
+            let observation = split_test_observation(&receipt);
+            let command = split_test_command(&receipt, &observation, &watermark);
+            let prepared = prepare_command(&command).unwrap();
+            let rows = rows_for_append(&prepared, 6, 0).unwrap();
+            let command_rows = rows.iter().collect::<Vec<_>>();
+
+            if historical_prefix {
+                assert!(input.clone().apply_row_batch(&command_rows).is_err());
+                input
+                    .apply_payload(
+                        JournalPayload::SessionImportEventRecorded(Box::new(
+                            crate::SessionImportEvent {
+                                session_id: "session-a".into(),
+                                source_instance_id: None,
+                                revision: 3,
+                                predecessor_revision: Some(2),
+                                occurred_at_us: 5,
+                                event: crate::SessionImportEventKind::AccessDecision {
+                                    decision: crate::SessionAccessDecision::Approved,
+                                    local_request_ref: evertrace_domain::ids::RequestId::new_v7(),
+                                    provenance_refs: vec!["local_cli:approve-prefix".into()],
+                                },
+                            },
+                        )),
+                        5,
+                    )
+                    .unwrap();
+                let mut forged = receipt.clone();
+                forged.repository_instance_id = Some(repository_id);
+                forged.worktree_instance_id = Some(worktree_id);
+                assert!(
+                    validate_split_receipt_scope(
+                        &watermark,
+                        Some(&forged),
+                        input.session_imports.get("session-a"),
+                        &input.worktree_snapshots,
+                        &input.worktrees
+                    )
+                    .is_err()
+                );
+            }
+            let admitted = input.clone().apply_row_batch(&command_rows).unwrap();
+            assert_eq!(
+                admitted.source_watermarks["codex-session:session-a"].revisions
+                    [&watermark.source_revision],
+                watermark
+            );
+
+            let mut replay = ReducerState {
+                repositories: input.repositories.clone(),
+                worktrees: input.worktrees.clone(),
+                worktree_snapshots: input.worktree_snapshots.clone(),
+                session_imports: input.session_imports.clone(),
+                ..ReducerState::default()
+            };
+            for row in &rows {
+                apply_event(&mut replay, row, &command_rows).unwrap();
+            }
+            replay.validate_evidence_relations().unwrap();
+            assert_eq!(
+                replay.source_watermarks[&watermark.stable_key()].0,
+                watermark
+            );
+        }
+
+        let source = SourceInstanceId::parse("codex-session:session-a").unwrap();
+        let revision = SourceRevision::parse("revision-a").unwrap();
+        let mut watermarked = baseline.clone();
+        record_source_watermark(
+            &mut watermarked.source_watermarks,
+            SourceIngestWatermark {
+                source_instance_id: source.clone(),
+                source_revision: revision.clone(),
+                source_sequence: 1,
+                confirmed_prefix_digest: Some("1".repeat(64)),
+                earlier_prefix: None,
+            },
+        );
+        assert!(
+            watermarked
+                .apply_payload(
+                    JournalPayload::SessionImportEventRecorded(Box::new(event.clone())),
+                    4,
+                )
+                .is_err()
+        );
+        let mut receipted = baseline;
+        receipted.source_ranges.insert(
+            source_revision_ref(&source, &revision),
+            KnownSourceRange {
+                sequences: [1].into_iter().collect(),
+                receipt_ids: BTreeMap::new(),
+                sequence_origin: Some(0),
+                close_watermark: None,
+                eligible_event_manifest_refs: BTreeSet::new(),
+            },
+        );
+        assert!(
+            receipted
+                .apply_payload(
+                    JournalPayload::SessionImportEventRecorded(Box::new(event)),
+                    4,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn split_session_watermark_advances_one_contiguous_leg() {
+        let current = split_test_current(Some(5), false, true);
+        let suffix_receipt = split_test_receipt(5, 8);
+        let mut suffix = split_test_watermark(8, 5, 0, None, None);
+        suffix.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &suffix,
+                suffix_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &suffix_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &suffix,
+                Some(&suffix_receipt),
+                Some(&current),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(None, &suffix, None, Some(&current)),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let prefix_receipt = split_test_receipt(0, 2);
+        let prefix_digest = session_import_prefix_digest(
+            &suffix,
+            prefix_receipt.source_byte_range.as_ref().unwrap(),
+            None,
+            &prefix_receipt.cas_ref,
+        )
+        .unwrap();
+        let after_prefix = split_test_watermark(
+            8,
+            5,
+            2,
+            Some(prefix_digest.clone()),
+            suffix.confirmed_prefix_digest.clone(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&suffix),
+                &after_prefix,
+                Some(&prefix_receipt),
+                Some(&current),
+            ),
+            Ok(())
+        );
+
+        let prefix_advance = split_test_receipt(2, 3);
+        let next_prefix_digest = session_import_prefix_digest(
+            &after_prefix,
+            prefix_advance.source_byte_range.as_ref().unwrap(),
+            Some(prefix_digest.clone()),
+            &prefix_advance.cas_ref,
+        )
+        .unwrap();
+        let after_second_prefix = split_test_watermark(
+            8,
+            5,
+            3,
+            Some(next_prefix_digest),
+            suffix.confirmed_prefix_digest.clone(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &after_second_prefix,
+                Some(&prefix_advance),
+                Some(&current),
+            ),
+            Ok(())
+        );
+
+        let forged_previous = "2".repeat(64);
+        let forged_next_digest = session_import_prefix_digest(
+            &after_prefix,
+            prefix_advance.source_byte_range.as_ref().unwrap(),
+            Some(forged_previous),
+            &prefix_advance.cas_ref,
+        )
+        .unwrap();
+        let forged = split_test_watermark(
+            8,
+            5,
+            3,
+            Some(forged_next_digest),
+            suffix.confirmed_prefix_digest.clone(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &forged,
+                Some(&prefix_advance),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let suffix_gap = split_test_receipt(9, 10);
+        let mut gap = split_test_watermark(10, 5, 2, Some(prefix_digest.clone()), None);
+        gap.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &gap,
+                suffix_gap.source_byte_range.as_ref().unwrap(),
+                suffix.confirmed_prefix_digest.clone(),
+                &suffix_gap.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &gap,
+                Some(&suffix_gap),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let suffix_next = split_test_receipt(8, 10);
+        let mut after_suffix = split_test_watermark(10, 5, 2, Some(prefix_digest.clone()), None);
+        after_suffix.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &after_suffix,
+                suffix_next.source_byte_range.as_ref().unwrap(),
+                suffix.confirmed_prefix_digest.clone(),
+                &suffix_next.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &after_suffix,
+                Some(&suffix_next),
+                Some(&current),
+            ),
+            Ok(())
+        );
+        let both_legs = split_test_watermark(10, 5, 3, Some("3".repeat(64)), Some("4".repeat(64)));
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &both_legs,
+                Some(&suffix_next),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+        let mut cleared = split_test_watermark(10, 5, 0, None, Some("4".repeat(64)));
+        cleared.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &cleared,
+                suffix_next.source_byte_range.as_ref().unwrap(),
+                suffix.confirmed_prefix_digest.clone(),
+                &suffix_next.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &cleared,
+                Some(&suffix_next),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let empty_checkpoint = split_test_watermark(5, 5, 0, None, None);
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &empty_checkpoint,
+                None,
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+        let unresolved = split_test_current(None, false, true);
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &suffix,
+                Some(&suffix_receipt),
+                Some(&unresolved),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+        let closed = split_test_current(Some(5), true, true);
+        assert!(
+            closed
+                .import_scope(
+                    suffix_receipt.source_byte_range.as_ref().unwrap(),
+                    None,
+                    None
+                )
+                .is_err()
+        );
+
+        let history_first = split_test_receipt(0, 2);
+        let mut first_history = split_test_watermark(5, 5, 2, None, None);
+        first_history.earlier_prefix.as_mut().unwrap().digest = Some(
+            session_import_prefix_digest(
+                &first_history,
+                history_first.source_byte_range.as_ref().unwrap(),
+                None,
+                &history_first.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &first_history,
+                Some(&history_first),
+                Some(&current),
+            ),
+            Ok(())
+        );
+
+        let legacy = split_test_current(None, false, false);
+        let legacy_receipt = split_test_receipt(0, 1);
+        let mut legacy_watermark = SourceIngestWatermark {
+            source_instance_id: legacy_receipt.source_instance_id.clone(),
+            source_revision: legacy_receipt.source_revision.clone(),
+            source_sequence: 1,
+            confirmed_prefix_digest: None,
+            earlier_prefix: None,
+        };
+        legacy_watermark.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &legacy_watermark,
+                legacy_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &legacy_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &legacy_watermark,
+                Some(&legacy_receipt),
+                Some(&legacy),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn identical_split_watermark_without_receipt_is_idempotent() {
+        let watermark = split_test_watermark(8, 5, 0, None, Some("1".repeat(64)));
+        let mut state = ReducerState::default();
+        state
+            .source_watermarks
+            .insert(watermark.stable_key(), (watermark.clone(), 1));
+        state
+            .session_imports
+            .insert("session-a".into(), split_test_current(None, false, false));
+        let session_event = |revision| {
+            JournalPayload::SessionImportEventRecorded(Box::new(crate::SessionImportEvent {
+                session_id: "session-a".into(),
+                source_instance_id: None,
+                revision,
+                predecessor_revision: revision.checked_sub(1),
+                occurred_at_us: i64::try_from(revision).unwrap(),
+                event: crate::SessionImportEventKind::BodyStateAdvanced {
+                    body_state: crate::SessionBodyState::BlockedScopeUnresolved,
+                    reason: crate::BodyStateReason::ScopeUnresolved,
+                },
+            }))
+        };
+
+        let command = r105_command(
+            2,
+            vec![
+                JournalPayload::SourceIngestWatermark(watermark.clone()),
+                session_event(2),
+            ],
+        );
+        let prepared = prepare_command(&command).unwrap();
+        let rows = rows_for_append(&prepared, 2, 0).unwrap();
+        let command_rows = rows.iter().collect::<Vec<_>>();
+        for row in &rows {
+            apply_event(&mut state, row, &command_rows).unwrap();
+        }
+        assert_eq!(state.source_watermarks[&watermark.stable_key()].1, 1);
+
+        let mut invented = watermark;
+        let prefix = invented.earlier_prefix.as_mut().unwrap();
+        prefix.through_byte = 1;
+        prefix.digest = Some("2".repeat(64));
+        let command = r105_command(
+            3,
+            vec![
+                JournalPayload::SourceIngestWatermark(invented),
+                session_event(3),
+            ],
+        );
+        let prepared = prepare_command(&command).unwrap();
+        let rows = rows_for_append(&prepared, 3, 0).unwrap();
+        let command_rows = rows.iter().collect::<Vec<_>>();
+        let mut unchanged = state.clone();
+        assert_eq!(
+            apply_event(&mut unchanged, &rows[0], &command_rows),
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(state.source_watermarks.len(), 1);
+    }
+
     #[test]
     fn session_prefix_digest_is_required_only_for_codex_sources() {
         let codex = SourceIngestWatermark {
@@ -16564,11 +17713,50 @@ mod tests {
             source_revision: SourceRevision::parse("revision-a").unwrap(),
             source_sequence: 1,
             confirmed_prefix_digest: None,
+            earlier_prefix: None,
         };
+        let old_bytes = serde_json::to_vec(&codex).unwrap();
+        assert!(!String::from_utf8_lossy(&old_bytes).contains("earlier_prefix"));
+        let decoded: SourceIngestWatermark = serde_json::from_slice(&old_bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), old_bytes);
         assert_eq!(
             validate_confirmed_session_prefix(&codex),
             Err(StoreError::StoreCorrupt)
         );
+        let valid_split = split_test_watermark(8, 5, 0, None, Some("1".repeat(64)));
+        assert!(
+            JournalPayload::SourceIngestWatermark(valid_split.clone())
+                .validate()
+                .is_ok()
+        );
+        let mut empty_prefix_with_digest = valid_split.clone();
+        empty_prefix_with_digest
+            .earlier_prefix
+            .as_mut()
+            .unwrap()
+            .digest = Some("2".repeat(64));
+        assert!(
+            JournalPayload::SourceIngestWatermark(empty_prefix_with_digest)
+                .validate()
+                .is_err()
+        );
+        let mut nonempty_prefix_without_digest = valid_split.clone();
+        nonempty_prefix_without_digest
+            .earlier_prefix
+            .as_mut()
+            .unwrap()
+            .through_byte = 2;
+        assert!(
+            JournalPayload::SourceIngestWatermark(nonempty_prefix_without_digest)
+                .validate()
+                .is_err()
+        );
+        let missing_prefix_digest = serde_json::json!({
+            "source_instance_id":"codex-session:session-a", "source_revision":"revision-a",
+            "source_sequence":8, "confirmed_prefix_digest":"1".repeat(64),
+            "earlier_prefix":{"fence_byte":5,"through_byte":2}
+        });
+        assert!(serde_json::from_value::<SourceIngestWatermark>(missing_prefix_digest).is_err());
         let ordinary = SourceIngestWatermark {
             source_instance_id: SourceInstanceId::parse("ordinary-source").unwrap(),
             ..codex
@@ -16576,6 +17764,7 @@ mod tests {
         assert_eq!(validate_confirmed_session_prefix(&ordinary), Ok(false));
         let forged_ordinary = SourceIngestWatermark {
             confirmed_prefix_digest: Some("1".repeat(64)),
+            earlier_prefix: None,
             ..ordinary
         };
         assert_eq!(
@@ -16607,6 +17796,7 @@ mod tests {
                 source_revision: receipt.source_revision.clone(),
                 source_sequence: 1,
                 confirmed_prefix_digest: indexed.then(|| "1".repeat(64)),
+                earlier_prefix: None,
             };
             let mut incremental = JournalAdmissionState::default();
             if source == "ordinary-source" {
@@ -18451,6 +19641,7 @@ mod tests {
                 source_revision: receipt.source_revision.clone(),
                 source_sequence: receipt.source_sequence,
                 confirmed_prefix_digest: None,
+                earlier_prefix: None,
             }),
         ];
         if let Some(surface) = surface {

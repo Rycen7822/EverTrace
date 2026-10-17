@@ -6624,6 +6624,7 @@ fn verify_edit_acceptance_cohort(
         source_revision: verified.body.source_revision.clone(),
         source_sequence: 1,
         confirmed_prefix_digest: None,
+        earlier_prefix: None,
     };
     if payloads
         .iter()
@@ -6904,6 +6905,7 @@ fn verify_acceptance_payload_cohort(
                         source_revision: verified.body.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     } =>
             {
                 watermark_count += 1;

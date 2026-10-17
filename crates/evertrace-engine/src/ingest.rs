@@ -883,6 +883,7 @@ pub(crate) fn capture_event_drafts(
             source_revision: verified.body.source_revision.clone(),
             source_sequence: verified.body.source_sequence,
             confirmed_prefix_digest,
+            earlier_prefix: None,
         },
     ));
     if let Some(surface) = verified.surface.clone() {
@@ -951,6 +952,7 @@ fn projected_confirmed_prefix(
         source_revision: source_revision.clone(),
         source_sequence: 0,
         confirmed_prefix_digest: None,
+        earlier_prefix: None,
     }
     .stable_key();
     let Some(row) = snapshot.row(&format!("runtime:watermark:source:{key}")) else {

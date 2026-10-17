@@ -2491,6 +2491,7 @@ mod tests {
             source_revision: SourceRevision::parse(revision).unwrap(),
             source_sequence: sequence,
             confirmed_prefix_digest: None,
+            earlier_prefix: None,
         });
         crate::ObjectRow {
             row_id: format!("runtime:watermark:{source}:{revision}"),

@@ -371,12 +371,31 @@ pub struct SourceRevisionRecorded {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SourceImportEarlierPrefix {
+    pub fence_byte: u64,
+    pub through_byte: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub digest: Option<String>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceIngestWatermark {
     pub source_instance_id: SourceInstanceId,
     pub source_revision: SourceRevision,
     pub source_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_prefix_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earlier_prefix: Option<SourceImportEarlierPrefix>,
 }
 
 impl SourceIngestWatermark {
@@ -815,14 +834,23 @@ impl JournalPayload {
             Self::SourceIngestWatermark(value) => {
                 validate_identifier(value.source_instance_id.as_str())?;
                 validate_identifier(value.source_revision.as_str())?;
+                let invalid_digest = |digest: &str| {
+                    digest.len() != 64
+                        || digest
+                            .bytes()
+                            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+                };
                 if value
                     .confirmed_prefix_digest
                     .as_deref()
-                    .is_some_and(|digest| {
-                        digest.len() != 64
-                            || digest
-                                .bytes()
-                                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+                    .is_some_and(invalid_digest)
+                    || value.earlier_prefix.as_ref().is_some_and(|prefix| {
+                        prefix.through_byte > prefix.fence_byte
+                            || prefix.fence_byte > value.source_sequence
+                            || (prefix.through_byte == 0) != prefix.digest.is_none()
+                            || (prefix.fence_byte == value.source_sequence)
+                                != value.confirmed_prefix_digest.is_none()
+                            || prefix.digest.as_deref().is_some_and(invalid_digest)
                     })
                 {
                     return Err(StoreError::InvalidInput);
@@ -2351,6 +2379,17 @@ fn validate_evidence_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
     let watermark = watermarks[0];
     let surface_dirty = surface_dirty[0];
     let normalization_dirty = normalization_dirty[0];
+    let historical_prefix_receipt =
+        crate::session_import::is_session_import_source(watermark.source_instance_id.as_str())
+            && watermark.earlier_prefix.as_ref().is_some_and(|prefix| {
+                prefix.digest.is_some()
+                    && receipt.source_byte_range.as_ref().is_some_and(|range| {
+                        range.start < range.end
+                            && range.end == receipt.source_sequence
+                            && range.end == prefix.through_byte
+                            && range.end <= prefix.fence_byte
+                    })
+            });
     if receipt.source_observation_id != observation.source_observation_id
         || receipt.source_receipt_id != observation.source_receipt_ref
         || receipt.source_instance_id != observation.source_instance_id
@@ -2358,7 +2397,7 @@ fn validate_evidence_command(events: &[JournalEventDraft]) -> Result<(), StoreEr
         || receipt.source_record_identity != observation.source_record_identity
         || receipt.source_instance_id != watermark.source_instance_id
         || receipt.source_revision != watermark.source_revision
-        || receipt.source_sequence != watermark.source_sequence
+        || (receipt.source_sequence != watermark.source_sequence && !historical_prefix_receipt)
         || surface_dirty.target_id != observation.source_observation_id.to_string()
         || surface_dirty.source_watermark != receipt.source_sequence
         || normalization_dirty.target_id != observation.source_observation_id.to_string()

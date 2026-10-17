@@ -158,6 +158,7 @@ fn source_payloads(receipt: SourceReceipt, observation: SourceObservation) -> Ve
             source_revision: receipt.source_revision,
             source_sequence: 1,
             confirmed_prefix_digest: None,
+            earlier_prefix: None,
         }),
         JournalPayload::DirtyTarget(DirtyTarget {
             target_kind: DirtyTargetKind::EvidenceSurface,
