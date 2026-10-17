@@ -3230,6 +3230,15 @@ mod tests {
             serde_json::Value::Null,
             serde_json::json!({}),
             serde_json::json!({"client_authored":true,"fallback_token_limit_override":4096}),
+            serde_json::json!({
+                "client_authored": false,
+                "retained_source": {
+                    "id": {"message_id": "native-message", "turn_id": "native-turn", "role": "user"},
+                    "revision": "native-retained-revision", "complete": true
+                },
+                "user_input_order": 6,
+                "mcp_attribution": {"status": "none"}
+            }),
         ] {
             record["metadata"] = metadata;
             let visibility = classify_record(&serde_json::to_vec(&record).unwrap()).unwrap();
@@ -3370,6 +3379,13 @@ struct ResponseMetadata {
     _client_authored: bool,
     #[serde(rename = "fallback_token_limit_override")]
     _fallback_token_limit_override: Option<usize>,
+    // Observed native archive metadata never supplies binding or read authority.
+    #[serde(rename = "retained_source")]
+    _retained_source: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "user_input_order")]
+    _user_input_order: Option<u64>,
+    #[serde(rename = "mcp_attribution")]
+    _mcp_attribution: Option<serde::de::IgnoredAny>,
 }
 
 // The supported display-message subset of protocol/src/{protocol,items,user_input}.rs

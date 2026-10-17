@@ -812,6 +812,7 @@ impl SessionCatalogService {
                             SessionBodyState::NotImported
                                 | SessionBodyState::Imported
                                 | SessionBodyState::Partial
+                                | SessionBodyState::Failed
                                 | SessionBodyState::SourceReplaced
                         )
                         && current.access_decision != Some(SessionAccessDecision::Revoked)
@@ -3440,6 +3441,7 @@ fn metadata_events_internal(
                             SessionBodyState::NotImported
                                 | SessionBodyState::Partial
                                 | SessionBodyState::Imported
+                                | SessionBodyState::Failed
                                 | SessionBodyState::SourceReplaced
                         )
                 }
@@ -3625,7 +3627,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_prospective_origin_never_auto_queues_an_imported_session_append() {
+    fn prospective_appends_require_open_origin_and_complete_new_records() {
         let source = "session-rollout:019d0000-0000-7000-8000-000000000001:019d0000-0000-7000-8000-000000000001";
         let origin = ProspectiveSourceOrigin {
             snapshot_ref: evertrace_domain::ids::WorktreeSnapshotId::new_v7(),
@@ -3655,7 +3657,7 @@ mod tests {
             parser_version: 1,
             metadata_state: MetadataState::Indexed,
         };
-        let old = SessionImportCurrent {
+        let mut old = SessionImportCurrent {
             session_id: "019d0000-0000-7000-8000-000000000001".into(),
             source_instance_id: Some(source.into()),
             revision: 1,
@@ -3673,7 +3675,7 @@ mod tests {
             Some(&old),
             old.session_id.clone(),
             old.source_instance_id.clone(),
-            appended,
+            appended.clone(),
             2,
             true,
             &mut payloads,
@@ -3699,6 +3701,49 @@ mod tests {
                 if matches!(&event.event, SessionImportEventKind::MetadataObserved { metadata }
                     if metadata.prospective_origin.as_ref().is_some_and(|origin|
                         origin.closed && origin.record_start == Some(100)))
+        )));
+
+        old.body_state = SessionBodyState::Failed;
+        old.access_decision = None;
+        old.metadata.prospective_origin.as_mut().unwrap().closed = false;
+        appended.prospective_origin = old.metadata.prospective_origin.clone();
+        payloads.clear();
+        metadata_events_internal(
+            Some(&old),
+            old.session_id.clone(),
+            old.source_instance_id.clone(),
+            appended.clone(),
+            3,
+            true,
+            &mut payloads,
+        )
+        .unwrap();
+        assert!(payloads.iter().any(|payload| matches!(
+            payload, JournalPayload::SessionImportEventRecorded(event)
+                if matches!(event.event, SessionImportEventKind::BodyStateAdvanced {
+                    body_state: SessionBodyState::Queued, ..
+                })
+        )));
+        assert!(!payloads.iter().any(|payload| matches!(
+            payload, JournalPayload::SessionImportEventRecorded(event)
+                if matches!(event.event, SessionImportEventKind::AccessDecision { .. })
+        )));
+        payloads.clear();
+        metadata_events_internal(
+            Some(&old),
+            old.session_id.clone(),
+            old.source_instance_id.clone(),
+            appended,
+            4,
+            false,
+            &mut payloads,
+        )
+        .unwrap();
+        assert!(!payloads.iter().any(|payload| matches!(
+            payload, JournalPayload::SessionImportEventRecorded(event)
+                if matches!(event.event, SessionImportEventKind::BodyStateAdvanced {
+                    body_state: SessionBodyState::Queued, ..
+                })
         )));
     }
 
@@ -4006,6 +4051,7 @@ mod tests {
             _agent_nickname: None,
             _agent_path: None,
             _context_window: None,
+            _runtime_workspace_roots: None,
             _history_mode: None,
             _multi_agent_version: None,
             _parent_thread_id: None,
