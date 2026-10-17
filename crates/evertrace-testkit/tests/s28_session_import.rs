@@ -5680,6 +5680,44 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
         provider_backlog.current.metadata.file_size,
         provider_backlog.job
     );
+    assert!(provider_backlog.current.access_decision.is_none());
+    // The next existing record arrives in two writes. Metadata must catch up
+    // while this job is queued, without granting a read of the incomplete tail.
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&provider_transcript)
+        .unwrap();
+    file.write_all(b"{").unwrap();
+    drop(file);
+    let provider_followup_size = fs::metadata(&provider_transcript).unwrap().len();
+    assert!(provider_followup_size > provider_backlog.current.metadata.file_size);
+    let refresh_while_queued = catalog.refresh_active(&provider_report).await.unwrap();
+    let provider_refreshed = writer
+        .session_import_context(&provider_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(refresh_while_queued > 0);
+    assert_eq!(
+        provider_refreshed.current.metadata.file_size,
+        provider_followup_size
+    );
+    assert_eq!(
+        provider_refreshed.current.body_state,
+        provider_backlog.current.body_state
+    );
+    assert!(provider_refreshed.current.access_decision.is_none());
+    assert_eq!(
+        provider_refreshed.current.metadata.prospective_origin,
+        provider_backlog.current.metadata.prospective_origin
+    );
+    assert_eq!(provider_refreshed.watermark, provider_backlog.watermark);
+    let refreshed_job = provider_refreshed.job.as_ref().unwrap();
+    assert_eq!(
+        refreshed_job.job_id,
+        provider_backlog.job.as_ref().unwrap().job_id
+    );
+    assert_eq!(refreshed_job.state, JobStatus::Queued);
 
     assert_eq!(
         admin
@@ -5821,7 +5859,12 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
         .append(true)
         .open(&provider_transcript)
         .unwrap();
-    writeln!(file, "{cold_proof_provider_line}").unwrap();
+    writeln!(
+        file,
+        "{}",
+        cold_proof_provider_line.strip_prefix('{').unwrap()
+    )
+    .unwrap();
     drop(file);
     let provider_refresh = catalog.refresh_active(&provider_report).await.unwrap();
     let provider_cold_pending = writer

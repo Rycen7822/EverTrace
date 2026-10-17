@@ -809,7 +809,9 @@ impl SessionCatalogService {
                     !origin.closed
                         && matches!(
                             current.body_state,
-                            SessionBodyState::NotImported
+                            SessionBodyState::Queued
+                                | SessionBodyState::Importing
+                                | SessionBodyState::NotImported
                                 | SessionBodyState::Imported
                                 | SessionBodyState::Partial
                                 | SessionBodyState::Failed
