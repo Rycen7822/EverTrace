@@ -1628,8 +1628,15 @@ impl SessionImportWorker {
             .next()
             .map(|entry| entry.identity)
             .ok_or(SessionImportError::Changed)?;
-        if matches.next().is_some()
-            || identity.size != current.metadata.file_size
+        if matches.next().is_some() {
+            return Err(SessionImportError::Changed);
+        }
+        // Growth may be a normal append since the last catalog refresh; defer
+        // reading until refresh and the existing protected-prefix proof.
+        if identity.size > current.metadata.file_size {
+            return Err(SessionImportError::Unavailable);
+        }
+        if identity.size != current.metadata.file_size
             || session_source_fingerprint(identity).to_string()
                 != current.metadata.source_fingerprint
         {

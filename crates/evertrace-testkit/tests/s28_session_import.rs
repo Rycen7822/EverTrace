@@ -975,7 +975,43 @@ async fn imported_messages_scenario(
     let body = fs::read_to_string(&transcript).unwrap();
     let raw_delta = serde_json::json!({"type":"response_item","metadata":{},"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"marigold appended claim"}],"phase":"final_answer"}});
     let delta = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"AgentMessage","id":"agent-1","content":[{"type":"Text","text":"marigold appended claim"}],"phase":"final_answer","memory_citation":{"entries":[{"path":"notes.md","lineStart":1,"lineEnd":2,"note":"source claim"}],"rolloutIds":["prior-rollout"]},"delivery":"async","questions":[{"title":"Continue?","options":["yes","no"]}]},"started_at_ms":1788998401000i64,"completed_at_ms":1788998402000i64}});
-    fs::write(&transcript, format!("{body}{raw_delta}\n{delta}\n")).unwrap();
+    fs::write(&transcript, format!("{body}{raw_delta}\n")).unwrap();
+    catalog.refresh(&report_value).await.unwrap();
+    let refreshed = writer.project().await.unwrap();
+    let refreshed_current = SessionImportCurrentView::from_snapshot(&refreshed).unwrap();
+    let refreshed_source = &refreshed_current.sessions[&source];
+    assert_eq!(refreshed_source.body_state, SessionBodyState::Queued);
+    assert_eq!(
+        refreshed_source.metadata.file_size,
+        fs::metadata(&transcript).unwrap().len()
+    );
+    drop(refreshed);
+    {
+        use std::io::Write as _;
+        let mut transcript_file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(transcript_file, "{delta}").unwrap();
+    }
+    let frontier_before_stale_read = writer.project().await.unwrap().frontier;
+    assert!(matches!(
+        worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await,
+        Err(evertrace_engine::SessionImportError::Unavailable)
+    ));
+    assert_eq!(
+        writer.project().await.unwrap().frontier,
+        frontier_before_stale_read
+    );
     catalog.refresh(&report_value).await.unwrap();
     let mut imported_delta = 0;
     for _ in 0..3 {
