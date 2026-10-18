@@ -623,6 +623,15 @@ impl JournalWriter {
         self.admission_state.repository_read_context(ids)
     }
 
+    pub fn source_repository_read_context(
+        &self,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+        retained_ids: &std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+    ) -> Result<crate::projections::RepositoryReadContext, StoreError> {
+        self.admission_state
+            .source_repository_read_context(identity, retained_ids)
+    }
+
     pub fn inventory_context(
         &self,
         context: &evertrace_domain::inventory::InventoryContext,

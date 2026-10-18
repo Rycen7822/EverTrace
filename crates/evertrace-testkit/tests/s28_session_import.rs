@@ -1,7 +1,12 @@
 #[path = "../src/provider.rs"]
 #[allow(dead_code)]
 mod provider_stub;
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use evertrace_capture::{
     DeviceKeyStore, RUNTIME_SNAPSHOT_VERSION, RecallCueGateMode, RecoveryGateMode, RuntimeSnapshot,
@@ -24,6 +29,10 @@ use tempfile::TempDir;
 use tokio::sync::RwLock;
 
 const CONFIG: [u8; 32] = [28; 32];
+
+fn source_observation_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(2)
+}
 
 fn runtime(root: &std::path::Path) -> RuntimeSnapshot {
     RuntimeSnapshot {
@@ -3538,11 +3547,13 @@ async fn prefix_mutation_phase(fixture: DualProofMutationFixture) {
     catalog.refresh(&mutation_catalog_report).await.unwrap();
     let mutation_request = RequestId::new_v7();
     let mutation_reference = format!("native_session_source_observation:{mutation_request}");
+    let mutation_deadline = source_observation_deadline();
     let mutation_start_report = evertrace_engine::repository::observe_session_source_report(
         revoke_transcript.to_str().unwrap(),
         revoke_session,
         None,
         &mutation_reference,
+        mutation_deadline,
     )
     .unwrap();
     assert!(
@@ -3553,6 +3564,7 @@ async fn prefix_mutation_phase(fixture: DualProofMutationFixture) {
                 revoke_session,
                 revoke_transcript.to_str().unwrap(),
                 &mutation_reference,
+                mutation_deadline,
             )
             .await
             .unwrap()
@@ -3901,11 +3913,13 @@ async fn suffix_mutation_phase(fixture: DualProofMutationFixture) {
     let suffix_mutation_request = RequestId::new_v7();
     let suffix_mutation_reference =
         format!("native_session_source_observation:{suffix_mutation_request}");
+    let suffix_mutation_deadline = source_observation_deadline();
     let suffix_mutation_report = evertrace_engine::repository::observe_session_source_report(
         revoke_transcript.to_str().unwrap(),
         revoke_session,
         None,
         &suffix_mutation_reference,
+        suffix_mutation_deadline,
     )
     .unwrap();
     assert!(
@@ -3916,6 +3930,7 @@ async fn suffix_mutation_phase(fixture: DualProofMutationFixture) {
                 revoke_session,
                 revoke_transcript.to_str().unwrap(),
                 &suffix_mutation_reference,
+                suffix_mutation_deadline,
             )
             .await
             .unwrap()
@@ -4551,11 +4566,13 @@ async fn dual_proofs_reject_mutation_of_each_nonselected_leg() {
     catalog.refresh(&initial_catalog_report).await.unwrap();
     let initial_request = RequestId::new_v7();
     let initial_reference = format!("native_session_source_observation:{initial_request}");
+    let initial_deadline = source_observation_deadline();
     let report = evertrace_engine::repository::observe_session_source_report(
         transcript.to_str().unwrap(),
         session,
         None,
         &initial_reference,
+        initial_deadline,
     )
     .unwrap();
     let trust = evertrace_engine::repository::read_report_repository_trust(
@@ -4686,11 +4703,13 @@ async fn direct_source_replacement_observation_does_not_inherit_historical_scope
 
     let request_id = RequestId::new_v7();
     let source_reference = format!("native_session_source_observation:{request_id}");
+    let source_deadline = source_observation_deadline();
     let report = evertrace_engine::repository::observe_session_source_report(
         transcript.to_str().unwrap(),
         session,
         None,
         &source_reference,
+        source_deadline,
     )
     .unwrap();
     let current_repositories =
@@ -4712,6 +4731,7 @@ async fn direct_source_replacement_observation_does_not_inherit_historical_scope
             session,
             transcript.to_str().unwrap(),
             &source_reference,
+            source_deadline,
         )
         .await;
     assert!(
@@ -4847,11 +4867,13 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
     let observed_end = fs::metadata(&transcript).unwrap().len();
     let start_request = RequestId::new_v7();
     let start_reference = format!("native_session_source_observation:{start_request}");
+    let start_deadline = source_observation_deadline();
     let start_report = evertrace_engine::repository::observe_session_source_report(
         transcript.to_str().unwrap(),
         session,
         None,
         &start_reference,
+        start_deadline,
     )
     .unwrap();
     let source_trust = evertrace_engine::repository::read_report_repository_trust(
@@ -4871,6 +4893,7 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
             session,
             transcript.to_str().unwrap(),
             &start_reference,
+            start_deadline,
         )
         .await;
     assert!(
@@ -4887,14 +4910,20 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
             .native_session_source_observed(
                 session,
                 transcript.to_str().unwrap(),
-                Some(&start_report)
+                Some(&start_report),
+                start_deadline,
             )
             .await
             .unwrap()
     );
     assert!(
         !catalog
-            .native_session_source_observed(session, transcript.to_str().unwrap(), None)
+            .native_session_source_observed(
+                session,
+                transcript.to_str().unwrap(),
+                None,
+                source_observation_deadline(),
+            )
             .await
             .unwrap(),
         "an archived origin must not bypass rebuilding the daemon's current report"
@@ -5038,7 +5067,8 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
             .native_session_source_observed(
                 session,
                 transcript.to_str().unwrap(),
-                Some(&start_report)
+                Some(&start_report),
+                source_observation_deadline(),
             )
             .await
             .unwrap(),
@@ -5050,7 +5080,8 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
             .native_session_source_observed(
                 session,
                 transcript.to_str().unwrap(),
-                Some(&start_report)
+                Some(&start_report),
+                source_observation_deadline(),
             )
             .await
             .unwrap()
@@ -5579,11 +5610,13 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
     ));
     let provider_request = RequestId::new_v7();
     let provider_observation = format!("native_session_source_observation:{provider_request}");
+    let provider_deadline = source_observation_deadline();
     let provider_report = evertrace_engine::repository::observe_session_source_report(
         provider_transcript.to_str().unwrap(),
         provider_session,
         None,
         &provider_observation,
+        provider_deadline,
     )
     .unwrap();
     assert!(
@@ -5594,6 +5627,7 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
                 provider_session,
                 provider_transcript.to_str().unwrap(),
                 &provider_observation,
+                provider_deadline,
             )
             .await
             .unwrap()
@@ -5970,11 +6004,13 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
     fs::write(&revoke_transcript, format!("{historical_header}\n{historical_prefix}")).unwrap();
     let revoke_request = RequestId::new_v7();
     let revoke_reference = format!("native_session_source_observation:{revoke_request}");
+    let revoke_deadline = source_observation_deadline();
     let revoke_report = evertrace_engine::repository::observe_session_source_report(
         revoke_transcript.to_str().unwrap(),
         revoke_session,
         None,
         &revoke_reference,
+        revoke_deadline,
     )
     .unwrap();
     assert!(
@@ -5985,6 +6021,7 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
                 revoke_session,
                 revoke_transcript.to_str().unwrap(),
                 &revoke_reference,
+                revoke_deadline,
             )
             .await
             .unwrap()
@@ -6626,6 +6663,7 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
         session,
         None,
         "archived-replacement-scope-denied",
+        source_observation_deadline(),
     )
     .unwrap();
     *report.write().await = Some(replacement_report.clone());
@@ -6674,6 +6712,7 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
         session,
         None,
         "archived-original-scope-read",
+        source_observation_deadline(),
     )
     .unwrap();
     catalog.refresh(&archive_report).await.unwrap();
@@ -7005,11 +7044,13 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
     let replacement_observation = RequestId::new_v7();
     let replacement_observation_ref =
         format!("native_session_source_observation:{replacement_observation}");
+    let replacement_deadline = source_observation_deadline();
     let replacement_start_report = evertrace_engine::repository::observe_session_source_report(
         transcript.to_str().unwrap(),
         session,
         None,
         &replacement_observation_ref,
+        replacement_deadline,
     )
     .unwrap();
     assert!(
@@ -7020,6 +7061,7 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
                 session,
                 transcript.to_str().unwrap(),
                 &replacement_observation_ref,
+                replacement_deadline,
             )
             .await
             .unwrap()

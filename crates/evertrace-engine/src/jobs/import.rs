@@ -2789,11 +2789,13 @@ mod tests {
         catalog.refresh(&catalog_report).await.unwrap();
         let observation_request = RequestId::new_v7();
         let observation_ref = format!("native_session_source_observation:{observation_request}");
+        let observation_deadline = Instant::now() + Duration::from_secs(2);
         let source_report = crate::repository::observe_session_source_report(
             transcript.to_str().unwrap(),
             session,
             None,
             &observation_ref,
+            observation_deadline,
         )
         .unwrap();
         assert!(
@@ -2804,6 +2806,7 @@ mod tests {
                     session,
                     transcript.to_str().unwrap(),
                     &observation_ref,
+                    observation_deadline,
                 )
                 .await
                 .unwrap()

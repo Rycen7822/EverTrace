@@ -14,6 +14,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use evertrace_engine::{
@@ -568,60 +569,89 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     ProtocolCommand::ObserveSessionSource(observation) => {
-                        if context.client_kind != ClientKind::Hook || !observation.validate() {
-                            return Err(ErrorCode::Untrusted);
-                        }
-                        let thread_locator = observation
-                            .agent_id
-                            .as_deref()
-                            .unwrap_or(&observation.session_id)
-                            .to_owned();
-                        let current_report = session_catalog_report.read().await.clone();
-                        if session_catalog
-                            .native_session_source_observed(
-                                &thread_locator,
-                                &observation.transcript_path,
-                                current_report.as_ref(),
-                            )
-                            .await
-                            .map_err(|_| ErrorCode::Untrusted)?
-                        {
-                            let next = (*session_import_wakeup.borrow()).wrapping_add(1);
-                            session_import_wakeup.send_replace(next);
-                            return Ok(Response::SessionSourceObserved(
-                                evertrace_protocol::response::SessionSourceObservedResponse {
-                                    changed: false,
-                                },
-                            ));
-                        }
-                        let source_reference =
-                            format!("native_session_source_observation:{request_id}");
-                        let report = observe_session_source_report(
-                            &observation.transcript_path,
-                            &observation.session_id,
-                            observation.agent_id.as_deref(),
-                            &source_reference,
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        let (response, report) = tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(deadline),
+                            async {
+                                if context.client_kind != ClientKind::Hook
+                                    || !observation.validate()
+                                {
+                                    return Err(ErrorCode::Untrusted);
+                                }
+                                let thread_locator = observation
+                                    .agent_id
+                                    .as_deref()
+                                    .unwrap_or(&observation.session_id)
+                                    .to_owned();
+                                let current_report = session_catalog_report.read().await.clone();
+                                if session_catalog
+                                    .native_session_source_observed(
+                                        &thread_locator,
+                                        &observation.transcript_path,
+                                        current_report.as_ref(),
+                                        deadline,
+                                    )
+                                    .await
+                                    .map_err(|_| ErrorCode::Untrusted)?
+                                {
+                                    return Ok((
+                                        Response::SessionSourceObserved(
+                                            evertrace_protocol::response::SessionSourceObservedResponse {
+                                                changed: false,
+                                            },
+                                        ),
+                                        None,
+                                    ));
+                                }
+                                let source_reference =
+                                    format!("native_session_source_observation:{request_id}");
+                                let report = observe_session_source_report(
+                                    &observation.transcript_path,
+                                    &observation.session_id,
+                                    observation.agent_id.as_deref(),
+                                    &source_reference,
+                                    deadline,
+                                )
+                                .map_err(|_| ErrorCode::Untrusted)?;
+                                let changed = session_catalog
+                                    .observe_native_session_source(
+                                        request_id,
+                                        &report,
+                                        &thread_locator,
+                                        &observation.transcript_path,
+                                        &source_reference,
+                                        deadline,
+                                    )
+                                    .await
+                                    .map_err(|reason| {
+                                        tracing::warn!(target: "evertrace_lifecycle", ?reason, "native source observation rejected");
+                                        ErrorCode::Untrusted
+                                    })?;
+                                Ok((
+                                    Response::SessionSourceObserved(
+                                        evertrace_protocol::response::SessionSourceObservedResponse {
+                                            changed,
+                                        },
+                                    ),
+                                    Some(report),
+                                ))
+                            },
                         )
-                        .map_err(|_| ErrorCode::Untrusted)?;
-                        let changed = session_catalog
-                            .observe_native_session_source(
-                                request_id,
-                                &report,
-                                &thread_locator,
-                                &observation.transcript_path,
-                                &source_reference,
+                        .await
+                        .map_err(|_| ErrorCode::Untrusted)??;
+                        if let Some(report) = report {
+                            tokio::time::timeout_at(
+                                tokio::time::Instant::from_std(deadline),
+                                async {
+                                    *session_catalog_report.write().await = Some(report);
+                                },
                             )
                             .await
-                            .map_err(|reason| {
-                                tracing::warn!(target: "evertrace_lifecycle", ?reason, "native source observation rejected");
-                                ErrorCode::Untrusted
-                            })?;
-                        *session_catalog_report.write().await = Some(report);
+                            .map_err(|_| ErrorCode::Untrusted)?;
+                        }
                         let next = (*session_import_wakeup.borrow()).wrapping_add(1);
                         session_import_wakeup.send_replace(next);
-                        Ok(Response::SessionSourceObserved(
-                            evertrace_protocol::response::SessionSourceObservedResponse { changed },
-                        ))
+                        Ok(response)
                     }
                     ProtocolCommand::ConfigRead => {
                         if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }

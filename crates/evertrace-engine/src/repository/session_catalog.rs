@@ -146,13 +146,14 @@ pub fn observe_session_source_report(
     session_id: &str,
     agent_id: Option<&str>,
     source_reference: &str,
+    deadline: Instant,
 ) -> Result<HostProbeReport, SessionCatalogObservationError> {
     let (root, _) = observe_session_source_root_at(
         Some(transcript_path),
         session_id,
         agent_id,
         source_reference,
-        Instant::now() + SESSION_ROOT_PROBE_BUDGET,
+        deadline.min(Instant::now() + SESSION_ROOT_PROBE_BUDGET),
     )?;
     let context = ProbeContext {
         adapter_kind: AdapterKind::CodexHook,

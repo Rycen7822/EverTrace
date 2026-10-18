@@ -9210,6 +9210,26 @@ impl JournalAdmissionState {
         })
     }
 
+    pub(crate) fn source_repository_read_context(
+        &self,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+        retained_ids: &BTreeSet<RepositoryId>,
+    ) -> Result<RepositoryReadContext, StoreError> {
+        let mut ids = retained_ids.clone();
+        if ids.len() > 64 {
+            return Err(StoreError::InvalidInput);
+        }
+        for (id, (repository, _)) in &self.repositories {
+            if repository.common_dir_filesystem == Some(identity) {
+                ids.insert(*id);
+                if ids.len() > 64 {
+                    return Err(StoreError::InvalidInput);
+                }
+            }
+        }
+        self.repository_read_context(&ids)
+    }
+
     pub(crate) fn inventory_context(
         &self,
         context: &evertrace_domain::inventory::InventoryContext,
