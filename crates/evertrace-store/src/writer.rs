@@ -528,6 +528,107 @@ enum ProjectionReturn {
     CurrentFacts,
 }
 
+enum CommitCondition {
+    Frontier(u64),
+    SourceObservation(Box<crate::session_import::SourceObservationGuard>),
+}
+
+fn source_observation_command_matches(
+    command: &JournalCommand,
+    guard: &crate::session_import::SourceObservationGuard,
+) -> bool {
+    if command.command_id() != guard.selector.command_id {
+        return false;
+    }
+    let mut origin_snapshot = None;
+    let mut boundary_snapshot = None;
+    let mut boundary_worktree = None;
+    let mut matching_worktree_id = None;
+    let mut boundary_snapshot_worktree_id = None;
+    let mut matching_worktree_count = 0;
+    let mut metadata_count = 0;
+    let mut boundary_snapshots = 0;
+    let mut replacement_transition = None;
+    let mut metadata_revision = None;
+    let mut metadata_predecessor_revision = None;
+    for event in command.events() {
+        match &event.payload {
+            JournalPayload::SessionImportEventRecorded(value) => {
+                if value.session_id != guard.selector.session_id
+                    || value.source_instance_id.as_deref()
+                        != Some(guard.selector.source_instance_id.as_str())
+                {
+                    return false;
+                }
+                let crate::SessionImportEventKind::MetadataObserved { metadata } = &value.event
+                else {
+                    if matches!(
+                        &value.event,
+                        crate::SessionImportEventKind::BodyStateAdvanced {
+                            body_state: crate::SessionBodyState::SourceReplaced,
+                            reason: crate::BodyStateReason::SourceReplaced,
+                        }
+                    ) && replacement_transition.is_none()
+                    {
+                        replacement_transition = Some((value.revision, value.predecessor_revision));
+                        continue;
+                    }
+                    return false;
+                };
+                if metadata.source_revision != guard.selector.source_revision {
+                    return false;
+                }
+                let Some(origin) = metadata.prospective_origin.as_ref() else {
+                    return false;
+                };
+                if origin.closed {
+                    return false;
+                }
+                metadata_count += 1;
+                metadata_revision = Some(value.revision);
+                metadata_predecessor_revision = value.predecessor_revision;
+                origin_snapshot = Some(origin.snapshot_ref);
+            }
+            JournalPayload::WorktreeInstanceRecorded(worktree)
+                if worktree.lifecycle
+                    == evertrace_domain::repository::WorktreeLifecycle::Active
+                    && worktree.current_path.as_deref()
+                        == Some(guard.selector.s11.repository.root_path.as_str()) =>
+            {
+                matching_worktree_count += 1;
+                matching_worktree_id = Some(worktree.worktree_instance_id);
+                boundary_worktree = Some(worktree.current_snapshot_id);
+            }
+            JournalPayload::WorktreeSnapshotRecorded(snapshot)
+                if snapshot
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference == &guard.selector.s11.source_reference) =>
+            {
+                boundary_snapshots += 1;
+                boundary_snapshot_worktree_id = Some(snapshot.worktree_instance_id);
+                boundary_snapshot = Some(snapshot.worktree_snapshot_id);
+            }
+            _ => {}
+        }
+    }
+    let replacement_transition_matches =
+        replacement_transition.is_none_or(|(revision, predecessor)| {
+            predecessor.is_some_and(|predecessor| predecessor.checked_add(1) == Some(revision))
+                && metadata_predecessor_revision == Some(revision)
+                && revision.checked_add(1) == metadata_revision
+        });
+    metadata_count == 1
+        && boundary_snapshots == 1
+        && matching_worktree_count == 1
+        && matching_worktree_id.is_some()
+        && matching_worktree_id == boundary_snapshot_worktree_id
+        && origin_snapshot.is_some()
+        && origin_snapshot == boundary_snapshot
+        && boundary_worktree.flatten() == boundary_snapshot
+        && replacement_transition_matches
+}
+
 pub struct JournalWriter {
     sqlite: SqliteHandle,
     search: Table,
@@ -630,6 +731,27 @@ impl JournalWriter {
     ) -> Result<crate::projections::RepositoryReadContext, StoreError> {
         self.admission_state
             .source_repository_read_context(identity, retained_ids)
+    }
+
+    pub async fn source_observation_authority_context(
+        &self,
+        selector: &crate::session_import::SourceObservationRepositorySelector,
+    ) -> Result<crate::RepositoryReadContext, StoreError> {
+        self.validated_current_read(|state, _| {
+            state.source_observation_repository_read_context(selector)
+        })
+        .await
+    }
+
+    pub async fn source_observation_revision_has_facts(
+        &self,
+        source: &evertrace_domain::evidence::SourceInstanceId,
+        revision: &evertrace_domain::evidence::SourceRevision,
+    ) -> Result<bool, StoreError> {
+        self.validated_current_read(|state, _| {
+            Ok(state.source_observation_revision_has_facts(source, revision))
+        })
+        .await
     }
 
     pub fn inventory_context(
@@ -1098,8 +1220,26 @@ impl JournalWriter {
         ingested_at_us: i64,
         expected_frontier: u64,
     ) -> Result<CommitOutcome, StoreError> {
-        self.commit_inner(command, ingested_at_us, Some(expected_frontier))
-            .await
+        self.commit_inner(
+            command,
+            ingested_at_us,
+            Some(CommitCondition::Frontier(expected_frontier)),
+        )
+        .await
+    }
+
+    pub async fn commit_source_observation(
+        &mut self,
+        command: &JournalCommand,
+        ingested_at_us: i64,
+        guard: crate::session_import::SourceObservationGuard,
+    ) -> Result<CommitOutcome, StoreError> {
+        self.commit_inner(
+            command,
+            ingested_at_us,
+            Some(CommitCondition::SourceObservation(Box::new(guard))),
+        )
+        .await
     }
 
     pub async fn committed_command(
@@ -1151,7 +1291,7 @@ impl JournalWriter {
         &mut self,
         command: &JournalCommand,
         ingested_at_us: i64,
-        expected_frontier: Option<u64>,
+        condition: Option<CommitCondition>,
     ) -> Result<CommitOutcome, StoreError> {
         if ingested_at_us < 0
             || command
@@ -1162,6 +1302,11 @@ impl JournalWriter {
             return Err(StoreError::InvalidInput);
         }
         let prepared = prepare_command(command)?;
+        if let Some(CommitCondition::SourceObservation(guard)) = &condition
+            && !source_observation_command_matches(command, guard)
+        {
+            return Err(StoreError::InvalidInput);
+        }
         // Persisted replay still requires a live, identity-bound store. Keep
         // replay ahead of the logical expected-frontier comparison, but do
         // not acknowledge rows through a replaced root or poisoned handle.
@@ -1170,10 +1315,19 @@ impl JournalWriter {
         if let Some(outcome) = replay_outcome(&existing, &prepared)? {
             return Ok(outcome);
         }
-        if let Some(expected) = expected_frontier
-            && live.frontier != expected
-        {
-            return Err(StoreError::StaleFrontier);
+        match condition {
+            Some(CommitCondition::Frontier(expected)) if live.frontier != expected => {
+                return Err(StoreError::StaleFrontier);
+            }
+            Some(CommitCondition::SourceObservation(guard)) => {
+                let matches = self
+                    .admission_state
+                    .source_observation_guard_matches(&guard)?;
+                if !matches {
+                    return Err(StoreError::StaleFrontier);
+                }
+            }
+            _ => {}
         }
         let next_admission_state = self.admission_state.apply_command(command, self.next_seq)?;
         let first_seq = reserve_range(&mut self.next_seq, prepared.event_count)?;
@@ -3407,6 +3561,226 @@ mod tests {
             writer.capture_current_context(None, None, 8).await,
             Err(StoreError::StoreCorrupt)
         ));
+    }
+
+    #[tokio::test]
+    async fn source_observation_replay_precedes_changed_guard_and_conflict_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let session_id = "019d0000-0000-7000-8000-0000000000e1";
+        let source = SourceInstanceId::parse(format!(
+            "session-rollout:{session_id}:019d0000-0000-7000-8000-0000000000e2"
+        ))
+        .unwrap();
+        let source_revision = SourceRevision::parse("same-logical-revision").unwrap();
+        let command_id = CommandId::new_v7();
+        let request_id = evertrace_domain::ids::RequestId::new_v7();
+        let source_reference = "native_session_source_observation:r494-replay".to_owned();
+        let repository_id = RepositoryId::new_v7();
+        let worktree_id = evertrace_domain::ids::WorktreeId::new_v7();
+        let snapshot_id = evertrace_domain::ids::WorktreeSnapshotId::new_v7();
+        let path_observation = |path: &str| evertrace_domain::repository::PathObservation {
+            path: path.into(),
+            first_observed_at_us: 1,
+            last_observed_at_us: 1,
+            evidence_refs: vec![source_reference.clone()],
+        };
+        let build_command = |source_fingerprint: String| {
+            let repository = evertrace_domain::repository::RepositoryInstance {
+                repository_id,
+                repository_revision: 1,
+                predecessor_revision: None,
+                current_path: "/repo".into(),
+                path_history: vec![path_observation("/repo")],
+                git_common_dir_path: Some("/repo/.git".into()),
+                common_dir_filesystem: Some(FilesystemIdentity {
+                    device: 1,
+                    inode: 2,
+                }),
+                object_format: Some(GitObjectFormat::Sha1),
+                remote_fingerprints: Vec::new(),
+                derived_from: None,
+                identity_evidence_refs: vec![source_reference.clone()],
+                recorded_at_us: 1,
+                user_disabled: false,
+                capability_state: None,
+            };
+            let worktree = evertrace_domain::repository::WorktreeInstance {
+                worktree_instance_id: worktree_id,
+                worktree_revision: 1,
+                predecessor_revision: None,
+                repository_instance_id: repository_id,
+                kind: evertrace_domain::repository::WorktreeKind::Main,
+                lifecycle: evertrace_domain::repository::WorktreeLifecycle::Active,
+                current_path: Some("/repo".into()),
+                path_history: vec![path_observation("/repo")],
+                git_admin_path_history: vec![path_observation("/repo/.git")],
+                git_registration_state:
+                    evertrace_domain::repository::GitRegistrationState::Registered,
+                current_snapshot_id: Some(snapshot_id),
+                created_event_ref: source_reference.clone(),
+                terminal_event_ref: None,
+                recreated_from_worktree_instance_id: None,
+                recorded_at_us: 1,
+            };
+            let snapshot = evertrace_domain::repository::WorktreeSnapshot {
+                worktree_snapshot_id: snapshot_id,
+                worktree_instance_id: worktree_id,
+                head_oid: None,
+                tree_oid: None,
+                branch_ref: None,
+                detached_head: false,
+                tracked_diff_digest: None,
+                index_digest: None,
+                untracked_manifest_digest: None,
+                relevant_anchor_digests: Vec::new(),
+                dependency_fingerprints: Vec::new(),
+                toolchain_fingerprint: None,
+                git_operation: evertrace_domain::repository::GitOperation::None,
+                captured_at_us: 1,
+                evidence_refs: vec![source_reference.clone()],
+                capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Complete,
+                omission_reasons: Vec::new(),
+            };
+            let metadata = crate::SessionMetadata {
+                source_path: "/sessions/replay-source.jsonl".into(),
+                source_format: "codex_rollout_jsonl_v1".into(),
+                started_at_us: Some(1),
+                ended_at_us: None,
+                host: None,
+                model_profile: None,
+                workspace_hint: Some("/repo".into()),
+                repository_hint: None,
+                worktree_hint: None,
+                workspace_resolution_kind: crate::WorkspaceResolutionKind::Repository,
+                resolved_repository_instance_id: Some(repository_id),
+                resolved_worktree_instance_id: Some(worktree_id),
+                repository_read_restrictions: Some(vec![repository_id]),
+                prospective_origin: Some(crate::ProspectiveSourceOrigin {
+                    snapshot_ref: snapshot_id,
+                    observed_end: 1,
+                    record_start: Some(1),
+                    closed: false,
+                }),
+                file_size: 1,
+                file_mtime_us: 1,
+                source_fingerprint,
+                source_revision: source_revision.clone(),
+                parser_version: 1,
+                metadata_state: crate::MetadataState::Indexed,
+            };
+            let payloads = vec![
+                JournalPayload::RepositoryInstanceRecorded(Box::new(repository)),
+                JournalPayload::WorktreeInstanceRecorded(Box::new(worktree)),
+                JournalPayload::WorktreeSnapshotRecorded(Box::new(snapshot)),
+                JournalPayload::SessionImportEventRecorded(Box::new(crate::SessionImportEvent {
+                    session_id: session_id.into(),
+                    source_instance_id: Some(source.as_str().into()),
+                    revision: 1,
+                    predecessor_revision: None,
+                    occurred_at_us: 1,
+                    event: crate::SessionImportEventKind::MetadataObserved {
+                        metadata: Box::new(metadata),
+                    },
+                })),
+            ];
+            JournalCommand::new(
+                command_id,
+                payloads
+                    .into_iter()
+                    .map(|payload| {
+                        JournalEventDraft::runtime(1, [1; 32], "session_import_admin_v1", payload)
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let original = build_command(
+            evertrace_capture::CasDigest::for_protected_bytes(b"source-a").to_string(),
+        );
+        let repository_selector = crate::session_import::SourceObservationRepositorySelector {
+            identity: FilesystemIdentity {
+                device: 1,
+                inode: 2,
+            },
+            root_path: "/repo".into(),
+            workspace_hints: std::collections::BTreeSet::from(["/repo".into()]),
+            retained_repository_ids: std::collections::BTreeSet::new(),
+        };
+        let authority = writer
+            .source_observation_authority_context(&repository_selector)
+            .await
+            .unwrap();
+        let guard = crate::session_import::SourceObservationGuard::from_preparation(
+            crate::session_import::SourceObservationGuardInput {
+                selector: crate::session_import::SourceObservationGuardSelector {
+                    session_id: session_id.into(),
+                    source_instance_id: source.clone(),
+                    source_revision: source_revision.clone(),
+                    command_id,
+                    s11: crate::session_import::SourceObservationS11Selector {
+                        repository: repository_selector,
+                        source_reference: source_reference.clone(),
+                        worktree_entry_paths: std::collections::BTreeSet::from(["/repo".into()]),
+                    },
+                },
+                source_slots: std::collections::BTreeMap::from([
+                    (session_id.into(), None),
+                    (source.as_str().into(), None),
+                ]),
+                source_progress: Vec::new(),
+                target_revision_has_facts: false,
+                raw_repositories: authority,
+            },
+            crate::session_import::SourceObservationS11Facts::default(),
+        )
+        .unwrap();
+        let first = writer
+            .commit_source_observation(&original, 1, guard.clone())
+            .await
+            .unwrap();
+        let revoke = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                2,
+                [1; 32],
+                "session_import_admin_v1",
+                JournalPayload::SessionImportEventRecorded(Box::new(crate::SessionImportEvent {
+                    session_id: session_id.into(),
+                    source_instance_id: Some(source.as_str().into()),
+                    revision: 2,
+                    predecessor_revision: Some(1),
+                    occurred_at_us: 2,
+                    event: crate::SessionImportEventKind::AccessDecision {
+                        decision: crate::SessionAccessDecision::Revoked,
+                        local_request_ref: request_id,
+                        provenance_refs: vec![source_reference.clone()],
+                    },
+                })),
+            )],
+        )
+        .unwrap();
+        writer.commit(&revoke, 2).await.unwrap();
+        let count_after_permission_change = writer.journal_rows().await.unwrap().len();
+        let replay = writer
+            .commit_source_observation(&original, 3, guard.clone())
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.first_seq, first.first_seq);
+        assert_eq!(replay.last_seq, first.last_seq);
+        let conflict = build_command(
+            evertrace_capture::CasDigest::for_protected_bytes(b"source-b").to_string(),
+        );
+        assert_eq!(
+            writer.commit_source_observation(&conflict, 3, guard).await,
+            Err(StoreError::IdempotencyConflict)
+        );
+        assert_eq!(
+            writer.journal_rows().await.unwrap().len(),
+            count_after_permission_change
+        );
     }
 
     #[tokio::test]

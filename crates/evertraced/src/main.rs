@@ -437,7 +437,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let maintenance_active = Arc::clone(&handler_maintenance_active);
             let dispatch_gate = Arc::clone(&handler_dispatch_gate);
             async move {
-                if maintenance_active.load(Ordering::Acquire) {
+                let observation_deadline = match &command {
+                    ProtocolCommand::ObserveSessionSource(observation) => {
+                        if context.client_kind != ClientKind::Hook || !observation.validate() {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        Some(Instant::now() + Duration::from_secs(2))
+                    }
+                    _ => None,
+                };
+                let mut observation_permit = if let Some(deadline) = observation_deadline {
+                    Some(
+                        session_catalog.acquire_source_observation_permit(deadline)
+                        .await
+                        .map_err(|_| ErrorCode::Untrusted)?,
+                    )
+                } else {
+                    None
+                };
+                if observation_permit.is_none() && maintenance_active.load(Ordering::Acquire) {
                     if !matches!(&command, ProtocolCommand::Health) {
                         return Err(ErrorCode::MaintenanceMode);
                     }
@@ -452,11 +470,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         host_canary: host_canary.current().map(map_host_canary),
                     }));
                 }
-                let _dispatch = dispatch_gate.read_owned().await;
+                let _dispatch = if let Some(deadline) = observation_deadline {
+                    tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        dispatch_gate.read_owned(),
+                    )
+                    .await
+                    .map_err(|_| ErrorCode::Untrusted)?
+                } else {
+                    dispatch_gate.read_owned().await
+                };
                 if maintenance_active.load(Ordering::Acquire) {
                     return Err(ErrorCode::MaintenanceMode);
                 }
-                let config_snapshot = config_reload.admit().await.map_err(|_| ErrorCode::MaintenanceMode)?;
+                let config_snapshot = if let Some(deadline) = observation_deadline {
+                    tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        config_reload.admit(),
+                    )
+                    .await
+                    .map_err(|_| ErrorCode::Untrusted)?
+                } else {
+                    config_reload.admit().await
+                }
+                .map_err(|_| ErrorCode::MaintenanceMode)?;
                 let mcp_service = mcp_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let human_governance = human_governance.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recovery_service = recovery_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
@@ -569,15 +606,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     ProtocolCommand::ObserveSessionSource(observation) => {
-                        let deadline = Instant::now() + Duration::from_secs(2);
+                        let deadline = observation_deadline.ok_or(ErrorCode::Internal)?;
                         let (response, report) = tokio::time::timeout_at(
                             tokio::time::Instant::from_std(deadline),
                             async {
-                                if context.client_kind != ClientKind::Hook
-                                    || !observation.validate()
-                                {
-                                    return Err(ErrorCode::Untrusted);
-                                }
                                 let thread_locator = observation
                                     .agent_id
                                     .as_deref()
@@ -613,14 +645,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     deadline,
                                 )
                                 .map_err(|_| ErrorCode::Untrusted)?;
+                                let permit = observation_permit.take().ok_or(ErrorCode::Internal)?;
                                 let changed = session_catalog
-                                    .observe_native_session_source(
+                                    .observe_native_session_source_with_permit(
                                         request_id,
                                         &report,
                                         &thread_locator,
                                         &observation.transcript_path,
                                         &source_reference,
-                                        deadline,
+                                        permit,
                                     )
                                     .await
                                     .map_err(|reason| {

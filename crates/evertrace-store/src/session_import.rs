@@ -4,10 +4,11 @@ use crate::ProjectionSnapshot;
 use crate::{ObjectRow, ObjectRowClass, ObjectRowKind, StoreError};
 use evertrace_capture::CasDigest;
 use evertrace_domain::{
-    evidence::SourceRevision,
-    ids::{RepositoryId, RequestId, WorktreeId, WorktreeSnapshotId},
+    evidence::{SourceInstanceId, SourceRevision},
+    ids::{CommandId, RepositoryId, RequestId, WorktreeId, WorktreeSnapshotId},
+    repository::{FilesystemIdentity, RepositoryInstance, WorktreeInstance, WorktreeSnapshot},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 pub const SESSION_IMPORT_ROW_PREFIX: &str = "runtime:session_import:";
@@ -33,6 +34,94 @@ pub struct SessionImportContext {
     /// transient query result must never be interpreted as complete negative
     /// continuity evidence; it is not a journal field or projected state.
     pub incomplete_repository_history: Vec<RepositoryId>,
+}
+
+/// The bounded repository inputs used to select source-observation authority
+/// and resolver preimages. This is request-local and never serialized.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceObservationRepositorySelector {
+    pub identity: FilesystemIdentity,
+    pub root_path: String,
+    pub workspace_hints: BTreeSet<String>,
+    pub retained_repository_ids: BTreeSet<RepositoryId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceObservationS11Selector {
+    pub repository: SourceObservationRepositorySelector,
+    pub source_reference: String,
+    pub worktree_entry_paths: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceObservationGuardSelector {
+    pub session_id: String,
+    pub source_instance_id: SourceInstanceId,
+    pub source_revision: SourceRevision,
+    pub command_id: CommandId,
+    pub s11: SourceObservationS11Selector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceObservationProgress {
+    pub source_instance_id: SourceInstanceId,
+    pub source_revision: SourceRevision,
+    pub watermark: Option<crate::SourceIngestWatermark>,
+    pub recorded_prefix_end: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceObservationS11Facts {
+    pub repositories: BTreeMap<RepositoryId, RepositoryInstance>,
+    pub worktrees: BTreeMap<WorktreeId, WorktreeInstance>,
+    pub snapshots: BTreeMap<WorktreeSnapshotId, WorktreeSnapshot>,
+}
+
+/// Inputs taken from the actual source/catalog reads before resolver upserts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceObservationGuardInput {
+    pub selector: SourceObservationGuardSelector,
+    /// Both canonical and legacy keys are present, including explicit None.
+    pub source_slots: BTreeMap<String, Option<SessionImportCurrent>>,
+    pub source_progress: Vec<SourceObservationProgress>,
+    pub target_revision_has_facts: bool,
+    pub raw_repositories: crate::RepositoryReadContext,
+}
+
+/// Closed, non-serialized compare set for one native source observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceObservationGuard {
+    pub(crate) selector: SourceObservationGuardSelector,
+    pub(crate) source_slots: BTreeMap<String, Option<SessionImportCurrent>>,
+    pub(crate) source_progress: Vec<SourceObservationProgress>,
+    pub(crate) raw_repositories: BTreeMap<RepositoryId, RepositoryInstance>,
+    pub(crate) raw_purged: BTreeSet<RepositoryId>,
+    pub(crate) s11_facts: SourceObservationS11Facts,
+}
+
+impl SourceObservationGuard {
+    pub fn from_preparation(
+        input: SourceObservationGuardInput,
+        s11_facts: SourceObservationS11Facts,
+    ) -> Result<Self, StoreError> {
+        let source_keys = BTreeSet::from([
+            input.selector.session_id.clone(),
+            input.selector.source_instance_id.as_str().to_owned(),
+        ]);
+        if input.target_revision_has_facts
+            || input.source_slots.keys().cloned().collect::<BTreeSet<_>>() != source_keys
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        Ok(Self {
+            selector: input.selector,
+            source_slots: input.source_slots,
+            source_progress: input.source_progress,
+            raw_repositories: input.raw_repositories.repositories,
+            raw_purged: input.raw_repositories.purged,
+            s11_facts,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -435,7 +524,11 @@ impl SessionImportCurrent {
 
 impl SessionMetadata {
     pub fn workspace_matches_path(&self, path: &str) -> bool {
-        self.workspace_hint.as_deref().is_some_and(|workspace| {
+        Self::workspace_hint_matches_path(self.workspace_hint.as_deref(), path)
+    }
+
+    pub fn workspace_hint_matches_path(workspace_hint: Option<&str>, path: &str) -> bool {
+        workspace_hint.is_some_and(|workspace| {
             std::path::Path::new(workspace).is_absolute()
                 && std::path::Path::new(path).is_absolute()
                 && std::path::Path::new(workspace).starts_with(path)

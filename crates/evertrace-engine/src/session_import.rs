@@ -8,7 +8,7 @@ pub use frozen_memory_export::{
 };
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -32,10 +32,13 @@ use evertrace_store::{
     JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
     MetadataState, ProspectiveSourceOrigin, SessionAccessDecision, SessionBodyState,
     SessionImportCurrent, SessionImportCurrentView, SessionImportEvent, SessionImportEventKind,
-    SessionMetadata, SourceKind, WorkspaceResolutionKind, repository::RepositoryCurrentView,
+    SessionMetadata, SourceKind, SourceObservationGuard, SourceObservationGuardInput,
+    SourceObservationGuardSelector, SourceObservationProgress, SourceObservationRepositorySelector,
+    SourceObservationS11Facts, SourceObservationS11Selector, WorkspaceResolutionKind,
+    repository::RepositoryCurrentView,
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 #[cfg(test)]
 use tokio::sync::{Semaphore, mpsc};
 
@@ -118,13 +121,9 @@ pub struct SessionCatalogService {
     observation_commit_seam: Option<Arc<ObservationCommitSeam>>,
 }
 
-// Per-request preparation only: these identities survive one definitely
-// uncommitted attempt so filtered absence cannot erase a restriction.
-struct SourceObservationPreparation {
-    budget: SessionCatalogBudget,
-    source_key: Option<String>,
-    repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
-    identity_repository_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
+pub struct SourceObservationPermit {
+    _cursor: OwnedMutexGuard<CatalogCursor>,
+    deadline: Instant,
 }
 
 #[cfg(test)]
@@ -244,6 +243,22 @@ impl SessionCatalogService {
         self
     }
 
+    pub async fn acquire_source_observation_permit(
+        &self,
+        deadline: Instant,
+    ) -> Result<SourceObservationPermit, SessionImportServiceError> {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            Arc::clone(&self.cursor).lock_owned(),
+        )
+        .await
+        .map(|cursor| SourceObservationPermit {
+            _cursor: cursor,
+            deadline,
+        })
+        .map_err(|_| SessionImportServiceError::Unavailable)
+    }
+
     pub async fn observe_native_session_source(
         &self,
         request_id: RequestId,
@@ -253,48 +268,36 @@ impl SessionCatalogService {
         source_reference: &str,
         deadline: Instant,
     ) -> Result<bool, SessionImportServiceError> {
-        let mut preparation = SourceObservationPreparation {
-            budget: SessionCatalogBudget {
-                max_entries: 8,
-                max_metadata_bytes: 4 * 1024 * 1024,
-                deadline,
-            },
-            source_key: None,
-            repository_ids: Default::default(),
-            identity_repository_ids: Default::default(),
-        };
-        for attempt in 0..2 {
-            if Instant::now() >= deadline {
-                return Err(SessionImportServiceError::Unavailable);
-            }
-            match self
-                .observe_native_session_source_attempt(
-                    request_id,
-                    report,
-                    session_id,
-                    transcript_path,
-                    source_reference,
-                    &mut preparation,
-                )
-                .await
-            {
-                Err(SessionImportServiceError::StaleFrontier) if attempt == 0 => continue,
-                result => return result,
-            }
-        }
-        Err(SessionImportServiceError::StaleFrontier)
+        let permit = self.acquire_source_observation_permit(deadline).await?;
+        self.observe_native_session_source_with_permit(
+            request_id,
+            report,
+            session_id,
+            transcript_path,
+            source_reference,
+            permit,
+        )
+        .await
     }
 
-    async fn observe_native_session_source_attempt(
+    pub async fn observe_native_session_source_with_permit(
         &self,
         request_id: RequestId,
         report: &HostProbeReport,
         session_id: &str,
         transcript_path: &str,
         source_reference: &str,
-        preparation: &mut SourceObservationPreparation,
+        permit: SourceObservationPermit,
     ) -> Result<bool, SessionImportServiceError> {
-        let deadline = preparation.budget.deadline;
+        let deadline = permit.deadline;
+        if Instant::now() >= deadline {
+            return Err(SessionImportServiceError::Unavailable);
+        }
+        let budget = SessionCatalogBudget {
+            max_entries: 8,
+            max_metadata_bytes: 4 * 1024 * 1024,
+            deadline,
+        };
         let (expected_root, relative) =
             evertrace_codex::session_import::native_session_path(transcript_path)
                 .map_err(|_| SessionImportServiceError::Unavailable)?;
@@ -320,7 +323,7 @@ impl SessionCatalogService {
             last_scanned: None,
             has_more: false,
             unavailable: false,
-            remaining: preparation.budget,
+            remaining: budget,
         };
         let relative = relative.to_string_lossy().into_owned();
         let item = page
@@ -333,13 +336,15 @@ impl SessionCatalogService {
             .ok_or(SessionImportServiceError::Unavailable)?;
         let had_catalog_source = current_catalog_source(&catalog.sessions, &item).is_some();
         drop(catalog.sessions);
-        let mut source_keys = vec![item.session_id.clone(), item.source_instance_id.clone()];
-        if let Some(key) = preparation.source_key.as_ref()
-            && !source_keys.iter().any(|candidate| candidate == key)
-        {
-            source_keys.push(key.clone());
-        }
+        let source_instance_id =
+            evertrace_domain::evidence::SourceInstanceId::parse(item.source_instance_id.clone())
+                .map_err(|_| SessionImportServiceError::Unavailable)?;
+        let mut source_revision = item.metadata.source_revision.clone();
+        let source_keys =
+            BTreeSet::from([item.session_id.clone(), item.source_instance_id.clone()]);
         let mut raw_contexts = BTreeMap::new();
+        let mut source_slots = BTreeMap::new();
+        let mut source_progress = Vec::new();
         for key in source_keys {
             let context = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -349,22 +354,36 @@ impl SessionCatalogService {
             .map_err(|_| SessionImportServiceError::Unavailable)?
             .map_err(map_writer)?;
             let Some(context) = context else {
+                source_slots.insert(key, None);
                 continue;
             };
-            if context.frontier != frontier {
-                preparation.budget = page.remaining;
-                return Err(SessionImportServiceError::StaleFrontier);
-            }
             if context.current.source_key() != key {
                 return Err(SessionImportServiceError::Corrupt);
             }
+            let current = context.current.clone();
+            let source = evertrace_domain::evidence::SourceInstanceId::parse(
+                current.source_instance().to_owned(),
+            )
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+            source_progress.push(SourceObservationProgress {
+                source_instance_id: source,
+                source_revision: current.metadata.source_revision.clone(),
+                watermark: context.watermark.clone(),
+                recorded_prefix_end: context.recorded_prefix_end,
+            });
+            source_slots.insert(key.clone(), Some(current));
             raw_contexts.insert(key, context);
         }
         let raw_sources = SessionImportCurrentView {
             frontier,
             sessions: raw_contexts
-                .iter()
-                .map(|(key, context)| (key.clone(), context.current.clone()))
+                .keys()
+                .filter_map(|key| {
+                    source_slots
+                        .get(key)
+                        .and_then(Option::as_ref)
+                        .map(|current| (key.clone(), current.clone()))
+                })
                 .collect(),
         };
         let old = current_catalog_source(&raw_sources, &item).cloned();
@@ -372,12 +391,29 @@ impl SessionCatalogService {
         if had_catalog_source && old.is_none() {
             return Err(SessionImportServiceError::Unavailable);
         }
-        if preparation.source_key.as_ref().is_some_and(|key| {
-            old.as_ref()
-                .is_none_or(|current| current.source_key() != *key)
-        }) {
-            return Err(SessionImportServiceError::Unavailable);
+        let command_id = CommandId::from_uuid(request_id.as_uuid())
+            .map_err(|_| SessionImportServiceError::Corrupt)?;
+        if let Some(committed) = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.writer.committed_command(command_id),
+        )
+        .await
+        .map_err(|_| SessionImportServiceError::Unavailable)?
+        .map_err(map_writer)?
+        {
+            return if compatible_source_observation_replay(
+                &committed,
+                command_id,
+                session_id,
+                &source_instance_id,
+                source_reference,
+            ) {
+                Ok(false)
+            } else {
+                Err(SessionImportServiceError::Corrupt)
+            };
         }
+        let mut retained_repository_ids = BTreeSet::new();
         if let Some(old) = &old {
             let context = raw_contexts
                 .get(&old.source_key())
@@ -390,14 +426,9 @@ impl SessionCatalogService {
             {
                 return Ok(false);
             }
-            if preparation.source_key.is_none() {
-                preparation.source_key = Some(old.source_key());
-            }
-            preparation
-                .repository_ids
-                .extend(old.metadata.read_restrictions());
+            retained_repository_ids.extend(old.metadata.read_restrictions());
             if let Some(id) = old.metadata.resolved_repository_instance_id {
-                preparation.repository_ids.insert(id);
+                retained_repository_ids.insert(id);
             }
             if context.watermark.is_some() || context.recorded_prefix_end.is_some() {
                 return Ok(false);
@@ -420,42 +451,38 @@ impl SessionCatalogService {
             return Ok(false);
         }
 
+        let mut workspace_hints = BTreeSet::new();
+        if let Some(workspace) = metadata.workspace_hint.as_ref() {
+            workspace_hints.insert(workspace.clone());
+        }
+        if let Some(old_workspace) = old
+            .as_ref()
+            .and_then(|current| current.metadata.workspace_hint.as_ref())
+        {
+            workspace_hints.insert(old_workspace.clone());
+        }
+        let repository_selector = SourceObservationRepositorySelector {
+            identity: location.common_dir_filesystem,
+            root_path: location.worktree_path.to_string_lossy().into_owned(),
+            workspace_hints,
+            retained_repository_ids,
+        };
         let raw_repositories = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            self.writer.source_repository_read_context(
-                location.common_dir_filesystem,
-                preparation.repository_ids.clone(),
-            ),
+            self.writer
+                .source_observation_authority_context(repository_selector.clone()),
         )
         .await
         .map_err(|_| SessionImportServiceError::Unavailable)?
         .map_err(map_writer)?;
-        if raw_repositories.frontier != frontier {
-            preparation.budget = page.remaining;
-            return Err(SessionImportServiceError::StaleFrontier);
-        }
-        if preparation
-            .repository_ids
+        if repository_selector
+            .retained_repository_ids
             .iter()
             .any(|id| !raw_repositories.repositories.contains_key(id))
         {
             return Err(SessionImportServiceError::Unavailable);
         }
-        if preparation.identity_repository_ids.iter().any(|id| {
-            raw_repositories
-                .repositories
-                .get(id)
-                .is_none_or(|repository| {
-                    repository.common_dir_filesystem != Some(location.common_dir_filesystem)
-                })
-        }) {
-            return Err(SessionImportServiceError::Unavailable);
-        }
         for (id, repository) in &raw_repositories.repositories {
-            if repository.common_dir_filesystem == Some(location.common_dir_filesystem) {
-                preparation.repository_ids.insert(*id);
-                preparation.identity_repository_ids.insert(*id);
-            }
             if !crate::repository::repository_read_gate(
                 repository,
                 raw_repositories.purged.contains(id),
@@ -463,10 +490,10 @@ impl SessionCatalogService {
                 return Ok(false);
             }
         }
-        drop(raw_repositories);
 
         let occurred_at_us = now_us().map_err(|_| SessionImportServiceError::Corrupt)?;
         let mut payloads = Vec::new();
+        let mut s11_preimage = None;
         crate::repository::with_probe_deadline(deadline, || {
             discover_source_repository(
                 &metadata,
@@ -479,6 +506,10 @@ impl SessionCatalogService {
                     payloads: &mut payloads,
                     location: Some(&location),
                     source_reference: Some(source_reference),
+                    source_observation: Some(RepositoryDiscoverySourceObservation {
+                        repository: &repository_selector,
+                        selected: &mut s11_preimage,
+                    }),
                 },
             )
         })?;
@@ -553,6 +584,9 @@ impl SessionCatalogService {
         metadata.source_fingerprint = session_source_fingerprint(identity).to_string();
         metadata.source_revision = session_source_revision(identity)
             .map_err(|_| SessionImportServiceError::Unavailable)?;
+        if metadata.source_revision != source_revision {
+            return Err(SessionImportServiceError::Unavailable);
+        }
         metadata.file_size = identity.size;
         metadata.file_mtime_us = identity
             .mtime_seconds
@@ -571,6 +605,7 @@ impl SessionCatalogService {
                 metadata.resolved_worktree_instance_id = old.metadata.resolved_worktree_instance_id;
             }
         }
+        source_revision = metadata.source_revision.clone();
         retain_read_restrictions(
             &mut metadata,
             old.as_ref().map(|current| &current.metadata),
@@ -617,6 +652,19 @@ impl SessionCatalogService {
         if old.as_ref().is_some_and(|old| old.metadata == metadata) {
             return Ok(false);
         }
+        let target_revision_has_facts = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.writer.source_observation_revision_has_facts(
+                source_instance_id.clone(),
+                source_revision.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| SessionImportServiceError::Unavailable)?
+        .map_err(map_writer)?;
+        if target_revision_has_facts {
+            return Ok(false);
+        }
         metadata_events(
             old.as_ref(),
             item.session_id.clone(),
@@ -635,7 +683,28 @@ impl SessionCatalogService {
             SourceKind::System,
             payloads,
         )?;
-        preparation.budget = page.remaining;
+        let (s11_selector, s11_facts) =
+            s11_preimage.ok_or(SessionImportServiceError::Unavailable)?;
+        let guard = SourceObservationGuard::from_preparation(
+            SourceObservationGuardInput {
+                selector: SourceObservationGuardSelector {
+                    session_id: item.session_id.clone(),
+                    source_instance_id,
+                    source_revision,
+                    command_id,
+                    s11: s11_selector,
+                },
+                source_slots,
+                source_progress,
+                target_revision_has_facts,
+                raw_repositories,
+            },
+            s11_facts,
+        )
+        .map_err(|_| SessionImportServiceError::Corrupt)?;
+        drop(repositories);
+        drop(page);
+        drop(qualified);
         #[cfg(test)]
         if let Some(seam) = &self.observation_commit_seam {
             seam.pause(frontier).await;
@@ -646,7 +715,7 @@ impl SessionCatalogService {
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             self.writer
-                .commit_if_frontier(command, occurred_at_us, frontier),
+                .commit_source_observation(command, occurred_at_us, guard),
         )
         .await
         .map_err(|_| SessionImportServiceError::Unavailable)?
@@ -718,7 +787,10 @@ impl SessionCatalogService {
         &self,
         report: &HostProbeReport,
     ) -> Result<usize, SessionImportServiceError> {
-        let mut cursor = self.cursor.lock().await;
+        let mut cursor = self
+            .cursor
+            .try_lock()
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
         let catalog = self
             .writer
             .session_catalog_current_context()
@@ -807,6 +879,7 @@ impl SessionCatalogService {
                     payloads: &mut payloads,
                     location: location.as_ref(),
                     source_reference: None,
+                    source_observation: None,
                 },
             )?;
             retain_read_restrictions(
@@ -962,7 +1035,10 @@ impl SessionCatalogService {
         &self,
         report: &HostProbeReport,
     ) -> Result<usize, SessionImportServiceError> {
-        let mut cursor = self.cursor.lock().await;
+        let mut cursor = self
+            .cursor
+            .try_lock()
+            .map_err(|_| SessionImportServiceError::Unavailable)?;
         let catalog = self
             .writer
             .session_catalog_current_context()
@@ -1601,6 +1677,90 @@ fn current_catalog_source<'a>(
         .or_else(|| current.sessions.get(&item.source_instance_id))
 }
 
+fn compatible_source_observation_replay(
+    committed: &evertrace_store::CommittedCommand,
+    command_id: CommandId,
+    session_id: &str,
+    source: &evertrace_domain::evidence::SourceInstanceId,
+    source_reference: &str,
+) -> bool {
+    if committed.command_id != command_id {
+        return false;
+    }
+    let mut origin_ref = None;
+    let mut metadata_events = 0;
+    let mut boundary_snapshots = 0;
+    let mut replacement_transition = None;
+    let mut metadata_revision = None;
+    let mut metadata_predecessor_revision = None;
+    for payload in &committed.payloads {
+        match payload {
+            JournalPayload::SessionImportEventRecorded(event) => {
+                if event.session_id != session_id
+                    || event.source_instance_id.as_deref() != Some(source.as_str())
+                {
+                    return false;
+                }
+                let SessionImportEventKind::MetadataObserved { metadata } = &event.event else {
+                    if matches!(
+                        &event.event,
+                        SessionImportEventKind::BodyStateAdvanced {
+                            body_state: SessionBodyState::SourceReplaced,
+                            reason: BodyStateReason::SourceReplaced,
+                        }
+                    ) && replacement_transition.is_none()
+                    {
+                        replacement_transition = Some((event.revision, event.predecessor_revision));
+                        continue;
+                    }
+                    return false;
+                };
+                let Some(origin) = metadata.prospective_origin.as_ref() else {
+                    return false;
+                };
+                if origin.closed
+                    || origin_ref.is_some_and(|snapshot| snapshot != origin.snapshot_ref)
+                {
+                    return false;
+                }
+                origin_ref = Some(origin.snapshot_ref);
+                metadata_events += 1;
+                metadata_revision = Some(event.revision);
+                metadata_predecessor_revision = event.predecessor_revision;
+            }
+            JournalPayload::WorktreeSnapshotRecorded(snapshot) => {
+                if snapshot
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference == source_reference)
+                {
+                    boundary_snapshots += 1;
+                    if origin_ref.is_some_and(|origin| origin != snapshot.worktree_snapshot_id) {
+                        return false;
+                    }
+                    origin_ref = Some(snapshot.worktree_snapshot_id);
+                }
+            }
+            JournalPayload::RepositoryInstanceRecorded(_)
+            | JournalPayload::WorktreeInstanceRecorded(_)
+            | JournalPayload::WorktreeTransitionRecorded(_)
+            | JournalPayload::IntegrationEventRecorded(_) => {}
+            _ => return false,
+        }
+    }
+    let replacement_transition_matches =
+        replacement_transition.is_none_or(|(transition_revision, predecessor)| {
+            predecessor
+                .is_some_and(|predecessor| predecessor.checked_add(1) == Some(transition_revision))
+                && metadata_predecessor_revision == Some(transition_revision)
+                && transition_revision.checked_add(1) == metadata_revision
+        });
+    metadata_events == 1
+        && boundary_snapshots == 1
+        && origin_ref.is_some()
+        && replacement_transition_matches
+}
+
 fn unavailable_metadata(metadata: &SessionMetadata) -> SessionMetadata {
     let mut metadata = metadata.clone();
     metadata.workspace_resolution_kind = WorkspaceResolutionKind::Unavailable;
@@ -2189,6 +2349,12 @@ struct RepositoryDiscoveryContext<'a> {
     payloads: &'a mut Vec<JournalPayload>,
     location: Option<&'a crate::repository::WorkspaceGitLocation>,
     source_reference: Option<&'a str>,
+    source_observation: Option<RepositoryDiscoverySourceObservation<'a>>,
+}
+
+struct RepositoryDiscoverySourceObservation<'a> {
+    repository: &'a SourceObservationRepositorySelector,
+    selected: &'a mut Option<(SourceObservationS11Selector, SourceObservationS11Facts)>,
 }
 
 fn discover_source_repository(
@@ -2204,6 +2370,7 @@ fn discover_source_repository(
         payloads,
         location,
         source_reference,
+        mut source_observation,
     } = context;
     let Some(workspace) = metadata.workspace_hint.as_deref() else {
         return Ok(());
@@ -2260,6 +2427,26 @@ fn discover_source_repository(
         || vec![format!("session_import_preflight:{source}")],
         |reference| vec![reference.to_owned()],
     );
+    let known_admin_paths = if let Some(observation) = source_observation.as_ref() {
+        let selector = SourceObservationS11Selector {
+            repository: observation.repository.clone(),
+            source_reference: source_reference.unwrap_or_default().to_owned(),
+            worktree_entry_paths: BTreeSet::new(),
+        };
+        SourceObservationS11Facts::select(repositories, &selector)
+            .worktrees
+            .values()
+            .filter(|worktree| !worktree.lifecycle.is_terminal())
+            .filter_map(|worktree| {
+                worktree
+                    .git_admin_path_history
+                    .last()
+                    .map(|path| path.path.clone())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        repositories.known_admin_paths()
+    };
     let evidence = if source_reference.is_some() {
         crate::repository::probe_repository(
             Path::new(workspace),
@@ -2267,7 +2454,7 @@ fn discover_source_repository(
             &evidence_refs,
             occurred_at_us,
             &crate::repository::ProbeLimits::default(),
-            &repositories.known_admin_paths(),
+            &known_admin_paths,
             &heads,
         )
     } else {
@@ -2286,6 +2473,19 @@ fn discover_source_repository(
         || evidence.git_dir.as_deref().map(Path::new) != Some(location.git_dir.as_path())
     {
         return Ok(());
+    }
+    if let Some(observation) = source_observation.as_mut() {
+        let selector = SourceObservationS11Selector {
+            repository: observation.repository.clone(),
+            source_reference: source_reference.unwrap_or_default().to_owned(),
+            worktree_entry_paths: evidence
+                .worktree_entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+        };
+        let facts = SourceObservationS11Facts::select(repositories, &selector);
+        *observation.selected = Some((selector, facts));
     }
     let input = crate::repository::RepositoryResolveInput {
         view: repositories,
@@ -2662,6 +2862,7 @@ pub(crate) async fn preflight_import_context(
             payloads: &mut payloads,
             location: location.as_ref(),
             source_reference: None,
+            source_observation: None,
         },
     )?;
     if let Some(location) = location.as_ref()
@@ -3862,6 +4063,10 @@ mod tests {
         }
 
         fn write_source(&self, session_id: &str) -> PathBuf {
+            self.write_source_in(session_id, &self.workspace, &self.head)
+        }
+
+        fn write_source_in(&self, session_id: &str, workspace: &Path, head: &str) -> PathBuf {
             let transcript = self.dated.join(format!(
                 "rollout-2026-10-18T00-00-00-{session_id}_{session_id}.jsonl"
             ));
@@ -3871,7 +4076,7 @@ mod tests {
                 "payload": {
                     "id": session_id,
                     "session_id": session_id,
-                    "cwd": self.workspace,
+                    "cwd": workspace,
                     "originator": "codex_cli_rs",
                     "model_provider": "openai",
                     "timestamp": "2026-10-18T00:00:00Z",
@@ -3882,7 +4087,7 @@ mod tests {
                     "multi_agent_version": "1",
                     "parent_thread_id": null,
                     "thread_source": "cli",
-                    "git": { "commit_hash": self.head }
+                    "git": { "commit_hash": head }
                 }
             });
             fs::write(&transcript, format!("{header}\n")).unwrap();
@@ -3910,7 +4115,7 @@ mod tests {
                 &self.sessions_root,
                 &RepositoryCurrentView::default(),
                 SessionCatalogBudget {
-                    max_entries: 8,
+                    max_entries: 32,
                     max_metadata_bytes: 4 * 1024 * 1024,
                     deadline: Instant::now() + Duration::from_secs(2),
                 },
@@ -3982,13 +4187,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_source_observation_reprepares_after_unrelated_writer_commit() {
+    async fn native_source_observation_commits_across_unrelated_writer_and_cancelled_waiter() {
         let fixture = SourceObservationFixture::new().await;
         let target_id = "019d0000-0000-7000-8000-0000000000a1";
         let unrelated_id = "019d0000-0000-7000-8000-0000000000a2";
+        let cancelled_id = "019d0000-0000-7000-8000-0000000000a3";
+        let live_id = "019d0000-0000-7000-8000-0000000000a4";
         let transcript = fixture.write_source(target_id);
         let unrelated_transcript = fixture.write_source(unrelated_id);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let cancelled_transcript = fixture.write_source(cancelled_id);
+        let live_transcript = fixture.write_source(live_id);
+        let invocation_started = Instant::now();
+        let deadline = invocation_started + Duration::from_secs(2);
         let report = fixture.report(&transcript, target_id);
         let request_id = RequestId::new_v7();
         let command_id = CommandId::from_uuid(request_id.as_uuid()).unwrap();
@@ -4006,21 +4216,83 @@ mod tests {
                 prepared,
                 release: Arc::clone(&release),
             });
+        let service_for_first = service.clone();
         let session = target_id.to_owned();
         let transcript_path = transcript.clone();
-        let mut observation = tokio::spawn(async move {
-            service
+        let first_report = report.clone();
+        let first_reference = source_reference.clone();
+        let observation = tokio::spawn(async move {
+            service_for_first
                 .observe_native_session_source(
                     request_id,
-                    &report,
+                    &first_report,
                     &session,
                     transcript_path.to_str().unwrap(),
-                    &source_reference,
+                    &first_reference,
                     deadline,
                 )
                 .await
         });
         let observed_frontier = prepared_rx.recv().await.unwrap();
+        let cancelled_request = RequestId::new_v7();
+        let cancelled_deadline = Instant::now() + Duration::from_secs(2);
+        let cancelled_report = fixture.report(&cancelled_transcript, cancelled_id);
+        let cancelled_session = cancelled_id.to_owned();
+        let cancelled_path = cancelled_transcript.clone();
+        let cancelled_reference = format!("native_session_source_observation:{cancelled_request}");
+        let cancelled_service = service.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_service
+                .observe_native_session_source(
+                    cancelled_request,
+                    &cancelled_report,
+                    &cancelled_session,
+                    cancelled_path.to_str().unwrap(),
+                    &cancelled_reference,
+                    cancelled_deadline,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !cancelled.is_finished(),
+            "queued observation should wait for the permit"
+        );
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(
+            fixture
+                .writer
+                .session_import_context(&format!("session-rollout:{cancelled_id}:{cancelled_id}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let live_request = RequestId::new_v7();
+        let live_started = Instant::now();
+        let live_deadline = live_started + Duration::from_secs(2);
+        let live_report = fixture.report(&live_transcript, live_id);
+        let live_session = live_id.to_owned();
+        let live_path = live_transcript.clone();
+        let live_reference = format!("native_session_source_observation:{live_request}");
+        let expected_live_reference = live_reference.clone();
+        let live_service = service.clone();
+        let live = tokio::spawn(async move {
+            let result = live_service
+                .observe_native_session_source(
+                    live_request,
+                    &live_report,
+                    &live_session,
+                    live_path.to_str().unwrap(),
+                    &live_reference,
+                    live_deadline,
+                )
+                .await;
+            (live_started.elapsed(), result)
+        });
+        let refresh_result = service.refresh(&report).await;
+        let active_refresh_result = service.refresh_active(&report).await;
         let unrelated_frontier = fixture
             .commit_unrelated_metadata(
                 &fixture.report(&unrelated_transcript, unrelated_id),
@@ -4030,18 +4302,11 @@ mod tests {
         let interleaving_is_real =
             observed_frontier == initial_frontier && unrelated_frontier > observed_frontier;
         release.add_permits(1);
-        let (result, retry_ordered) = tokio::select! {
-            retry_frontier = prepared_rx.recv() => {
-                if let Some(retry_frontier) = retry_frontier {
-                    let ordered = retry_frontier >= unrelated_frontier;
-                    release.add_permits(1);
-                    (observation.await.unwrap(), ordered)
-                } else {
-                    (observation.await.unwrap(), false)
-                }
-            }
-            result = &mut observation => (result.unwrap(), false),
-        };
+        let result = observation.await.unwrap();
+        let live_frontier = prepared_rx.recv().await.unwrap();
+        assert!(live_frontier >= unrelated_frontier);
+        release.add_permits(1);
+        let (live_elapsed, live_result) = live.await.unwrap();
         let committed = fixture.writer.committed_command(command_id).await.unwrap();
         let snapshot = fixture.writer.project().await.unwrap();
         let source_key = format!("session-rollout:{target_id}:{target_id}");
@@ -4050,12 +4315,24 @@ mod tests {
             .session_import_context(&source_key)
             .await
             .unwrap();
+        let live_key = format!("session-rollout:{live_id}:{live_id}");
+        let live_current = fixture
+            .writer
+            .session_import_context(&live_key)
+            .await
+            .unwrap();
         let view = RepositoryCurrentView::from_snapshot(&snapshot).unwrap();
         let observed_end = fs::metadata(&transcript).unwrap().len();
         fixture.close().await;
         assert!(interleaving_is_real);
         assert_eq!(result, Ok(true));
-        assert!(retry_ordered);
+        assert_eq!(refresh_result, Err(SessionImportServiceError::Unavailable));
+        assert_eq!(
+            active_refresh_result,
+            Err(SessionImportServiceError::Unavailable)
+        );
+        assert!(live_elapsed < Duration::from_secs(2));
+        assert_eq!(live_result, Ok(true));
         let counts = committed
             .unwrap()
             .payloads
@@ -4090,13 +4367,31 @@ mod tests {
                 view.worktrees.len(),
                 view.snapshots.len()
             ),
-            (1, 1, 1)
+            (1, 1, 2)
+        );
+        assert!(
+            view.snapshots[&origin.snapshot_ref]
+                .evidence_refs
+                .contains(&source_reference)
+        );
+        let live_origin = live_current
+            .unwrap()
+            .current
+            .metadata
+            .prospective_origin
+            .unwrap();
+        assert_ne!(origin.snapshot_ref, live_origin.snapshot_ref);
+        assert!(
+            view.snapshots[&live_origin.snapshot_ref]
+                .evidence_refs
+                .contains(&expected_live_reference)
         );
         assert!(current.job.is_none());
+        assert!(invocation_started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
-    async fn native_source_observation_rechecks_raw_revocation_after_stale_frontier() {
+    async fn native_source_observation_rejects_raw_revocation_after_preparation() {
         let fixture = SourceObservationFixture::new().await;
         let session_id = "019d0000-0000-7000-8000-0000000000b1";
         let transcript = fixture.write_source(session_id);
@@ -4186,7 +4481,7 @@ mod tests {
         let repository_view = RepositoryCurrentView::from_snapshot(&snapshot).unwrap();
         assert_eq!(prepared_frontier, initial_frontier);
         assert!(revoked_frontier > prepared_frontier);
-        assert_eq!(result, Ok(false));
+        assert_eq!(result, Err(SessionImportServiceError::StaleFrontier));
         assert_eq!(
             current.current.access_decision,
             Some(SessionAccessDecision::Revoked)
@@ -4216,50 +4511,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_source_observation_rejects_purge_hidden_physical_repository() {
+    async fn native_source_observation_detects_purge_hidden_repository_aba() {
         let fixture = SourceObservationFixture::new().await;
-        let initial_session = "019d0000-0000-7000-8000-0000000000c1";
-        let replacement_session = "019d0000-0000-7000-8000-0000000000c2";
-        let initial_transcript = fixture.write_source(initial_session);
-        let initial_deadline = Instant::now() + Duration::from_secs(2);
-        let initial_request = RequestId::new_v7();
-        let initial_reference = format!("native_session_source_observation:{initial_request}");
-        let initial_report = observe_session_source_report(
-            initial_transcript.to_str().unwrap(),
-            initial_session,
-            None,
-            &initial_reference,
-            initial_deadline,
-        )
-        .unwrap();
-        let catalog = SessionCatalogService::new(fixture.writer.clone(), [0; 32]);
-        assert!(
+        let session_id = "019d0000-0000-7000-8000-0000000000c2";
+        let transcript = fixture.write_source(session_id);
+        let report = fixture.report(&transcript, session_id);
+        let request_id = RequestId::new_v7();
+        let command_id = CommandId::from_uuid(request_id.as_uuid()).unwrap();
+        let source_reference = format!("native_session_source_observation:{request_id}");
+        let invocation_started = Instant::now();
+        let deadline = invocation_started + Duration::from_secs(2);
+        let (prepared, mut prepared_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let catalog = SessionCatalogService::new(fixture.writer.clone(), [0; 32])
+            .with_observation_commit_seam(ObservationCommitSeam {
+                prepared,
+                release: Arc::clone(&release),
+            });
+        let transcript_path = transcript.clone();
+        let session = session_id.to_owned();
+        let source_ref = source_reference.clone();
+        let observation = tokio::spawn(async move {
             catalog
                 .observe_native_session_source(
-                    initial_request,
-                    &initial_report,
-                    initial_session,
-                    initial_transcript.to_str().unwrap(),
-                    &initial_reference,
-                    initial_deadline,
+                    request_id,
+                    &report,
+                    &session,
+                    transcript_path.to_str().unwrap(),
+                    &source_ref,
+                    deadline,
                 )
                 .await
-                .unwrap()
-        );
-        let initial_key = format!("session-rollout:{initial_session}:{initial_session}");
-        let initial = fixture
-            .writer
-            .session_import_context(&initial_key)
-            .await
+        });
+        let prepared_frontier = prepared_rx.recv().await.unwrap();
+
+        let items = catalog_codex_sessions(
+            &fixture.report(&transcript, session_id),
+            &fixture.sessions_root,
+            &RepositoryCurrentView::default(),
+            SessionCatalogBudget {
+                max_entries: 8,
+                max_metadata_bytes: 4 * 1024 * 1024,
+                deadline,
+            },
+        )
+        .unwrap();
+        let item = items
+            .into_iter()
+            .find(|item| item.session_id == session_id)
+            .unwrap();
+        let location = workspace_location(&item.metadata, deadline)
             .unwrap()
             .unwrap();
-        let before_purge = fixture.writer.project().await.unwrap();
-        let before_view = RepositoryCurrentView::from_snapshot(&before_purge).unwrap();
-        assert_eq!(before_view.repositories.len(), 1);
-        let (repository_id, repository) = before_view.repositories.iter().next().unwrap();
+        let mut repositories = RepositoryCurrentView::default();
+        let mut payloads = Vec::new();
+        let create_at_us = now_us().unwrap();
+        discover_source_repository(
+            &item.metadata,
+            &item.source_instance_id,
+            RepositoryDiscoveryContext {
+                current: &mut repositories,
+                incomplete_history: &[],
+                occurred_at_us: create_at_us,
+                deadline,
+                payloads: &mut payloads,
+                location: Some(&location),
+                source_reference: None,
+                source_observation: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !payloads.is_empty(),
+            "legal S11 create must produce product facts"
+        );
+        let create = command(
+            RequestId::new_v7(),
+            session_id,
+            create_at_us,
+            [0; 32],
+            SourceKind::System,
+            payloads,
+        )
+        .unwrap();
+        fixture.writer.commit(create, create_at_us).await.unwrap();
+        let created = fixture.writer.project().await.unwrap();
+        let created_view = RepositoryCurrentView::from_snapshot(&created).unwrap();
+        assert_eq!(created_view.repositories.len(), 1);
+        let (repository_id, repository) = created_view.repositories.iter().next().unwrap();
         let identity = repository.common_dir_filesystem.unwrap();
         let preview = evertrace_store::projections::repository_scope_purge_preview(
-            &before_purge,
+            &created,
             *repository_id,
             repository.repository_revision,
         )
@@ -4275,13 +4617,13 @@ mod tests {
             &preview,
             preview.deletion_generation,
             purge_at_us,
-            before_purge.frontier,
+            created.frontier,
             [0; 32],
         )
         .unwrap();
         fixture
             .writer
-            .commit_if_frontier(purge_command, purge_at_us, before_purge.frontier)
+            .commit_if_frontier(purge_command, purge_at_us, created.frontier)
             .await
             .unwrap();
         let purge_frontier = fixture
@@ -4290,49 +4632,43 @@ mod tests {
             .await
             .unwrap()
             .frontier;
+        let source_instance =
+            evertrace_domain::evidence::SourceInstanceId::parse(item.source_instance_id).unwrap();
+        let mut workspace_hints = BTreeSet::new();
+        workspace_hints.insert(item.metadata.workspace_hint.unwrap());
         let raw_repositories = fixture
             .writer
-            .source_repository_read_context(identity, Default::default())
+            .source_observation_authority_context(SourceObservationRepositorySelector {
+                identity,
+                root_path: location.worktree_path.to_string_lossy().into_owned(),
+                workspace_hints,
+                retained_repository_ids: BTreeSet::new(),
+            })
             .await
             .unwrap();
-        assert_eq!(raw_repositories.frontier, purge_frontier);
-        assert_eq!(raw_repositories.repositories.len(), 1);
-        assert!(raw_repositories.repositories.contains_key(repository_id));
-        assert!(raw_repositories.purged.contains(repository_id));
-
-        let replacement_transcript = fixture.write_source(replacement_session);
-        let replacement_deadline = Instant::now() + Duration::from_secs(2);
-        let replacement_request = RequestId::new_v7();
-        let replacement_command_id = CommandId::from_uuid(replacement_request.as_uuid()).unwrap();
-        let replacement_reference =
-            format!("native_session_source_observation:{replacement_request}");
-        let replacement_report = observe_session_source_report(
-            replacement_transcript.to_str().unwrap(),
-            replacement_session,
-            None,
-            &replacement_reference,
-            replacement_deadline,
-        )
-        .unwrap();
         assert!(
-            !catalog
-                .observe_native_session_source(
-                    replacement_request,
-                    &replacement_report,
-                    replacement_session,
-                    replacement_transcript.to_str().unwrap(),
-                    &replacement_reference,
-                    replacement_deadline,
+            !fixture
+                .writer
+                .source_observation_revision_has_facts(
+                    source_instance,
+                    item.metadata.source_revision,
                 )
                 .await
                 .unwrap()
         );
-        let replacement_key =
-            format!("session-rollout:{replacement_session}:{replacement_session}");
+        assert_eq!(raw_repositories.repositories.len(), 1);
+        assert!(raw_repositories.repositories.contains_key(repository_id));
+        assert!(raw_repositories.purged.contains(repository_id));
+        assert!(purge_frontier > prepared_frontier);
+        release.add_permits(1);
+        let result = observation.await.unwrap();
+        assert_eq!(result, Err(SessionImportServiceError::StaleFrontier));
+
+        let source_key = format!("session-rollout:{session_id}:{session_id}");
         assert!(
             fixture
                 .writer
-                .session_import_context(&replacement_key)
+                .session_import_context(&source_key)
                 .await
                 .unwrap()
                 .is_none()
@@ -4340,7 +4676,9 @@ mod tests {
         let after = fixture.writer.project().await.unwrap();
         let after_view = RepositoryCurrentView::from_snapshot(&after).unwrap();
         assert!(
-            after_view.repositories.is_empty(),
+            after_view.repositories.is_empty()
+                && after_view.worktrees.is_empty()
+                && after_view.snapshots.is_empty(),
             "purge must keep product rows hidden"
         );
         assert_eq!(
@@ -4350,35 +4688,63 @@ mod tests {
         assert!(
             fixture
                 .writer
-                .committed_command(replacement_command_id)
+                .committed_command(command_id)
                 .await
                 .unwrap()
                 .is_none()
         );
-        assert!(initial.current.metadata.prospective_origin.is_some());
+        assert!(invocation_started.elapsed() < Duration::from_secs(2));
         fixture.close().await;
     }
 
     #[tokio::test]
-    async fn native_source_observation_stops_after_second_stale_frontier() {
+    async fn native_source_observation_orders_five_same_and_cross_directory_sources() {
         let fixture = SourceObservationFixture::new().await;
-        let target_id = "019d0000-0000-7000-8000-0000000000d1";
-        let first_unrelated_id = "019d0000-0000-7000-8000-0000000000d2";
-        let second_unrelated_id = "019d0000-0000-7000-8000-0000000000d3";
-        let target_transcript = fixture.write_source(target_id);
-        let first_unrelated_transcript = fixture.write_source(first_unrelated_id);
-        let second_unrelated_transcript = fixture.write_source(second_unrelated_id);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let report = fixture.report(&target_transcript, target_id);
-        let request_id = RequestId::new_v7();
-        let command_id = CommandId::from_uuid(request_id.as_uuid()).unwrap();
-        let source_reference = format!("native_session_source_observation:{request_id}");
-        let initial_frontier = fixture
-            .writer
-            .session_catalog_current_context()
-            .await
-            .unwrap()
-            .frontier;
+        let second_workspace = fixture.root.join("repository-two");
+        fs::create_dir(&second_workspace).unwrap();
+        fixture_git(&second_workspace, &["init", "-q", "-b", "main"]);
+        fixture_git(
+            &second_workspace,
+            &["commit", "--allow-empty", "-qm", "initial"],
+        );
+        let second_head = fixture_git(&second_workspace, &["rev-parse", "HEAD"]);
+        let config_path = fixture.root.join("adapter/config.toml");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!(
+            "\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(second_workspace.to_str().unwrap()).unwrap()
+        ));
+        fs::write(&config_path, config).unwrap();
+
+        let session_ids = [
+            "019d0000-0000-7000-8000-0000000000d1",
+            "019d0000-0000-7000-8000-0000000000d2",
+            "019d0000-0000-7000-8000-0000000000d3",
+            "019d0000-0000-7000-8000-0000000000d4",
+            "019d0000-0000-7000-8000-0000000000d5",
+        ];
+        let transcripts = session_ids
+            .iter()
+            .enumerate()
+            .map(|(index, session)| {
+                if index < 3 {
+                    fixture.write_source(session)
+                } else {
+                    fixture.write_source_in(session, &second_workspace, &second_head)
+                }
+            })
+            .collect::<Vec<_>>();
+        let unrelated_id = "019d0000-0000-7000-8000-0000000000d6";
+        let unrelated_transcript = fixture.write_source(unrelated_id);
+        let unrelated_report = fixture.report(&unrelated_transcript, unrelated_id);
+        let requests = session_ids
+            .iter()
+            .map(|_| RequestId::new_v7())
+            .collect::<Vec<_>>();
+        let source_references = requests
+            .iter()
+            .map(|request| format!("native_session_source_observation:{request}"))
+            .collect::<Vec<_>>();
         let (prepared, mut prepared_rx) = mpsc::unbounded_channel();
         let release = Arc::new(Semaphore::new(0));
         let catalog = SessionCatalogService::new(fixture.writer.clone(), [0; 32])
@@ -4386,61 +4752,132 @@ mod tests {
                 prepared,
                 release: Arc::clone(&release),
             });
-        let transcript_path = target_transcript.clone();
-        let target_session = target_id.to_owned();
-        let source_reference_owned = source_reference.clone();
-        let observation = tokio::spawn(async move {
-            catalog
-                .observe_native_session_source(
+        let mut observations = Vec::new();
+        for (((session_id, transcript), request_id), source_reference) in session_ids
+            .into_iter()
+            .zip(transcripts.iter().cloned())
+            .zip(requests.iter().copied())
+            .zip(source_references.iter().cloned())
+        {
+            let service = catalog.clone();
+            let report = fixture.report(&transcript, session_id);
+            let session = session_id.to_owned();
+            observations.push(tokio::spawn(async move {
+                let started = Instant::now();
+                let deadline = started + Duration::from_secs(2);
+                let result = service
+                    .observe_native_session_source(
+                        request_id,
+                        &report,
+                        &session,
+                        transcript.to_str().unwrap(),
+                        &source_reference,
+                        deadline,
+                    )
+                    .await;
+                (
+                    started.elapsed(),
+                    session,
                     request_id,
-                    &report,
-                    &target_session,
-                    transcript_path.to_str().unwrap(),
-                    &source_reference_owned,
-                    deadline,
+                    source_reference,
+                    result,
                 )
-                .await
-        });
+            }));
+        }
         let first_prepared_frontier = prepared_rx.recv().await.unwrap();
-        let first_unrelated_frontier = fixture
-            .commit_unrelated_metadata(
-                &fixture.report(&first_unrelated_transcript, first_unrelated_id),
-                first_unrelated_id,
-            )
+        let unrelated_frontier = fixture
+            .commit_unrelated_metadata(&unrelated_report, unrelated_id)
             .await;
+        assert!(unrelated_frontier > first_prepared_frontier);
+        let mut prepared_frontiers = vec![first_prepared_frontier];
         release.add_permits(1);
-        let second_prepared_frontier = prepared_rx.recv().await.unwrap();
-        let second_unrelated_frontier = fixture
-            .commit_unrelated_metadata(
-                &fixture.report(&second_unrelated_transcript, second_unrelated_id),
-                second_unrelated_id,
-            )
-            .await;
-        release.add_permits(1);
-        let result = observation.await.unwrap();
-        let target_key = format!("session-rollout:{target_id}:{target_id}");
-        let target_current = fixture
-            .writer
-            .session_import_context(&target_key)
-            .await
-            .unwrap();
+        for _ in 1..session_ids.len() {
+            prepared_frontiers.push(prepared_rx.recv().await.unwrap());
+            release.add_permits(1);
+        }
+        let mut results = Vec::with_capacity(observations.len());
+        for observation in observations {
+            results.push(observation.await.unwrap());
+        }
         let snapshot = fixture.writer.project().await.unwrap();
         let repository_view = RepositoryCurrentView::from_snapshot(&snapshot).unwrap();
-        assert_eq!(first_prepared_frontier, initial_frontier);
-        assert!(first_unrelated_frontier > first_prepared_frontier);
-        assert!(second_prepared_frontier >= first_unrelated_frontier);
-        assert!(second_unrelated_frontier > second_prepared_frontier);
-        assert_eq!(result, Err(SessionImportServiceError::StaleFrontier));
-        assert!(target_current.is_none());
-        assert!(repository_view.repositories.is_empty());
-        assert!(
-            fixture
+        assert_eq!(prepared_frontiers.len(), 5);
+        assert!(prepared_frontiers.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert!(repository_view.repositories.len() == 2);
+        assert!(repository_view.worktrees.len() == 2);
+        assert!(repository_view.snapshots.len() == 5);
+        let mut boundary_counts = BTreeMap::new();
+        let mut worktree_counts = BTreeMap::new();
+        for (elapsed, session_id, request_id, source_reference, result) in results {
+            eprintln!(
+                "native_source_observation_five_source_elapsed session={session_id} elapsed_us={}",
+                elapsed.as_micros()
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "deadline includes permit wait"
+            );
+            assert_eq!(result, Ok(true));
+            let command_id = CommandId::from_uuid(request_id.as_uuid()).unwrap();
+            let committed = fixture
                 .writer
                 .committed_command(command_id)
                 .await
                 .unwrap()
-                .is_none()
-        );
+                .unwrap();
+            let source_key = format!("session-rollout:{session_id}:{session_id}");
+            let current = fixture
+                .writer
+                .session_import_context(&source_key)
+                .await
+                .unwrap()
+                .unwrap();
+            let origin = current.current.metadata.prospective_origin.unwrap();
+            let boundary = repository_view.snapshots.get(&origin.snapshot_ref).unwrap();
+            assert!(boundary.evidence_refs.contains(&source_reference));
+            *boundary_counts
+                .entry(boundary.worktree_instance_id)
+                .or_insert(0usize) += 1;
+            assert_eq!(current.current.access_decision, None);
+            assert!(current.job.is_none());
+            assert!(committed.payloads.iter().any(|payload| matches!(
+                payload,
+                JournalPayload::SessionImportEventRecorded(event)
+                    if event.session_id == session_id
+                        && event.source_instance_id.as_deref()
+                            == Some(format!("session-rollout:{session_id}:{session_id}").as_str())
+            )));
+            let worktree = repository_view
+                .worktrees
+                .get(&boundary.worktree_instance_id)
+                .unwrap();
+            *worktree_counts
+                .entry(worktree.repository_instance_id)
+                .or_insert(0usize) += 1;
+        }
+        let mut boundary_group_sizes = boundary_counts.values().copied().collect::<Vec<_>>();
+        boundary_group_sizes.sort_unstable();
+        assert_eq!(boundary_group_sizes, [2, 3]);
+        let mut worktree_group_sizes = worktree_counts.values().copied().collect::<Vec<_>>();
+        worktree_group_sizes.sort_unstable();
+        assert_eq!(worktree_group_sizes, [2, 3]);
+        for (repository_id, repository) in &repository_view.repositories {
+            let worktree = repository_view
+                .worktrees
+                .values()
+                .find(|worktree| worktree.repository_instance_id == *repository_id)
+                .unwrap();
+            let source_count = *worktree_counts.get(repository_id).unwrap();
+            assert_eq!(
+                u32::try_from(source_count).unwrap(),
+                worktree.worktree_revision
+            );
+            assert_eq!(
+                worktree.predecessor_revision,
+                (source_count > 1).then_some(u32::try_from(source_count - 1).unwrap())
+            );
+            assert!(repository.common_dir_filesystem.is_some());
+        }
         assert!(prepared_rx.try_recv().is_err());
         fixture.close().await;
     }

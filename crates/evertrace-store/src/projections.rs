@@ -4288,6 +4288,236 @@ fn normal_search_row_matches(row: &ObjectRow, references: &BTreeSet<String>) -> 
             .is_some_and(|value| references.contains(value))
 }
 
+impl crate::session_import::SourceObservationS11Facts {
+    pub fn select(
+        view: &crate::repository::RepositoryCurrentView,
+        selector: &crate::session_import::SourceObservationS11Selector,
+    ) -> Self {
+        let identity_repositories = view
+            .repositories
+            .values()
+            .filter(|repository| {
+                repository.common_dir_filesystem == Some(selector.repository.identity)
+            })
+            .map(|repository| repository.repository_id)
+            .collect::<BTreeSet<_>>();
+        let mut repository_ids = identity_repositories.clone();
+        if identity_repositories.is_empty() {
+            repository_ids.extend(
+                view.repositories
+                    .values()
+                    .filter(|repository| repository.current_path == selector.repository.root_path)
+                    .map(|repository| repository.repository_id),
+            );
+        }
+        repository_ids.extend(selector.repository.retained_repository_ids.iter().copied());
+        repository_ids.extend(view.repositories.values().filter_map(|repository| {
+            source_observation_repository_path_candidate(repository, &selector.repository)
+                .then_some(repository.repository_id)
+        }));
+        repository_ids.extend(view.worktrees.values().filter_map(|worktree| {
+            source_observation_worktree_path_candidate(worktree, &selector.repository)
+                .then_some(worktree.repository_instance_id)
+        }));
+
+        let terminal_worktrees = view
+            .worktrees
+            .values()
+            .filter(|worktree| {
+                worktree.lifecycle.is_terminal()
+                    && worktree
+                        .path_history
+                        .last()
+                        .is_some_and(|path| selector.worktree_entry_paths.contains(&path.path))
+            })
+            .map(|worktree| worktree.worktree_instance_id)
+            .collect::<BTreeSet<_>>();
+        let mut worktree_ids = terminal_worktrees;
+        worktree_ids.extend(view.worktrees.values().filter_map(|worktree| {
+            repository_ids
+                .contains(&worktree.repository_instance_id)
+                .then_some(worktree.worktree_instance_id)
+        }));
+        repository_ids.extend(worktree_ids.iter().filter_map(|id| {
+            view.worktrees
+                .get(id)
+                .map(|worktree| worktree.repository_instance_id)
+        }));
+
+        let mut snapshot_ids = view
+            .snapshots
+            .values()
+            .filter(|snapshot| {
+                worktree_ids.contains(&snapshot.worktree_instance_id)
+                    && (view
+                        .worktrees
+                        .get(&snapshot.worktree_instance_id)
+                        .is_some_and(|worktree| {
+                            repository_ids.contains(&worktree.repository_instance_id)
+                        })
+                        || snapshot
+                            .evidence_refs
+                            .iter()
+                            .any(|reference| reference == &selector.source_reference))
+            })
+            .map(|snapshot| snapshot.worktree_snapshot_id)
+            .collect::<BTreeSet<_>>();
+        for id in &worktree_ids {
+            if let Some(snapshot_id) = view
+                .worktrees
+                .get(id)
+                .filter(|worktree| worktree.lifecycle.is_terminal())
+                .and_then(|worktree| worktree.current_snapshot_id)
+            {
+                snapshot_ids.insert(snapshot_id);
+            }
+        }
+        Self {
+            repositories: repository_ids
+                .into_iter()
+                .filter_map(|id| view.repositories.get(&id).cloned().map(|value| (id, value)))
+                .collect(),
+            worktrees: worktree_ids
+                .into_iter()
+                .filter_map(|id| view.worktrees.get(&id).cloned().map(|value| (id, value)))
+                .collect(),
+            snapshots: snapshot_ids
+                .into_iter()
+                .filter_map(|id| view.snapshots.get(&id).cloned().map(|value| (id, value)))
+                .collect(),
+        }
+    }
+}
+
+fn source_observation_path_candidate(
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+    path: &str,
+) -> bool {
+    path == selector.root_path
+        || selector.workspace_hints.iter().any(|workspace| {
+            crate::session_import::SessionMetadata::workspace_hint_matches_path(
+                Some(workspace),
+                path,
+            )
+        })
+}
+
+fn source_observation_repository_path_candidate(
+    repository: &RepositoryInstance,
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+) -> bool {
+    source_observation_path_candidate(selector, &repository.current_path)
+        || repository
+            .path_history
+            .iter()
+            .any(|path| source_observation_path_candidate(selector, &path.path))
+}
+
+fn source_observation_worktree_path_candidate(
+    worktree: &WorktreeInstance,
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+) -> bool {
+    worktree
+        .current_path
+        .as_deref()
+        .is_some_and(|path| source_observation_path_candidate(selector, path))
+        || worktree
+            .path_history
+            .iter()
+            .any(|path| source_observation_path_candidate(selector, &path.path))
+}
+
+fn source_observation_raw_repository_ids(
+    repositories: &BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+) -> Result<BTreeSet<RepositoryId>, StoreError> {
+    let mut ids = selector.retained_repository_ids.clone();
+    ids.extend(repositories.iter().filter_map(|(id, (repository, _))| {
+        (repository.common_dir_filesystem == Some(selector.identity)
+            || source_observation_repository_path_candidate(repository, selector))
+        .then_some(*id)
+    }));
+    ids.extend(worktrees.values().filter_map(|(worktree, _)| {
+        source_observation_worktree_path_candidate(worktree, selector)
+            .then_some(worktree.repository_instance_id)
+    }));
+    if ids.len() > 64 {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(ids)
+}
+
+fn source_observation_s11_candidate_ids(
+    repositories: &BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    snapshots: &BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    selector: &crate::session_import::SourceObservationS11Selector,
+) -> (
+    BTreeSet<RepositoryId>,
+    BTreeSet<WorktreeId>,
+    BTreeSet<WorktreeSnapshotId>,
+) {
+    let mut repository_ids = repositories
+        .iter()
+        .filter_map(|(id, (repository, _))| {
+            (repository.common_dir_filesystem == Some(selector.repository.identity)
+                || repository.current_path == selector.repository.root_path
+                || source_observation_repository_path_candidate(repository, &selector.repository))
+            .then_some(*id)
+        })
+        .collect::<BTreeSet<_>>();
+    repository_ids.extend(selector.repository.retained_repository_ids.iter().copied());
+    repository_ids.extend(worktrees.values().filter_map(|(worktree, _)| {
+        source_observation_worktree_path_candidate(worktree, &selector.repository)
+            .then_some(worktree.repository_instance_id)
+    }));
+
+    let mut worktree_ids = worktrees
+        .iter()
+        .filter_map(|(id, (worktree, _))| {
+            (repository_ids.contains(&worktree.repository_instance_id)
+                || worktree.lifecycle.is_terminal()
+                    && worktree
+                        .path_history
+                        .last()
+                        .is_some_and(|path| selector.worktree_entry_paths.contains(&path.path)))
+            .then_some(*id)
+        })
+        .collect::<BTreeSet<_>>();
+    repository_ids.extend(worktree_ids.iter().filter_map(|id| {
+        worktrees
+            .get(id)
+            .map(|(worktree, _)| worktree.repository_instance_id)
+    }));
+
+    let mut snapshot_ids =
+        snapshots
+            .iter()
+            .filter_map(|(id, (snapshot, _))| {
+                (worktree_ids.contains(&snapshot.worktree_instance_id)
+                    && (worktrees.get(&snapshot.worktree_instance_id).is_some_and(
+                        |(worktree, _)| repository_ids.contains(&worktree.repository_instance_id),
+                    ) || snapshot
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| reference == &selector.source_reference)))
+                .then_some(*id)
+            })
+            .collect::<BTreeSet<_>>();
+    for id in &worktree_ids {
+        if let Some(snapshot_id) = worktrees
+            .get(id)
+            .filter(|(worktree, _)| worktree.lifecycle.is_terminal())
+            .and_then(|(worktree, _)| worktree.current_snapshot_id)
+        {
+            snapshot_ids.insert(snapshot_id);
+        }
+    }
+    worktree_ids.retain(|id| worktrees.contains_key(id));
+    (repository_ids, worktree_ids, snapshot_ids)
+}
+
 impl JournalAdmissionState {
     pub(crate) fn committed_frontier(&self) -> u64 {
         self.frontier
@@ -6179,6 +6409,127 @@ impl JournalAdmissionState {
             read_snapshots,
             incomplete_repository_history: incomplete_history.into_iter().collect(),
         }))
+    }
+
+    pub(crate) fn source_observation_repository_read_context(
+        &self,
+        selector: &crate::session_import::SourceObservationRepositorySelector,
+    ) -> Result<RepositoryReadContext, StoreError> {
+        let ids =
+            source_observation_raw_repository_ids(&self.repositories, &self.worktrees, selector)?;
+        self.repository_read_context(&ids)
+    }
+
+    pub(crate) fn source_observation_revision_has_facts(
+        &self,
+        source: &SourceInstanceId,
+        revision: &SourceRevision,
+    ) -> bool {
+        session_import_revision_has_facts(
+            &self.source_watermarks,
+            &self.source_ranges,
+            source,
+            revision,
+        )
+    }
+
+    pub(crate) fn source_observation_guard_matches(
+        &self,
+        guard: &crate::session_import::SourceObservationGuard,
+    ) -> Result<bool, StoreError> {
+        for (key, expected) in &guard.source_slots {
+            if self.session_imports.get(key) != expected.as_ref() {
+                return Ok(false);
+            }
+        }
+        for expected in &guard.source_progress {
+            let current = self
+                .source_watermarks
+                .get(expected.source_instance_id.as_str())
+                .and_then(|state| state.revisions.get(&expected.source_revision))
+                .cloned();
+            let source_ref =
+                source_revision_ref(&expected.source_instance_id, &expected.source_revision);
+            let recorded_prefix_end = self
+                .source_ranges
+                .get(&source_ref)
+                .and_then(KnownSourceRange::last_sequence);
+            if current != expected.watermark || recorded_prefix_end != expected.recorded_prefix_end
+            {
+                return Ok(false);
+            }
+        }
+        if self.source_observation_revision_has_facts(
+            &guard.selector.source_instance_id,
+            &guard.selector.source_revision,
+        ) {
+            return Ok(false);
+        }
+        let raw =
+            self.source_observation_repository_read_context(&guard.selector.s11.repository)?;
+        if raw.repositories != guard.raw_repositories || raw.purged != guard.raw_purged {
+            return Ok(false);
+        }
+        Ok(self.source_observation_s11_facts(&guard.selector.s11)? == guard.s11_facts)
+    }
+
+    fn source_observation_s11_facts(
+        &self,
+        selector: &crate::session_import::SourceObservationS11Selector,
+    ) -> Result<crate::session_import::SourceObservationS11Facts, StoreError> {
+        let (repository_ids, worktree_ids, snapshot_ids) = source_observation_s11_candidate_ids(
+            &self.repositories,
+            &self.worktrees,
+            &self.worktree_snapshots,
+            selector,
+        );
+        let mut rows = Vec::new();
+        for id in repository_ids {
+            if let Some((value, seq)) = self.repositories.get(&id) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "repository",
+                    id.to_string(),
+                    format!("{}@{}", id, value.repository_revision),
+                    &JournalPayload::RepositoryInstanceRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for id in worktree_ids {
+            if let Some((value, seq)) = self.worktrees.get(&id) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "worktree",
+                    id.to_string(),
+                    format!("{}@{}", id, value.worktree_revision),
+                    &JournalPayload::WorktreeInstanceRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for id in snapshot_ids {
+            if let Some((value, seq)) = self.worktree_snapshots.get(&id) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "worktree_snapshot",
+                    id.to_string(),
+                    id.to_string(),
+                    &JournalPayload::WorktreeSnapshotRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        let rows = filter_product_rows(
+            rows,
+            &self.deletions,
+            &self.scope_purges,
+            self.repository_closures.values(),
+        )?;
+        let view = crate::repository::RepositoryCurrentView::from_rows(self.frontier, &rows)?;
+        Ok(crate::session_import::SourceObservationS11Facts::select(
+            &view, selector,
+        ))
     }
 
     pub(crate) fn session_import_contexts(

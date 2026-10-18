@@ -4,7 +4,8 @@ use evertrace_store::{
     RecallCurrentContext, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
     ReconciliationFrontier, RuntimeSchedulerView, ScopePurgeCurrentView,
     SessionCatalogCurrentContext, SessionImportContext, SessionImportPrefixPage,
-    SessionImportPrefixRequest, SessionImportSelection, StoreError,
+    SessionImportPrefixRequest, SessionImportSelection, SourceObservationGuard,
+    SourceObservationRepositorySelector, StoreError,
 };
 use std::{
     collections::BTreeSet,
@@ -44,12 +45,7 @@ enum WriterRequest {
     Commit {
         command: JournalCommand,
         ingested_at_us: i64,
-        reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
-    },
-    CommitIfFrontier {
-        command: JournalCommand,
-        ingested_at_us: i64,
-        expected_frontier: u64,
+        condition: WriterCommitCondition,
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
     ScopeCurrent {
@@ -140,6 +136,15 @@ enum WriterRequest {
     SessionCatalogCurrent {
         reply: oneshot::Sender<Result<SessionCatalogCurrentContext, WriterActorError>>,
     },
+    SourceObservationAuthorityContext {
+        selector: SourceObservationRepositorySelector,
+        reply: oneshot::Sender<Result<evertrace_store::RepositoryReadContext, WriterActorError>>,
+    },
+    SourceObservationRevisionHasFacts {
+        source: evertrace_domain::evidence::SourceInstanceId,
+        revision: evertrace_domain::evidence::SourceRevision,
+        reply: oneshot::Sender<Result<bool, WriterActorError>>,
+    },
     SessionImportContexts {
         after: Option<String>,
         limit: usize,
@@ -167,6 +172,12 @@ enum WriterRequest {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+}
+
+enum WriterCommitCondition {
+    None,
+    Frontier(u64),
+    SourceObservation(Box<SourceObservationGuard>),
 }
 
 #[derive(Clone)]
@@ -314,6 +325,35 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
+    pub async fn source_observation_authority_context(
+        &self,
+        selector: SourceObservationRepositorySelector,
+    ) -> Result<evertrace_store::RepositoryReadContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SourceObservationAuthorityContext { selector, reply })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn source_observation_revision_has_facts(
+        &self,
+        source: evertrace_domain::evidence::SourceInstanceId,
+        revision: evertrace_domain::evidence::SourceRevision,
+    ) -> Result<bool, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::SourceObservationRevisionHasFacts {
+                source,
+                revision,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
     pub async fn repository_read_context(
         &self,
         ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
@@ -420,6 +460,7 @@ impl WriterHandle {
             .send(WriterRequest::Commit {
                 command,
                 ingested_at_us,
+                condition: WriterCommitCondition::None,
                 reply,
             })
             .await
@@ -683,10 +724,29 @@ impl WriterHandle {
     ) -> Result<CommitOutcome, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(WriterRequest::CommitIfFrontier {
+            .send(WriterRequest::Commit {
                 command,
                 ingested_at_us,
-                expected_frontier,
+                condition: WriterCommitCondition::Frontier(expected_frontier),
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub async fn commit_source_observation(
+        &self,
+        command: JournalCommand,
+        ingested_at_us: i64,
+        guard: SourceObservationGuard,
+    ) -> Result<CommitOutcome, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::Commit {
+                command,
+                ingested_at_us,
+                condition: WriterCommitCondition::SourceObservation(Box::new(guard)),
                 reply,
             })
             .await
@@ -961,14 +1021,26 @@ async fn run_writer(
                 WriterRequest::Commit {
                     command,
                     ingested_at_us,
+                    condition,
                     reply,
                 } => {
-                    let result = writer
-                        .as_mut()
-                        .ok_or(WriterActorError::Stopped)?
-                        .commit(&command, ingested_at_us)
-                        .await
-                        .map_err(map_store_error);
+                    let writer = writer.as_mut().ok_or(WriterActorError::Stopped)?;
+                    let result = match condition {
+                        WriterCommitCondition::None => {
+                            writer.commit(&command, ingested_at_us).await
+                        }
+                        WriterCommitCondition::Frontier(frontier) => {
+                            writer
+                                .commit_if_frontier(&command, ingested_at_us, frontier)
+                                .await
+                        }
+                        WriterCommitCondition::SourceObservation(guard) => {
+                            writer
+                                .commit_source_observation(&command, ingested_at_us, *guard)
+                                .await
+                        }
+                    }
+                    .map_err(map_store_error);
                     let notify = result
                         .as_ref()
                         .ok()
@@ -997,59 +1069,7 @@ async fn run_writer(
                         return Err(error);
                     }
                     if reconcile
-                        && let Some(frontier) = Box::pin(reconcile_object_deletions(
-                            writer.as_mut().ok_or(WriterActorError::Stopped)?,
-                        ))
-                        .await?
-                    {
-                        recall_frontier.send_replace(frontier);
-                        background_frontier.send_replace(frontier);
-                    }
-                }
-                WriterRequest::CommitIfFrontier {
-                    command,
-                    ingested_at_us,
-                    expected_frontier,
-                    reply,
-                } => {
-                    let result = writer
-                        .as_mut()
-                        .ok_or(WriterActorError::Stopped)?
-                        .commit_if_frontier(&command, ingested_at_us, expected_frontier)
-                        .await
-                        .map_err(map_store_error);
-                    let notify = result
-                        .as_ref()
-                        .ok()
-                        .filter(|_| recall_relevant(&command))
-                        .map(|outcome| outcome.last_seq);
-                    let background_notify = result
-                        .as_ref()
-                        .ok()
-                        .filter(|_| background_relevant(&command))
-                        .map(|outcome| outcome.last_seq);
-                    let fatal = result.as_ref().err().copied().filter(|error| {
-                        matches!(
-                            error,
-                            WriterActorError::Store | WriterActorError::StoreCorrupt
-                        )
-                    });
-                    let reconcile = result.is_ok() && object_deletion_relevant(&command);
-                    let _ = reply.send(result);
-                    if let Some(frontier) = notify {
-                        recall_frontier.send_replace(frontier);
-                    }
-                    if let Some(frontier) = background_notify {
-                        background_frontier.send_replace(frontier);
-                    }
-                    if let Some(error) = fatal {
-                        return Err(error);
-                    }
-                    if reconcile
-                        && let Some(frontier) = Box::pin(reconcile_object_deletions(
-                            writer.as_mut().ok_or(WriterActorError::Stopped)?,
-                        ))
-                        .await?
+                        && let Some(frontier) = Box::pin(reconcile_object_deletions(writer)).await?
                     {
                         recall_frontier.send_replace(frontier);
                         background_frontier.send_replace(frontier);
@@ -1327,6 +1347,52 @@ async fn run_writer(
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::SourceObservationAuthorityContext { selector, reply } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .source_observation_authority_context(&selector)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.as_ref().err().is_some_and(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::SourceObservationRevisionHasFacts {
+                    source,
+                    revision,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .source_observation_revision_has_facts(&source, &revision)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.as_ref().err().is_some_and(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
                     let _ = reply.send(result);
                     if fatal {
                         return Err(WriterActorError::Store);
