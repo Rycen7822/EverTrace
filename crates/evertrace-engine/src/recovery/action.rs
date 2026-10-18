@@ -459,25 +459,25 @@ impl RecoveryActionService {
     }
 
     pub async fn reconcile_pending_on_startup(&self) -> Result<(), RecoveryError> {
-        let projected = self
-            .writer
-            .project()
-            .await
-            .map_err(|_| RecoveryError::Store)?;
-        let view = RecoveryCurrentView::from_snapshot(&projected)?;
-        let pending = view
-            .state
-            .applications
-            .values()
-            .filter(|application| {
-                matches!(
-                    application.application_status,
-                    RecoveryApplicationStatus::Unknown
-                        | RecoveryApplicationStatus::PartiallyApplied
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let pending = {
+            let facts = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(|_| RecoveryError::Store)?;
+            let view = RecoveryCurrentView::from_current(&facts)?;
+            view.state
+                .applications
+                .into_values()
+                .filter(|application| {
+                    matches!(
+                        application.application_status,
+                        RecoveryApplicationStatus::Unknown
+                            | RecoveryApplicationStatus::PartiallyApplied
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let mut first_error = None;
         for application in pending {
             let request = RecoveryRequest {

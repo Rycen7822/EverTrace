@@ -2560,6 +2560,8 @@ async fn immutable_pending_timeout_replays_and_rebuilds_from_fresh_current_view(
     service.reconcile_pending_on_startup().await.unwrap();
     let first = handle.project().await.unwrap();
     let current = RecoveryCurrentView::from_snapshot(&first).unwrap();
+    let facts = evertrace_store::projections::CurrentFacts::try_from(first.clone()).unwrap();
+    assert_eq!(current, RecoveryCurrentView::from_current(&facts).unwrap());
     let terminal = current
         .terminal_request(pending.recovery_capture_request_id)
         .unwrap();

@@ -20117,8 +20117,33 @@ mod tests {
                 Some("source_receipt" | "source_observation" | "evidence_surface")
             )
         }));
+        let recovery_from_current = RecoveryCurrentView::from_current(&facts).unwrap();
 
         let replayed = writer.full_projection().await.unwrap();
+        assert_eq!(
+            recovery_from_current,
+            RecoveryCurrentView::from_snapshot(&replayed).unwrap()
+        );
+
+        let mut damaged = replayed.clone();
+        let repository_row = damaged
+            .rows
+            .iter_mut()
+            .find(|row| {
+                row.row_id == crate::repository::repository_row_id(&repository.repository_id)
+            })
+            .unwrap();
+        repository_row.payload_json = Some("{".into());
+        let damaged_facts = CurrentFacts::try_from(damaged.clone()).unwrap();
+        assert_eq!(
+            RecoveryCurrentView::from_current(&damaged_facts),
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(
+            RecoveryCurrentView::from_snapshot(&damaged),
+            Err(StoreError::StoreCorrupt)
+        );
+
         assert_eq!(facts.frontier(), replayed.frontier);
         assert_eq!(facts.into_full_snapshot().unwrap(), replayed);
         assert_eq!(
