@@ -674,8 +674,9 @@ async fn reconcile_selected(
             items: Vec::new(),
         }
     } else if let Some(observation_ids) = observation_ids {
+        // Selection needs current objects; the post-barrier below syncs indexes.
         writer
-            .project_current(true)
+            .project_current(false)
             .await
             .map_err(map_reconcile_writer)?
             .reconciliation_frontier_for_observations(observation_ids)
