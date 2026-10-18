@@ -2306,14 +2306,6 @@ impl BackgroundScheduler {
                         return Ok(Some(dirty.target_id));
                     }
                     let physical = physical_targets.contains(dirty.target_id.as_str());
-                    if current_manifest.is_none()
-                        && (!physical
-                            || retained_manifests
-                                .get_or_insert_with(&load_retained_manifests)
-                                .is_empty())
-                    {
-                        return Ok(None);
-                    }
                     let observation_id = SourceObservationId::from_str(&dirty.target_id)
                         .map_err(|_| BackgroundSchedulerError::Store)?;
                     let (observation, _) = snapshot
@@ -2328,10 +2320,25 @@ impl BackgroundScheduler {
                     receipt
                         .validate()
                         .map_err(|_| BackgroundSchedulerError::Store)?;
+                    let weak_import = is_verified_importer_weak_normalization(
+                        &snapshot,
+                        dirty.target_kind,
+                        &dirty.target_id,
+                    );
+                    if current_manifest.is_none()
+                        && (!physical
+                            || retained_manifests
+                                .get_or_insert_with(&load_retained_manifests)
+                                .is_empty())
+                        && !weak_import
+                    {
+                        return Ok(None);
+                    }
                     // The primary receipt is only a necessary admission condition;
                     // the complete dependency manifest check below remains authoritative.
                     let manifest = receipt.adapter_manifest_ref.as_str();
-                    Ok((current_manifest == Some(manifest)
+                    Ok((weak_import
+                        || current_manifest == Some(manifest)
                         || (physical
                             && retained_manifests
                                 .get_or_insert_with(&load_retained_manifests)
@@ -2437,7 +2444,13 @@ impl BackgroundScheduler {
                     && job.target_generation == item.source_event_seq.max(1)
                     && capture_job_is_current(job, self.runtime.effective_config_hash)
             });
-            if covered || resolve_capture_report(&item, report.as_ref(), &self.runtime).is_none() {
+            if covered
+                || (!is_verified_importer_weak_normalization(
+                    &snapshot,
+                    item.target_kind,
+                    &item.target_id,
+                ) && resolve_capture_report(&item, report.as_ref(), &self.runtime).is_none())
+            {
                 continue;
             }
             capture_jobs.push(DurableJob {
@@ -3872,14 +3885,23 @@ impl BackgroundScheduler {
                 )
                 .await;
         }
-        let Some(report) = resolve_capture_report(item, report_guard.as_ref(), &self.runtime)
-        else {
-            return Err(BackgroundSchedulerError::Store);
+        let adapter_manifests = if is_verified_importer_weak_normalization(
+            &claimed.current,
+            item.target_kind,
+            &item.target_id,
+        ) {
+            Vec::new()
+        } else {
+            let Some(report) = resolve_capture_report(item, report_guard.as_ref(), &self.runtime)
+            else {
+                return Err(BackgroundSchedulerError::Store);
+            };
+            vec![report.manifest().clone()]
         };
         let reconciliation = reconcile_observations_once(
             ReconcileInput {
                 runtime_snapshot: self.runtime.clone(),
-                adapter_manifests: vec![report.manifest().clone()],
+                adapter_manifests,
                 liveness: Vec::new(),
                 reconciled_gaps: Vec::new(),
                 reconciled_outages: Vec::new(),
@@ -4586,7 +4608,12 @@ impl BackgroundScheduler {
                     item.target_kind == expected_kind
                         && item.target_id == current.target_revision
                         && item.source_event_seq == current.target_watermark
-                        && resolve_capture_report(item, report.as_ref(), &self.runtime).is_some()
+                        && (is_verified_importer_weak_normalization(
+                            &snapshot,
+                            item.target_kind,
+                            &item.target_id,
+                        ) || resolve_capture_report(item, report.as_ref(), &self.runtime)
+                            .is_some())
                 })
             {
                 return Ok(None);
@@ -4798,6 +4825,74 @@ fn is_capture_job(job: &DurableJob) -> bool {
         job.kind.as_str(),
         "physical_normalization" | "capture_reconciliation"
     )
+}
+
+fn is_verified_importer_weak_normalization(
+    current: &CurrentFacts,
+    target_kind: DirtyTargetKind,
+    target_id: &str,
+) -> bool {
+    if target_kind != DirtyTargetKind::PhysicalNormalization {
+        return false;
+    }
+    let Ok(observation_id) = SourceObservationId::from_str(target_id) else {
+        return false;
+    };
+    let Some((observation, _)) = current.source_observation(observation_id) else {
+        return false;
+    };
+    if observation.validate().is_err() {
+        return false;
+    }
+    let Some((receipt, _)) = current.source_receipt(observation.source_receipt_ref) else {
+        return false;
+    };
+    if receipt.validate().is_err() {
+        return false;
+    }
+    let correlation = &observation.correlation;
+    observation.source_role == evertrace_domain::evidence::SourceRole::Imported
+        && observation.content_trust == evertrace_domain::evidence::ContentTrust::ImportedClaim
+        && observation.source_instance_id == receipt.source_instance_id
+        && observation.source_revision == receipt.source_revision
+        && observation.source_record_identity == receipt.source_record_identity
+        && observation.source_receipt_ref == receipt.source_receipt_id
+        && receipt.source_observation_id == observation.source_observation_id
+        && receipt.source_kind == evertrace_domain::evidence::EvidenceSourceKind::CodexSessionJsonl
+        && evertrace_store::is_session_import_source(receipt.source_instance_id.as_str())
+        && receipt.identity_domain == "codex-session-jsonl-v1"
+        && receipt.source_ref.strip_prefix("session:") == Some(receipt.source_session_ref.as_str())
+        && receipt.adapter_manifest_ref == "codex-session-import-v1"
+        && receipt.eligible_event_manifest_ref == "codex-session-import-events-v1"
+        && receipt.adapter_revision == 1
+        && receipt.parser_revision == 1
+        && receipt.canonicalization_revision == 1
+        && observation.adapter_revision == receipt.adapter_revision
+        && correlation.occurrence_schema_version == 1
+        && correlation.adapter_revision == receipt.adapter_revision
+        && correlation.adapter_manifest_ref == receipt.adapter_manifest_ref
+        && observation.parser_revision == receipt.parser_revision
+        && observation.canonicalization_revision == receipt.canonicalization_revision
+        && observation.detector_revision == receipt.detector_revision
+        && observation.redaction_revision == receipt.redaction_revision
+        && observation.identity_strength == receipt.identity_strength
+        && observation.capture_completeness == receipt.capture_completeness
+        && observation.observation_role == receipt.observation_role
+        && correlation.pairing_role == receipt.observation_role
+        && correlation.admission == evertrace_domain::evidence::CorrelationAdmission::Unavailable
+        && correlation.host_instance_id.is_none()
+        && correlation.host_trace_lineage_id.is_none()
+        && correlation.host_lane_key.is_none()
+        && correlation.canonical_event_family.is_none()
+        && correlation.native_request_id.is_none()
+        && correlation.physical_execution_ordinal.is_none()
+        && correlation.field_provenance.is_empty()
+        && correlation.strong_gate_receipt_ref.is_none()
+        && correlation.partial_correlation_ref.is_none()
+        && correlation.possible_duplicate_group_id.is_none()
+        && observation.source_local_evidence.is_none()
+        && observation.scope_effect_claims.is_empty()
+        && receipt.lifecycle.is_none()
 }
 
 fn capture_item_manifest_matches(

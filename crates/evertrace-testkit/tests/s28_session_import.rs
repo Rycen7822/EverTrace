@@ -120,6 +120,293 @@ async fn imported_method_independent_append_remains_live_after_first_proposal() 
     Box::pin(imported_messages_scenario(true, false, None, true)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_weak_observation_normalizes_without_host_report_and_survives_reopen() {
+    use evertrace_engine::{BackgroundScheduler, SynthesisPlanner};
+
+    let temp = TempDir::new().unwrap();
+    let adapter = temp.path().join("adapter");
+    let sessions = adapter.join("sessions");
+    let dated = sessions.join("2026/08/30");
+    fs::create_dir_all(&dated).unwrap();
+    for path in [
+        &adapter,
+        &sessions,
+        &sessions.join("2026"),
+        &sessions.join("2026/08"),
+        &dated,
+    ] {
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if path == &adapter { 0o700 } else { 0o755 }),
+        )
+        .unwrap();
+    }
+    let session_id = "019d0000-0000-7000-8000-000000000029";
+    let transcript = dated.join(format!("rollout-2026-08-30T00-00-00-{session_id}.jsonl"));
+    let header = serde_json::json!({
+        "ordinal": 0,
+        "timestamp": "2026-08-30T00:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": session_id,
+            "session_id": session_id,
+            "cwd": "/not-a-repository",
+            "originator": "codex_cli_rs",
+            "model_provider": "openai",
+            "git": null
+        }
+    });
+    let message = serde_json::json!({
+        "ordinal": 1,
+        "timestamp": "2026-08-30T00:00:01Z",
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "weak importer normalization"}
+    });
+    fs::write(&transcript, format!("{header}\n{message}\n")).unwrap();
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o644)).unwrap();
+    let observed_report =
+        observe_session_catalog_report(transcript.to_str(), session_id, "weak-normalization", None)
+            .unwrap();
+    let report = Arc::new(RwLock::new(Some(observed_report.clone())));
+    let data = temp.path().join("data");
+    let writer = open_writer(&data).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 32).unwrap();
+    let catalog = SessionCatalogService::new(handle.clone(), CONFIG);
+    assert_eq!(catalog.refresh(&observed_report).await.unwrap(), 1);
+    let source = format!("session-rollout:{session_id}:{session_id}");
+    let admin = SessionImportAdminService::new(handle.clone(), Arc::clone(&report), CONFIG);
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session_id,
+                SessionImportAdminAction::QueueImport,
+                10,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let worker =
+        SessionImportWorker::new(handle.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap();
+    let mut import_completed = false;
+    for _ in 0..4 {
+        import_completed = worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap()
+            .completed;
+        if import_completed {
+            break;
+        }
+    }
+    assert!(import_completed, "the normal importer did not finish");
+
+    let imported = handle.project().await.unwrap();
+    let observations = imported
+        .data_rows()
+        .filter_map(|row| {
+            row.payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        })
+        .filter_map(|payload| match payload {
+            JournalPayload::SourceObservationRecorded(observation) => {
+                Some(observation.source_observation_id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observations.len(), 2);
+    let mut observation_ids = observations;
+    observation_ids.sort_unstable();
+    assert!(!imported.data_rows().any(|row| {
+        row.payload_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+            .is_some_and(|payload| matches!(payload, JournalPayload::NormalizationWatermark(_)))
+    }));
+    drop(imported);
+
+    *report.write().await = None;
+    assert!(report.read().await.is_none());
+    let scheduler = BackgroundScheduler::new(
+        handle.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+            enabled: false,
+            ..Default::default()
+        }),
+        evertrace_domain::config::DreamingConfig::default(),
+    );
+    scheduler.run_once().await.unwrap();
+
+    let normalized = handle.project().await.unwrap();
+    let payloads = normalized
+        .data_rows()
+        .filter_map(|row| {
+            row.payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        })
+        .collect::<Vec<_>>();
+    let occurrences = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::HostOccurrenceNormalized(value) => Some(value.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(occurrences.len(), observation_ids.len());
+    let mut occurrence_observation_ids = occurrences
+        .iter()
+        .map(|occurrence| {
+            assert_eq!(occurrence.source_observation_refs.len(), 1);
+            occurrence.source_observation_refs[0]
+        })
+        .collect::<Vec<_>>();
+    occurrence_observation_ids.sort_unstable();
+    assert_eq!(occurrence_observation_ids, observation_ids);
+    for occurrence in &occurrences {
+        assert_eq!(
+            occurrence.correlation_strength,
+            evertrace_domain::evidence::CorrelationStrength::Unavailable
+        );
+        assert_eq!(
+            occurrence.normalization_state,
+            evertrace_domain::evidence::NormalizationState::SingleSource
+        );
+        assert!(occurrence.exact_key.is_none());
+        assert!(occurrence.possible_duplicate_group_id.is_none());
+    }
+    assert!(payloads.iter().all(|payload| !matches!(
+        payload,
+        JournalPayload::OperationDerived(_)
+            | JournalPayload::ScopeEffectDerived(_)
+            | JournalPayload::ExecutionLaneRecorded(_)
+            | JournalPayload::CaptureReceiptRecorded(_)
+    )));
+    let mut watermarked_observation_ids = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::NormalizationWatermark(value) => Some(value.source_observation_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    watermarked_observation_ids.sort_unstable();
+    assert_eq!(watermarked_observation_ids, observation_ids);
+    assert!(
+        normalized
+            .reconciliation_frontier_for_observations(&observation_ids)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let completed_frontier = normalized.frontier;
+    let mut completed_occurrence_ids = occurrences
+        .iter()
+        .map(|occurrence| occurrence.host_occurrence_id)
+        .collect::<Vec<_>>();
+    completed_occurrence_ids.sort_unstable();
+    let completed_jobs = RuntimeSchedulerView::from_snapshot(&normalized)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .filter(|job| job.kind == "physical_normalization")
+        .collect::<Vec<_>>();
+    assert_eq!(completed_jobs.len(), observation_ids.len());
+    assert!(
+        completed_jobs
+            .iter()
+            .all(|job| job.state == JobStatus::Succeeded)
+    );
+    let mut completed_job_ids = completed_jobs
+        .iter()
+        .map(|job| job.job_id)
+        .collect::<Vec<_>>();
+    completed_job_ids.sort_unstable();
+
+    drop(normalized);
+    drop(scheduler);
+    drop(worker);
+    drop(admin);
+    drop(catalog);
+    drop(handle);
+    task.await.unwrap().unwrap();
+
+    let writer = open_writer(&data).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 32).unwrap();
+    let catalog = SessionCatalogService::new(handle.clone(), CONFIG);
+    let worker =
+        SessionImportWorker::new(handle.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap();
+    let scheduler = BackgroundScheduler::new(
+        handle.clone(),
+        catalog,
+        worker,
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+            enabled: false,
+            ..Default::default()
+        }),
+        evertrace_domain::config::DreamingConfig::default(),
+    );
+    let repeated = scheduler.run_once().await.unwrap();
+    let reopened = handle.project().await.unwrap();
+    assert_eq!(repeated.completed, 0);
+    assert_eq!(reopened.frontier, completed_frontier);
+    let reopened_payloads = reopened
+        .data_rows()
+        .filter_map(|row| {
+            row.payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        })
+        .collect::<Vec<_>>();
+    let mut reopened_occurrence_ids = reopened_payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::HostOccurrenceNormalized(value) => Some(value.host_occurrence_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    reopened_occurrence_ids.sort_unstable();
+    assert_eq!(reopened_occurrence_ids, completed_occurrence_ids);
+    let reopened_jobs = RuntimeSchedulerView::from_snapshot(&reopened)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .filter(|job| job.kind == "physical_normalization")
+        .collect::<Vec<_>>();
+    assert_eq!(reopened_jobs.len(), completed_jobs.len());
+    let mut reopened_job_ids = reopened_jobs
+        .iter()
+        .map(|job| job.job_id)
+        .collect::<Vec<_>>();
+    reopened_job_ids.sort_unstable();
+    assert_eq!(reopened_job_ids, completed_job_ids);
+    drop(reopened);
+    drop(scheduler);
+    drop(handle);
+    task.await.unwrap().unwrap();
+}
+
 async fn imported_messages_scenario(
     method: bool,
     terminal: bool,
