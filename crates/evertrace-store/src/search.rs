@@ -9,12 +9,14 @@ use std::{
     str::FromStr,
 };
 
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::{
     Table,
     index::scalar::FullTextSearchQuery,
-    query::{QueryBase, Select},
+    query::{ExecutableQuery, HasQuery, QueryBase, Select},
 };
 
 use crate::{StoreError, connection::StoreReadHandle};
@@ -349,35 +351,101 @@ async fn query_rows(
     limit: usize,
     fts: Option<&str>,
 ) -> Result<Vec<SearchProjectionRow>, StoreError> {
-    let batches = if let Some(query) = fts {
+    if let Some(query) = fts {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let native_limit = i64::try_from(limit).map_err(|_| StoreError::InvalidInput)?;
         let mut query = table
             .query()
-            .full_text_search(FullTextSearchQuery::new(query.into()))
-            .select(Select::columns(&SEARCH_COLUMNS))
-            .limit(limit);
+            .full_text_search(FullTextSearchQuery::new(query.into()).limit(Some(native_limit)))
+            .select(Select::columns(&SEARCH_COLUMNS));
+        // The builder adds an outer limit of ten. Clear it: flat matches are
+        // not ordered, so truncation must follow selection, not precede it.
+        // The independent native limit still bounds indexed top-k work.
+        query.mut_query().limit = None;
         if let Some(filter) = filter {
             query = query.only_if(filter);
         }
-        crate::collect_batches(&query)
-            .await
-            .map_err(|_| StoreError::LanceDb)?
-    } else {
-        let mut query = table
-            .query()
-            .select(Select::columns(&SEARCH_COLUMNS))
-            .limit(limit);
-        if let Some(filter) = filter {
-            query = query.only_if(filter);
+        let mut stream = query.execute().await.map_err(|_| StoreError::LanceDb)?;
+        let mut selected = Vec::with_capacity(limit);
+        while let Some(batch) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            let batch = batch.map_err(|_| StoreError::LanceDb)?;
+            select_fts_batch(&batch, &mut selected, limit).await?;
         }
-        crate::collect_batches(&query)
-            .await
-            .map_err(|_| StoreError::LanceDb)?
-    };
-    let mut rows = rows_from_batches(batches, false)?;
-    if fts.is_none() {
-        rows.sort();
+        let rows = selected.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+        ensure_unique_row_ids(&rows)?;
+        return Ok(rows);
     }
+    let mut query = table
+        .query()
+        .select(Select::columns(&SEARCH_COLUMNS))
+        .limit(limit);
+    if let Some(filter) = filter {
+        query = query.only_if(filter);
+    }
+    let batches = crate::collect_batches(&query)
+        .await
+        .map_err(|_| StoreError::LanceDb)?;
+    let mut rows = rows_from_batches(batches, false)?;
+    rows.sort();
     Ok(rows)
+}
+
+async fn select_fts_batch(
+    batch: &RecordBatch,
+    selected: &mut Vec<(f32, SearchProjectionRow)>,
+    limit: usize,
+) -> Result<(), StoreError> {
+    let ids = batch
+        .column_by_name("row_id")
+        .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+        .ok_or(StoreError::StoreCorrupt)?;
+    let scores = batch
+        .column_by_name("_score")
+        .and_then(|array| array.as_any().downcast_ref::<Float32Array>())
+        .ok_or(StoreError::StoreCorrupt)?;
+    for index in 0..batch.num_rows() {
+        if ids.is_null(index) || scores.is_null(index) || !scores.value(index).is_finite() {
+            return Err(StoreError::StoreCorrupt);
+        }
+        let score = scores.value(index);
+        let position = selected.partition_point(|(other_score, row)| {
+            other_score
+                .total_cmp(&score)
+                .reverse()
+                .then_with(|| row.row_id.as_str().cmp(ids.value(index)))
+                .is_le()
+        });
+        if position < limit {
+            // The existing decoder validates and owns only this contender's
+            // fields. Never retain slices backed by a losing batch's buffers.
+            let row = rows_from_batches(vec![batch.slice(index, 1)], false)?
+                .pop()
+                .ok_or(StoreError::StoreCorrupt)?;
+            if selected.len() == limit {
+                selected.pop();
+            }
+            selected.insert(position, (score, row));
+        }
+        if index % 256 == 255 {
+            tokio::task::yield_now().await;
+        }
+    }
+    tokio::task::yield_now().await;
+    Ok(())
+}
+
+fn ensure_unique_row_ids(rows: &[SearchProjectionRow]) -> Result<(), StoreError> {
+    let mut ids = rows
+        .iter()
+        .map(|row| row.row_id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
 }
 
 fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
@@ -1004,16 +1072,7 @@ fn rows_from_batches(
             return Err(StoreError::StoreCorrupt);
         }
     } else {
-        // Finite FTS reads keep native relevance order. Check identity uniqueness
-        // through borrowed keys, without reordering rows or cloning their text.
-        let mut ids = rows
-            .iter()
-            .map(|row| row.row_id.as_str())
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(StoreError::StoreCorrupt);
-        }
+        ensure_unique_row_ids(&rows)?;
     }
     Ok(rows)
 }
@@ -1176,21 +1235,18 @@ mod tests {
     #[tokio::test]
     async fn real_fts_rank_order_survives_bounded_wrapper() {
         const QUERY: &str = "needle";
-        const WEAK_IDS: [&str; 4] = [
-            "01890f47-6a4a-7cc1-98b9-01890f476c10",
-            "01890f47-6a4a-7cc1-98b9-01890f476c11",
-            "01890f47-6a4a-7cc1-98b9-01890f476c12",
-            "01890f47-6a4a-7cc1-98b9-01890f476c13",
-        ];
-        const STRONG_ID: &str = "01890f47-6a4a-7cc1-98b9-01890f476c14";
-        assert!(WEAK_IDS.iter().all(|weak| *weak < STRONG_ID));
+        const STRONG_ID: &str = "01890f47-6a4a-7cc1-98b9-01890f476c11";
+        let weak_ids = (0x00..=0x0a)
+            .map(|suffix| format!("01890f47-6a4a-7cc1-98b9-01890f476c{suffix:02x}"))
+            .collect::<Vec<_>>();
+        assert!(weak_ids.iter().all(|weak| weak.as_str() < STRONG_ID));
 
         let weak_text = format!("needle {}", "background ".repeat(24));
-        let mut rows = Vec::with_capacity(5);
-        for candidate_id in WEAK_IDS {
+        let mut rows = Vec::with_capacity(12);
+        for candidate_id in &weak_ids {
             let mut row = object_row();
             row.row_id = format!("search:object:{candidate_id}");
-            row.candidate_id = Some(candidate_id.into());
+            row.candidate_id = Some(candidate_id.clone());
             row.text = weak_text.clone();
             rows.push(row);
         }
@@ -1270,7 +1326,7 @@ mod tests {
             }
         }
 
-        let wrapper_ids = query_rows(&table, Some(filter), 3, Some(QUERY))
+        let wrapper_ids = query_rows(&table, Some(filter.clone()), 3, Some(QUERY))
             .await
             .unwrap()
             .into_iter()
@@ -1291,6 +1347,136 @@ mod tests {
         assert_eq!(
             wrapper_ids[0], native_ids[0],
             "query_rows must preserve the strictly strongest native FTS hit"
+        );
+
+        // Updating text invalidates the index's covered text. Normal searches
+        // must rank these flat-evaluated matches before applying their limit too.
+        table
+            .update()
+            .column("text", "concat(text, ' ')")
+            .execute()
+            .await
+            .unwrap();
+        let ordered_query = table
+            .query()
+            .full_text_search(FullTextSearchQuery::new(QUERY.into()))
+            .select(Select::columns(&SEARCH_COLUMNS))
+            .only_if(filter.clone())
+            .limit(rows.len());
+        let mut scored = Vec::new();
+        for batch in crate::collect_batches(&ordered_query).await.unwrap() {
+            let ids = batch
+                .column_by_name("candidate_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let scores = batch
+                .column_by_name("_score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for index in 0..batch.num_rows() {
+                scored.push((scores.value(index), ids.value(index).to_owned()));
+            }
+        }
+        let strong_emission_index = scored.iter().position(|(_, id)| id == STRONG_ID);
+        assert!(
+            strong_emission_index.is_some_and(|index| index >= 10),
+            "fixture precondition: the strong row must be physically emitted at raw index >= 10; index={strong_emission_index:?}, emitted={scored:?}"
+        );
+        scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+        assert_eq!(scored.len(), rows.len());
+        assert_eq!(scored[0].1, STRONG_ID);
+        assert!(scored[0].0 > scored[1].0);
+        let updated = query_rows(&table, Some(filter), 3, Some(QUERY))
+            .await
+            .unwrap();
+        assert_eq!(
+            updated[0].candidate_id.as_deref(),
+            Some(scored[0].1.as_str()),
+            "flat-evaluated text updates must retain the strongest result before the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn fts_selector_caps_orders_and_rejects_invalid_selected_rows() {
+        let with_scores = |batch: RecordBatch, scores: Vec<f32>| {
+            assert_eq!(batch.num_rows(), scores.len());
+            let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+            fields.push(Arc::new(Field::new("_score", DataType::Float32, false)));
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(Float32Array::from(scores)) as ArrayRef);
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let id = |suffix: &str| format!("search:object:01890f47-6a4a-7cc1-98b9-01890f476{suffix}");
+        let row = |suffix: &str| {
+            let mut row = object_row();
+            row.row_id = id(suffix);
+            row.candidate_id = Some(row.row_id.trim_start_matches("search:object:").into());
+            row
+        };
+        let selected_ids = |selected: &[(f32, SearchProjectionRow)]| {
+            selected
+                .iter()
+                .map(|(_, row)| row.row_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut selected = Vec::new();
+        let first = with_scores(
+            search_batch(&[row("c23"), row("c22")]).unwrap(),
+            vec![0.5, 0.5],
+        );
+        select_fts_batch(&first, &mut selected, 2).await.unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected_ids(&selected), vec![id("c22"), id("c23")]);
+        let late = with_scores(
+            search_batch(&[row("c24"), row("c21")]).unwrap(),
+            vec![0.9, 0.5],
+        );
+        select_fts_batch(&late, &mut selected, 2).await.unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected_ids(&selected), vec![id("c24"), id("c21")]);
+        let mut duplicates = Vec::new();
+        let duplicate = with_scores(search_batch(&[row("c30")]).unwrap(), vec![0.9]);
+        let separated = with_scores(
+            search_batch(&[row("c31"), row("c30")]).unwrap(),
+            vec![0.8, 0.7],
+        );
+        select_fts_batch(&duplicate, &mut duplicates, 3)
+            .await
+            .unwrap();
+        select_fts_batch(&separated, &mut duplicates, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            duplicates
+                .iter()
+                .filter(|(_, row)| row.row_id.ends_with("c30"))
+                .count(),
+            2
+        );
+        let retained: Vec<_> = duplicates.iter().map(|p| p.1.clone()).collect();
+        assert_eq!(
+            ensure_unique_row_ids(&retained),
+            Err(StoreError::StoreCorrupt)
+        );
+        let valid = search_batch(&[row("c32")]).unwrap();
+        let mut columns = valid.columns().to_vec();
+        columns[5] = Arc::new(StringArray::from(vec![""]));
+        let malformed = with_scores(
+            RecordBatch::try_new(valid.schema(), columns).unwrap(),
+            vec![0.7],
+        );
+        assert_eq!(
+            select_fts_batch(&malformed, &mut Vec::new(), 1).await,
+            Err(StoreError::StoreCorrupt)
+        );
+        let invalid_score = with_scores(search_batch(&[row("c33")]).unwrap(), vec![f32::NAN]);
+        assert_eq!(
+            select_fts_batch(&invalid_score, &mut Vec::new(), 1).await,
+            Err(StoreError::StoreCorrupt)
         );
     }
     #[tokio::test]
