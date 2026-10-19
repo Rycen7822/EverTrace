@@ -373,7 +373,11 @@ async fn query_rows(
             .await
             .map_err(|_| StoreError::LanceDb)?
     };
-    rows_from_batches(batches, false)
+    let mut rows = rows_from_batches(batches, false)?;
+    if fts.is_none() {
+        rows.sort();
+    }
+    Ok(rows)
 }
 
 fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
@@ -988,16 +992,28 @@ fn rows_from_batches(
             rows.push(row);
         }
     }
-    rows.sort();
-    if (require_checkpoint
-        && rows
+    if require_checkpoint {
+        rows.sort();
+        if rows
             .iter()
             .filter(|row| row.row_id == SEARCH_CHECKPOINT_ID)
             .count()
-            != 1)
-        || rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id)
-    {
-        return Err(StoreError::StoreCorrupt);
+            != 1
+            || rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    } else {
+        // Finite FTS reads keep native relevance order. Check identity uniqueness
+        // through borrowed keys, without reordering rows or cloning their text.
+        let mut ids = rows
+            .iter()
+            .map(|row| row.row_id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StoreError::StoreCorrupt);
+        }
     }
     Ok(rows)
 }
@@ -1080,6 +1096,7 @@ mod tests {
     use std::str::FromStr;
 
     use evertrace_domain::ids::CommandId;
+    use lancedb::index::{Index, scalar::FtsIndexBuilder};
 
     use super::*;
     use crate::{DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload};
@@ -1143,8 +1160,139 @@ mod tests {
             exact_checkpoint_frontier(&[checkpoint.clone(), checkpoint]),
             Err(StoreError::StoreCorrupt)
         );
+        let row = object_row();
+        let mut other = row.clone();
+        other.row_id.push_str(":other");
+        assert_eq!(
+            rows_from_batches(
+                vec![search_batch(&[row.clone(), other, row]).unwrap()],
+                false
+            ),
+            Err(StoreError::StoreCorrupt),
+            "rank-preserving queries must still reject nonadjacent duplicate IDs"
+        );
     }
 
+    #[tokio::test]
+    async fn real_fts_rank_order_survives_bounded_wrapper() {
+        const QUERY: &str = "needle";
+        const WEAK_IDS: [&str; 4] = [
+            "01890f47-6a4a-7cc1-98b9-01890f476c10",
+            "01890f47-6a4a-7cc1-98b9-01890f476c11",
+            "01890f47-6a4a-7cc1-98b9-01890f476c12",
+            "01890f47-6a4a-7cc1-98b9-01890f476c13",
+        ];
+        const STRONG_ID: &str = "01890f47-6a4a-7cc1-98b9-01890f476c14";
+        assert!(WEAK_IDS.iter().all(|weak| *weak < STRONG_ID));
+
+        let weak_text = format!("needle {}", "background ".repeat(24));
+        let mut rows = Vec::with_capacity(5);
+        for candidate_id in WEAK_IDS {
+            let mut row = object_row();
+            row.row_id = format!("search:object:{candidate_id}");
+            row.candidate_id = Some(candidate_id.into());
+            row.text = weak_text.clone();
+            rows.push(row);
+        }
+        let mut strong = object_row();
+        strong.row_id = format!("search:object:{STRONG_ID}");
+        strong.candidate_id = Some(STRONG_ID.into());
+        strong.text = "needle ".repeat(18);
+        rows.push(strong);
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = lancedb::connect(temp.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let table = database
+            .create_table(SEARCH_TABLE, search_batch(&rows).unwrap())
+            .execute()
+            .await
+            .unwrap();
+        table
+            .create_index(
+                &["text"],
+                Index::FTS(
+                    FtsIndexBuilder::default()
+                        .base_tokenizer("icu".into())
+                        .stem(false)
+                        .remove_stop_words(false)
+                        .ascii_folding(true)
+                        .with_position(false),
+                ),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        let indices = table.list_indices().await.unwrap();
+        eprintln!("r529_fts_index_count={}", indices.len());
+        for index in &indices {
+            eprintln!("r529_fts_index_columns={:?}", index.columns);
+        }
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].columns, vec!["text".to_owned()]);
+
+        let filter = SearchHardFilter {
+            lifecycle: Some("active".into()),
+            object_only: true,
+            current_only: true,
+            ..SearchHardFilter::default()
+        };
+        let filter = filter_sql(&filter).unwrap();
+        let native_query = table
+            .query()
+            .full_text_search(FullTextSearchQuery::new(QUERY.into()))
+            .select(Select::columns(&SEARCH_COLUMNS))
+            .limit(3)
+            .only_if(filter.clone());
+        let native_batches = crate::collect_batches(&native_query).await.unwrap();
+        let mut native_ids = Vec::new();
+        let mut native_scores = Vec::new();
+        for batch in native_batches {
+            let candidate_index = batch.schema().index_of("candidate_id").unwrap();
+            let candidates = batch
+                .column(candidate_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let scores = batch
+                .column_by_name("_score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            native_scores.extend(scores.values().iter().copied());
+            for row in 0..batch.num_rows() {
+                assert!(!candidates.is_null(row));
+                native_ids.push(candidates.value(row).to_owned());
+            }
+        }
+
+        let wrapper_ids = query_rows(&table, Some(filter), 3, Some(QUERY))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.candidate_id.unwrap())
+            .collect::<Vec<_>>();
+        eprintln!("r529_native_top_three_candidate_ids={native_ids:?}");
+        eprintln!("r529_native_scores={native_scores:?}");
+        eprintln!("r529_query_rows_top_three_candidate_ids={wrapper_ids:?}");
+        assert_eq!(native_ids.len(), 3, "native FTS must return top three");
+        assert_eq!(native_scores.len(), 3);
+        assert!(native_scores[0] > native_scores[1] && native_scores[0] > native_scores[2]);
+        assert_eq!(
+            native_ids[0], STRONG_ID,
+            "fixture precondition: designated strong row must lead native FTS; IDs={native_ids:?}, scores={native_scores:?}"
+        );
+        // Equal-score weak rows may tie differently between two native queries.
+        assert_eq!(wrapper_ids.len(), native_ids.len());
+        assert_eq!(
+            wrapper_ids[0], native_ids[0],
+            "query_rows must preserve the strictly strongest native FTS hit"
+        );
+    }
     #[tokio::test]
     async fn validated_frontier_snapshot_keeps_post_pin_authority_and_falls_back() {
         let temp = tempfile::tempdir().unwrap();
