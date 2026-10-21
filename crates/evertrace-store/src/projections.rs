@@ -16767,15 +16767,18 @@ impl ProjectionWorker {
         });
         let reconcile_recall = reconcile_core;
         let reconcile_wiki = reconcile_core;
-        let reconcile_procedure_effect = delta.iter().any(|row| {
+        let reconcile_effect_events = delta.iter().any(|row| {
             matches!(
                 row.event_type.as_str(),
                 "procedure_usage_recorded_v1"
                     | "procedure_negative_evidence_recorded_v1"
                     | "procedure_negative_review_recorded_v1"
-                    | "worktree_snapshot_recorded_v1"
             )
         });
+        // A snapshot's effect dependency is decided after the delta is applied.
+        let snapshot_effect_trigger = delta
+            .iter()
+            .any(|row| row.event_type == "worktree_snapshot_recorded_v1");
         let reconcile_all = delta.iter().try_fold(false, |reconcile, row| {
             if row.event_type == "object_deletion_ledger_recorded_v1" {
                 return Ok::<_, StoreError>(true);
@@ -16800,17 +16803,28 @@ impl ProjectionWorker {
             }
             state.validate_evidence_relations()?;
         }
-        let ordinary_upsert = !reconcile_all
-            && !reconcile_recall
-            && !reconcile_core
-            && !reconcile_wiki
-            && !reconcile_procedure_effect;
-        let direct_facts = return_current_facts
-            && ordinary_upsert
+        let ordinary_without_effect =
+            !reconcile_all && !reconcile_recall && !reconcile_core && !reconcile_wiki;
+        let direct_eligible = return_current_facts
+            && ordinary_without_effect
+            && !reconcile_effect_events
             && source_facts.is_some_and(|facts| {
                 state.can_emit_current_facts()
                     && state.preserves_source_prefix(facts, checkpoint_frontier)
             });
+        // Only proven direct facts with no usage or current effect can waive
+        // a snapshot dependency; all other triggers keep the original path.
+        let empty_effect_snapshot = snapshot_effect_trigger
+            && direct_eligible
+            && validated_frontier.is_some()
+            && state.procedure.effect_usages().next().is_none()
+            && current
+                .iter()
+                .all(|row| row.object_kind.as_deref() != Some("procedure_context_effect"));
+        let reconcile_procedure_effect =
+            reconcile_effect_events || (snapshot_effect_trigger && !empty_effect_snapshot);
+        let ordinary_upsert = ordinary_without_effect && !reconcile_procedure_effect;
+        let direct_facts = direct_eligible && ordinary_upsert;
         if direct_facts {
             let facts = state.into_current_facts(journal_frontier)?;
             validate_ordinary_upsert_rows(&current, facts.other_rows())?;
@@ -20170,6 +20184,86 @@ mod tests {
                 .search
                 .iter()
                 .any(|row| row.source_event_seq == surface_seq)
+        );
+
+        // A warm proof-hit read returns the admission-owned source Arcs; keep
+        // them as the reference for the earlier branch added below.
+        let warm = writer.project_current(true).await.unwrap();
+        let warm_receipt = Arc::clone(warm.source_receipts().next().unwrap().0);
+        let warm_observation = Arc::clone(warm.source_observations().next().unwrap().0);
+        let warm_surface = Arc::clone(warm.evidence_surfaces().next().unwrap().0);
+        assert!(writer.source_prefix_proven_for_test());
+        drop(warm);
+
+        // A worktree snapshot is an observational-effect input, but the applied
+        // state has no usage, so this source step takes the earlier decision:
+        // the snapshot-triggered effect reconcile is waived and the existing
+        // ordinary upsert plus source-prefix proof commits the same row.
+        let snapshot_id = WorktreeSnapshotId::new_v7();
+        let snapshot = evertrace_domain::repository::WorktreeSnapshot {
+            worktree_snapshot_id: snapshot_id,
+            worktree_instance_id: worktree.worktree_instance_id,
+            head_oid: None,
+            tree_oid: None,
+            branch_ref: None,
+            detached_head: false,
+            tracked_diff_digest: None,
+            index_digest: None,
+            untracked_manifest_digest: None,
+            relevant_anchor_digests: vec![],
+            dependency_fingerprints: vec![],
+            toolchain_fingerprint: None,
+            git_operation: evertrace_domain::repository::GitOperation::None,
+            captured_at_us: 1,
+            evidence_refs: vec!["snapshot:r610".into()],
+            capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Complete,
+            omission_reasons: vec![],
+        };
+        writer
+            .commit(
+                &r105_command(
+                    3,
+                    vec![JournalPayload::WorktreeSnapshotRecorded(Box::new(snapshot))],
+                ),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+
+        // The retained successor delta must be consumed by this read alone.
+        let reconciled = writer.project_current(true).await.unwrap();
+        let replayed = writer.full_projection().await.unwrap();
+        assert_eq!(reconciled.frontier(), replayed.frontier);
+        assert!(
+            reconciled
+                .other_row(&crate::repository::snapshot_row_id(&snapshot_id))
+                .is_some()
+        );
+        assert!(reconciled.other_data_rows().all(|row| {
+            !matches!(
+                row.object_kind.as_deref(),
+                Some("source_receipt" | "source_observation" | "evidence_surface")
+            )
+        }));
+        assert!(Arc::ptr_eq(
+            &warm_receipt,
+            reconciled.source_receipts().next().unwrap().0
+        ));
+        assert!(Arc::ptr_eq(
+            &warm_observation,
+            reconciled.source_observations().next().unwrap().0
+        ));
+        assert!(Arc::ptr_eq(
+            &warm_surface,
+            reconciled.evidence_surfaces().next().unwrap().0
+        ));
+        assert_eq!(writer.capture_delta_selections(), 0);
+        assert_eq!(reconciled.into_full_snapshot().unwrap(), replayed);
+        let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
+        assert_eq!(
+            writer.l0002_projection_worker().current().await.unwrap(),
+            expected
         );
     }
 
