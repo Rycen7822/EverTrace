@@ -547,6 +547,7 @@ mod tests {
                 &search,
                 &read_search_rows(&search).await.unwrap(),
                 &search_rows,
+                &Default::default(),
                 false
             )
             .await,

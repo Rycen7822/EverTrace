@@ -25,7 +25,7 @@ use crate::{
         ProjectionWorker, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
         ReconciliationFrontier,
     },
-    query::L0002ProjectionWorker,
+    query::{L0002ProjectionWorker, SurfaceRowBase},
     search::SEARCH_TABLE,
     sqlite_state::{SqliteHandle, SqliteStamp, SqliteState},
 };
@@ -462,19 +462,19 @@ struct ProjectionValidation {
     search_version: u64,
     frontier: u64,
     has_failed_job: bool,
-    // Private level: this exact physical stamp, the derived-family
-    // checkpoints and the real search version were established by a
-    // completed full L0002 derive whose persisted relations and search rows
-    // were read back equal. It is not a persisted certificate and is never
-    // upgraded by a checkpoint-only no-delta read.
+    // Complete L0002 derivation/readback proof for the stored relations
+    // checkpoint and search version. Objects-only progress can retain that
+    // older base, not proof of synchronization to the new journal frontier.
+    // A checkpoint-only no-delta read never creates this grade.
     content_proven: bool,
     // Exact current/live equality for the immutable source prefix at this
     // physical objects checkpoint. It is only preserved across a confirmed
     // append that cannot change the old prefix.
     source_prefix_proven: bool,
-    // Last confirmed append, not a claim that the old objects or indexes have
-    // advanced. Each retained successor is bound to the input stamp plus the
-    // committed frontier it appended.
+    // Last append this writer confirmed, recorded as the real post-append
+    // physical stamp and the committed frontier it appended. It is never a
+    // claim that the old objects input or the indexes advanced, and it is not
+    // a hybrid of the pre-append input and the new frontier.
     appended_through: Option<(SqliteStamp, u64)>,
     // At most one small typed delta. Multiple appends use the ordinary
     // journal delta read without retaining or concatenating their rows.
@@ -492,31 +492,92 @@ impl ProjectionValidation {
             && self.stamp.object_generation == other.object_generation
     }
 
+    /// The live physical state is exactly this proof's confirmed append. A
+    /// raw journal append, an objects/relations commit or an external change
+    /// moves a compared field and therefore fails.
     fn appended_successor_bound(&self, other: &SqliteStamp) -> bool {
         self.appended_through
             .as_ref()
-            .is_some_and(|(input, frontier)| {
-                input.incarnation == other.incarnation
-                    && input.data_version == other.data_version
-                    && input.objects_epoch == other.objects_epoch
-                    && input.object_checkpoint == other.object_checkpoint
-                    && input.object_generation == other.object_generation
-                    && *frontier == other.frontier
+            .is_some_and(|(post, frontier)| *frontier == post.frontier && post == other)
+    }
+
+    /// Whether this proof still describes the live pre-append state. A retained
+    /// successor must match its own post-append stamp; a completed projection
+    /// must match the stamp it was derived from. Neither comparison re-stamps a
+    /// state this writer never confirmed.
+    fn continues_live(&self, live: &SqliteStamp) -> bool {
+        match self.appended_through {
+            Some((post, frontier)) => frontier == post.frontier && post == *live,
+            None => self.stamp == *live,
+        }
+    }
+
+    /// Whether the live journal lineage is still this proof's confirmed
+    /// lineage. A proof without a confirmed append must still be the exact
+    /// derived stamp; one with a confirmed append must be that real
+    /// post-append stamp, reached only through appends this writer confirmed
+    /// one at a time. Objects and relations may not advance the journal, so
+    /// this is what separates a legal objects-only successor from a raw or
+    /// external journal advance.
+    fn journal_lineage_continues(&self, live: &SqliteStamp) -> bool {
+        match self.appended_through {
+            Some((post, frontier)) => {
+                frontier == post.frontier
+                    && post.journal_epoch > self.stamp.journal_epoch
+                    && post.incarnation == self.stamp.incarnation
+                    && post.data_version == self.stamp.data_version
+                    && *live == post
+            }
+            None => {
+                live.incarnation == self.stamp.incarnation
+                    && live.data_version == self.stamp.data_version
+                    && live.journal_epoch == self.stamp.journal_epoch
+                    && live.frontier == self.stamp.frontier
+            }
+        }
+    }
+
+    /// The proven L0002 base whose complete derived rows and source prefix were
+    /// read back equal, provided the live journal lineage, relations family and
+    /// search native version still are that base. Objects-only progress keeps
+    /// the base fact without refreshing the journal lineage or promoting the
+    /// base to a synchronized stamp.
+    fn source_row_base(&self, live: &SqliteStamp, search_version: u64) -> Option<SurfaceRowBase> {
+        (self.content_proven
+            && self.source_prefix_proven
+            && self.journal_lineage_continues(live)
+            && self.search_version == search_version
+            && self.stamp.relations_epoch == live.relations_epoch
+            && self.stamp.relation_checkpoint == live.relation_checkpoint)
+            .then_some(SurfaceRowBase {
+                frontier: self.stamp.relation_checkpoint,
+                relations_epoch: self.stamp.relations_epoch,
+                search_version: self.search_version,
             })
     }
 
     /// A confirmed closed single append descending from a proven complete
     /// content frontier whose derived families still sit on that same base
-    /// and search version. One append is bound by the retained rows, the
-    /// journal epoch and the unchanged objects/relations/search state.
+    /// and search version. One append is bound by the retained rows, the real
+    /// post-append journal epoch and the unchanged objects/relations/search
+    /// state; a base whose relations/search rows are not at the objects
+    /// checkpoint never reaches this delta path.
     fn capture_successor_bound(&self, other: &SqliteStamp, search_version: u64) -> bool {
+        let Some((post, _)) = self.appended_through.as_ref() else {
+            return false;
+        };
         self.content_proven
             && self.appended_rows.is_some()
             && self.search_version == search_version
             && self.stamp.frontier == self.stamp.object_checkpoint
-            && self.stamp.relations_epoch == other.relations_epoch
-            && self.stamp.relation_checkpoint == other.relation_checkpoint
-            && other.journal_epoch == self.stamp.journal_epoch.saturating_add(1)
+            && self.stamp.relation_checkpoint == self.stamp.object_checkpoint
+            && post.objects_epoch == self.stamp.objects_epoch
+            && post.object_checkpoint == self.stamp.object_checkpoint
+            && post.object_generation == self.stamp.object_generation
+            && post.relations_epoch == self.stamp.relations_epoch
+            && post.relation_checkpoint == self.stamp.relation_checkpoint
+            // Exactly one confirmed journal step from the proven base.
+            && post.journal_epoch == self.stamp.journal_epoch.saturating_add(1)
             && self.appended_successor_bound(other)
     }
 }
@@ -1345,10 +1406,19 @@ impl JournalWriter {
             stamps[1] = None;
             input
         };
+        let pre_live = self.physical_stamp()?;
+        let continuity = validated_input
+            .as_ref()
+            .is_some_and(|stamp| stamp.continues_live(&pre_live));
         let handoff = validated_input
             .as_ref()
             .filter(|stamp| {
-                stamp.appended_through.is_none()
+                // The retained rows and the old source-prefix fact only
+                // describe this exact pre-append state. A live state this
+                // writer never confirmed (for example a raw journal append on
+                // the same connection) must lose the reuse, not be re-stamped.
+                continuity
+                    && stamp.appended_through.is_none()
                     && rows.iter().map(|row| row.payload_json.len()).sum::<usize>()
                         <= MAX_PROJECTION_HANDOFF_BYTES
             })
@@ -1358,22 +1428,53 @@ impl JournalWriter {
             state.append_command_rows(&rows)?;
         }
         self._lock.validate_held()?;
-        self.admission_state = next_admission_state;
-        if let Some(mut input) = validated_input {
-            if rows.iter().any(|row| {
-                matches!(
-                    row.event_type.as_str(),
-                    "object_deletion_ledger_recorded_v1" | "scope_purge_progress_recorded_v1"
-                )
-            }) {
-                input.source_prefix_proven = false;
-            }
-            input.appended_through = Some((input.stamp, last_seq));
-            input.appended_rows = handoff;
-            self.projection_validation
-                .lock()
-                .map_err(|_| StoreError::StoreCorrupt)?[0] = Some(input);
+        // The tuple records the real physical state this writer just
+        // confirmed, never a mixture of the pre-append stamp with the new
+        // frontier. A confirmed append is exactly one journal epoch, ends at
+        // the appended frontier and leaves every other family untouched;
+        // anything else is an unexplained physical result.
+        let post_live = self.physical_stamp()?;
+        if post_live.incarnation != pre_live.incarnation
+            || post_live.data_version != pre_live.data_version
+            || post_live.journal_epoch != pre_live.journal_epoch.saturating_add(1)
+            || post_live.frontier != last_seq
+            || post_live.objects_epoch != pre_live.objects_epoch
+            || post_live.object_checkpoint != pre_live.object_checkpoint
+            || post_live.object_generation != pre_live.object_generation
+            || post_live.relations_epoch != pre_live.relations_epoch
+            || post_live.relation_checkpoint != pre_live.relation_checkpoint
+        {
+            // No new admission and no reuse credential may be published from a
+            // commit whose physical result this append cannot explain.
+            return Err(StoreError::StoreCorrupt);
         }
+        if let Some(mut input) = validated_input {
+            // A proof that does not continue this exact live state is not this
+            // writer's confirmed lineage: neither its old objects/content grade
+            // nor its source prefix may be republished. The next request starts
+            // again from the complete algorithm. A cancelled reuse is not a
+            // licence to re-stamp the current state either.
+            if continuity {
+                if rows.iter().any(|row| {
+                    matches!(
+                        row.event_type.as_str(),
+                        "object_deletion_ledger_recorded_v1" | "scope_purge_progress_recorded_v1"
+                    )
+                }) {
+                    // Deletion, purge and restore cleanup keep their original
+                    // complete handling: no derived-content grade and no source
+                    // prefix is carried across them.
+                    input.content_proven = false;
+                    input.source_prefix_proven = false;
+                }
+                input.appended_through = Some((post_live, last_seq));
+                input.appended_rows = handoff;
+                self.projection_validation
+                    .lock()
+                    .map_err(|_| StoreError::StoreCorrupt)?[0] = Some(input);
+            }
+        }
+        self.admission_state = next_admission_state;
         Ok(CommitOutcome {
             command_id: prepared.command_id,
             first_seq,
@@ -1688,6 +1789,29 @@ impl JournalWriter {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .clone();
+            // An objects-only run cannot change the L0002 families, so a
+            // completed derive that still describes this exact live journal
+            // lineage remains a valid content proof of its own relations base.
+            // The journal lineage is not refreshed and the base is never
+            // promoted to a synchronized stamp.
+            let carried_content: Option<(u64, u64, u64)> = if indexes {
+                None
+            } else {
+                stamps[0]
+                    .as_ref()
+                    .filter(|stamp| {
+                        stamp.content_proven
+                            && stamp.source_prefix_proven
+                            && stamp.journal_lineage_continues(&before)
+                    })
+                    .map(|stamp| {
+                        (
+                            stamp.stamp.relations_epoch,
+                            stamp.stamp.relation_checkpoint,
+                            stamp.search_version,
+                        )
+                    })
+            };
             let objects = stamps[0]
                 .as_ref()
                 .filter(|stamp| stamp.objects_bound(&before));
@@ -1706,6 +1830,23 @@ impl JournalWriter {
                     && output_kind == ProjectionReturn::None
                     && stamp.capture_successor_bound(&before, before_search)
             });
+            // The L0002 source-surface reuse needs the same confirmed successor,
+            // the proven relations/search base whose actual versions are still
+            // live, a currently proven source prefix and a current admission
+            // without deletion, purge or closure obligations. It is granted only
+            // to a run whose internal view is complete current facts, including
+            // a None-return synchronization barrier. Already-caught-up objects
+            // need no additional append to consume the proven L0002 base. The
+            // public full snapshot keeps its own algorithm.
+            let surface_base = stamps[0]
+                .as_ref()
+                .filter(|_| {
+                    indexes
+                        && output_kind != ProjectionReturn::Snapshot
+                        && (objects.is_some() || validated_input.is_some())
+                        && self.admission_state.has_no_deletion_closure()
+                })
+                .and_then(|stamp| stamp.source_row_base(&before, before_search));
             let source_facts = validated_input
                 .filter(|stamp| stamp.source_prefix_proven)
                 .map(|_| self.admission_state.source_facts());
@@ -1944,7 +2085,11 @@ impl JournalWriter {
                                 }
                                 ProjectionOutput::CurrentFacts(facts) => {
                                     worker
-                                        .catch_up_validated_current_facts_proof(facts, delta)
+                                        .catch_up_validated_current_facts_proof(
+                                            facts,
+                                            delta,
+                                            surface_base,
+                                        )
                                         .await?
                                 }
                             };
@@ -1960,6 +2105,12 @@ impl JournalWriter {
                             return Err(StoreError::StoreCorrupt);
                         }
                         (search_version, derived)
+                    } else if let Some((relations_epoch, relation_checkpoint, prior_search)) =
+                        carried_content
+                        && objects_stamp.relations_epoch == relations_epoch
+                        && objects_stamp.relation_checkpoint == relation_checkpoint
+                    {
+                        (prior_search, true)
                     } else {
                         (0, false)
                     };
@@ -4025,7 +4176,19 @@ mod tests {
             let input = stamps[0].as_ref().unwrap();
             assert_eq!(input.stamp, initial.stamp);
             assert_eq!(input.frontier, initial.frontier);
-            assert_eq!(input.appended_through, Some((initial.stamp, last_seq)));
+            // The tuple records the real confirmed post-append stamp, never the
+            // pre-append input stamp with a new frontier.
+            let (post, frontier) = input.appended_through.unwrap();
+            assert_eq!(frontier, last_seq);
+            assert_eq!(post.frontier, last_seq);
+            assert_eq!(post.journal_epoch, initial.stamp.journal_epoch + ordinal);
+            assert_eq!(post.incarnation, initial.stamp.incarnation);
+            assert_eq!(post.data_version, initial.stamp.data_version);
+            assert_eq!(post.objects_epoch, initial.stamp.objects_epoch);
+            assert_eq!(post.object_checkpoint, initial.stamp.object_checkpoint);
+            assert_eq!(post.object_generation, initial.stamp.object_generation);
+            assert_eq!(post.relations_epoch, initial.stamp.relations_epoch);
+            assert_eq!(post.relation_checkpoint, initial.stamp.relation_checkpoint);
             assert_eq!(input.appended_rows.is_some(), ordinal == 1);
             assert!(stamps[1].is_none());
             assert!(writer.commit(&command, 3).await.unwrap().replayed);
@@ -4045,6 +4208,165 @@ mod tests {
             assert!(stamp.appended_through.is_none());
             assert!(stamp.appended_rows.is_none());
         }
+    }
+
+    /// An objects-only catch-up must neither refresh the journal lineage nor
+    /// promote the proven L0002 base to a synchronized stamp, but its content
+    /// grade and source prefix stay available for the next complete run.
+    #[tokio::test]
+    async fn objects_only_progress_keeps_the_proven_base_without_promoting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let seed = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                0,
+                [0; 32],
+                "objects-v1",
+                JournalPayload::MigrationApplied(crate::MigrationApplied {
+                    migration_id: "objects-only-base".into(),
+                }),
+            )],
+        )
+        .unwrap();
+        writer.commit(&seed, 0).await.unwrap();
+        let derived = writer.project().await.unwrap();
+        let base = writer.projection_validation.lock().unwrap()[0]
+            .clone()
+            .unwrap();
+        assert!(base.content_proven);
+        assert!(base.source_prefix_proven);
+        assert!(base.appended_through.is_none());
+
+        let ordinary = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [1; 32],
+                "objects-v1",
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::ObjectsProjection,
+                    target_id: "objects-only-progress".into(),
+                    algorithm_revision: "objects-v1".into(),
+                    source_watermark: derived.frontier,
+                }),
+            )],
+        )
+        .unwrap();
+        let committed = writer.commit(&ordinary, 1).await.unwrap();
+        let objects = writer.project_objects().await.unwrap();
+        assert_eq!(objects.frontier, committed.last_seq);
+        assert_eq!(objects, writer.full_projection().await.unwrap());
+        let carried = writer.projection_validation.lock().unwrap()[0]
+            .clone()
+            .unwrap();
+        // The proof now describes the advanced objects family, yet it still
+        // claims the content grade of the older relations/search base and it is
+        // not an append successor of that base.
+        assert!(carried.content_proven);
+        assert!(carried.appended_through.is_none());
+        assert_eq!(carried.stamp.objects_epoch, base.stamp.objects_epoch + 1);
+        assert_eq!(carried.stamp.relations_epoch, base.stamp.relations_epoch);
+        assert_eq!(
+            carried.stamp.relation_checkpoint,
+            base.stamp.relation_checkpoint
+        );
+        assert_eq!(carried.search_version, base.search_version);
+        assert_ne!(carried.stamp.frontier, base.stamp.frontier);
+        // A later full run still derives and matches the independent replay.
+        let replayed = writer.project().await.unwrap();
+        assert_eq!(replayed, writer.full_projection().await.unwrap());
+    }
+
+    /// A raw journal advance this writer never confirmed must not be re-stamped
+    /// by the next ordinary append: the old objects content grade and the old
+    /// source prefix stay revoked, and the following request recovers through
+    /// the complete algorithm.
+    #[tokio::test]
+    async fn unconfirmed_direct_append_is_not_relabelled_by_the_next_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        // Establish a real derived content grade first.
+        let seed = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                0,
+                [0; 32],
+                "objects-v1",
+                JournalPayload::MigrationApplied(crate::MigrationApplied {
+                    migration_id: "unconfirmed-direct-seed".into(),
+                }),
+            )],
+        )
+        .unwrap();
+        writer.commit(&seed, 0).await.unwrap();
+        writer.project().await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        let proven = writer.projection_validation.lock().unwrap()[0]
+            .clone()
+            .unwrap();
+        assert!(proven.content_proven);
+        assert!(proven.appended_through.is_none());
+
+        // Bypass the writer: a raw append on the same connection advances the
+        // real journal without any admission or confirmed successor.
+        let direct = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                1,
+                [1; 32],
+                "objects-v1",
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::ObjectsProjection,
+                    target_id: "unconfirmed-direct".into(),
+                    algorithm_revision: "objects-v1".into(),
+                    source_watermark: proven.frontier,
+                }),
+            )],
+        )
+        .unwrap();
+        let rows = rows_for_append(&prepare_command(&direct).unwrap(), writer.next_seq, 1).unwrap();
+        append_rows(&writer.projection_handle(), &rows)
+            .await
+            .unwrap();
+        reserve_range(&mut writer.next_seq, 1).unwrap();
+        assert_ne!(
+            writer.physical_stamp().unwrap().journal_epoch,
+            proven.stamp.journal_epoch
+        );
+
+        let ordinary = JournalCommand::new(
+            CommandId::new_v7(),
+            vec![JournalEventDraft::runtime(
+                2,
+                [2; 32],
+                "objects-v1",
+                JournalPayload::DirtyTarget(DirtyTarget {
+                    target_kind: DirtyTargetKind::ObjectsProjection,
+                    target_id: "after-unconfirmed-direct".into(),
+                    algorithm_revision: "objects-v1".into(),
+                    source_watermark: proven.frontier,
+                }),
+            )],
+        )
+        .unwrap();
+        let committed = writer.commit(&ordinary, 2).await.unwrap();
+        assert_eq!(
+            writer.physical_stamp().unwrap().frontier,
+            committed.last_seq
+        );
+        // Neither the old content grade nor the old source prefix may be
+        // republished for a lineage this writer did not confirm.
+        let stamps = writer.projection_validation.lock().unwrap().clone();
+        assert!(stamps[0].is_none());
+        assert!(stamps[1].is_none());
+        assert!(!writer.source_prefix_proven_for_test());
+        // The next request still recovers through the ordinary complete path.
+        let projected = writer.project().await.unwrap();
+        assert_eq!(projected, writer.full_projection().await.unwrap());
+        assert_eq!(projected.frontier, committed.last_seq);
     }
 
     #[tokio::test]
