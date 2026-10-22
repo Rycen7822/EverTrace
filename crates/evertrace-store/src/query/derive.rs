@@ -350,7 +350,10 @@ pub(super) fn surface_row(
         DefaultRetrievalSuppressionGeneration::ContentSpanV2,
     )?;
     Ok(SearchProjectionRow {
-        row_id: surface_row_id(surface),
+        row_id: format!(
+            "search:evidence:{}:{}",
+            surface.source_observation_revision_ref, surface.span_hash
+        ),
         row_variant: "evidence_surface".into(),
         candidate_id: Some(format!(
             "{}:{}:{}",
@@ -408,16 +411,6 @@ pub(super) fn surface_row(
         source_event_seq: seq,
         projection_generation: 1,
     })
-}
-
-/// The stable row identity of one evidence surface. It depends only on the
-/// surface's own observation reference and span, so a consumer can address the
-/// persisted row before reconstructing its protected text.
-pub(super) fn surface_row_id(surface: &EvidenceSurface) -> String {
-    format!(
-        "search:evidence:{}:{}",
-        surface.source_observation_revision_ref, surface.span_hash
-    )
 }
 
 fn source_kind(kind: EvidenceSourceKind) -> &'static str {

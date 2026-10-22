@@ -32,7 +32,7 @@ use crate::{
     sqlite_state::SqliteHandle,
 };
 
-use super::derive::{exact_identifier_row, surface_row, surface_row_id, wiki_search_row};
+use super::derive::{exact_identifier_row, surface_row, wiki_search_row};
 use super::relation_assembly::{
     add_attempt, add_autoresearch, add_burst, add_capture, add_correction, add_episode,
     add_physical, add_recovery, add_repository, add_semantic, add_work_binding, add_work_identity,
@@ -76,45 +76,6 @@ struct L0002Handoff {
     relation_frontier: u64,
     search_frontier: u64,
     versions: [u64; 2],
-}
-
-/// A proven complete L0002 base whose persisted relations and search rows were
-/// derived from the same frontier and read back equal. Reuse of its immutable
-/// source prefix is only a claim about that frontier, never a claim that the
-/// current journal frontier or the current source rows have been synchronized.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SurfaceRowBase {
-    pub frontier: u64,
-    pub relations_epoch: u64,
-    pub search_version: u64,
-}
-
-// Test-only observation that the proven-base handover of an evidence-surface
-// row really happened. No production consumer reads it and it carries no
-// content or state.
-#[cfg(test)]
-std::thread_local! {
-    static SURFACE_ROW_REUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_surface_row_reuses() {
-    SURFACE_ROW_REUSES.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn surface_row_reuses() -> usize {
-    SURFACE_ROW_REUSES.with(std::cell::Cell::get)
-}
-
-/// The old evidence-surface rows of one proven base, taken out of the handoff
-/// so unchanged rows can move into the complete expected set instead of being
-/// reconstructed. Every row that is not claimed stays available for the
-/// ordinary deletion comparison.
-struct SurfaceRowReuse<'a> {
-    base: SurfaceRowBase,
-    rows: &'a mut BTreeMap<String, SearchProjectionRow>,
-    reused: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,14 +162,7 @@ impl L0002ProjectionWorker {
             .relation_rows()?;
         let search = read_search_rows(&self.search).await?;
         commit_relation_rows(&self.sqlite, &relations, &expected.relations)?;
-        commit_search_rows(
-            &self.search,
-            &search,
-            &expected.search,
-            &BTreeSet::new(),
-            false,
-        )
-        .await?;
+        commit_search_rows(&self.search, &search, &expected.search, false).await?;
         if self
             .sqlite
             .lock()
@@ -227,13 +181,7 @@ impl L0002ProjectionWorker {
         objects: &ProjectionSnapshot,
     ) -> Result<L0002ProjectionSnapshot, StoreError> {
         Ok(self
-            .catch_up_inner(
-                ObjectProjectionView::Snapshot(objects),
-                None,
-                None,
-                false,
-                false,
-            )
+            .catch_up_inner(ObjectProjectionView::Snapshot(objects), None, false, false)
             .await?
             .0)
     }
@@ -249,7 +197,6 @@ impl L0002ProjectionWorker {
         self.catch_up_inner(
             ObjectProjectionView::Snapshot(objects),
             journal_delta,
-            None,
             false,
             false,
         )
@@ -260,12 +207,10 @@ impl L0002ProjectionWorker {
         &self,
         facts: &CurrentFacts,
         journal_delta: Option<ProjectionJournalDelta>,
-        reuse: Option<SurfaceRowBase>,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
         self.catch_up_inner(
             ObjectProjectionView::CurrentFacts(facts),
             journal_delta,
-            reuse,
             false,
             false,
         )
@@ -322,7 +267,6 @@ impl L0002ProjectionWorker {
                 relations,
                 search,
             },
-            &BTreeSet::new(),
             fail_relation_commit,
             fail_search_commit,
         )
@@ -334,11 +278,10 @@ impl L0002ProjectionWorker {
         &self,
         objects: ObjectProjectionView<'_>,
         journal_delta: Option<ProjectionJournalDelta>,
-        reuse: Option<SurfaceRowBase>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2], bool), StoreError> {
-        let mut handoff = self
+        let handoff = self
             .prepare_handoff(objects.frontier(), journal_delta)
             .await?;
         if handoff.relation_frontier == handoff.frontier
@@ -354,66 +297,13 @@ impl L0002ProjectionWorker {
                 false,
             ));
         }
-        // The handoff must really be the proven base: both derived families sit
-        // on that same checkpoint and their actual versions are still the ones
-        // the base was proven with. Anything else derives the full projection.
-        let live_versions = handoff.versions;
-        let reuse = reuse.filter(|base| {
-            handoff.relation_frontier == base.frontier
-                && handoff.search_frontier == base.frontier
-                && live_versions[0] == base.relations_epoch
-                && live_versions[1] == base.search_version
-        });
-        // The base only covers content that existed when it was proven. Entry
-        // sequences are append-only and the source families and their receipts
-        // are insert-only under admission, so a surface whose own sequence and
-        // whose selected receipt's sequence both sit inside the base keeps the
-        // same text; everything newer is derived normally. The old
-        // evidence-surface rows are taken out of the handoff by value; the
-        // text is never copied into a second complete set. Rows that the
-        // derivation does not claim are put back for the ordinary comparison.
-        let mut pending = BTreeMap::new();
-        let mut reuse = reuse.map(|base| {
-            let mut others = Vec::new();
-            for row in std::mem::take(&mut handoff.search) {
-                if row.row_variant == "evidence_surface" {
-                    pending.insert(row.row_id.clone(), row);
-                } else {
-                    others.push(row);
-                }
-            }
-            handoff.search = others;
-            SurfaceRowReuse {
-                base,
-                rows: &mut pending,
-                reused: BTreeSet::new(),
-            }
-        });
         let expected = derive_l0002_projection_rows(
             objects.frontier(),
             objects.rows(),
             objects.current_facts(),
-            reuse.as_mut(),
         )?;
-        let reused = match reuse {
-            Some(reuse) => {
-                // Only rows actually inserted into expected are recorded. The
-                // unclaimed old rows still participate in the ordinary diff.
-                let reused = reuse.reused;
-                handoff.search.extend(pending.into_values());
-                handoff.search.sort();
-                reused
-            }
-            None => BTreeSet::new(),
-        };
         let (snapshot, versions) = self
-            .commit_expected(
-                handoff,
-                expected,
-                &reused,
-                fail_relation_commit,
-                fail_search_commit,
-            )
+            .commit_expected(handoff, expected, fail_relation_commit, fail_search_commit)
             .await?;
         Ok((snapshot, versions, true))
     }
@@ -522,7 +412,6 @@ impl L0002ProjectionWorker {
         &self,
         handoff: L0002Handoff,
         expected: L0002ProjectionSnapshot,
-        reused: &BTreeSet<String>,
         fail_relation_commit: bool,
         fail_search_commit: bool,
     ) -> Result<(L0002ProjectionSnapshot, [u64; 2]), StoreError> {
@@ -534,7 +423,6 @@ impl L0002ProjectionWorker {
             &self.search,
             &handoff.search,
             &expected.search,
-            reused,
             fail_search_commit,
         )
         .await?;
@@ -571,7 +459,6 @@ impl L0002ProjectionWorker {
             .catch_up_inner(
                 ObjectProjectionView::Snapshot(objects),
                 journal_delta,
-                None,
                 fail_relation_commit,
                 fail_search_commit,
             )
@@ -675,16 +562,14 @@ fn capture_delta_search(
 pub fn derive_l0002_projections(
     objects: &ProjectionSnapshot,
 ) -> Result<L0002ProjectionSnapshot, StoreError> {
-    derive_l0002_projection_rows(objects.frontier, &objects.rows, None, None)
+    derive_l0002_projection_rows(objects.frontier, &objects.rows, None)
 }
 
 fn derive_l0002_projection_rows(
     frontier: u64,
     rows: &[ObjectRow],
     source_facts: Option<&CurrentFacts>,
-    reuse: Option<&mut SurfaceRowReuse<'_>>,
 ) -> Result<L0002ProjectionSnapshot, StoreError> {
-    let mut reuse = reuse;
     if rows
         .iter()
         .filter(|row| row.row_kind == ObjectRowKind::Checkpoint)
@@ -1271,42 +1156,16 @@ fn derive_l0002_projection_rows(
     relations.insert(RelationProjectionRow::checkpoint(frontier));
 
     let mut search = exact_rows.into_values().collect::<BTreeSet<_>>();
-    // Keep the existing receipt-ID-ordered first match and the seq of that
-    // exact receipt; only the Arc handle is shared, never the protected text.
     let mut receipts_by_observation = BTreeMap::new();
-    for (receipt, receipt_seq) in receipts.values() {
+    for (receipt, _) in receipts.values() {
         receipts_by_observation
             .entry(receipt.source_observation_id)
-            .or_insert((receipt, *receipt_seq));
+            .or_insert(receipt);
     }
     for (observation_id, (surface, seq)) in surfaces {
-        let (receipt, receipt_seq) = receipts_by_observation
+        let receipt = receipts_by_observation
             .get(&observation_id)
             .ok_or(StoreError::StoreCorrupt)?;
-        // Only a surface and the receipt actually selected for it that both
-        // belong to the proven immutable prefix may take over the old text.
-        // The selected receipt cannot change inside that prefix: the source
-        // rows are immutable and the ordered-first choice is stable there, so
-        // a new winning receipt always sits after the base.
-        if let Some(reuse) = reuse.as_deref_mut()
-            && seq <= reuse.base.frontier
-            && *receipt_seq <= reuse.base.frontier
-        {
-            let row_id = surface_row_id(&surface);
-            // A qualified base must already contain this row; a missing one is
-            // corruption, not a reason to fall back to a fresh construction.
-            let reused = reuse.rows.remove(&row_id).ok_or(StoreError::StoreCorrupt)?;
-            if reused.row_variant != "evidence_surface" {
-                return Err(StoreError::StoreCorrupt);
-            }
-            // prepare_handoff already validated every persisted row, and the
-            // base proof binds that exact native version. Move it unchanged.
-            search.insert(reused);
-            reuse.reused.insert(row_id);
-            #[cfg(test)]
-            SURFACE_ROW_REUSES.with(|count| count.set(count.get() + 1));
-            continue;
-        }
         search.insert(surface_row(&surface, receipt, seq)?);
     }
     search.insert(SearchProjectionRow::checkpoint(frontier));
@@ -1375,7 +1234,6 @@ async fn commit_search_rows(
     table: &Table,
     current: &[SearchProjectionRow],
     rows: &[SearchProjectionRow],
-    reused: &BTreeSet<String>,
     fail_before_execute: bool,
 ) -> Result<(), StoreError> {
     if current == rows {
@@ -1386,11 +1244,8 @@ async fn commit_search_rows(
         .map(|row| (&row.row_id, row))
         .collect::<BTreeMap<_, _>>();
     let expected = rows.iter().map(|row| &row.row_id).collect::<BTreeSet<_>>();
-    // A row whose exact persised copy was moved into the complete expected set
-    // is not new and not changed; it is the same owned text in the same place.
     let changed = rows
         .iter()
-        .filter(|row| !reused.contains(&row.row_id))
         .filter(|row| previous.get(&row.row_id).copied() != Some(*row))
         .cloned()
         .collect::<Vec<_>>();
