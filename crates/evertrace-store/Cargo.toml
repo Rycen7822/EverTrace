@@ -15,7 +15,6 @@ arrow-schema.workspace = true
 evertrace-capture = { path = "../evertrace-capture" }
 evertrace-domain = { path = "../evertrace-domain" }
 fs2.workspace = true
-lance.workspace = true
 lancedb.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

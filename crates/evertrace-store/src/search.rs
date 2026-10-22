@@ -316,9 +316,6 @@ impl SearchSnapshot {
     }
 }
 
-/// Physical row address system column exposed by the pinned Lance scanner.
-const ROW_ADDR: &str = "_rowaddr";
-
 const SEARCH_COLUMNS: [&str; 26] = [
     "row_id",
     "row_variant",
@@ -347,18 +344,6 @@ const SEARCH_COLUMNS: [&str; 26] = [
     "source_event_seq",
     "projection_generation",
 ];
-
-/// Test-only bridge to the production FTS query path (`query_rows`): the same
-/// indexed-plus-flat selection and row validation, without the journal
-/// freshness gate that `SearchIndex` snapshots legitimately require.
-#[cfg(test)]
-pub(crate) async fn query_rows_for_test(
-    table: &Table,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<SearchProjectionRow>, StoreError> {
-    query_rows(table, None, limit, Some(query)).await
-}
 
 async fn query_rows(
     table: &Table,
@@ -941,141 +926,11 @@ pub(crate) fn search_batch(rows: &[SearchProjectionRow]) -> Result<RecordBatch, 
     .map_err(|_| StoreError::StoreCorrupt)
 }
 
-/// Physical row addresses read in the same pass as the complete search rows.
-///
-/// The map is a private per-call companion bound to the exact dataset version it
-/// was read from; it is never persisted, cached or reused as a logical identity.
-/// The checkpoint row is included, so a complete map covers every old row.
-pub(crate) struct SearchRowAddresses {
-    table: Table,
-    dataset: Arc<lance::Dataset>,
-    by_row_id: std::collections::BTreeMap<String, u64>,
-}
-
-impl SearchRowAddresses {
-    pub(crate) fn version(&self) -> u64 {
-        self.dataset.version().version
-    }
-
-    pub(crate) fn dataset_for(&self, table: &Table) -> Option<Arc<lance::Dataset>> {
-        match (self.table.dataset(), table.dataset()) {
-            (Some(owner), Some(current)) if std::ptr::eq(owner, current) => {
-                Some(Arc::clone(&self.dataset))
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn get(&self, row_id: &str) -> Option<u64> {
-        self.by_row_id.get(row_id).copied()
-    }
-}
-
-/// Read every persisted search row together with its physical `_rowaddr` from
-/// one dataset version. The 26-column decoder is unchanged: only the extra
-/// system column is stripped before it runs.
-pub(crate) async fn read_search_rows_with_addresses(
-    table: &Table,
-) -> Result<(Vec<SearchProjectionRow>, SearchRowAddresses), StoreError> {
-    table
-        .checkout_latest()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if schema.as_ref() != search_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let dataset = table
-        .dataset()
-        .ok_or(StoreError::StoreCorrupt)?
-        .get()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let version = dataset.version().version;
-    let mut columns = SEARCH_COLUMNS.to_vec();
-    columns.push(ROW_ADDR);
-    let batches = crate::collect_batches(&table.query().select(Select::columns(&columns)))
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    if table.version().await.map_err(|_| StoreError::LanceDb)? != version {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let projected = (0..SEARCH_COLUMNS.len()).collect::<Vec<_>>();
-    let mut rows_batches = Vec::with_capacity(batches.len());
-    let mut by_row_id = std::collections::BTreeMap::new();
-    let mut seen_addresses = std::collections::BTreeSet::new();
-    for batch in batches {
-        let names = batch.schema();
-        let names = names.fields();
-        if names.len() != SEARCH_COLUMNS.len() + 1
-            || names[..SEARCH_COLUMNS.len()]
-                .iter()
-                .map(|field| field.name().as_str())
-                .ne(SEARCH_COLUMNS)
-            || names[SEARCH_COLUMNS.len()].name() != ROW_ADDR
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        let addresses = batch
-            .column(SEARCH_COLUMNS.len())
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        if addresses.null_count() != 0
-            || ids.len() != batch.num_rows()
-            || addresses.len() != batch.num_rows()
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-        for index in 0..batch.num_rows() {
-            let address = addresses.value(index);
-            if by_row_id
-                .insert(ids.value(index).to_owned(), address)
-                .is_some()
-                || !seen_addresses.insert(address)
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-        }
-        rows_batches.push(
-            batch
-                .project(&projected)
-                .map_err(|_| StoreError::StoreCorrupt)?,
-        );
-    }
-    let rows = rows_from_batches(rows_batches, true)?;
-    if by_row_id.len() != rows.len() || rows.iter().any(|row| !by_row_id.contains_key(&row.row_id))
-    {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok((
-        rows,
-        SearchRowAddresses {
-            table: table.clone(),
-            dataset,
-            by_row_id,
-        },
-    ))
-}
-
 pub async fn read_search_rows(table: &Table) -> Result<Vec<SearchProjectionRow>, StoreError> {
     table
         .checkout_latest()
         .await
         .map_err(|_| StoreError::LanceDb)?;
-    read_search_rows_at_current_version(table).await
-}
-
-/// Decode the complete search family from whatever version `table` is pinned
-/// to. Ordinary callers keep `read_search_rows`' latest-version contract.
-pub(crate) async fn read_search_rows_at_current_version(
-    table: &Table,
-) -> Result<Vec<SearchProjectionRow>, StoreError> {
     let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
     if schema.as_ref() != search_schema().as_ref() {
         return Err(StoreError::StoreCorrupt);
