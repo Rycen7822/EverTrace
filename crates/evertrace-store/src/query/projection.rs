@@ -623,6 +623,7 @@ fn derive_l0002_projection_rows(
     let mut semantic_digests = Vec::new();
     let mut exact_rows = BTreeMap::new();
     let mut endpoint_seqs = BTreeMap::<String, u64>::new();
+    let mut scratch = String::new();
     let mut current_revisions = BTreeMap::<String, (u64, String)>::new();
     let mut wiki_atoms_by_revision = BTreeMap::<RevisionId, Atom>::new();
     for row in rows
@@ -752,7 +753,12 @@ fn derive_l0002_projection_rows(
                 .ok_or(StoreError::StoreCorrupt)?,
         )
         .map_err(|_| StoreError::StoreCorrupt)?;
-        index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
+        index_typed_ids(
+            &payload,
+            row.source_event_seq,
+            &mut endpoint_seqs,
+            &mut scratch,
+        )?;
         match payload {
             JournalPayload::SourceReceiptRecorded(value) => latest(
                 &mut receipts,
@@ -968,6 +974,7 @@ fn derive_l0002_projection_rows(
                 &JournalPayloadRef::Receipt(value.as_ref()),
                 seq,
                 &mut endpoint_seqs,
+                &mut scratch,
             )?;
             latest(
                 &mut receipts,
@@ -984,6 +991,7 @@ fn derive_l0002_projection_rows(
                 &JournalPayloadRef::Observation(value.as_ref()),
                 seq,
                 &mut endpoint_seqs,
+                &mut scratch,
             )?;
         }
         for (value, seq) in source_facts.evidence_surfaces() {
@@ -994,6 +1002,7 @@ fn derive_l0002_projection_rows(
                 &JournalPayloadRef::Surface(value.as_ref()),
                 seq,
                 &mut endpoint_seqs,
+                &mut scratch,
             )?;
             latest(
                 &mut surfaces,
@@ -1003,6 +1012,9 @@ fn derive_l0002_projection_rows(
             );
         }
     }
+    // No payload is indexed past this point; the request-local scratch ends here
+    // instead of living through the complete output construction below.
+    drop(scratch);
 
     let available_atom_revisions = atoms.keys().copied().collect::<BTreeSet<_>>();
     let available_procedure_revisions = procedures.keys().copied().collect::<BTreeSet<_>>();

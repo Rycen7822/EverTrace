@@ -1,7 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io,
     str::FromStr,
 };
+
+use evertrace_domain::{ids::AnyPublicId, revision::RevisionId};
+use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
 
 use crate::{
     JournalPayload, StoreError,
@@ -23,7 +27,142 @@ fn causal_seq(endpoint_seqs: &BTreeMap<String, u64>, source: &str, target: &str)
         .unwrap_or(0)
 }
 
+/// Reassembles every string value serde_json serializes into one shared
+/// scratch buffer, so typed IDs can be indexed without building a
+/// `serde_json::Value` tree for the whole payload. Object keys pass through the
+/// same string callbacks, so they are tracked only to be excluded: keys
+/// serialize as scalars and therefore cannot nest, and closing the key always
+/// precedes the key's value. Key text is never collected.
+struct TypedIdIndexFormatter<'a> {
+    scratch: &'a mut String,
+    endpoint_seqs: &'a mut BTreeMap<String, u64>,
+    source_event_seq: u64,
+    in_key: bool,
+}
+
+impl Formatter for TypedIdIndexFormatter<'_> {
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        self.in_key = true;
+        CompactFormatter.begin_object_key(writer, first)
+    }
+
+    fn end_object_key<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        self.in_key = false;
+        CompactFormatter.end_object_key(writer)
+    }
+
+    fn begin_string<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        self.scratch.clear();
+        CompactFormatter.begin_string(writer)
+    }
+
+    fn end_string<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !self.in_key
+            && (AnyPublicId::from_str(self.scratch).is_ok()
+                || RevisionId::from_str(self.scratch).is_ok())
+        {
+            self.endpoint_seqs
+                .entry(self.scratch.clone())
+                .and_modify(|current| *current = (*current).max(self.source_event_seq))
+                .or_insert(self.source_event_seq);
+        }
+        CompactFormatter.end_string(writer)
+    }
+
+    fn write_string_fragment<W>(&mut self, _writer: &mut W, fragment: &str) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !self.in_key {
+            self.scratch.push_str(fragment);
+        }
+        Ok(())
+    }
+
+    fn write_char_escape<W>(&mut self, _writer: &mut W, char_escape: CharEscape) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !self.in_key {
+            self.scratch.push(match char_escape {
+                CharEscape::Quote => '"',
+                CharEscape::ReverseSolidus => '\\',
+                CharEscape::Solidus => '/',
+                CharEscape::Backspace => '\u{8}',
+                CharEscape::FormFeed => '\u{c}',
+                CharEscape::LineFeed => '\n',
+                CharEscape::CarriageReturn => '\r',
+                CharEscape::Tab => '\t',
+                CharEscape::AsciiControl(byte) => char::from(byte),
+            });
+        }
+        Ok(())
+    }
+
+    fn write_i128<W>(&mut self, writer: &mut W, value: i128) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        // `Value` accepts an i128 only when it fits i64 or u64, and the closed
+        // payload shapes contain no wider field, so widening acceptance would
+        // silently change which payloads serialize.
+        if !self.in_key && u64::try_from(value).is_err() && i64::try_from(value).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "integer out of range",
+            ));
+        }
+        CompactFormatter.write_i128(writer, value)
+    }
+
+    fn write_u128<W>(&mut self, writer: &mut W, value: u128) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !self.in_key && u64::try_from(value).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "integer out of range",
+            ));
+        }
+        CompactFormatter.write_u128(writer, value)
+    }
+}
+
 pub(super) fn index_typed_ids<T: serde::Serialize + ?Sized>(
+    payload: &T,
+    source_event_seq: u64,
+    endpoint_seqs: &mut BTreeMap<String, u64>,
+    scratch: &mut String,
+) -> Result<(), StoreError> {
+    let formatter = TypedIdIndexFormatter {
+        scratch,
+        endpoint_seqs,
+        source_event_seq,
+        in_key: false,
+    };
+    let mut serializer = serde_json::Serializer::with_formatter(io::sink(), formatter);
+    payload
+        .serialize(&mut serializer)
+        .map_err(|_| StoreError::StoreCorrupt)
+}
+
+/// The pre-R630 algorithm, kept only as an independent test oracle: build the
+/// complete DOM and then visit string values (never keys) recursively.
+#[cfg(test)]
+pub(super) fn reference_index_typed_ids<T: serde::Serialize + ?Sized>(
     payload: &T,
     source_event_seq: u64,
     endpoint_seqs: &mut BTreeMap<String, u64>,
@@ -31,8 +170,7 @@ pub(super) fn index_typed_ids<T: serde::Serialize + ?Sized>(
     fn visit(value: &serde_json::Value, seq: u64, out: &mut BTreeMap<String, u64>) {
         match value {
             serde_json::Value::String(value)
-                if evertrace_domain::ids::AnyPublicId::from_str(value).is_ok()
-                    || evertrace_domain::revision::RevisionId::from_str(value).is_ok() =>
+                if AnyPublicId::from_str(value).is_ok() || RevisionId::from_str(value).is_ok() =>
             {
                 out.entry(value.clone())
                     .and_modify(|current| *current = (*current).max(seq))
@@ -425,6 +563,7 @@ pub(super) fn update_capture_relations(
     frontier: u64,
 ) -> Result<Vec<RelationProjectionRow>, StoreError> {
     let mut endpoint_seqs = BTreeMap::<String, u64>::new();
+    let mut scratch = String::new();
     for row in changed_rows {
         if crate::projections::recall_trigger_contract(row)?.is_some()
             || crate::projections::recall_need(row)?.is_some()
@@ -450,8 +589,14 @@ pub(super) fn update_capture_relations(
             .ok_or(StoreError::StoreCorrupt)?;
         let payload: JournalPayload =
             serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
-        index_typed_ids(&payload, row.source_event_seq, &mut endpoint_seqs)?;
+        index_typed_ids(
+            &payload,
+            row.source_event_seq,
+            &mut endpoint_seqs,
+            &mut scratch,
+        )?;
     }
+    drop(scratch);
     let mut relations = current.to_vec();
     for row in &mut relations {
         if row.row_id == crate::relations::RELATIONS_CHECKPOINT_ID {
