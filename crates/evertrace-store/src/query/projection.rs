@@ -1,12 +1,18 @@
 //! L0002 projection workers over one validated L0001 object frontier.
 
+// The search family is committed through its own physical row addresses on the
+// exact dataset version the complete handoff read; see `commit_search_rows`.
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     revision::RevisionId,
     semantic::Atom,
+};
+use lance::dataset::{
+    CommitBuilder, InsertBuilder, WriteMode, WriteParams,
+    transaction::{Operation, Transaction, UpdateMode},
 };
 use lancedb::Table;
 
@@ -28,7 +34,10 @@ use crate::{
         build_wiki_relation_rows, build_work_binding_relation_rows,
         build_work_identity_relation_rows,
     },
-    search::{SearchProjectionRow, read_search_rows, search_batch},
+    search::{
+        SearchProjectionRow, SearchRowAddresses, read_search_rows, read_search_rows_with_addresses,
+        search_batch,
+    },
     sqlite_state::SqliteHandle,
 };
 
@@ -73,6 +82,8 @@ struct L0002Handoff {
     frontier: u64,
     relation_rows: Vec<RelationProjectionRow>,
     search: Vec<SearchProjectionRow>,
+    // Physical addresses read with `search` from the same dataset version.
+    addresses: SearchRowAddresses,
     relation_frontier: u64,
     search_frontier: u64,
     versions: [u64; 2],
@@ -160,9 +171,16 @@ impl L0002ProjectionWorker {
             .lock()
             .map_err(|_| StoreError::StoreCorrupt)?
             .relation_rows()?;
-        let search = read_search_rows(&self.search).await?;
+        let (search, addresses) = read_search_rows_with_addresses(&self.search).await?;
         commit_relation_rows(&self.sqlite, &relations, &expected.relations)?;
-        commit_search_rows(&self.search, &search, &expected.search, false).await?;
+        commit_search_rows(
+            &self.search,
+            &search,
+            &addresses,
+            &expected.search,
+            SearchCommitFault::None,
+        )
+        .await?;
         if self
             .sqlite
             .lock()
@@ -337,7 +355,7 @@ impl L0002ProjectionWorker {
             .version()
             .await
             .map_err(|_| StoreError::LanceDb)?;
-        let search = read_search_rows(&self.search).await?;
+        let (search, addresses) = read_search_rows_with_addresses(&self.search).await?;
         if self
             .search
             .version()
@@ -345,6 +363,9 @@ impl L0002ProjectionWorker {
             .map_err(|_| StoreError::LanceDb)?
             != search_version
         {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if addresses.version() != search_version {
             return Err(StoreError::StoreCorrupt);
         }
         let search_frontier = checkpoint_search(&search)?;
@@ -400,6 +421,7 @@ impl L0002ProjectionWorker {
             frontier: journal_frontier,
             relation_rows,
             search,
+            addresses,
             relation_frontier,
             search_frontier,
             versions: current_versions,
@@ -422,8 +444,9 @@ impl L0002ProjectionWorker {
         commit_search_rows(
             &self.search,
             &handoff.search,
+            &handoff.addresses,
             &expected.search,
-            fail_search_commit,
+            SearchCommitFault::from(fail_search_commit),
         )
         .await?;
         let (relations_epoch_after, relations) = {
@@ -1188,16 +1211,6 @@ fn all_values<K, V: Clone>(map: &BTreeMap<K, (V, u64)>) -> Vec<V> {
     values(map)
 }
 
-// The merge source contains only changed rows. Deletion must name only rows
-// absent from the complete expected projection, never unchanged target rows.
-fn deleted_row_predicate(removed: &[&str]) -> String {
-    let ids = removed
-        .iter()
-        .map(|id| format!("'{}'", id.replace('\'', "''")))
-        .collect::<Vec<_>>();
-    format!("row_id IN ({})", ids.join(","))
-}
-
 fn commit_relation_rows(
     state: &SqliteHandle,
     current: &[RelationProjectionRow],
@@ -1230,48 +1243,161 @@ fn commit_relation_rows(
         .map_err(|_| StoreError::StoreCorrupt)?
         .commit_relation_rows(&changed, &removed, checkpoint)
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchCommitFault {
+    None,
+    BeforeExecute,
+    #[cfg(test)]
+    AfterStaging,
+    #[cfg(test)]
+    AfterCommit,
+}
+
+impl From<bool> for SearchCommitFault {
+    fn from(fail: bool) -> Self {
+        if fail {
+            Self::BeforeExecute
+        } else {
+            Self::None
+        }
+    }
+}
+
 async fn commit_search_rows(
     table: &Table,
     current: &[SearchProjectionRow],
+    addresses: &SearchRowAddresses,
     rows: &[SearchProjectionRow],
-    fail_before_execute: bool,
+    fault: SearchCommitFault,
 ) -> Result<(), StoreError> {
     if current == rows {
         return Ok(());
     }
     let previous = current
         .iter()
-        .map(|row| (&row.row_id, row))
+        .map(|row| (row.row_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
-    let expected = rows.iter().map(|row| &row.row_id).collect::<BTreeSet<_>>();
+    let expected = rows
+        .iter()
+        .map(|row| (row.row_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
     let changed = rows
         .iter()
-        .filter(|row| previous.get(&row.row_id).copied() != Some(*row))
+        .filter(|row| previous.get(row.row_id.as_str()).copied() != Some(*row))
         .cloned()
         .collect::<Vec<_>>();
-    let removed = current
+    // Delete only removed rows and old copies of changed rows. Both complete
+    // families have already passed the independent decoder/derivation.
+    let mut deletions = BTreeMap::<u32, Vec<u32>>::new();
+    for row in current
         .iter()
-        .filter(|row| !expected.contains(&row.row_id))
-        .map(|row| row.row_id.as_str())
-        .collect::<Vec<_>>();
-    let reader = Box::new(RecordBatchIterator::new(
-        vec![Ok(search_batch(&changed)?)],
-        crate::search::search_schema(),
-    ));
-    let mut merge = table.merge_insert(&["row_id"]);
-    merge
-        .when_matched_update_all(None)
-        .when_not_matched_insert_all();
-    if !removed.is_empty() {
-        merge.when_not_matched_by_source_delete(Some(deleted_row_predicate(&removed)));
+        .filter(|row| expected.get(row.row_id.as_str()).copied() != Some(*row))
+    {
+        let address = addresses.get(&row.row_id).ok_or(StoreError::StoreCorrupt)?;
+        let fragment = (address >> 32) as u32;
+        let offset = address as u32;
+        deletions.entry(fragment).or_default().push(offset);
     }
-    if fail_before_execute {
+    if fault == SearchCommitFault::BeforeExecute {
         return Err(StoreError::Projection);
     }
-    merge
-        .execute(reader)
+    let wrapper = table.dataset().ok_or(StoreError::StoreCorrupt)?;
+    wrapper
+        .ensure_mutable()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let dataset = addresses
+        .dataset_for(table)
+        .ok_or(StoreError::StoreCorrupt)?;
+    let version = dataset.version().version;
+    if table.version().await.map_err(|_| StoreError::LanceDb)? != version
+        || dataset
+            .latest_version_id()
+            .await
+            .map_err(|_| StoreError::LanceDb)?
+            != version
+        || arrow_schema::Schema::from(dataset.schema()) != *crate::search::search_schema()
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let mut updated_fragments = Vec::with_capacity(deletions.len());
+    let mut removed_fragment_ids = Vec::new();
+    for (fragment_id, offsets) in &deletions {
+        let fragment = dataset
+            .get_fragment(usize::try_from(*fragment_id).map_err(|_| StoreError::StoreCorrupt)?)
+            .ok_or(StoreError::StoreCorrupt)?;
+        match fragment
+            .extend_deletions(offsets.iter().copied())
+            .await
+            .map_err(|_| StoreError::Projection)?
+        {
+            Some(fragment) => updated_fragments.push(fragment.metadata().clone()),
+            None => removed_fragment_ids.push(u64::from(*fragment_id)),
+        }
+    }
+    let new_fragments = if changed.is_empty() {
+        Vec::new()
+    } else {
+        let batch = search_batch(&changed)?;
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            session: Some(dataset.session()),
+            ..Default::default()
+        };
+        let staged = InsertBuilder::new(dataset.clone())
+            .with_params(&params)
+            .execute_uncommitted(vec![batch])
+            .await
+            .map_err(|_| StoreError::Projection)?;
+        match staged.operation {
+            Operation::Append { fragments } => fragments,
+            _ => return Err(StoreError::Projection),
+        }
+    };
+    #[cfg(test)]
+    if fault == SearchCommitFault::AfterStaging {
+        return Err(StoreError::Projection);
+    }
+    // The staged addresses belong to this exact version and are never rebound:
+    // any concurrent commit is rejected by the single attempt below.
+    wrapper
+        .ensure_mutable()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let current_dataset = wrapper.get().await.map_err(|_| StoreError::LanceDb)?;
+    if current_dataset.version().version != version
+        || dataset
+            .latest_version_id()
+            .await
+            .map_err(|_| StoreError::LanceDb)?
+            != version
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let operation = Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        new_fragments,
+        fields_modified: Vec::new(),
+        compacted_sstables: Vec::new(),
+        fields_for_preserving_frag_bitmap: dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id as u32)
+            .collect(),
+        update_mode: Some(UpdateMode::RewriteRows),
+        inserted_rows_filter: None,
+        updated_fragment_offsets: None,
+    };
+    let transaction = Transaction::new(version, operation, None);
+    let committed = CommitBuilder::new(dataset)
+        .with_max_retries(0)
+        .execute(transaction)
         .await
         .map_err(|_| StoreError::Projection)?;
+    wrapper.update(committed);
+    #[cfg(test)]
+    if fault == SearchCommitFault::AfterCommit {
+        return Err(StoreError::Projection);
+    }
     Ok(())
 }
 pub(super) fn checkpoint_relation(rows: &[RelationProjectionRow]) -> Result<u64, StoreError> {
