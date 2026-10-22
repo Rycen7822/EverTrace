@@ -26,6 +26,7 @@ arrow-schema = "=58.3.0"
 crossterm = "=0.28.1"
 fs2 = "=0.4.3"
 hmac = "=0.12.1"
+lance = { version = "=10.0.0", default-features = false }
 lancedb = { version = "=0.37.1", default-features = false }
 ratatui = { version = "=0.29.0", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.12.24", default-features = false, features = ["json", "rustls-tls"] }

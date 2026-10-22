@@ -1911,6 +1911,7 @@ dependencies = [
  "evertrace-capture",
  "evertrace-domain",
  "fs2",
+ "lance",
  "lancedb",
  "rusqlite",
  "serde",

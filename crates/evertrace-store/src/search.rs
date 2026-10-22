@@ -13,10 +13,12 @@ use arrow_array::{
     Array, ArrayRef, Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use lance::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use lancedb::{
     Table,
+    datafusion::{execution::TaskContext, physical_plan::ExecutionPlan},
     index::scalar::FullTextSearchQuery,
-    query::{ExecutableQuery, HasQuery, QueryBase, Select},
+    query::{ExecutableQuery, HasQuery, QueryBase, QueryExecutionOptions, Select},
 };
 
 use crate::{StoreError, connection::StoreReadHandle};
@@ -935,10 +937,62 @@ pub async fn read_search_rows(table: &Table) -> Result<Vec<SearchProjectionRow>,
     if schema.as_ref() != search_schema().as_ref() {
         return Err(StoreError::StoreCorrupt);
     }
-    let batches = crate::collect_batches(&table.query())
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
+    // One immutable pin for both the format decision and the physical read;
+    // a separate latest lookup here could mix two versions.
+    let dataset = match table.dataset() {
+        Some(native) => Some(native.get().await.map_err(|_| StoreError::LanceDb)?),
+        None => None,
+    };
+    let batches = if let Some(dataset) = dataset
+        .as_ref()
+        .filter(|dataset| native_full_read_supported(dataset))
+    {
+        native_full_read(dataset).await?
+    } else {
+        crate::collect_batches(&table.query())
+            .await
+            .map_err(|_| StoreError::LanceDb)?
+    };
+    drop(dataset);
     rows_from_batches(batches, true)
+}
+
+/// Native v2 fragments are served by the public physical full-scan node; v1
+/// (legacy) fragments keep the generic query plan because the native read node
+/// cannot decode them. Both decisions come from the pinned manifest/metadata,
+/// never from a file name, and an unreadable format is an error, not legacy.
+fn native_full_read_supported(dataset: &lance::Dataset) -> bool {
+    let manifest = dataset.manifest();
+    !manifest.should_use_legacy_format()
+        && !manifest
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.files.iter())
+            .any(|file| file.is_legacy_file())
+}
+
+/// Collect every physical batch of the pinned dataset before the unchanged
+/// typed decoder runs, so a late storage failure is reported ahead of any
+/// corruption found in an earlier batch. The node is request-local: the plan,
+/// stream and task context are dropped before decoding and never retained.
+async fn native_full_read(dataset: &Arc<lance::Dataset>) -> Result<Vec<RecordBatch>, StoreError> {
+    let arrow: Schema = dataset.schema().into();
+    if arrow.as_ref() != search_schema().as_ref() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let options = FilteredReadOptions::basic_full_read(dataset)
+        .with_batch_size(QueryExecutionOptions::default().max_batch_length);
+    let plan = FilteredReadExec::try_new(dataset.clone(), options, None)
+        .map_err(|_| StoreError::LanceDb)?;
+    let mut stream = plan
+        .execute(0, Arc::new(TaskContext::default()))
+        .map_err(|_| StoreError::LanceDb)?;
+    let mut batches = Vec::new();
+    while let Some(batch) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+        batches.push(batch.map_err(|_| StoreError::LanceDb)?);
+    }
+    // Returning drops this stream/plan and their context before typed decoding.
+    Ok(batches)
 }
 
 pub(crate) async fn read_search_checkpoint(table: &Table) -> Result<u64, StoreError> {
@@ -1611,5 +1665,241 @@ mod tests {
         drop(guard);
         assert!(!readers.journal_rows().await.unwrap().is_empty());
         writer.sync_frontier().await.unwrap();
+    }
+
+    fn native_row(tag: u32) -> SearchProjectionRow {
+        let id = format!("01890f47-6a4a-7cc1-98b9-01890f6{tag:05x}");
+        let mut row = object_row();
+        row.row_id = format!("search:object:{id}");
+        row.candidate_id = Some(id.clone());
+        row.source_ref = Some(id);
+        row.text = format!("r627 native full read {tag}");
+        row.event_time_us = 1 + i64::from(tag);
+        row
+    }
+
+    /// One typed-invalid batch: every column is physically valid Arrow, only
+    /// `text` is empty, which the unchanged decoder rejects.
+    fn typed_invalid_batch() -> RecordBatch {
+        let valid =
+            search_batch(&[native_row(90_000), SearchProjectionRow::checkpoint(17)]).unwrap();
+        let mut columns = valid.columns().to_vec();
+        columns[5] = Arc::new(StringArray::from(vec!["", ""]));
+        RecordBatch::try_new(valid.schema(), columns).unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_full_read_matches_generic_query_across_fragments_and_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = lancedb::connect(temp.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let mut all = vec![SearchProjectionRow::checkpoint(17)];
+        let table = database
+            .create_table(SEARCH_TABLE, search_batch(&all).unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let rows_per_fragment = QueryExecutionOptions::default().max_batch_length + 1;
+        for fragment in 0..3u32 {
+            let rows = (0..rows_per_fragment)
+                .map(|offset| native_row(fragment * rows_per_fragment + offset))
+                .collect::<Vec<_>>();
+            table
+                .add(search_batch(&rows).unwrap())
+                .execute()
+                .await
+                .unwrap();
+            all.extend(rows);
+        }
+        all.sort();
+        let v0 = table.version().await.unwrap();
+
+        // Independent reference: the original complete query collection plus the
+        // unchanged decoder, spanning several fragments and several batches.
+        let generic = crate::collect_batches(&table.query()).await.unwrap();
+        assert!(
+            generic.len() > 1,
+            "multi-fragment fixture must yield several batches"
+        );
+        assert_eq!(
+            generic.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            all.len()
+        );
+        assert_eq!(rows_from_batches(generic.clone(), true).unwrap(), all);
+
+        let dataset = table.dataset().unwrap().get().await.unwrap();
+        assert!(native_full_read_supported(&dataset));
+        let native = native_full_read(&dataset).await.unwrap();
+        assert_eq!(
+            native.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            all.len()
+        );
+        for batch in &native {
+            assert_eq!(batch.num_columns(), 26);
+            assert_eq!(batch.schema_ref(), generic[0].schema_ref());
+            assert_eq!(batch.schema_ref().as_ref(), search_schema().as_ref());
+        }
+        assert_eq!(rows_from_batches(native, true).unwrap(), all);
+        assert_eq!(read_search_rows(&table).await.unwrap(), all);
+
+        // An independently pinned older version is unaffected by later writes,
+        // while a fresh reopen of the same store decodes the same complete rows.
+        let deleted = all
+            .iter()
+            .find(|row| row.row_variant == "object")
+            .unwrap()
+            .row_id
+            .clone();
+        let predicate = format!("row_id = '{deleted}'");
+        table.delete(predicate.as_str()).await.unwrap();
+        let after_delete = read_search_rows(&table).await.unwrap();
+        assert_eq!(after_delete.len(), all.len() - 1);
+        assert!(!after_delete.iter().any(|row| row.row_id == deleted));
+        let pinned = dataset.checkout_version(v0).await.unwrap();
+        assert_eq!(pinned.version().version, v0);
+        assert_eq!(
+            rows_from_batches(native_full_read(&Arc::new(pinned)).await.unwrap(), true).unwrap(),
+            all
+        );
+
+        // Compaction rewrites the fragments; the complete reader must decode the
+        // same latest rows from the compacted layout.
+        table
+            .optimize(lancedb::table::OptimizeAction::Compact {
+                options: lancedb::table::CompactionOptions::default(),
+                remap_options: None,
+            })
+            .await
+            .unwrap();
+        assert!(table.version().await.unwrap() > v0);
+        assert_eq!(read_search_rows(&table).await.unwrap(), after_delete);
+        let reopened = database.open_table(SEARCH_TABLE).execute().await.unwrap();
+        assert_eq!(read_search_rows(&reopened).await.unwrap(), after_delete);
+    }
+
+    #[tokio::test]
+    async fn legacy_and_empty_tables_keep_their_existing_route_and_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = lancedb::connect(temp.path().to_str().unwrap())
+            .database_options(&lancedb::database::listing::ListingDatabaseOptions {
+                new_table_config: lancedb::database::listing::NewTableConfig {
+                    data_storage_version: Some(lancedb::connection::LanceFileVersion::Legacy),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        let mut rows = vec![native_row(1), native_row(2)];
+        rows.push(SearchProjectionRow::checkpoint(5));
+        rows.sort();
+        let table = legacy
+            .create_table(SEARCH_TABLE, search_batch(&rows).unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let manifest = table.as_native().unwrap().manifest().await.unwrap();
+        assert!(
+            manifest.should_use_legacy_format(),
+            "fixture precondition: this small table really is legacy storage"
+        );
+        let dataset = table.dataset().unwrap().get().await.unwrap();
+        assert!(!native_full_read_supported(&dataset));
+        assert_eq!(read_search_rows(&table).await.unwrap(), rows);
+
+        // The native path is chosen for well-formed v2 metadata, yet an empty
+        // table still reports the original missing-checkpoint corruption.
+        let native = lancedb::connect(temp.path().join("native").to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let empty = native
+            .create_table(SEARCH_TABLE, search_batch(&[native_row(3)]).unwrap())
+            .execute()
+            .await
+            .unwrap();
+        empty.delete("true").await.unwrap();
+        let dataset = empty.dataset().unwrap().get().await.unwrap();
+        assert!(native_full_read_supported(&dataset));
+        assert!(native_full_read(&dataset).await.unwrap().is_empty());
+        assert_eq!(
+            read_search_rows(&empty).await,
+            Err(StoreError::StoreCorrupt)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_full_read_reports_late_physical_failure_before_typed_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = lancedb::connect(temp.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        // Fragment 1 is typed-invalid but physically intact; fragment 2 is valid
+        // and is the fragment whose file this test destroys.
+        let table = database
+            .create_table(SEARCH_TABLE, typed_invalid_batch())
+            .execute()
+            .await
+            .unwrap();
+        table
+            .add(search_batch(&[native_row(4)]).unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let dataset = table.dataset().unwrap().get().await.unwrap();
+        let mut fragments = dataset.manifest().fragments.iter();
+        fragments
+            .next()
+            .expect("fixture needs a typed-invalid fragment");
+        let second = fragments.next().expect("fixture needs two fragments");
+        assert!(
+            second.files.iter().any(|file| !file.is_legacy_file()),
+            "fixture precondition: the destroyed fragment is native v2"
+        );
+        let collected = native_full_read(&dataset).await.unwrap();
+        assert_eq!(
+            collected.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            3,
+            "control: with every file readable both physical batches are collected"
+        );
+        assert_eq!(
+            rows_from_batches(collected, true),
+            Err(StoreError::StoreCorrupt),
+            "control: the unchanged decoder rejects the typed-invalid row"
+        );
+
+        let root = temp.path().join(format!("{SEARCH_TABLE}.lance/data"));
+        for file in &second.files {
+            let path = root.join(&file.path);
+            assert!(path.starts_with(temp.path()));
+            assert!(path.is_file(), "fixture precondition: {path:?} exists");
+            std::fs::remove_file(&path).unwrap();
+        }
+        // A new native session ensures the missing file requires actual I/O,
+        // rather than relying on what a previous reader may have cached/pinned.
+        drop(dataset);
+        drop(table);
+        drop(database);
+        let database = lancedb::connect(temp.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let table = database.open_table(SEARCH_TABLE).execute().await.unwrap();
+        let dataset = table.dataset().unwrap().get().await.unwrap();
+        assert!(crate::collect_batches(&table.query()).await.is_err());
+        assert_eq!(
+            native_full_read(&dataset).await,
+            Err(StoreError::LanceDb),
+            "a late physical read failure must win over earlier typed corruption"
+        );
+        assert_eq!(
+            read_search_rows(&table).await,
+            Err(StoreError::LanceDb),
+            "the production reader must propagate the physical category"
+        );
     }
 }
