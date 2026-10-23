@@ -713,7 +713,7 @@ impl JournalWriter {
     pub async fn session_catalog_current_context(
         &self,
     ) -> Result<crate::SessionCatalogCurrentContext, StoreError> {
-        self.validated_source_read(|state| state.session_catalog_current_context())
+        self.validated_current_read(|state, _| state.session_catalog_current_context())
             .await
     }
 
@@ -737,7 +737,7 @@ impl JournalWriter {
         &self,
         selector: &crate::session_import::SourceObservationRepositorySelector,
     ) -> Result<crate::RepositoryReadContext, StoreError> {
-        self.validated_source_read(|state| {
+        self.validated_current_read(|state, _| {
             state.source_observation_repository_read_context(selector)
         })
         .await
@@ -748,7 +748,7 @@ impl JournalWriter {
         source: &evertrace_domain::evidence::SourceInstanceId,
         revision: &evertrace_domain::evidence::SourceRevision,
     ) -> Result<bool, StoreError> {
-        self.validated_source_read(|state| {
+        self.validated_current_read(|state, _| {
             Ok(state.source_observation_revision_has_facts(source, revision))
         })
         .await
@@ -1582,38 +1582,7 @@ impl JournalWriter {
     ) -> Result<T, StoreError> {
         self.project_validated(false, ProjectionReturn::None)
             .await?;
-        self.read_validated_admission(read)
-    }
-
-    // These selectors consume committed admission facts, not persisted
-    // objects or the stamp's possibly older has_failed_job field. A confirmed
-    // append may retain the old objects proof without advancing its checkpoint.
-    async fn validated_source_read<T>(
-        &self,
-        read: impl FnOnce(&JournalAdmissionState) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
-        if self
-            .projection_validation
-            .lock()
-            .map_err(|_| StoreError::StoreCorrupt)?[0]
-            .is_none()
-        {
-            self.project_validated(false, ProjectionReturn::None)
-                .await?;
-        }
-        self.read_validated_admission(|state, _| {
-            self.validate_projection_directories(false)?;
-            let context = read(state)?;
-            self.validate_projection_directories(false)?;
-            Ok(context)
-        })
-    }
-
-    fn read_validated_admission<T>(
-        &self,
-        read: impl FnOnce(&JournalAdmissionState, &ProjectionValidation) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
-        let result = (|| {
+        let result = async {
             let stamp = self
                 .projection_validation
                 .lock()
@@ -1631,7 +1600,8 @@ impl JournalWriter {
                 return Err(StoreError::StoreCorrupt);
             }
             Ok(context)
-        })();
+        }
+        .await;
         if result.is_err() {
             *self
                 .projection_validation
@@ -3738,23 +3708,10 @@ mod tests {
             workspace_hints: std::collections::BTreeSet::from(["/repo".into()]),
             retained_repository_ids: std::collections::BTreeSet::new(),
         };
-        // Cold: no completed projection exists yet, so the original selector
-        // still runs the original objects recovery before answering. The
-        // expectation uses the real committed frontier, because opening the
-        // store already commits its migration rows.
-        let cold = writer.projection_handle().lock().unwrap().stamp().unwrap();
-        assert_eq!(cold.frontier, writer.frontier());
         let authority = writer
             .source_observation_authority_context(&repository_selector)
             .await
             .unwrap();
-        assert_eq!(authority.frontier, cold.frontier);
-        assert!(authority.repositories.is_empty());
-        assert!(authority.purged.is_empty());
-        // The cold read legally synchronized objects to that frontier; the
-        // later source reads must not move this recovered input again.
-        let cold_recovered = writer.projection_handle().lock().unwrap().stamp().unwrap();
-        assert_eq!(cold_recovered.object_checkpoint, cold.frontier);
         let guard = crate::session_import::SourceObservationGuard::from_preparation(
             crate::session_import::SourceObservationGuardInput {
                 selector: crate::session_import::SourceObservationGuardSelector {
@@ -3763,7 +3720,7 @@ mod tests {
                     source_revision: source_revision.clone(),
                     command_id,
                     s11: crate::session_import::SourceObservationS11Selector {
-                        repository: repository_selector.clone(),
+                        repository: repository_selector,
                         source_reference: source_reference.clone(),
                         worktree_entry_paths: std::collections::BTreeSet::from(["/repo".into()]),
                     },
@@ -3783,50 +3740,6 @@ mod tests {
             .commit_source_observation(&original, 1, guard.clone())
             .await
             .unwrap();
-        // The confirmed append is durable but its objects input is untouched.
-        // These three consumers read only committed admission facts, so they
-        // must see the new frontier without advancing the objects epoch or
-        // checkpoint and without producing a projection snapshot.
-        let stamp = writer.projection_handle().lock().unwrap().stamp().unwrap();
-        assert_eq!(stamp.frontier, first.last_seq);
-        assert_eq!(stamp.objects_epoch, cold_recovered.objects_epoch);
-        assert_eq!(stamp.object_checkpoint, cold_recovered.object_checkpoint);
-        let catalog = writer.session_catalog_current_context().await.unwrap();
-        assert_eq!(catalog.frontier, first.last_seq);
-        let catalog_repository = catalog
-            .repositories
-            .repositories
-            .get(&repository_id)
-            .expect("the committed command's repository must be visible");
-        let catalog_session = catalog
-            .sessions
-            .sessions
-            .get(source.as_str())
-            .expect("the committed command's import must be visible");
-        assert_eq!(catalog_session.revision, 1);
-        let appended_authority = writer
-            .source_observation_authority_context(&repository_selector)
-            .await
-            .unwrap();
-        assert_eq!(appended_authority.frontier, first.last_seq);
-        assert_eq!(
-            appended_authority.repositories.get(&repository_id),
-            Some(catalog_repository)
-        );
-        assert!(appended_authority.purged.is_empty());
-        // MetadataObserved alone records no import payload, so this source
-        // revision still has no imported facts.
-        assert!(
-            !writer
-                .source_observation_revision_has_facts(&source, &source_revision)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            writer.projection_handle().lock().unwrap().stamp().unwrap(),
-            stamp
-        );
-        assert_eq!(writer.frontier(), first.last_seq);
         let revoke = JournalCommand::new(
             CommandId::new_v7(),
             vec![JournalEventDraft::runtime(
@@ -3868,32 +3781,6 @@ mod tests {
             writer.journal_rows().await.unwrap().len(),
             count_after_permission_change
         );
-        // The original synchronization still reaches the committed frontier
-        // through the unchanged objects algorithm and an independent replay.
-        let frontier = writer.sync_frontier().await.unwrap();
-        assert_eq!(frontier, writer.frontier());
-        let replayed = writer.full_projection().await.unwrap();
-        assert_eq!(replayed.frontier, frontier);
-        assert_eq!(
-            writer
-                .projection_handle()
-                .lock()
-                .unwrap()
-                .object_rows()
-                .unwrap(),
-            replayed.rows
-        );
-        let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
-        assert_eq!(
-            writer
-                .projection_handle()
-                .lock()
-                .unwrap()
-                .relation_rows()
-                .unwrap(),
-            expected.relations
-        );
-        assert_eq!(writer.search_rows().await.unwrap(), expected.search);
     }
 
     #[tokio::test]

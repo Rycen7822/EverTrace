@@ -20209,28 +20209,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // Before the mandatory synchronization, the source selectors must read
-        // the committed admission facts directly. They may not spend the
-        // retained single-capture proof, advance the objects input, or make
-        // the following sync lose its one-append fast path.
-        let pending = writer.projection_handle().lock().unwrap().stamp().unwrap();
-        assert_eq!(pending.object_checkpoint, seeded.frontier);
-        let catalog = writer.session_catalog_current_context().await.unwrap();
-        assert_eq!(catalog.frontier, pending.frontier);
-        // The real receipt is visible without materializing its current row.
-        assert!(
-            writer
-                .source_observation_revision_has_facts(
-                    &receipt.source_instance_id,
-                    &receipt.source_revision,
-                )
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            writer.projection_handle().lock().unwrap().stamp().unwrap(),
-            pending
-        );
         let frontier = writer.sync_frontier().await.unwrap();
         assert_eq!(writer.capture_delta_selections(), 1);
         let replayed = r105_assert_projection_eq(&writer, &root, frontier).await;
@@ -20491,13 +20469,10 @@ mod tests {
         let frontier = writer.sync_frontier().await.unwrap();
         assert_eq!(writer.capture_delta_selections(), 0);
         r105_assert_projection_eq(&writer, &root, frontier).await;
-        let seeded_frontier = frontier;
 
         // Two appends before one sync are not a single confirmed successor.
         let (a_receipt, a_observation, _) =
             r105_capture("multi-a", 1, &repository, &worktree, false);
-        let (b_receipt, b_observation, _) =
-            r105_capture("multi-b", 1, &repository, &worktree, false);
         writer
             .commit(
                 &r105_command(3, r105_capture_payloads(&a_receipt, &a_observation, None)),
@@ -20505,35 +20480,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // A real source read between the two appends must observe the first
-        // command's facts from admission, without synchronizing the old
-        // objects checkpoint or consuming the (absent) single-append proof.
-        let between = writer.projection_handle().lock().unwrap().stamp().unwrap();
-        assert_eq!(between.object_checkpoint, seeded_frontier);
-        let between_catalog = writer.session_catalog_current_context().await.unwrap();
-        assert_eq!(between_catalog.frontier, between.frontier);
-        assert!(
-            writer
-                .source_observation_revision_has_facts(
-                    &a_receipt.source_instance_id,
-                    &a_receipt.source_revision,
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !writer
-                .source_observation_revision_has_facts(
-                    &b_receipt.source_instance_id,
-                    &b_receipt.source_revision,
-                )
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            writer.projection_handle().lock().unwrap().stamp().unwrap(),
-            between
-        );
+        let (b_receipt, b_observation, _) =
+            r105_capture("multi-b", 1, &repository, &worktree, false);
         writer
             .commit(
                 &r105_command(4, r105_capture_payloads(&b_receipt, &b_observation, None)),
@@ -20541,33 +20489,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // The final read before the mandatory sync sees both commands at the
-        // new committed frontier and still leaves the old checkpoint alone.
-        let pending = writer.projection_handle().lock().unwrap().stamp().unwrap();
-        assert_eq!(pending.object_checkpoint, seeded_frontier);
-        assert_eq!(
-            writer
-                .session_catalog_current_context()
-                .await
-                .unwrap()
-                .frontier,
-            pending.frontier
-        );
-        for receipt in [&a_receipt, &b_receipt] {
-            assert!(
-                writer
-                    .source_observation_revision_has_facts(
-                        &receipt.source_instance_id,
-                        &receipt.source_revision,
-                    )
-                    .await
-                    .unwrap()
-            );
-        }
-        assert_eq!(
-            writer.projection_handle().lock().unwrap().stamp().unwrap(),
-            pending
-        );
         let frontier = writer.sync_frontier().await.unwrap();
         assert_eq!(writer.capture_delta_selections(), 0);
         r105_assert_projection_eq(&writer, &root, frontier).await;
@@ -20638,25 +20559,7 @@ mod tests {
                 .unwrap(),
             1,
         );
-        // The source entry point runs first and must fail closed on the
-        // externally committed change. It reports StoreCorrupt and, by the
-        // writer contract, closes the poisoned handle; the following sync must
-        // then reject with Io rather than reusing that connection. Neither
-        // read may advance the persisted objects checkpoint.
-        assert!(matches!(
-            writer.session_catalog_current_context().await,
-            Err(StoreError::StoreCorrupt)
-        ));
-        assert!(matches!(
-            writer
-                .source_observation_revision_has_facts(
-                    &external_receipt.source_instance_id,
-                    &external_receipt.source_revision,
-                )
-                .await,
-            Err(StoreError::Io)
-        ));
-        assert_eq!(writer.sync_frontier().await, Err(StoreError::Io));
+        assert_eq!(writer.sync_frontier().await, Err(StoreError::StoreCorrupt));
         assert_eq!(writer.capture_delta_selections(), 1);
         let checkpoint: Vec<u8> = external
             .query_row(
