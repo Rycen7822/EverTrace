@@ -20105,6 +20105,9 @@ mod tests {
             .await
             .unwrap();
 
+        drop(writer);
+        let writer = JournalWriter::open(&root).await.unwrap();
+        assert!(!writer.source_prefix_proven_for_test());
         let facts = writer.project_current(true).await.unwrap();
         assert_eq!(writer.capture_delta_selections(), 0);
         assert!(writer.source_prefix_proven_for_test());
@@ -20117,6 +20120,12 @@ mod tests {
                 Some("source_receipt" | "source_observation" | "evidence_surface")
             )
         }));
+        let shared_a = writer.project_current(true).await.unwrap();
+        let shared_b = writer.project_current(true).await.unwrap();
+        assert!(Arc::ptr_eq(
+            shared_a.source_receipts().next().unwrap().0,
+            shared_b.source_receipts().next().unwrap().0,
+        ));
         let recovery_from_current = RecoveryCurrentView::from_current(&facts).unwrap();
 
         let replayed = writer.full_projection().await.unwrap();
