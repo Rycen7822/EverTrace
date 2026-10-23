@@ -14847,20 +14847,6 @@ impl ReducerState {
             && self.repository_closures.is_empty()
     }
 
-    fn has_source_rows_after(&self, checkpoint: u64) -> bool {
-        self.source_receipts
-            .values()
-            .any(|(_, seq)| *seq > checkpoint)
-            || self
-                .source_observations
-                .values()
-                .any(|(_, seq)| *seq > checkpoint)
-            || self
-                .evidence_surfaces
-                .values()
-                .any(|(_, seq)| *seq > checkpoint)
-    }
-
     fn preserves_source_prefix(&self, facts: &SourceFactsRef<'_>, checkpoint: u64) -> bool {
         fn preserves<K: Ord, T>(
             old: &BTreeMap<K, (Arc<T>, u64)>,
@@ -16820,17 +16806,14 @@ impl ProjectionWorker {
             && !reconcile_wiki
             && !reconcile_procedure_effect;
         let direct_facts = return_current_facts
-            && !reconcile_all
+            && ordinary_upsert
             && source_facts.is_some_and(|facts| {
                 state.can_emit_current_facts()
                     && state.preserves_source_prefix(facts, checkpoint_frontier)
-                    && (ordinary_upsert || !state.has_source_rows_after(checkpoint_frontier))
             });
         if direct_facts {
             let facts = state.into_current_facts(journal_frontier)?;
-            if ordinary_upsert {
-                validate_ordinary_upsert_rows(&current, facts.other_rows())?;
-            }
+            validate_ordinary_upsert_rows(&current, facts.other_rows())?;
             let current_by_id = current
                 .iter()
                 .map(|row| (row.row_id.as_str(), row))
@@ -16844,9 +16827,7 @@ impl ProjectionWorker {
                 reconcile_procedure_effect,
                 None,
             );
-            if ordinary_upsert {
-                changed.extend(facts.source_rows_after(checkpoint_frontier)?);
-            }
+            changed.extend(facts.source_rows_after(checkpoint_frontier)?);
             changed.sort_by(|left, right| left.row_id.cmp(&right.row_id));
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
@@ -16867,21 +16848,7 @@ impl ProjectionWorker {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .objects_epoch();
-            if ordinary_upsert {
-                validate_ordinary_commit_version(current_epoch, committed_epoch)?;
-            } else {
-                // The unchanged source prefix is already physically bound and
-                // Arc-identical. Reconcile can remove only non-source families;
-                // retain the complete physical readback and equality for them.
-                let persisted = self
-                    .sqlite
-                    .lock()
-                    .map_err(|_| StoreError::StoreCorrupt)?
-                    .object_rows_without_source_facts()?;
-                if persisted.as_slice() != facts.other_rows() {
-                    return Err(StoreError::Projection);
-                }
-            }
+            validate_ordinary_commit_version(current_epoch, committed_epoch)?;
             return Ok((
                 ProjectionOutput::CurrentFacts(facts),
                 committed_epoch,
@@ -17296,9 +17263,8 @@ mod tests {
             WorkstreamId, WorktreeId, WorktreeSnapshotId,
         },
         repository::{
-            FilesystemIdentity, GitObjectFormat, GitOperation, GitRegistrationState,
-            IntegrationKind, LineageAssessment, PathObservation, SnapshotCaptureStatus,
-            WorktreeKind, WorktreeLifecycle, WorktreeSnapshot,
+            FilesystemIdentity, GitObjectFormat, GitRegistrationState, IntegrationKind,
+            LineageAssessment, PathObservation, WorktreeKind, WorktreeLifecycle,
         },
         semantic::{MetricValue, ParserReceipt, VerifierReceipt},
         work::{
@@ -20204,159 +20170,6 @@ mod tests {
                 .search
                 .iter()
                 .any(|row| row.source_event_seq == surface_seq)
-        );
-
-        // A warm proof-qualified read owns the admission state's three source
-        // Arcs. Keep them as the identity witness for the nonordinary branch
-        // that emits them before complete source rows are built.
-        let warm = writer.project_current(true).await.unwrap();
-        let warm_receipt = Arc::clone(warm.source_receipts().next().unwrap().0);
-        let warm_observation = Arc::clone(warm.source_observations().next().unwrap().0);
-        let warm_surface = Arc::clone(warm.evidence_surfaces().next().unwrap().0);
-        let warm_facts = SourceFactsRef {
-            source_receipts: &warm.source_receipts,
-            source_observations: &warm.source_observations,
-            evidence_surfaces: &warm.evidence_surfaces,
-        };
-        assert!(writer.source_prefix_proven_for_test());
-
-        // A worktree snapshot reconciles only procedure_effect and adds no
-        // source row, so the qualified prefix may be consumed directly.
-        let snapshot_id = WorktreeSnapshotId::new_v7();
-        let snapshot = WorktreeSnapshot {
-            worktree_snapshot_id: snapshot_id,
-            worktree_instance_id: worktree.worktree_instance_id,
-            head_oid: None,
-            tree_oid: None,
-            branch_ref: None,
-            detached_head: false,
-            tracked_diff_digest: None,
-            index_digest: None,
-            untracked_manifest_digest: None,
-            relevant_anchor_digests: vec![],
-            dependency_fingerprints: vec![],
-            toolchain_fingerprint: None,
-            git_operation: GitOperation::None,
-            captured_at_us: 1,
-            evidence_refs: vec!["snapshot:r641".into()],
-            capture_status: SnapshotCaptureStatus::Complete,
-            omission_reasons: vec![],
-        };
-        writer
-            .commit(
-                &r105_command(
-                    3,
-                    vec![JournalPayload::WorktreeSnapshotRecorded(Box::new(
-                        snapshot.clone(),
-                    ))],
-                ),
-                3,
-            )
-            .await
-            .unwrap();
-        assert!(writer.source_prefix_proven_for_test());
-
-        // The existing pre-commit fault seam on this pending warm-source
-        // nonordinary delta must leave the persisted objects untouched.
-        let sqlite = writer.projection_handle();
-        let (objects_epoch, checkpoint, frontier) = {
-            let mut state = sqlite.lock().unwrap();
-            let stamp = state.stamp().unwrap();
-            (stamp.objects_epoch, stamp.object_checkpoint, stamp.frontier)
-        };
-        let appended = sqlite.lock().unwrap().rows_after(checkpoint).unwrap();
-        assert!(!appended.is_empty());
-        assert!(matches!(
-            ProjectionWorker::new(sqlite.clone())
-                .catch_up_inner(
-                    true,
-                    Some((objects_epoch, checkpoint, frontier)),
-                    Some(&appended),
-                    Some(&warm_facts),
-                    true,
-                )
-                .await,
-            Err(StoreError::Projection)
-        ));
-        {
-            let mut state = sqlite.lock().unwrap();
-            let stamp = state.stamp().unwrap();
-            assert_eq!(
-                (stamp.objects_epoch, stamp.object_checkpoint, stamp.frontier),
-                (objects_epoch, checkpoint, frontier)
-            );
-        }
-
-        // The next normal writer request retries the same delta and must return
-        // the unchanged source prefix with its original Arcs.
-        let reconciled = writer.project_current(true).await.unwrap();
-        let replayed_snapshot = writer.full_projection().await.unwrap();
-        assert!(Arc::ptr_eq(
-            &warm_receipt,
-            reconciled
-                .source_receipt(receipt.source_receipt_id)
-                .unwrap()
-                .0
-        ));
-        assert!(Arc::ptr_eq(
-            &warm_observation,
-            reconciled
-                .source_observation(observation.source_observation_id)
-                .unwrap()
-                .0
-        ));
-        assert!(Arc::ptr_eq(
-            &warm_surface,
-            reconciled
-                .evidence_surface(observation.source_observation_id)
-                .unwrap()
-                .0
-        ));
-        assert_eq!(reconciled.into_full_snapshot().unwrap(), replayed_snapshot);
-        assert_eq!(
-            sqlite.lock().unwrap().object_rows().unwrap(),
-            replayed_snapshot.rows
-        );
-        let expected = crate::query::derive_l0002_projections(&replayed_snapshot).unwrap();
-        assert_eq!(
-            writer.l0002_projection_worker().current().await.unwrap(),
-            expected
-        );
-
-        // A legitimate mixed delta adds new source rows together with the
-        // nonordinary reconcile. It must fall back to the original complete
-        // path and keep every new source row in the committed projection.
-        let (mixed_receipt, mixed_observation, mixed_surface) =
-            r105_capture("mixed-new", 1, &repository, &worktree, true);
-        let mixed_snapshot = WorktreeSnapshot {
-            worktree_snapshot_id: WorktreeSnapshotId::new_v7(),
-            evidence_refs: vec!["snapshot:r641-mixed".into()],
-            ..snapshot
-        };
-        let mut mixed_payloads =
-            r105_capture_payloads(&mixed_receipt, &mixed_observation, mixed_surface.as_ref());
-        mixed_payloads.push(JournalPayload::WorktreeSnapshotRecorded(Box::new(
-            mixed_snapshot,
-        )));
-        writer
-            .commit(&r105_command(4, mixed_payloads), 4)
-            .await
-            .unwrap();
-
-        let mixed = writer.project_current(true).await.unwrap();
-        let replayed_mixed = writer.full_projection().await.unwrap();
-        assert_eq!(mixed.source_receipts().count(), 2);
-        assert_eq!(mixed.source_observations().count(), 2);
-        assert_eq!(mixed.evidence_surfaces().count(), 2);
-        assert_eq!(mixed.into_full_snapshot().unwrap(), replayed_mixed);
-        assert_eq!(
-            sqlite.lock().unwrap().object_rows().unwrap(),
-            replayed_mixed.rows
-        );
-        let expected = crate::query::derive_l0002_projections(&replayed_mixed).unwrap();
-        assert_eq!(
-            writer.l0002_projection_worker().current().await.unwrap(),
-            expected
         );
     }
 
