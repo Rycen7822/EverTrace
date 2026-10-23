@@ -868,8 +868,7 @@ impl JournalWriter {
     ) -> Result<Self, StoreError> {
         lock.validate_held()?;
         let sqlite = SqliteState::open(data_dir)?.handle();
-        let (migration_outcome, migration_objects_validation) =
-            L0002::apply_for_writer(&sqlite, &connection).await?;
+        let migration_outcome = L0002::apply(&sqlite, &connection).await?;
         let search = connection
             .open_table(SEARCH_TABLE)
             .execute()
@@ -888,58 +887,18 @@ impl JournalWriter {
             return Err(StoreError::StoreCorrupt);
         }
         let projection_directories = vec![(path, file)];
-        let (rows, replay_input_stamp) = {
-            let mut state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+        let (admission_state, next_seq) = {
+            let state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             let rows = state.rows()?;
-            let stamp = state.stamp()?;
-            (rows, stamp)
+            let admission_state = JournalAdmissionState::from_journal_rows(&rows)?;
+            let next_seq = rows
+                .last()
+                .map(|row| row.seq)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(StoreError::StoreCorrupt)?;
+            (admission_state, next_seq)
         };
-        let admission_state = JournalAdmissionState::from_journal_rows(&rows)?;
-        let committed_frontier = rows.last().map(|row| row.seq).unwrap_or(0);
-        let next_seq = committed_frontier
-            .checked_add(1)
-            .ok_or(StoreError::StoreCorrupt)?;
-
-        lock.validate_held()?;
-        for (path, file) in &projection_directories {
-            let located = fs::symlink_metadata(path).map_err(|_| StoreError::StoreCorrupt)?;
-            let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
-            if !located.is_dir()
-                || located.file_type().is_symlink()
-                || (located.dev(), located.ino()) != (held.dev(), held.ino())
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-        }
-        let final_replay_stamp = {
-            let mut state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
-            state.revalidate()?;
-            let current = state.stamp()?;
-            if current != replay_input_stamp
-                || admission_state.committed_frontier() != committed_frontier
-                || committed_frontier != current.frontier
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            current
-        };
-        drop(rows);
-
-        let mut projection_validation = [None, None];
-        if let Some((stamp, has_failed_job)) =
-            migration_objects_validation.filter(|(stamp, _)| *stamp == final_replay_stamp)
-        {
-            projection_validation[0] = Some(ProjectionValidation {
-                frontier: stamp.frontier,
-                stamp,
-                search_version: 0,
-                has_failed_job,
-                content_proven: false,
-                source_prefix_proven: false,
-                appended_through: None,
-                appended_rows: None,
-            });
-        }
         readers.publish_writer_binding(connection.clone(), &sqlite)?;
         Ok(Self {
             _lock: lock,
@@ -951,7 +910,7 @@ impl JournalWriter {
             admission_state,
             migration_outcome,
             projection_directories,
-            projection_validation: Mutex::new(projection_validation),
+            projection_validation: Mutex::new([None, None]),
             #[cfg(test)]
             capture_delta_selections: std::sync::atomic::AtomicU64::new(0),
         })
@@ -1763,8 +1722,26 @@ impl JournalWriter {
                 content_proven,
                 source_prefix_proven,
             ) = if let Some(stamp) = hit {
-                let (projection, source_prefix_proven) = if output_kind == ProjectionReturn::None {
-                    (None, stamp.source_prefix_proven)
+                let projection = if output_kind == ProjectionReturn::None {
+                    None
+                } else if output_kind == ProjectionReturn::Snapshot {
+                    let rows = {
+                        let state = self.lock_sqlite()?;
+                        if stamp.source_prefix_proven {
+                            state.object_rows_without_source_facts()?
+                        } else {
+                            state.object_rows()?
+                        }
+                    };
+                    Some(ProjectionOutput::Snapshot(if stamp.source_prefix_proven {
+                        self.admission_state
+                            .snapshot_with_source_prefix(rows, stamp.frontier)?
+                    } else {
+                        ProjectionSnapshot {
+                            frontier: stamp.frontier,
+                            rows,
+                        }
+                    }))
                 } else {
                     let rows = {
                         let state = self.lock_sqlite()?;
@@ -1774,36 +1751,16 @@ impl JournalWriter {
                             state.object_rows()?
                         }
                     };
-                    let source_prefix_proven = stamp.source_prefix_proven
-                        || self
-                            .admission_state
-                            .source_prefix_matches_rows(&rows, stamp.frontier)?;
-                    let projection = if stamp.source_prefix_proven {
-                        if output_kind == ProjectionReturn::Snapshot {
-                            ProjectionOutput::Snapshot(
-                                self.admission_state
-                                    .snapshot_with_source_prefix(rows, stamp.frontier)?,
-                            )
-                        } else {
-                            ProjectionOutput::CurrentFacts(
-                                self.admission_state
-                                    .current_facts_with_source_prefix(rows, stamp.frontier)?,
-                            )
-                        }
+                    let facts = if stamp.source_prefix_proven {
+                        self.admission_state
+                            .current_facts_with_source_prefix(rows, stamp.frontier)?
                     } else {
-                        let snapshot = ProjectionSnapshot {
+                        CurrentFacts::from_full_snapshot(ProjectionSnapshot {
                             frontier: stamp.frontier,
                             rows,
-                        };
-                        if output_kind == ProjectionReturn::Snapshot {
-                            ProjectionOutput::Snapshot(snapshot)
-                        } else {
-                            ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(
-                                snapshot,
-                            )?)
-                        }
+                        })?
                     };
-                    (Some(projection), source_prefix_proven)
+                    Some(ProjectionOutput::CurrentFacts(facts))
                 };
                 (
                     stamp.frontier,
@@ -1811,7 +1768,7 @@ impl JournalWriter {
                     stamp.has_failed_job,
                     stamp.search_version,
                     stamp.content_proven && (indexes || stamp.stamp == before),
-                    source_prefix_proven,
+                    stamp.source_prefix_proven,
                 )
             } else {
                 let capture_update = match capture_input {
@@ -1893,10 +1850,6 @@ impl JournalWriter {
                                     state.object_rows()?
                                 }
                             };
-                            let source_prefix_proven = stamp.source_prefix_proven
-                                || self
-                                    .admission_state
-                                    .source_prefix_matches_rows(&rows, stamp.frontier)?;
                             let projection = if stamp.source_prefix_proven {
                                 if output_kind == ProjectionReturn::Snapshot {
                                     ProjectionOutput::Snapshot(
@@ -1928,7 +1881,7 @@ impl JournalWriter {
                                 Some(projection),
                                 stamp.stamp.objects_epoch,
                                 None,
-                                source_prefix_proven,
+                                stamp.source_prefix_proven,
                             )
                         } else {
                             let appended =
@@ -2903,39 +2856,6 @@ mod tests {
         assert_eq!(state.rows().unwrap(), journal_before);
         assert_eq!(state.object_checkpoint_row().unwrap(), Some((0, 1)));
         assert_eq!(state.object_rows().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn reopened_startup_objects_proof_keeps_full_replay_output() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("data");
-        let first = JournalWriter::open(&root).await.unwrap();
-        first.project_objects().await.unwrap();
-        drop(first);
-
-        let writer = JournalWriter::open(&root).await.unwrap();
-        let actual = writer.projection_handle().lock().unwrap().stamp().unwrap();
-        {
-            let stamps = writer.projection_validation.lock().unwrap();
-            let startup = stamps[0].as_ref().unwrap();
-            assert_eq!(startup.stamp, actual);
-            assert_eq!(startup.frontier, actual.frontier);
-            assert_eq!(startup.search_version, 0);
-            assert!(!startup.content_proven);
-            assert!(!startup.source_prefix_proven);
-            assert!(stamps[1].is_none());
-        }
-
-        let replayed = writer.full_projection().await.unwrap();
-        let physical = writer
-            .projection_handle()
-            .lock()
-            .unwrap()
-            .object_rows()
-            .unwrap();
-        let first_read = writer.project_objects().await.unwrap();
-        assert_eq!(first_read, replayed);
-        assert_eq!(first_read.rows, physical);
     }
 
     #[tokio::test]

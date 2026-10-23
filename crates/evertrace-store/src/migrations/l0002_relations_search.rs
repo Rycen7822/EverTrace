@@ -10,12 +10,11 @@ use crate::{
     JournalCommand, JournalEventDraft, JournalPayload, MigrationApplied, StoreError,
     journal::{rows_for_append, validate_complete_command},
     migrations::{L0001, MigrationOutcome},
-    objects::{OBJECTS_CHECKPOINT_ID, checkpoint_from_rows},
-    projections::{ProjectionSnapshot, ProjectionWorker, RuntimeSchedulerView},
+    projections::ProjectionWorker,
     query::L0002ProjectionWorker,
     relations::RelationProjectionRow,
     search::{SEARCH_TABLE, SearchProjectionRow, search_batch, search_schema},
-    sqlite_state::{SqliteHandle, SqliteStamp},
+    sqlite_state::SqliteHandle,
 };
 
 const MIGRATION_ID: &str = "L0002";
@@ -37,15 +36,6 @@ impl L0002 {
         sqlite: &SqliteHandle,
         connection: &Connection,
     ) -> Result<MigrationOutcome, StoreError> {
-        Self::apply_inner(sqlite, connection, false)
-            .await
-            .map(|(outcome, _)| outcome)
-    }
-
-    pub(crate) async fn apply_for_writer(
-        sqlite: &SqliteHandle,
-        connection: &Connection,
-    ) -> Result<(MigrationOutcome, Option<(SqliteStamp, bool)>), StoreError> {
         Self::apply_inner(sqlite, connection, false).await
     }
 
@@ -54,16 +44,14 @@ impl L0002 {
         sqlite: &SqliteHandle,
         connection: &Connection,
     ) -> Result<MigrationOutcome, StoreError> {
-        Self::apply_inner(sqlite, connection, true)
-            .await
-            .map(|(outcome, _)| outcome)
+        Self::apply_inner(sqlite, connection, true).await
     }
 
     async fn apply_inner(
         sqlite: &SqliteHandle,
         connection: &Connection,
         crash_before_marker: bool,
-    ) -> Result<(MigrationOutcome, Option<(SqliteStamp, bool)>), StoreError> {
+    ) -> Result<MigrationOutcome, StoreError> {
         let initial_names = connection
             .table_names()
             .execute()
@@ -76,14 +64,9 @@ impl L0002 {
             .relation_checkpoint_row()?
             .is_some();
         let base_outcome = L0001::apply_inner(sqlite, has_relation || has_search).await?;
-        let initial_stamp = sqlite
-            .lock()
-            .map_err(|_| StoreError::StoreCorrupt)?
-            .stamp()?;
-        let (mut objects_snapshot, mut objects_epoch, _) =
-            ProjectionWorker::new(std::sync::Arc::clone(sqlite))
-                .catch_up_validated_with_source_facts(None, None, None)
-                .await?;
+        let mut objects_snapshot = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
+            .catch_up()
+            .await?;
         let created_relation = !has_relation;
         if created_relation {
             let checkpoint = RelationProjectionRow::checkpoint(0);
@@ -110,11 +93,9 @@ impl L0002 {
             }
             append_migration(sqlite, rows.last().map(|row| row.seq).unwrap_or(0)).await?;
             // The marker itself advances the authoritative frontier.
-            let (snapshot, epoch, _) = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
-                .catch_up_validated_with_source_facts(None, None, None)
+            objects_snapshot = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
+                .catch_up()
                 .await?;
-            objects_snapshot = snapshot;
-            objects_epoch = epoch;
         }
 
         // Independently committed projections converge to the validated
@@ -122,68 +103,16 @@ impl L0002 {
         worker.catch_up(&objects_snapshot).await?;
         ensure_fts(&search).await?;
 
-        let has_failed_job = RuntimeSchedulerView::from_snapshot(&objects_snapshot)
-            .map(|view| {
-                view.jobs
-                    .iter()
-                    .any(|job| job.state == crate::JobStatus::Failed)
-            })
-            .ok();
-        let final_stamp = sqlite
-            .lock()
-            .map_err(|_| StoreError::StoreCorrupt)?
-            .stamp()?;
-        let objects_validation = bind_startup_objects_validation(
-            initial_stamp,
-            final_stamp,
-            objects_epoch,
-            &objects_snapshot,
-            has_failed_job,
-        )?;
-
-        Ok((
-            if base_outcome == MigrationOutcome::Applied {
-                MigrationOutcome::Applied
-            } else if base_outcome == MigrationOutcome::RebuiltObjects {
-                MigrationOutcome::RebuiltObjects
-            } else if appended || created_relation || !has_search {
-                MigrationOutcome::Reconciled
-            } else {
-                MigrationOutcome::Noop
-            },
-            objects_validation,
-        ))
+        Ok(if base_outcome == MigrationOutcome::Applied {
+            MigrationOutcome::Applied
+        } else if base_outcome == MigrationOutcome::RebuiltObjects {
+            MigrationOutcome::RebuiltObjects
+        } else if appended || created_relation || !has_search {
+            MigrationOutcome::Reconciled
+        } else {
+            MigrationOutcome::Noop
+        })
     }
-}
-
-fn bind_startup_objects_validation(
-    initial_stamp: SqliteStamp,
-    final_stamp: SqliteStamp,
-    objects_epoch: u64,
-    snapshot: &ProjectionSnapshot,
-    has_failed_job: Option<bool>,
-) -> Result<Option<(SqliteStamp, bool)>, StoreError> {
-    let Some(has_failed_job) = has_failed_job else {
-        return Ok(None);
-    };
-    let snapshot_checkpoint = checkpoint_from_rows(&snapshot.rows)?;
-    let checkpoint = snapshot
-        .rows
-        .iter()
-        .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
-        .ok_or(StoreError::StoreCorrupt)?;
-    checkpoint.validate()?;
-    if initial_stamp.incarnation != final_stamp.incarnation
-        || initial_stamp.data_version != final_stamp.data_version
-        || final_stamp.objects_epoch != objects_epoch
-        || final_stamp.frontier != snapshot.frontier
-        || snapshot_checkpoint != final_stamp.object_checkpoint
-        || checkpoint.source_event_seq != snapshot.frontier
-        || checkpoint.projection_generation != final_stamp.object_generation
-    {
-        return Ok(None);
-    }
-    Ok(Some((final_stamp, has_failed_job)))
 }
 
 async fn open_or_create_search(connection: &Connection, exists: bool) -> Result<Table, StoreError> {
@@ -319,7 +248,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::objects::ObjectRow;
     use crate::sqlite_state::SqliteState;
 
     async fn fixture() -> (tempfile::TempDir, SqliteHandle, Connection) {
@@ -368,83 +296,6 @@ mod tests {
         );
         let search = connection.open_table(SEARCH_TABLE).execute().await.unwrap();
         assert!(!search.list_indices().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn startup_objects_binding_rejects_same_checkpoint_epoch_rewrite() {
-        let (_temp, sqlite, connection) = fixture().await;
-        let (outcome, accepted) = L0002::apply_for_writer(&sqlite, &connection).await.unwrap();
-        assert_eq!(outcome, MigrationOutcome::Applied);
-        let (accepted_stamp, accepted_has_failed_job) = accepted.unwrap();
-        assert_eq!(accepted_stamp, sqlite.lock().unwrap().stamp().unwrap());
-        let (snapshot, objects_epoch, _) = ProjectionWorker::new(std::sync::Arc::clone(&sqlite))
-            .catch_up_validated_with_source_facts(None, None, None)
-            .await
-            .unwrap();
-        let has_failed_job = RuntimeSchedulerView::from_snapshot(&snapshot)
-            .map(|view| {
-                view.jobs
-                    .iter()
-                    .any(|job| job.state == crate::JobStatus::Failed)
-            })
-            .unwrap();
-        assert_eq!(has_failed_job, accepted_has_failed_job);
-        assert!(
-            bind_startup_objects_validation(
-                accepted_stamp,
-                accepted_stamp,
-                objects_epoch,
-                &snapshot,
-                Some(has_failed_job),
-            )
-            .unwrap()
-            .is_some()
-        );
-
-        let mut changed_row = ObjectRow::checkpoint(
-            accepted_stamp.object_checkpoint,
-            accepted_stamp.object_generation,
-        );
-        changed_row.row_id = "startup-binding-test".into();
-        changed_row.row_kind = crate::objects::ObjectRowKind::Data;
-        changed_row.row_class = Some(crate::objects::ObjectRowClass::Projection);
-        changed_row.object_kind = Some("startup_binding_test".into());
-        changed_row.payload_json = Some("{}".into());
-        let checkpoint = ObjectRow::checkpoint(
-            accepted_stamp.object_checkpoint,
-            accepted_stamp.object_generation,
-        );
-        sqlite
-            .lock()
-            .unwrap()
-            .commit_object_rows(
-                &[changed_row, checkpoint.clone()],
-                crate::sqlite_state::ObjectReconcile::default(),
-                &checkpoint,
-            )
-            .unwrap();
-        let rewritten_stamp = sqlite.lock().unwrap().stamp().unwrap();
-        assert_eq!(rewritten_stamp.frontier, accepted_stamp.frontier);
-        assert_eq!(
-            rewritten_stamp.object_checkpoint,
-            accepted_stamp.object_checkpoint
-        );
-        assert_eq!(
-            rewritten_stamp.object_generation,
-            accepted_stamp.object_generation
-        );
-        assert_eq!(rewritten_stamp.objects_epoch, objects_epoch + 1);
-        assert!(
-            bind_startup_objects_validation(
-                accepted_stamp,
-                rewritten_stamp,
-                objects_epoch,
-                &snapshot,
-                Some(has_failed_job),
-            )
-            .unwrap()
-            .is_none()
-        );
     }
 
     #[tokio::test]
