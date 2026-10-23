@@ -6835,6 +6835,30 @@ impl JournalAdmissionState {
 }
 
 impl SourceFactsRef<'_> {
+    fn matches_current_sources(&self, facts: &CurrentFacts) -> bool {
+        fn matches<K: Ord, T: Eq>(
+            expected: &BTreeMap<K, (Arc<T>, u64)>,
+            admitted: &BTreeMap<K, (Arc<T>, u64)>,
+            frontier: u64,
+        ) -> bool {
+            expected
+                .iter()
+                .eq(admitted.iter().filter(|(_, (_, seq))| *seq <= frontier))
+        }
+
+        matches(&facts.source_receipts, self.source_receipts, facts.frontier)
+            && matches(
+                &facts.source_observations,
+                self.source_observations,
+                facts.frontier,
+            )
+            && matches(
+                &facts.evidence_surfaces,
+                self.evidence_surfaces,
+                facts.frontier,
+            )
+    }
+
     fn current_facts_with_source_prefix(
         &self,
         mut other_rows: Vec<ObjectRow>,
@@ -16806,14 +16830,16 @@ impl ProjectionWorker {
             && !reconcile_wiki
             && !reconcile_procedure_effect;
         let direct_facts = return_current_facts
-            && ordinary_upsert
+            && !reconcile_all
             && source_facts.is_some_and(|facts| {
                 state.can_emit_current_facts()
                     && state.preserves_source_prefix(facts, checkpoint_frontier)
             });
         if direct_facts {
-            let facts = state.into_current_facts(journal_frontier)?;
-            validate_ordinary_upsert_rows(&current, facts.other_rows())?;
+            let mut facts = state.into_current_facts(journal_frontier)?;
+            if ordinary_upsert {
+                validate_ordinary_upsert_rows(&current, facts.other_rows())?;
+            }
             let current_by_id = current
                 .iter()
                 .map(|row| (row.row_id.as_str(), row))
@@ -16848,7 +16874,24 @@ impl ProjectionWorker {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .objects_epoch();
-            validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            if ordinary_upsert {
+                validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            } else {
+                let persisted = self
+                    .sqlite
+                    .lock()
+                    .map_err(|_| StoreError::StoreCorrupt)?
+                    .object_rows_without_source_facts()?;
+                // Reconcile touches only non-source families. The old source
+                // prefix is physically bound; compare all typed source members,
+                // including new independently admitted values, without JSON.
+                if persisted.as_slice() != facts.other_rows()
+                    || !source_facts.is_some_and(|source| source.matches_current_sources(&facts))
+                {
+                    return Err(StoreError::Projection);
+                }
+                facts.other_rows = persisted;
+            }
             return Ok((
                 ProjectionOutput::CurrentFacts(facts),
                 committed_epoch,
@@ -20117,6 +20160,82 @@ mod tests {
                 Some("source_receipt" | "source_observation" | "evidence_surface")
             )
         }));
+
+        let sqlite = writer.projection_handle();
+        let admitted =
+            JournalAdmissionState::from_journal_rows(&sqlite.lock().unwrap().rows().unwrap())
+                .unwrap();
+        let admitted_source_facts = admitted.source_facts();
+        assert!(admitted_source_facts.matches_current_sources(&facts));
+
+        let independently_allocated = CurrentFacts {
+            frontier: facts.frontier,
+            other_rows: facts.other_rows.clone(),
+            source_receipts: facts
+                .source_receipts
+                .iter()
+                .map(|(id, (value, seq))| (*id, (Arc::new(value.as_ref().clone()), *seq)))
+                .collect(),
+            source_observations: facts
+                .source_observations
+                .iter()
+                .map(|(id, (value, seq))| (*id, (Arc::new(value.as_ref().clone()), *seq)))
+                .collect(),
+            evidence_surfaces: facts
+                .evidence_surfaces
+                .iter()
+                .map(|(id, (value, seq))| (*id, (Arc::new(value.as_ref().clone()), *seq)))
+                .collect(),
+        };
+        assert!(admitted_source_facts.matches_current_sources(&independently_allocated));
+        let receipt_id = *facts.source_receipts.keys().next().unwrap();
+        assert!(!Arc::ptr_eq(
+            &facts.source_receipts[&receipt_id].0,
+            &independently_allocated.source_receipts[&receipt_id].0,
+        ));
+
+        let copy_facts = || CurrentFacts {
+            frontier: facts.frontier,
+            other_rows: facts.other_rows.clone(),
+            source_receipts: facts.source_receipts.clone(),
+            source_observations: facts.source_observations.clone(),
+            evidence_surfaces: facts.evidence_surfaces.clone(),
+        };
+        let mut changed_payload = copy_facts();
+        Arc::make_mut(
+            &mut changed_payload
+                .source_receipts
+                .get_mut(&receipt_id)
+                .unwrap()
+                .0,
+        )
+        .source_ref
+        .push_str("-changed");
+        assert!(!admitted_source_facts.matches_current_sources(&changed_payload));
+
+        let observation_id = *facts.source_observations.keys().next().unwrap();
+        let mut changed_seq = copy_facts();
+        changed_seq
+            .source_observations
+            .get_mut(&observation_id)
+            .unwrap()
+            .1 += 1;
+        assert!(!admitted_source_facts.matches_current_sources(&changed_seq));
+
+        let mut missing_member = copy_facts();
+        missing_member.source_receipts.remove(&receipt_id);
+        assert!(!admitted_source_facts.matches_current_sources(&missing_member));
+
+        let (extra_receipt, _, _) =
+            r105_capture("current-facts-extra", 1, &repository, &worktree, false);
+        let mut extra_member = copy_facts();
+        extra_member.source_receipts.insert(
+            extra_receipt.source_receipt_id,
+            (Arc::new(extra_receipt), facts.frontier),
+        );
+        assert!(!admitted_source_facts.matches_current_sources(&extra_member));
+
+        let baseline_facts = copy_facts();
         let recovery_from_current = RecoveryCurrentView::from_current(&facts).unwrap();
 
         let replayed = writer.full_projection().await.unwrap();
@@ -20146,15 +20265,9 @@ mod tests {
 
         assert_eq!(facts.frontier(), replayed.frontier);
         assert_eq!(facts.into_full_snapshot().unwrap(), replayed);
-        assert_eq!(
-            writer
-                .project_current(true)
-                .await
-                .unwrap()
-                .into_full_snapshot()
-                .unwrap(),
-            replayed
-        );
+        let bound_prefix = writer.project_current(true).await.unwrap();
+        let bound_receipt = Arc::clone(&bound_prefix.source_receipts[&receipt_id].0);
+        assert_eq!(bound_prefix.into_full_snapshot().unwrap(), replayed);
         let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
         let persisted = writer.l0002_projection_worker().current().await.unwrap();
         assert_eq!(persisted, expected);
@@ -20170,6 +20283,141 @@ mod tests {
                 .search
                 .iter()
                 .any(|row| row.source_event_seq == surface_seq)
+        );
+
+        let make_snapshot = |captured_at_us| WorktreeSnapshot {
+            worktree_snapshot_id: WorktreeSnapshotId::new_v7(),
+            worktree_instance_id: worktree.worktree_instance_id,
+            head_oid: None,
+            tree_oid: None,
+            branch_ref: None,
+            detached_head: false,
+            tracked_diff_digest: None,
+            index_digest: None,
+            untracked_manifest_digest: None,
+            relevant_anchor_digests: vec![],
+            dependency_fingerprints: vec![],
+            toolchain_fingerprint: None,
+            git_operation: evertrace_domain::repository::GitOperation::None,
+            captured_at_us,
+            evidence_refs: vec!["snapshot:r660".into()],
+            capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Complete,
+            omission_reasons: vec![],
+        };
+        writer
+            .commit(
+                &r105_command(
+                    3,
+                    vec![JournalPayload::WorktreeSnapshotRecorded(Box::new(
+                        make_snapshot(3),
+                    ))],
+                ),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        let reconciled_without_new_source = writer.project_current(true).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &bound_receipt,
+            &reconciled_without_new_source.source_receipts[&receipt_id].0,
+        ));
+        assert_eq!(reconciled_without_new_source.source_receipts().count(), 1);
+        assert_eq!(
+            reconciled_without_new_source.source_observations().count(),
+            1
+        );
+        assert_eq!(reconciled_without_new_source.evidence_surfaces().count(), 1);
+        assert!(writer.source_prefix_proven_for_test());
+        let replayed_without_new_source = writer.full_projection().await.unwrap();
+        assert_eq!(
+            reconciled_without_new_source.into_full_snapshot().unwrap(),
+            replayed_without_new_source
+        );
+        assert_eq!(
+            sqlite.lock().unwrap().object_rows().unwrap(),
+            replayed_without_new_source.rows
+        );
+        let expected =
+            crate::query::derive_l0002_projections(&replayed_without_new_source).unwrap();
+        assert_eq!(
+            writer.l0002_projection_worker().current().await.unwrap(),
+            expected
+        );
+
+        let (next_receipt, next_observation, next_surface) =
+            r105_capture("current-facts-mixed", 1, &repository, &worktree, true);
+        let mut mixed_payloads =
+            r105_capture_payloads(&next_receipt, &next_observation, next_surface.as_ref());
+        mixed_payloads.push(JournalPayload::WorktreeSnapshotRecorded(Box::new(
+            make_snapshot(4),
+        )));
+        writer
+            .commit(&r105_command(4, mixed_payloads), 4)
+            .await
+            .unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+
+        let (stamp, journal_rows, appended_rows, before_fault_rows) = {
+            let mut state = sqlite.lock().unwrap();
+            let stamp = state.stamp().unwrap();
+            let journal_rows = state.rows().unwrap();
+            let appended_rows = state.rows_after(stamp.object_checkpoint).unwrap();
+            let object_rows = state.object_rows().unwrap();
+            (stamp, journal_rows, appended_rows, object_rows)
+        };
+        let fault_admission = JournalAdmissionState::from_journal_rows(&journal_rows).unwrap();
+        let fault_source_facts = fault_admission.source_facts();
+        let worker = ProjectionWorker::new(sqlite.clone());
+        assert!(matches!(
+            worker
+                .catch_up_inner(
+                    true,
+                    Some((stamp.objects_epoch, stamp.object_checkpoint, stamp.frontier)),
+                    Some(&appended_rows),
+                    Some(&fault_source_facts),
+                    true,
+                )
+                .await,
+            Err(StoreError::Projection)
+        ));
+        {
+            let mut state = sqlite.lock().unwrap();
+            assert_eq!(state.object_rows().unwrap(), before_fault_rows);
+            assert_eq!(
+                state.stamp().unwrap().object_checkpoint,
+                stamp.object_checkpoint
+            );
+        }
+
+        let mixed_facts = writer.project_current(true).await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        assert!(Arc::ptr_eq(
+            &bound_receipt,
+            &mixed_facts.source_receipts[&receipt_id].0,
+        ));
+        assert_eq!(mixed_facts.source_receipts().count(), 2);
+        assert_eq!(mixed_facts.source_observations().count(), 2);
+        assert_eq!(mixed_facts.evidence_surfaces().count(), 2);
+        let replayed_mixed = writer.full_projection().await.unwrap();
+        assert_eq!(mixed_facts.into_full_snapshot().unwrap(), replayed_mixed);
+        assert_eq!(
+            sqlite.lock().unwrap().object_rows().unwrap(),
+            replayed_mixed.rows
+        );
+        let expected = crate::query::derive_l0002_projections(&replayed_mixed).unwrap();
+        assert_eq!(
+            writer.l0002_projection_worker().current().await.unwrap(),
+            expected
+        );
+
+        let post_append_admission =
+            JournalAdmissionState::from_journal_rows(&sqlite.lock().unwrap().rows().unwrap())
+                .unwrap();
+        assert!(
+            post_append_admission
+                .source_facts()
+                .matches_current_sources(&baseline_facts)
         );
     }
 
