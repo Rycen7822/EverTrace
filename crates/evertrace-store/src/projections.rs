@@ -6835,70 +6835,6 @@ impl JournalAdmissionState {
 }
 
 impl SourceFactsRef<'_> {
-    // The caller supplies the reducer's strictly sorted, unique expected rows.
-    // Complete the original source serialization even after an inequality so a
-    // later constructor error still takes precedence over Projection mismatch.
-    fn matches_readback(
-        &self,
-        persisted: &[ObjectRow],
-        expected: &ProjectionSnapshot,
-    ) -> Result<bool, StoreError> {
-        let mut seen = vec![false; expected.rows.len()];
-        let mut matches = true;
-        for row in persisted {
-            match expected
-                .rows
-                .binary_search_by(|item| item.row_id.cmp(&row.row_id))
-            {
-                Ok(index) => {
-                    matches &=
-                        !std::mem::replace(&mut seen[index], true) && expected.rows[index] == *row;
-                }
-                Err(_) => matches = false,
-            }
-        }
-        let mut scratch = Vec::new();
-        for (value, seq) in self
-            .source_receipts
-            .values()
-            .filter(|(_, seq)| *seq <= expected.frontier)
-        {
-            let (fields, payload) = source_receipt_parts(value.as_ref());
-            matches &= match_readback_source_row(
-                &expected.rows,
-                &mut seen,
-                &mut scratch,
-                evidence_object_row_fields(fields, *seq),
-                &payload,
-            )?;
-        }
-        for (value, seq) in self
-            .source_observations
-            .values()
-            .filter(|(_, seq)| *seq <= expected.frontier)
-        {
-            let (fields, payload) = source_observation_parts(value.as_ref());
-            matches &= match_readback_source_row(
-                &expected.rows,
-                &mut seen,
-                &mut scratch,
-                evidence_object_row_fields(fields, *seq),
-                &payload,
-            )?;
-        }
-        for (value, seq) in self
-            .evidence_surfaces
-            .values()
-            .filter(|(_, seq)| *seq <= expected.frontier)
-        {
-            let (row, payload) =
-                surface_row_parts(value.source_observation_revision_ref, value.as_ref(), *seq);
-            matches &=
-                match_readback_source_row(&expected.rows, &mut seen, &mut scratch, row, &payload)?;
-        }
-        Ok(matches && seen.into_iter().all(|matched| matched))
-    }
-
     fn current_facts_with_source_prefix(
         &self,
         mut other_rows: Vec<ObjectRow>,
@@ -16023,40 +15959,6 @@ fn runtime_row(
     })
 }
 
-fn match_readback_source_row(
-    expected: &[ObjectRow],
-    seen: &mut [bool],
-    scratch: &mut Vec<u8>,
-    mut row: ObjectRow,
-    payload: &impl serde::Serialize,
-) -> Result<bool, StoreError> {
-    scratch.clear();
-    serde_json::to_writer(&mut *scratch, payload).map_err(|_| StoreError::Serialization)?;
-    let text = std::str::from_utf8(scratch).map_err(|_| StoreError::Serialization)?;
-    let matches = expected
-        .binary_search_by(|item| item.row_id.cmp(&row.row_id))
-        .is_ok_and(|index| {
-            let first = !std::mem::replace(&mut seen[index], true);
-            let exact = expected[index]
-                .payload_json
-                .as_ref()
-                .is_some_and(|payload| {
-                    if payload.as_str() != text {
-                        return false;
-                    }
-                    // Independent serialization proved the bytes before sharing
-                    // their storage; full Row Eq still verifies every field.
-                    row.payload_json = Some(payload.clone());
-                    row == expected[index]
-                });
-            first && exact
-        });
-    if scratch.capacity() > crate::objects::OBJECT_ROW_PAYLOAD_BLOCK_BYTES {
-        *scratch = Vec::new();
-    }
-    Ok(matches)
-}
-
 fn push_canonical_row(
     rows: &mut Vec<ObjectRow>,
     payload_blocks: &mut crate::objects::RowPayloadBlockBuilder,
@@ -17026,41 +16928,20 @@ impl ProjectionWorker {
                 None => state.object_rows()?,
             }
         };
-        let output = if return_current_facts
-            && let Some(facts) = source_facts
-            && expected
-                .rows
-                .windows(2)
-                .all(|pair| pair[0].row_id < pair[1].row_id)
-        {
-            if !facts.matches_readback(&persisted_rows, &expected)? {
-                return Err(StoreError::Projection);
-            }
-            let mut facts = CurrentFacts::from_full_snapshot(expected)?;
-            // Keep the original physical reader's packed non-source payloads;
-            // their complete equality was independently established above.
-            facts.other_rows = persisted_rows;
-            ProjectionOutput::CurrentFacts(facts)
+        let persisted_snapshot = match source_facts {
+            Some(facts) => facts.snapshot_with_source_prefix(persisted_rows, expected.frontier)?,
+            None => ProjectionSnapshot {
+                frontier: expected.frontier,
+                rows: persisted_rows,
+            },
+        };
+        if persisted_snapshot.rows != expected.rows {
+            return Err(StoreError::Projection);
+        }
+        let output = if return_current_facts {
+            ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(persisted_snapshot)?)
         } else {
-            let persisted_snapshot = match source_facts {
-                Some(facts) => {
-                    facts.snapshot_with_source_prefix(persisted_rows, expected.frontier)?
-                }
-                None => ProjectionSnapshot {
-                    frontier: expected.frontier,
-                    rows: persisted_rows,
-                },
-            };
-            if persisted_snapshot.rows != expected.rows {
-                return Err(StoreError::Projection);
-            }
-            if return_current_facts {
-                ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(
-                    persisted_snapshot,
-                )?)
-            } else {
-                ProjectionOutput::Snapshot(persisted_snapshot)
-            }
+            ProjectionOutput::Snapshot(persisted_snapshot)
         };
         Ok((
             output,
@@ -20290,147 +20171,6 @@ mod tests {
                 .iter()
                 .any(|row| row.source_event_seq == surface_seq)
         );
-
-        // Worktree reconciliation retains the source prefix but requires the
-        // nonordinary CurrentFacts readback and complete L0002 projection.
-        let snapshot = evertrace_domain::repository::WorktreeSnapshot {
-            worktree_snapshot_id: WorktreeSnapshotId::new_v7(),
-            worktree_instance_id: worktree.worktree_instance_id,
-            head_oid: None,
-            tree_oid: None,
-            branch_ref: None,
-            detached_head: false,
-            tracked_diff_digest: None,
-            index_digest: None,
-            untracked_manifest_digest: None,
-            relevant_anchor_digests: vec![],
-            dependency_fingerprints: vec![],
-            toolchain_fingerprint: None,
-            git_operation: evertrace_domain::repository::GitOperation::None,
-            captured_at_us: 1,
-            evidence_refs: vec!["snapshot:r650".into()],
-            capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Complete,
-            omission_reasons: vec![],
-        };
-        let snapshot_id = snapshot.worktree_snapshot_id;
-        writer
-            .commit(
-                &r105_command(
-                    3,
-                    vec![JournalPayload::WorktreeSnapshotRecorded(Box::new(snapshot))],
-                ),
-                3,
-            )
-            .await
-            .unwrap();
-        let nonordinary = writer.project_current(true).await.unwrap();
-        assert!(writer.source_prefix_proven_for_test());
-        let snapshot_row = nonordinary
-            .other_row(&crate::repository::snapshot_row_id(&snapshot_id))
-            .unwrap();
-        assert_eq!(snapshot_row.source_event_seq, nonordinary.frontier());
-        assert_eq!(
-            nonordinary.other_rows(),
-            writer
-                .projection_handle()
-                .lock()
-                .unwrap()
-                .object_rows_without_source_facts()
-                .unwrap()
-        );
-        let replayed_after_snapshot = writer.full_projection().await.unwrap();
-        assert_eq!(
-            writer
-                .projection_handle()
-                .lock()
-                .unwrap()
-                .object_rows()
-                .unwrap(),
-            replayed_after_snapshot.rows
-        );
-        assert_eq!(
-            nonordinary.into_full_snapshot().unwrap(),
-            replayed_after_snapshot
-        );
-        assert_eq!(
-            writer.l0002_projection_worker().current().await.unwrap(),
-            crate::query::derive_l0002_projections(&replayed_after_snapshot).unwrap()
-        );
-    }
-
-    #[test]
-    fn source_readback_comparator_rejects_payload_metadata_and_membership_differences() {
-        let (repository, worktree) = r105_repository_and_worktree();
-        let (receipt, observation, surface) =
-            r105_capture("readback", 1, &repository, &worktree, true);
-        let mut rows = Vec::new();
-        append(
-            r105_command(
-                1,
-                r105_capture_payloads(&receipt, &observation, surface.as_ref()),
-            ),
-            1,
-            &mut rows,
-        );
-        let state = JournalAdmissionState::default()
-            .apply_row_batch(&rows.iter().collect::<Vec<_>>())
-            .unwrap();
-        let facts = state.source_facts();
-        let expected = reduce_journal(&rows).unwrap();
-        let is_source_row = |row: &ObjectRow| {
-            matches!(
-                row.object_kind.as_deref(),
-                Some("source_receipt" | "source_observation" | "evidence_surface")
-            )
-        };
-        // The physical prefix reader returns exactly the non-source rows.
-        let persisted = expected
-            .rows
-            .iter()
-            .filter(|row| !is_source_row(row))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(facts.matches_readback(&persisted, &expected).unwrap());
-
-        let receipt_index = expected
-            .rows
-            .iter()
-            .position(|row| row.object_kind.as_deref() == Some("source_receipt"))
-            .unwrap();
-        let observation_index = expected
-            .rows
-            .iter()
-            .position(|row| row.object_kind.as_deref() == Some("source_observation"))
-            .unwrap();
-        let mut changed = expected.clone();
-        changed.rows[receipt_index].payload_json = Some(
-            format!(
-                "{} ",
-                changed.rows[receipt_index].payload_json.as_deref().unwrap()
-            )
-            .into(),
-        );
-        assert!(!facts.matches_readback(&persisted, &changed).unwrap());
-
-        let mut changed = expected.clone();
-        changed.rows[observation_index].source_event_seq += 1;
-        assert!(!facts.matches_readback(&persisted, &changed).unwrap());
-
-        // Keep expected sorted/unique: it is the caller's precondition.
-        // Physical missing, extra and duplicate rows must each be rejected.
-        let mut missing = persisted.clone();
-        missing.pop().unwrap();
-        assert!(!facts.matches_readback(&missing, &expected).unwrap());
-
-        let mut extra = persisted.clone();
-        let mut row = persisted[0].clone();
-        row.row_id = "zzz:extra".into();
-        extra.push(row);
-        assert!(!facts.matches_readback(&extra, &expected).unwrap());
-
-        let mut duplicate = persisted.clone();
-        duplicate.push(persisted[0].clone());
-        assert!(!facts.matches_readback(&duplicate, &expected).unwrap());
     }
 
     #[tokio::test]
