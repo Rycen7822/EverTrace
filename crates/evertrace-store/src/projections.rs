@@ -6835,7 +6835,7 @@ impl JournalAdmissionState {
 }
 
 impl SourceFactsRef<'_> {
-    fn matches_current_sources(&self, facts: &CurrentFacts) -> bool {
+    pub(crate) fn matches_current_sources(&self, facts: &CurrentFacts) -> bool {
         fn matches<K: Ord, T: Eq>(
             expected: &BTreeMap<K, (Arc<T>, u64)>,
             admitted: &BTreeMap<K, (Arc<T>, u64)>,
@@ -13816,11 +13816,80 @@ impl ReducerState {
 
     fn from_current_rows(rows: &[ObjectRow], checkpoint_frontier: u64) -> Result<Self, StoreError> {
         let state = Self::decode_current_rows(rows, checkpoint_frontier, None)?;
+        if state.can_emit_current_facts() {
+            state.validate_evidence_relations()?;
+            // The decoder already checked each actual source payload's exact
+            // canonical bytes. Regenerate every other family, including its
+            // derived rows, without materializing those source bytes again.
+            let mut canonical = state.clone().into_rows_with_source_rows(false)?;
+            canonical.push(ObjectRow::checkpoint(
+                checkpoint_frontier,
+                PROJECTION_GENERATION,
+            ));
+            canonical.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+            let mut matches = rows.windows(2).all(|pair| pair[0].row_id < pair[1].row_id)
+                && canonical
+                    .iter()
+                    .eq(rows.iter().filter(|row| !is_source_fact_row(row)));
+            matches &= rows.iter().filter(|row| is_source_fact_row(row)).count()
+                == state.source_receipts.len()
+                    + state.source_observations.len()
+                    + state.evidence_surfaces.len();
+            let mut compare_source = |mut expected: ObjectRow| {
+                if let Ok(index) = rows.binary_search_by(|row| row.row_id.cmp(&expected.row_id)) {
+                    let actual = &rows[index];
+                    expected.payload_json = actual.payload_json.clone();
+                    matches &= expected == *actual;
+                } else {
+                    matches = false;
+                }
+            };
+            for (value, seq) in state.source_receipts.values() {
+                compare_source(evidence_object_row_fields(
+                    source_receipt_parts(value).0,
+                    *seq,
+                ));
+            }
+            for (value, seq) in state.source_observations.values() {
+                compare_source(evidence_object_row_fields(
+                    source_observation_parts(value).0,
+                    *seq,
+                ));
+            }
+            for (value, seq) in state.evidence_surfaces.values() {
+                compare_source(
+                    surface_row_parts(value.source_observation_revision_ref, value, *seq).0,
+                );
+            }
+            if !matches {
+                return Err(StoreError::Projection);
+            }
+            return Ok(state);
+        }
         let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
         if canonical.rows != rows {
             return Err(StoreError::Projection);
         }
         Ok(state)
+    }
+
+    fn into_validated_current_facts(
+        self,
+        rows: Vec<ObjectRow>,
+        frontier: u64,
+    ) -> Result<CurrentFacts, StoreError> {
+        let facts = CurrentFacts {
+            frontier,
+            other_rows: rows
+                .into_iter()
+                .filter(|row| !is_source_fact_row(row))
+                .collect(),
+            source_receipts: self.source_receipts,
+            source_observations: self.source_observations,
+            evidence_surfaces: self.evidence_surfaces,
+        };
+        facts.validate_frontier()?;
+        Ok(facts)
     }
 
     fn decode_current_rows(
@@ -16014,6 +16083,13 @@ fn source_receipt_parts(value: &SourceReceipt) -> (EvidenceRowFields, JournalPay
     (fields, JournalPayloadRef::Receipt(value))
 }
 
+fn is_source_fact_row(row: &ObjectRow) -> bool {
+    matches!(
+        row.object_kind.as_deref(),
+        Some("source_receipt" | "source_observation" | "evidence_surface")
+    )
+}
+
 fn source_receipt_row(value: &SourceReceipt, seq: u64) -> Result<ObjectRow, StoreError> {
     let (fields, payload) = source_receipt_parts(value);
     evidence_object_row(fields, &payload, seq)
@@ -16763,6 +16839,9 @@ impl ProjectionWorker {
             let output = match (return_current_facts, source_facts) {
                 (true, Some(facts)) => ProjectionOutput::CurrentFacts(
                     facts.current_facts_with_source_prefix(current, checkpoint_frontier)?,
+                ),
+                (true, None) if state.can_emit_current_facts() => ProjectionOutput::CurrentFacts(
+                    state.into_validated_current_facts(current, checkpoint_frontier)?,
                 ),
                 (true, None) => ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(
                     ProjectionSnapshot {
@@ -20147,6 +20226,10 @@ mod tests {
             )
             .await
             .unwrap();
+        writer.project_objects().await.unwrap();
+        drop(writer);
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        assert!(!writer.source_prefix_proven_for_test());
 
         let facts = writer.project_current(true).await.unwrap();
         assert_eq!(writer.capture_delta_selections(), 0);
@@ -20239,10 +20322,57 @@ mod tests {
         let recovery_from_current = RecoveryCurrentView::from_current(&facts).unwrap();
 
         let replayed = writer.full_projection().await.unwrap();
+        let physical_rows = sqlite.lock().unwrap().object_rows().unwrap();
+        assert_eq!(physical_rows, replayed.rows);
         assert_eq!(
             recovery_from_current,
             RecoveryCurrentView::from_snapshot(&replayed).unwrap()
         );
+
+        let recovered = ReducerState::from_current_rows(&physical_rows, facts.frontier()).unwrap();
+        let recovered_receipt = Arc::clone(&recovered.source_receipts[&receipt_id].0);
+        let moved_facts = recovered
+            .into_validated_current_facts(physical_rows.clone(), facts.frontier())
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &recovered_receipt,
+            &moved_facts.source_receipts[&receipt_id].0,
+        ));
+
+        let mut wrong_epistemic = replayed.clone();
+        let receipt_row = wrong_epistemic
+            .rows
+            .iter_mut()
+            .find(|row| row.object_kind.as_deref() == Some("source_receipt"))
+            .unwrap();
+        receipt_row.epistemic = Some("inferred".into());
+        assert!(matches!(
+            ReducerState::from_current_rows(&wrong_epistemic.rows, wrong_epistemic.frontier),
+            Err(StoreError::Projection)
+        ));
+
+        let mut wrong_support = replayed.clone();
+        wrong_support
+            .rows
+            .iter_mut()
+            .find(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+            .unwrap()
+            .support_state = Some("unsupported".into());
+        assert!(matches!(
+            ReducerState::from_current_rows(&wrong_support.rows, wrong_support.frontier),
+            Err(StoreError::Projection)
+        ));
+
+        wrong_epistemic
+            .rows
+            .iter_mut()
+            .find(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+            .unwrap()
+            .payload_json = Some("{".into());
+        assert!(matches!(
+            ReducerState::from_current_rows(&wrong_epistemic.rows, wrong_epistemic.frontier),
+            Err(StoreError::StoreCorrupt)
+        ));
 
         let mut damaged = replayed.clone();
         let repository_row = damaged
@@ -20863,10 +20993,24 @@ mod tests {
             .insert_object_row_for_test(&altered)
             .unwrap();
 
+        let current_facts = writer.project_current(true).await.unwrap();
+        assert!(!writer.source_prefix_proven_for_test());
+        let current_facts_snapshot = current_facts.into_full_snapshot().unwrap();
+        assert!(
+            current_facts_snapshot
+                .rows
+                .iter()
+                .any(|row| row == &altered)
+        );
+        assert_ne!(
+            current_facts_snapshot.rows,
+            writer.full_projection().await.unwrap().rows
+        );
+
         let current = writer.project_objects().await.unwrap();
         assert!(!writer.source_prefix_proven_for_test());
         assert!(current.rows.iter().any(|row| row == &altered));
-        assert_ne!(current.rows, writer.full_projection().await.unwrap().rows);
+        assert_eq!(current, current_facts_snapshot);
     }
 
     #[test]

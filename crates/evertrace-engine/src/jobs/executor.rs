@@ -1703,9 +1703,12 @@ async fn reconcile_object_deletions(
 ) -> Result<Option<u64>, WriterActorError> {
     let mut completed_frontier = None;
     loop {
-        let snapshot = writer.project().await.map_err(map_store_error)?;
-        let ledger =
-            ObjectDeletionCurrentView::from_snapshot(&snapshot).map_err(map_store_error)?;
+        let facts = writer
+            .project_current(true)
+            .await
+            .map_err(map_store_error)?;
+        let ledger = ObjectDeletionCurrentView::from_rows(facts.frontier(), facts.other_rows())
+            .map_err(map_store_error)?;
         let Some(pending) = ledger
             .events
             .values()
@@ -1714,7 +1717,8 @@ async fn reconcile_object_deletions(
         else {
             return Ok(completed_frontier);
         };
-        let runtime = RuntimeSchedulerView::from_snapshot(&snapshot).map_err(map_store_error)?;
+        let runtime = RuntimeSchedulerView::from_rows(facts.frontier(), facts.other_rows())
+            .map_err(map_store_error)?;
         let job = runtime
             .jobs
             .iter()
@@ -1735,7 +1739,7 @@ async fn reconcile_object_deletions(
         )
         .map_err(map_store_error)?;
         let outcome = writer
-            .commit_if_frontier(&command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(&command, occurred_at_us, facts.frontier())
             .await
             .map_err(map_store_error)?;
         completed_frontier = Some(outcome.last_seq);
