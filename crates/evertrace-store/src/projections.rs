@@ -2358,29 +2358,15 @@ impl CurrentFacts {
                 other_rows.push(row);
                 continue;
             }
-            let payload_json = row
-                .payload_json
-                .as_deref()
-                .ok_or(StoreError::StoreCorrupt)?;
-            let payload: JournalPayload =
-                serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
-            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
-            if !payload
-                .matches_canonical_json(payload_json)
-                .map_err(|_| StoreError::StoreCorrupt)?
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
+            let payload = validated_source_payload(&row)?;
             match payload {
                 JournalPayload::SourceReceiptRecorded(value) if kind == "source_receipt" => {
-                    let expected = source_receipt_row(&value, row.source_event_seq)?;
-                    if expected != row
-                        || source_receipts
-                            .insert(
-                                value.source_receipt_id,
-                                (Arc::new(*value), row.source_event_seq),
-                            )
-                            .is_some()
+                    if source_receipts
+                        .insert(
+                            value.source_receipt_id,
+                            (Arc::new(*value), row.source_event_seq),
+                        )
+                        .is_some()
                     {
                         return Err(StoreError::StoreCorrupt);
                     }
@@ -2388,31 +2374,23 @@ impl CurrentFacts {
                 JournalPayload::SourceObservationRecorded(value)
                     if kind == "source_observation" =>
                 {
-                    let expected = source_observation_row(&value, row.source_event_seq)?;
-                    if expected != row
-                        || source_observations
-                            .insert(
-                                value.source_observation_id,
-                                (Arc::new(*value), row.source_event_seq),
-                            )
-                            .is_some()
+                    if source_observations
+                        .insert(
+                            value.source_observation_id,
+                            (Arc::new(*value), row.source_event_seq),
+                        )
+                        .is_some()
                     {
                         return Err(StoreError::StoreCorrupt);
                     }
                 }
                 JournalPayload::EvidenceSurfaceRecorded(value) if kind == "evidence_surface" => {
-                    let expected = surface_row(
-                        value.source_observation_revision_ref,
-                        &value,
-                        row.source_event_seq,
-                    )?;
-                    if expected != row
-                        || evidence_surfaces
-                            .insert(
-                                value.source_observation_revision_ref,
-                                (Arc::new(*value), row.source_event_seq),
-                            )
-                            .is_some()
+                    if evidence_surfaces
+                        .insert(
+                            value.source_observation_revision_ref,
+                            (Arc::new(*value), row.source_event_seq),
+                        )
+                        .is_some()
                     {
                         return Err(StoreError::StoreCorrupt);
                     }
@@ -2461,6 +2439,33 @@ impl CurrentFacts {
             return Err(StoreError::StoreCorrupt);
         }
         Ok(())
+    }
+
+    fn source_row_for_readback(&self, row: &ObjectRow) -> Result<Option<ObjectRow>, StoreError> {
+        let Some(id) = row.current_revision_id.as_deref() else {
+            return Ok(None);
+        };
+        match row.object_kind.as_deref() {
+            Some("source_receipt") => id
+                .parse::<SourceReceiptId>()
+                .ok()
+                .and_then(|id| self.source_receipts.get(&id))
+                .map(|(value, seq)| source_receipt_row(value.as_ref(), *seq))
+                .transpose(),
+            Some("source_observation") => id
+                .parse::<SourceObservationId>()
+                .ok()
+                .and_then(|id| self.source_observations.get(&id))
+                .map(|(value, seq)| source_observation_row(value.as_ref(), *seq))
+                .transpose(),
+            Some("evidence_surface") => id
+                .parse::<SourceObservationId>()
+                .ok()
+                .and_then(|id| self.evidence_surfaces.get(&id).map(|value| (id, value)))
+                .map(|(id, (value, seq))| surface_row(id, value.as_ref(), *seq))
+                .transpose(),
+            _ => Ok(None),
+        }
     }
 
     fn source_rows_after(&self, checkpoint: u64) -> Result<Vec<ObjectRow>, StoreError> {
@@ -2576,6 +2581,56 @@ struct ReducerState {
     deletions: Box<ObjectDeletionState>,
     scope_purges: Box<ScopePurgeState>,
     repository_closures: BTreeMap<RepositoryId, RepositoryClosureKeys>,
+}
+
+// Shared with full-snapshot decoding: streaming changes ownership, not the
+// payload, canonical or complete ObjectRow validation contract.
+fn validated_source_payload(row: &ObjectRow) -> Result<JournalPayload, StoreError> {
+    let text = row
+        .payload_json
+        .as_deref()
+        .ok_or(StoreError::StoreCorrupt)?;
+    let payload: JournalPayload =
+        serde_json::from_str(text).map_err(|_| StoreError::StoreCorrupt)?;
+    payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+    if !payload
+        .matches_canonical_json(text)
+        .map_err(|_| StoreError::StoreCorrupt)?
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    let expected = match &payload {
+        JournalPayload::SourceReceiptRecorded(value)
+            if row.object_kind.as_deref() == Some("source_receipt") =>
+        {
+            source_receipt_row(value, row.source_event_seq)?
+        }
+        JournalPayload::SourceObservationRecorded(value)
+            if row.object_kind.as_deref() == Some("source_observation") =>
+        {
+            source_observation_row(value, row.source_event_seq)?
+        }
+        JournalPayload::EvidenceSurfaceRecorded(value)
+            if row.object_kind.as_deref() == Some("evidence_surface") =>
+        {
+            surface_row(
+                value.source_observation_revision_ref,
+                value,
+                row.source_event_seq,
+            )?
+        }
+        _ => return Err(StoreError::StoreCorrupt),
+    };
+    if expected != *row {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(payload)
+}
+
+enum SourceRowMode<'a> {
+    Retain,
+    Omit,
+    Consume(&'a mut dyn FnMut(ObjectRow)),
 }
 
 #[derive(Clone, Debug)]
@@ -6873,6 +6928,83 @@ impl SourceFactsRef<'_> {
         };
         facts.validate_frontier()?;
         Ok(facts)
+    }
+
+    fn for_each_source_row(
+        &self,
+        frontier: u64,
+        mut consume: impl FnMut(ObjectRow),
+    ) -> Result<(), StoreError> {
+        for (value, seq) in self
+            .source_receipts
+            .values()
+            .filter(|(_, seq)| *seq <= frontier)
+        {
+            consume(source_receipt_row(value.as_ref(), *seq)?);
+        }
+        for (value, seq) in self
+            .source_observations
+            .values()
+            .filter(|(_, seq)| *seq <= frontier)
+        {
+            consume(source_observation_row(value.as_ref(), *seq)?);
+        }
+        for (value, seq) in self
+            .evidence_surfaces
+            .values()
+            .filter(|(_, seq)| *seq <= frontier)
+        {
+            consume(surface_row(
+                value.source_observation_revision_ref,
+                value.as_ref(),
+                *seq,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn validate_streamed_readback(
+        &self,
+        expected: &CurrentFacts,
+        persisted: &[ObjectRow],
+    ) -> Result<(), StoreError> {
+        let mut matches = expected.other_rows.as_slice() == persisted;
+        let mut seen = BTreeSet::new();
+        let mut first_error: Option<(String, StoreError)> = None;
+        self.for_each_source_row(expected.frontier, |row| {
+            matches &= seen.insert(row.row_id.clone());
+            let validation = match expected.source_row_for_readback(&row) {
+                Ok(Some(candidate)) => {
+                    matches &= candidate == row;
+                    validated_source_payload(&row).map(|_| ())
+                }
+                Ok(None) => {
+                    matches = false;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = validation
+                && first_error
+                    .as_ref()
+                    .is_none_or(|(id, _)| row.row_id.as_str() < id.as_str())
+            {
+                first_error = Some((row.row_id.clone(), error));
+            }
+        })?;
+        matches &= seen.len()
+            == expected.source_receipts.len()
+                + expected.source_observations.len()
+                + expected.evidence_surfaces.len();
+        // The original algorithm completed every constructor before Vec Eq,
+        // and only decoded source rows (in row-id order) after successful Eq.
+        if !matches {
+            return Err(StoreError::Projection);
+        }
+        if let Some((_, error)) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn snapshot_with_source_prefix(
@@ -14893,13 +15025,59 @@ impl ReducerState {
         Ok(facts)
     }
 
+    fn into_streamed_current_facts(
+        self,
+        frontier: u64,
+        checkpoint: u64,
+    ) -> Result<(CurrentFacts, Vec<ObjectRow>), StoreError> {
+        self.validate_evidence_relations()?;
+        if !self.can_emit_current_facts() {
+            return Err(StoreError::Projection);
+        }
+        // Only map nodes/Arc handles are copied; source bodies keep the
+        // independent reducer's immutable ownership throughout emission.
+        let source_receipts = self.source_receipts.clone();
+        let source_observations = self.source_observations.clone();
+        let evidence_surfaces = self.evidence_surfaces.clone();
+        let mut changed = Vec::new();
+        let mut consume = |row: ObjectRow| {
+            if row.source_event_seq > checkpoint {
+                changed.push(row);
+            }
+        };
+        let mut other_rows =
+            self.into_rows_with_source_mode(SourceRowMode::Consume(&mut consume))?;
+        other_rows.push(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION));
+        other_rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        let facts = CurrentFacts {
+            frontier,
+            other_rows,
+            source_receipts,
+            source_observations,
+            evidence_surfaces,
+        };
+        facts.validate_frontier()?;
+        Ok((facts, changed))
+    }
+
     fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
         self.into_rows_with_source_rows(true)
     }
 
     fn into_rows_with_source_rows(
-        mut self,
+        self,
         include_source_rows: bool,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
+        self.into_rows_with_source_mode(if include_source_rows {
+            SourceRowMode::Retain
+        } else {
+            SourceRowMode::Omit
+        })
+    }
+
+    fn into_rows_with_source_mode(
+        mut self,
+        mut source_mode: SourceRowMode<'_>,
     ) -> Result<Vec<ObjectRow>, StoreError> {
         self.close_deleted_product_state();
         let repository_closures = self
@@ -15018,26 +15196,42 @@ impl ReducerState {
                 seq,
             )?);
         }
-        if include_source_rows {
+        if !matches!(source_mode, SourceRowMode::Omit) {
             for (_, (value, seq)) in self.source_receipts {
-                let (fields, payload) = source_receipt_parts(value.as_ref());
-                push_canonical_row(
-                    &mut rows,
-                    &mut payload_blocks,
-                    evidence_object_row_fields(fields, seq),
-                    &payload,
-                    &mut payload_scratch,
-                )?;
+                match &mut source_mode {
+                    SourceRowMode::Retain => {
+                        let (fields, payload) = source_receipt_parts(value.as_ref());
+                        push_canonical_row(
+                            &mut rows,
+                            &mut payload_blocks,
+                            evidence_object_row_fields(fields, seq),
+                            &payload,
+                            &mut payload_scratch,
+                        )?;
+                    }
+                    SourceRowMode::Consume(consume) => {
+                        consume(source_receipt_row(value.as_ref(), seq)?)
+                    }
+                    SourceRowMode::Omit => {}
+                }
             }
             for (_, (value, seq)) in self.source_observations {
-                let (fields, payload) = source_observation_parts(value.as_ref());
-                push_canonical_row(
-                    &mut rows,
-                    &mut payload_blocks,
-                    evidence_object_row_fields(fields, seq),
-                    &payload,
-                    &mut payload_scratch,
-                )?;
+                match &mut source_mode {
+                    SourceRowMode::Retain => {
+                        let (fields, payload) = source_observation_parts(value.as_ref());
+                        push_canonical_row(
+                            &mut rows,
+                            &mut payload_blocks,
+                            evidence_object_row_fields(fields, seq),
+                            &payload,
+                            &mut payload_scratch,
+                        )?;
+                    }
+                    SourceRowMode::Consume(consume) => {
+                        consume(source_observation_row(value.as_ref(), seq)?)
+                    }
+                    SourceRowMode::Omit => {}
+                }
             }
         }
         for (key, (value, seq)) in self.source_watermarks {
@@ -15048,16 +15242,24 @@ impl ReducerState {
                 seq,
             )?);
         }
-        if include_source_rows {
+        if !matches!(source_mode, SourceRowMode::Omit) {
             for (id, (value, seq)) in self.evidence_surfaces {
-                let (row, payload) = surface_row_parts(id, value.as_ref(), seq);
-                push_canonical_row(
-                    &mut rows,
-                    &mut payload_blocks,
-                    row,
-                    &payload,
-                    &mut payload_scratch,
-                )?;
+                match &mut source_mode {
+                    SourceRowMode::Retain => {
+                        let (row, payload) = surface_row_parts(id, value.as_ref(), seq);
+                        push_canonical_row(
+                            &mut rows,
+                            &mut payload_blocks,
+                            row,
+                            &payload,
+                            &mut payload_scratch,
+                        )?;
+                    }
+                    SourceRowMode::Consume(consume) => {
+                        consume(surface_row(id, value.as_ref(), seq)?)
+                    }
+                    SourceRowMode::Omit => {}
+                }
             }
         }
         for ((id, revision), (value, seq)) in self.host_occurrence_revisions {
@@ -16806,14 +17008,23 @@ impl ProjectionWorker {
             && !reconcile_wiki
             && !reconcile_procedure_effect;
         let direct_facts = return_current_facts
-            && ordinary_upsert
+            && !reconcile_all
             && source_facts.is_some_and(|facts| {
                 state.can_emit_current_facts()
                     && state.preserves_source_prefix(facts, checkpoint_frontier)
             });
         if direct_facts {
-            let facts = state.into_current_facts(journal_frontier)?;
-            validate_ordinary_upsert_rows(&current, facts.other_rows())?;
+            let mut source_changes = None;
+            let mut facts = if ordinary_upsert {
+                let facts = state.into_current_facts(journal_frontier)?;
+                validate_ordinary_upsert_rows(&current, facts.other_rows())?;
+                facts
+            } else {
+                let (facts, changed) =
+                    state.into_streamed_current_facts(journal_frontier, checkpoint_frontier)?;
+                source_changes = Some(changed);
+                facts
+            };
             let current_by_id = current
                 .iter()
                 .map(|row| (row.row_id.as_str(), row))
@@ -16827,7 +17038,10 @@ impl ProjectionWorker {
                 reconcile_procedure_effect,
                 None,
             );
-            changed.extend(facts.source_rows_after(checkpoint_frontier)?);
+            changed.extend(match source_changes {
+                Some(rows) => rows,
+                None => facts.source_rows_after(checkpoint_frontier)?,
+            });
             changed.sort_by(|left, right| left.row_id.cmp(&right.row_id));
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
@@ -16848,7 +17062,19 @@ impl ProjectionWorker {
                 .lock()
                 .map_err(|_| StoreError::StoreCorrupt)?
                 .objects_epoch();
-            validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            if ordinary_upsert {
+                validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            } else {
+                let persisted = self
+                    .sqlite
+                    .lock()
+                    .map_err(|_| StoreError::StoreCorrupt)?
+                    .object_rows_without_source_facts()?;
+                source_facts
+                    .ok_or(StoreError::StoreCorrupt)?
+                    .validate_streamed_readback(&facts, &persisted)?;
+                facts.other_rows = persisted;
+            }
             return Ok((
                 ProjectionOutput::CurrentFacts(facts),
                 committed_epoch,
@@ -20170,6 +20396,225 @@ mod tests {
                 .search
                 .iter()
                 .any(|row| row.source_event_seq == surface_seq)
+        );
+
+        assert!(writer.source_prefix_proven_for_test());
+        let warm = writer.project_current(false).await.unwrap();
+        let (old_receipt, _) = warm.source_receipts().next().unwrap();
+        let old_receipt_id = old_receipt.source_receipt_id;
+        let old_receipt = std::sync::Arc::clone(old_receipt);
+        drop(warm);
+
+        let snapshot = evertrace_domain::repository::WorktreeSnapshot {
+            worktree_snapshot_id: WorktreeSnapshotId::new_v7(),
+            worktree_instance_id: worktree.worktree_instance_id,
+            head_oid: None,
+            tree_oid: None,
+            branch_ref: None,
+            detached_head: false,
+            tracked_diff_digest: None,
+            index_digest: None,
+            untracked_manifest_digest: None,
+            relevant_anchor_digests: vec![],
+            dependency_fingerprints: vec![],
+            toolchain_fingerprint: None,
+            git_operation: evertrace_domain::repository::GitOperation::None,
+            captured_at_us: 3,
+            evidence_refs: vec!["snapshot:r654-mixed".into()],
+            capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Complete,
+            omission_reasons: vec![],
+        };
+        let (mixed_receipt, mixed_observation, mixed_surface) =
+            r105_capture("streamed-mixed", 1, &repository, &worktree, true);
+        let mut payloads = vec![JournalPayload::WorktreeSnapshotRecorded(Box::new(snapshot))];
+        payloads.extend(r105_capture_payloads(
+            &mixed_receipt,
+            &mixed_observation,
+            mixed_surface.as_ref(),
+        ));
+        writer.commit(&r105_command(3, payloads), 3).await.unwrap();
+
+        let streamed = writer.project_current(false).await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        let shared_receipt = streamed
+            .source_receipts()
+            .find(|(receipt, _)| receipt.source_receipt_id == old_receipt_id)
+            .unwrap()
+            .0;
+        assert!(std::sync::Arc::ptr_eq(&old_receipt, shared_receipt));
+        assert!(
+            streamed
+                .source_receipts()
+                .any(|(receipt, _)| receipt.as_ref() == &mixed_receipt)
+        );
+        assert!(
+            streamed
+                .source_observations()
+                .any(|(observation, _)| observation.as_ref() == &mixed_observation)
+        );
+        let mixed_surface = mixed_surface.as_ref().unwrap();
+        assert!(
+            streamed
+                .evidence_surfaces()
+                .any(|(surface, _)| surface.as_ref() == mixed_surface)
+        );
+
+        let replayed = writer.full_projection().await.unwrap();
+        let (persisted_objects, persisted_other) = {
+            let sqlite = writer.projection_handle();
+            let sqlite = sqlite.lock().unwrap();
+            (
+                sqlite.object_rows().unwrap(),
+                sqlite.object_rows_without_source_facts().unwrap(),
+            )
+        };
+        assert_eq!(streamed.other_rows.as_slice(), persisted_other.as_slice());
+        assert_eq!(persisted_objects, replayed.rows);
+        assert_eq!(streamed.into_full_snapshot().unwrap(), replayed);
+
+        assert_eq!(
+            writer
+                .project_current(true)
+                .await
+                .unwrap()
+                .into_full_snapshot()
+                .unwrap(),
+            replayed
+        );
+        let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
+        let current = writer.l0002_projection_worker().current().await.unwrap();
+        assert_eq!(current, expected);
+    }
+
+    #[tokio::test]
+    async fn streamed_readback_rejects_source_membership_and_canonical_differences() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    vec![
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                        JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+                    ],
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        writer.project().await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+
+        let (receipt, observation, surface) =
+            r105_capture("streamed-readback", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    2,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let expected = writer.project_current(false).await.unwrap();
+        let persisted = writer
+            .projection_handle()
+            .lock()
+            .unwrap()
+            .object_rows_without_source_facts()
+            .unwrap();
+        let validate = |source_receipts: &SourceReceiptFacts,
+                        source_observations: &SourceObservationFacts,
+                        evidence_surfaces: &EvidenceSurfaceFacts| {
+            SourceFactsRef {
+                source_receipts,
+                source_observations,
+                evidence_surfaces,
+            }
+            .validate_streamed_readback(&expected, &persisted)
+        };
+        assert_eq!(
+            validate(
+                &expected.source_receipts,
+                &expected.source_observations,
+                &expected.evidence_surfaces,
+            ),
+            Ok(())
+        );
+
+        let receipt_id = receipt.source_receipt_id;
+        let mut changed_receipts = expected.source_receipts.clone();
+        let (source, seq) = changed_receipts.get(&receipt_id).unwrap();
+        let mut changed = source.as_ref().clone();
+        changed.source_ref = "source-ref-r654-changed".into();
+        changed_receipts.insert(receipt_id, (std::sync::Arc::new(changed), *seq));
+        assert_eq!(
+            validate(
+                &changed_receipts,
+                &expected.source_observations,
+                &expected.evidence_surfaces,
+            ),
+            Err(StoreError::Projection)
+        );
+
+        let mut wrong_seq_receipts = expected.source_receipts.clone();
+        let (_, seq) = wrong_seq_receipts.get_mut(&receipt_id).unwrap();
+        assert!(*seq < expected.frontier);
+        *seq += 1;
+        assert!(*seq <= expected.frontier);
+        assert_eq!(
+            validate(
+                &wrong_seq_receipts,
+                &expected.source_observations,
+                &expected.evidence_surfaces,
+            ),
+            Err(StoreError::Projection)
+        );
+
+        let mut missing_receipts = expected.source_receipts.clone();
+        missing_receipts.remove(&receipt_id).unwrap();
+        assert_eq!(
+            validate(
+                &missing_receipts,
+                &expected.source_observations,
+                &expected.evidence_surfaces,
+            ),
+            Err(StoreError::Projection)
+        );
+
+        let (extra_receipt, _, _) =
+            r105_capture("streamed-readback-extra", 1, &repository, &worktree, false);
+        let mut extra_receipts = expected.source_receipts.clone();
+        assert!(!extra_receipts.contains_key(&extra_receipt.source_receipt_id));
+        extra_receipts.insert(
+            extra_receipt.source_receipt_id,
+            (std::sync::Arc::new(extra_receipt), expected.frontier),
+        );
+        assert_eq!(
+            validate(
+                &extra_receipts,
+                &expected.source_observations,
+                &expected.evidence_surfaces,
+            ),
+            Err(StoreError::Projection)
+        );
+
+        let mut duplicate_receipts = expected.source_receipts.clone();
+        let (source, seq) = duplicate_receipts.get(&receipt_id).unwrap();
+        let duplicate_key = SourceReceiptId::from_digest([0; 32]);
+        assert!(!duplicate_receipts.contains_key(&duplicate_key));
+        duplicate_receipts.insert(duplicate_key, (std::sync::Arc::clone(source), *seq));
+        assert_eq!(
+            validate(
+                &duplicate_receipts,
+                &expected.source_observations,
+                &expected.evidence_surfaces,
+            ),
+            Err(StoreError::Projection)
         );
     }
 
