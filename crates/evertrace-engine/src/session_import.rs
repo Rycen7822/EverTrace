@@ -836,11 +836,19 @@ impl SessionCatalogService {
             if let Some(old) = old
                 && old.metadata.source_revision == item.metadata.source_revision
             {
-                item.metadata.workspace_resolution_kind = old.metadata.workspace_resolution_kind;
-                item.metadata.resolved_repository_instance_id =
-                    old.metadata.resolved_repository_instance_id;
-                item.metadata.resolved_worktree_instance_id =
-                    old.metadata.resolved_worktree_instance_id;
+                // Retain source scope without overriding a catalog conflict or
+                // a verified recovery from one, even at the same revision.
+                if item.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Unavailable
+                    && old.metadata.workspace_resolution_kind
+                        != WorkspaceResolutionKind::Unavailable
+                {
+                    item.metadata.workspace_resolution_kind =
+                        old.metadata.workspace_resolution_kind;
+                    item.metadata.resolved_repository_instance_id =
+                        old.metadata.resolved_repository_instance_id;
+                    item.metadata.resolved_worktree_instance_id =
+                        old.metadata.resolved_worktree_instance_id;
+                }
                 item.metadata.repository_read_restrictions =
                     old.metadata.repository_read_restrictions.clone();
                 item.metadata.prospective_origin = old.metadata.prospective_origin.clone();
@@ -2916,6 +2924,13 @@ pub(crate) async fn preflight_import_context(
         metadata.resolved_repository_instance_id = repository;
         metadata.resolved_worktree_instance_id = worktree;
     }
+    let closed_partial_route = current.body_state == SessionBodyState::Partial
+        && metadata
+            .prospective_origin
+            .as_ref()
+            .is_some_and(|origin| origin.closed)
+        && metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
+        && current.access_decision != Some(SessionAccessDecision::Approved);
     if metadata != current.metadata {
         metadata_events(
             Some(current),
@@ -2929,8 +2944,8 @@ pub(crate) async fn preflight_import_context(
     if payloads.is_empty() {
         return Ok(false);
     }
-    if payloads.iter().any(|payload| matches!(payload, JournalPayload::SessionImportEventRecorded(event)
-        if matches!(event.event, SessionImportEventKind::BodyStateAdvanced { body_state: SessionBodyState::BlockedScopeUnresolved, .. })))
+    if (closed_partial_route || payloads.iter().any(|payload| matches!(payload, JournalPayload::SessionImportEventRecorded(event)
+        if matches!(event.event, SessionImportEventKind::BodyStateAdvanced { body_state: SessionBodyState::BlockedScopeUnresolved, .. }))))
         && let Some(mut job) = context.job.clone()
     {
         job.state = JobStatus::Failed;

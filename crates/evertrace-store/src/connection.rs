@@ -36,7 +36,7 @@ pub(crate) fn native_session() -> Arc<lancedb::Session> {
 pub(crate) fn prepare_native_root(data_dir: &Path) -> Result<(), crate::StoreError> {
     use std::os::unix::fs::DirBuilderExt;
     let native = native_root(data_dir);
-    match std::fs::symlink_metadata(&native) {
+    let container_missing = match std::fs::symlink_metadata(&native) {
         Ok(_) => {
             evertrace_capture::ConfinedRoot::open_owned_private(&native)
                 .map_err(|_| crate::StoreError::StoreCorrupt)?;
@@ -65,29 +65,33 @@ pub(crate) fn prepare_native_root(data_dir: &Path) -> Result<(), crate::StoreErr
                     Err(_) => return Err(crate::StoreError::Io),
                 }
             }
+            false
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            for table in [
-                crate::JOURNAL_TABLE,
-                crate::OBJECTS_TABLE,
-                crate::RELATIONS_TABLE,
-                crate::SEARCH_TABLE,
-            ] {
-                match std::fs::symlink_metadata(data_dir.join(format!("{table}.lance"))) {
-                    Ok(_) => return Err(crate::StoreError::UpgradeRequired),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return Err(crate::StoreError::Io),
-                }
-            }
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&native)
-                .map_err(|_| crate::StoreError::Io)?;
-            std::fs::File::open(data_dir)
-                .and_then(|file| file.sync_all())
-                .map_err(|_| crate::StoreError::Io)?;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => return Err(crate::StoreError::Io),
+    };
+    if !crate::JournalWriter::store_database_exists(data_dir)? {
+        for table in [
+            crate::JOURNAL_TABLE,
+            crate::OBJECTS_TABLE,
+            crate::RELATIONS_TABLE,
+            crate::SEARCH_TABLE,
+        ] {
+            match std::fs::symlink_metadata(data_dir.join(format!("{table}.lance"))) {
+                Ok(_) => return Err(crate::StoreError::UpgradeRequired),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(crate::StoreError::Io),
+            }
+        }
+    }
+    if container_missing {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&native)
+            .map_err(|_| crate::StoreError::Io)?;
+        std::fs::File::open(data_dir)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| crate::StoreError::Io)?;
     }
     Ok(())
 }

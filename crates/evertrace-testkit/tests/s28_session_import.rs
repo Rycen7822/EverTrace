@@ -4725,6 +4725,306 @@ async fn source_start_fixture() -> SourceStartFixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_conflicts_preserve_unavailability_until_a_complete_clean_round() {
+    use evertrace_store::{WorkspaceResolutionKind, session_import::MetadataState};
+    let SourceStartFixture {
+        temp,
+        dated,
+        writer,
+        task,
+        cases,
+        repository,
+        worktree,
+        ..
+    } = source_start_fixture().await;
+    let session = cases[0].0;
+    let source = format!("session-rollout:{session}:{session}");
+    let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+    let original = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .current;
+    // Force the duplicate onto another real catalog page without Git probes
+    // or payload reads for the unrelated metadata-only entries.
+    for ordinal in 0x100..0x140 {
+        let thread = format!("019d0000-0000-7000-8000-{ordinal:012x}");
+        let header = serde_json::json!({"timestamp":"2026-10-06T00:00:02Z","type":"session_meta","payload":{"id":thread,"session_id":thread,"cwd":null,"git":null}});
+        fs::write(
+            dated.join(format!("rollout-2026-10-06T00-00-02-{thread}.jsonl")),
+            format!("{header}\n"),
+        )
+        .unwrap();
+    }
+    let duplicate_dir = dated.parent().unwrap().join("07");
+    fs::create_dir(&duplicate_dir).unwrap();
+    let duplicate = duplicate_dir.join(format!("rollout-2026-10-07T00-00-01-{session}.jsonl"));
+    fs::copy(&transcript, &duplicate).unwrap();
+    let report =
+        observe_session_catalog_report(transcript.to_str(), session, "conflict-refresh", None)
+            .unwrap();
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    catalog.refresh(&report).await.unwrap();
+    catalog.refresh(&report).await.unwrap();
+    let conflicted = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .current;
+    assert_eq!(
+        conflicted.metadata.workspace_resolution_kind,
+        WorkspaceResolutionKind::Unavailable
+    );
+    assert_eq!(conflicted.metadata.metadata_state, MetadataState::Partial);
+    assert_eq!(
+        conflicted.metadata.source_revision,
+        original.metadata.source_revision
+    );
+    assert!(
+        conflicted
+            .metadata
+            .resolved_repository_instance_id
+            .is_none()
+    );
+    assert!(conflicted.metadata.resolved_worktree_instance_id.is_none());
+    for _ in 0..4 {
+        catalog.refresh(&report).await.unwrap();
+        assert_eq!(
+            writer
+                .session_import_context(&source)
+                .await
+                .unwrap()
+                .unwrap()
+                .current,
+            conflicted
+        );
+    }
+    fs::remove_file(duplicate).unwrap();
+    drop(catalog);
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    catalog.refresh(&report).await.unwrap();
+    assert_eq!(
+        writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap()
+            .current,
+        conflicted
+    );
+    catalog.refresh(&report).await.unwrap();
+    let recovered = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .current;
+    assert_eq!(
+        recovered.metadata.workspace_resolution_kind,
+        WorkspaceResolutionKind::Repository
+    );
+    assert_eq!(recovered.metadata.metadata_state, MetadataState::Indexed);
+    assert_eq!(
+        recovered.metadata.resolved_repository_instance_id,
+        Some(repository)
+    );
+    assert_eq!(
+        recovered.metadata.resolved_worktree_instance_id,
+        Some(worktree)
+    );
+    assert_eq!(
+        recovered.metadata.source_revision,
+        original.metadata.source_revision
+    );
+    assert_eq!(recovered.access_decision, original.access_decision);
+    assert_eq!(
+        recovered.metadata.repository_read_restrictions,
+        original.metadata.repository_read_restrictions
+    );
+    drop(catalog);
+    drop(writer);
+    task.await.unwrap().unwrap();
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_an_unapproved_partial_origin_settles_its_active_job() {
+    use evertrace_store::{JobTerminalOutcome, JobTerminalReason, SessionAccessDecision};
+    use std::io::Write as _;
+    let SourceStartFixture {
+        temp,
+        workspace,
+        dated,
+        writer,
+        task,
+        cases,
+        ..
+    } = source_start_fixture().await;
+    let session = cases[2].0;
+    let source = format!("session-rollout:{session}:{session}");
+    let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let request = RequestId::new_v7();
+    let reference = format!("native_session_source_observation:{request}");
+    let deadline = source_observation_deadline();
+    let report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        &reference,
+        deadline,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .observe_native_session_source(
+                request,
+                &report,
+                session,
+                transcript.to_str().unwrap(),
+                &reference,
+                deadline
+            )
+            .await
+            .unwrap()
+    );
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    for ordinal in 0..2 {
+        let message = serde_json::json!({"timestamp":"2026-10-06T00:02:01Z","type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":format!("suffix-{ordinal}"),"item":{"type":"UserMessage","id":format!("suffix-{ordinal}"),"content":[{"type":"text","text":"Durably preserve this independently completed suffix message.","text_elements":[]}]},"completed_at_ms":1791244921000i64}});
+        writeln!(file, "{message}").unwrap();
+    }
+    drop(file);
+    catalog.refresh(&report).await.unwrap();
+    let snapshot = runtime(temp.path());
+    DeviceKeyStore::new(snapshot.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    drop(evertrace_capture::CaptureRuntime::open(snapshot.clone()).unwrap());
+    let worker = SessionImportWorker::new(
+        writer.clone(),
+        snapshot,
+        Arc::new(RwLock::new(Some(report.clone()))),
+    )
+    .unwrap();
+    let budget = SessionImportBudget {
+        max_bytes: 1024 * 1024,
+        max_records: 1,
+        max_work_time: Duration::from_millis(250),
+    };
+    let mut processed = false;
+    for _ in 0..24 {
+        if worker
+            .process_checkpoint(&source, budget)
+            .await
+            .unwrap()
+            .records
+            > 0
+        {
+            processed = true;
+            break;
+        }
+    }
+    assert!(processed);
+    let partial = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(partial.current.body_state, SessionBodyState::Partial);
+    assert_ne!(
+        partial.current.access_decision,
+        Some(SessionAccessDecision::Approved)
+    );
+    let job = partial.job.as_ref().unwrap();
+    assert_eq!(job.state, JobStatus::Queued);
+    let job_id = job.job_id;
+    let before = writer.project().await.unwrap();
+    let receipts = projected_source_receipts(&before)
+        .filter(|receipt| receipt.source_instance_id.as_str() == source)
+        .count();
+    assert!(receipts > 0);
+    let transcript_size = fs::metadata(&transcript).unwrap().len();
+    fs::rename(workspace.join(".git"), temp.path().join("old-git")).unwrap();
+    source_fixture_git(&workspace, &["init", "-q", "-b", "main"]);
+    source_fixture_git(
+        &workspace,
+        &["commit", "--allow-empty", "-qm", "replacement"],
+    );
+    // There is no new transcript append to trigger a separate catalog change.
+    assert_eq!(
+        worker
+            .process_checkpoint(&source, budget)
+            .await
+            .unwrap()
+            .records,
+        0
+    );
+    let closed = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        closed
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed
+    );
+    assert_eq!(closed.current.body_state, SessionBodyState::Partial);
+    assert_eq!(closed.watermark, partial.watermark);
+    assert!(closed.job.is_none());
+    let after = writer.project().await.unwrap();
+    assert_eq!(
+        projected_source_receipts(&after)
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+            .count(),
+        receipts
+    );
+    let terminal = after
+        .data_rows()
+        .filter_map(|row| serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok())
+        .find_map(|payload| match payload {
+            JournalPayload::JobState(job) if job.job_id == job_id => Some(job),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(terminal.state, JobStatus::Failed);
+    assert!(terminal.lease_until_us.is_none());
+    assert_eq!(
+        terminal.terminal.as_ref().unwrap().outcome,
+        JobTerminalOutcome::Failed
+    );
+    assert_eq!(
+        terminal.terminal.as_ref().unwrap().reason,
+        JobTerminalReason::SourceUnavailable
+    );
+    for _ in 0..2 {
+        catalog.refresh(&report).await.unwrap();
+        let settled = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(settled.job.is_none());
+        assert_eq!(settled.current, closed.current);
+        assert_eq!(settled.watermark, closed.watermark);
+    }
+    assert_eq!(fs::metadata(&transcript).unwrap().len(), transcript_size);
+    drop(worker);
+    drop(catalog);
+    drop(writer);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dual_proofs_reject_mutation_of_each_nonselected_leg() {
     use evertrace_engine::repository::{
         HostTrustDecision, ProbeLimits, RepositoryResolveInput, probe_repository,

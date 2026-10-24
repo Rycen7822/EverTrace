@@ -3759,6 +3759,24 @@ fn owned_merge_idempotence_uninstall_and_unknown_owner() {
     assert_eq!(wiring_hash(), hash); // User TOML is not the wiring digest domain.
     fs::write(&paths.host_config, &installed).unwrap();
     let arguments = evertrace_codex::install::candidate_host_arguments();
+    for event in [
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse",
+        "UserPromptSubmit",
+    ] {
+        let override_value = arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix(&format!("hooks.{event}=")))
+            .expect("each installed hook must be overridden for the candidate");
+        let document: toml::Value = toml::from_str(&format!("hooks={override_value}")).unwrap();
+        assert_eq!(
+            document["hooks"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            "exec \"$EVERTRACE_CANDIDATE_ROOT/hook-v1\" --launcher-root \"$EVERTRACE_CANDIDATE_ROOT\""
+        );
+    }
     let candidate_hash = evertrace_codex::install::candidate_wiring_hash(&arguments);
     let mut reordered = arguments.clone();
     reordered.swap(1, 3);

@@ -1945,13 +1945,14 @@ impl PackageService {
 }
 
 /// Wiring for the caller-owned disposable package probe only.
-pub fn candidate_host_arguments() -> [String; 6] {
+pub fn candidate_host_arguments() -> [String; 7] {
     // Literal definitions remain stable across disposable roots. Environment is
     // routing only; normal Host hook trust and candidate evidence still apply.
     let command =
         "exec \"$EVERTRACE_CANDIDATE_ROOT/hook-v1\" --launcher-root \"$EVERTRACE_CANDIDATE_ROOT\"";
     let hooks = toml::Value::String(command.into()).to_string();
     [
+        format!("hooks.SessionStart=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         format!("hooks.PreToolUse=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         format!("hooks.PostToolUse=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         format!("hooks.UserPromptSubmit=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
@@ -1962,7 +1963,7 @@ pub fn candidate_host_arguments() -> [String; 6] {
 }
 
 /// The ordered session arguments themselves are the candidate's wiring.
-pub fn candidate_wiring_hash(arguments: &[String; 6]) -> String {
+pub fn candidate_wiring_hash(arguments: &[String; 7]) -> String {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(arguments).expect("string array serialization");
     format!("{:x}", Sha256::digest(bytes))

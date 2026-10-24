@@ -242,7 +242,7 @@ enum CanaryWiring {
         config: std::path::PathBuf,
         host: std::path::PathBuf,
     },
-    Candidate([String; 6]),
+    Candidate([String; 7]),
 }
 
 fn canary_file_identity(path: &std::path::Path) -> Option<[u64; 7]> {

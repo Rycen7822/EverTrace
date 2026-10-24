@@ -943,6 +943,20 @@ async fn old_l0001_layout_is_refused_without_moving_durable_inputs() {
         Err(evertrace_store::StoreError::UpgradeRequired)
     ));
     assert!(!data.join("store").exists());
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(data.join("store"))
+        .unwrap();
+    assert!(matches!(
+        JournalWriter::open(&data).await,
+        Err(evertrace_store::StoreError::UpgradeRequired)
+    ));
+    assert!(!data.join("store/evertrace.sqlite").exists());
+    assert_eq!(
+        std::fs::read(legacy.join("data.lance")).unwrap(),
+        b"legacy-l0001"
+    );
+    std::fs::remove_dir(data.join("store")).unwrap();
     let mut configured = EffectiveConfig::default().config().clone();
     configured.runtime.data_dir = data.to_str().unwrap().into();
     let effective = EffectiveConfig::new(configured).unwrap();
