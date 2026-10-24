@@ -31,14 +31,13 @@ use evertrace_domain::{
     ids::{CommandId, JobId},
     repository::{RepositoryCapabilityState, RepositoryInstance},
 };
-use evertrace_store::projections::CurrentFacts;
 use evertrace_store::projections::{
     INVENTORY_JOB_KIND, inventory_job_context_ref, inventory_job_worktree,
     inventory_repository_target,
 };
 use evertrace_store::{
     DurableJob, JobLease, JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason,
-    JournalCommand, JournalEventDraft, JournalPayload,
+    JournalCommand, JournalEventDraft, JournalPayload, ProjectionSnapshot,
 };
 
 #[derive(Clone)]
@@ -102,12 +101,12 @@ impl InventoryWorker {
 
     pub(crate) async fn procedure_coverage(
         &self,
-        snapshot: &CurrentFacts,
+        snapshot: &ProjectionSnapshot,
         draft: &evertrace_domain::procedure::ProcedureDraft,
         source_refs: &[String],
     ) -> Result<crate::procedure::VerifiedProcedureCoverage, crate::semantic::SemanticServiceError>
     {
-        crate::procedure::resolve_procedure_coverage_current(
+        crate::procedure::resolve_procedure_coverage(
             &self.writer,
             &self.bindings,
             &self.runtime,
@@ -122,7 +121,7 @@ impl InventoryWorker {
     /// observations in the existing bounded MCP connection entries.
     pub(crate) async fn enqueue_observed(
         &self,
-        snapshot: &CurrentFacts,
+        snapshot: &ProjectionSnapshot,
     ) -> Result<bool, InventoryWorkerError> {
         let after = self.state.lock().await.after.clone();
         let inputs = self
@@ -149,7 +148,7 @@ impl InventoryWorker {
             let mut repositories = BTreeMap::new();
             let mut worktrees = Vec::new();
             for row in snapshot
-                .other_data_rows()
+                .data_rows()
                 .filter(|row| matches!(row.object_kind.as_deref(), Some("repository" | "worktree")))
             {
                 match serde_json::from_str::<JournalPayload>(
@@ -349,14 +348,14 @@ impl InventoryWorker {
         };
         let snapshot = self
             .writer
-            .project_current(true)
+            .project()
             .await
             .map_err(|_| InventoryWorkerError::Store)?;
         let mut repository = None;
         let mut worktree = None;
         let mut previous = None;
         let reference = inventory_job_context_ref(job).ok_or(InventoryWorkerError::Store)?;
-        for row in snapshot.other_data_rows().filter(|row| {
+        for row in snapshot.data_rows().filter(|row| {
             matches!(
                 row.object_kind.as_deref(),
                 Some("repository" | "worktree" | "capability_inventory")
@@ -831,12 +830,13 @@ impl InventoryWorker {
         let command = inventory_command(payloads, now, job.config_hash)?;
         let frontier = match frontier {
             Some(value) => value,
-            None => self
-                .writer
-                .project_current(true)
-                .await
-                .map_err(|_| InventoryWorkerError::Store)?
-                .frontier(),
+            None => {
+                self.writer
+                    .project()
+                    .await
+                    .map_err(|_| InventoryWorkerError::Store)?
+                    .frontier
+            }
         };
         commit_known(&self.writer, command, now, frontier).await?;
         Ok(InventoryProgress {

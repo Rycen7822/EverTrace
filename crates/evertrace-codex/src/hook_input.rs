@@ -11,7 +11,6 @@ use crate::capability::CanaryStatus;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEventKind {
-    SessionStarted,
     InputSubmitted,
     PreToolUse,
     PostToolUse,
@@ -183,7 +182,7 @@ impl CaptureHookInput {
         let payload = serde_json::to_string(&input).map_err(|_| HookInputError::Invalid)?;
         Self::native_delivery(
             input.session_id,
-            Some(input.turn_id),
+            input.turn_id,
             Some(input.tool_use_id),
             event_kind,
             payload,
@@ -201,7 +200,7 @@ impl CaptureHookInput {
         let payload = serde_json::to_string(&input).map_err(|_| HookInputError::Invalid)?;
         Self::native_delivery(
             input.session_id,
-            Some(input.turn_id),
+            input.turn_id,
             None,
             HookEventKind::InputSubmitted,
             payload,
@@ -209,27 +208,9 @@ impl CaptureHookInput {
         )
     }
 
-    pub fn from_session_start(
-        input: crate::binding::NativeSessionStart,
-        generation: u64,
-    ) -> Result<Self, HookInputError> {
-        input
-            .validate_host_fields()
-            .map_err(|_| HookInputError::Invalid)?;
-        let payload = serde_json::to_string(&input).map_err(|_| HookInputError::Invalid)?;
-        Self::native_delivery(
-            input.session_id,
-            None,
-            None,
-            HookEventKind::SessionStarted,
-            payload,
-            generation,
-        )
-    }
-
     fn native_delivery(
         session_id: String,
-        turn_id: Option<String>,
+        turn_id: String,
         request: Option<String>,
         event_kind: HookEventKind,
         payload: String,
@@ -245,7 +226,6 @@ impl CaptureHookInput {
             HookEventKind::PreToolUse => ObservationRole::Intent,
             HookEventKind::PostToolUse => ObservationRole::Result,
             HookEventKind::InputSubmitted => ObservationRole::Message,
-            HookEventKind::SessionStarted => ObservationRole::StateProbe,
             _ => return Err(HookInputError::Invalid),
         };
         let field_provenance = request
@@ -274,7 +254,7 @@ impl CaptureHookInput {
             previous_source_revision: None,
             source_ref: source.clone(),
             session_id,
-            turn_id,
+            turn_id: Some(turn_id),
             tool_use_id: request.clone(),
             event_kind,
             correlation: HostCorrelationEvidence {

@@ -41,7 +41,6 @@ pub struct ManagedInstallPaths {
     pub unit: PathBuf,
     pub config: PathBuf,
     pub cli: PathBuf,
-    pub mcp: PathBuf,
     pub hook: PathBuf,
     pub daemon: PathBuf,
     pub systemctl: PathBuf,
@@ -318,12 +317,7 @@ fn wiring_with_host(
         "../../../packaging/codex/hooks.v1.template.json"
     ))
     .map_err(|_| InstallError::InvalidType)?;
-    for event in [
-        "SessionStart",
-        "PreToolUse",
-        "PostToolUse",
-        "UserPromptSubmit",
-    ] {
+    for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit"] {
         hooks["hooks"][event][0]["hooks"][0]["command"] = command.clone().into();
     }
     mcp.as_table_mut().ok_or(InstallError::InvalidType)?.insert(
@@ -365,8 +359,6 @@ struct WiringLocations {
 
 #[derive(Default, Deserialize)]
 struct HookLocations {
-    #[serde(default, rename = "SessionStart")]
-    start: Vec<toml::Spanned<LocatedHook>>,
     #[serde(default, rename = "PreToolUse")]
     pre: Vec<toml::Spanned<LocatedHook>>,
     #[serde(default, rename = "PostToolUse")]
@@ -441,7 +433,6 @@ fn wiring_declarations(bytes: &[u8]) -> Result<WiringDeclarations, InstallError>
     let mut values = BTreeMap::new();
     let mut removals = vec![begin.clone(), end.clone()];
     for (event, entries) in [
-        ("SessionStart", locations.hooks.start),
         ("PreToolUse", locations.hooks.pre),
         ("PostToolUse", locations.hooks.post),
         ("UserPromptSubmit", locations.hooks.submit),
@@ -451,7 +442,7 @@ fn wiring_declarations(bytes: &[u8]) -> Result<WiringDeclarations, InstallError>
             .enumerate()
             .filter(|(_, item)| within(&item.span()))
             .collect();
-        if selected.is_empty() && matches!(event, "SessionStart" | "UserPromptSubmit") {
+        if selected.is_empty() && event == "UserPromptSubmit" {
             continue;
         }
         let [(index, entry)] = selected.as_slice() else {
@@ -573,13 +564,7 @@ fn replace_wiring(
         let old = previous_tool_wiring(
             std::str::from_utf8(&expected.canonical).map_err(|_| InstallError::InvalidType)?,
         )?;
-        let prior_source = previous_source_wiring(
-            std::str::from_utf8(&expected.canonical).map_err(|_| InstallError::InvalidType)?,
-        )?;
-        if actual.canonical != expected.canonical
-            && actual.canonical != old.as_bytes()
-            && actual.canonical != prior_source.as_bytes()
-        {
+        if actual.canonical != expected.canonical && actual.canonical != old.as_bytes() {
             return Err(InstallError::InvalidType);
         }
         unowned = actual.unowned;
@@ -591,19 +576,20 @@ fn replace_wiring(
                     edits.push((range.clone(), desired.to_string()));
                 }
             }
-            let mut missing_hooks = toml::Table::new();
-            let value: toml::Value = toml::from_str(
-                std::str::from_utf8(&target.canonical).map_err(|_| InstallError::InvalidType)?,
-            )
-            .map_err(|_| InstallError::InvalidType)?;
-            for event in ["SessionStart", "UserPromptSubmit"] {
-                if !actual.values.contains_key(&format!("{event}.command")) {
-                    missing_hooks.insert(event.into(), value["hooks"][event].clone());
-                }
-            }
-            if !missing_hooks.is_empty() {
+            if !actual.values.contains_key("UserPromptSubmit.command") {
+                let value: toml::Value = toml::from_str(
+                    std::str::from_utf8(&target.canonical)
+                        .map_err(|_| InstallError::InvalidType)?,
+                )
+                .map_err(|_| InstallError::InvalidType)?;
                 let mut extra = toml::Table::new();
-                extra.insert("hooks".into(), toml::Value::Table(missing_hooks));
+                extra.insert(
+                    "hooks".into(),
+                    toml::Value::Table(toml::Table::from_iter([(
+                        "UserPromptSubmit".into(),
+                        value["hooks"]["UserPromptSubmit"].clone(),
+                    )])),
+                );
                 edits.push((
                     actual.end..actual.end,
                     toml::to_string(&extra).map_err(|_| InstallError::InvalidType)?,
@@ -678,33 +664,11 @@ fn previous_tool_wiring(owned: &str) -> Result<String, InstallError> {
         .and_then(|value| value.strip_suffix(OWNED_END))
         .ok_or(InstallError::InvalidType)?;
     let mut value: toml::Value = toml::from_str(body).map_err(|_| InstallError::InvalidType)?;
-    let hooks = value
-        .get_mut("hooks")
-        .and_then(toml::Value::as_table_mut)
-        .ok_or(InstallError::InvalidType)?;
-    hooks
-        .remove("UserPromptSubmit")
-        .ok_or(InstallError::InvalidType)?;
-    hooks
-        .remove("SessionStart")
-        .ok_or(InstallError::InvalidType)?;
-    Ok(format!(
-        "{OWNED_BEGIN}{}{OWNED_END}",
-        toml::to_string(&value).map_err(|_| InstallError::InvalidType)?
-    ))
-}
-
-fn previous_source_wiring(owned: &str) -> Result<String, InstallError> {
-    let body = owned
-        .strip_prefix(OWNED_BEGIN)
-        .and_then(|value| value.strip_suffix(OWNED_END))
-        .ok_or(InstallError::InvalidType)?;
-    let mut value: toml::Value = toml::from_str(body).map_err(|_| InstallError::InvalidType)?;
     value
         .get_mut("hooks")
         .and_then(toml::Value::as_table_mut)
         .ok_or(InstallError::InvalidType)?
-        .remove("SessionStart")
+        .remove("UserPromptSubmit")
         .ok_or(InstallError::InvalidType)?;
     Ok(format!(
         "{OWNED_BEGIN}{}{OWNED_END}",
@@ -1055,31 +1019,9 @@ pub fn managed_install(
             .as_ref()
             .map_or(&[][..], |(_, bytes)| bytes.as_slice());
         let previous_locator = wiring_host_locator(original_host)?;
-        let original_host_text =
-            std::str::from_utf8(original_host).map_err(|_| InstallError::InvalidType)?;
-        let expected_mcp = if original_host_text.contains(OWNED_BEGIN) {
-            let original: toml::Value =
-                toml::from_str(original_host_text).map_err(|_| InstallError::InvalidType)?;
-            let command = original
-                .get("mcp_servers")
-                .and_then(|value| value.get("evertrace"))
-                .and_then(|value| value.get("command"))
-                .and_then(toml::Value::as_str)
-                .ok_or(InstallError::InvalidType)?;
-            let command = Path::new(command);
-            if command == paths.cli.as_path() {
-                &paths.cli
-            } else if command == paths.mcp.as_path() {
-                &paths.mcp
-            } else {
-                return Err(InstallError::InvalidType);
-            }
-        } else {
-            &paths.mcp
-        };
         let expected = wiring_with_host(
             &paths.data_root,
-            expected_mcp,
+            &paths.cli,
             &paths.config,
             previous_locator
                 .as_ref()
@@ -1090,7 +1032,7 @@ pub fn managed_install(
         } else {
             Some(wiring_with_host(
                 &paths.data_root,
-                &paths.mcp,
+                &paths.cli,
                 &paths.config,
                 Some((&paths.host_executable, &paths.host_config)),
             )?)
@@ -1167,7 +1109,6 @@ pub fn managed_install(
         if !uninstall {
             stage = "package assets";
             package_metadata(&paths.cli)?;
-            package_metadata(&paths.mcp)?;
             package_metadata(&paths.daemon)?;
             let bytes = package_bytes(&paths.hook)?;
             ensure_install_parent(&paths.data_root)?;
@@ -1957,7 +1898,7 @@ pub fn candidate_host_arguments() -> [String; 6] {
         format!("hooks.UserPromptSubmit=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         "mcp_servers.evertrace.command=\"/bin/sh\"".into(),
         "mcp_servers.evertrace.env_vars=[\"EVERTRACE_CANDIDATE_PACKAGE\",\"EVERTRACE_CANDIDATE_CONFIG\"]".into(),
-        format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace-mcp\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),
+        format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),
     ]
 }
 
@@ -2013,7 +1954,6 @@ pub fn preflight_package_check(
 ) -> Result<PackageCheckPreflight, InstallError> {
     let old_cli = validate_installed_wiring(data, config, host_config)?;
     let old_package = old_cli.parent().ok_or(InstallError::InvalidType)?;
-    let old_uses_mcp = old_cli == old_package.join("evertrace-mcp");
     if !package.is_absolute()
         || package.starts_with(old_package)
         || old_package.starts_with(package)
@@ -2043,14 +1983,12 @@ pub fn preflight_package_check(
         return Err(InstallError::InvalidType);
     }
     let mut assets = Vec::new();
-    for name in ["evertrace", "evertrace-mcp", "evertrace-hook", "evertraced"] {
+    for name in ["evertrace", "evertrace-hook", "evertraced"] {
         let source = package.join(name);
         let identity = hook_file_identity(&package_metadata(&source)?);
-        if name != "evertrace-mcp" || old_uses_mcp {
-            let previous = package_metadata(&old_package.join(name))?;
-            if (identity.device, identity.inode) == (previous.dev(), previous.ino()) {
-                return Err(InstallError::InvalidType);
-            }
+        let previous = package_metadata(&old_package.join(name))?;
+        if (identity.device, identity.inode) == (previous.dev(), previous.ino()) {
+            return Err(InstallError::InvalidType);
         }
         assets.push((source, identity));
     }
@@ -2078,7 +2016,7 @@ pub fn preflight_package_check(
         &wiring_with_host(data, &old_cli, config, host_locator)?,
         Some(&wiring_with_host(
             data,
-            &package.join("evertrace-mcp"),
+            &package.join("evertrace"),
             config,
             host_locator,
         )?),
@@ -3279,12 +3217,6 @@ mod package_publication_tests {
                     .unwrap();
                 }
             }
-            atomic_write(
-                &new.join("evertrace-mcp"),
-                b"#!/bin/sh\necho 'configuration is valid'\n",
-                0o700,
-            )
-            .unwrap();
             let config = root.join("config.toml");
             let host = root.join("host.toml");
             let unit = root.join("evertraced.service");
@@ -3312,32 +3244,6 @@ mod package_publication_tests {
                 0o600,
             )
             .unwrap();
-            if failure == 0 {
-                let host_before = fs::read(&host).unwrap();
-                let mcp = new.join("evertrace-mcp");
-                let mcp_bytes = fs::read(&mcp).unwrap();
-                fs::remove_file(&mcp).unwrap();
-                assert!(preflight_package_check(&data, &config, &host, &unit, &new).is_err());
-                assert_eq!(fs::read(&host).unwrap(), host_before);
-                atomic_write(&mcp, &mcp_bytes, 0o700).unwrap();
-
-                let preflight =
-                    preflight_package_check(&data, &config, &host, &unit, &new).unwrap();
-                fs::write(&mcp, b"#!/bin/sh\nexit 0\n").unwrap();
-                let tampered_candidate = root.join("tampered-candidate");
-                DirBuilder::new()
-                    .mode(0o700)
-                    .create(&tampered_candidate)
-                    .unwrap();
-                assert!(
-                    prepare_package_check(preflight, &tampered_candidate, |path| {
-                        atomic_write(path, b"tampered runtime", 0o600)
-                    })
-                    .is_err()
-                );
-                assert_eq!(fs::read(&host).unwrap(), host_before);
-                atomic_write(&mcp, &mcp_bytes, 0o700).unwrap();
-            }
             let original = [
                 host.clone(),
                 unit.clone(),

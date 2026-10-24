@@ -373,17 +373,8 @@ async fn second_process_probe_entry() {
     let root = PathBuf::from(env::var_os(CHILD_STORE).unwrap());
     let store = CompatibilityStore::connect_local(&root).await.unwrap();
     if mode == "open_corrupt" {
-        // Isolated upstream behaviour: a short malformed manifest may return a
-        // typed error or panic inside Lance. The parent distinguishes
-        // those two observed outcomes by a dedicated exit code; every other
-        // failure (setup, cancellation, unexpected success) gets its own.
-        let opened = tokio::spawn(async move { store.open_probe_table("probe_malformed").await });
-        match opened.await {
-            Ok(Err(_)) => std::process::exit(73),
-            Ok(Ok(_)) => std::process::exit(0),
-            Err(error) if error.is_panic() => std::process::exit(74),
-            Err(_) => std::process::exit(75),
-        }
+        store.open_probe_table("probe_malformed").await.unwrap();
+        panic!("malformed manifest unexpectedly opened");
     }
     assert_eq!(mode, "write_and_exit");
     let table = store.open_probe_table("probe_process").await.unwrap();
@@ -417,29 +408,14 @@ async fn corrupt_derived_probe_table_fails_open() {
     assert!(reopened.open_probe_table("probe_corrupt").await.is_err());
 
     let malformed_manifest = first_manifest(&temp.path().join("probe_malformed.lance/_versions"));
-
-    // Healthy-manifest control through the same child mode: a successful open
-    // must be reported as success, so an explicit post-open panic cannot stand
-    // in for the corruption result below.
-    let healthy = open_corrupt_child(temp.path()).expect("healthy control child must start");
-    println!("malformed-manifest healthy control exit={healthy}");
-    assert_eq!(healthy, 0);
-
     fs::write(malformed_manifest, b"corrupt-derived-probe").unwrap();
-    let corrupted = open_corrupt_child(temp.path()).expect("corrupted child must start");
-    println!("malformed-manifest corrupted open exit={corrupted}");
-    // 73 = typed open error, 74 = isolated upstream panic. Both fail closed;
-    // a successful open, a signal or any setup failure is not accepted.
-    assert!(matches!(corrupted, 73 | 74), "unexpected exit {corrupted}");
-}
-
-fn open_corrupt_child(store: &Path) -> std::io::Result<i32> {
-    Command::new(env::current_exe().unwrap())
+    let status = Command::new(env::current_exe().unwrap())
         .args(["--exact", "second_process_probe_entry", "--nocapture"])
         .env(CHILD_MODE, "open_corrupt")
-        .env(CHILD_STORE, store)
+        .env(CHILD_STORE, temp.path())
         .status()
-        .map(|status| status.code().unwrap_or(-1))
+        .unwrap();
+    assert!(!status.success());
 }
 
 fn first_manifest(versions: &Path) -> PathBuf {

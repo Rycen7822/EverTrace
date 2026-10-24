@@ -224,7 +224,7 @@ impl McpActionService {
         writer: WriterHandle,
         runtime_snapshot: RuntimeSnapshot,
     ) -> Result<Self, McpServiceError> {
-        let search_index = SearchIndex::open_with_read_handle(data_dir, writer.read_handle())
+        let search_index = SearchIndex::open(data_dir)
             .await
             .map_err(|_| McpServiceError::Store)?;
         Ok(Self::new(bindings, search_index, writer, runtime_snapshot))
@@ -964,8 +964,7 @@ mod tests {
             session_id: None,
             payload_json: Some(
                 serde_json::to_string(&JournalPayload::AtomRecorded(Box::new(atom.clone())))
-                    .unwrap()
-                    .into(),
+                    .unwrap(),
             ),
             source_event_seq: sequence,
             projection_generation: 0,

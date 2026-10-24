@@ -4,11 +4,10 @@ use crate::ProjectionSnapshot;
 use crate::{ObjectRow, ObjectRowClass, ObjectRowKind, StoreError};
 use evertrace_capture::CasDigest;
 use evertrace_domain::{
-    evidence::{SourceInstanceId, SourceRevision},
-    ids::{CommandId, RepositoryId, RequestId, WorktreeId, WorktreeSnapshotId},
-    repository::{FilesystemIdentity, RepositoryInstance, WorktreeInstance, WorktreeSnapshot},
+    evidence::SourceRevision,
+    ids::{RepositoryId, RequestId, WorktreeId},
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 pub const SESSION_IMPORT_ROW_PREFIX: &str = "runtime:session_import:";
@@ -34,94 +33,6 @@ pub struct SessionImportContext {
     /// transient query result must never be interpreted as complete negative
     /// continuity evidence; it is not a journal field or projected state.
     pub incomplete_repository_history: Vec<RepositoryId>,
-}
-
-/// The bounded repository inputs used to select source-observation authority
-/// and resolver preimages. This is request-local and never serialized.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceObservationRepositorySelector {
-    pub identity: FilesystemIdentity,
-    pub root_path: String,
-    pub workspace_hints: BTreeSet<String>,
-    pub retained_repository_ids: BTreeSet<RepositoryId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceObservationS11Selector {
-    pub repository: SourceObservationRepositorySelector,
-    pub source_reference: String,
-    pub worktree_entry_paths: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceObservationGuardSelector {
-    pub session_id: String,
-    pub source_instance_id: SourceInstanceId,
-    pub source_revision: SourceRevision,
-    pub command_id: CommandId,
-    pub s11: SourceObservationS11Selector,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceObservationProgress {
-    pub source_instance_id: SourceInstanceId,
-    pub source_revision: SourceRevision,
-    pub watermark: Option<crate::SourceIngestWatermark>,
-    pub recorded_prefix_end: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SourceObservationS11Facts {
-    pub repositories: BTreeMap<RepositoryId, RepositoryInstance>,
-    pub worktrees: BTreeMap<WorktreeId, WorktreeInstance>,
-    pub snapshots: BTreeMap<WorktreeSnapshotId, WorktreeSnapshot>,
-}
-
-/// Inputs taken from the actual source/catalog reads before resolver upserts.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceObservationGuardInput {
-    pub selector: SourceObservationGuardSelector,
-    /// Both canonical and legacy keys are present, including explicit None.
-    pub source_slots: BTreeMap<String, Option<SessionImportCurrent>>,
-    pub source_progress: Vec<SourceObservationProgress>,
-    pub target_revision_has_facts: bool,
-    pub raw_repositories: crate::RepositoryReadContext,
-}
-
-/// Closed, non-serialized compare set for one native source observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceObservationGuard {
-    pub(crate) selector: SourceObservationGuardSelector,
-    pub(crate) source_slots: BTreeMap<String, Option<SessionImportCurrent>>,
-    pub(crate) source_progress: Vec<SourceObservationProgress>,
-    pub(crate) raw_repositories: BTreeMap<RepositoryId, RepositoryInstance>,
-    pub(crate) raw_purged: BTreeSet<RepositoryId>,
-    pub(crate) s11_facts: SourceObservationS11Facts,
-}
-
-impl SourceObservationGuard {
-    pub fn from_preparation(
-        input: SourceObservationGuardInput,
-        s11_facts: SourceObservationS11Facts,
-    ) -> Result<Self, StoreError> {
-        let source_keys = BTreeSet::from([
-            input.selector.session_id.clone(),
-            input.selector.source_instance_id.as_str().to_owned(),
-        ]);
-        if input.target_revision_has_facts
-            || input.source_slots.keys().cloned().collect::<BTreeSet<_>>() != source_keys
-        {
-            return Err(StoreError::InvalidInput);
-        }
-        Ok(Self {
-            selector: input.selector,
-            source_slots: input.source_slots,
-            source_progress: input.source_progress,
-            raw_repositories: input.raw_repositories.repositories,
-            raw_purged: input.raw_repositories.purged,
-            s11_facts,
-        })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,29 +126,6 @@ pub enum BodyStateReason {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProspectiveSourceOrigin {
-    pub snapshot_ref: WorktreeSnapshotId,
-    pub observed_end: u64,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub record_start: Option<u64>,
-    pub closed: bool,
-}
-
-impl ProspectiveSourceOrigin {
-    fn validate(&self, file_size: u64) -> Result<(), StoreError> {
-        if self.observed_end > file_size
-            || self
-                .record_start
-                .is_some_and(|start| start < self.observed_end || start > file_size)
-        {
-            return Err(StoreError::InvalidInput);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SessionMetadata {
     pub source_path: String,
     pub source_format: String,
@@ -253,8 +141,6 @@ pub struct SessionMetadata {
     pub resolved_worktree_instance_id: Option<WorktreeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_read_restrictions: Option<Vec<RepositoryId>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prospective_origin: Option<ProspectiveSourceOrigin>,
     pub file_size: u64,
     pub file_mtime_us: i64,
     pub source_fingerprint: String,
@@ -387,56 +273,6 @@ impl SessionImportCurrent {
             .unwrap_or_else(|| format!("codex-session:{}", self.session_id))
     }
 
-    /// Resolve one newly imported record's scope. File safety and current trust
-    /// remain the caller's checks; a prospective origin never grants its prefix.
-    pub fn import_scope(
-        &self,
-        range: &evertrace_domain::evidence::EvidenceByteRange,
-        origin_snapshot: Option<&evertrace_domain::repository::WorktreeSnapshot>,
-        origin_worktree: Option<&evertrace_domain::repository::WorktreeInstance>,
-    ) -> Result<(Option<RepositoryId>, Option<WorktreeId>), StoreError> {
-        if range.end <= range.start || self.access_decision == Some(SessionAccessDecision::Revoked)
-        {
-            return Err(StoreError::InvalidInput);
-        }
-        if let Some(origin) = &self.metadata.prospective_origin {
-            let fence = origin.record_start.ok_or(StoreError::InvalidInput)?;
-            if range.start < fence && range.end > fence {
-                return Err(StoreError::InvalidInput);
-            }
-            if range.start >= fence && !origin.closed {
-                let snapshot = origin_snapshot.ok_or(StoreError::InvalidInput)?;
-                let worktree = origin_worktree.ok_or(StoreError::InvalidInput)?;
-                if snapshot.worktree_snapshot_id != origin.snapshot_ref
-                    || snapshot.worktree_instance_id != worktree.worktree_instance_id
-                    || !self
-                        .metadata
-                        .repository_read_restrictions
-                        .as_ref()
-                        .is_some_and(|ids| {
-                            ids.binary_search(&worktree.repository_instance_id).is_ok()
-                        })
-                {
-                    return Err(StoreError::InvalidInput);
-                }
-                return Ok((
-                    Some(worktree.repository_instance_id),
-                    Some(worktree.worktree_instance_id),
-                ));
-            }
-        }
-        if self.metadata.workspace_resolution_kind == WorkspaceResolutionKind::Repository {
-            Ok((
-                self.metadata.resolved_repository_instance_id,
-                self.metadata.resolved_worktree_instance_id,
-            ))
-        } else if self.access_decision == Some(SessionAccessDecision::Approved) {
-            Ok((None, None))
-        } else {
-            Err(StoreError::InvalidInput)
-        }
-    }
-
     pub fn validate(&self) -> Result<(), StoreError> {
         if !valid_text(&self.session_id, 512)
             || !valid_source_instance(&self.session_id, self.source_instance_id.as_deref())
@@ -446,14 +282,6 @@ impl SessionImportCurrent {
             return Err(StoreError::InvalidInput);
         }
         self.metadata.validate()?;
-        if matches!(
-            self.body_state,
-            SessionBodyState::Queued | SessionBodyState::Importing
-        ) && self.access_decision == Some(SessionAccessDecision::Revoked)
-            && self.metadata.prospective_origin.is_some()
-        {
-            return Err(StoreError::InvalidInput);
-        }
         if self.metadata.repository_read_restrictions.is_some() {
             if self.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
                 && matches!(
@@ -463,26 +291,9 @@ impl SessionImportCurrent {
                         | SessionBodyState::Partial
                         | SessionBodyState::Imported
                 )
+                && self.access_decision != Some(SessionAccessDecision::Approved)
             {
-                let has_prospective_route = self
-                    .metadata
-                    .prospective_origin
-                    .as_ref()
-                    .is_some_and(|origin| !origin.closed && origin.record_start.is_some());
-                // Completed/partial archival progress survives loss of the
-                // live route. It is not permission to queue or read new bytes.
-                let archived_prospective_progress = self.metadata.prospective_origin.is_some()
-                    && matches!(
-                        self.body_state,
-                        SessionBodyState::Partial | SessionBodyState::Imported
-                    );
-                if !archived_prospective_progress
-                    && (self.access_decision == Some(SessionAccessDecision::Revoked)
-                        || (self.access_decision != Some(SessionAccessDecision::Approved)
-                            && !has_prospective_route))
-                {
-                    return Err(StoreError::InvalidInput);
-                }
+                return Err(StoreError::InvalidInput);
             }
             return Ok(());
         }
@@ -524,11 +335,7 @@ impl SessionImportCurrent {
 
 impl SessionMetadata {
     pub fn workspace_matches_path(&self, path: &str) -> bool {
-        Self::workspace_hint_matches_path(self.workspace_hint.as_deref(), path)
-    }
-
-    pub fn workspace_hint_matches_path(workspace_hint: Option<&str>, path: &str) -> bool {
-        workspace_hint.is_some_and(|workspace| {
+        self.workspace_hint.as_deref().is_some_and(|workspace| {
             std::path::Path::new(workspace).is_absolute()
                 && std::path::Path::new(path).is_absolute()
                 && std::path::Path::new(workspace).starts_with(path)
@@ -555,12 +362,6 @@ impl SessionMetadata {
     }
 
     pub fn validate(&self) -> Result<(), StoreError> {
-        if let Some(origin) = &self.prospective_origin {
-            origin.validate(self.file_size)?;
-            if self.repository_read_restrictions.is_none() {
-                return Err(StoreError::InvalidInput);
-            }
-        }
         if let Some(restrictions) = &self.repository_read_restrictions
             && (restrictions.len() > MAX_REPOSITORY_READ_RESTRICTIONS
                 || restrictions.windows(2).any(|pair| pair[0] >= pair[1])
@@ -616,44 +417,6 @@ impl SessionMetadata {
     }
 }
 
-fn prospective_origin_transition_is_valid(
-    old: &SessionMetadata,
-    next: &SessionMetadata,
-    source_revision_changed: bool,
-    body_state: SessionBodyState,
-) -> bool {
-    if source_revision_changed {
-        return true;
-    }
-    match (&old.prospective_origin, &next.prospective_origin) {
-        (None, None) => true,
-        (None, Some(_)) => matches!(
-            body_state,
-            SessionBodyState::NotImported | SessionBodyState::SourceReplaced
-        ),
-        (Some(_), None) => false,
-        (Some(previous), Some(current)) => {
-            previous.snapshot_ref == current.snapshot_ref
-                && previous.observed_end == current.observed_end
-                && match (previous.record_start, current.record_start) {
-                    (None, None) => true,
-                    (None, Some(start)) => start >= previous.observed_end,
-                    (Some(old_start), Some(new_start)) => old_start == new_start,
-                    (Some(_), None) => false,
-                }
-                && (!previous.closed || current.closed)
-        }
-    }
-}
-
-fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
-}
-
 pub fn apply_session_event(
     current: Option<&SessionImportCurrent>,
     event: &SessionImportEvent,
@@ -705,15 +468,6 @@ pub fn apply_session_event(
                 || (metadata.source_path == old.metadata.source_path
                     && metadata.file_size == old.metadata.file_size
                     && old.metadata.file_mtime_us != metadata.file_mtime_us);
-            let source_revision_changed = old.metadata.source_revision != metadata.source_revision;
-            if !prospective_origin_transition_is_valid(
-                &old.metadata,
-                metadata,
-                source_revision_changed,
-                old.body_state,
-            ) {
-                return Err(StoreError::InvalidInput);
-            }
             if source_changed
                 && !matches!(
                     old.body_state,
@@ -758,21 +512,11 @@ pub fn apply_session_event(
             if !body_transition(old.body_state, *body_state) {
                 return Err(StoreError::InvalidInput);
             }
-            if *body_state == SessionBodyState::Queued {
-                let has_prospective_route = old
-                    .metadata
-                    .prospective_origin
-                    .as_ref()
-                    .is_some_and(|origin| !origin.closed && origin.record_start.is_some());
-                if (old.metadata.prospective_origin.is_some()
-                    && old.access_decision == Some(SessionAccessDecision::Revoked))
-                    || (old.metadata.workspace_resolution_kind
-                        != WorkspaceResolutionKind::Repository
-                        && old.access_decision != Some(SessionAccessDecision::Approved)
-                        && !has_prospective_route)
-                {
-                    return Err(StoreError::InvalidInput);
-                }
+            if *body_state == SessionBodyState::Queued
+                && old.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Repository
+                && old.access_decision != Some(SessionAccessDecision::Approved)
+            {
+                return Err(StoreError::InvalidInput);
             }
             let mut next = old.clone();
             next.revision = event.revision;
@@ -815,11 +559,7 @@ pub fn current_row(value: &SessionImportCurrent, generation: u64) -> Result<Obje
         task_id: None,
         workstream_id: None,
         session_id: Some(value.session_id.clone()),
-        payload_json: Some(
-            serde_json::to_string(value)
-                .map_err(|_| StoreError::Serialization)?
-                .into(),
-        ),
+        payload_json: Some(serde_json::to_string(value).map_err(|_| StoreError::Serialization)?),
         source_event_seq: value.source_event_seq,
         projection_generation: generation,
     })
@@ -930,10 +670,6 @@ fn reason_matches(state: SessionBodyState, reason: BodyStateReason) -> bool {
                 BodyStateReason::ScopeUnresolved
             )
             | (SessionBodyState::Partial, BodyStateReason::BudgetExhausted)
-            | (
-                SessionBodyState::Partial,
-                BodyStateReason::ApprovalUnavailable
-            )
             | (SessionBodyState::Failed, BodyStateReason::ImportFailed)
             | (
                 SessionBodyState::SourceReplaced,
@@ -988,7 +724,6 @@ mod tests {
             resolved_repository_instance_id: None,
             resolved_worktree_instance_id: None,
             repository_read_restrictions: None,
-            prospective_origin: None,
             file_size: 10,
             file_mtime_us: 1,
             source_fingerprint: fingerprint.into(),
@@ -1021,7 +756,6 @@ mod tests {
         let bytes = serde_json::to_vec(&old).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("source_instance_id"));
         assert!(!String::from_utf8_lossy(&bytes).contains("repository_read_restrictions"));
-        assert!(!String::from_utf8_lossy(&bytes).contains("prospective_origin"));
         let decoded: SessionImportEvent = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
         let legacy = apply_session_event(None, &decoded, 1).unwrap();
@@ -1039,287 +773,6 @@ mod tests {
         assert!(
             apply_session_event(restore_current(&legacy_row).unwrap().as_ref(), &next, 3).is_err()
         );
-    }
-
-    #[test]
-    fn prospective_origin_is_monotone_and_queues_only_a_live_resolved_route() {
-        let digest = "1".repeat(64);
-        let initial = apply_session_event(
-            None,
-            &event(
-                1,
-                SessionImportEventKind::MetadataObserved {
-                    metadata: Box::new(metadata(&digest, &digest)),
-                },
-            ),
-            1,
-        )
-        .unwrap();
-        let mut observed_metadata = initial.metadata.clone();
-        observed_metadata.repository_read_restrictions = Some(Vec::new());
-        observed_metadata.prospective_origin = Some(ProspectiveSourceOrigin {
-            snapshot_ref: WorktreeSnapshotId::new_v7(),
-            observed_end: 4,
-            record_start: None,
-            closed: false,
-        });
-        let observed = apply_session_event(
-            Some(&initial),
-            &event(
-                2,
-                SessionImportEventKind::MetadataObserved {
-                    metadata: Box::new(observed_metadata.clone()),
-                },
-            ),
-            2,
-        )
-        .unwrap();
-        let mut missing_record_start = serde_json::to_value(&observed_metadata).unwrap();
-        missing_record_start["prospective_origin"]
-            .as_object_mut()
-            .unwrap()
-            .remove("record_start");
-        assert!(serde_json::from_value::<SessionMetadata>(missing_record_start).is_err());
-        let mut unknown_origin_field = serde_json::to_value(&observed_metadata).unwrap();
-        unknown_origin_field["prospective_origin"]["unexpected"] = true.into();
-        assert!(serde_json::from_value::<SessionMetadata>(unknown_origin_field).is_err());
-
-        observed_metadata
-            .prospective_origin
-            .as_mut()
-            .unwrap()
-            .record_start = Some(6);
-        let resolved = apply_session_event(
-            Some(&observed),
-            &event(
-                3,
-                SessionImportEventKind::MetadataObserved {
-                    metadata: Box::new(observed_metadata.clone()),
-                },
-            ),
-            3,
-        )
-        .unwrap();
-        let queued = apply_session_event(
-            Some(&resolved),
-            &event(
-                4,
-                SessionImportEventKind::BodyStateAdvanced {
-                    body_state: SessionBodyState::Queued,
-                    reason: BodyStateReason::Requested,
-                },
-            ),
-            4,
-        )
-        .unwrap();
-        assert_eq!(queued.access_decision, None);
-        assert_eq!(queued.metadata.resolved_repository_instance_id, None);
-        assert_eq!(queued.metadata.resolved_worktree_instance_id, None);
-        queued.validate().unwrap();
-
-        let importing = apply_session_event(
-            Some(&queued),
-            &event(
-                5,
-                SessionImportEventKind::BodyStateAdvanced {
-                    body_state: SessionBodyState::Importing,
-                    reason: BodyStateReason::Started,
-                },
-            ),
-            5,
-        )
-        .unwrap();
-        let suffix_only = apply_session_event(
-            Some(&importing),
-            &event(
-                6,
-                SessionImportEventKind::BodyStateAdvanced {
-                    body_state: SessionBodyState::Partial,
-                    reason: BodyStateReason::ApprovalUnavailable,
-                },
-            ),
-            6,
-        )
-        .unwrap();
-        assert_eq!(suffix_only.access_decision, None);
-        assert_eq!(suffix_only.body_state, SessionBodyState::Partial);
-        suffix_only.validate().unwrap();
-
-        let earlier = evertrace_domain::evidence::EvidenceByteRange { start: 0, end: 2 };
-        assert!(resolved.import_scope(&earlier, None, None).is_err());
-        let mut approved = resolved.clone();
-        approved.access_decision = Some(SessionAccessDecision::Approved);
-        assert_eq!(
-            approved.import_scope(&earlier, None, None).unwrap(),
-            (None, None)
-        );
-        let mut archived = resolved.clone();
-        archived.body_state = SessionBodyState::Partial;
-        archived
-            .metadata
-            .prospective_origin
-            .as_mut()
-            .unwrap()
-            .closed = true;
-        archived.validate().unwrap();
-        let later = evertrace_domain::evidence::EvidenceByteRange { start: 6, end: 8 };
-        assert!(archived.import_scope(&later, None, None).is_err());
-        archived.access_decision = Some(SessionAccessDecision::Approved);
-        assert_eq!(
-            archived.import_scope(&later, None, None).unwrap(),
-            (None, None)
-        );
-
-        let mut invalid = observed_metadata.clone();
-        invalid.prospective_origin.as_mut().unwrap().observed_end = 5;
-        assert!(
-            apply_session_event(
-                Some(&resolved),
-                &event(
-                    4,
-                    SessionImportEventKind::MetadataObserved {
-                        metadata: Box::new(invalid),
-                    },
-                ),
-                4,
-            )
-            .is_err()
-        );
-        let mut invalid = observed_metadata.clone();
-        invalid.prospective_origin.as_mut().unwrap().record_start = Some(7);
-        assert!(
-            apply_session_event(
-                Some(&resolved),
-                &event(
-                    4,
-                    SessionImportEventKind::MetadataObserved {
-                        metadata: Box::new(invalid),
-                    },
-                ),
-                4,
-            )
-            .is_err()
-        );
-        let mut invalid = observed_metadata.clone();
-        invalid.prospective_origin = None;
-        assert!(
-            apply_session_event(
-                Some(&resolved),
-                &event(
-                    4,
-                    SessionImportEventKind::MetadataObserved {
-                        metadata: Box::new(invalid),
-                    },
-                ),
-                4,
-            )
-            .is_err()
-        );
-        let mut invalid = observed_metadata.clone();
-        invalid.prospective_origin.as_mut().unwrap().snapshot_ref = WorktreeSnapshotId::new_v7();
-        assert!(
-            apply_session_event(
-                Some(&resolved),
-                &event(
-                    4,
-                    SessionImportEventKind::MetadataObserved {
-                        metadata: Box::new(invalid),
-                    },
-                ),
-                4,
-            )
-            .is_err()
-        );
-        let mut invalid = observed_metadata.clone();
-        invalid.prospective_origin.as_mut().unwrap().record_start = Some(11);
-        assert!(invalid.validate().is_err());
-
-        assert!(
-            apply_session_event(
-                Some(&observed),
-                &event(
-                    3,
-                    SessionImportEventKind::BodyStateAdvanced {
-                        body_state: SessionBodyState::Queued,
-                        reason: BodyStateReason::Requested,
-                    },
-                ),
-                3,
-            )
-            .is_err()
-        );
-        let mut closed_metadata = observed_metadata.clone();
-        closed_metadata.prospective_origin.as_mut().unwrap().closed = true;
-        let closed = apply_session_event(
-            Some(&resolved),
-            &event(
-                4,
-                SessionImportEventKind::MetadataObserved {
-                    metadata: Box::new(closed_metadata.clone()),
-                },
-            ),
-            4,
-        )
-        .unwrap();
-        assert!(
-            apply_session_event(
-                Some(&closed),
-                &event(
-                    5,
-                    SessionImportEventKind::BodyStateAdvanced {
-                        body_state: SessionBodyState::Queued,
-                        reason: BodyStateReason::Requested,
-                    },
-                ),
-                5,
-            )
-            .is_err()
-        );
-        closed_metadata.prospective_origin.as_mut().unwrap().closed = false;
-        assert!(
-            apply_session_event(
-                Some(&closed),
-                &event(
-                    5,
-                    SessionImportEventKind::MetadataObserved {
-                        metadata: Box::new(closed_metadata),
-                    },
-                ),
-                5,
-            )
-            .is_err()
-        );
-
-        let revoked = apply_session_event(
-            Some(&resolved),
-            &event(
-                4,
-                SessionImportEventKind::AccessDecision {
-                    decision: SessionAccessDecision::Revoked,
-                    local_request_ref: RequestId::new_v7(),
-                    provenance_refs: vec!["local_cli:revoke".into()],
-                },
-            ),
-            4,
-        )
-        .unwrap();
-        assert!(
-            apply_session_event(
-                Some(&revoked),
-                &event(
-                    5,
-                    SessionImportEventKind::BodyStateAdvanced {
-                        body_state: SessionBodyState::Queued,
-                        reason: BodyStateReason::Requested,
-                    },
-                ),
-                5,
-            )
-            .is_err()
-        );
-        let mut corrupted = queued;
-        corrupted.access_decision = Some(SessionAccessDecision::Revoked);
-        assert!(corrupted.validate().is_err());
     }
 
     #[test]

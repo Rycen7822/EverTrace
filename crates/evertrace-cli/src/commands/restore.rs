@@ -141,8 +141,7 @@ pub async fn upgrade(
             );
         }
         println!(
-            "scope=package_prepublication check=not-ready native_prepared={} migrated={} materials_validated={} candidate_native_verified={} candidate_daemon_verified={} host_verified={} generation={:?} backup={} candidate_removed=true",
-            checked.native_prepared,
+            "scope=package_prepublication check=not-ready native_prepared=true migrated={} materials_validated={} candidate_native_verified={} candidate_daemon_verified={} host_verified={} generation={:?} backup={} candidate_removed=true",
             checked.migrated,
             checked.materials_validated,
             checked.candidate_native_verified,
@@ -183,7 +182,12 @@ pub async fn upgrade(
             retained_native,
         } => {
             println!(
-                "upgrade=published migrated={migrated} backup={}",
+                "upgrade={} profile=L0002 backup={}",
+                if migrated {
+                    "L0001_to_L0002"
+                } else {
+                    "layout_converted"
+                },
                 backup.display()
             );
             for path in retained_native {

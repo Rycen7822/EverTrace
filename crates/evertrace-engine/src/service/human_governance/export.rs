@@ -516,7 +516,7 @@ fn charge_metadata(
     // Different references can retain the same row; each retained copy consumes
     // the metadata budget even though it is only one distinct dependency.
     *remaining = remaining
-        .checked_sub(row.payload_json.as_ref().map_or(0, |payload| payload.len()) as u64)
+        .checked_sub(row.payload_json.as_ref().map_or(0, String::len) as u64)
         .ok_or(Failure::Limit)?;
     Ok(())
 }
@@ -1155,9 +1155,7 @@ mod tests {
             workstream_id: None,
             session_id: None,
             payload_json: Some(
-                serde_json::to_string(&JournalPayload::TaskRecorded(Box::new(task)))
-                    .unwrap()
-                    .into(),
+                serde_json::to_string(&JournalPayload::TaskRecorded(Box::new(task))).unwrap(),
             ),
             source_event_seq: 1,
             projection_generation: 1,
@@ -1201,8 +1199,7 @@ mod tests {
                 effective_config_hash: [0; 32],
                 reload: None,
             }))
-            .unwrap()
-            .into(),
+            .unwrap(),
         );
         snapshot.rows.push(unrelated);
         let after = select(&snapshot, &selections, deadline).unwrap();
@@ -1229,11 +1226,8 @@ mod tests {
             .parse()
             .unwrap();
         task.request_root_refs = vec!["source:user".into()];
-        related.payload_json = Some(
-            serde_json::to_string(&JournalPayload::TaskRecorded(task))
-                .unwrap()
-                .into(),
-        );
+        related.payload_json =
+            Some(serde_json::to_string(&JournalPayload::TaskRecorded(task)).unwrap());
         snapshot.rows.push(related);
         assert_ne!(
             selected.dependencies,

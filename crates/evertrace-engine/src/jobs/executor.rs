@@ -1,20 +1,22 @@
 use evertrace_store::{
     BackupError, BackupSummary, CommitOutcome, CommittedCommand, DurableJob, JobStatus,
-    JournalCommand, JournalWriter, ObjectDeletionCurrentView, ProjectionSnapshot,
+    JournalCommand, JournalWriter, ObjectDeletionCurrentView, ProjectionSnapshot, ProjectionWorker,
     RecallCurrentContext, ReconciliationArtifactDescriptor, ReconciliationArtifactFrontier,
     ReconciliationFrontier, RuntimeSchedulerView, ScopePurgeCurrentView,
     SessionCatalogCurrentContext, SessionImportContext, SessionImportPrefixPage,
-    SessionImportPrefixRequest, SessionImportSelection, SourceObservationGuard,
-    SourceObservationRepositorySelector, StoreError,
+    SessionImportPrefixRequest, SessionImportSelection, StoreError,
 };
 use std::{
     collections::BTreeSet,
-    future::Future,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::{JoinHandle, JoinSet},
+};
 
 enum WriterRequest {
     ConfirmProcedureReturn {
@@ -24,6 +26,12 @@ enum WriterRequest {
         effective_config_hash: [u8; 32],
         stable_min_outcome_supported: u32,
         reply: oneshot::Sender<Result<(), WriterActorError>>,
+    },
+    LlmBudgetPage {
+        day_start_us: i64,
+        after: u64,
+        frontier: u64,
+        reply: oneshot::Sender<Result<Vec<evertrace_store::JournalRow>, WriterActorError>>,
     },
     ReadDiagnostics {
         reply: oneshot::Sender<evertrace_store::NativeDiagnostics>,
@@ -45,7 +53,12 @@ enum WriterRequest {
     Commit {
         command: JournalCommand,
         ingested_at_us: i64,
-        condition: WriterCommitCondition,
+        reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
+    },
+    CommitIfFrontier {
+        command: JournalCommand,
+        ingested_at_us: i64,
+        expected_frontier: u64,
         reply: oneshot::Sender<Result<CommitOutcome, WriterActorError>>,
     },
     ScopeCurrent {
@@ -88,11 +101,6 @@ enum WriterRequest {
         indexes: bool,
         reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
-    ProjectCurrent {
-        indexes: bool,
-        reply:
-            oneshot::Sender<Result<evertrace_store::projections::CurrentFacts, WriterActorError>>,
-    },
     SyncFrontier {
         indexes: bool,
         reply: oneshot::Sender<Result<u64, WriterActorError>>,
@@ -100,10 +108,6 @@ enum WriterRequest {
     CommittedCommand {
         command_id: evertrace_domain::ids::CommandId,
         reply: oneshot::Sender<Result<Option<CommittedCommand>, WriterActorError>>,
-    },
-    ProjectAtFrontier {
-        frontier: u64,
-        reply: oneshot::Sender<Result<ProjectionSnapshot, WriterActorError>>,
     },
     CommittedCommands {
         command_ids: Vec<evertrace_domain::ids::CommandId>,
@@ -120,7 +124,6 @@ enum WriterRequest {
     },
     RepositoryReadContext {
         ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
-        filesystem: Option<evertrace_domain::repository::FilesystemIdentity>,
         reply: oneshot::Sender<Result<evertrace_store::RepositoryReadContext, WriterActorError>>,
     },
     InventoryContext {
@@ -135,15 +138,6 @@ enum WriterRequest {
     },
     SessionCatalogCurrent {
         reply: oneshot::Sender<Result<SessionCatalogCurrentContext, WriterActorError>>,
-    },
-    SourceObservationAuthorityContext {
-        selector: SourceObservationRepositorySelector,
-        reply: oneshot::Sender<Result<evertrace_store::RepositoryReadContext, WriterActorError>>,
-    },
-    SourceObservationRevisionHasFacts {
-        source: evertrace_domain::evidence::SourceInstanceId,
-        revision: evertrace_domain::evidence::SourceRevision,
-        reply: oneshot::Sender<Result<bool, WriterActorError>>,
     },
     SessionImportContexts {
         after: Option<String>,
@@ -174,16 +168,10 @@ enum WriterRequest {
     },
 }
 
-enum WriterCommitCondition {
-    None,
-    Frontier(u64),
-    SourceObservation(Box<SourceObservationGuard>),
-}
-
 #[derive(Clone)]
 pub struct WriterHandle {
     sender: mpsc::Sender<WriterRequest>,
-    readers: evertrace_store::StoreReadHandle,
+    projection_worker: Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
     recall_frontier: watch::Sender<u64>,
     background_frontier: watch::Sender<u64>,
 }
@@ -197,16 +185,18 @@ impl WriterHandle {
     ) -> Result<evertrace_domain::semantic::DerivationQuotaUsage, WriterActorError> {
         let mut usage = super::synthesis::DailyLlmUsage::new(jobs, at);
         let mut after = 0;
-        let mut bound = None;
         loop {
-            let (upper, rows) = self
-                .readers
-                .llm_budget_page(usage.day_start_us(), after, frontier, bound)
+            let (reply, response) = oneshot::channel();
+            self.sender
+                .send(WriterRequest::LlmBudgetPage {
+                    day_start_us: usage.day_start_us(),
+                    after,
+                    frontier,
+                    reply,
+                })
                 .await
-                .map_err(map_store_error)?;
-            // Every later page reuses the frontier fixed by the first
-            // consistent read transaction.
-            bound = Some(upper);
+                .map_err(|_| WriterActorError::Stopped)?;
+            let rows = response.await.map_err(|_| WriterActorError::Stopped)??;
             let Some(last) = rows.last() else {
                 break;
             };
@@ -272,12 +262,6 @@ impl WriterHandle {
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
-    /// The writer's shared read handle, so search snapshots participate in the
-    /// same read fence and backup quiesce as every other reader.
-    pub fn read_handle(&self) -> evertrace_store::StoreReadHandle {
-        self.readers.clone()
-    }
-
     pub fn subscribe_recall_frontier(&self) -> watch::Receiver<u64> {
         self.recall_frontier.subscribe()
     }
@@ -325,63 +309,13 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
-    pub async fn source_observation_authority_context(
-        &self,
-        selector: SourceObservationRepositorySelector,
-    ) -> Result<evertrace_store::RepositoryReadContext, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::SourceObservationAuthorityContext { selector, reply })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
-    pub async fn source_observation_revision_has_facts(
-        &self,
-        source: evertrace_domain::evidence::SourceInstanceId,
-        revision: evertrace_domain::evidence::SourceRevision,
-    ) -> Result<bool, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::SourceObservationRevisionHasFacts {
-                source,
-                revision,
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
     pub async fn repository_read_context(
         &self,
         ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
     ) -> Result<evertrace_store::RepositoryReadContext, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(WriterRequest::RepositoryReadContext {
-                ids,
-                filesystem: None,
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
-    pub async fn source_repository_read_context(
-        &self,
-        identity: evertrace_domain::repository::FilesystemIdentity,
-        retained_ids: std::collections::BTreeSet<evertrace_domain::ids::RepositoryId>,
-    ) -> Result<evertrace_store::RepositoryReadContext, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::RepositoryReadContext {
-                ids: retained_ids,
-                filesystem: Some(identity),
-                reply,
-            })
+            .send(WriterRequest::RepositoryReadContext { ids, reply })
             .await
             .map_err(|_| WriterActorError::Stopped)?;
         response.await.map_err(|_| WriterActorError::Stopped)?
@@ -460,7 +394,6 @@ impl WriterHandle {
             .send(WriterRequest::Commit {
                 command,
                 ingested_at_us,
-                condition: WriterCommitCondition::None,
                 reply,
             })
             .await
@@ -630,18 +563,6 @@ impl WriterHandle {
         response.await.map_err(|_| WriterActorError::Stopped)?
     }
 
-    pub(crate) async fn project_current(
-        &self,
-        indexes: bool,
-    ) -> Result<evertrace_store::projections::CurrentFacts, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::ProjectCurrent { indexes, reply })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
     /// Complete the projection barrier without transferring a full snapshot.
     pub async fn sync_frontier(&self) -> Result<u64, WriterActorError> {
         self.sync_projection_frontier(true).await
@@ -724,29 +645,10 @@ impl WriterHandle {
     ) -> Result<CommitOutcome, WriterActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(WriterRequest::Commit {
+            .send(WriterRequest::CommitIfFrontier {
                 command,
                 ingested_at_us,
-                condition: WriterCommitCondition::Frontier(expected_frontier),
-                reply,
-            })
-            .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
-    }
-
-    pub async fn commit_source_observation(
-        &self,
-        command: JournalCommand,
-        ingested_at_us: i64,
-        guard: SourceObservationGuard,
-    ) -> Result<CommitOutcome, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::Commit {
-                command,
-                ingested_at_us,
-                condition: WriterCommitCondition::SourceObservation(Box::new(guard)),
+                expected_frontier,
                 reply,
             })
             .await
@@ -786,12 +688,13 @@ impl WriterHandle {
         &self,
         frontier: u64,
     ) -> Result<ProjectionSnapshot, WriterActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WriterRequest::ProjectAtFrontier { frontier, reply })
+        let worker = self.projection_worker.read().await;
+        worker
+            .as_ref()
+            .ok_or(WriterActorError::Stopped)?
+            .project_at_frontier(frontier)
             .await
-            .map_err(|_| WriterActorError::Stopped)?;
-        response.await.map_err(|_| WriterActorError::Stopped)?
+            .map_err(map_store_error)
     }
 }
 
@@ -818,168 +721,82 @@ pub async fn open_writer(data_dir: &Path) -> Result<JournalWriter, WriterActorEr
 pub fn spawn_writer(
     writer: JournalWriter,
     capacity: usize,
-) -> Result<(WriterHandle, WriterTask), WriterActorError> {
+) -> Result<(WriterHandle, JoinHandle<Result<(), WriterActorError>>), WriterActorError> {
     if capacity == 0 {
         return Err(WriterActorError::InvalidInput);
     }
     let frontier = writer.frontier();
-    let readers = writer.read_handle();
+    let projection_worker = Arc::new(tokio::sync::RwLock::new(Some(writer.projection_worker())));
     let (sender, receiver) = mpsc::channel(capacity);
     let (recall_frontier, _) = watch::channel(frontier);
     let (background_frontier, _) = watch::channel(frontier);
-    // Out-of-band stop, deliberately independent of the bounded request queue:
-    // a full queue must never prevent shutdown.
-    let (stop, stop_rx) = watch::channel(false);
-    let (completion, completed) = oneshot::channel();
-    let runtime = tokio::runtime::Handle::current();
-    let task_recall = recall_frontier.clone();
-    let task_background = background_frontier.clone();
-    let join = std::thread::Builder::new()
-        .name("evertrace-writer".to_owned())
-        .spawn(move || {
-            let result = runtime.block_on(run_writer(
-                writer,
-                receiver,
-                stop_rx,
-                task_recall,
-                task_background,
-            ));
-            let _ = completion.send(result);
-        })
-        .map_err(|_| WriterActorError::Store)?;
+    let task = tokio::spawn(Box::pin(run_writer(
+        writer,
+        receiver,
+        Arc::clone(&projection_worker),
+        recall_frontier.clone(),
+        background_frontier.clone(),
+    )));
     Ok((
         WriterHandle {
             sender,
-            readers,
+            projection_worker,
             recall_frontier,
             background_frontier,
         },
-        WriterTask {
-            stop: Some(stop),
-            completion: completed,
-            join: Some(join),
-            finished: false,
-            result: None,
-        },
+        task,
     ))
-}
-
-pub struct WriterTask {
-    stop: Option<watch::Sender<bool>>,
-    completion: oneshot::Receiver<Result<(), WriterActorError>>,
-    join: Option<std::thread::JoinHandle<()>>,
-    finished: bool,
-    result: Option<Result<(), WriterActorError>>,
-}
-
-impl WriterTask {
-    fn signal_stop(&mut self) {
-        if let Some(stop) = self.stop.as_ref() {
-            let _ = stop.send(true);
-        }
-    }
-
-    /// Actively signal stop, wait for the actor to finish the executing
-    /// command and drain every accepted request, then join the writer thread
-    /// exactly once through a bounded blocking-pool task. Never joins on the
-    /// async executor thread.
-    pub async fn shutdown_and_join(mut self) -> Result<(), WriterActorError> {
-        self.signal_stop();
-        let result = match self.result.take() {
-            Some(result) => result,
-            None => (&mut self.completion)
-                .await
-                .unwrap_or(Err(WriterActorError::Stopped)),
-        };
-        let joined = if let Some(join) = self.join.take() {
-            tokio::task::spawn_blocking(move || join.join())
-                .await
-                .map_err(|_| WriterActorError::Stopped)
-                .and_then(|result| result.map_err(|_| WriterActorError::Stopped))
-        } else {
-            Ok(())
-        };
-        self.finished = true;
-        result.and(joined)
-    }
-}
-
-impl Future for WriterTask {
-    type Output = Result<Result<(), WriterActorError>, WriterActorError>;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        if !self.finished {
-            match std::pin::Pin::new(&mut self.completion).poll(context) {
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-                std::task::Poll::Ready(result) => {
-                    self.finished = true;
-                    self.result = Some(match &result {
-                        Ok(result) => *result,
-                        Err(_) => Err(WriterActorError::Stopped),
-                    });
-                    // The actor only sends completion after the writer and its
-                    // sibling lock are dropped; the reaping join is deferred to
-                    // `shutdown_and_join` or the Drop fallback.
-                    return std::task::Poll::Ready(match result {
-                        Ok(result) => Ok(result),
-                        Err(_) => Err(WriterActorError::Stopped),
-                    });
-                }
-            }
-        }
-        std::task::Poll::Ready(Err(WriterActorError::Stopped))
-    }
-}
-
-impl Drop for WriterTask {
-    fn drop(&mut self) {
-        self.signal_stop();
-        // A cancelled owner must not block the executor. Detaching permits
-        // the signalled thread to exit; normal teardown uses the explicit join.
-        drop(self.join.take());
-    }
 }
 
 async fn run_writer(
     writer: JournalWriter,
     mut receiver: mpsc::Receiver<WriterRequest>,
-    mut stop: watch::Receiver<bool>,
+    projection_worker: Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
     recall_frontier: watch::Sender<u64>,
     background_frontier: watch::Sender<u64>,
 ) -> Result<(), WriterActorError> {
     let mut writer = Some(writer);
+    if let Some(frontier) = Box::pin(reconcile_object_deletions(
+        writer.as_mut().ok_or(WriterActorError::Stopped)?,
+    ))
+    .await?
+    {
+        recall_frontier.send_replace(frontier);
+        background_frontier.send_replace(frontier);
+    }
     let mut shutdown_replies = Vec::new();
+    let mut budget_reads = JoinSet::new();
     let result = async {
-        if let Some(frontier) = Box::pin(reconcile_object_deletions(
-            writer.as_mut().ok_or(WriterActorError::Stopped)?,
-        ))
-        .await?
-        {
-            recall_frontier.send_replace(frontier);
-            background_frontier.send_replace(frontier);
-        }
-        let mut stopped = false;
         loop {
             let request = tokio::select! {
                 request = receiver.recv() => {
                     let Some(request) = request else { break };
                     request
                 }
-                changed = stop.changed(), if !stopped => {
-                    // Out-of-band stop: refuse new submissions and keep
-                    // draining everything already accepted. The executing
-                    // command always finishes first because its handler runs
-                    // to completion inside this loop.
-                    let _ = changed;
-                    stopped = true;
-                    receiver.close();
+                Some(result) = budget_reads.join_next(), if !budget_reads.is_empty() => {
+                    result.map_err(|_| WriterActorError::Store)?;
                     continue;
                 }
             };
             match request {
+                WriterRequest::LlmBudgetPage {
+                    day_start_us,
+                    after,
+                    frontier,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    // Acquire inside the actor, after any earlier backup request.
+                    // The owned guard fences the cloned table until its read ends.
+                    let guard = Arc::clone(&projection_worker).read_owned().await;
+                    let read = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .llm_budget_page(day_start_us, after, frontier);
+                    budget_reads.spawn(reply_llm_budget_page(guard, read, reply));
+                }
                 WriterRequest::ConfirmProcedureReturn {
                     original_request,
                     acknowledgement,
@@ -1021,26 +838,14 @@ async fn run_writer(
                 WriterRequest::Commit {
                     command,
                     ingested_at_us,
-                    condition,
                     reply,
                 } => {
-                    let writer = writer.as_mut().ok_or(WriterActorError::Stopped)?;
-                    let result = match condition {
-                        WriterCommitCondition::None => {
-                            writer.commit(&command, ingested_at_us).await
-                        }
-                        WriterCommitCondition::Frontier(frontier) => {
-                            writer
-                                .commit_if_frontier(&command, ingested_at_us, frontier)
-                                .await
-                        }
-                        WriterCommitCondition::SourceObservation(guard) => {
-                            writer
-                                .commit_source_observation(&command, ingested_at_us, *guard)
-                                .await
-                        }
-                    }
-                    .map_err(map_store_error);
+                    let result = writer
+                        .as_mut()
+                        .ok_or(WriterActorError::Stopped)?
+                        .commit(&command, ingested_at_us)
+                        .await
+                        .map_err(map_store_error);
                     let notify = result
                         .as_ref()
                         .ok()
@@ -1069,7 +874,59 @@ async fn run_writer(
                         return Err(error);
                     }
                     if reconcile
-                        && let Some(frontier) = Box::pin(reconcile_object_deletions(writer)).await?
+                        && let Some(frontier) = Box::pin(reconcile_object_deletions(
+                            writer.as_mut().ok_or(WriterActorError::Stopped)?,
+                        ))
+                        .await?
+                    {
+                        recall_frontier.send_replace(frontier);
+                        background_frontier.send_replace(frontier);
+                    }
+                }
+                WriterRequest::CommitIfFrontier {
+                    command,
+                    ingested_at_us,
+                    expected_frontier,
+                    reply,
+                } => {
+                    let result = writer
+                        .as_mut()
+                        .ok_or(WriterActorError::Stopped)?
+                        .commit_if_frontier(&command, ingested_at_us, expected_frontier)
+                        .await
+                        .map_err(map_store_error);
+                    let notify = result
+                        .as_ref()
+                        .ok()
+                        .filter(|_| recall_relevant(&command))
+                        .map(|outcome| outcome.last_seq);
+                    let background_notify = result
+                        .as_ref()
+                        .ok()
+                        .filter(|_| background_relevant(&command))
+                        .map(|outcome| outcome.last_seq);
+                    let fatal = result.as_ref().err().copied().filter(|error| {
+                        matches!(
+                            error,
+                            WriterActorError::Store | WriterActorError::StoreCorrupt
+                        )
+                    });
+                    let reconcile = result.is_ok() && object_deletion_relevant(&command);
+                    let _ = reply.send(result);
+                    if let Some(frontier) = notify {
+                        recall_frontier.send_replace(frontier);
+                    }
+                    if let Some(frontier) = background_notify {
+                        background_frontier.send_replace(frontier);
+                    }
+                    if let Some(error) = fatal {
+                        return Err(error);
+                    }
+                    if reconcile
+                        && let Some(frontier) = Box::pin(reconcile_object_deletions(
+                            writer.as_mut().ok_or(WriterActorError::Stopped)?,
+                        ))
+                        .await?
                     {
                         recall_frontier.send_replace(frontier);
                         background_frontier.send_replace(frontier);
@@ -1245,31 +1102,6 @@ async fn run_writer(
                         return Err(WriterActorError::Store);
                     }
                 }
-                WriterRequest::ProjectCurrent { indexes, reply } => {
-                    if reply.is_closed() {
-                        continue;
-                    }
-                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
-                    let result = writer
-                        .project_current(indexes)
-                        .await
-                        .map_err(map_store_error);
-                    let fatal = result.is_err();
-                    let _ = reply.send(result);
-                    if fatal {
-                        return Err(WriterActorError::Store);
-                    }
-                }
-                WriterRequest::ProjectAtFrontier { frontier, reply } => {
-                    let result = writer
-                        .as_ref()
-                        .ok_or(WriterActorError::Stopped)?
-                        .projection_worker()
-                        .project_at_frontier(frontier)
-                        .await
-                        .map_err(map_store_error);
-                    let _ = reply.send(result);
-                }
                 WriterRequest::SyncFrontier { indexes, reply } => {
                     if reply.is_closed() {
                         continue;
@@ -1352,63 +1184,12 @@ async fn run_writer(
                         return Err(WriterActorError::Store);
                     }
                 }
-                WriterRequest::SourceObservationAuthorityContext { selector, reply } => {
-                    if reply.is_closed() {
-                        continue;
-                    }
+                WriterRequest::RepositoryReadContext { ids, reply } => {
                     let result = writer
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
-                        .source_observation_authority_context(&selector)
-                        .await
+                        .repository_read_context(&ids)
                         .map_err(map_store_error);
-                    let fatal = result.as_ref().err().is_some_and(|error| {
-                        matches!(
-                            error,
-                            WriterActorError::Store | WriterActorError::StoreCorrupt
-                        )
-                    });
-                    let _ = reply.send(result);
-                    if fatal {
-                        return Err(WriterActorError::Store);
-                    }
-                }
-                WriterRequest::SourceObservationRevisionHasFacts {
-                    source,
-                    revision,
-                    reply,
-                } => {
-                    if reply.is_closed() {
-                        continue;
-                    }
-                    let result = writer
-                        .as_ref()
-                        .ok_or(WriterActorError::Stopped)?
-                        .source_observation_revision_has_facts(&source, &revision)
-                        .await
-                        .map_err(map_store_error);
-                    let fatal = result.as_ref().err().is_some_and(|error| {
-                        matches!(
-                            error,
-                            WriterActorError::Store | WriterActorError::StoreCorrupt
-                        )
-                    });
-                    let _ = reply.send(result);
-                    if fatal {
-                        return Err(WriterActorError::Store);
-                    }
-                }
-                WriterRequest::RepositoryReadContext {
-                    ids,
-                    filesystem,
-                    reply,
-                } => {
-                    let writer = writer.as_ref().ok_or(WriterActorError::Stopped)?;
-                    let result = match filesystem {
-                        Some(identity) => writer.source_repository_read_context(identity, &ids),
-                        None => writer.repository_read_context(&ids),
-                    }
-                    .map_err(map_store_error);
                     let _ = reply.send(result);
                 }
                 WriterRequest::InventoryContext {
@@ -1489,9 +1270,14 @@ async fn run_writer(
                     runtime,
                     reply,
                 } => {
-                    let result =
-                        create_quiesced_backup(&mut writer, backup_job_id, config_path, *runtime)
-                            .await;
+                    let result = create_quiesced_backup(
+                        &mut writer,
+                        &projection_worker,
+                        backup_job_id,
+                        config_path,
+                        *runtime,
+                    )
+                    .await;
                     let fatal = result.as_ref().err().copied();
                     let _ = reply.send(result);
                     if let Some(error) = fatal {
@@ -1534,27 +1320,40 @@ async fn run_writer(
         Ok::<(), WriterActorError>(())
     }
     .await;
-    // One terminal cleanup for normal and fatal exits: drain the fence held by
-    // real readers, revoke the binding, close SQLite and the native handles,
-    // and only then release the sibling lock. A writer already consumed by a
-    // closed-backup window is not closed twice.
-    let mut failure = result.err();
-    if let Some(writer) = writer.take()
-        && let Err(error) = writer.shutdown().await
-    {
-        failure.get_or_insert_with(|| map_store_error(error));
-    }
+    // Drain cancellation even on a writer error. All table futures and read
+    // fences are gone before shutdown acknowledgement or writer-table closure.
+    budget_reads.shutdown().await;
+    result?;
     for reply in shutdown_replies {
         let _ = reply.send(());
     }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
+    Ok(())
+}
+
+fn reply_llm_budget_page(
+    guard: tokio::sync::OwnedRwLockReadGuard<Option<ProjectionWorker>>,
+    read: impl Future<Output = Result<Vec<evertrace_store::JournalRow>, StoreError>>,
+    mut reply: oneshot::Sender<Result<Vec<evertrace_store::JournalRow>, WriterActorError>>,
+) -> impl Future<Output = ()> {
+    // Tuple fields drop in order, including if the task is cancelled before
+    // its first poll: the table future must die before the backup read fence.
+    let mut fenced = (Box::pin(read), guard);
+    async move {
+        let result = tokio::select! {
+            biased;
+            _ = reply.closed() => None,
+            result = &mut fenced.0 => Some(result.map_err(map_store_error)),
+        };
+        drop(fenced);
+        if let Some(result) = result {
+            let _ = reply.send(result);
+        }
     }
 }
 
-pub(crate) async fn create_quiesced_backup(
+async fn create_quiesced_backup(
     writer: &mut Option<JournalWriter>,
+    projection_worker: &Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
     backup_job_id: evertrace_domain::ids::JobId,
     config_path: PathBuf,
     runtime: evertrace_capture::RuntimeSnapshot,
@@ -1637,24 +1436,12 @@ pub(crate) async fn create_quiesced_backup(
         hook,
     };
 
-    let guard = match writer
-        .as_mut()
-        .ok_or(WriterActorError::Stopped)?
-        .quiesce_for_backup()
-        .await
-    {
-        Ok(Some(guard)) => guard,
-        // A known SQLite-busy checkpoint is one ordinary failed backup: the
-        // actor keeps the open writer and replies with the inner failure
-        // instead of entering the fatal/reopen path.
-        Ok(None) => return Ok(Err(BackupError::Io)),
-        Err(error) => return Err(map_store_error(error)),
-    };
+    let mut projection = projection_worker.write().await;
+    *projection = None;
     let closed = writer
         .take()
         .ok_or(WriterActorError::Stopped)?
-        .close_for_backup(guard)
-        .map_err(map_store_error)?;
+        .close_for_backup();
     let (closed, staged) = tokio::task::spawn_blocking(move || {
         closed.stage_backup(
             config_path,
@@ -1694,6 +1481,7 @@ pub(crate) async fn create_quiesced_backup(
         Err(error) => (closed, Err(error)),
     };
     let reopened = closed.reopen().await.map_err(map_store_error)?;
+    *projection = Some(reopened.projection_worker());
     *writer = Some(reopened);
     Ok(result)
 }
@@ -1989,15 +1777,9 @@ async fn confirm_procedure_return(
     let Some(original) = original else {
         return Ok(None);
     };
-    let current = writer
-        .project_current(true)
-        .await
-        .map_err(map_store_error)?;
-    let view = crate::procedure::ProcedureUsageCurrentView::from_rows(
-        current.frontier(),
-        current.other_rows(),
-    )
-    .map_err(|_| WriterActorError::StoreCorrupt)?;
+    let snapshot = writer.project().await.map_err(map_store_error)?;
+    let view = crate::procedure::ProcedureUsageCurrentView::from_snapshot(&snapshot)
+        .map_err(|_| WriterActorError::StoreCorrupt)?;
     let command_id = CommandId::from_uuid(acknowledgement.as_uuid())
         .map_err(|_| WriterActorError::InvalidInput)?;
     let now = now_us()?;
@@ -2019,7 +1801,7 @@ async fn confirm_procedure_return(
     }
     let command = JournalCommand::new(command_id, events).map_err(map_store_error)?;
     let outcome = writer
-        .commit_if_frontier(&command, now, current.frontier())
+        .commit_if_frontier(&command, now, snapshot.frontier)
         .await;
     let frontier = match outcome {
         Ok(outcome) => outcome.last_seq,
@@ -2125,36 +1907,67 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn cancelled_budget_read_is_drained_before_backup_quiesce() {
-        let root =
-            std::env::temp_dir().join(format!("evertrace-writer-readers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        private_root(&data);
-        let writer = crate::open_writer(&data).await.unwrap();
-        let readers = writer.read_handle();
-        let task = tokio::spawn({
-            let readers = readers.clone();
-            async move { readers.llm_budget_page(0, 0, 0, None).await }
+    async fn cancelled_llm_budget_read_drops_the_page_before_releasing_backup_fence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct PageDrop {
+            fence: Arc<tokio::sync::RwLock<Option<ProjectionWorker>>>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Drop for PageDrop {
+            fn drop(&mut self) {
+                assert!(self.fence.try_write().is_err());
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        let fence = Arc::new(tokio::sync::RwLock::new(None));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let page = PageDrop {
+            fence: Arc::clone(&fence),
+            dropped: Arc::clone(&dropped),
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let polled = Arc::clone(&started);
+        let read = std::future::poll_fn(move |_| {
+            let _ = &page;
+            polled.notify_one();
+            std::task::Poll::Pending
         });
-        task.abort();
-        let _ = task.await;
-        // A cancelled caller must not release the physical read permit; the
-        // backup quiesce barrier waits for the real blocking read to finish.
-        let guard = tokio::time::timeout(Duration::from_secs(5), readers.quiesce())
+        let (reply, response) = oneshot::channel();
+        let task = tokio::spawn(reply_llm_budget_page(
+            Arc::clone(&fence).read_owned().await,
+            read,
+            reply,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
             .await
-            .expect("quiesce drains cancelled readers");
-        drop(guard);
-        // Both read permits are usable again after the fence drains.
-        let (first, second) = tokio::join!(
-            readers.llm_budget_page(0, 0, 0, None),
-            readers.llm_budget_page(0, 0, 0, None)
-        );
-        first.unwrap();
-        second.unwrap();
-        drop(writer);
-        let _ = std::fs::remove_dir_all(&root);
+            .unwrap();
+        assert!(fence.try_write().is_err());
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(fence.try_write().is_ok());
+
+        // An actor abort before the first poll has the same table/fence order.
+        let page = PageDrop {
+            fence: Arc::clone(&fence),
+            dropped: Arc::clone(&dropped),
+        };
+        let read = std::future::poll_fn(move |_| {
+            let _ = &page;
+            std::task::Poll::Pending
+        });
+        let (reply, _response) = oneshot::channel();
+        dropped.store(false, Ordering::SeqCst);
+        drop(reply_llm_budget_page(
+            Arc::clone(&fence).read_owned().await,
+            read,
+            reply,
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(fence.try_write().is_ok());
     }
 
     #[test]
@@ -2163,123 +1976,6 @@ mod tests {
             WriterActorError::InvalidInput.to_string(),
             "writer actor input is invalid"
         );
-    }
-
-    fn private_root(path: &std::path::Path) {
-        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
-    }
-
-    fn writer_test_root(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("evertrace-writer-{label}-{}", std::process::id()))
-    }
-
-    #[tokio::test]
-    async fn out_of_band_stop_drains_a_full_queue_and_releases_the_sibling_lock() {
-        let root = writer_test_root("stop");
-        let _ = std::fs::remove_dir_all(&root);
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        private_root(&data);
-        let writer = crate::open_writer(&data).await.unwrap();
-        // Capacity one: several senders with live handle clones fill the
-        // accepted queue while the actor is busy, so only the out-of-band stop
-        // can close admission.
-        let (handle, task) = spawn_writer(writer, 1).unwrap();
-        let mut senders = Vec::new();
-        for _ in 0..8 {
-            let handle = handle.clone();
-            senders.push(tokio::spawn(async move { handle.project().await }));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::time::timeout(Duration::from_secs(10), task.shutdown_and_join())
-            .await
-            .expect("stop must not depend on a free queue slot")
-            .unwrap();
-        // The dedicated writer thread really joined and released the lock.
-        let reopened = crate::open_writer(&data).await.unwrap();
-        drop(reopened);
-        for sender in senders {
-            let _ = sender.await;
-        }
-        drop(handle);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn startup_error_teardown_joins_the_writer_and_releases_the_lock() {
-        let root = writer_test_root("startup");
-        let _ = std::fs::remove_dir_all(&root);
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        private_root(&data);
-        let writer = crate::open_writer(&data).await.unwrap();
-        let (handle, mut task) = spawn_writer(writer, 8).unwrap();
-        // main::run's startup failure arm: stop the handle, then unconditionally
-        // stop and join the writer before propagating the error.
-        handle.shutdown().await.unwrap();
-        // main also selects an already completed writer before its common
-        // teardown. Joining must not poll the consumed oneshot a second time.
-        (&mut task).await.unwrap().unwrap();
-        task.shutdown_and_join().await.unwrap();
-        let reopened = crate::open_writer(&data).await.unwrap();
-        drop(reopened);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn shutdown_waits_for_a_started_reader_before_releasing_the_sibling_lock() {
-        let root = writer_test_root("drain");
-        let _ = std::fs::remove_dir_all(&root);
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        private_root(&data);
-        let writer = crate::open_writer(&data).await.unwrap();
-        let (handle, task) = spawn_writer(writer, 8).unwrap();
-        let readers = handle.read_handle();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let read = tokio::spawn(async move {
-            readers
-                .read(move |_connection, _cancel| {
-                    started_tx.send(()).unwrap();
-                    let _ = release_rx.recv();
-                    Ok(())
-                })
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(5), started_rx)
-            .await
-            .expect("the blocking read must actually start")
-            .unwrap();
-
-        let join = tokio::spawn(async move { task.shutdown_and_join().await });
-        // The actor enters terminal cleanup, but the started read still holds
-        // the fence: shutdown must neither complete nor release the sibling
-        // lock before that real reader exits.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !join.is_finished(),
-            "shutdown must wait for the live reader"
-        );
-        assert!(crate::open_writer(&data).await.is_err());
-
-        release_tx.send(()).unwrap();
-        // The read may fail closed if the actor revoked the binding first; the
-        // join below is the real drain proof.
-        let _ = read.await;
-        let joined = tokio::time::timeout(Duration::from_secs(5), join)
-            .await
-            .expect("the actor joins after the reader exits")
-            .unwrap();
-        assert!(joined.is_ok());
-        // The closed store refuses the old binding and a new writer takes the
-        // sibling lock.
-        assert!(handle.read_handle().journal_rows().await.is_err());
-        let reopened = crate::open_writer(&data).await.unwrap();
-        drop(reopened);
-        drop(handle);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

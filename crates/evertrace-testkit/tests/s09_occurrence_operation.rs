@@ -21,8 +21,9 @@ use evertrace_domain::{
 };
 use evertrace_engine::PhysicalNormalizer;
 use evertrace_store::{
-    DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter,
-    SourceIngestWatermark, StoreError, reduce_journal,
+    CompatibilityStore, DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft,
+    JournalPayload, JournalWriter, OBJECTS_TABLE, SourceIngestWatermark, StoreError,
+    reduce_journal,
     relations::{PhysicalRelationKind, build_physical_relation_rows},
 };
 use tempfile::TempDir;
@@ -739,7 +740,6 @@ fn evidence_command(
         source_revision: receipt.source_revision.clone(),
         source_sequence: receipt.source_sequence,
         confirmed_prefix_digest: None,
-        earlier_prefix: None,
     };
     let target = observation.source_observation_id.to_string();
     let payloads = vec![
@@ -830,7 +830,7 @@ async fn separately_selected_pair_members_close_watermarks_without_new_objects()
         .await
         .unwrap();
     let (handle, actor) = spawn_writer(writer, 8).unwrap();
-    let mut input = ReconcileInput {
+    let input = ReconcileInput {
         runtime_snapshot: runtime,
         adapter_manifests: vec![],
         liveness: vec![],
@@ -842,13 +842,9 @@ async fn separately_selected_pair_members_close_watermarks_without_new_objects()
         occurred_at_us: 3,
         max_items: 1,
     };
-    let first_progress = reconcile_observations_once(input.clone(), &handle, &[intent_id])
+    reconcile_observations_once(input.clone(), &handle, &[intent_id])
         .await
         .unwrap();
-    let first_diagnostics = handle.read_diagnostics().await.unwrap();
-    for table in &first_diagnostics.tables[1..=3] {
-        assert_eq!(table.checkpoint, Some(first_progress.frontier));
-    }
     let first = handle.project().await.unwrap();
     let physical = |snapshot: &evertrace_store::ProjectionSnapshot| {
         snapshot
@@ -871,13 +867,9 @@ async fn separately_selected_pair_members_close_watermarks_without_new_objects()
             .items
             .is_empty()
     );
-    let second_progress = reconcile_observations_once(input.clone(), &handle, &[result_id])
+    reconcile_observations_once(input.clone(), &handle, &[result_id])
         .await
         .unwrap();
-    let second_diagnostics = handle.read_diagnostics().await.unwrap();
-    for table in &second_diagnostics.tables[1..=3] {
-        assert_eq!(table.checkpoint, Some(second_progress.frontier));
-    }
     let second = handle.project().await.unwrap();
     // Same immutable occurrence payload is co-command support, not a successor.
     let before_payloads = before
@@ -899,106 +891,13 @@ async fn separately_selected_pair_members_close_watermarks_without_new_objects()
             .items
             .is_empty()
     );
-    let (receipt, unrelated) = observation(
-        "selected-unrelated-read",
-        ObservationRole::Intent,
-        exact_correlation("unrelated-read", CanonicalEventFamily::Read),
-        vec![],
-    );
-    let unrelated_id = unrelated.source_observation_id;
-    let unrelated_commit = handle
-        .commit(evidence_command(CommandId::new_v7(), receipt, unrelated), 4)
-        .await
-        .unwrap();
-    input.occurred_at_us = 5;
-    let repeated = reconcile_observations_once(input.clone(), &handle, &[result_id])
+    let repeated = reconcile_observations_once(input, &handle, &[result_id])
         .await
         .unwrap();
     assert!(repeated.no_delta);
-    assert_eq!(repeated.frontier, unrelated_commit.last_seq);
-    let repeated_diagnostics = handle.read_diagnostics().await.unwrap();
-    for table in &repeated_diagnostics.tables[1..=3] {
-        assert_eq!(table.checkpoint, Some(repeated.frontier));
-    }
-    let caught_up = handle.project().await.unwrap();
-    assert_eq!(caught_up.frontier, unrelated_commit.last_seq);
-    assert!(
-        !caught_up
-            .reconciliation_frontier_for_observations(&[unrelated_id])
-            .unwrap()
-            .items
-            .is_empty()
-    );
-
-    let search_dir = root.join("store/evertrace_search.lance");
-    let search_dir_aside = temp.path().join("evertrace_search.aside");
-    std::fs::rename(&search_dir, &search_dir_aside).unwrap();
-    // The post-barrier failure may follow a durable normalization commit.
-    let failed = reconcile_observations_once(input.clone(), &handle, &[unrelated_id]).await;
-    assert!(failed.is_err());
-    let actor_exit = tokio::time::timeout(std::time::Duration::from_secs(5), actor)
-        .await
-        .expect("writer actor should stop after native projection failure")
-        .unwrap();
-    assert!(actor_exit.is_err());
-    drop(handle);
-    std::fs::rename(&search_dir_aside, &search_dir).unwrap();
-
-    let reopened = JournalWriter::open(&root).await.unwrap();
-    let journal_rows = reopened.journal_rows().await.unwrap();
-    let replay = reduce_journal(&journal_rows).unwrap();
-    let replayed = reopened.project().await.unwrap();
-    assert_eq!(replayed, replay);
-    let (reopened_handle, reopened_actor) = spawn_writer(reopened, 8).unwrap();
-    let recovered = reconcile_observations_once(input.clone(), &reopened_handle, &[unrelated_id])
-        .await
-        .unwrap();
-    let recovered_diagnostics = reopened_handle.read_diagnostics().await.unwrap();
-    for table in &recovered_diagnostics.tables[1..=3] {
-        assert_eq!(table.checkpoint, Some(recovered.frontier));
-    }
-    let recovered_snapshot = reopened_handle.project().await.unwrap();
-    let recovered_current =
-        evertrace_store::RecoveryEvidenceCurrentView::from_snapshot(&recovered_snapshot).unwrap();
-    assert!(recovered_current.observation(unrelated_id).is_some());
-    assert!(
-        recovered_snapshot
-            .reconciliation_frontier_for_observations(&[unrelated_id])
-            .unwrap()
-            .items
-            .is_empty()
-    );
-    let recovered_physical = physical(&recovered_snapshot);
-
-    let settled_again = reconcile_observations_once(input, &reopened_handle, &[unrelated_id])
-        .await
-        .unwrap();
-    assert!(settled_again.no_delta);
-    let settled_diagnostics = reopened_handle.read_diagnostics().await.unwrap();
-    for table in &settled_diagnostics.tables[1..=3] {
-        assert_eq!(table.checkpoint, Some(settled_again.frontier));
-    }
-    let settled = reopened_handle.project().await.unwrap();
-    let settled_physical = physical(&settled);
-    assert_eq!(
-        recovered_physical
-            .iter()
-            .map(|row| &row.payload_json)
-            .collect::<Vec<_>>(),
-        settled_physical
-            .iter()
-            .map(|row| &row.payload_json)
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        settled
-            .reconciliation_frontier_for_observations(&[unrelated_id])
-            .unwrap()
-            .items
-            .is_empty()
-    );
-    reopened_handle.shutdown().await.unwrap();
-    reopened_actor.await.unwrap().unwrap();
+    assert_eq!(handle.project().await.unwrap().frontier, second.frontier);
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1198,11 +1097,26 @@ async fn journal_projection_replay_relations_and_no_delta_are_closed() {
 
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_search"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search"
+        ]
     );
-    let before = writer.object_rows().await.unwrap();
+    let reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
+    let objects = reader
+        .connection()
+        .open_table(OBJECTS_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    let before = objects.version().await.unwrap();
     writer.project().await.unwrap();
-    assert_eq!(writer.object_rows().await.unwrap(), before);
+    assert_eq!(objects.version().await.unwrap(), before);
 
     let relations = build_physical_relation_rows(
         &normalized.occurrences,

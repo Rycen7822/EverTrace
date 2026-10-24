@@ -378,7 +378,7 @@ pub(crate) async fn read_procedure_historical_inventory(
     writer: &crate::WriterHandle,
     bindings: &crate::McpBindingAuthority,
     runtime: &evertrace_capture::RuntimeSnapshot,
-    rows: &[evertrace_store::ObjectRow],
+    projection: &evertrace_store::ProjectionSnapshot,
     fact: &evertrace_domain::inventory::CapabilityInventoryRecorded,
     source: (&str, (u64, i64)),
     deadline: Instant,
@@ -394,9 +394,8 @@ pub(crate) async fn read_procedure_historical_inventory(
         return Ok(None);
     }
     let fact_id = fact.job_id.to_string();
-    let Some(row) = rows
-        .iter()
-        .filter(|row| row.row_kind == evertrace_store::ObjectRowKind::Data)
+    let Some(row) = projection
+        .data_rows()
         .take_while(|_| Instant::now() < deadline)
         .find(|row| {
             row.object_kind.as_deref() == Some("capability_inventory")

@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
     evidence::{
-        CaptureCompleteness, ContentTrust, EvidenceSourceKind, IdentityStrength, ObservationRole,
-        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode, SourceRole, hex,
-        payload_fingerprint,
+        CaptureCompleteness, ContentTrust, EvidenceSourceKind, EvidenceSurface, IdentityStrength,
+        ObservationRole, SourceArchiveMode, SourceObservation, SourceReceipt, SourceRevisionMode,
+        SourceRole, hex, payload_fingerprint,
     },
     ids::{
         AtomId, RepositoryId, ResultEvidenceId, RevisionProposalId, SemanticDigestId,
@@ -27,10 +27,7 @@ use evertrace_domain::{
 
 use crate::{
     JournalPayload, ObjectRowClass, SourceIngestWatermark, StoreError,
-    projections::{
-        EvidenceSurfaceFacts, ProjectionSnapshot, SourceObservationFacts, SourceReceiptFacts,
-    },
-    purge::ObjectDeletionState,
+    projections::ProjectionSnapshot, purge::ObjectDeletionState,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -44,16 +41,9 @@ pub struct SemanticCurrentView {
 
 impl SemanticCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
-        Self::from_rows(snapshot.frontier, &snapshot.rows)
-    }
-
-    pub fn from_rows(frontier: u64, rows: &[crate::ObjectRow]) -> Result<Self, StoreError> {
         let mut atom_revisions = BTreeMap::new();
         let mut proposal_revisions = BTreeMap::new();
-        for row in rows
-            .iter()
-            .filter(|row| row.row_kind == crate::ObjectRowKind::Data)
-        {
+        for row in snapshot.data_rows() {
             let Some(kind) = row.object_kind.as_deref() else {
                 continue;
             };
@@ -108,7 +98,7 @@ impl SemanticCurrentView {
         rebuild_atoms(&mut atoms, &atom_revisions)?;
         rebuild_proposals(&mut proposals, &proposal_revisions)?;
         Ok(Self {
-            frontier,
+            frontier: snapshot.frontier,
             atoms: atoms
                 .into_iter()
                 .map(|(id, (value, _))| (id, value))
@@ -318,9 +308,9 @@ pub(crate) struct SemanticRelationInputs<'a> {
     pub atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
     pub deleted_revision_ids: &'a BTreeSet<RevisionId>,
     pub proposal_revisions: &'a BTreeMap<RevisionId, (RevisionProposal, u64)>,
-    pub source_observations: &'a SourceObservationFacts,
-    pub source_receipts: &'a SourceReceiptFacts,
-    pub evidence_surfaces: &'a EvidenceSurfaceFacts,
+    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    pub evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
     pub tasks: &'a BTreeMap<TaskId, (Task, u64)>,
     pub repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
@@ -916,7 +906,6 @@ fn validate_accepted_edit_boundary(
         source_revision: receipt.1.source_revision.clone(),
         source_sequence: 1,
         confirmed_prefix_digest: None,
-        earlier_prefix: None,
     };
     let watermarks = payloads
         .iter()

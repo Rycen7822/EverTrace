@@ -31,8 +31,9 @@ use evertrace_engine::{
     },
 };
 use evertrace_store::{
-    DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter,
-    SourceIngestWatermark, StoreError, WorkBindingCurrentView, WorkIdentityCurrentView,
+    CompatibilityStore, DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft,
+    JournalPayload, JournalWriter, OBJECTS_TABLE, SourceIngestWatermark, StoreError,
+    WorkBindingCurrentView, WorkIdentityCurrentView,
     relations::{WorkBindingRelationKind, build_work_binding_relation_rows},
     repository::RepositoryCurrentView,
 };
@@ -225,7 +226,6 @@ fn evidence_command(receipt: SourceReceipt, observation: SourceObservation) -> J
                 source_revision: receipt.source_revision,
                 source_sequence: receipt.source_sequence,
                 confirmed_prefix_digest: None,
-                earlier_prefix: None,
             }),
             JournalPayload::DirtyTarget(DirtyTarget {
                 target_kind: DirtyTargetKind::EvidenceSurface,
@@ -329,7 +329,17 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     assert!(first_context.is_resolved());
     assert_eq!(first_context.operation_id, operation_id);
     assert_eq!(first_context.task_id, Some(task.task_id));
-    let object_rows = writer.object_rows().await.unwrap();
+    let reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
+    let objects = reader
+        .connection()
+        .open_table(OBJECTS_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    let object_version = objects.version().await.unwrap();
     assert_eq!(
         resolve_binding(
             &current_view,
@@ -346,7 +356,7 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     let no_delta_projection = writer.project().await.unwrap();
     assert_eq!(writer.journal_rows().await.unwrap().len(), no_delta_rows);
     assert_eq!(no_delta_projection, projected);
-    assert_eq!(writer.object_rows().await.unwrap(), object_rows);
+    assert_eq!(objects.version().await.unwrap(), object_version);
 
     let successor = resolve_binding(
         &current_view,
@@ -389,8 +399,7 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     fork_row.payload_json = Some(
         JournalPayload::WorkBindingRecorded(Box::new(fork_revision))
             .canonical_json()
-            .unwrap()
-            .into(),
+            .unwrap(),
     );
     forked.rows.push(fork_row);
     assert_eq!(
@@ -399,7 +408,12 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_search"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search"
+        ]
     );
     drop(writer);
     let writer = JournalWriter::open(&root).await.unwrap();
@@ -411,7 +425,17 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     );
     let identity = WorkIdentityCurrentView::from_snapshot(&restart_snapshot).unwrap();
     let restart_rows = writer.journal_rows().await.unwrap().len();
-    let restart_object_rows = writer.object_rows().await.unwrap();
+    let restart_reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
+    let restart_objects = restart_reader
+        .connection()
+        .open_table(OBJECTS_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    let restart_version = restart_objects.version().await.unwrap();
     assert_eq!(
         resolve_binding(
             &identity,
@@ -426,7 +450,7 @@ async fn resolved_successor_replay_projection_restart_and_four_tables_are_closed
     );
     assert_eq!(writer.journal_rows().await.unwrap().len(), restart_rows);
     assert_eq!(writer.project().await.unwrap(), restart_snapshot);
-    assert_eq!(writer.object_rows().await.unwrap(), restart_object_rows);
+    assert_eq!(restart_objects.version().await.unwrap(), restart_version);
 }
 
 #[test]

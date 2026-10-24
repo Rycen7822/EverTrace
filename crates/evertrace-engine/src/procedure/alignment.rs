@@ -6,7 +6,7 @@ use evertrace_domain::{
     },
     work::{Attempt, AttemptVerification, WorkCheckpoint, WorkEpisode},
 };
-use evertrace_store::JournalPayload;
+use evertrace_store::{JournalPayload, ProjectionSnapshot};
 use serde::Serialize;
 
 use super::ProcedurePhase;
@@ -39,6 +39,13 @@ pub(crate) struct ActionWindow {
 }
 
 impl StageTrace {
+    pub(crate) fn compile(
+        snapshot: &ProjectionSnapshot,
+        target: &WorkEpisode,
+    ) -> Result<Self, SemanticServiceError> {
+        Self::compile_rows(&snapshot.rows, target)
+    }
+
     pub(crate) fn compile_rows(
         rows: &[evertrace_store::ObjectRow],
         target: &WorkEpisode,
@@ -46,12 +53,12 @@ impl StageTrace {
         Self::compile_rows_with_attempt(rows, target, None)
     }
 
-    pub(crate) fn compile_rows_for_attempt(
-        rows: &[evertrace_store::ObjectRow],
+    pub(crate) fn compile_for_attempt(
+        snapshot: &ProjectionSnapshot,
         target: &WorkEpisode,
         attempt: evertrace_domain::ids::AttemptId,
     ) -> Result<Self, SemanticServiceError> {
-        Self::compile_rows_with_attempt(rows, target, Some(attempt))
+        Self::compile_rows_with_attempt(&snapshot.rows, target, Some(attempt))
     }
 
     fn compile_rows_with_attempt(
@@ -1046,29 +1053,30 @@ mod tests {
                 serde_json::to_string(&JournalPayload::WorkEpisodeRecorded(Box::new(
                     episode.clone(),
                 )))
-                .unwrap()
-                .into(),
+                .unwrap(),
             ),
             source_event_seq: seq,
             ..evertrace_store::ObjectRow::checkpoint(0, 1)
         };
-        let mut rows = vec![
-            episode_row(&episode, 1),
-            evertrace_store::ObjectRow {
-                row_id: checkpoint.stable_key(),
-                row_kind: evertrace_store::ObjectRowKind::Data,
-                object_kind: Some("work_checkpoint".into()),
-                payload_json: Some(
-                    serde_json::to_string(&JournalPayload::WorkCheckpointRecorded(Box::new(
-                        checkpoint.clone(),
-                    )))
-                    .unwrap()
-                    .into(),
-                ),
-                source_event_seq: 2,
-                ..evertrace_store::ObjectRow::checkpoint(0, 1)
-            },
-        ];
+        let mut snapshot = ProjectionSnapshot {
+            frontier: 300,
+            rows: vec![
+                episode_row(&episode, 1),
+                evertrace_store::ObjectRow {
+                    row_id: checkpoint.stable_key(),
+                    row_kind: evertrace_store::ObjectRowKind::Data,
+                    object_kind: Some("work_checkpoint".into()),
+                    payload_json: Some(
+                        serde_json::to_string(&JournalPayload::WorkCheckpointRecorded(Box::new(
+                            checkpoint.clone(),
+                        )))
+                        .unwrap(),
+                    ),
+                    source_event_seq: 2,
+                    ..evertrace_store::ObjectRow::checkpoint(0, 1)
+                },
+            ],
+        };
         for seq in 3..=300 {
             let mut successor = episode.clone();
             successor.predecessor_revision_id = Some(episode.revision_id);
@@ -1076,10 +1084,10 @@ mod tests {
             successor.revision_generation += 1;
             successor.checkpoint_refs = vec![checkpoint.stable_key()];
             episode.validate_successor(&successor).unwrap();
-            rows.push(episode_row(&successor, seq));
+            snapshot.rows.push(episode_row(&successor, seq));
             episode = successor;
         }
-        let trace = StageTrace::compile_rows(&rows, &episode).unwrap();
+        let trace = StageTrace::compile(&snapshot, &episode).unwrap();
         assert!(!trace.truncated);
         assert_eq!(trace.frames.len(), 1);
         assert_eq!(trace.align(&draft()).unwrap().0, ProcedurePhase::InProgress);

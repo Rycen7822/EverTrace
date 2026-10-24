@@ -230,7 +230,6 @@ fn source_payloads(receipt: SourceReceipt, observation: SourceObservation) -> Ve
             source_revision: receipt.source_revision,
             source_sequence: 1,
             confirmed_prefix_digest: None,
-            earlier_prefix: None,
         }),
         JournalPayload::DirtyTarget(DirtyTarget {
             target_kind: DirtyTargetKind::EvidenceSurface,
@@ -355,7 +354,12 @@ async fn scenario_successors_rebuild_with_four_tables_and_safe_search_text() {
     }));
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_search"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search"
+        ]
     );
     drop(writer);
 
@@ -1052,7 +1056,7 @@ async fn global_atom_and_independent_core_membership_accept_as_atomic_cohorts() 
             .iter()
             .any(|row| row.object_kind.as_deref() == Some("recall_trigger_index"))
     );
-    assert_eq!(writer.table_names().await.unwrap().len(), 1);
+    assert_eq!(writer.table_names().await.unwrap().len(), 4);
     let view = SemanticCurrentView::from_snapshot(&pending_membership_snapshot).unwrap();
     let conflict = submit_core_conflict_proposal(
         &view,

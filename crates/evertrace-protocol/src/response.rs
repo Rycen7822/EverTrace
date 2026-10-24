@@ -25,7 +25,6 @@ pub enum Response {
     RecoveryTerminal(RecoveryTerminalResponse),
     RecoveryAction(RecoveryActionResponse),
     McpBindingIssued(McpBindingIssuedResponse),
-    SessionSourceObserved(SessionSourceObservedResponse),
     McpResult(Box<McpResultEnvelope>),
     McpReturned,
     RecallCue(RecallCueResponse),
@@ -73,12 +72,6 @@ pub enum RecallCueResponse {
 pub struct McpBindingIssuedResponse {
     pub bound_workspace: String,
     pub expires_at_us: i64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionSourceObservedResponse {
-    pub changed: bool,
 }
 
 impl std::fmt::Debug for McpBindingIssuedResponse {

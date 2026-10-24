@@ -611,14 +611,12 @@ impl RecoveryBarrierService {
 
     pub async fn reconcile_pending_on_startup(&self) -> Result<(), RecoveryError> {
         loop {
-            let current = {
-                let facts = self
-                    .writer
-                    .project_current(true)
-                    .await
-                    .map_err(|_| RecoveryError::Store)?;
-                RecoveryCurrentView::from_current(&facts)?
-            };
+            let projected = self
+                .writer
+                .project()
+                .await
+                .map_err(|_| RecoveryError::Store)?;
+            let current = RecoveryCurrentView::from_snapshot(&projected)?;
             let Some(pending) = current
                 .state
                 .requests

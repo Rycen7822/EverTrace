@@ -1,7 +1,7 @@
 use super::*;
-use crate::projections::{SourceObservationFacts, SourceReceiptFacts};
 use evertrace_domain::{
-    ids::SourceObservationId,
+    evidence::{SourceObservation, SourceReceipt},
+    ids::{SourceObservationId, SourceReceiptId},
     semantic::{SemanticJobTarget, SemanticSourceTarget},
 };
 
@@ -10,8 +10,8 @@ pub(super) fn validate_refs(
     after_sequence: u64,
     through_sequence: u64,
     refs: &[String],
-    receipts: &SourceReceiptFacts,
-    observations: &SourceObservationFacts,
+    receipts: &BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    observations: &BTreeMap<SourceObservationId, (SourceObservation, u64)>,
 ) -> Result<(), StoreError> {
     let mut sequences = std::collections::BTreeSet::new();
     for reference in refs {

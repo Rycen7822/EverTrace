@@ -12,8 +12,8 @@ struct ProcedureRelationInputs<'a> {
     experiment_run_revisions: &'a BTreeMap<RevisionId, (ExperimentRun, u64)>,
     result_evidence_revisions: &'a BTreeMap<RevisionId, (ResultEvidence, u64)>,
     scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
-    source_observations: &'a SourceObservationFacts,
-    source_receipts: &'a SourceReceiptFacts,
+    source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
     tasks: &'a BTreeMap<TaskId, (Task, u64)>,
 }
 

@@ -2988,19 +2988,19 @@ mod tests {
                 backup_summary: Some(HumanBackupSummary {
                     frontier: 9,
                     journal: HumanBackupTableState {
-                        version: None,
+                        version: 4,
                         frontier: 9,
                     },
                     objects: HumanBackupTableState {
-                        version: None,
+                        version: 5,
                         frontier: 9,
                     },
                     relations: Some(HumanBackupTableState {
-                        version: None,
+                        version: 6,
                         frontier: 6,
                     }),
                     search: Some(HumanBackupTableState {
-                        version: Some(7),
+                        version: 7,
                         frontier: 7,
                     }),
                     committed_source_watermark_count: 2,
@@ -3098,7 +3098,7 @@ mod tests {
         app.state.ui.detail_view = crate::state::DetailView::Technical;
         let rendered = render_app(&app, 160, 100);
         assert!(rendered.contains("backup verification/frontier: VerifiedBeforePublish / 9"));
-        for table in ["n/a@9", "n/a@6", "v7@7"] {
+        for table in ["v4@9", "v5@9", "v6@6", "v7@7"] {
             assert!(rendered.contains(table));
         }
         assert!(rendered.contains("backup hook current/retained: 2/2"));

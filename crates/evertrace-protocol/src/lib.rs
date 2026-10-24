@@ -140,7 +140,6 @@ impl LocalServer {
                 Command::RecoveryBarrier(_) => Err(ErrorCode::InvalidInput),
                 Command::RequestRecovery(_) => Err(ErrorCode::InvalidInput),
                 Command::IssueMcpBinding(_)
-                | Command::ObserveSessionSource(_)
                 | Command::RunHostCanary(_)
                 | Command::ConfigReload
                 | Command::ConfigRead
@@ -753,7 +752,6 @@ pub async fn request_health(
             | Response::ConfigDocument(_)
             | Response::RecoveryAction(_)
             | Response::McpBindingIssued(_)
-            | Response::SessionSourceObserved(_)
             | Response::McpResult(_)
             | Response::McpReturned
             | Response::RecallCue(_)
@@ -831,7 +829,6 @@ pub async fn request_recovery(
             | Response::ConfigDocument(_)
             | Response::RecoveryTerminal(_)
             | Response::McpBindingIssued(_)
-            | Response::SessionSourceObserved(_)
             | Response::McpResult(_)
             | Response::McpReturned
             | Response::RecallCue(_)
@@ -1010,59 +1007,6 @@ pub fn request_mcp_binding_sync(
         envelope::ServerEnvelope::Response(value) if value.request_id == request_id => {
             match value.response {
                 response::Response::McpBindingIssued(response) => {
-                    if checked_sync_socket(socket_path)? != socket_identity {
-                        return Err(SyncProtocolError::Connect);
-                    }
-                    Ok(response)
-                }
-                _ => Err(SyncProtocolError::InvalidResponse),
-            }
-        }
-        envelope::ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
-            Err(SyncProtocolError::Wire)
-        }
-        _ => Err(SyncProtocolError::InvalidResponse),
-    }
-}
-
-#[cfg(unix)]
-pub fn request_session_source_observation_sync(
-    socket_path: &Path,
-    build_id: &str,
-    request: command::ObserveSessionSourceCommand,
-    timeout_limit: Duration,
-) -> Result<response::SessionSourceObservedResponse, error::SyncProtocolError> {
-    use error::SyncProtocolError;
-    use frame::{read_frame_sync, write_frame_sync};
-
-    if !request.validate() {
-        return Err(SyncProtocolError::InvalidInput);
-    }
-    let SyncHookConnection {
-        mut stream,
-        deadline,
-        socket_identity,
-        negotiated_max: negotiated,
-    } = connect_sync_hook(socket_path, build_id, timeout_limit)?;
-    let request_id = evertrace_domain::ids::RequestId::from_uuid(uuid::Uuid::now_v7())
-        .map_err(|_| SyncProtocolError::InvalidInput)?;
-    set_sync_deadline(&stream, deadline)?;
-    write_frame_sync(
-        &mut stream,
-        &envelope::ClientEnvelope::Command(command::CommandEnvelope {
-            request_id,
-            command: command::Command::ObserveSessionSource(request),
-        }),
-        negotiated,
-    )
-    .map_err(map_sync_frame_error)?;
-    set_sync_deadline(&stream, deadline)?;
-    match read_frame_sync::<envelope::ServerEnvelope>(&mut stream, negotiated)
-        .map_err(map_sync_frame_error)?
-    {
-        envelope::ServerEnvelope::Response(value) if value.request_id == request_id => {
-            match value.response {
-                response::Response::SessionSourceObserved(response) => {
                     if checked_sync_socket(socket_path)? != socket_identity {
                         return Err(SyncProtocolError::Connect);
                     }

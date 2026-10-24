@@ -3,14 +3,11 @@
 
 mod args;
 mod commands;
-mod config_input;
 mod daemon_client;
 
-use std::env;
+use std::{env, path::PathBuf};
 
 use args::Args;
-
-pub(crate) use config_input::resolve_config_path;
 
 #[tokio::main]
 async fn main() {
@@ -22,4 +19,16 @@ async fn main() {
         eprintln!("evertrace: {error}");
         std::process::exit(2);
     }
+}
+
+pub(crate) fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, &'static str> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if let Some(path) = env::var_os("EVERTRACE_CONFIG") {
+        return Ok(PathBuf::from(path));
+    }
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".evertrace/config.toml"))
+        .ok_or("HOME unavailable for default EverTrace configuration")
 }

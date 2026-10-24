@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-default-run = "evertrace"
 
 [dependencies]
 evertrace-codex = { path = "../evertrace-codex" }
@@ -24,7 +23,3 @@ workspace = true
 [[bin]]
 name = "evertrace"
 path = "src/main.rs"
-
-[[bin]]
-name = "evertrace-mcp"
-path = "src/mcp_main.rs"

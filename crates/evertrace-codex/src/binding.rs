@@ -221,44 +221,6 @@ pub enum NativeSubmissionEvent {
     Submitted,
 }
 
-/// Fixed native SessionStart locator. It intentionally omits turn and tool
-/// identities: SessionStart is an observation boundary, not a tool action.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NativeSessionStart {
-    pub cwd: String,
-    pub hook_event_name: String,
-    pub model: String,
-    pub permission_mode: NativePermissionMode,
-    pub session_id: String,
-    pub source: String,
-    pub transcript_path: Option<String>,
-}
-
-impl NativeSessionStart {
-    pub fn from_json(bytes: &[u8]) -> Result<Self, BindingError> {
-        let value: Self = serde_json::from_slice(bytes).map_err(|_| BindingError::InvalidCall)?;
-        value.validate_host_fields()?;
-        Ok(value)
-    }
-
-    pub fn validate_host_fields(&self) -> Result<(), BindingError> {
-        if self.hook_event_name != "SessionStart"
-            || self.source != "startup"
-            || !valid_lexical_absolute_path(&self.cwd)
-            || [&self.model, &self.session_id].into_iter().any(|value| {
-                value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
-            })
-            || self.transcript_path.as_deref().is_some_and(|value| {
-                value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control)
-            })
-        {
-            return Err(BindingError::InvalidAnchor);
-        }
-        Ok(())
-    }
-}
-
 impl NativeInputSubmission {
     pub fn from_json(bytes: &[u8]) -> Result<Self, BindingError> {
         let value: Self = serde_json::from_slice(bytes).map_err(|_| BindingError::InvalidCall)?;

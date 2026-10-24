@@ -437,7 +437,7 @@ mod tests {
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(serde_json::to_string(&payload).unwrap().into()),
+            payload_json: Some(serde_json::to_string(&payload).unwrap()),
             source_event_seq: 1,
             projection_generation: 1,
         }

@@ -485,7 +485,6 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
                         source_revision: exclusive_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
-                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
                         target_kind: evertrace_store::DirtyTargetKind::EvidenceSurface,
@@ -524,7 +523,6 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
                         source_revision: host_shared_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
-                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
                         target_kind: evertrace_store::DirtyTargetKind::EvidenceSurface,
@@ -566,7 +564,6 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
-                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
                         target_kind: evertrace_store::DirtyTargetKind::EvidenceSurface,
@@ -1450,7 +1447,6 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
                         source_revision: rewritten_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
-                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
                         target_kind: evertrace_store::DirtyTargetKind::EvidenceSurface,
@@ -1866,7 +1862,7 @@ async fn object_forget_closes_three_targets_and_replays_without_resurrection() {
             )
         }));
     }
-    assert_eq!(reopened.table_names().await.unwrap().len(), 1);
+    assert_eq!(reopened.table_names().await.unwrap().len(), 4);
     assert_eq!(reopened.project().await.unwrap(), expected);
     assert_eq!(reopened.full_projection().await.unwrap(), expected);
     let (reopened_handle, reopened_task) = spawn_writer(reopened, 8).unwrap();

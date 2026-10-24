@@ -9,17 +9,18 @@ use std::{
     str::FromStr,
 };
 
-use arrow_array::{
-    Array, ArrayRef, Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
-};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::{
-    Table,
+    Connection, Table,
     index::scalar::FullTextSearchQuery,
-    query::{ExecutableQuery, HasQuery, QueryBase, Select},
+    query::{QueryBase, Select},
 };
 
-use crate::{StoreError, connection::StoreReadHandle};
+use crate::{
+    StoreError,
+    journal::{JOURNAL_TABLE, read_journal_frontier},
+};
 
 pub const SEARCH_TABLE: &str = "evertrace_search";
 pub const SEARCH_CHECKPOINT_ID: &str = "checkpoint:evertrace_search";
@@ -28,15 +29,12 @@ pub const SEARCH_PROJECTION_GENERATION: u64 = 1;
 #[derive(Clone)]
 pub struct SearchIndex {
     data_dir: PathBuf,
-    readers: StoreReadHandle,
 }
 
 pub struct SearchSnapshot {
     table: Table,
     frontier: u64,
     authoritative_frontier: u64,
-    // Declared last so the pinned table drops before the read fence and permit.
-    _lease: crate::connection::StoreReadLease,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,32 +59,9 @@ pub struct SearchHardFilter {
 }
 
 impl SearchIndex {
-    /// Standalone read-only opener: validate the real on-disk store, attach a
-    /// native connection to the same binding and open the search table.
     pub async fn open(data_dir: &Path) -> Result<Self, StoreError> {
-        let readers = StoreReadHandle::open_read_only(data_dir).await?;
         let connection = crate::connection::connect_native(data_dir).await?;
-        readers.bind_read_only_search(connection)?;
-        Self::from_read_handle(data_dir, readers).await
-    }
-
-    /// Share the writer's single Lance search lifecycle and read fence. The
-    /// writer publishes its validated binding; a handle without one fails
-    /// closed instead of opening a private connection from the path.
-    pub async fn open_with_read_handle(
-        data_dir: &Path,
-        readers: StoreReadHandle,
-    ) -> Result<Self, StoreError> {
-        Self::from_read_handle(data_dir, readers).await
-    }
-
-    async fn from_read_handle(
-        data_dir: &Path,
-        readers: StoreReadHandle,
-    ) -> Result<Self, StoreError> {
-        let lease = readers.search_lease().await?;
-        let table = lease
-            .lance()
+        let table = connection
             .open_table(SEARCH_TABLE)
             .execute()
             .await
@@ -99,16 +74,9 @@ impl SearchIndex {
         if indices.len() != 1 || indices[0].columns != ["text"] {
             return Err(StoreError::StoreCorrupt);
         }
-        drop(table);
-        drop(lease);
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
-            readers,
         })
-    }
-
-    pub fn read_handle(&self) -> StoreReadHandle {
-        self.readers.clone()
     }
 
     pub async fn all(&self) -> Result<Vec<SearchProjectionRow>, StoreError> {
@@ -124,7 +92,8 @@ impl SearchIndex {
     }
 
     pub async fn snapshot(&self) -> Result<SearchSnapshot, StoreError> {
-        self.snapshot_validated(None).await
+        let connection = crate::connection::connect_native(&self.data_dir).await?;
+        self.snapshot_validated(&connection).await
     }
 
     /// Use a frontier freshly validated by the caller's current projection.
@@ -136,45 +105,48 @@ impl SearchIndex {
         &self,
         validated_frontier: u64,
     ) -> Result<SearchSnapshot, StoreError> {
-        self.snapshot_validated(Some(validated_frontier)).await
+        let connection = crate::connection::connect_native(&self.data_dir).await?;
+        let snapshot = self.pinned_snapshot(&connection).await?;
+        let after = self.authoritative_frontier(&connection).await?;
+        if after != validated_frontier {
+            return self.snapshot_validated(&connection).await;
+        }
+        if snapshot.frontier > after {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(SearchSnapshot {
+            authoritative_frontier: after,
+            ..snapshot
+        })
     }
 
     async fn snapshot_validated(
         &self,
-        validated_frontier: Option<u64>,
+        connection: &Connection,
     ) -> Result<SearchSnapshot, StoreError> {
         for attempt in 0..2 {
-            // The snapshot holds the fence and Lance connection. SQL frontier
-            // reads take a permit only for their actual blocking lifetime.
-            let lease = self.readers.search_lease().await?;
-            let before = self.authoritative_frontier(&lease).await?;
-            let (table, frontier) = self.pinned_snapshot(&lease).await?;
-            let after = self.authoritative_frontier(&lease).await?;
-            if before == after || after == validated_frontier.unwrap_or(u64::MAX) || attempt == 1 {
-                if frontier > after {
+            let before = self.authoritative_frontier(connection).await?;
+            let snapshot = self.pinned_snapshot(connection).await?;
+            let after = self.authoritative_frontier(connection).await?;
+            if before == after || attempt == 1 {
+                if snapshot.frontier > after {
                     return Err(StoreError::StoreCorrupt);
                 }
                 return Ok(SearchSnapshot {
-                    table,
-                    frontier,
                     authoritative_frontier: after,
-                    _lease: lease,
+                    ..snapshot
                 });
             }
         }
         unreachable!("bounded snapshot loop always returns")
     }
 
-    async fn pinned_snapshot(
-        &self,
-        lease: &crate::connection::StoreReadLease,
-    ) -> Result<(Table, u64), StoreError> {
+    async fn pinned_snapshot(&self, connection: &Connection) -> Result<SearchSnapshot, StoreError> {
         evertrace_capture::ConfinedRoot::open_owned_private(&crate::connection::native_root(
             &self.data_dir,
         ))
         .map_err(|_| StoreError::StoreCorrupt)?;
-        let table = lease
-            .lance()
+        let table = connection
             .open_table(SEARCH_TABLE)
             .execute()
             .await
@@ -205,22 +177,28 @@ impl SearchIndex {
         )
         .await?;
         let frontier = exact_checkpoint_frontier(&checkpoints)?;
-        Ok((table, frontier))
+        Ok(SearchSnapshot {
+            table,
+            frontier,
+            authoritative_frontier: 0,
+        })
     }
 
-    async fn authoritative_frontier(
-        &self,
-        lease: &crate::connection::StoreReadLease,
-    ) -> Result<u64, StoreError> {
+    async fn authoritative_frontier(&self, connection: &Connection) -> Result<u64, StoreError> {
         evertrace_capture::ConfinedRoot::open_owned_private(&crate::connection::native_root(
             &self.data_dir,
         ))
         .map_err(|_| StoreError::StoreCorrupt)?;
-        self.readers
-            .lease_read(lease, |connection, _| {
-                crate::sqlite_state::read_persisted_frontier(connection)
-            })
+        let table = connection
+            .open_table(JOURNAL_TABLE)
+            .execute()
             .await
+            .map_err(|_| StoreError::LanceDb)?;
+        table
+            .checkout_latest()
+            .await
+            .map_err(|_| StoreError::LanceDb)?;
+        read_journal_frontier(&table).await
     }
 }
 
@@ -351,101 +329,31 @@ async fn query_rows(
     limit: usize,
     fts: Option<&str>,
 ) -> Result<Vec<SearchProjectionRow>, StoreError> {
-    if let Some(query) = fts {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let native_limit = i64::try_from(limit).map_err(|_| StoreError::InvalidInput)?;
+    let batches = if let Some(query) = fts {
         let mut query = table
             .query()
-            .full_text_search(FullTextSearchQuery::new(query.into()).limit(Some(native_limit)))
-            .select(Select::columns(&SEARCH_COLUMNS));
-        // The builder adds an outer limit of ten. Clear it: flat matches are
-        // not ordered, so truncation must follow selection, not precede it.
-        // The independent native limit still bounds indexed top-k work.
-        query.mut_query().limit = None;
+            .full_text_search(FullTextSearchQuery::new(query.into()))
+            .select(Select::columns(&SEARCH_COLUMNS))
+            .limit(limit);
         if let Some(filter) = filter {
             query = query.only_if(filter);
         }
-        let mut stream = query.execute().await.map_err(|_| StoreError::LanceDb)?;
-        let mut selected = Vec::with_capacity(limit);
-        while let Some(batch) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
-            let batch = batch.map_err(|_| StoreError::LanceDb)?;
-            select_fts_batch(&batch, &mut selected, limit).await?;
+        crate::collect_batches(&query)
+            .await
+            .map_err(|_| StoreError::LanceDb)?
+    } else {
+        let mut query = table
+            .query()
+            .select(Select::columns(&SEARCH_COLUMNS))
+            .limit(limit);
+        if let Some(filter) = filter {
+            query = query.only_if(filter);
         }
-        let rows = selected.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
-        ensure_unique_row_ids(&rows)?;
-        return Ok(rows);
-    }
-    let mut query = table
-        .query()
-        .select(Select::columns(&SEARCH_COLUMNS))
-        .limit(limit);
-    if let Some(filter) = filter {
-        query = query.only_if(filter);
-    }
-    let batches = crate::collect_batches(&query)
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let mut rows = rows_from_batches(batches, false)?;
-    rows.sort();
-    Ok(rows)
-}
-
-async fn select_fts_batch(
-    batch: &RecordBatch,
-    selected: &mut Vec<(f32, SearchProjectionRow)>,
-    limit: usize,
-) -> Result<(), StoreError> {
-    let ids = batch
-        .column_by_name("row_id")
-        .and_then(|array| array.as_any().downcast_ref::<StringArray>())
-        .ok_or(StoreError::StoreCorrupt)?;
-    let scores = batch
-        .column_by_name("_score")
-        .and_then(|array| array.as_any().downcast_ref::<Float32Array>())
-        .ok_or(StoreError::StoreCorrupt)?;
-    for index in 0..batch.num_rows() {
-        if ids.is_null(index) || scores.is_null(index) || !scores.value(index).is_finite() {
-            return Err(StoreError::StoreCorrupt);
-        }
-        let score = scores.value(index);
-        let position = selected.partition_point(|(other_score, row)| {
-            other_score
-                .total_cmp(&score)
-                .reverse()
-                .then_with(|| row.row_id.as_str().cmp(ids.value(index)))
-                .is_le()
-        });
-        if position < limit {
-            // The existing decoder validates and owns only this contender's
-            // fields. Never retain slices backed by a losing batch's buffers.
-            let row = rows_from_batches(vec![batch.slice(index, 1)], false)?
-                .pop()
-                .ok_or(StoreError::StoreCorrupt)?;
-            if selected.len() == limit {
-                selected.pop();
-            }
-            selected.insert(position, (score, row));
-        }
-        if index % 256 == 255 {
-            tokio::task::yield_now().await;
-        }
-    }
-    tokio::task::yield_now().await;
-    Ok(())
-}
-
-fn ensure_unique_row_ids(rows: &[SearchProjectionRow]) -> Result<(), StoreError> {
-    let mut ids = rows
-        .iter()
-        .map(|row| row.row_id.as_str())
-        .collect::<Vec<_>>();
-    ids.sort_unstable();
-    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok(())
+        crate::collect_batches(&query)
+            .await
+            .map_err(|_| StoreError::LanceDb)?
+    };
+    rows_from_batches(batches, false)
 }
 
 fn filter_sql(filter: &SearchHardFilter) -> Option<String> {
@@ -1060,19 +968,16 @@ fn rows_from_batches(
             rows.push(row);
         }
     }
-    if require_checkpoint {
-        rows.sort();
-        if rows
+    rows.sort();
+    if (require_checkpoint
+        && rows
             .iter()
             .filter(|row| row.row_id == SEARCH_CHECKPOINT_ID)
             .count()
-            != 1
-            || rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id)
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-    } else {
-        ensure_unique_row_ids(&rows)?;
+            != 1)
+        || rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id)
+    {
+        return Err(StoreError::StoreCorrupt);
     }
     Ok(rows)
 }
@@ -1155,7 +1060,6 @@ mod tests {
     use std::str::FromStr;
 
     use evertrace_domain::ids::CommandId;
-    use lancedb::index::{Index, scalar::FtsIndexBuilder};
 
     use super::*;
     use crate::{DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload};
@@ -1219,266 +1123,8 @@ mod tests {
             exact_checkpoint_frontier(&[checkpoint.clone(), checkpoint]),
             Err(StoreError::StoreCorrupt)
         );
-        let row = object_row();
-        let mut other = row.clone();
-        other.row_id.push_str(":other");
-        assert_eq!(
-            rows_from_batches(
-                vec![search_batch(&[row.clone(), other, row]).unwrap()],
-                false
-            ),
-            Err(StoreError::StoreCorrupt),
-            "rank-preserving queries must still reject nonadjacent duplicate IDs"
-        );
     }
 
-    #[tokio::test]
-    async fn real_fts_rank_order_survives_bounded_wrapper() {
-        const QUERY: &str = "needle";
-        const STRONG_ID: &str = "01890f47-6a4a-7cc1-98b9-01890f476c11";
-        let weak_ids = (0x00..=0x0a)
-            .map(|suffix| format!("01890f47-6a4a-7cc1-98b9-01890f476c{suffix:02x}"))
-            .collect::<Vec<_>>();
-        assert!(weak_ids.iter().all(|weak| weak.as_str() < STRONG_ID));
-
-        let weak_text = format!("needle {}", "background ".repeat(24));
-        let mut rows = Vec::with_capacity(12);
-        for candidate_id in &weak_ids {
-            let mut row = object_row();
-            row.row_id = format!("search:object:{candidate_id}");
-            row.candidate_id = Some(candidate_id.clone());
-            row.text = weak_text.clone();
-            rows.push(row);
-        }
-        let mut strong = object_row();
-        strong.row_id = format!("search:object:{STRONG_ID}");
-        strong.candidate_id = Some(STRONG_ID.into());
-        strong.text = "needle ".repeat(18);
-        rows.push(strong);
-
-        let temp = tempfile::tempdir().unwrap();
-        let database = lancedb::connect(temp.path().to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let table = database
-            .create_table(SEARCH_TABLE, search_batch(&rows).unwrap())
-            .execute()
-            .await
-            .unwrap();
-        table
-            .create_index(
-                &["text"],
-                Index::FTS(
-                    FtsIndexBuilder::default()
-                        .base_tokenizer("icu".into())
-                        .stem(false)
-                        .remove_stop_words(false)
-                        .ascii_folding(true)
-                        .with_position(false),
-                ),
-            )
-            .execute()
-            .await
-            .unwrap();
-
-        let indices = table.list_indices().await.unwrap();
-        eprintln!("r529_fts_index_count={}", indices.len());
-        for index in &indices {
-            eprintln!("r529_fts_index_columns={:?}", index.columns);
-        }
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].columns, vec!["text".to_owned()]);
-
-        let filter = SearchHardFilter {
-            lifecycle: Some("active".into()),
-            object_only: true,
-            current_only: true,
-            ..SearchHardFilter::default()
-        };
-        let filter = filter_sql(&filter).unwrap();
-        let native_query = table
-            .query()
-            .full_text_search(FullTextSearchQuery::new(QUERY.into()))
-            .select(Select::columns(&SEARCH_COLUMNS))
-            .limit(3)
-            .only_if(filter.clone());
-        let native_batches = crate::collect_batches(&native_query).await.unwrap();
-        let mut native_ids = Vec::new();
-        let mut native_scores = Vec::new();
-        for batch in native_batches {
-            let candidate_index = batch.schema().index_of("candidate_id").unwrap();
-            let candidates = batch
-                .column(candidate_index)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let scores = batch
-                .column_by_name("_score")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::Float32Array>()
-                .unwrap();
-            native_scores.extend(scores.values().iter().copied());
-            for row in 0..batch.num_rows() {
-                assert!(!candidates.is_null(row));
-                native_ids.push(candidates.value(row).to_owned());
-            }
-        }
-
-        let wrapper_ids = query_rows(&table, Some(filter.clone()), 3, Some(QUERY))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.candidate_id.unwrap())
-            .collect::<Vec<_>>();
-        eprintln!("r529_native_top_three_candidate_ids={native_ids:?}");
-        eprintln!("r529_native_scores={native_scores:?}");
-        eprintln!("r529_query_rows_top_three_candidate_ids={wrapper_ids:?}");
-        assert_eq!(native_ids.len(), 3, "native FTS must return top three");
-        assert_eq!(native_scores.len(), 3);
-        assert!(native_scores[0] > native_scores[1] && native_scores[0] > native_scores[2]);
-        assert_eq!(
-            native_ids[0], STRONG_ID,
-            "fixture precondition: designated strong row must lead native FTS; IDs={native_ids:?}, scores={native_scores:?}"
-        );
-        // Equal-score weak rows may tie differently between two native queries.
-        assert_eq!(wrapper_ids.len(), native_ids.len());
-        assert_eq!(
-            wrapper_ids[0], native_ids[0],
-            "query_rows must preserve the strictly strongest native FTS hit"
-        );
-
-        // Updating text invalidates the index's covered text. Normal searches
-        // must rank these flat-evaluated matches before applying their limit too.
-        table
-            .update()
-            .column("text", "concat(text, ' ')")
-            .execute()
-            .await
-            .unwrap();
-        let ordered_query = table
-            .query()
-            .full_text_search(FullTextSearchQuery::new(QUERY.into()))
-            .select(Select::columns(&SEARCH_COLUMNS))
-            .only_if(filter.clone())
-            .limit(rows.len());
-        let mut scored = Vec::new();
-        for batch in crate::collect_batches(&ordered_query).await.unwrap() {
-            let ids = batch
-                .column_by_name("candidate_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let scores = batch
-                .column_by_name("_score")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::Float32Array>()
-                .unwrap();
-            for index in 0..batch.num_rows() {
-                scored.push((scores.value(index), ids.value(index).to_owned()));
-            }
-        }
-        let strong_emission_index = scored.iter().position(|(_, id)| id == STRONG_ID);
-        assert!(
-            strong_emission_index.is_some_and(|index| index >= 10),
-            "fixture precondition: the strong row must be physically emitted at raw index >= 10; index={strong_emission_index:?}, emitted={scored:?}"
-        );
-        scored.sort_by(|left, right| right.0.total_cmp(&left.0));
-        assert_eq!(scored.len(), rows.len());
-        assert_eq!(scored[0].1, STRONG_ID);
-        assert!(scored[0].0 > scored[1].0);
-        let updated = query_rows(&table, Some(filter), 3, Some(QUERY))
-            .await
-            .unwrap();
-        assert_eq!(
-            updated[0].candidate_id.as_deref(),
-            Some(scored[0].1.as_str()),
-            "flat-evaluated text updates must retain the strongest result before the limit"
-        );
-    }
-
-    #[tokio::test]
-    async fn fts_selector_caps_orders_and_rejects_invalid_selected_rows() {
-        let with_scores = |batch: RecordBatch, scores: Vec<f32>| {
-            assert_eq!(batch.num_rows(), scores.len());
-            let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
-            fields.push(Arc::new(Field::new("_score", DataType::Float32, false)));
-            let mut columns = batch.columns().to_vec();
-            columns.push(Arc::new(Float32Array::from(scores)) as ArrayRef);
-            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-        };
-        let id = |suffix: &str| format!("search:object:01890f47-6a4a-7cc1-98b9-01890f476{suffix}");
-        let row = |suffix: &str| {
-            let mut row = object_row();
-            row.row_id = id(suffix);
-            row.candidate_id = Some(row.row_id.trim_start_matches("search:object:").into());
-            row
-        };
-        let selected_ids = |selected: &[(f32, SearchProjectionRow)]| {
-            selected
-                .iter()
-                .map(|(_, row)| row.row_id.clone())
-                .collect::<Vec<_>>()
-        };
-        let mut selected = Vec::new();
-        let first = with_scores(
-            search_batch(&[row("c23"), row("c22")]).unwrap(),
-            vec![0.5, 0.5],
-        );
-        select_fts_batch(&first, &mut selected, 2).await.unwrap();
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected_ids(&selected), vec![id("c22"), id("c23")]);
-        let late = with_scores(
-            search_batch(&[row("c24"), row("c21")]).unwrap(),
-            vec![0.9, 0.5],
-        );
-        select_fts_batch(&late, &mut selected, 2).await.unwrap();
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected_ids(&selected), vec![id("c24"), id("c21")]);
-        let mut duplicates = Vec::new();
-        let duplicate = with_scores(search_batch(&[row("c30")]).unwrap(), vec![0.9]);
-        let separated = with_scores(
-            search_batch(&[row("c31"), row("c30")]).unwrap(),
-            vec![0.8, 0.7],
-        );
-        select_fts_batch(&duplicate, &mut duplicates, 3)
-            .await
-            .unwrap();
-        select_fts_batch(&separated, &mut duplicates, 3)
-            .await
-            .unwrap();
-        assert_eq!(
-            duplicates
-                .iter()
-                .filter(|(_, row)| row.row_id.ends_with("c30"))
-                .count(),
-            2
-        );
-        let retained: Vec<_> = duplicates.iter().map(|p| p.1.clone()).collect();
-        assert_eq!(
-            ensure_unique_row_ids(&retained),
-            Err(StoreError::StoreCorrupt)
-        );
-        let valid = search_batch(&[row("c32")]).unwrap();
-        let mut columns = valid.columns().to_vec();
-        columns[5] = Arc::new(StringArray::from(vec![""]));
-        let malformed = with_scores(
-            RecordBatch::try_new(valid.schema(), columns).unwrap(),
-            vec![0.7],
-        );
-        assert_eq!(
-            select_fts_batch(&malformed, &mut Vec::new(), 1).await,
-            Err(StoreError::StoreCorrupt)
-        );
-        let invalid_score = with_scores(search_batch(&[row("c33")]).unwrap(), vec![f32::NAN]);
-        assert_eq!(
-            select_fts_batch(&invalid_score, &mut Vec::new(), 1).await,
-            Err(StoreError::StoreCorrupt)
-        );
-    }
     #[tokio::test]
     async fn validated_frontier_snapshot_keeps_post_pin_authority_and_falls_back() {
         let temp = tempfile::tempdir().unwrap();
@@ -1533,83 +1179,5 @@ mod tests {
             .unwrap();
         assert_eq!(refreshed.frontier(), appended.last_seq);
         assert_eq!(refreshed.authoritative_frontier(), appended.last_seq);
-    }
-    #[tokio::test]
-    async fn two_live_snapshots_bound_the_read_permits_and_queued_maintenance_completes() {
-        use std::time::Duration;
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        let mut writer = crate::JournalWriter::open(&data).await.unwrap();
-        let index = SearchIndex::open_with_read_handle(&data, writer.read_handle())
-            .await
-            .unwrap();
-        let first = index.snapshot().await.unwrap();
-        let second = index.snapshot().await.unwrap();
-        // Snapshots hold a read fence, not a SQL connection: further live
-        // snapshots stay usable instead of queueing behind the short permits.
-        let third = index.snapshot().await.unwrap();
-        assert_eq!(third.frontier(), second.frontier());
-        // Queued maintenance waits for the live read fences but must not
-        // deadlock behind them: releasing every snapshot completes the quiesce.
-        let mut quiesce = Box::pin(writer.quiesce_for_backup());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut quiesce)
-                .await
-                .is_err()
-        );
-        drop(first);
-        drop(second);
-        drop(third);
-        let guard = tokio::time::timeout(Duration::from_secs(5), &mut quiesce)
-            .await
-            .expect("queued maintenance must not deadlock behind released readers")
-            .unwrap()
-            .expect("no external reader holds the WAL");
-        drop(quiesce);
-        drop(writer.close_for_backup(guard).unwrap());
-    }
-
-    #[tokio::test]
-    async fn cancelled_lease_read_keeps_the_fence_until_the_real_task_exits() {
-        use std::time::Duration;
-
-        let temp = tempfile::tempdir().unwrap();
-        let writer = crate::JournalWriter::open(&temp.path().join("data"))
-            .await
-            .unwrap();
-        let readers = writer.read_handle();
-        let lease = readers.search_lease().await.unwrap();
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let task_readers = readers.clone();
-        let task = tokio::spawn(async move {
-            task_readers
-                .lease_read(&lease, move |_, cancel| {
-                    let _ = started.send(());
-                    released
-                        .recv_timeout(Duration::from_secs(3))
-                        .map_err(|_| StoreError::Io)?;
-                    cancel.check()
-                })
-                .await
-        });
-        ready.await.unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-
-        // The outer future and its lease are gone, but the started blocking
-        // closure is still alive. Maintenance must not pass it.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), readers.quiesce())
-                .await
-                .is_err()
-        );
-        release.send(()).unwrap();
-        let guard = tokio::time::timeout(Duration::from_secs(3), readers.quiesce())
-            .await
-            .expect("the actual task must release the fence");
-        drop(guard);
-        assert!(!readers.journal_rows().await.unwrap().is_empty());
-        writer.sync_frontier().await.unwrap();
     }
 }

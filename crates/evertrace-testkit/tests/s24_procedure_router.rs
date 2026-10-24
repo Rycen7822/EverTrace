@@ -158,7 +158,6 @@ fn source_payloads(receipt: SourceReceipt, observation: SourceObservation) -> Ve
             source_revision: receipt.source_revision,
             source_sequence: 1,
             confirmed_prefix_digest: None,
-            earlier_prefix: None,
         }),
         JournalPayload::DirtyTarget(DirtyTarget {
             target_kind: DirtyTargetKind::EvidenceSurface,
@@ -809,7 +808,12 @@ async fn missing_inventory_blocks_auto_full_but_manual_acceptance_is_atomic_and_
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_search"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search",
+        ]
     );
     drop(writer);
     let reopened = JournalWriter::open(&root).await.unwrap();

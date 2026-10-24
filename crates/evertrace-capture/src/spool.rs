@@ -263,39 +263,6 @@ pub struct DurableSpool {
     last_watermark: u64,
 }
 
-// Close alone can leave a flock held by a descriptor inherited during fork,
-// even with CLOEXEC. A directory critical section belongs to this caller.
-struct DirectoryUnlock<'a>(&'a File);
-
-impl Drop for DirectoryUnlock<'_> {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(self.0);
-    }
-}
-
-#[test]
-fn directory_critical_section_releases_with_an_inherited_descriptor() {
-    let path =
-        std::env::temp_dir().join(format!("evertrace-directory-lock-{}", uuid::Uuid::now_v7()));
-    ensure_directory(&path).unwrap();
-    let inherited = {
-        let directory = File::open(&path).unwrap();
-        FileExt::lock_exclusive(&directory).unwrap();
-        let _unlock = DirectoryUnlock(&directory);
-        // A duplicate shares the same open file description, just as fork does.
-        directory.try_clone().unwrap()
-    };
-    let reader = File::open(&path).unwrap();
-    let acquired = FileExt::try_lock_shared(&reader);
-    drop(reader);
-    drop(inherited);
-    fs::remove_dir(&path).unwrap();
-    assert!(
-        acquired.is_ok(),
-        "directory lock outlived its critical section"
-    );
-}
-
 impl DurableSpool {
     pub fn open(
         root: impl Into<PathBuf>,
@@ -487,7 +454,6 @@ impl DurableSpool {
         self.validate_directories()?;
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let frame = encode_frame(record)?;
         let usage = self.main_usage()?;
         let frame_bytes = u64::try_from(frame.len()).map_err(|_| SpoolError::ResourceExhausted)?;
@@ -543,7 +509,6 @@ impl DurableSpool {
         let frame_bytes = u64::try_from(frame.len()).map_err(|_| SpoolError::ResourceExhausted)?;
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let existing_prefix = format!("{ISOLATED_PREFIX}{routing_hint}-");
         for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
             let entry = entry.map_err(map_io)?;
@@ -610,7 +575,6 @@ impl DurableSpool {
     pub fn read_active(&self) -> Result<Vec<DecodedFrame>, SpoolError> {
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::lock_shared(&directory_lock).map_err(map_io)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let path = self.active_path();
         match fs::symlink_metadata(&path) {
             Ok(_) => {
@@ -711,7 +675,6 @@ impl DurableSpool {
         self.validate_directories()?;
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::lock_shared(&directory_lock).map_err(map_io)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let mut paths = Vec::new();
         for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
             let entry = entry.map_err(map_io)?;
@@ -762,7 +725,6 @@ impl DurableSpool {
     pub fn seal_active(&mut self, generation: u64) -> Result<Option<PathBuf>, SpoolError> {
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::try_lock_exclusive(&directory_lock).map_err(map_busy)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let active = self.active_path();
         let metadata = match fs::symlink_metadata(&active) {
             Ok(value) => value,
@@ -831,7 +793,6 @@ impl DurableSpool {
         self.validate_directories()?;
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::try_lock_shared(&directory_lock).map_err(map_busy)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let mut paths = Vec::new();
         for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
             let entry = entry.map_err(map_io)?;
@@ -888,7 +849,6 @@ impl DurableSpool {
             }
             claimed.push((path, file, opened));
         }
-        drop(_directory_unlock);
         drop(directory_lock);
         let mut segments = Vec::new();
         for (path, mut file, opened) in claimed {
@@ -920,7 +880,6 @@ impl DurableSpool {
                 // recoverable rename. Crashes on either side retain all bytes.
                 let directory = File::open(&self.main_dir).map_err(map_io)?;
                 FileExt::try_lock_exclusive(&directory).map_err(map_busy)?;
-                let _directory_unlock = DirectoryUnlock(&directory);
                 validate_owned_file(&path, &file)?;
                 if segment_identity(&file.metadata().map_err(map_io)?) != segment_identity(&opened)
                     || segment_identity(&fs::symlink_metadata(&path).map_err(map_io)?)
@@ -1001,7 +960,6 @@ impl DurableSpool {
         }
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::try_lock_exclusive(&directory_lock).map_err(map_busy)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let path_metadata = fs::symlink_metadata(&segment.path).map_err(map_io)?;
         validate_owned_file_metadata(&path_metadata)?;
         let opened = segment.file.metadata().map_err(map_io)?;
@@ -1025,7 +983,6 @@ impl DurableSpool {
         self.validate_directories()?;
         let directory_lock = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::lock_exclusive(&directory_lock).map_err(map_io)?;
-        let _directory_unlock = DirectoryUnlock(&directory_lock);
         let mut report = RecoveryReport::default();
         let mut sealed = Vec::new();
         for entry in fs::read_dir(&self.main_dir).map_err(map_io)? {
@@ -1093,7 +1050,6 @@ impl DurableSpool {
         self.validate_directories()?;
         let directory = File::open(&self.main_dir).map_err(map_io)?;
         FileExt::lock_shared(&directory).map_err(map_io)?;
-        let _directory_unlock = DirectoryUnlock(&directory);
         let path = self.active_path();
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

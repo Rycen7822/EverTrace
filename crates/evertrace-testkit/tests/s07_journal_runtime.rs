@@ -11,10 +11,11 @@ use evertrace_engine::{
     pending_dirty, pending_outbox, spawn_writer,
 };
 use evertrace_store::{
-    CommitOutcome, ConfigAudit, DirtyTarget, DirtyTargetKind, DurableJob, JobBudget, JobLease,
-    JobStatus, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter, MigrationOutcome,
-    ObjectRowKind, OutboxEntry, SiblingWriterLock, StaleGenerationAudit, StoreError,
-    WatermarkAdvanced, WatermarkKind, reduce_journal,
+    CommitOutcome, CompatibilityStore, ConfigAudit, DirtyTarget, DirtyTargetKind, DurableJob,
+    JOURNAL_TABLE, JobBudget, JobLease, JobStatus, JournalCommand, JournalEventDraft,
+    JournalPayload, JournalWriter, L0001, MigrationOutcome, OBJECTS_TABLE, ObjectRowKind,
+    OutboxEntry, SiblingWriterLock, StaleGenerationAudit, StoreError, WatermarkAdvanced,
+    WatermarkKind, journal_schema, objects_schema, reduce_journal,
 };
 use tempfile::TempDir;
 
@@ -57,7 +58,12 @@ async fn l0001_bootstrap_reopen_is_noop_and_creates_only_authorized_tables() {
     assert_eq!(writer.migration_outcome(), MigrationOutcome::Applied);
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_search"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search",
+        ]
     );
     assert_eq!(writer.journal_rows().await.unwrap().len(), 2);
     let objects = writer.object_rows().await.unwrap();
@@ -93,20 +99,31 @@ async fn l0001_bootstrap_reopen_is_noop_and_creates_only_authorized_tables() {
 }
 
 #[tokio::test]
-async fn current_store_applies_its_migration_marker_once() {
+async fn l0001_reconciles_valid_tables_with_missing_event_once() {
     let temp = TempDir::new().unwrap();
-    let root = temp.path().join("store");
-    let writer = JournalWriter::open(&root).await.unwrap();
-    let marker_count = |rows: &[evertrace_store::JournalRow]| {
-        rows.iter()
-            .filter(|row| matches!(row.payload(), Ok(JournalPayload::MigrationApplied(applied)) if applied.migration_id == "L0002"))
-            .count()
-    };
-    assert_eq!(marker_count(&writer.journal_rows().await.unwrap()), 1);
-    drop(writer);
-    let reopened = JournalWriter::open(&root).await.unwrap();
-    assert_eq!(marker_count(&reopened.journal_rows().await.unwrap()), 1);
-    assert_eq!(reopened.migration_outcome(), MigrationOutcome::Noop);
+    let store = CompatibilityStore::connect_local(temp.path())
+        .await
+        .unwrap();
+    store
+        .connection()
+        .create_empty_table(JOURNAL_TABLE, journal_schema())
+        .execute()
+        .await
+        .unwrap();
+    store
+        .connection()
+        .create_empty_table(OBJECTS_TABLE, objects_schema())
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        L0001::apply(store.connection()).await,
+        Ok(MigrationOutcome::Reconciled)
+    );
+    assert_eq!(
+        L0001::apply(store.connection()).await,
+        Ok(MigrationOutcome::Noop)
+    );
 }
 
 #[tokio::test]
@@ -286,14 +303,19 @@ async fn dirty_outbox_projection_is_incremental_and_full_rebuild_is_identical() 
         .await
         .unwrap();
     writer.project().await.unwrap();
-    let before_no_delta = writer.read_diagnostics().await.tables[1].checkpoint;
-    let before_rows = writer.object_rows().await.unwrap();
+    let reader =
+        CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root))
+            .await
+            .unwrap();
+    let objects = reader
+        .connection()
+        .open_table(OBJECTS_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    let before_no_delta = objects.version().await.unwrap();
     writer.project().await.unwrap();
-    assert_eq!(
-        writer.read_diagnostics().await.tables[1].checkpoint,
-        before_no_delta
-    );
-    assert_eq!(writer.object_rows().await.unwrap(), before_rows);
+    assert_eq!(objects.version().await.unwrap(), before_no_delta);
     writer.commit(&command(0xa2, payloads), 11).await.unwrap();
     let incremental = writer.project().await.unwrap();
     assert_eq!(
@@ -308,14 +330,19 @@ async fn dirty_outbox_projection_is_incremental_and_full_rebuild_is_identical() 
             .len(),
         1
     );
-    let persisted = writer.object_rows().await.unwrap();
+    let persisted = evertrace_store::objects::read_object_rows(&objects)
+        .await
+        .unwrap();
     let full = writer.full_projection().await.unwrap();
     assert_eq!(persisted, incremental.rows);
     assert_eq!(persisted, full.rows);
     assert_eq!(incremental, full);
     drop(writer);
 
-    evertrace_store::test_support::clear_objects(&root).unwrap();
+    fs::remove_dir_all(
+        evertrace_store::connection::native_root(&root).join("evertrace_objects.lance"),
+    )
+    .unwrap();
     let rebuilt = JournalWriter::open(&root).await.unwrap();
     assert_eq!(
         rebuilt.migration_outcome(),
@@ -425,7 +452,10 @@ async fn job_lease_recovery_watermark_config_and_stale_audit_rebuild() {
     assert_eq!(after_stale, writer.full_projection().await.unwrap());
     drop(writer);
 
-    evertrace_store::test_support::clear_objects(&root).unwrap();
+    fs::remove_dir_all(
+        evertrace_store::connection::native_root(&root).join("evertrace_objects.lance"),
+    )
+    .unwrap();
     let mut rebuilt = JournalWriter::open(&root).await.unwrap();
     assert_eq!(
         rebuilt.migration_outcome(),

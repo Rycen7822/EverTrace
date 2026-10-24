@@ -217,8 +217,7 @@ impl RecallLedgerState {
                                 need: Box::new(need),
                             },
                         ))
-                        .canonical_json()?
-                        .into(),
+                        .canonical_json()?,
                     ),
                     source_event_seq,
                     projection_generation: generation,

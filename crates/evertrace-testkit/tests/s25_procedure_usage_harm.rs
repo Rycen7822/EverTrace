@@ -271,7 +271,6 @@ fn source_payloads(receipt: SourceReceipt, observation: SourceObservation) -> Ve
             source_revision: receipt.source_revision,
             source_sequence: 1,
             confirmed_prefix_digest: None,
-            earlier_prefix: None,
         }),
         JournalPayload::DirtyTarget(DirtyTarget {
             target_kind: DirtyTargetKind::EvidenceSurface,
@@ -1463,7 +1462,12 @@ async fn s25_keeps_the_production_store_at_four_tables() {
         .unwrap();
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec!["evertrace_search"]
+        vec![
+            "evertrace_journal",
+            "evertrace_objects",
+            "evertrace_relations",
+            "evertrace_search",
+        ]
     );
 }
 
@@ -5625,13 +5629,11 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         )
         .await
         .unwrap();
-    let snapshot =
-        evertrace_store::projections::CurrentFacts::try_from(handle.project().await.unwrap())
-            .unwrap();
+    let snapshot = handle.project().await.unwrap();
     // This is a synthetic provider, not an authenticated model. The candidate
     // still traverses the real provider DTO, synthesis, proposal and acceptance.
     let current_episode = snapshot
-        .other_data_rows()
+        .data_rows()
         .filter_map(|row| {
             let payload: JournalPayload =
                 serde_json::from_str(row.payload_json.as_deref()?).ok()?;
@@ -5728,7 +5730,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         });
     let generated = planner
         .execute(evertrace_engine::jobs::SynthesisRequest {
-            current: &snapshot,
+            snapshot: &snapshot,
             target: evertrace_engine::jobs::SynthesisTarget::Episode(current_episode.revision_id),
             trigger: evertrace_domain::semantic::SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![evertrace_engine::provider::ProtectedDeltaItem {

@@ -5,7 +5,6 @@ use evertrace_domain::{
     revision::RevisionId,
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path};
 
 use crate::dto::HumanGovernanceRequest;
 use crate::mcp::McpToolInput;
@@ -28,7 +27,6 @@ pub enum Command {
     RecoveryBarrier(RecoveryBarrierLocator),
     RequestRecovery(RequestRecoveryCommand),
     IssueMcpBinding(McpBindingIssueCommand),
-    ObserveSessionSource(ObserveSessionSourceCommand),
     McpCall(McpCallCommand),
     /// Internal stdio transport receipt, not a public MCP action.
     McpReturned {
@@ -89,33 +87,6 @@ pub struct McpBindingIssueCommand {
     pub transcript_path: Option<String>,
     pub original_input: McpToolInput,
     pub launcher_protocol_revision: u32,
-}
-
-/// Internal Hook-only observation request. It carries only fields from the
-/// native session locator; the daemon derives root, cut, trust, and S11 state.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ObserveSessionSourceCommand {
-    pub session_id: String,
-    pub transcript_path: String,
-    pub agent_id: Option<String>,
-}
-
-impl ObserveSessionSourceCommand {
-    pub fn validate(&self) -> bool {
-        !self.session_id.is_empty()
-            && self.session_id.len() <= 512
-            && !self.session_id.chars().any(char::is_control)
-            && self.transcript_path.len() <= 4096
-            && Path::new(&self.transcript_path).is_absolute()
-            && !Path::new(&self.transcript_path)
-                .components()
-                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-            && !self.transcript_path.chars().any(char::is_control)
-            && self.agent_id.as_deref().is_none_or(|value| {
-                !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
-            })
-    }
 }
 
 impl std::fmt::Debug for McpBindingIssueCommand {

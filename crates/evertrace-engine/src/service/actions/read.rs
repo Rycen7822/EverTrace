@@ -1195,9 +1195,8 @@ impl McpActionService {
             )
         } else {
             row.payload_json
-                .as_ref()
+                .clone()
                 .filter(|payload| payload.len() <= 8_192)
-                .map(|payload| payload.to_owned_string())
         };
         let payload_omitted = payload.is_none();
         let retained_forgotten_source = retained_forgotten_source(&scope.snapshot, row)?;

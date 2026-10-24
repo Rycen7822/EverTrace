@@ -215,17 +215,17 @@ impl ProductionSearch {
                 Vec::new()
             }
         };
-        let fts_ranks = fts
+        let fts_ids = fts
             .iter()
-            .enumerate()
-            .map(|(position, row)| (row.row_id.clone(), position))
-            .collect::<BTreeMap<_, _>>();
+            .map(|row| row.row_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut rows = structured;
         rows.extend(fts);
         rows.sort();
         rows.dedup_by(|left, right| left.row_id == right.row_id);
-        let mut ranked = Vec::with_capacity(rows.len());
-        for row in &rows {
+        let mut selected = BTreeMap::<String, (u8, SearchCandidate, &SearchProjectionRow)>::new();
+        let mut omitted_refs = BTreeSet::new();
+        for (row_index, row) in rows.iter().enumerate() {
             if row.candidate_id.is_none() || !hard_compatible(row, &context)? {
                 continue;
             }
@@ -240,46 +240,41 @@ impl ProductionSearch {
                 .candidate_id
                 .as_deref()
                 .is_some_and(|id| id == context.raw_query);
-            let rank = if exact || stable {
-                (0, 0)
-            } else if let Some(position) = fts_ranks.get(&row.row_id) {
-                (3, *position)
+            let origin = if exact || stable {
+                "exact"
+            } else if fts_ids.contains(&row.row_id) {
+                "fts"
             } else {
                 continue;
             };
-            ranked.push((rank, row));
-        }
-        ranked.sort_by(|(left_rank, left), (right_rank, right)| {
-            left_rank
-                .cmp(right_rank)
-                .then_with(|| left.candidate_id.cmp(&right.candidate_id))
-        });
-        let mut selected = BTreeMap::<String, (u8, SearchCandidate, &SearchProjectionRow)>::new();
-        let mut omitted_refs = BTreeSet::new();
-        for (row_index, (rank, row)) in ranked.iter().enumerate() {
-            let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
-            let origin = if rank.0 == 0 { "exact" } else { "fts" };
-            if let Some(entry) = selected.get_mut(&candidate_id) {
-                entry.1.retrieval_origins.insert(origin.into());
-                if fts_ranks.contains_key(&row.row_id) {
-                    entry.1.retrieval_origins.insert("fts".into());
-                }
-                continue;
-            }
             if context
                 .budget
                 .consume_candidate_text(row.text.len())
                 .is_err()
             {
-                omitted_refs.extend(
-                    ranked[row_index..]
+                for value in &rows[row_index..] {
+                    if value.candidate_id.is_none() || !hard_compatible(value, &context)? {
+                        continue;
+                    }
+                    let exact = context
+                        .query_facets
+                        .exact_identifiers
                         .iter()
-                        .filter_map(|(_, value)| value.candidate_id.as_ref())
-                        .filter(|id| !selected.contains_key(*id))
-                        .cloned(),
-                );
+                        .any(|identifier| {
+                            value.candidate_id.as_deref() == Some(identifier)
+                                || value.text.contains(identifier)
+                        });
+                    let stable = value
+                        .candidate_id
+                        .as_deref()
+                        .is_some_and(|id| id == context.raw_query);
+                    if exact || stable || fts_ids.contains(&value.row_id) {
+                        omitted_refs.extend(value.candidate_id.clone());
+                    }
+                }
                 break;
             }
+            let candidate_id = row.candidate_id.clone().ok_or(SearchError::Corrupt)?;
             let row_variant = match row.row_variant.as_str() {
                 "object" => evertrace_domain::query::SearchCandidateVariant::Object,
                 "evidence_surface" => {
@@ -289,7 +284,7 @@ impl ProductionSearch {
             };
             let entry = selected.entry(candidate_id.clone()).or_insert_with(|| {
                 (
-                    rank.0,
+                    if exact || stable { 0 } else { 3 },
                     SearchCandidate {
                         candidate_id,
                         source_ref: row.source_ref.clone().unwrap_or_default(),
@@ -306,24 +301,13 @@ impl ProductionSearch {
                     row,
                 )
             });
+            entry.0 = entry.0.min(if exact || stable { 0 } else { 3 });
             entry.1.retrieval_origins.insert(origin.into());
-            if fts_ranks.contains_key(&row.row_id) {
-                entry.1.retrieval_origins.insert("fts".into());
-            }
         }
         let mut candidates = selected.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
             left.0
                 .cmp(&right.0)
-                .then_with(|| {
-                    if left.0 == 3 {
-                        fts_ranks
-                            .get(&left.2.row_id)
-                            .cmp(&fts_ranks.get(&right.2.row_id))
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
                 .then_with(|| left.1.candidate_id.cmp(&right.1.candidate_id))
         });
         if candidates.len() > limit {
