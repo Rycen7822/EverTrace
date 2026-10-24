@@ -87,11 +87,12 @@ use evertrace_domain::{
         ProposalStatus,
     },
 };
+use evertrace_store::projections::CurrentFacts;
 use evertrace_store::{
     BackupError, BackupSummary, DirtyTargetKind, DurableJob, EventScope, JobBudget, JobLease,
     JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalCommand,
     JournalEventDraft, JournalPayload, QUIESCED_BACKUP_CREATE_JOB_KIND,
-    QUIESCED_BACKUP_VERIFY_JOB_KIND, RuntimeSchedulerView, SourceKind,
+    QUIESCED_BACKUP_VERIFY_JOB_KIND, RuntimeSchedulerView, SourceKind, restore::RestoreError,
 };
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
@@ -200,6 +201,9 @@ pub struct PackageUpgradeCheck {
     pub backup: std::path::PathBuf,
     pub migrated: bool,
     pub generation: Option<u64>,
+    /// A private native candidate was prepared for this check; it is discarded
+    /// unless publication was explicitly requested and completed.
+    pub native_prepared: bool,
     pub materials_validated: bool,
     pub candidate_native_verified: bool,
     pub candidate_daemon_verified: bool,
@@ -235,15 +239,29 @@ async fn resume_unpublished_service(
     original: Option<&evertrace_capture::ConfinedRoot>,
     eligible: bool,
 ) -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+
     if !eligible {
         return "withheld_uncertain";
     }
     let Some(original) = original else {
         return "withheld_unverified_native";
     };
+    let runtime_path = data.join("runtime");
+    let Ok(runtime) = evertrace_capture::ConfinedRoot::open_owned_private(&runtime_path) else {
+        return "withheld_unverified_native";
+    };
+    // Recovery filesystem roots may be public-readable, but the installed
+    // daemon runtime has the stricter existing 0700 contract.
+    if !std::fs::symlink_metadata(&runtime_path)
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o700)
+    {
+        return "withheld_unverified_native";
+    }
     if evertrace_store::restore::verify_package_resume(data, original)
         .await
         .is_err()
+        || runtime.revalidate_stable().is_err()
     {
         return "withheld_unverified_native";
     }
@@ -261,8 +279,115 @@ pub async fn verify_package_native(
     evertrace_store::restore::verify_package_native(native, cas).await
 }
 
+/// Mint one verified backup of the current isolated store for a package check.
+/// The caller owns exclusive writer access (service quiesced or no daemon); the
+/// store itself is never copied through a candidate locator.
+async fn create_check_backup(
+    data_dir: &Path,
+    config_path: &Path,
+) -> Result<
+    (
+        std::path::PathBuf,
+        evertrace_store::backup::BackupSummary,
+        evertrace_store::ClosedJournalWriter,
+    ),
+    RestoreError,
+> {
+    let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
+        .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
+    let mut writer = Some(
+        crate::jobs::open_writer(data_dir)
+            .await
+            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?,
+    );
+    let job_id = evertrace_domain::ids::JobId::new_v7();
+    let summary =
+        crate::jobs::create_quiesced_backup(&mut writer, job_id, config_path.to_owned(), runtime)
+            .await
+            .map_err(|_| RestoreError::Io)?
+            .map_err(|_| RestoreError::Io)?;
+    // The same sibling lock stays held, physically closed, through backup
+    // verification, native verification and package publish/rollback. It is
+    // released only immediately before the service is started again.
+    let mut writer = writer.take().ok_or(RestoreError::Io)?;
+    let guard = match writer.quiesce_for_backup().await? {
+        Some(guard) => guard,
+        // Known SQLite-busy checkpoint: the package check reports the typed
+        // failure and never swaps or publishes any directory.
+        None => return Err(RestoreError::Store(evertrace_store::StoreError::Io)),
+    };
+    let closed = writer.close_for_backup(guard)?;
+    Ok((
+        data_dir.join("backups").join(format!("backup-{job_id}")),
+        summary,
+        closed,
+    ))
+}
+
 /// Pre-publication only. The returned materials result never certifies a Host
 /// or package-ready state; the verified backup survives candidate disposal.
+/// Private scratch root for one package check. The native store is never
+/// copied or rewritten: only the candidate package materials and probes need
+/// an owned directory, removed on every ordinary exit.
+struct PackageCheckScratch {
+    path: std::path::PathBuf,
+    custody: Option<evertrace_capture::ConfinedRoot>,
+    retained: bool,
+}
+
+impl PackageCheckScratch {
+    fn create(data_dir: &Path) -> Result<Self, evertrace_store::restore::RestoreError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let parent = data_dir
+            .parent()
+            .ok_or(evertrace_store::StoreError::InvalidPath)?;
+        let name = data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(evertrace_store::StoreError::InvalidPath)?;
+        let path = parent.join(format!(
+            "{name}.package-check-{}",
+            evertrace_domain::ids::JobId::new_v7()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|_| evertrace_store::restore::RestoreError::Io)?;
+        let custody = evertrace_capture::ConfinedRoot::open_owned_private(&path)
+            .map_err(|_| evertrace_store::restore::RestoreError::Io)?;
+        Ok(Self {
+            path,
+            custody: Some(custody),
+            retained: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn retain(&mut self) {
+        self.retained = true;
+    }
+
+    fn cleanup(&mut self) -> Result<(), evertrace_store::restore::RestoreError> {
+        use evertrace_store::restore::RestoreError;
+        let custody = self.custody.as_ref().ok_or(RestoreError::Io)?;
+        custody.revalidate_stable().map_err(|_| RestoreError::Io)?;
+        std::fs::remove_dir_all(&self.path).map_err(|_| RestoreError::Io)?;
+        self.custody = None;
+        Ok(())
+    }
+}
+
+impl Drop for PackageCheckScratch {
+    fn drop(&mut self) {
+        if !self.retained && self.custody.is_some() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 pub async fn check_package_upgrade<F, Fut, G, Run>(
     data_dir: &Path,
     config_path: &Path,
@@ -360,6 +485,9 @@ where
         None
     };
     let mut may_resume = false;
+    // The preflight revalidation is captured before the validation block moves
+    // the preflight; the recovery path re-verifies the old side independently.
+    let preflight_original_ok = preflight.revalidate_original().is_ok();
     let result: Result<PackageUpgradeCheck, RestoreError> = async {
         let generation = preflight.generation();
         let preparation = evertrace_store::restore::prepare_native_upgrade(
@@ -376,12 +504,47 @@ where
                 return Err(error);
             }
         };
-        let NativeUpgradePreparation::Prepared(prepared) = preparation else {
-            may_resume = preflight.revalidate_original().is_ok();
-            return Err(evertrace_store::StoreError::InvalidInput.into());
+        let (mut prepared, mut retained_native) = match preparation {
+            NativeUpgradePreparation::Prepared(prepared) => (Some(prepared), Vec::new()),
+            NativeUpgradePreparation::Unchanged(outcome) => (
+                None,
+                match outcome {
+                    evertrace_store::restore::NativeUpgradeOutcome::Noop { retained_native } => {
+                        retained_native
+                    }
+                    evertrace_store::restore::NativeUpgradeOutcome::Empty => Vec::new(),
+                    evertrace_store::restore::NativeUpgradeOutcome::Published {
+                        retained_native,
+                        ..
+                    } => retained_native,
+                },
+            ),
         };
-        let backup = prepared.backup().to_owned();
-        let migrated = prepared.migrated();
+        // A retired layout was already converted into a private native-only
+        // candidate with its published v2 backup; a current store is validated
+        // read-only and left byte-for-byte in place. Package materials always
+        // live in their own scratch root and never pollute the candidate.
+        let mut scratch = PackageCheckScratch::create(data_dir)?;
+        let mut check_lock = None;
+        let native_prepared = prepared.is_some();
+        let (native, cas, backup, migrated) = if let Some(prepared) = prepared.as_ref() {
+            (
+                prepared.path().to_owned(),
+                prepared.backup().join("cas"),
+                prepared.backup().to_owned(),
+                prepared.migrated(),
+            )
+        } else {
+            let native = evertrace_store::connection::native_root(data_dir);
+            let cas = data_dir.join("cas");
+            // The check still mints a verified pre-upgrade backup of the
+            // current store even though the native itself is not republished;
+            // restore authority comes from that backup.
+            let (backup, _backup_summary, closed) =
+                create_check_backup(data_dir, config_path).await?;
+            check_lock = Some(closed);
+            (native, cas, backup, false)
+        };
         let mut candidate_native_verified = false;
         let mut candidate_daemon_verified = false;
         let mut candidate_host = None;
@@ -396,7 +559,7 @@ where
             runtime.recall_cues.clear();
             let materials = evertrace_codex::install::prepare_package_check(
                 preflight,
-                prepared.path(),
+                scratch.path(),
                 |destination| {
                     runtime
                         .publish(destination)
@@ -406,13 +569,9 @@ where
             .map_err(|_| RestoreError::Store(evertrace_store::StoreError::InvalidInput))?;
             let candidate_runtime = RuntimeSnapshot::load(&materials.runtime)
                 .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
-            probe_package_capture(prepared.path(), &materials.executable, &candidate_runtime)?;
-            run_package_native(
-                &package.join("evertraced"),
-                prepared.path(),
-                &backup.join("cas"),
-            )
-            .await?;
+            probe_package_capture(scratch.path(), &materials.executable, &candidate_runtime)?;
+            evertrace_store::restore::verify_package_native(&native, &cas).await?;
+            run_package_native(&package.join("evertraced"), &native, &cas).await?;
             candidate_native_verified = true;
             candidate_host =
                 probe_package_daemon(package, materials.generation, &health, live_host, &canary)
@@ -443,62 +602,109 @@ where
                     cause: Box::new(RestoreError::Io),
                 }
             })?;
-            let mut called = false;
-            let outcome = prepared
-                .publish_package(|| {
-                    called = true;
-                    let Ok(_guard) = fence.exclusive() else {
-                        return evertrace_store::restore::PackagePublication::Uncertain;
-                    };
-                    match materials.commit(data_dir, &RuntimeSnapshot::snapshot_path(data_dir)) {
-                        evertrace_codex::install::PackageCommit::Committed => {
-                            evertrace_store::restore::PackagePublication::Committed
-                        }
-                        evertrace_codex::install::PackageCommit::Restored
-                            if materials.discard_staged().is_ok() =>
+            if let Some(prepared) = prepared.take() {
+                // The native candidate is published first, then package assets
+                // commit; any package failure rolls the native back before a
+                // semantic writer resumes.
+                let mut called = false;
+                let outcome = prepared
+                    .publish_package(|| {
+                        called = true;
+                        let Ok(_guard) = fence.exclusive() else {
+                            return evertrace_store::restore::PackagePublication::Uncertain;
+                        };
+                        match materials
+                            .commit(data_dir, &RuntimeSnapshot::snapshot_path(data_dir))
                         {
-                            evertrace_store::restore::PackagePublication::Restored
+                            evertrace_codex::install::PackageCommit::Committed => {
+                                evertrace_store::restore::PackagePublication::Committed
+                            }
+                            evertrace_codex::install::PackageCommit::Restored
+                                if materials.discard_staged().is_ok() =>
+                            {
+                                evertrace_store::restore::PackagePublication::Restored
+                            }
+                            _ => evertrace_store::restore::PackagePublication::Uncertain,
                         }
-                        _ => evertrace_store::restore::PackagePublication::Uncertain,
-                    }
-                })
-                .await;
-            if !called
-                && outcome.is_err()
-                && !matches!(
-                    outcome,
-                    Err(RestoreError::NativePublicationUncertain { .. })
-                )
-            {
-                materials
-                    .discard_staged()
-                    .map_err(|_| RestoreError::ResidualCandidate {
-                        directory: data_dir.to_owned(),
-                        cause: Box::new(RestoreError::Io),
+                    })
+                    .await;
+                if !called
+                    && outcome.is_err()
+                    && !matches!(outcome, Err(RestoreError::NativePublicationUncertain { .. }))
+                {
+                    materials.discard_staged().map_err(|_| {
+                        RestoreError::ResidualCandidate {
+                            directory: data_dir.to_owned(),
+                            cause: Box::new(RestoreError::Io),
+                        }
                     })?;
-            }
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    if !matches!(
-                        error,
-                        RestoreError::NativePublicationUncertain { .. }
-                            | RestoreError::ResidualCandidate { .. }
-                    ) {
-                        may_resume = true;
+                }
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if !matches!(
+                            error,
+                            RestoreError::NativePublicationUncertain { .. }
+                                | RestoreError::ResidualCandidate { .. }
+                        ) {
+                            may_resume = true;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
+                };
+                retained_native = match outcome {
+                    evertrace_store::restore::NativeUpgradeOutcome::Published {
+                        retained_native,
+                        ..
+                    }
+                    | evertrace_store::restore::NativeUpgradeOutcome::Noop { retained_native } => {
+                        retained_native
+                    }
+                    evertrace_store::restore::NativeUpgradeOutcome::Empty => Vec::new(),
+                };
+            } else {
+                let published = {
+                    let Ok(_guard) = fence.exclusive() else {
+                        scratch.retain();
+                        return Err(RestoreError::ResidualCandidate {
+                            directory: scratch.path().to_owned(),
+                            cause: Box::new(RestoreError::Io),
+                        });
+                    };
+                    materials.commit(data_dir, &RuntimeSnapshot::snapshot_path(data_dir))
+                };
+                match published {
+                    evertrace_codex::install::PackageCommit::Committed => {}
+                    evertrace_codex::install::PackageCommit::Restored => {
+                        // The adapter rolled the package back to the previous
+                        // verified generation: an unpublished failure, never a
+                        // committed publication.
+                        materials.discard_staged().map_err(|_| {
+                            RestoreError::ResidualCandidate {
+                                directory: data_dir.to_owned(),
+                                cause: Box::new(RestoreError::Io),
+                            }
+                        })?;
+                        may_resume = preflight_original_ok;
+                        return Err(RestoreError::Io);
+                    }
+                    evertrace_codex::install::PackageCommit::Uncertain => {
+                        // An uncertain package commit may leave the registry or
+                        // a rollback still referencing the staged generation.
+                        // Never unlink assets that may be active or recoverable:
+                        // retain the scratch and return the typed uncertainty
+                        // without resuming the service.
+                        scratch.retain();
+                        return Err(RestoreError::NativePublicationUncertain {
+                            active: data_dir.to_owned(),
+                            preserved: scratch.path().to_owned(),
+                        });
+                    }
                 }
-            };
-            let retained_native = match outcome {
-                evertrace_store::restore::NativeUpgradeOutcome::Published {
-                    retained_native, ..
-                }
-                | evertrace_store::restore::NativeUpgradeOutcome::Noop { retained_native } => {
-                    retained_native
-                }
-                evertrace_store::restore::NativeUpgradeOutcome::Empty => Vec::new(),
-            };
+            }
+            // Publication is complete: release the sibling lock before the
+            // daemon is asked to reopen the store.
+            drop(check_lock.take());
             let resumed = if !retained_native.is_empty() {
                 Err(evertrace_codex::install::InstallError::Io)
             } else {
@@ -526,10 +732,12 @@ where
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
+            scratch.cleanup()?;
             return Ok(PackageUpgradeCheck {
                 backup,
                 migrated,
                 generation: Some(generation),
+                native_prepared,
                 materials_validated: true,
                 candidate_native_verified,
                 candidate_daemon_verified,
@@ -541,13 +749,23 @@ where
                 retained_native,
             });
         }
-        // Both failed and successful checks dispose only this owned candidate while
-        // the same sibling lock is still held. Unknown residuals are explicit errors.
-        if matches!(&validation, Err(RestoreError::ResidualCandidate { directory, .. }) if directory.starts_with(prepared.path()))
+        // Check-only (or failed validation) disposes exactly this owned
+        // prepared candidate before any status is reported. An unknown residual
+        // is still an explicit error, never silently adopted or deleted.
+        if let Some(prepared) = prepared.take() {
+            prepared.discard()?;
+        }
+        // Failed checks dispose only this owned scratch candidate; any unknown
+        // residual is an explicit error.
+        if matches!(&validation, Err(RestoreError::ResidualCandidate { directory, .. }) if directory.starts_with(scratch.path()))
         {
+            scratch.retain();
             return validation.map(|_| unreachable!());
         }
-        prepared.discard()?;
+        if let Err(error) = scratch.cleanup() {
+            scratch.retain();
+            return Err(error);
+        }
         if matches!(&validation, Err(RestoreError::ResidualCandidate { .. })) {
             return validation.map(|_| unreachable!());
         }
@@ -559,6 +777,7 @@ where
                 .as_ref()
                 .ok()
                 .map(|materials| materials.generation),
+            native_prepared,
             materials_validated: validation.is_ok(),
             candidate_native_verified,
             candidate_daemon_verified,
@@ -811,9 +1030,8 @@ where
         crate::recovery::finish_owned_child(&mut hook.0, true).map_err(|_| uncertain())?;
         hook_result?;
         loop {
-            let connection = evertrace_store::connection::CompatibilityStore::connect_local(&evertrace_store::connection::native_root(&root)).await.map_err(|_| invalid())?;
-            let journal = connection.connection().open_table(evertrace_store::JOURNAL_TABLE).execute().await.map_err(|_| invalid())?;
-            let payloads = evertrace_store::journal::read_all_journal_rows(&journal).await?.iter().map(|row| row.payload()).collect::<Result<Vec<_>, _>>()?;
+            let readers = evertrace_store::StoreReadHandle::open_read_only(&root).await.map_err(|_| invalid())?;
+            let payloads = readers.journal_rows().await.map_err(|_| invalid())?.iter().map(|row| row.payload()).collect::<Result<Vec<_>, _>>()?;
             let receipt = payloads.iter().find_map(|payload| match payload {
                 JournalPayload::SourceReceiptRecorded(receipt) if receipt.source_session_ref == "package-daemon-probe" => Some(receipt), _ => None,
             });
@@ -827,7 +1045,7 @@ where
                 if !payload.windows(b"package-daemon-probe".len()).any(|value| value == b"package-daemon-probe") { return Err(invalid()); }
                 break;
             }
-            drop(journal); drop(connection);
+            drop(readers);
             if tokio::time::Instant::now() >= deadline { return Err(invalid()); }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -866,7 +1084,14 @@ pub async fn restore_offline(
 ) -> Result<OfflineRestoreOutcome, evertrace_store::restore::RestoreError> {
     use evertrace_store::restore::{RestoreError, RestorePreparation};
     let at = now_us().map_err(|_| RestoreError::Io)?;
-    let preparation = evertrace_store::restore::prepare(data_dir, backup, at, config_hash).await?;
+    let preparation = evertrace_store::restore::prepare(
+        data_dir,
+        backup,
+        at,
+        config_hash,
+        verify_hook_backup_assets,
+    )
+    .await?;
     let RestorePreparation::Candidate(mut candidate) = preparation else {
         let RestorePreparation::Historical { directory } = preparation else {
             unreachable!()
@@ -1088,8 +1313,8 @@ async fn validate_restore_jobs(
     config: &evertrace_domain::config::EffectiveConfig,
     at: i64,
 ) -> Result<(), evertrace_store::restore::RestoreError> {
-    let snapshot = candidate.full_projection().await?;
-    let view = RuntimeSchedulerView::from_snapshot(&snapshot)?;
+    let snapshot = CurrentFacts::try_from(candidate.full_projection().await?)?;
+    let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
     for mut job in view
         .jobs
         .iter()
@@ -1147,7 +1372,7 @@ async fn validate_restore_jobs(
 }
 
 fn restore_job_is_current(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     view: &RuntimeSchedulerView,
     job: &DurableJob,
     config: &evertrace_domain::config::EffectiveConfig,
@@ -1177,7 +1402,7 @@ fn restore_job_is_current(
 /// Pure authoritative target checks, shared by offline preparation and the
 /// ordinary pre-lease boundary. Host manifests are additionally checked online.
 fn job_target_is_current(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     view: &RuntimeSchedulerView,
     job: &DurableJob,
     config_hash: [u8; 32],
@@ -1191,7 +1416,7 @@ fn job_target_is_current(
     if !source_synthesis
         && !(job.kind == crate::jobs::procedure::KIND
             && crate::jobs::procedure::has_source_target(job))
-        && job.target_watermark > snapshot.frontier
+        && job.target_watermark > snapshot.frontier()
     {
         return Ok(false);
     }
@@ -1226,7 +1451,7 @@ fn job_target_is_current(
                         && dirty.target_kind.as_str() == job.kind
                         && job.idempotency_key == format!("{}:{}", job.kind, dirty.target_id)
                         && snapshot
-                            .row(&format!("runtime:dirty:{}", dirty.stable_key()))
+                            .other_row(&format!("runtime:dirty:{}", dirty.stable_key()))
                             .is_some_and(|row| {
                                 row.source_event_seq == job.target_watermark
                                     && job.target_generation == row.source_event_seq.max(1)
@@ -1268,10 +1493,13 @@ fn job_target_is_current(
             if !valid_job {
                 false
             } else if let Ok(revision) = job.target_revision.parse() {
-                crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(snapshot)
-                    .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?
-                    .current_procedure_by_revision(revision)
-                    .is_some()
+                crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                    snapshot.frontier(),
+                    snapshot.other_rows(),
+                )
+                .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?
+                .current_procedure_by_revision(revision)
+                .is_some()
             } else {
                 false
             }
@@ -1292,26 +1520,31 @@ fn job_target_is_current(
                 && job.algorithm_revision == evertrace_store::QUIESCED_BACKUP_ALGORITHM_REVISION
         }
         evertrace_store::REPOSITORY_SCOPE_PURGE_JOB_KIND => {
-            evertrace_store::ScopePurgeCurrentView::from_snapshot(snapshot)?
-                .events
-                .values()
-                .any(|progress| {
-                    progress.purge_job_id == job.job_id
-                        && progress.deletion_generation == job.target_generation
-                        && progress.confirmation_frontier == job.target_watermark
-                        && progress.stage != evertrace_domain::purge::ScopePurgeStage::Purged
-                })
+            evertrace_store::ScopePurgeCurrentView::from_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )?
+            .events
+            .values()
+            .any(|progress| {
+                progress.purge_job_id == job.job_id
+                    && progress.deletion_generation == job.target_generation
+                    && progress.confirmation_frontier == job.target_watermark
+                    && progress.stage != evertrace_domain::purge::ScopePurgeStage::Purged
+            })
         }
         _ => return Err(evertrace_store::StoreError::InvalidInput),
     })
 }
 
 fn import_target_is_current(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<bool, evertrace_store::StoreError> {
-    let sessions =
-        evertrace_store::session_import::SessionImportCurrentView::from_snapshot(snapshot)?;
+    let sessions = evertrace_store::session_import::SessionImportCurrentView::from_rows(
+        snapshot.frontier(),
+        snapshot.other_rows(),
+    )?;
     Ok(sessions.sessions.values().any(|session| {
         job.idempotency_key == format!("session_import:{}", session.source_key())
             && job.target_revision == session.metadata.source_revision.as_str()
@@ -1406,7 +1639,7 @@ impl QuiescedBackupRequest {
 }
 
 struct ClaimedJob {
-    snapshot: evertrace_store::ProjectionSnapshot,
+    current: CurrentFacts,
     job: DurableJob,
     report: Option<OwnedRwLockReadGuard<Option<HostProbeReport>>>,
 }
@@ -1604,10 +1837,15 @@ impl BackgroundScheduler {
         let mut completed = 0;
         completed += self.run_gc_round().await?;
         let mut retryable = false;
-        if optional_allowed && self.import_settings.historical_metadata_backfill {
+        if optional_allowed {
             let report = self.report.read().await.clone();
             if let Some(report) = report.as_ref() {
-                match self.catalog.refresh(report).await {
+                let refresh = if self.import_settings.historical_metadata_backfill {
+                    self.catalog.refresh(report).await
+                } else {
+                    self.catalog.refresh_active(report).await
+                };
+                match refresh {
                     Ok(changed) => completed += changed,
                     Err(_) => retryable = true,
                 }
@@ -1617,13 +1855,25 @@ impl BackgroundScheduler {
         // Capture-backlog selection consumes current objects; ingest owns its
         // acknowledgement barrier and executable projection jobs sync below.
         let mut snapshot = if capture_state == CaptureAdmissionState::Normal && ordinary_pending {
-            self.writer.project_objects().await.map_err(map_writer)?
+            self.writer
+                .project_current(false)
+                .await
+                .map_err(map_writer)?
         } else {
-            self.writer.project().await.map_err(map_writer)?
+            self.writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?
         };
         if optional_allowed && let Some(inventory) = &self.inventory {
             match inventory.enqueue_observed(&snapshot).await {
-                Ok(true) => snapshot = self.writer.project().await.map_err(map_writer)?,
+                Ok(true) => {
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?
+                }
                 Ok(false) => {}
                 Err(crate::jobs::InventoryWorkerError::StaleFrontier) => retryable = true,
                 Err(crate::jobs::InventoryWorkerError::Store) => {
@@ -1632,7 +1882,7 @@ impl BackgroundScheduler {
             }
         }
         let recovery_now_us = now_us()?;
-        let recovery = expired_leases(&snapshot.rows, recovery_now_us, snapshot.frontier)
+        let recovery = expired_leases(snapshot.other_rows(), recovery_now_us, snapshot.frontier())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if !recovery.is_empty() {
             let events = recovery
@@ -1660,12 +1910,16 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, recovery_now_us, snapshot.frontier)
+                .commit_if_frontier(command, recovery_now_us, snapshot.frontier())
                 .await
             {
                 Ok(outcome) => {
                     completed += usize::from(!outcome.replayed);
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
                     return Ok(RunOnceOutcome {
@@ -1680,11 +1934,15 @@ impl BackgroundScheduler {
             }
         }
 
-        let mut view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let mut view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if self.seed_capture_artifacts(&snapshot, &view).await? {
-            snapshot = self.writer.project().await.map_err(map_writer)?;
-            view = RuntimeSchedulerView::from_snapshot(&snapshot)
+            snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                 .map_err(|_| BackgroundSchedulerError::Store)?;
         }
         let max_synthesis_wall_time = Duration::from_secs(self.dreaming.max_wall_time.seconds());
@@ -1701,7 +1959,9 @@ impl BackgroundScheduler {
                         && !import_job_is_current(job, self.runtime.effective_config_hash)
                         || matches!(
                             job.kind.as_str(),
-                            PROCEDURE_PROMOTION_JOB_KIND | PROCEDURE_USAGE_JOB_KIND
+                            PROCEDURE_PROMOTION_JOB_KIND
+                                | PROCEDURE_USAGE_JOB_KIND
+                                | crate::jobs::procedure::KIND
                         ) && job.state == JobStatus::Queued
                             && job.config_hash != self.runtime.effective_config_hash
                         || job.kind == "semantic_synthesis_v1"
@@ -1766,14 +2026,19 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(outcome) => {
                     completed += usize::from(!outcome.replayed);
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
                     return Ok(RunOnceOutcome {
@@ -1789,15 +2054,21 @@ impl BackgroundScheduler {
         }
         if optional_allowed {
             if self.enqueue_procedure_consumers(&snapshot, &view).await? {
-                snapshot = self.writer.project().await.map_err(map_writer)?;
-                view = RuntimeSchedulerView::from_snapshot(&snapshot)
+                snapshot = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
+                view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                     .map_err(|_| BackgroundSchedulerError::Store)?;
             }
             let occurred_at_us = now_us()?;
             let deadline = Instant::now() + Duration::from_millis(250);
-            let usage =
-                crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&snapshot)
-                    .map_err(|_| BackgroundSchedulerError::Store)?;
+            let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
             let cohorts = usage
                 .promotion_cohorts(
                     self.stable_min_outcome_supported,
@@ -1828,8 +2099,8 @@ impl BackgroundScheduler {
                                 "{PROCEDURE_PROMOTION_JOB_KIND}:{target_revision}"
                             ),
                             target_revision,
-                            target_watermark: snapshot.frontier,
-                            target_generation: snapshot.frontier.max(1),
+                            target_watermark: snapshot.frontier(),
+                            target_generation: snapshot.frontier().max(1),
                             kind: PROCEDURE_PROMOTION_JOB_KIND.into(),
                             algorithm_revision: PROCEDURE_PROMOTION_JOB_KIND.into(),
                             model_id: None,
@@ -1850,13 +2121,20 @@ impl BackgroundScheduler {
                     .map_err(|_| BackgroundSchedulerError::Store)?;
                 match self
                     .writer
-                    .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                    .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                     .await
                 {
                     Ok(_) => {
-                        snapshot = self.writer.project().await.map_err(map_writer)?;
-                        view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                            .map_err(|_| BackgroundSchedulerError::Store)?;
+                        snapshot = self
+                            .writer
+                            .project_current(true)
+                            .await
+                            .map_err(map_writer)?;
+                        view = RuntimeSchedulerView::from_rows(
+                            snapshot.frontier(),
+                            snapshot.other_rows(),
+                        )
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
                     }
                     Err(WriterActorError::StaleFrontier) => retryable = true,
                     Err(error) => return Err(map_writer(error)),
@@ -1943,13 +2221,18 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
                 Err(WriterActorError::StaleFrontier) => retryable = true,
                 Err(error) => return Err(map_writer(error)),
@@ -2009,16 +2292,6 @@ impl BackgroundScheduler {
                 })
                 .map(|job| job.target_revision.as_str())
                 .collect::<BTreeSet<_>>();
-            let capture_rows = snapshot
-                .data_rows()
-                .filter(|row| {
-                    matches!(
-                        row.object_kind.as_deref(),
-                        Some("source_observation" | "source_receipt")
-                    )
-                })
-                .map(|row| (row.row_id.as_str(), row))
-                .collect::<BTreeMap<_, _>>();
             capture_candidates
                 .into_values()
                 .filter(|dirty| {
@@ -2033,48 +2306,39 @@ impl BackgroundScheduler {
                         return Ok(Some(dirty.target_id));
                     }
                     let physical = physical_targets.contains(dirty.target_id.as_str());
+                    let observation_id = SourceObservationId::from_str(&dirty.target_id)
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    let (observation, _) = snapshot
+                        .source_observation(observation_id)
+                        .ok_or(BackgroundSchedulerError::Store)?;
+                    observation
+                        .validate()
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    let (receipt, _) = snapshot
+                        .source_receipt(observation.source_receipt_ref)
+                        .ok_or(BackgroundSchedulerError::Store)?;
+                    receipt
+                        .validate()
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    let weak_import = is_verified_importer_weak_normalization(
+                        &snapshot,
+                        dirty.target_kind,
+                        &dirty.target_id,
+                    );
                     if current_manifest.is_none()
                         && (!physical
                             || retained_manifests
                                 .get_or_insert_with(&load_retained_manifests)
                                 .is_empty())
+                        && !weak_import
                     {
                         return Ok(None);
                     }
-                    let read_payload = |id: &str| {
-                        let row = capture_rows
-                            .get(id)
-                            .ok_or(BackgroundSchedulerError::Store)?;
-                        serde_json::from_str::<JournalPayload>(
-                            row.payload_json
-                                .as_deref()
-                                .ok_or(BackgroundSchedulerError::Store)?,
-                        )
-                        .map_err(|_| BackgroundSchedulerError::Store)
-                    };
-                    let JournalPayload::SourceObservationRecorded(observation) = read_payload(
-                        &format!("object:evidence:source_observation:{}", dirty.target_id),
-                    )?
-                    else {
-                        return Err(BackgroundSchedulerError::Store);
-                    };
-                    observation
-                        .validate()
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
-                    let JournalPayload::SourceReceiptRecorded(receipt) = read_payload(&format!(
-                        "object:evidence:source_receipt:{}",
-                        observation.source_receipt_ref,
-                    ))?
-                    else {
-                        return Err(BackgroundSchedulerError::Store);
-                    };
-                    receipt
-                        .validate()
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
                     // The primary receipt is only a necessary admission condition;
                     // the complete dependency manifest check below remains authoritative.
                     let manifest = receipt.adapter_manifest_ref.as_str();
-                    Ok((current_manifest == Some(manifest)
+                    Ok((weak_import
+                        || current_manifest == Some(manifest)
                         || (physical
                             && retained_manifests
                                 .get_or_insert_with(&load_retained_manifests)
@@ -2180,7 +2444,13 @@ impl BackgroundScheduler {
                     && job.target_generation == item.source_event_seq.max(1)
                     && capture_job_is_current(job, self.runtime.effective_config_hash)
             });
-            if covered || resolve_capture_report(&item, report.as_ref(), &self.runtime).is_none() {
+            if covered
+                || (!is_verified_importer_weak_normalization(
+                    &snapshot,
+                    item.target_kind,
+                    &item.target_id,
+                ) && resolve_capture_report(&item, report.as_ref(), &self.runtime).is_none())
+            {
                 continue;
             }
             capture_jobs.push(DurableJob {
@@ -2218,13 +2488,18 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                 }
                 Err(WriterActorError::StaleFrontier) => {
                     self.capture_cursor.lock().await.rescan_pending = true;
@@ -2345,13 +2620,18 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
-                    snapshot = self.writer.project().await.map_err(map_writer)?;
-                    view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                    snapshot = self
+                        .writer
+                        .project_current(true)
+                        .await
+                        .map_err(map_writer)?;
+                    view =
+                        RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                            .map_err(|_| BackgroundSchedulerError::Store)?;
                     idle.refresh(&snapshot, &view)?;
                 }
                 Err(WriterActorError::StaleFrontier) => retryable = true,
@@ -2409,7 +2689,7 @@ impl BackgroundScheduler {
                 match claimed.job.kind.as_str() {
                     "support_closure" => {
                         completed += self
-                            .run_support_closure(&claimed.snapshot, &claimed.job)
+                            .run_support_closure(&claimed.current, &claimed.job)
                             .await?;
                     }
                     "capture_reconciliation" => {
@@ -2452,7 +2732,7 @@ impl BackgroundScheduler {
                 if claimed.job.kind != "objects_projection" {
                     return Err(BackgroundSchedulerError::Store);
                 }
-                if claimed.snapshot.frontier < claimed.job.target_watermark {
+                if claimed.current.frontier() < claimed.job.target_watermark {
                     retryable = true;
                     continue;
                 }
@@ -2480,7 +2760,7 @@ impl BackgroundScheduler {
                 .map_err(|_| BackgroundSchedulerError::Store)?;
                 match self
                     .writer
-                    .commit_if_frontier(command, occurred_at_us, claimed.snapshot.frontier)
+                    .commit_if_frontier(command, occurred_at_us, claimed.current.frontier())
                     .await
                 {
                     Ok(outcome) => completed += usize::from(!outcome.replayed),
@@ -2519,7 +2799,10 @@ impl BackgroundScheduler {
                     let progress = crate::jobs::reconcile_repository_scope_purge_batch(
                         &self.writer,
                         &self.runtime,
-                        claimed.snapshot,
+                        claimed
+                            .current
+                            .into_full_snapshot()
+                            .map_err(|_| BackgroundSchedulerError::Store)?,
                         &claimed.job,
                         &self.repository_purge_plans,
                     )
@@ -2605,7 +2888,7 @@ impl BackgroundScheduler {
                     continue;
                 }
                 if !self
-                    .synthesis_repository_allowed(&claimed.snapshot, &claimed.job)
+                    .synthesis_repository_allowed(&claimed.current, &claimed.job)
                     .await?
                 {
                     // Permission revalidation may itself record a revocation.
@@ -2617,7 +2900,7 @@ impl BackgroundScheduler {
                 let occurred_at_us = now_us()?;
                 let daily_wall_time = self
                     .synthesis
-                    .remaining_daily_wall_time(&claimed.snapshot, occurred_at_us)
+                    .remaining_daily_wall_time(&claimed.current, occurred_at_us)
                     .map_err(|_| BackgroundSchedulerError::Store)?;
                 let source_job = matches!(
                     evertrace_domain::semantic::SemanticJobTarget::parse(
@@ -2626,18 +2909,18 @@ impl BackgroundScheduler {
                     Ok(evertrace_domain::semantic::SemanticJobTarget::Source { .. })
                 );
                 let ClaimedJob {
-                    snapshot,
+                    current,
                     job,
                     report: claim_report,
                 } = claimed;
                 drop(claim_report);
-                let claim_frontier = snapshot.frontier;
+                let claim_frontier = current.frontier();
                 let execution_future = async {
                     if source_job {
                         let report = self.report.read().await.clone();
                         self.synthesis
                             .execute_source_job(
-                                snapshot,
+                                current,
                                 &job,
                                 self.runtime.effective_config_hash,
                                 occurred_at_us,
@@ -2650,17 +2933,17 @@ impl BackgroundScheduler {
                     } else {
                         self.synthesis
                             .execute_owned_episode_job(
-                                snapshot,
+                                current,
                                 &job,
                                 occurred_at_us,
                                 max_synthesis_wall_time,
                                 &self.writer,
                                 || async {
                                     let current =
-                                        self.writer.project().await.map_err(|_| {
+                                        self.writer.project_current(true).await.map_err(|_| {
                                             crate::provider::ProviderError::Transport
                                         })?;
-                                    if current.frontier == claim_frontier
+                                    if current.frontier() == claim_frontier
                                         && self
                                             .synthesis_repository_allowed(&current, &job)
                                             .await
@@ -2696,9 +2979,13 @@ impl BackgroundScheduler {
                             retryable |= result.retryable;
                             continue;
                         }
-                        let current = self.writer.project().await.map_err(map_writer)?;
+                        let current = self
+                            .writer
+                            .project_current(true)
+                            .await
+                            .map_err(map_writer)?;
                         if !self.synthesis_repository_allowed(&current, &job).await? {
-                            self.fail_stale(&job, current.frontier).await?;
+                            self.fail_stale(&job, current.frontier()).await?;
                             completed += 1;
                             continue;
                         }
@@ -2713,16 +3000,23 @@ impl BackgroundScheduler {
                         }
                     }
                     Ok(Err(_)) => {
-                        let current = self.writer.project().await.map_err(map_writer)?;
-                        if !RuntimeSchedulerView::from_snapshot(&current)
-                            .map_err(|_| BackgroundSchedulerError::Store)?
-                            .jobs
-                            .iter()
-                            .any(|current| current == &job)
+                        let current = self
+                            .writer
+                            .project_current(true)
+                            .await
+                            .map_err(map_writer)?;
+                        if !RuntimeSchedulerView::from_rows(
+                            current.frontier(),
+                            current.other_rows(),
+                        )
+                        .map_err(|_| BackgroundSchedulerError::Store)?
+                        .jobs
+                        .iter()
+                        .any(|current| current == &job)
                         {
                             continue;
                         }
-                        self.fail_stale(&job, current.frontier).await?;
+                        self.fail_stale(&job, current.frontier()).await?;
                         completed += 1;
                     }
                 }
@@ -2743,7 +3037,7 @@ impl BackgroundScheduler {
         remaining: Duration,
     ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
         let ClaimedJob {
-            snapshot,
+            current,
             job,
             report: claim_report,
         } = claimed;
@@ -2755,7 +3049,7 @@ impl BackgroundScheduler {
             crate::jobs::procedure::execute(
                 &self.writer,
                 &self.synthesis,
-                snapshot,
+                current,
                 &job,
                 report.as_ref(),
                 at,
@@ -2769,8 +3063,12 @@ impl BackgroundScheduler {
                 return Err(BackgroundSchedulerError::Store);
             }
             failure => {
-                let current = self.writer.project().await.map_err(map_writer)?;
-                if !RuntimeSchedulerView::from_snapshot(&current)
+                let current = self
+                    .writer
+                    .project_current(true)
+                    .await
+                    .map_err(map_writer)?;
+                if !RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows())
                     .map_err(|_| BackgroundSchedulerError::Store)?
                     .jobs
                     .iter()
@@ -2815,8 +3113,12 @@ impl BackgroundScheduler {
                     retryable: false,
                 });
             }
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             if !view.jobs.iter().any(|current| current == &job) {
                 return Ok(BackgroundProgress::default());
@@ -2848,7 +3150,7 @@ impl BackgroundScheduler {
             }
             match self
                 .writer
-                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier)
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier())
                 .await
             {
                 Ok(_) => {
@@ -2905,8 +3207,12 @@ impl BackgroundScheduler {
                     retryable: false,
                 });
             }
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let jobs = RuntimeSchedulerView::from_snapshot(&snapshot)
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let jobs = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
                 .map_err(|_| BackgroundSchedulerError::Store)?;
             if !jobs.jobs.iter().any(|current| current == job) {
                 return Ok(BackgroundProgress::default());
@@ -2921,7 +3227,7 @@ impl BackgroundScheduler {
             }
             let result = self
                 .writer
-                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier)
+                .commit_if_frontier(command.clone(), now_us()?, snapshot.frontier())
                 .await;
             if result.is_ok()
                 || self
@@ -2950,7 +3256,7 @@ impl BackgroundScheduler {
 
     async fn synthesis_repository_allowed(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         job: &DurableJob,
     ) -> Result<bool, BackgroundSchedulerError> {
         if matches!(
@@ -2972,7 +3278,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store);
         }
         let ids = snapshot
-            .data_rows()
+            .other_data_rows()
             .filter(|row| {
                 row.object_kind.as_deref() == Some("work_episode")
                     && row.current_revision_id.as_deref() == Some(job.target_revision.as_str())
@@ -3155,8 +3461,12 @@ impl BackgroundScheduler {
         leased: DurableJob,
         result: Result<BackupSummary, BackupError>,
     ) -> Result<BackgroundProgress, BackgroundSchedulerError> {
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let current = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(true)
+            .await
+            .map_err(map_writer)?;
+        let current = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?
             .jobs
             .into_iter()
@@ -3210,7 +3520,7 @@ impl BackgroundScheduler {
         .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
             .await
         {
             Ok(outcome) => Ok(BackgroundProgress {
@@ -3298,8 +3608,12 @@ impl BackgroundScheduler {
         &self,
         retryable: bool,
     ) -> Result<tokio::time::Instant, BackgroundSchedulerError> {
-        let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(false)
+            .await
+            .map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let dreaming = self.dreaming_for_wake().await?;
         let wake_at = tokio::time::Instant::now();
@@ -3422,12 +3736,15 @@ impl BackgroundScheduler {
 
     async fn run_support_closure(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         job: &DurableJob,
     ) -> Result<usize, BackgroundSchedulerError> {
         let (contract, current) = support_context(snapshot, job)?;
-        let semantic = evertrace_store::SemanticCurrentView::from_snapshot(snapshot)
-            .map_err(|_| BackgroundSchedulerError::Store)?;
+        let semantic = evertrace_store::SemanticCurrentView::from_rows(
+            snapshot.frontier(),
+            snapshot.other_rows(),
+        )
+        .map_err(|_| BackgroundSchedulerError::Store)?;
         let current_atom_revisions = semantic
             .atoms
             .values()
@@ -3504,7 +3821,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
             .await
         {
             Ok(outcome) => Ok(usize::from(!outcome.replayed)),
@@ -3529,14 +3846,14 @@ impl BackgroundScheduler {
             _ => return Err(BackgroundSchedulerError::Store),
         };
         let frontier = claimed
-            .snapshot
+            .current
             .reconciliation_frontier_for_observations(&[observation_id])
             .map_err(|_| BackgroundSchedulerError::Store)?;
         if frontier.items.is_empty() {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Succeeded,
                     JobTerminalReason::Completed,
                 )
@@ -3550,7 +3867,7 @@ impl BackgroundScheduler {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Failed,
                     JobTerminalReason::StaleGeneration,
                 )
@@ -3562,20 +3879,29 @@ impl BackgroundScheduler {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Failed,
                     JobTerminalReason::Unsupported,
                 )
                 .await;
         }
-        let Some(report) = resolve_capture_report(item, report_guard.as_ref(), &self.runtime)
-        else {
-            return Err(BackgroundSchedulerError::Store);
+        let adapter_manifests = if is_verified_importer_weak_normalization(
+            &claimed.current,
+            item.target_kind,
+            &item.target_id,
+        ) {
+            Vec::new()
+        } else {
+            let Some(report) = resolve_capture_report(item, report_guard.as_ref(), &self.runtime)
+            else {
+                return Err(BackgroundSchedulerError::Store);
+            };
+            vec![report.manifest().clone()]
         };
         let reconciliation = reconcile_observations_once(
             ReconcileInput {
                 runtime_snapshot: self.runtime.clone(),
-                adapter_manifests: vec![report.manifest().clone()],
+                adapter_manifests,
                 liveness: Vec::new(),
                 reconciled_gaps: Vec::new(),
                 reconciled_outages: Vec::new(),
@@ -3590,8 +3916,12 @@ impl BackgroundScheduler {
         )
         .await;
         drop(report_guard);
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(true)
+            .await
+            .map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let current = view
             .jobs
@@ -3634,13 +3964,13 @@ impl BackgroundScheduler {
                 ),
             }
         };
-        self.finish_job(&current, snapshot.frontier, outcome, reason)
+        self.finish_job(&current, snapshot.frontier(), outcome, reason)
             .await
     }
 
     async fn enqueue_procedure_consumers(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         runtime: &RuntimeSchedulerView,
     ) -> Result<bool, BackgroundSchedulerError> {
         let at = now_us()?;
@@ -3725,10 +4055,15 @@ impl BackgroundScheduler {
                 .ok_or(BackgroundSchedulerError::Store)?;
             let contextual_watermark = [None, row.workstream_id.as_deref()]
                 .into_iter()
-                .filter_map(|stream| candidates.context_watermarks.get(&(task, stream)).copied())
+                .filter_map(|stream| {
+                    candidates
+                        .context_watermarks
+                        .get(&(task.to_owned(), stream.map(str::to_owned)))
+                        .copied()
+                })
                 .max()
                 .unwrap_or(0);
-            let packet = crate::procedure::ProcedureUsageCurrentView::execution_snapshot(
+            let packet = crate::procedure::ProcedureUsageCurrentView::execution_rows(
                 snapshot,
                 usage.procedure_usage_id,
                 &budget,
@@ -3736,9 +4071,11 @@ impl BackgroundScheduler {
             )
             .map_err(|_| BackgroundSchedulerError::Store)?;
             if let Some(packet) = &packet {
-                let control =
-                    crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(packet)
-                        .map_err(|_| BackgroundSchedulerError::Store)?;
+                let control = crate::procedure::ProcedureUsageCurrentView::from_execution_rows(
+                    snapshot.frontier(),
+                    packet,
+                )
+                .map_err(|_| BackgroundSchedulerError::Store)?;
                 if !control
                     .pending_usage_ids()
                     .any(|id| id == usage.procedure_usage_id)
@@ -3748,7 +4085,7 @@ impl BackgroundScheduler {
             }
             let watermark = packet
                 .as_ref()
-                .map(crate::procedure::procedure_input_watermark)
+                .map(|rows| crate::procedure::procedure_input_watermark_rows(rows))
                 .unwrap_or(contextual_watermark)
                 .max(1);
             if jobs.iter().any(|job| {
@@ -3790,7 +4127,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, at, snapshot.frontier)
+            .commit_if_frontier(command, at, snapshot.frontier())
             .await
         {
             Ok(_) => Ok(true),
@@ -3811,9 +4148,14 @@ impl BackgroundScheduler {
         // The operation clone owns the configuration admitted for this claim.
         // Fresh evidence and authorization are re-read; configuration is not.
         for _ in 0..3 {
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let runtime = RuntimeSchedulerView::from_snapshot(&snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let runtime =
+                RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
             if !runtime.jobs.iter().any(|job| job == &claimed.job) {
                 return Ok(BackgroundProgress::default());
             }
@@ -3831,7 +4173,7 @@ impl BackgroundScheduler {
                     .target_revision
                     .parse()
                     .map_err(|_| BackgroundSchedulerError::Store)?;
-                match crate::procedure::ProcedureUsageCurrentView::execution_snapshot(
+                match crate::procedure::ProcedureUsageCurrentView::execution_rows(
                     &snapshot,
                     id,
                     &claimed.job.budget,
@@ -3841,7 +4183,8 @@ impl BackgroundScheduler {
                 {
                     Some(packet) => {
                         let view =
-                            crate::procedure::ProcedureUsageCurrentView::from_execution_snapshot(
+                            crate::procedure::ProcedureUsageCurrentView::from_execution_rows(
+                                snapshot.frontier(),
                                 &packet,
                             )
                             .map_err(|_| BackgroundSchedulerError::Store)?;
@@ -3924,7 +4267,7 @@ impl BackgroundScheduler {
                 .collect::<Vec<_>>();
             let result = self
                 .writer
-                .commit_if_frontier(command, at, snapshot.frontier)
+                .commit_if_frontier(command, at, snapshot.frontier())
                 .await;
             if result.is_ok()
                 || self
@@ -3969,9 +4312,11 @@ impl BackgroundScheduler {
         );
         let deadline = Instant::now()
             + remaining_lease.min(Duration::from_millis(claimed.job.budget.max_wall_time_ms));
-        let view =
-            crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&claimed.snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+        let view = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+            claimed.current.frontier(),
+            claimed.current.other_rows(),
+        )
+        .map_err(|_| BackgroundSchedulerError::Store)?;
         let mut cohorts = view
             .promotion_cohorts(
                 self.stable_min_outcome_supported,
@@ -3991,7 +4336,7 @@ impl BackgroundScheduler {
             return self
                 .finish_job(
                     &claimed.job,
-                    claimed.snapshot.frontier,
+                    claimed.current.frontier(),
                     JobTerminalOutcome::Failed,
                     JobTerminalReason::StaleGeneration,
                 )
@@ -4000,15 +4345,22 @@ impl BackgroundScheduler {
         // The exact cohort and threshold belong to this claim. A fresh frontier
         // may admit unrelated writes, but cannot replace a changed usage/revision.
         for _ in 0..3 {
-            let snapshot = self.writer.project().await.map_err(map_writer)?;
-            let runtime = RuntimeSchedulerView::from_snapshot(&snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let snapshot = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(map_writer)?;
+            let runtime =
+                RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
+                    .map_err(|_| BackgroundSchedulerError::Store)?;
             if !runtime.jobs.iter().any(|job| job == &claimed.job) {
                 return Ok(BackgroundProgress::default());
             }
-            let view =
-                crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&snapshot)
-                    .map_err(|_| BackgroundSchedulerError::Store)?;
+            let view = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
             let occurred_at_us = now_us()?;
             let promotion = crate::procedure::promote_procedure_from_cohort(
                 &view,
@@ -4028,7 +4380,7 @@ impl BackgroundScheduler {
                     return self
                         .finish_job(
                             &claimed.job,
-                            snapshot.frontier,
+                            snapshot.frontier(),
                             JobTerminalOutcome::Failed,
                             JobTerminalReason::StaleGeneration,
                         )
@@ -4064,7 +4416,7 @@ impl BackgroundScheduler {
                 .collect::<Vec<_>>();
             let result = self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await;
             if result.is_ok()
                 || self
@@ -4171,8 +4523,12 @@ impl BackgroundScheduler {
         } else {
             None
         };
-        let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(false)
+            .await
+            .map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let Some(current) = view.jobs.iter().find(|job| job.job_id == selected.job_id) else {
             // A repository purge may remove a queued selection while an earlier
@@ -4214,7 +4570,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
             match self
                 .writer
-                .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+                .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
                 .await
             {
                 Ok(_) | Err(WriterActorError::StaleFrontier) => {}
@@ -4252,7 +4608,12 @@ impl BackgroundScheduler {
                     item.target_kind == expected_kind
                         && item.target_id == current.target_revision
                         && item.source_event_seq == current.target_watermark
-                        && resolve_capture_report(item, report.as_ref(), &self.runtime).is_some()
+                        && (is_verified_importer_weak_normalization(
+                            &snapshot,
+                            item.target_kind,
+                            &item.target_id,
+                        ) || resolve_capture_report(item, report.as_ref(), &self.runtime)
+                            .is_some())
                 })
             {
                 return Ok(None);
@@ -4278,7 +4639,7 @@ impl BackgroundScheduler {
                 return Ok(None);
             }
             if current.attempt >= 6 {
-                fail_exhausted_llm_job(&self.writer, current, snapshot.frontier, occurred_at_us)
+                fail_exhausted_llm_job(&self.writer, current, snapshot.frontier(), occurred_at_us)
                     .await?;
                 return Ok(None);
             }
@@ -4321,15 +4682,20 @@ impl BackgroundScheduler {
         .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, occurred_at_us, snapshot.frontier)
+            .commit_if_frontier(command, occurred_at_us, snapshot.frontier())
             .await
         {
             Ok(_) => {
                 drop(view);
                 drop(snapshot);
-                let snapshot = self.writer.project_objects().await.map_err(map_writer)?;
-                let view = RuntimeSchedulerView::from_snapshot(&snapshot)
-                    .map_err(|_| BackgroundSchedulerError::Store)?;
+                let current = self
+                    .writer
+                    .project_current(false)
+                    .await
+                    .map_err(map_writer)?;
+                let view =
+                    RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows())
+                        .map_err(|_| BackgroundSchedulerError::Store)?;
                 let job = view
                     .jobs
                     .into_iter()
@@ -4340,7 +4706,7 @@ impl BackgroundScheduler {
                     })
                     .ok_or(BackgroundSchedulerError::Store)?;
                 Ok(Some(ClaimedJob {
-                    snapshot,
+                    current,
                     job,
                     report,
                 }))
@@ -4459,6 +4825,74 @@ fn is_capture_job(job: &DurableJob) -> bool {
         job.kind.as_str(),
         "physical_normalization" | "capture_reconciliation"
     )
+}
+
+fn is_verified_importer_weak_normalization(
+    current: &CurrentFacts,
+    target_kind: DirtyTargetKind,
+    target_id: &str,
+) -> bool {
+    if target_kind != DirtyTargetKind::PhysicalNormalization {
+        return false;
+    }
+    let Ok(observation_id) = SourceObservationId::from_str(target_id) else {
+        return false;
+    };
+    let Some((observation, _)) = current.source_observation(observation_id) else {
+        return false;
+    };
+    if observation.validate().is_err() {
+        return false;
+    }
+    let Some((receipt, _)) = current.source_receipt(observation.source_receipt_ref) else {
+        return false;
+    };
+    if receipt.validate().is_err() {
+        return false;
+    }
+    let correlation = &observation.correlation;
+    observation.source_role == evertrace_domain::evidence::SourceRole::Imported
+        && observation.content_trust == evertrace_domain::evidence::ContentTrust::ImportedClaim
+        && observation.source_instance_id == receipt.source_instance_id
+        && observation.source_revision == receipt.source_revision
+        && observation.source_record_identity == receipt.source_record_identity
+        && observation.source_receipt_ref == receipt.source_receipt_id
+        && receipt.source_observation_id == observation.source_observation_id
+        && receipt.source_kind == evertrace_domain::evidence::EvidenceSourceKind::CodexSessionJsonl
+        && evertrace_store::is_session_import_source(receipt.source_instance_id.as_str())
+        && receipt.identity_domain == "codex-session-jsonl-v1"
+        && receipt.source_ref.strip_prefix("session:") == Some(receipt.source_session_ref.as_str())
+        && receipt.adapter_manifest_ref == "codex-session-import-v1"
+        && receipt.eligible_event_manifest_ref == "codex-session-import-events-v1"
+        && receipt.adapter_revision == 1
+        && receipt.parser_revision == 1
+        && receipt.canonicalization_revision == 1
+        && observation.adapter_revision == receipt.adapter_revision
+        && correlation.occurrence_schema_version == 1
+        && correlation.adapter_revision == receipt.adapter_revision
+        && correlation.adapter_manifest_ref == receipt.adapter_manifest_ref
+        && observation.parser_revision == receipt.parser_revision
+        && observation.canonicalization_revision == receipt.canonicalization_revision
+        && observation.detector_revision == receipt.detector_revision
+        && observation.redaction_revision == receipt.redaction_revision
+        && observation.identity_strength == receipt.identity_strength
+        && observation.capture_completeness == receipt.capture_completeness
+        && observation.observation_role == receipt.observation_role
+        && correlation.pairing_role == receipt.observation_role
+        && correlation.admission == evertrace_domain::evidence::CorrelationAdmission::Unavailable
+        && correlation.host_instance_id.is_none()
+        && correlation.host_trace_lineage_id.is_none()
+        && correlation.host_lane_key.is_none()
+        && correlation.canonical_event_family.is_none()
+        && correlation.native_request_id.is_none()
+        && correlation.physical_execution_ordinal.is_none()
+        && correlation.field_provenance.is_empty()
+        && correlation.strong_gate_receipt_ref.is_none()
+        && correlation.partial_correlation_ref.is_none()
+        && correlation.possible_duplicate_group_id.is_none()
+        && observation.source_local_evidence.is_none()
+        && observation.scope_effect_claims.is_empty()
+        && receipt.lifecycle.is_none()
 }
 
 fn capture_item_manifest_matches(
@@ -4697,13 +5131,13 @@ fn job_lane(job: &DurableJob) -> BackgroundLane {
 }
 
 fn support_context(
-    snapshot: &evertrace_store::ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<(GlobalSuccessorSupportContract, GlobalSupportValidationEvent), BackgroundSchedulerError>
 {
     let mut contracts = Vec::new();
     let mut validations = Vec::new();
-    for row in snapshot.data_rows() {
+    for row in snapshot.other_data_rows() {
         if evertrace_store::session_import::restore_current(row)
             .map_err(|_| BackgroundSchedulerError::Store)?
             .is_some()
@@ -4776,7 +5210,7 @@ struct SynthesisIdle {
 impl SynthesisIdle {
     fn refresh(
         &mut self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         runtime: &RuntimeSchedulerView,
     ) -> Result<(), BackgroundSchedulerError> {
         let targets = runtime
@@ -4789,7 +5223,7 @@ impl SynthesisIdle {
             .map(|job| job.target_revision.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         let mut scopes = BTreeMap::new();
-        for row in snapshot.data_rows().filter(|row| {
+        for row in snapshot.other_data_rows().filter(|row| {
             matches!(
                 row.object_kind.as_deref(),
                 Some("revision_proposal_revision" | "procedure_revision")
@@ -4841,7 +5275,7 @@ impl SynthesisIdle {
         }
         self.procedure_scopes = scopes;
         let attribution_rows = snapshot
-            .data_rows()
+            .other_data_rows()
             .filter(|row| {
                 matches!(
                     row.object_kind.as_deref(),
@@ -4851,7 +5285,7 @@ impl SynthesisIdle {
             .map(|row| (row.row_id.clone(), row.source_event_seq))
             .collect::<BTreeMap<_, _>>();
         let episode_rows = snapshot
-            .data_rows()
+            .other_data_rows()
             .filter(|row| row.object_kind.as_deref() == Some("work_episode"))
             .map(|row| (row.row_id.clone(), row.source_event_seq))
             .collect::<BTreeMap<_, _>>();
@@ -4869,15 +5303,17 @@ impl SynthesisIdle {
             self.episode_rows = episode_rows;
         }
         let receipt_rows = snapshot
-            .data_rows()
-            .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-            .map(|row| {
+            .source_receipts()
+            .map(|(receipt, seq)| {
                 (
-                    row.row_id.clone(),
+                    format!(
+                        "object:evidence:source_receipt:{}",
+                        receipt.source_receipt_id
+                    ),
                     (
-                        row.source_event_seq,
-                        row.repository_id.clone(),
-                        row.worktree_id.clone(),
+                        seq,
+                        receipt.repository_instance_id.map(|id| id.to_string()),
+                        receipt.worktree_instance_id.map(|id| id.to_string()),
                     ),
                 )
             })
@@ -4888,11 +5324,14 @@ impl SynthesisIdle {
             .any(|(id, seq)| receipt_rows.get(id) != Some(seq));
         if episode_attribution_changed || attribution_rows != self.attribution_rows {
             let mut observations = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
-            let bindings = evertrace_store::WorkBindingCurrentView::from_snapshot(snapshot)
-                .map_err(|_| BackgroundSchedulerError::Store)?;
+            let bindings = evertrace_store::WorkBindingCurrentView::from_rows(
+                snapshot.frontier(),
+                snapshot.other_rows(),
+            )
+            .map_err(|_| BackgroundSchedulerError::Store)?;
             let mut operations = BTreeMap::new();
             for row in snapshot
-                .data_rows()
+                .other_data_rows()
                 .filter(|row| row.object_kind.as_deref() == Some("operation"))
             {
                 let JournalPayload::OperationDerived(operation) = serde_json::from_str(
@@ -4956,27 +5395,19 @@ impl SynthesisIdle {
             self.local.clear();
             self.source_scopes.clear();
         }
-        for row in snapshot
-            .data_rows()
-            .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-        {
-            let stamp = (
-                row.source_event_seq,
-                row.repository_id.clone(),
-                row.worktree_id.clone(),
+        for (receipt, seq) in snapshot.source_receipts() {
+            let row_id = format!(
+                "object:evidence:source_receipt:{}",
+                receipt.source_receipt_id
             );
-            if self.receipts.get(&row.row_id) == Some(&stamp) {
+            let stamp = (
+                seq,
+                receipt.repository_instance_id.map(|id| id.to_string()),
+                receipt.worktree_instance_id.map(|id| id.to_string()),
+            );
+            if self.receipts.get(&row_id) == Some(&stamp) {
                 continue;
             }
-            let JournalPayload::SourceReceiptRecorded(receipt) = serde_json::from_str(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(BackgroundSchedulerError::Store)?,
-            )
-            .map_err(|_| BackgroundSchedulerError::Store)?
-            else {
-                return Err(BackgroundSchedulerError::Store);
-            };
             receipt
                 .validate()
                 .map_err(|_| BackgroundSchedulerError::Store)?;
@@ -4997,7 +5428,7 @@ impl SynthesisIdle {
                 receipt.source_observation_id,
                 receipt.recorded_at_us,
             );
-            self.receipts.insert(row.row_id.clone(), stamp);
+            self.receipts.insert(row_id, stamp);
         }
         Ok(())
     }
@@ -5097,7 +5528,7 @@ impl SynthesisIdle {
 
     fn job_ready(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         job: &DurableJob,
         config: &evertrace_domain::config::DreamingConfig,
         now: i64,
@@ -5163,7 +5594,7 @@ impl SynthesisIdle {
 
     fn select(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &CurrentFacts,
         view: &RuntimeSchedulerView,
         capture: CaptureAdmissionState,
         ordinary_pending: bool,
@@ -5232,6 +5663,65 @@ fn map_writer(error: WriterActorError) -> BackgroundSchedulerError {
 mod idle_tests {
     use super::*;
     use evertrace_domain::{ids::*, revision::RevisionId, work::*};
+
+    fn empty_current(frontier: u64) -> CurrentFacts {
+        CurrentFacts::try_from(evertrace_store::ProjectionSnapshot {
+            frontier,
+            rows: vec![evertrace_store::ObjectRow::checkpoint(frontier, 1)],
+        })
+        .unwrap()
+    }
+
+    fn current_with_receipt(
+        snapshot: &evertrace_store::ProjectionSnapshot,
+        receipt: &evertrace_domain::evidence::SourceReceipt,
+        receipt_seq: u64,
+        frontier: u64,
+    ) -> Result<CurrentFacts, evertrace_store::StoreError> {
+        use evertrace_store::{ObjectFamily, ObjectRow, ObjectRowClass, ObjectRowKind};
+
+        let mut rows = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                row.row_kind != ObjectRowKind::Checkpoint
+                    && row.object_kind.as_deref() != Some("source_receipt")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let id = receipt.source_receipt_id.to_string();
+        rows.push(ObjectRow {
+            row_id: format!("object:evidence:source_receipt:{id}"),
+            row_kind: ObjectRowKind::Data,
+            row_class: Some(ObjectRowClass::Object),
+            object_family: Some(ObjectFamily::Evidence),
+            object_kind: Some("source_receipt".into()),
+            object_id: Some(id.clone()),
+            current_revision_id: Some(id),
+            lifecycle: Some("immutable".into()),
+            epistemic: Some("observed".into()),
+            authority: Some("none".into()),
+            publication_state: None,
+            support_state: None,
+            project_id: None,
+            repository_id: receipt
+                .repository_instance_id
+                .map(|value| value.to_string()),
+            worktree_id: receipt.worktree_instance_id.map(|value| value.to_string()),
+            task_id: receipt.task_id.map(|value| value.to_string()),
+            workstream_id: None,
+            session_id: None,
+            payload_json: Some(
+                JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone()))
+                    .canonical_json()?
+                    .into(),
+            ),
+            source_event_seq: receipt_seq,
+            projection_generation: 1,
+        });
+        rows.push(ObjectRow::checkpoint(frontier, 1));
+        CurrentFacts::try_from(evertrace_store::ProjectionSnapshot { frontier, rows })
+    }
 
     #[test]
     fn capture_scan_is_finite_and_rescans_notifications_without_starvation() {
@@ -5627,7 +6117,7 @@ mod idle_tests {
         row.row_id = id;
         row.row_kind = evertrace_store::ObjectRowKind::Data;
         row.object_kind = Some(kind.into());
-        row.payload_json = Some(payload.canonical_json().unwrap());
+        row.payload_json = Some(payload.canonical_json().unwrap().into());
         row
     }
 
@@ -5688,10 +6178,7 @@ mod idle_tests {
         };
         assert_eq!(
             idle.select(
-                &evertrace_store::ProjectionSnapshot {
-                    frontier: 100,
-                    rows: vec![]
-                },
+                &empty_current(100),
                 &view,
                 CaptureAdmissionState::Normal,
                 false,
@@ -5710,10 +6197,7 @@ mod idle_tests {
         stale_view.jobs.push(stale.clone());
         let selected = idle
             .select(
-                &evertrace_store::ProjectionSnapshot {
-                    frontier: 100,
-                    rows: vec![],
-                },
+                &empty_current(100),
                 &stale_view,
                 CaptureAdmissionState::Normal,
                 false,
@@ -5729,15 +6213,7 @@ mod idle_tests {
         );
         // Activity observed at fresh claim makes the formerly selected target busy.
         idle.record((quiet.repository_instance_id, None), observation, now);
-        assert!(!idle.job_ready(
-            &evertrace_store::ProjectionSnapshot {
-                frontier: 100,
-                rows: vec![]
-            },
-            &planned[0],
-            &config,
-            now
-        ));
+        assert!(!idle.job_ready(&empty_current(100), &planned[0], &config, now));
         let tree_a = WorktreeId::new_v7();
         let tree_b = WorktreeId::new_v7();
         quiet.worktree_instance_id = Some(tree_a);
@@ -5873,9 +6349,10 @@ mod idle_tests {
             "receipt".into(),
             JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
         ));
+        let current = current_with_receipt(&snapshot, &receipt, 9, 9).unwrap();
         idle.refresh(
-            &snapshot,
-            &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+            &current,
+            &RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows()).unwrap(),
         )
         .unwrap();
         let config = evertrace_domain::config::DreamingConfig::default();
@@ -5895,41 +6372,25 @@ mod idle_tests {
                 .unwrap()
                 .is_zero()
         );
-        // Deliberately unreadable cached payload proves subsequent claims only
-        // inspect unchanged metadata. A new source event must be decoded.
-        snapshot.rows.last_mut().unwrap().payload_json = Some("invalid".into());
+        // Repeated current facts keep the same typed receipt admission metadata.
         for frontier in 10..13 {
-            snapshot.frontier = frontier;
+            let current = current_with_receipt(&snapshot, &receipt, 9, frontier).unwrap();
             idle.refresh(
-                &snapshot,
-                &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+                &current,
+                &RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows()).unwrap(),
             )
             .unwrap();
         }
         assert_eq!(idle.decoded_receipts, 1);
         let mut future = receipt.clone();
         future.event_time_us = i64::MAX;
-        snapshot.rows.last_mut().unwrap().payload_json = Some(
-            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(future)))
-                .unwrap(),
-        );
-        snapshot.rows.last_mut().unwrap().source_event_seq = 13;
-        assert!(
-            idle.refresh(
-                &snapshot,
-                &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap()
-            )
-            .is_err()
-        );
+        assert!(current_with_receipt(&snapshot, &future, 13, 13).is_err());
         let mut fresh = receipt;
         fresh.recorded_at_us = 2_000_000_000;
-        snapshot.rows.last_mut().unwrap().payload_json = Some(
-            serde_json::to_string(&JournalPayload::SourceReceiptRecorded(Box::new(fresh))).unwrap(),
-        );
-        snapshot.rows.last_mut().unwrap().source_event_seq = 14;
+        let current = current_with_receipt(&snapshot, &fresh, 14, 14).unwrap();
         idle.refresh(
-            &snapshot,
-            &RuntimeSchedulerView::from_snapshot(&snapshot).unwrap(),
+            &current,
+            &RuntimeSchedulerView::from_rows(current.frontier(), current.other_rows()).unwrap(),
         )
         .unwrap();
         assert_eq!(idle.decoded_receipts, 2);

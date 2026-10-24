@@ -1,8 +1,12 @@
 #[path = "../src/provider.rs"]
 #[allow(dead_code)]
 mod provider_stub;
-
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use evertrace_capture::{
     DeviceKeyStore, RUNTIME_SNAPSHOT_VERSION, RecallCueGateMode, RecoveryGateMode, RuntimeSnapshot,
@@ -18,13 +22,17 @@ use evertrace_engine::{
     spawn_writer,
 };
 use evertrace_store::{
-    JobStatus, JournalPayload, JournalWriter, SemanticCurrentView, SessionBodyState,
-    SessionImportCurrentView,
+    CurrentFacts, JobStatus, JournalPayload, JournalWriter, RuntimeSchedulerView,
+    SemanticCurrentView, SessionBodyState, SessionImportCurrentView,
 };
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 
 const CONFIG: [u8; 32] = [28; 32];
+
+fn source_observation_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(2)
+}
 
 fn runtime(root: &std::path::Path) -> RuntimeSnapshot {
     RuntimeSnapshot {
@@ -110,6 +118,293 @@ enum InflightInterruption {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_method_independent_append_remains_live_after_first_proposal() {
     Box::pin(imported_messages_scenario(true, false, None, true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_weak_observation_normalizes_without_host_report_and_survives_reopen() {
+    use evertrace_engine::{BackgroundScheduler, SynthesisPlanner};
+
+    let temp = TempDir::new().unwrap();
+    let adapter = temp.path().join("adapter");
+    let sessions = adapter.join("sessions");
+    let dated = sessions.join("2026/08/30");
+    fs::create_dir_all(&dated).unwrap();
+    for path in [
+        &adapter,
+        &sessions,
+        &sessions.join("2026"),
+        &sessions.join("2026/08"),
+        &dated,
+    ] {
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if path == &adapter { 0o700 } else { 0o755 }),
+        )
+        .unwrap();
+    }
+    let session_id = "019d0000-0000-7000-8000-000000000029";
+    let transcript = dated.join(format!("rollout-2026-08-30T00-00-00-{session_id}.jsonl"));
+    let header = serde_json::json!({
+        "ordinal": 0,
+        "timestamp": "2026-08-30T00:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": session_id,
+            "session_id": session_id,
+            "cwd": "/not-a-repository",
+            "originator": "codex_cli_rs",
+            "model_provider": "openai",
+            "git": null
+        }
+    });
+    let message = serde_json::json!({
+        "ordinal": 1,
+        "timestamp": "2026-08-30T00:00:01Z",
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "weak importer normalization"}
+    });
+    fs::write(&transcript, format!("{header}\n{message}\n")).unwrap();
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o644)).unwrap();
+    let observed_report =
+        observe_session_catalog_report(transcript.to_str(), session_id, "weak-normalization", None)
+            .unwrap();
+    let report = Arc::new(RwLock::new(Some(observed_report.clone())));
+    let data = temp.path().join("data");
+    let writer = open_writer(&data).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 32).unwrap();
+    let catalog = SessionCatalogService::new(handle.clone(), CONFIG);
+    assert_eq!(catalog.refresh(&observed_report).await.unwrap(), 1);
+    let source = format!("session-rollout:{session_id}:{session_id}");
+    let admin = SessionImportAdminService::new(handle.clone(), Arc::clone(&report), CONFIG);
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session_id,
+                SessionImportAdminAction::QueueImport,
+                10,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let worker =
+        SessionImportWorker::new(handle.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap();
+    let mut import_completed = false;
+    for _ in 0..4 {
+        import_completed = worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await
+            .unwrap()
+            .completed;
+        if import_completed {
+            break;
+        }
+    }
+    assert!(import_completed, "the normal importer did not finish");
+
+    let imported = handle.project().await.unwrap();
+    let observations = imported
+        .data_rows()
+        .filter_map(|row| {
+            row.payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        })
+        .filter_map(|payload| match payload {
+            JournalPayload::SourceObservationRecorded(observation) => {
+                Some(observation.source_observation_id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observations.len(), 2);
+    let mut observation_ids = observations;
+    observation_ids.sort_unstable();
+    assert!(!imported.data_rows().any(|row| {
+        row.payload_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+            .is_some_and(|payload| matches!(payload, JournalPayload::NormalizationWatermark(_)))
+    }));
+    drop(imported);
+
+    *report.write().await = None;
+    assert!(report.read().await.is_none());
+    let scheduler = BackgroundScheduler::new(
+        handle.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+            enabled: false,
+            ..Default::default()
+        }),
+        evertrace_domain::config::DreamingConfig::default(),
+    );
+    scheduler.run_once().await.unwrap();
+
+    let normalized = handle.project().await.unwrap();
+    let payloads = normalized
+        .data_rows()
+        .filter_map(|row| {
+            row.payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        })
+        .collect::<Vec<_>>();
+    let occurrences = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::HostOccurrenceNormalized(value) => Some(value.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(occurrences.len(), observation_ids.len());
+    let mut occurrence_observation_ids = occurrences
+        .iter()
+        .map(|occurrence| {
+            assert_eq!(occurrence.source_observation_refs.len(), 1);
+            occurrence.source_observation_refs[0]
+        })
+        .collect::<Vec<_>>();
+    occurrence_observation_ids.sort_unstable();
+    assert_eq!(occurrence_observation_ids, observation_ids);
+    for occurrence in &occurrences {
+        assert_eq!(
+            occurrence.correlation_strength,
+            evertrace_domain::evidence::CorrelationStrength::Unavailable
+        );
+        assert_eq!(
+            occurrence.normalization_state,
+            evertrace_domain::evidence::NormalizationState::SingleSource
+        );
+        assert!(occurrence.exact_key.is_none());
+        assert!(occurrence.possible_duplicate_group_id.is_none());
+    }
+    assert!(payloads.iter().all(|payload| !matches!(
+        payload,
+        JournalPayload::OperationDerived(_)
+            | JournalPayload::ScopeEffectDerived(_)
+            | JournalPayload::ExecutionLaneRecorded(_)
+            | JournalPayload::CaptureReceiptRecorded(_)
+    )));
+    let mut watermarked_observation_ids = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::NormalizationWatermark(value) => Some(value.source_observation_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    watermarked_observation_ids.sort_unstable();
+    assert_eq!(watermarked_observation_ids, observation_ids);
+    assert!(
+        normalized
+            .reconciliation_frontier_for_observations(&observation_ids)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let completed_frontier = normalized.frontier;
+    let mut completed_occurrence_ids = occurrences
+        .iter()
+        .map(|occurrence| occurrence.host_occurrence_id)
+        .collect::<Vec<_>>();
+    completed_occurrence_ids.sort_unstable();
+    let completed_jobs = RuntimeSchedulerView::from_snapshot(&normalized)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .filter(|job| job.kind == "physical_normalization")
+        .collect::<Vec<_>>();
+    assert_eq!(completed_jobs.len(), observation_ids.len());
+    assert!(
+        completed_jobs
+            .iter()
+            .all(|job| job.state == JobStatus::Succeeded)
+    );
+    let mut completed_job_ids = completed_jobs
+        .iter()
+        .map(|job| job.job_id)
+        .collect::<Vec<_>>();
+    completed_job_ids.sort_unstable();
+
+    drop(normalized);
+    drop(scheduler);
+    drop(worker);
+    drop(admin);
+    drop(catalog);
+    drop(handle);
+    task.await.unwrap().unwrap();
+
+    let writer = open_writer(&data).await.unwrap();
+    let (handle, task) = spawn_writer(writer, 32).unwrap();
+    let catalog = SessionCatalogService::new(handle.clone(), CONFIG);
+    let worker =
+        SessionImportWorker::new(handle.clone(), runtime(temp.path()), Arc::clone(&report))
+            .unwrap();
+    let scheduler = BackgroundScheduler::new(
+        handle.clone(),
+        catalog,
+        worker,
+        Arc::clone(&report),
+        runtime(temp.path()),
+        SynthesisPlanner::new(evertrace_domain::config::LlmConfig {
+            enabled: false,
+            ..Default::default()
+        }),
+        evertrace_domain::config::DreamingConfig::default(),
+    );
+    let repeated = scheduler.run_once().await.unwrap();
+    let reopened = handle.project().await.unwrap();
+    assert_eq!(repeated.completed, 0);
+    assert_eq!(reopened.frontier, completed_frontier);
+    let reopened_payloads = reopened
+        .data_rows()
+        .filter_map(|row| {
+            row.payload_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+        })
+        .collect::<Vec<_>>();
+    let mut reopened_occurrence_ids = reopened_payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            JournalPayload::HostOccurrenceNormalized(value) => Some(value.host_occurrence_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    reopened_occurrence_ids.sort_unstable();
+    assert_eq!(reopened_occurrence_ids, completed_occurrence_ids);
+    let reopened_jobs = RuntimeSchedulerView::from_snapshot(&reopened)
+        .unwrap()
+        .jobs
+        .into_iter()
+        .filter(|job| job.kind == "physical_normalization")
+        .collect::<Vec<_>>();
+    assert_eq!(reopened_jobs.len(), completed_jobs.len());
+    let mut reopened_job_ids = reopened_jobs
+        .iter()
+        .map(|job| job.job_id)
+        .collect::<Vec<_>>();
+    reopened_job_ids.sort_unstable();
+    assert_eq!(reopened_job_ids, completed_job_ids);
+    drop(reopened);
+    drop(scheduler);
+    drop(handle);
+    task.await.unwrap().unwrap();
 }
 
 async fn imported_messages_scenario(
@@ -581,7 +876,11 @@ async fn imported_messages_scenario(
                 let llm = LlmConfig { base_url: ValidatedBaseUrl::parse(&stub.base_url).unwrap(), ..llm.clone() };
                 let runner = BackgroundScheduler::new(writer.clone(), catalog.clone(), worker.clone(), Arc::clone(&report), runtime(temp.path()), SynthesisPlanner::new(llm), dreaming.clone());
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                Box::pin(runner.run_once()).await.unwrap();
+                let running = runner.clone();
+                tokio::spawn(async move { running.run_once().await })
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let view = SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
                 assert_eq!(view.proposals.len(), 2, "a previous method must not consume an entire session forever");
                 assert_eq!(view.proposals[&proposal.proposal_id], proposal);
@@ -972,7 +1271,43 @@ async fn imported_messages_scenario(
     let body = fs::read_to_string(&transcript).unwrap();
     let raw_delta = serde_json::json!({"type":"response_item","metadata":{},"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"marigold appended claim"}],"phase":"final_answer"}});
     let delta = serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"AgentMessage","id":"agent-1","content":[{"type":"Text","text":"marigold appended claim"}],"phase":"final_answer","memory_citation":{"entries":[{"path":"notes.md","lineStart":1,"lineEnd":2,"note":"source claim"}],"rolloutIds":["prior-rollout"]},"delivery":"async","questions":[{"title":"Continue?","options":["yes","no"]}]},"started_at_ms":1788998401000i64,"completed_at_ms":1788998402000i64}});
-    fs::write(&transcript, format!("{body}{raw_delta}\n{delta}\n")).unwrap();
+    fs::write(&transcript, format!("{body}{raw_delta}\n")).unwrap();
+    catalog.refresh(&report_value).await.unwrap();
+    let refreshed = writer.project().await.unwrap();
+    let refreshed_current = SessionImportCurrentView::from_snapshot(&refreshed).unwrap();
+    let refreshed_source = &refreshed_current.sessions[&source];
+    assert_eq!(refreshed_source.body_state, SessionBodyState::Queued);
+    assert_eq!(
+        refreshed_source.metadata.file_size,
+        fs::metadata(&transcript).unwrap().len()
+    );
+    drop(refreshed);
+    {
+        use std::io::Write as _;
+        let mut transcript_file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(transcript_file, "{delta}").unwrap();
+    }
+    let frontier_before_stale_read = writer.project().await.unwrap().frontier;
+    assert!(matches!(
+        worker
+            .process_checkpoint(
+                &source,
+                SessionImportBudget {
+                    max_bytes: 64 * 1024,
+                    max_records: 16,
+                    max_work_time: Duration::from_millis(250),
+                },
+            )
+            .await,
+        Err(evertrace_engine::SessionImportError::Unavailable)
+    ));
+    assert_eq!(
+        writer.project().await.unwrap().frontier,
+        frontier_before_stale_read
+    );
     catalog.refresh(&report_value).await.unwrap();
     let mut imported_delta = 0;
     for _ in 0..3 {
@@ -1349,10 +1684,11 @@ async fn imported_messages_scenario(
         replacement.source_observation_id.to_string(),
     ];
     mixed.sort();
+    let current = CurrentFacts::try_from(rewritten_snapshot.clone()).unwrap();
     assert!(
         Box::pin(SynthesisPlanner::new(llm.clone())
             .execute(evertrace_engine::jobs::SynthesisRequest {
-                snapshot: &rewritten_snapshot,
+                current: &current,
                 target: evertrace_engine::jobs::SynthesisTarget::Source {
                     source: target,
                     after_sequence: 0,
@@ -1795,15 +2131,7 @@ async fn frozen_memory_export_maps_to_l0_pending_proposal_and_provenance() {
     assert_eq!(reopened.project().await.unwrap(), replayed);
     reopened.full_projection().await.unwrap();
     assert_eq!(reopened.project().await.unwrap(), replayed);
-    assert_eq!(
-        reopened.table_names().await.unwrap(),
-        [
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
-    );
+    assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2257,8 +2585,11 @@ async fn source_only_archive_later_restriction_closes_reads_and_purge_after_rest
     let foreign = evertrace_domain::ids::RepositoryId::new_v7();
     receipt.repository_instance_id = Some(foreign);
     row.repository_id = Some(foreign.to_string());
-    row.payload_json =
-        Some(serde_json::to_string(&JournalPayload::SourceReceiptRecorded(receipt)).unwrap());
+    row.payload_json = Some(
+        serde_json::to_string(&JournalPayload::SourceReceiptRecorded(receipt))
+            .unwrap()
+            .into(),
+    );
     assert!(
         evertrace_store::projections::repository_scope_purge_preview(
             &foreign_scope,
@@ -3431,13 +3762,3772 @@ async fn qualified_catalog_admin_and_streaming_body_rebuild_from_four_tables() {
     assert_eq!(reopened.project().await.unwrap(), projected);
     reopened.full_projection().await.unwrap();
     assert_eq!(reopened.project().await.unwrap(), projected);
-    assert_eq!(
-        reopened.table_names().await.unwrap(),
-        [
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
+    assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
+}
+
+/// The source-start boundary factory is exactly the input the catalog
+/// resolution consumes: with one ordinary registration already durable, a
+/// second source stays `Repository`-resolved at its own start instant with the
+/// expected IDs and read scope, while sources without that durable closure
+/// (wrong source, wrong instant) never receive a resolved scope.
+#[derive(Clone)]
+struct DualProofMutationFixture {
+    writer: evertrace_engine::WriterHandle,
+    report: Arc<RwLock<Option<evertrace_codex::HostProbeReport>>>,
+    worker: SessionImportWorker,
+    configured_runtime: RuntimeSnapshot,
+    revoke_session: String,
+    revoke_source: String,
+    revoke_transcript: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+    replacement_head: String,
+}
+
+async fn prefix_mutation_phase(fixture: DualProofMutationFixture) {
+    let DualProofMutationFixture {
+        writer,
+        report,
+        worker,
+        configured_runtime,
+        revoke_session,
+        revoke_source,
+        revoke_transcript,
+        workspace,
+        replacement_head,
+    } = fixture;
+    use std::io::Write as _;
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+    let revoke_session = revoke_session.as_str();
+
+    // Reuse this already trusted native source for two independent physical
+    // rewrite continuations. Each starts from durable receipts in both legs;
+    // the body work left pending after the rewrite is in the opposite leg.
+    let mutation_line = |id: &str, text: &str| {
+        serde_json::json!({
+        "timestamp":"2026-10-06T00:08:00Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":revoke_session,"turn_id":id,"item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":text,"text_elements":[]}]},"completed_at_ms":1_791_245_280_000_i64}
+    })
+    .to_string()
+    };
+    let mutation_header = serde_json::json!({
+    "timestamp":"2026-10-06T00:08:00Z",
+    "type":"session_meta",
+    "payload":{"id":revoke_session,"session_id":revoke_session,"cwd":workspace,"git":{"commit_hash":replacement_head}}
+})
+.to_string();
+    let prefix_lines = [
+        mutation_line("dual-prefix-one", "prefix-marker-A stays historical"),
+        mutation_line("dual-prefix-two", "second historical chain record"),
+        mutation_line("dual-prefix-three", "third historical chain record"),
+    ];
+    let prefix_body = format!("{mutation_header}\n{}\n", prefix_lines.join("\n"));
+    fs::write(&revoke_transcript, &prefix_body).unwrap();
+    let mutation_catalog_report = observe_session_catalog_report(
+        revoke_transcript.to_str(),
+        revoke_session,
+        "source-start-dual-proof-prefix-replacement",
+        None,
+    )
+    .unwrap();
+    catalog.refresh(&mutation_catalog_report).await.unwrap();
+    let mutation_request = RequestId::new_v7();
+    let mutation_reference = format!("native_session_source_observation:{mutation_request}");
+    let mutation_deadline = source_observation_deadline();
+    let mutation_start_report = evertrace_engine::repository::observe_session_source_report(
+        revoke_transcript.to_str().unwrap(),
+        revoke_session,
+        None,
+        &mutation_reference,
+        mutation_deadline,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .observe_native_session_source(
+                mutation_request,
+                &mutation_start_report,
+                revoke_session,
+                revoke_transcript.to_str().unwrap(),
+                &mutation_reference,
+                mutation_deadline,
+            )
+            .await
+            .unwrap()
     );
+    *report.write().await = Some(mutation_start_report.clone());
+    let prefix_observed = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        prefix_observed.current.body_state,
+        SessionBodyState::NotImported | SessionBodyState::SourceReplaced
+    ));
+    assert!(prefix_observed.current.access_decision.is_none());
+    assert!(
+        prefix_observed
+            .current
+            .metadata
+            .prospective_origin
+            .is_some()
+    );
+    let mutation_fence = prefix_observed
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap()
+        .record_start
+        .unwrap();
+    assert_eq!(mutation_fence, prefix_body.len() as u64);
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                revoke_session,
+                SessionImportAdminAction::QueueImport,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+
+    let prefix_suffix_lines = (0..8)
+        .map(|index| {
+            mutation_line(
+                &format!("dual-prefix-suffix-{index}"),
+                &format!("suffix backlog remains after prefix completion {index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&revoke_transcript)
+        .unwrap();
+    for line in &prefix_suffix_lines {
+        writeln!(file, "{line}").unwrap();
+    }
+    file.write_all(b"{\"type\":\"unfinished-suffix-tail")
+        .unwrap();
+    drop(file);
+    catalog.refresh(&mutation_start_report).await.unwrap();
+    let prefix_revision = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap()
+        .current
+        .metadata
+        .source_revision
+        .clone();
+    let prefix_full_suffix_end = fs::metadata(&revoke_transcript).unwrap().len()
+        - b"{\"type\":\"unfinished-suffix-tail".len() as u64;
+    let mutation_budget = SessionImportBudget {
+        max_bytes: 64 * 1024,
+        max_records: 1,
+        max_work_time: Duration::from_millis(250),
+    };
+    let mut both_prefix_and_suffix_progress = false;
+    for _ in 0..64 {
+        let context = writer
+            .session_import_context(&revoke_source)
+            .await
+            .unwrap()
+            .unwrap();
+        let watermark = context.watermark.as_ref();
+        let earlier_end = watermark
+            .and_then(|value| value.earlier_prefix.as_ref())
+            .map_or(0, |prefix| prefix.through_byte);
+        let suffix_end = watermark.map_or(mutation_fence, |value| {
+            if value.confirmed_prefix_digest.is_some() {
+                value.source_sequence
+            } else {
+                mutation_fence
+            }
+        });
+        if earlier_end == mutation_fence
+            && suffix_end > mutation_fence
+            && suffix_end < prefix_full_suffix_end
+        {
+            both_prefix_and_suffix_progress = true;
+            break;
+        }
+        let progress = worker
+            .process_checkpoint(&revoke_source, mutation_budget)
+            .await
+            .unwrap();
+        assert!(
+            !progress.completed,
+            "the unfinished suffix tail must keep the job Partial"
+        );
+        assert!(progress.records <= 1);
+    }
+    assert!(
+        both_prefix_and_suffix_progress,
+        "older H must drain while E keeps a nonempty backlog and incomplete tail"
+    );
+    let prefix_proven = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    let prefix_watermark = prefix_proven.watermark.clone().unwrap();
+    assert_eq!(
+        prefix_watermark
+            .earlier_prefix
+            .as_ref()
+            .unwrap()
+            .through_byte,
+        mutation_fence
+    );
+    assert!(prefix_watermark.source_sequence < prefix_full_suffix_end);
+    assert_eq!(prefix_proven.job.as_ref().unwrap().state, JobStatus::Queued);
+    assert!(prefix_proven.job.as_ref().unwrap().terminal.is_none());
+    let prefix_page = writer
+        .session_import_prefix_page(evertrace_store::SessionImportPrefixRequest {
+            source: revoke_source.clone(),
+            revision: prefix_revision.clone(),
+            after: 0,
+            end: mutation_fence,
+            max_records: 16,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+    let suffix_page = writer
+        .session_import_prefix_page(evertrace_store::SessionImportPrefixRequest {
+            source: revoke_source.clone(),
+            revision: prefix_revision.clone(),
+            after: mutation_fence,
+            end: prefix_watermark.source_sequence,
+            max_records: 16,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+    assert_eq!(prefix_page.records.first().unwrap().start, 0);
+    assert_eq!(prefix_page.records.last().unwrap().end, mutation_fence);
+    assert_eq!(suffix_page.records.first().unwrap().start, mutation_fence);
+    assert_eq!(
+        suffix_page.records.last().unwrap().end,
+        prefix_watermark.source_sequence
+    );
+    let cas =
+        evertrace_capture::CasStore::open_existing(configured_runtime.cas_dir.clone()).unwrap();
+    for record in prefix_page.records.iter().chain(&suffix_page.records) {
+        let protected = cas
+            .read(&evertrace_capture::CasStore::parse_digest(&record.cas_ref).unwrap())
+            .unwrap();
+        assert_eq!(
+            evertrace_capture::CasDigest::for_protected_bytes(&protected).as_hex(),
+            record.cas_ref
+        );
+    }
+    let prefix_receipts_before = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == revoke_source
+                && receipt.source_revision == prefix_revision
+        })
+        .map(|receipt| {
+            (
+                receipt.source_sequence,
+                receipt.cas_ref,
+                receipt.source_observation_id.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let prefix_watermarks_before = writer
+        .project()
+        .await
+        .unwrap()
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceIngestWatermark(watermark)
+                    if watermark.source_instance_id.as_str() == revoke_source
+                        && watermark.source_revision == prefix_revision =>
+                {
+                    Some(watermark)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut rewritten_prefix = fs::read_to_string(&revoke_transcript).unwrap();
+    rewritten_prefix = rewritten_prefix.replacen("prefix-marker-A", "prefix-marker-B", 1);
+    assert_eq!(
+        rewritten_prefix.len(),
+        fs::metadata(&revoke_transcript).unwrap().len() as usize
+    );
+    let rewritten_prefix = format!(
+        "{}{}\n",
+        rewritten_prefix.trim_end_matches("{\"type\":\"unfinished-suffix-tail"),
+        mutation_line(
+            "prefix-mutation-append",
+            "append after the rewritten nonselected H chain"
+        )
+    );
+    fs::write(&revoke_transcript, rewritten_prefix).unwrap();
+    catalog.refresh(&mutation_start_report).await.unwrap();
+    let mut rejected_prefix_mutation = None;
+    for _ in 0..16 {
+        match worker
+            .process_checkpoint(&revoke_source, mutation_budget)
+            .await
+        {
+            Ok(progress) => {
+                assert_eq!(progress.records, 0, "proof-only work cannot add a receipt");
+                assert!(!progress.completed);
+            }
+            Err(error) => {
+                let detail = format!("{error:?}");
+                assert!(
+                    detail.contains("Changed"),
+                    "unexpected fail-closed result: {detail}"
+                );
+                rejected_prefix_mutation = Some(detail);
+                break;
+            }
+        }
+    }
+    assert!(
+        rejected_prefix_mutation.is_some(),
+        "the changed nonselected processed prefix must fail its real protected-chain proof"
+    );
+    let after_prefix_rewrite = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        after_prefix_rewrite.current.metadata.source_revision,
+        prefix_revision
+    );
+    assert_eq!(
+        after_prefix_rewrite.current.body_state,
+        SessionBodyState::SourceReplaced
+    );
+    assert!(
+        after_prefix_rewrite
+            .current
+            .metadata
+            .prospective_origin
+            .is_none()
+    );
+    assert!(after_prefix_rewrite.watermark.is_none());
+    let prefix_receipts_after_worker = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == revoke_source
+                && receipt.source_revision == prefix_revision
+        })
+        .map(|receipt| {
+            (
+                receipt.source_sequence,
+                receipt.cas_ref,
+                receipt.source_observation_id.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prefix_receipts_after_worker, prefix_receipts_before);
+    let prefix_watermarks_after_worker = writer
+        .project()
+        .await
+        .unwrap()
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceIngestWatermark(watermark)
+                    if watermark.source_instance_id.as_str() == revoke_source
+                        && watermark.source_revision == prefix_revision =>
+                {
+                    Some(watermark)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prefix_watermarks_after_worker, prefix_watermarks_before);
+}
+
+async fn suffix_mutation_phase(fixture: DualProofMutationFixture) {
+    let DualProofMutationFixture {
+        writer,
+        report,
+        worker,
+        configured_runtime,
+        revoke_session,
+        revoke_source,
+        revoke_transcript,
+        ..
+    } = fixture;
+    use std::io::Write as _;
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+    let revoke_session = revoke_session.as_str();
+    let mutation_line = |id: &str, text: &str| {
+        serde_json::json!({
+            "timestamp":"2026-10-06T00:08:00Z",
+            "type":"event_msg",
+            "payload":{"type":"item_completed","thread_id":revoke_session,"turn_id":id,"item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":text,"text_elements":[]}]},"completed_at_ms":1_791_245_280_000_i64}
+        })
+        .to_string()
+    };
+    let mutation_budget = SessionImportBudget {
+        max_bytes: 64 * 1024,
+        max_records: 1,
+        max_work_time: Duration::from_millis(250),
+    };
+    let cas =
+        evertrace_capture::CasStore::open_existing(configured_runtime.cas_dir.clone()).unwrap();
+    let mutation_start_report = report
+        .read()
+        .await
+        .clone()
+        .expect("the current source report remains installed");
+
+    // Reobserve the genuinely new revision. One prefix record and one suffix
+    // record then create independent durable proof chains; suffix is the
+    // nonselected processed leg while the older prefix still has body work.
+    catalog.refresh(&mutation_start_report).await.unwrap();
+    let suffix_mutation_request = RequestId::new_v7();
+    let suffix_mutation_reference =
+        format!("native_session_source_observation:{suffix_mutation_request}");
+    let suffix_mutation_deadline = source_observation_deadline();
+    let suffix_mutation_report = evertrace_engine::repository::observe_session_source_report(
+        revoke_transcript.to_str().unwrap(),
+        revoke_session,
+        None,
+        &suffix_mutation_reference,
+        suffix_mutation_deadline,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .observe_native_session_source(
+                suffix_mutation_request,
+                &suffix_mutation_report,
+                revoke_session,
+                revoke_transcript.to_str().unwrap(),
+                &suffix_mutation_reference,
+                suffix_mutation_deadline,
+            )
+            .await
+            .unwrap()
+    );
+    *report.write().await = Some(suffix_mutation_report.clone());
+    let suffix_mutation_observed = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        suffix_mutation_observed.current.body_state,
+        SessionBodyState::SourceReplaced
+    );
+    assert!(suffix_mutation_observed.current.access_decision.is_none());
+    let suffix_mutation_fence = suffix_mutation_observed
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap()
+        .record_start
+        .unwrap();
+    assert_eq!(
+        suffix_mutation_fence,
+        fs::metadata(&revoke_transcript).unwrap().len()
+    );
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                revoke_session,
+                SessionImportAdminAction::QueueImport,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    let second_suffix_lines = [
+        mutation_line("dual-suffix-one", "suffix-marker-A is already admitted"),
+        mutation_line("dual-suffix-two", "second suffix remains pending"),
+        mutation_line("dual-suffix-three", "third suffix remains pending"),
+    ];
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&revoke_transcript)
+        .unwrap();
+    for line in &second_suffix_lines {
+        writeln!(file, "{line}").unwrap();
+    }
+    file.write_all(b"{\"type\":\"unfinished-suffix-tail")
+        .unwrap();
+    drop(file);
+    catalog.refresh(&suffix_mutation_report).await.unwrap();
+    let suffix_revision = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap()
+        .current
+        .metadata
+        .source_revision
+        .clone();
+    let prefix_turn = worker
+        .process_checkpoint(&revoke_source, mutation_budget)
+        .await
+        .unwrap();
+    assert_eq!(prefix_turn.records, 1);
+    let suffix_turn = worker
+        .process_checkpoint(&revoke_source, mutation_budget)
+        .await
+        .unwrap();
+    assert_eq!(suffix_turn.records, 1);
+    let suffix_proven = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    let suffix_watermark = suffix_proven.watermark.clone().unwrap();
+    let suffix_earlier = suffix_watermark.earlier_prefix.as_ref().unwrap();
+    assert!(suffix_earlier.through_byte > 0 && suffix_earlier.through_byte < suffix_mutation_fence);
+    assert!(suffix_watermark.source_sequence > suffix_mutation_fence);
+    assert!(suffix_watermark.source_sequence < fs::metadata(&revoke_transcript).unwrap().len());
+    let suffix_prefix_page = writer
+        .session_import_prefix_page(evertrace_store::SessionImportPrefixRequest {
+            source: revoke_source.clone(),
+            revision: suffix_revision.clone(),
+            after: 0,
+            end: suffix_earlier.through_byte,
+            max_records: 16,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+    let suffix_records_page = writer
+        .session_import_prefix_page(evertrace_store::SessionImportPrefixRequest {
+            source: revoke_source.clone(),
+            revision: suffix_revision.clone(),
+            after: suffix_mutation_fence,
+            end: suffix_watermark.source_sequence,
+            max_records: 16,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        suffix_prefix_page.records.last().unwrap().end,
+        suffix_earlier.through_byte
+    );
+    assert_eq!(
+        suffix_records_page.records.first().unwrap().start,
+        suffix_mutation_fence
+    );
+    assert_eq!(
+        suffix_records_page.records.last().unwrap().end,
+        suffix_watermark.source_sequence
+    );
+    for record in suffix_prefix_page
+        .records
+        .iter()
+        .chain(&suffix_records_page.records)
+    {
+        let protected = cas
+            .read(&evertrace_capture::CasStore::parse_digest(&record.cas_ref).unwrap())
+            .unwrap();
+        assert_eq!(
+            evertrace_capture::CasDigest::for_protected_bytes(&protected).as_hex(),
+            record.cas_ref
+        );
+    }
+    let suffix_receipts_before = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == revoke_source
+                && receipt.source_revision == suffix_revision
+        })
+        .map(|receipt| {
+            (
+                receipt.source_sequence,
+                receipt.cas_ref,
+                receipt.source_observation_id.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let suffix_watermarks_before = writer
+        .project()
+        .await
+        .unwrap()
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceIngestWatermark(watermark)
+                    if watermark.source_instance_id.as_str() == revoke_source
+                        && watermark.source_revision == suffix_revision =>
+                {
+                    Some(watermark)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut rewritten_suffix = fs::read_to_string(&revoke_transcript).unwrap();
+    rewritten_suffix = rewritten_suffix.replacen("suffix-marker-A", "suffix-marker-B", 1);
+    assert_eq!(
+        rewritten_suffix.len(),
+        fs::metadata(&revoke_transcript).unwrap().len() as usize
+    );
+    let rewritten_suffix = format!(
+        "{}{}\n",
+        rewritten_suffix.trim_end_matches("{\"type\":\"unfinished-suffix-tail"),
+        mutation_line(
+            "suffix-mutation-append",
+            "append after the rewritten nonselected E chain"
+        )
+    );
+    fs::write(&revoke_transcript, rewritten_suffix).unwrap();
+    catalog.refresh(&suffix_mutation_report).await.unwrap();
+    let mut rejected_suffix_mutation = None;
+    for _ in 0..16 {
+        match worker
+            .process_checkpoint(&revoke_source, mutation_budget)
+            .await
+        {
+            Ok(progress) => {
+                assert_eq!(progress.records, 0, "proof-only work cannot add a receipt");
+                assert!(!progress.completed);
+            }
+            Err(error) => {
+                let detail = format!("{error:?}");
+                assert!(
+                    detail.contains("Changed"),
+                    "unexpected fail-closed result: {detail}"
+                );
+                rejected_suffix_mutation = Some(detail);
+                break;
+            }
+        }
+    }
+    assert!(
+        rejected_suffix_mutation.is_some(),
+        "the changed nonselected processed suffix must fail its real protected-chain proof"
+    );
+    let after_suffix_rewrite = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        after_suffix_rewrite.current.metadata.source_revision,
+        suffix_revision
+    );
+    assert_eq!(
+        after_suffix_rewrite.current.body_state,
+        SessionBodyState::SourceReplaced
+    );
+    assert!(
+        after_suffix_rewrite
+            .current
+            .metadata
+            .prospective_origin
+            .is_none()
+    );
+    assert!(after_suffix_rewrite.watermark.is_none());
+    let suffix_receipts_after = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == revoke_source
+                && receipt.source_revision == suffix_revision
+        })
+        .map(|receipt| {
+            (
+                receipt.source_sequence,
+                receipt.cas_ref,
+                receipt.source_observation_id.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(suffix_receipts_after, suffix_receipts_before);
+    let suffix_watermarks_after = writer
+        .project()
+        .await
+        .unwrap()
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceIngestWatermark(watermark)
+                    if watermark.source_instance_id.as_str() == revoke_source
+                        && watermark.source_revision == suffix_revision =>
+                {
+                    Some(watermark)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(suffix_watermarks_after, suffix_watermarks_before);
+}
+
+fn dual_proof_mutation_phases(
+    fixture: DualProofMutationFixture,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        prefix_mutation_phase(fixture.clone()).await;
+        suffix_mutation_phase(fixture).await;
+    })
+}
+
+struct SourceStartFixture {
+    temp: TempDir,
+    workspace: std::path::PathBuf,
+    dated: std::path::PathBuf,
+    writer: evertrace_engine::WriterHandle,
+    task: evertrace_engine::WriterTask,
+    repository: evertrace_domain::ids::RepositoryId,
+    worktree: evertrace_domain::ids::WorktreeId,
+    cases: [(&'static str, &'static str, bool); 3],
+}
+
+fn source_fixture_git(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn projected_source_receipts(
+    snapshot: &evertrace_store::ProjectionSnapshot,
+) -> impl Iterator<Item = Box<evertrace_domain::evidence::SourceReceipt>> + '_ {
+    snapshot.data_rows().filter_map(|row| {
+        match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+            JournalPayload::SourceReceiptRecorded(receipt) => Some(receipt),
+            _ => None,
+        }
+    })
+}
+
+async fn source_start_fixture() -> SourceStartFixture {
+    use evertrace_engine::repository::{
+        HostTrustDecision, ProbeLimits, RepositoryResolveInput, ResolutionKind, probe_repository,
+        resolve_repository, resolve_repository_source_start,
+    };
+    use evertrace_store::{WorkspaceResolutionKind, repository::RepositoryCurrentView};
+
+    fn write_transcript(
+        path: &std::path::Path,
+        session: &str,
+        stamp: &str,
+        workspace: &std::path::Path,
+        head: &str,
+    ) {
+        let header = serde_json::json!({"timestamp":stamp,"type":"session_meta","payload":{"id":session,"session_id":session,"cwd":workspace,"git":{"commit_hash":head}}});
+        let raw = serde_json::json!({"type":"response_item","metadata":{"client_authored":false,"fallback_token_limit_override":8192},"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"marigold source start boundary"}]}});
+        let message = serde_json::json!({"timestamp":stamp,"type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"turn","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"marigold source start boundary","text_elements":[]}]},"completed_at_ms":1791244801000i64}});
+        fs::write(path, format!("{header}\n{raw}\n{message}\n")).unwrap();
+    }
+
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    source_fixture_git(&workspace, &["init", "-q", "-b", "main"]);
+    source_fixture_git(&workspace, &["commit", "--allow-empty", "-qm", "initial"]);
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let head = source_fixture_git(&workspace, &["rev-parse", "HEAD"]);
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/10/06");
+    fs::create_dir_all(&dated).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&dated, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let (writer, task) =
+        spawn_writer(open_writer(&temp.path().join("data")).await.unwrap(), 32).unwrap();
+
+    let at = 1_791_244_801_000_000;
+    let start = "2026-10-06T00:00:01Z";
+    let cases = [
+        ("019d0000-0000-7000-8000-0000000000a1", start, true),
+        ("019d0000-0000-7000-8000-0000000000a2", start, false),
+        (
+            "019d0000-0000-7000-8000-0000000000a3",
+            "2026-10-06T00:01:01Z",
+            false,
+        ),
+    ];
+    let evidence = probe_repository(
+        &workspace,
+        HostTrustDecision::Trusted,
+        &["register:source-start".into()],
+        at - 1_000_000,
+        &ProbeLimits::default(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let registration = resolve_repository(&RepositoryResolveInput {
+        view: &RepositoryCurrentView::default(),
+        evidence: &evidence,
+        derived_from_hint: None,
+    })
+    .unwrap();
+    assert_eq!(registration.kind, Some(ResolutionKind::Create));
+    let repository = registration.repositories[0].repository_id;
+    let worktree = registration.worktrees[0].worktree_instance_id;
+    writer
+        .commit(
+            registration
+                .journal_command(at - 1_000_000, CONFIG, "source-attribution")
+                .unwrap()
+                .unwrap(),
+            at - 1_000_000,
+        )
+        .await
+        .unwrap();
+
+    for index in [0, 2] {
+        let session = cases[index].0;
+        let source = format!("session-rollout:{session}:{session}");
+        let projected = writer.project().await.unwrap();
+        let current = RepositoryCurrentView::from_snapshot(&projected).unwrap();
+        let evidence = probe_repository(
+            &workspace,
+            HostTrustDecision::Trusted,
+            std::slice::from_ref(&source),
+            at,
+            &ProbeLimits::default(),
+            &current.known_admin_paths(),
+            &[],
+        )
+        .unwrap();
+        let boundary = resolve_repository_source_start(
+            &RepositoryResolveInput {
+                view: &current,
+                evidence: &evidence,
+                derived_from_hint: None,
+            },
+            &source,
+        )
+        .unwrap();
+        assert_eq!(boundary.kind, Some(ResolutionKind::Successor));
+        writer
+            .commit_if_frontier(
+                boundary
+                    .journal_command(at, CONFIG, "source-start-boundary")
+                    .unwrap()
+                    .unwrap(),
+                at,
+                current.frontier,
+            )
+            .await
+            .unwrap();
+    }
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    for (session, stamp, resolved) in cases {
+        let source = format!("session-rollout:{session}:{session}");
+        let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+        write_transcript(&transcript, session, stamp, &workspace, &head);
+        let report =
+            observe_session_catalog_report(transcript.to_str(), session, "source-summary", None)
+                .unwrap();
+        catalog.refresh(&report).await.unwrap();
+        let context = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata = &context.current.metadata;
+        if resolved {
+            assert_eq!(
+                metadata.workspace_resolution_kind,
+                WorkspaceResolutionKind::Repository
+            );
+            assert_eq!(metadata.resolved_repository_instance_id, Some(repository));
+            assert_eq!(metadata.resolved_worktree_instance_id, Some(worktree));
+            assert!(metadata.read_restrictions().any(|id| id == repository));
+            assert!(
+                context
+                    .read_repositories
+                    .iter()
+                    .any(|value| value.repository_id == repository)
+            );
+            let current_snapshot = context
+                .worktree
+                .as_ref()
+                .unwrap()
+                .current_snapshot_id
+                .unwrap();
+            assert!(context.read_snapshots.iter().any(|snapshot| {
+                snapshot.worktree_instance_id == worktree
+                    && snapshot.worktree_snapshot_id == current_snapshot
+            }));
+            let durable =
+                RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+            assert!(durable.snapshots.values().any(|snapshot| {
+                snapshot.worktree_instance_id == worktree
+                    && snapshot.captured_at_us == at
+                    && snapshot.evidence_refs.contains(&source)
+            }));
+        } else {
+            assert_eq!(
+                metadata.workspace_resolution_kind,
+                WorkspaceResolutionKind::Ambiguous
+            );
+            assert!(metadata.resolved_repository_instance_id.is_none());
+            assert!(metadata.resolved_worktree_instance_id.is_none());
+        }
+    }
+    drop(catalog);
+
+    SourceStartFixture {
+        temp,
+        workspace,
+        dated,
+        writer,
+        task,
+        repository,
+        worktree,
+        cases,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_proofs_reject_mutation_of_each_nonselected_leg() {
+    use evertrace_engine::repository::{
+        HostTrustDecision, ProbeLimits, RepositoryResolveInput, probe_repository,
+        resolve_repository, resolve_repository_source_start,
+    };
+    use evertrace_store::repository::RepositoryCurrentView;
+
+    let git = source_fixture_git;
+
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q", "-b", "main"]);
+    git(&workspace, &["commit", "--allow-empty", "-qm", "initial"]);
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let head = git(&workspace, &["rev-parse", "HEAD"]);
+
+    let adapter = temp.path().join("adapter");
+    let dated = adapter.join("sessions/2026/10/06");
+    fs::create_dir_all(&dated).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&dated, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        adapter.join("config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let session = "019d0000-0000-7000-8000-0000000000a1";
+    let source = format!("session-rollout:{session}:{session}");
+    let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+    let start = "2026-10-06T00:00:01Z";
+    let header = serde_json::json!({
+        "timestamp": start,
+        "type": "session_meta",
+        "payload": {"id": session, "session_id": session, "cwd": workspace, "git": {"commit_hash": head}}
+    });
+    let initial_message = serde_json::json!({
+        "timestamp": start,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": session,
+            "turn_id": "initial-dual-proof-record",
+            "item": {"type": "UserMessage", "id": "initial-dual-proof-record", "content": [{"type": "text", "text": "initial historical evidence", "text_elements": []}]},
+            "completed_at_ms": 1_791_244_801_000_i64
+        }
+    });
+    fs::write(&transcript, format!("{header}\n{initial_message}\n")).unwrap();
+
+    let at = 1_791_244_801_000_000;
+    let (writer, task) =
+        spawn_writer(open_writer(&temp.path().join("data")).await.unwrap(), 32).unwrap();
+    let initial_evidence = probe_repository(
+        &workspace,
+        HostTrustDecision::Trusted,
+        &["register:dual-proof-source".into()],
+        at - 1_000_000,
+        &ProbeLimits::default(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let registration = resolve_repository(&RepositoryResolveInput {
+        view: &RepositoryCurrentView::default(),
+        evidence: &initial_evidence,
+        derived_from_hint: None,
+    })
+    .unwrap();
+    let worktree = registration.worktrees[0].worktree_instance_id;
+    writer
+        .commit(
+            registration
+                .journal_command(at - 1_000_000, CONFIG, "dual-proof-registration")
+                .unwrap()
+                .unwrap(),
+            at - 1_000_000,
+        )
+        .await
+        .unwrap();
+    let repository_view =
+        RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    let source_evidence = probe_repository(
+        &workspace,
+        HostTrustDecision::Trusted,
+        std::slice::from_ref(&source),
+        at,
+        &ProbeLimits::default(),
+        &repository_view.known_admin_paths(),
+        &[],
+    )
+    .unwrap();
+    let source_start = resolve_repository_source_start(
+        &RepositoryResolveInput {
+            view: &repository_view,
+            evidence: &source_evidence,
+            derived_from_hint: None,
+        },
+        &source,
+    )
+    .unwrap();
+    writer
+        .commit_if_frontier(
+            source_start
+                .journal_command(at, CONFIG, "dual-proof-source-start")
+                .unwrap()
+                .unwrap(),
+            at,
+            repository_view.frontier,
+        )
+        .await
+        .unwrap();
+
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let initial_catalog_report = observe_session_catalog_report(
+        transcript.to_str(),
+        session,
+        "dual-proof-initial-source",
+        None,
+    )
+    .unwrap();
+    catalog.refresh(&initial_catalog_report).await.unwrap();
+    let initial_request = RequestId::new_v7();
+    let initial_reference = format!("native_session_source_observation:{initial_request}");
+    let initial_deadline = source_observation_deadline();
+    let report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        &initial_reference,
+        initial_deadline,
+    )
+    .unwrap();
+    let trust = evertrace_engine::repository::read_report_repository_trust(
+        &report,
+        &RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap(),
+        worktree,
+    );
+    assert_eq!(
+        trust.state,
+        evertrace_codex::policy::RepositoryTrustState::Trusted
+    );
+
+    let data_dir = temp.path().join("data");
+    let mut config_file = evertrace_domain::config::ConfigFile::default();
+    config_file.runtime.data_dir = data_dir.to_str().unwrap().to_owned();
+    config_file.session_import.historical_metadata_backfill = false;
+    let effective = evertrace_domain::config::EffectiveConfig::new(config_file).unwrap();
+    let config_toml = effective.to_toml().unwrap();
+    let config_path = temp.path().join("daemon.toml");
+    fs::write(&config_path, &config_toml).unwrap();
+    let engine = Arc::new(
+        evertrace_engine::EngineService::from_toml(
+            &config_toml,
+            evertrace_engine::RuntimeMode::Normal,
+        )
+        .unwrap(),
+    );
+    let config_reload =
+        evertrace_engine::ConfigReloadService::new(engine, writer.clone(), data_dir, config_path)
+            .unwrap();
+    let configured_runtime = config_reload.initialize_runtime().await.unwrap();
+    evertrace_capture::DurableSpool::open(
+        configured_runtime.spool_dir.clone(),
+        configured_runtime.spool_limits().unwrap(),
+    )
+    .unwrap();
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let report = Arc::new(RwLock::new(Some(report)));
+    let worker = SessionImportWorker::new(
+        writer.clone(),
+        configured_runtime.clone(),
+        Arc::clone(&report),
+    )
+    .unwrap();
+
+    dual_proof_mutation_phases(DualProofMutationFixture {
+        writer: writer.clone(),
+        report,
+        worker,
+        configured_runtime,
+        revoke_session: session.to_owned(),
+        revoke_source: source,
+        revoke_transcript: transcript,
+        workspace,
+        replacement_head: head,
+    })
+    .await;
+    drop(catalog);
+    drop(config_reload);
+    drop(writer);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_source_replacement_observation_does_not_inherit_historical_scope() {
+    use evertrace_store::{WorkspaceResolutionKind, repository::RepositoryCurrentView};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let SourceStartFixture {
+        temp: _temp,
+        workspace,
+        dated,
+        writer,
+        task,
+        repository,
+        worktree,
+        cases,
+    } = source_start_fixture().await;
+    let session = cases[0].0;
+    let source = format!("session-rollout:{session}:{session}");
+    let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+    let before = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.current.metadata.workspace_resolution_kind,
+        WorkspaceResolutionKind::Repository
+    );
+    assert_eq!(
+        before.current.metadata.resolved_repository_instance_id,
+        Some(repository)
+    );
+    assert_eq!(
+        before.current.metadata.resolved_worktree_instance_id,
+        Some(worktree)
+    );
+    assert_eq!(before.current.body_state, SessionBodyState::NotImported);
+    assert!(before.current.metadata.prospective_origin.is_none());
+    assert!(before.current.access_decision.is_none());
+    assert!(before.watermark.is_none());
+    assert!(before.recorded_prefix_end.is_none());
+    let prior_projection = writer.project().await.unwrap();
+    assert!(
+        projected_source_receipts(&prior_projection)
+            .all(|receipt| receipt.source_instance_id.as_str() != source)
+    );
+
+    let old_inode = fs::metadata(&transcript).unwrap().ino();
+    let replacement_header = serde_json::json!({
+        "timestamp":"2026-10-06T00:02:01Z",
+        "type":"session_meta",
+        "payload":{"id":session,"session_id":session,"cwd":workspace,"git":{"commit_hash":source_fixture_git(&workspace, &["rev-parse", "HEAD"])}}
+    });
+    let replacement_content = format!("{replacement_header}\n");
+    let replacement_path = dated.join(format!(".{session}.replacement"));
+    fs::write(&replacement_path, &replacement_content).unwrap();
+    assert!(replacement_content.len() < fs::metadata(&transcript).unwrap().len() as usize);
+    let replacement_inode = fs::metadata(&replacement_path).unwrap().ino();
+    assert_ne!(replacement_inode, old_inode);
+    fs::rename(&replacement_path, &transcript).unwrap();
+    let replacement_identity = fs::metadata(&transcript).unwrap();
+    assert_eq!(replacement_identity.ino(), replacement_inode);
+    assert!(replacement_identity.len() < before.current.metadata.file_size);
+
+    let request_id = RequestId::new_v7();
+    let source_reference = format!("native_session_source_observation:{request_id}");
+    let source_deadline = source_observation_deadline();
+    let report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        &source_reference,
+        source_deadline,
+    )
+    .unwrap();
+    let current_repositories =
+        RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    assert_eq!(
+        evertrace_engine::repository::read_report_repository_trust(
+            &report,
+            &current_repositories,
+            worktree,
+        )
+        .state,
+        evertrace_codex::policy::RepositoryTrustState::Trusted
+    );
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let observed = catalog
+        .observe_native_session_source(
+            request_id,
+            &report,
+            session,
+            transcript.to_str().unwrap(),
+            &source_reference,
+            source_deadline,
+        )
+        .await;
+    assert!(
+        observed.as_ref().is_ok_and(|changed| *changed),
+        "{observed:?}"
+    );
+
+    let after = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        after.current.metadata.source_revision,
+        before.current.metadata.source_revision
+    );
+    assert_eq!(after.current.body_state, SessionBodyState::NotImported);
+    assert!(after.current.access_decision.is_none());
+    assert!(after.watermark.is_none());
+    assert!(after.recorded_prefix_end.is_none());
+    assert_eq!(
+        after.current.metadata.workspace_resolution_kind,
+        WorkspaceResolutionKind::Ambiguous
+    );
+    assert!(
+        after
+            .current
+            .metadata
+            .resolved_repository_instance_id
+            .is_none()
+    );
+    assert!(
+        after
+            .current
+            .metadata
+            .resolved_worktree_instance_id
+            .is_none()
+    );
+    let origin = after
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .expect("the replacement revision receives the actual new source origin");
+    assert!(!origin.closed);
+    let after_projection = writer.project().await.unwrap();
+    assert!(
+        projected_source_receipts(&after_projection)
+            .all(|receipt| receipt.source_instance_id.as_str() != source)
+    );
+    let repositories = RepositoryCurrentView::from_snapshot(&after_projection).unwrap();
+    let forwarded_snapshot = repositories
+        .snapshots
+        .get(&origin.snapshot_ref)
+        .expect("the new origin points to the current source-observation snapshot");
+    assert_eq!(forwarded_snapshot.worktree_instance_id, worktree);
+    assert!(forwarded_snapshot.evidence_refs.contains(&source_reference));
+    assert_eq!(
+        repositories
+            .worktrees
+            .get(&worktree)
+            .unwrap()
+            .repository_instance_id,
+        repository
+    );
+
+    drop(catalog);
+    drop(writer);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn source_start_boundary_is_the_catalog_resolution_input() {
+    Box::pin(source_start_boundary_is_the_catalog_resolution_input_body()).await;
+}
+
+async fn source_start_boundary_is_the_catalog_resolution_input_body() {
+    Box::pin(async move {
+    use evertrace_domain::config::{ConfigFile, EffectiveConfig, LlmConfig, ValidatedBaseUrl};
+    use evertrace_domain::evidence::ObservationRole;
+    use evertrace_engine::{
+        BackgroundScheduler, ConfigReloadService, EngineService, RuntimeMode,
+        jobs::SynthesisPlanner,
+    };
+    use evertrace_store::{WorkspaceResolutionKind, repository::RepositoryCurrentView};
+    use provider_stub::ProviderStub;
+    use std::io::Write as _;
+
+    let SourceStartFixture {
+        temp,
+        workspace,
+        dated,
+        writer,
+        task,
+        repository,
+        worktree,
+        cases,
+        ..
+    } = source_start_fixture().await;
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+
+    // Exercise the live native-source path on the unresolved a3 catalog row:
+    // SessionStart stores only metadata and its current S11 origin; a later
+    // normal scheduler refresh discovers the append with historical backfill
+    // disabled, imports only its suffix, and explicit permission admits prefix.
+    let session = cases[2].0;
+    let source = format!("session-rollout:{session}:{session}");
+    let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
+    let crossing_line = serde_json::json!({
+        "timestamp": "2026-10-06T00:01:01Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": session,
+            "turn_id": "turn-crossing-start",
+            "item": {
+                "type": "UserMessage",
+                "id": "user-crossing-start",
+                "content": [{"type":"text","text":"must stay before the observed fence","text_elements":[]}]
+            },
+            "completed_at_ms": 1_791_244_861_000_i64
+        }
+    })
+    .to_string();
+    let split = crossing_line.len() / 2;
+    let (crossing_prefix, crossing_suffix) = crossing_line.split_at(split);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    file.write_all(crossing_prefix.as_bytes()).unwrap();
+    drop(file);
+    let observed_end = fs::metadata(&transcript).unwrap().len();
+    let start_request = RequestId::new_v7();
+    let start_reference = format!("native_session_source_observation:{start_request}");
+    let start_deadline = source_observation_deadline();
+    let start_report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        &start_reference,
+        start_deadline,
+    )
+    .unwrap();
+    let source_trust = evertrace_engine::repository::read_report_repository_trust(
+        &start_report,
+        &RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap(),
+        worktree,
+    );
+    assert_eq!(
+        source_trust.state,
+        evertrace_codex::policy::RepositoryTrustState::Trusted,
+        "source observer report did not retain the fixture's trusted repository: {source_trust:?}"
+    );
+    let observed = catalog
+        .observe_native_session_source(
+            start_request,
+            &start_report,
+            session,
+            transcript.to_str().unwrap(),
+            &start_reference,
+            start_deadline,
+        )
+        .await;
+    assert!(
+        observed.as_ref().is_ok_and(|observed| *observed),
+        "observer: {observed:?}"
+    );
+    let started = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        catalog
+            .native_session_source_observed(
+                session,
+                transcript.to_str().unwrap(),
+                Some(&start_report),
+                start_deadline,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !catalog
+            .native_session_source_observed(
+                session,
+                transcript.to_str().unwrap(),
+                None,
+                source_observation_deadline(),
+            )
+            .await
+            .unwrap(),
+        "an archived origin must not bypass rebuilding the daemon's current report"
+    );
+    let origin = started
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap();
+    assert_eq!(origin.record_start, None);
+    assert_eq!(origin.observed_end, observed_end);
+    assert_eq!(started.current.body_state, SessionBodyState::NotImported);
+    assert!(started.current.access_decision.is_none());
+    assert_eq!(started.current.metadata.file_size, observed_end);
+    assert_eq!(
+        started.current.metadata.workspace_resolution_kind,
+        WorkspaceResolutionKind::Ambiguous
+    );
+    assert!(
+        started
+            .current
+            .metadata
+            .read_restrictions()
+            .any(|id| id == repository)
+    );
+    assert!(started.job.is_none());
+    let source_snapshot = RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap())
+        .unwrap()
+        .snapshots
+        .into_values()
+        .find(|snapshot| {
+            snapshot.worktree_instance_id == worktree
+                && snapshot.evidence_refs.contains(&start_reference)
+        })
+        .expect("the prospective origin is a source-linked current snapshot");
+    assert_eq!(
+        Some(source_snapshot.worktree_snapshot_id),
+        started
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .map(|origin| origin.snapshot_ref)
+    );
+
+    let data_dir = temp.path().join("data");
+    let mut config_file = ConfigFile::default();
+    config_file.runtime.data_dir = data_dir.to_str().unwrap().to_owned();
+    config_file.session_import.historical_metadata_backfill = false;
+    let effective = EffectiveConfig::new(config_file).unwrap();
+    assert!(
+        !effective
+            .config()
+            .session_import
+            .historical_metadata_backfill
+    );
+    let config_toml = effective.to_toml().unwrap();
+    let config_path = temp.path().join("daemon.toml");
+    fs::write(&config_path, &config_toml).unwrap();
+    let engine = Arc::new(EngineService::from_toml(&config_toml, RuntimeMode::Normal).unwrap());
+    let config_reload =
+        Arc::new(ConfigReloadService::new(engine, writer.clone(), data_dir, config_path).unwrap());
+    let configured_runtime = config_reload.initialize_runtime().await.unwrap();
+    evertrace_capture::DurableSpool::open(
+        configured_runtime.spool_dir.clone(),
+        configured_runtime.spool_limits().unwrap(),
+    )
+    .unwrap();
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let report = Arc::new(RwLock::new(Some(start_report.clone())));
+    let worker = SessionImportWorker::new(
+        writer.clone(),
+        configured_runtime.clone(),
+        Arc::clone(&report),
+    )
+    .unwrap();
+    let budget = SessionImportBudget {
+        max_bytes: 1024 * 1024,
+        max_records: 1,
+        max_work_time: Duration::from_millis(250),
+    };
+    let scheduler = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        configured_runtime.clone(),
+        SynthesisPlanner::new(LlmConfig {
+            enabled: false,
+            ..LlmConfig::default()
+        }),
+        effective.config().dreaming.clone(),
+    )
+    .with_config(Arc::clone(&config_reload));
+
+    let unchanged_revision = started.current.revision;
+    let running_scheduler = scheduler.clone();
+    tokio::spawn(async move { running_scheduler.run_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    let unchanged = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.current.revision, unchanged_revision);
+    assert_eq!(unchanged.current.body_state, SessionBodyState::NotImported);
+    assert!(unchanged.job.is_none());
+
+    let appended_line = serde_json::json!({
+        "timestamp": "2026-10-06T00:02:01Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": session,
+            "turn_id": "turn-after-start",
+            "item": {
+                "type": "UserMessage",
+                "id": "user-after-start",
+                "content": [{"type":"text","text":"Saffron cache replacement: preserve the live repository cache while writing a complete replacement into a sibling temporary directory. Validate the manifest and every referenced entry before one atomic rename. Abort on a missing entry, then reopen the live cache and compare its manifest to the validated replacement; effectiveness remains unverified.","text_elements":[]}]
+            },
+            "completed_at_ms": 1_791_244_921_000_i64
+        }
+    })
+    .to_string();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    file.write_all(crossing_suffix.as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+    writeln!(file, "{appended_line}").unwrap();
+    drop(file);
+    let appended_end = fs::metadata(&transcript).unwrap().len();
+    assert!(
+        !catalog
+            .native_session_source_observed(
+                session,
+                transcript.to_str().unwrap(),
+                Some(&start_report),
+                source_observation_deadline(),
+            )
+            .await
+            .unwrap(),
+        "a stale source fingerprint must fall through to ordinary catalog refresh"
+    );
+    catalog.refresh(&start_report).await.unwrap();
+    assert!(
+        catalog
+            .native_session_source_observed(
+                session,
+                transcript.to_str().unwrap(),
+                Some(&start_report),
+                source_observation_deadline(),
+            )
+            .await
+            .unwrap()
+    );
+    let first_body_attempt = worker.process_checkpoint(&source, budget).await;
+    assert!(
+        first_body_attempt.is_ok(),
+        "direct worker attempt after ordinary refresh failed: {first_body_attempt:?}"
+    );
+    let running_scheduler = scheduler.clone();
+    tokio::spawn(async move { running_scheduler.run_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    let queued = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = queued
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap()
+        .record_start
+        .unwrap();
+    assert!(fence > observed_end);
+    assert!(appended_end > fence);
+    assert_eq!(fence, observed_end + crossing_suffix.len() as u64 + 1);
+    assert_eq!(queued.current.metadata.file_size, appended_end);
+    assert_eq!(
+        queued
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .record_start,
+        Some(fence)
+    );
+    let mut suffix_only = queued;
+    for _ in 0..8 {
+        if suffix_only.current.body_state == SessionBodyState::Partial
+            && suffix_only.job.is_none()
+            && suffix_only
+                .watermark
+                .as_ref()
+                .is_some_and(|watermark| watermark.source_sequence == appended_end)
+        {
+            break;
+        }
+        let running_scheduler = scheduler.clone();
+        tokio::spawn(async move { running_scheduler.run_once().await })
+            .await
+            .unwrap()
+            .unwrap();
+        suffix_only = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(suffix_only.current.body_state, SessionBodyState::Partial);
+    assert!(suffix_only.job.is_none());
+    assert_eq!(
+        suffix_only.watermark.as_ref().unwrap().source_sequence,
+        appended_end
+    );
+    let suffix_jobs = RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
+        .unwrap()
+        .jobs;
+    let suffix_job = suffix_jobs
+        .iter()
+        .find(|job| job.idempotency_key == format!("session_import:{source}"))
+        .unwrap();
+    assert_eq!(
+        suffix_job.state,
+        JobStatus::Succeeded,
+        "terminal={:?}; context={suffix_only:?}",
+        suffix_job.terminal
+    );
+    assert_eq!(
+        suffix_job.terminal.as_ref().unwrap().reason,
+        evertrace_store::JobTerminalReason::Completed
+    );
+    assert!(suffix_only.current.access_decision.is_none());
+    let suffix_page = writer
+        .session_import_prefix_page(evertrace_store::SessionImportPrefixRequest {
+            source: source.clone(),
+            revision: suffix_only.current.metadata.source_revision.clone(),
+            after: fence,
+            end: appended_end,
+            max_records: 16,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+    assert_eq!(suffix_page.records.len(), 1);
+    assert_eq!(
+        (suffix_page.records[0].start, suffix_page.records[0].end),
+        (fence, appended_end)
+    );
+    let prefix_before_approval = writer
+        .session_import_prefix_page(evertrace_store::SessionImportPrefixRequest {
+            source: source.clone(),
+            revision: suffix_only.current.metadata.source_revision.clone(),
+            after: 0,
+            end: fence,
+            max_records: 16,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+    assert!(prefix_before_approval.records.is_empty());
+
+    let drained_revision = suffix_only.current.revision;
+    let running_scheduler = scheduler.clone();
+    tokio::spawn(async move { running_scheduler.run_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    let drained = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(drained.current.revision, drained_revision);
+    assert!(drained.job.is_none());
+
+    // An unapproved source can still feed the existing independent semantic
+    // and method consumers from its admitted suffix. The no-op summary
+    // response proves that the method does not depend on a summary object.
+    let first_suffix_receipts = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.observation_role == ObservationRole::Message
+                && receipt.source_sequence > fence
+                && receipt.source_sequence <= appended_end
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_suffix_receipts.len(), 1);
+    let first_suffix_ref = first_suffix_receipts[0].source_observation_id.to_string();
+    let method_content = serde_json::json!({
+        "title": "Saffron atomic cache replacement",
+        "summary": "A reusable cache replacement hypothesis; effectiveness remains unverified.",
+        "procedure_kind": "workflow",
+        "when": {
+            "goals": ["Replace a repository cache without exposing a partial build"],
+            "targets": ["repository cache"],
+            "signals": ["cache rebuild"],
+            "stage": "replace",
+            "requires": ["A sibling temporary directory and expected manifest are available"],
+            "excludes": ["The live cache must be overwritten in place"]
+        },
+        "applicability_expr": {"op":"exists","field":"failure_signature"},
+        "avoid_expr": {"op":"eq","field":"phase","value":{"kind":"text","value":"unknown"}},
+        "completion_expr": {"op":"eq","field":"verifier_state","value":{"kind":"text","value":"passed"}},
+        "actions": {
+            "stages": [
+                "Build a complete sibling cache while preserving the live cache",
+                "Validate the manifest and every referenced entry, then atomically rename the replacement"
+            ],
+            "branches": [],
+            "avoid": ["Do not report success when an entry is missing"]
+        },
+        "done": {
+            "success": ["The live cache matches the validated replacement"],
+            "abort": ["A referenced entry is missing"],
+            "verify": ["Reopen the live cache and compare its manifest with the validated replacement"]
+        },
+        "pitfalls": ["A source claim is not proof of successful execution"]
+    });
+    let response = |content: serde_json::Value| {
+        serde_json::to_vec(&serde_json::json!({
+            "choices": [{"message": {"content": content.to_string()}}],
+            "usage": {"prompt_tokens": 17, "completion_tokens": 5}
+        }))
+        .unwrap()
+    };
+    let no_op = response(serde_json::json!({"operation":"no_op"}));
+    let method_body = response(serde_json::json!({
+        "operation":"create",
+        "content":method_content,
+        "direct_refs":[first_suffix_ref.clone()]
+    }));
+    let method_stub = ProviderStub::methods(method_body, no_op.clone(), no_op.clone(), 2).await;
+    let method_llm = LlmConfig {
+        base_url: ValidatedBaseUrl::parse(&method_stub.base_url).unwrap(),
+        api_key_env: "PATH".into(),
+        ..LlmConfig::default()
+    };
+    let dreaming = evertrace_domain::config::DreamingConfig {
+        idle_after: evertrace_domain::config::DurationValue::from_seconds(1).unwrap(),
+        ..Default::default()
+    };
+    let method_scheduler = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        configured_runtime.clone(),
+        SynthesisPlanner::new(method_llm),
+        dreaming.clone(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let running_scheduler = method_scheduler.clone();
+    let method_run = tokio::spawn(async move { running_scheduler.run_once().await })
+        .await
+        .unwrap();
+    assert!(
+        method_run.is_ok(),
+        "source-start provider cycle failed: {method_run:?}; jobs={:?}",
+        RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
+            .unwrap()
+            .jobs
+    );
+    let method_snapshot = writer.project().await.unwrap();
+    let methods = SemanticCurrentView::from_snapshot(&method_snapshot).unwrap();
+    assert_eq!(methods.proposals.len(), 1);
+    let proposal = methods.proposals.values().next().unwrap();
+    let proposal_id = proposal.proposal_id;
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+    assert_eq!(
+        proposal.eligibility,
+        evertrace_domain::semantic::ProposalEligibility::ManualRequired
+    );
+    assert!(proposal.evidence_refs.contains(&first_suffix_ref));
+    assert!(
+        !method_snapshot
+            .data_rows()
+            .any(|row| { row.object_kind.as_deref() == Some("semantic_digest") })
+    );
+    drop(method_snapshot);
+    let after_method = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_method.current.body_state, SessionBodyState::Partial);
+    assert!(after_method.current.access_decision.is_none());
+    assert_eq!(
+        after_method.current.metadata.workspace_resolution_kind,
+        WorkspaceResolutionKind::Ambiguous
+    );
+    let method_requests = method_stub.finish_all().await;
+    assert_eq!(method_requests.len(), 2);
+    assert!(method_requests.iter().any(|request| {
+        String::from_utf8_lossy(request).contains("Extract at most one nontrivial reusable method")
+    }));
+    assert!(method_requests.iter().all(|request| {
+        let request = String::from_utf8_lossy(request);
+        !request.contains("must stay before the observed fence")
+            && !request.contains("turn-crossing-start")
+    }));
+
+    let bindings = evertrace_engine::McpBindingAuthority::new(
+        DeviceKeyStore::new(temp.path().join("keys"))
+            .load_or_create()
+            .unwrap(),
+    );
+    let mcp = evertrace_engine::McpActionService::open(
+        bindings.clone(),
+        &temp.path().join("data"),
+        writer.clone(),
+        configured_runtime.clone(),
+    )
+    .await
+    .unwrap()
+    .with_session_report(Arc::clone(&report));
+    let cross_session = "019d0000-0000-7000-8000-000000000098";
+    for (action, input) in [
+        (evertrace_engine::McpServiceAction::Search, "Saffron".into()),
+        (
+            evertrace_engine::McpServiceAction::Get,
+            proposal_id.to_string(),
+        ),
+    ] {
+        let grant = bindings
+            .issue_with_report(
+                evertrace_engine::McpBindingIssue {
+                    session_id: cross_session.into(),
+                    turn_id: "source-start-cross-session".into(),
+                    tool_use_id: "source-suffix-read".into(),
+                    agent_id: None,
+                    action: if action == evertrace_engine::McpServiceAction::Get {
+                        "get"
+                    } else {
+                        "search"
+                    }
+                    .into(),
+                    workspace: "@active".into(),
+                    input: input.clone(),
+                    refs: vec![],
+                    launcher_protocol_revision: 1,
+                },
+                Some(Arc::new(start_report.clone())),
+            )
+            .unwrap();
+        let request = evertrace_engine::McpServiceRequest {
+            request_id: RequestId::new_v7(),
+            action,
+            workspace: grant.bound_workspace,
+            input,
+            refs: vec![],
+            client_cwd: workspace.to_str().unwrap().into(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            mcp.handle("source-start-cross-session", request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.items.iter().any(|item| {
+            item.object_ref == Some(proposal_id.to_string())
+                && item.content_trust == evertrace_domain::evidence::ContentTrust::AgentClaim
+        }));
+    }
+    drop(method_scheduler);
+
+    let first_suffix_end = appended_end;
+    let next_line = serde_json::json!({
+        "timestamp": "2026-10-06T00:03:01Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": session,
+            "turn_id": "turn-after-start-2",
+            "item": {
+                "type": "UserMessage",
+                "id": "user-after-start-2",
+                "content": [{"type":"text","text":"Saffron verification note: after replacing the live repository cache, reopen it and compare its manifest against the validated sibling before reporting completion; effectiveness remains unverified.","text_elements":[]}]
+            },
+            "completed_at_ms": 1_791_244_981_000_i64
+        }
+    })
+    .to_string();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(file, "{next_line}").unwrap();
+    drop(file);
+    let appended_end = fs::metadata(&transcript).unwrap().len();
+    let running_scheduler = scheduler.clone();
+    tokio::spawn(async move { running_scheduler.run_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    let requeued = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(requeued.current.metadata.file_size, appended_end);
+    assert_eq!(requeued.current.body_state, SessionBodyState::Queued);
+    assert_eq!(requeued.job.as_ref().unwrap().state, JobStatus::Queued);
+    let mut next_suffix_records = 0;
+    let mut next_suffix_completed = false;
+    for _ in 0..8 {
+        let progress = worker.process_checkpoint(&source, budget).await.unwrap();
+        next_suffix_records += progress.records;
+        next_suffix_completed = progress.completed;
+        if next_suffix_completed {
+            break;
+        }
+    }
+    assert!(next_suffix_completed);
+    assert_eq!(next_suffix_records, 1);
+    let drained_again = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(drained_again.current.body_state, SessionBodyState::Partial);
+    assert!(drained_again.job.is_none());
+
+    let second_suffix_receipts = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.observation_role == ObservationRole::Message
+                && receipt.source_sequence > first_suffix_end
+                && receipt.source_sequence <= appended_end
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(second_suffix_receipts.len(), 1);
+    let second_suffix_ref = second_suffix_receipts[0].source_observation_id.to_string();
+    let summary_application = serde_json::json!({
+        "progress_delta": [{
+            "label":"cache replacement verification",
+            "value":"The source proposes reopening the live cache and comparing its manifest with a validated sibling; execution and effectiveness remain unverified.",
+            "direct_refs":[second_suffix_ref.clone()]
+        }],
+        "decision_delta":[],
+        "failed_routes":[],
+        "resolved_items":[],
+        "open_loops":[],
+        "outcome_delta":[],
+        "omissions":[],
+        "candidates":[],
+        "completeness":"partial"
+    });
+    let summary_stub = ProviderStub::methods(
+        no_op.clone(),
+        no_op.clone(),
+        response(summary_application),
+        3,
+    )
+    .await;
+    let summary_scheduler = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        configured_runtime.clone(),
+        SynthesisPlanner::new(LlmConfig {
+            base_url: ValidatedBaseUrl::parse(&summary_stub.base_url).unwrap(),
+            api_key_env: "PATH".into(),
+            ..LlmConfig::default()
+        }),
+        dreaming.clone(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let running_scheduler = summary_scheduler.clone();
+    tokio::spawn(async move { running_scheduler.run_once().await })
+        .await
+        .unwrap()
+        .unwrap();
+    let summary_requests = summary_stub.finish_all().await;
+    let summary_snapshot = writer.project().await.unwrap();
+    let source_summary_requests = summary_requests
+        .iter()
+        .filter(|request| {
+            String::from_utf8_lossy(request)
+                .contains("describing only the supplied archived messages")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(source_summary_requests.len(), 1);
+    let source_request = &source_summary_requests[0];
+    let body_offset = source_request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let source_request: serde_json::Value =
+        serde_json::from_slice(&source_request[body_offset..]).unwrap();
+    let source_input: serde_json::Value =
+        serde_json::from_str(source_request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        source_input["source_refs"],
+        serde_json::json!([second_suffix_ref])
+    );
+    assert!(
+        !source_input
+            .to_string()
+            .contains("must stay before the observed fence")
+    );
+    assert!(!source_input.to_string().contains("turn-crossing-start"));
+    let suffix_summary = summary_snapshot
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SemanticDigestRecorded(digest)
+                    if digest
+                        .application
+                        .progress_delta
+                        .iter()
+                        .any(|delta| delta.direct_refs.contains(&second_suffix_ref)) =>
+                {
+                    Some(digest)
+                }
+                _ => None,
+            }
+        })
+        .next()
+        .expect("source-summary did not commit the new suffix");
+    assert!(suffix_summary.application.candidates.is_empty());
+    assert!(
+        suffix_summary
+            .application
+            .progress_delta
+            .iter()
+            .all(|delta| {
+                delta
+                    .direct_refs
+                    .iter()
+                    .all(|reference| reference == &second_suffix_ref)
+            })
+    );
+    assert!(
+        !suffix_summary
+            .application
+            .progress_delta
+            .iter()
+            .any(|delta| { delta.value.contains("must stay before the observed fence") })
+    );
+    drop(summary_snapshot);
+    let after_summary = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_summary.current.body_state, SessionBodyState::Partial);
+    assert!(after_summary.current.access_decision.is_none());
+    assert!(after_summary.current.metadata.prospective_origin.is_some());
+    assert_eq!(summary_requests.len(), 3);
+    assert!(summary_requests.iter().all(|request| {
+        let request = String::from_utf8_lossy(request);
+        !request.contains("must stay before the observed fence")
+            && !request.contains("turn-crossing-start")
+    }));
+    assert_eq!(
+        methods.proposals.get(&proposal_id).unwrap().status,
+        ProposalStatus::Pending
+    );
+    drop(methods);
+
+    tokio::spawn(async move {
+    let admin = SessionImportAdminService::new(writer.clone(), Arc::clone(&report), CONFIG);
+
+    // Keep a second prospective source runnable while the main source builds
+    // real receipts in both the historical-prefix and suffix lanes.
+    let provider_session = cases[1].0;
+    let provider_source = format!("session-rollout:{provider_session}:{provider_session}");
+    let provider_transcript = dated.join(format!(
+        "rollout-2026-10-06T00-00-01-{provider_session}.jsonl"
+    ));
+    let provider_request = RequestId::new_v7();
+    let provider_observation = format!("native_session_source_observation:{provider_request}");
+    let provider_deadline = source_observation_deadline();
+    let provider_report = evertrace_engine::repository::observe_session_source_report(
+        provider_transcript.to_str().unwrap(),
+        provider_session,
+        None,
+        &provider_observation,
+        provider_deadline,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .observe_native_session_source(
+                provider_request,
+                &provider_report,
+                provider_session,
+                provider_transcript.to_str().unwrap(),
+                &provider_observation,
+                provider_deadline,
+            )
+            .await
+            .unwrap()
+    );
+    let provider_origin = writer
+        .session_import_context(&provider_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(provider_origin.current.access_decision.is_none());
+    let provider_fence = provider_origin
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap()
+        .record_start
+        .unwrap();
+    let provider_line = serde_json::json!({
+        "timestamp":"2026-10-06T00:02:30Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":provider_session,"turn_id":"provider-revoke-1","item":{"type":"UserMessage","id":"provider-revoke-1","content":[{"type":"text","text":"A prospective provider candidate must be discarded if access is revoked while generation is pending.","text_elements":[]}]},"completed_at_ms":1_791_244_951_000_i64}
+    })
+    .to_string();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&provider_transcript)
+        .unwrap();
+    writeln!(file, "{provider_line}").unwrap();
+    drop(file);
+    catalog.refresh(&provider_report).await.unwrap();
+    for _ in 0..4 {
+        if worker
+            .process_checkpoint(&provider_source, budget)
+            .await
+            .unwrap()
+            .completed
+        {
+            break;
+        }
+    }
+    let provider_ready = writer
+        .session_import_context(&provider_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(provider_ready.current.access_decision.is_none());
+    assert!(provider_ready.watermark.as_ref().unwrap().source_sequence > provider_fence);
+    let first_provider_reference = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == provider_source
+                && receipt.source_sequence > provider_fence
+                && receipt.observation_role == ObservationRole::Message
+        })
+        .map(|receipt| receipt.source_observation_id.to_string())
+        .next()
+        .unwrap();
+    let provider_backlog_line = serde_json::json!({
+        "timestamp":"2026-10-06T00:03:00Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":provider_session,"turn_id":"provider-revoke-backlog","item":{"type":"UserMessage","id":"provider-revoke-backlog","content":[{"type":"text","text":"A second prospective source record remains queued until a later body quantum.","text_elements":[]}]},"completed_at_ms":1_791_244_981_000_i64}
+    })
+    .to_string();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&provider_transcript)
+        .unwrap();
+    writeln!(file, "{provider_backlog_line}").unwrap();
+    drop(file);
+    let provider_refresh = catalog.refresh_active(&provider_report).await.unwrap();
+    let provider_backlog = writer
+        .session_import_context(&provider_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        provider_refresh > 0
+            && provider_backlog
+                .job
+                .as_ref()
+                .is_some_and(|job| job.state == JobStatus::Queued),
+        "active refresh must queue the complete append on a drained prospective source: refreshed={provider_refresh}, body={:?}, metadata_size={}, job={:?}",
+        provider_backlog.current.body_state,
+        provider_backlog.current.metadata.file_size,
+        provider_backlog.job
+    );
+    assert!(provider_backlog.current.access_decision.is_none());
+    // The next existing record arrives in two writes. Metadata must catch up
+    // while this job is queued, without granting a read of the incomplete tail.
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&provider_transcript)
+        .unwrap();
+    file.write_all(b"{").unwrap();
+    drop(file);
+    let provider_followup_size = fs::metadata(&provider_transcript).unwrap().len();
+    assert!(provider_followup_size > provider_backlog.current.metadata.file_size);
+    let refresh_while_queued = catalog.refresh_active(&provider_report).await.unwrap();
+    let provider_refreshed = writer
+        .session_import_context(&provider_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(refresh_while_queued > 0);
+    assert_eq!(
+        provider_refreshed.current.metadata.file_size,
+        provider_followup_size
+    );
+    assert_eq!(
+        provider_refreshed.current.body_state,
+        provider_backlog.current.body_state
+    );
+    assert!(provider_refreshed.current.access_decision.is_none());
+    assert_eq!(
+        provider_refreshed.current.metadata.prospective_origin,
+        provider_backlog.current.metadata.prospective_origin
+    );
+    assert_eq!(provider_refreshed.watermark, provider_backlog.watermark);
+    let refreshed_job = provider_refreshed.job.as_ref().unwrap();
+    assert_eq!(
+        refreshed_job.job_id,
+        provider_backlog.job.as_ref().unwrap().job_id
+    );
+    assert_eq!(refreshed_job.state, JobStatus::Queued);
+
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                SessionImportAdminAction::QueueImport,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    let mut suffix_lines = Vec::new();
+    for index in 0..12 {
+        suffix_lines.push(
+            serde_json::json!({
+                "timestamp":"2026-10-06T00:04:00Z",
+                "type":"event_msg",
+                "payload":{"type":"item_completed","thread_id":session,"turn_id":format!("dual-backlog-{index}"),"item":{"type":"UserMessage","id":format!("dual-backlog-{index}"),"content":[{"type":"text","text":format!("admitted suffix backlog item {index}"),"text_elements":[]}]},"completed_at_ms":1_791_245_040_000_i64 + index}
+            })
+            .to_string(),
+        );
+    }
+    let missing_git_line = serde_json::json!({
+        "timestamp":"2026-10-06T00:05:00Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":session,"turn_id":"missing-git-append","item":{"type":"UserMessage","id":"missing-git-append","content":[{"type":"text","text":"This append is admitted only after the original Git evidence returns.","text_elements":[]}]},"completed_at_ms":1_791_245_100_000_i64}
+    })
+    .to_string();
+    let missing_git_split = missing_git_line.len() / 2;
+    let before_missing_git = &missing_git_line[..missing_git_split];
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    for line in &suffix_lines {
+        writeln!(file, "{line}").unwrap();
+    }
+    let full_suffix_end = file.metadata().unwrap().len();
+    file.write_all(before_missing_git.as_bytes()).unwrap();
+    drop(file);
+    catalog.refresh(&start_report).await.unwrap();
+    let queued_dual = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        queued_dual.current.access_decision,
+        Some(evertrace_store::SessionAccessDecision::Approved)
+    );
+    assert!(queued_dual.current.metadata.file_size > full_suffix_end);
+    assert_eq!(queued_dual.current.body_state, SessionBodyState::Queued);
+    let mut saw_prefix_progress = false;
+    let mut saw_suffix_progress = false;
+    let mut saw_prefix_eof_with_suffix_pending = false;
+    let mut other_source_advanced_during_body = false;
+    for _ in 0..32 {
+        let before = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        let previous_watermark = before.watermark.clone().unwrap();
+        let progress = worker.process_checkpoint(&source, budget).await.unwrap();
+        let after = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_watermark = after.watermark.as_ref().unwrap();
+        let prefix_before = previous_watermark
+            .earlier_prefix
+            .as_ref()
+            .map_or(0, |prefix| prefix.through_byte);
+        let prefix_after = current_watermark
+            .earlier_prefix
+            .as_ref()
+            .map_or(0, |prefix| prefix.through_byte);
+        if prefix_after > prefix_before {
+            saw_prefix_progress = true;
+        }
+        if current_watermark.source_sequence > previous_watermark.source_sequence {
+            saw_suffix_progress = true;
+        }
+        if progress.records > 0 && !other_source_advanced_during_body {
+            for _ in 0..8 {
+                let other = worker
+                    .process_checkpoint(&provider_source, budget)
+                    .await
+                    .unwrap();
+                if other.records > 0 {
+                    other_source_advanced_during_body = true;
+                    break;
+                }
+            }
+        }
+        if prefix_after == fence && current_watermark.source_sequence < full_suffix_end {
+            assert!(
+                !progress.completed,
+                "one finished lane cannot finish the whole job"
+            );
+            saw_prefix_eof_with_suffix_pending = true;
+            break;
+        }
+        assert!(!progress.completed || current_watermark.source_sequence >= full_suffix_end);
+    }
+    assert!(saw_prefix_progress && saw_suffix_progress);
+    assert!(saw_prefix_eof_with_suffix_pending);
+    assert!(
+        other_source_advanced_during_body,
+        "the other prospective source must advance while the dual-leg suffix backlog remains nonempty"
+    );
+    let dual_progress = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let dual_watermark = dual_progress.watermark.as_ref().unwrap();
+    assert_eq!(
+        dual_watermark.earlier_prefix.as_ref().unwrap().through_byte,
+        fence
+    );
+    assert!(dual_watermark.source_sequence < full_suffix_end);
+    assert_eq!(dual_progress.job.as_ref().unwrap().state, JobStatus::Queued);
+    assert!(dual_progress.job.as_ref().unwrap().terminal.is_none());
+
+    let cold_proof_provider_line = serde_json::json!({
+        "timestamp":"2026-10-06T00:03:30Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":provider_session,"turn_id":"provider-cold-proof-runnable","item":{"type":"UserMessage","id":"provider-cold-proof-runnable","content":[{"type":"text","text":"A second source remains runnable throughout cold dual-proof pages.","text_elements":[]}]},"completed_at_ms":1_791_245_011_000_i64}
+    })
+    .to_string();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&provider_transcript)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        cold_proof_provider_line.strip_prefix('{').unwrap()
+    )
+    .unwrap();
+    drop(file);
+    let provider_refresh = catalog.refresh_active(&provider_report).await.unwrap();
+    let provider_cold_pending = writer
+        .session_import_context(&provider_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        provider_refresh > 0
+            && provider_cold_pending
+                .job
+                .as_ref()
+                .is_some_and(|job| job.state == JobStatus::Queued),
+        "a fresh complete append must leave the other source runnable for cold proof"
+    );
+
+    let cold_worker = SessionImportWorker::new(
+        writer.clone(),
+        configured_runtime.clone(),
+        Arc::clone(&report),
+    )
+    .unwrap();
+    let receipts_before_cold_proof = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| receipt.source_instance_id.as_str() == source)
+        .count();
+    let watermark_before_cold_proof = dual_progress.watermark.clone();
+    let mut cold_proof_pages = 0;
+    let mut other_source_advanced = false;
+    let mut body_after_proofs = 0;
+    for _ in 0..24 {
+        let progress = cold_worker
+            .process_checkpoint(&source, budget)
+            .await
+            .unwrap();
+        if progress.records > 0 || progress.completed {
+            body_after_proofs = progress.records;
+            break;
+        }
+        cold_proof_pages += usize::from(progress.bytes > 0);
+        let current = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.watermark, watermark_before_cold_proof);
+        assert_eq!(current.job.as_ref().unwrap().state, JobStatus::Queued);
+        assert!(current.job.as_ref().unwrap().terminal.is_none());
+        let receipts_during_proof = projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+            .count();
+        assert_eq!(
+            receipts_during_proof, receipts_before_cold_proof,
+            "proof-only checkpoints cannot append selected-source receipts"
+        );
+        if !other_source_advanced {
+            for _ in 0..4 {
+                let other = worker
+                    .process_checkpoint(&provider_source, budget)
+                    .await
+                    .unwrap();
+                if other.records > 0 {
+                    other_source_advanced = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        cold_proof_pages >= 2,
+        "both committed legs need bounded proof pages"
+    );
+    assert!(
+        other_source_advanced,
+        "the other runnable source must advance during cold proof"
+    );
+    assert_eq!(
+        body_after_proofs, 1,
+        "one body record is allowed after proofs"
+    );
+
+    tokio::spawn(async move {
+    // This independent source has no source-time S11 identity. The positive
+    // a1 historical-resolution fixture is intentionally not reused here.
+    let revoke_session = "019d0000-0000-7000-8000-0000000000a4";
+    let revoke_source = format!("session-rollout:{revoke_session}:{revoke_session}");
+    let revoke_transcript = dated.join(format!(
+        "rollout-2026-10-06T00-00-01-{revoke_session}.jsonl"
+    ));
+    let historical_line = serde_json::json!({
+        "timestamp":"2026-10-06T00:00:30Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":revoke_session,"turn_id":"closed-unknown-fence","item":{"type":"UserMessage","id":"closed-unknown-fence","content":[{"type":"text","text":"historical record completed after the origin closed","text_elements":[]}]},"completed_at_ms":1_791_244_831_000_i64}
+    })
+    .to_string();
+    let historical_split = historical_line.len() / 2;
+    let (historical_prefix, historical_suffix) = historical_line.split_at(historical_split);
+    let historical_header = serde_json::json!({
+        "timestamp":"2026-10-06T00:00:01Z",
+        "type":"session_meta",
+        "payload":{"id":revoke_session,"session_id":revoke_session,"cwd":workspace,
+            "git":{"commit_hash":source_fixture_git(&workspace, &["rev-parse", "HEAD"])}}
+    });
+    fs::write(&revoke_transcript, format!("{historical_header}\n{historical_prefix}")).unwrap();
+    let revoke_request = RequestId::new_v7();
+    let revoke_reference = format!("native_session_source_observation:{revoke_request}");
+    let revoke_deadline = source_observation_deadline();
+    let revoke_report = evertrace_engine::repository::observe_session_source_report(
+        revoke_transcript.to_str().unwrap(),
+        revoke_session,
+        None,
+        &revoke_reference,
+        revoke_deadline,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .observe_native_session_source(
+                revoke_request,
+                &revoke_report,
+                revoke_session,
+                revoke_transcript.to_str().unwrap(),
+                &revoke_reference,
+                revoke_deadline,
+            )
+            .await
+            .unwrap()
+    );
+    let unapproved = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(unapproved.current.access_decision.is_none());
+    assert!(unapproved.current.metadata.resolved_repository_instance_id.is_none());
+    assert!(unapproved.current.metadata.resolved_worktree_instance_id.is_none());
+    assert!(unapproved.current.metadata.prospective_origin.is_some());
+    assert_eq!(unapproved.current.body_state, SessionBodyState::NotImported);
+    assert_eq!(
+        unapproved
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .record_start,
+        None,
+        "the live observation ended inside a transcript record"
+    );
+
+    // The second prospective source remains live with an incomplete suffix tail.
+    // Its most recent committed receipt drives the paused provider request.
+    let provider_ready = writer
+        .session_import_context(&provider_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(provider_ready.current.access_decision.is_none());
+    assert!(
+        provider_ready
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .is_some_and(|origin| !origin.closed)
+    );
+    let provider_reference = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == provider_source
+                && receipt.observation_role == ObservationRole::Message
+        })
+        .map(|receipt| {
+            (
+                receipt.source_sequence,
+                receipt.source_observation_id.to_string(),
+            )
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .unwrap()
+        .1;
+    assert_ne!(
+        first_provider_reference, provider_reference,
+        "the independently runnable source must have durable progress beyond its first receipt"
+    );
+    let provider_method_body = response(serde_json::json!({
+        "operation":"create",
+        "content":method_content.clone(),
+        "direct_refs":[provider_reference.clone()]
+    }));
+    let (revoked_stub, release_provider) =
+        ProviderStub::methods_once_paused(provider_method_body, no_op.clone(), no_op.clone(), 2)
+            .await;
+    let revoking_scheduler = BackgroundScheduler::new(
+        writer.clone(),
+        catalog.clone(),
+        worker.clone(),
+        Arc::clone(&report),
+        configured_runtime.clone(),
+        SynthesisPlanner::new(LlmConfig {
+            base_url: ValidatedBaseUrl::parse(&revoked_stub.base_url).unwrap(),
+            api_key_env: "PATH".into(),
+            ..LlmConfig::default()
+        }),
+        dreaming.clone(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let running_revocation = tokio::spawn({
+        let scheduler = revoking_scheduler.clone();
+        async move { scheduler.run_once().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), revoked_stub.wait_received())
+        .await
+        .expect("method provider did not reach the controlled in-flight point");
+
+    let prior_main_watermark = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .watermark
+        .unwrap();
+    let mut concurrent_progress = None;
+    for _ in 0..16 {
+        let progress = worker.process_checkpoint(&source, budget).await.unwrap();
+        if progress.records > 0 {
+            concurrent_progress = Some(progress);
+            break;
+        }
+    }
+    assert!(
+        concurrent_progress.is_some(),
+        "the live main source must keep progressing while the other provider request is pending"
+    );
+    let main_advanced = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        main_advanced.current.access_decision,
+        Some(evertrace_store::SessionAccessDecision::Approved)
+    );
+    assert!(
+        main_advanced.watermark.as_ref().unwrap().source_sequence
+            > prior_main_watermark.source_sequence
+    );
+
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                provider_session,
+                SessionImportAdminAction::RevokeAccess,
+                11,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Revoked
+    );
+    assert_eq!(
+        writer
+            .session_import_context(&provider_source)
+            .await
+            .unwrap()
+            .unwrap()
+            .current
+            .access_decision,
+        Some(evertrace_store::SessionAccessDecision::Revoked)
+    );
+    release_provider.send(()).unwrap();
+    running_revocation.await.unwrap().unwrap();
+    let revoked_requests = revoked_stub.finish_all().await;
+    assert!(revoked_requests.iter().any(|request| {
+        String::from_utf8_lossy(request).contains("Extract at most one nontrivial reusable method")
+    }));
+    let after_revoked_provider =
+        SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    assert!(
+        after_revoked_provider
+            .proposals
+            .values()
+            .all(|proposal| { !proposal.evidence_refs.contains(&provider_reference) })
+    );
+
+    // A missing Git locator is ambiguity, not proof of a replacement. Appending
+    // while the evidence is unavailable cannot claim or import the new bytes.
+    let receipt_count_before_missing_git =
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+        .count();
+    let open_before_missing = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let origin_before_missing = open_before_missing
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap()
+        .clone();
+    let job_before_missing = open_before_missing.job.clone();
+    let job_id_before_missing = job_before_missing.as_ref().unwrap().job_id;
+    let watermark_before_missing = open_before_missing.watermark.clone();
+    let leases_before_missing = writer
+        .project()
+        .await
+        .unwrap()
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::JobLease(lease) if lease.job_id == job_id_before_missing => {
+                    Some(())
+                }
+                _ => None,
+            }
+        })
+        .count();
+    let git_dir = workspace.join(".git");
+    let held_git_dir = temp.path().join("held-origin-git");
+    let missing_git_line = serde_json::json!({
+        "timestamp":"2026-10-06T00:05:00Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":session,"turn_id":"missing-git-append","item":{"type":"UserMessage","id":"missing-git-append","content":[{"type":"text","text":"This append is admitted only after the original Git evidence returns.","text_elements":[]}]},"completed_at_ms":1_791_245_100_000_i64}
+    })
+    .to_string();
+    let missing_git_split = missing_git_line.len() / 2;
+    let (before_missing_git, after_missing_git) = missing_git_line.split_at(missing_git_split);
+    fs::rename(&git_dir, &held_git_dir).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    file.write_all(before_missing_git.as_bytes()).unwrap();
+    drop(file);
+    let incomplete_tail_end = fs::metadata(&transcript).unwrap().len();
+    let missing_git_attempt = worker.process_checkpoint(&source, budget).await;
+    assert!(missing_git_attempt.is_err() || missing_git_attempt.unwrap().records == 0);
+    let still_open = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let still_open_origin = still_open
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap();
+    assert!(!still_open_origin.closed);
+    assert_eq!(
+        still_open_origin.snapshot_ref,
+        origin_before_missing.snapshot_ref
+    );
+    assert_eq!(
+        still_open_origin.record_start,
+        origin_before_missing.record_start
+    );
+    assert_eq!(still_open.watermark, watermark_before_missing);
+    let leases_after_missing = writer
+        .project()
+        .await
+        .unwrap()
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::JobLease(lease) if lease.job_id == job_id_before_missing => {
+                    Some(())
+                }
+                _ => None,
+            }
+        })
+        .count();
+    assert_eq!(
+        leases_after_missing, leases_before_missing,
+        "missing evidence cannot claim a new body lease"
+    );
+    assert!(still_open.current.metadata.file_size < incomplete_tail_end);
+    assert_eq!(
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+            .count(),
+        receipt_count_before_missing_git
+    );
+    fs::rename(&held_git_dir, &git_dir).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    file.write_all(after_missing_git.as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    let missing_git_end = fs::metadata(&transcript).unwrap().len();
+    catalog.refresh(&start_report).await.unwrap();
+    let restored_evidence = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let restored_origin = restored_evidence
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap();
+    assert!(!restored_origin.closed);
+    assert_eq!(
+        restored_origin.snapshot_ref,
+        origin_before_missing.snapshot_ref
+    );
+    assert_eq!(
+        restored_origin.record_start,
+        origin_before_missing.record_start
+    );
+    assert_eq!(
+        restored_evidence.current.metadata.file_size,
+        missing_git_end
+    );
+    let watermark_before_resume = still_open.watermark.as_ref().unwrap().source_sequence;
+    let mut resumed_progress = None;
+    for _ in 0..24 {
+        let progress = worker.process_checkpoint(&source, budget).await.unwrap();
+        let resumed = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        if resumed
+            .watermark
+            .as_ref()
+            .is_some_and(|watermark| watermark.source_sequence > watermark_before_resume)
+        {
+            resumed_progress = Some(progress);
+            break;
+        }
+    }
+    let resumed = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resumed_progress.is_some_and(|progress| progress.records > 0));
+    let resumed_watermark = resumed.watermark.as_ref().unwrap();
+    assert!(resumed_watermark.source_sequence > watermark_before_resume);
+    assert!(resumed_watermark.source_sequence < missing_git_end);
+    assert_eq!(resumed.job.as_ref().unwrap().state, JobStatus::Queued);
+    assert_eq!(resumed.current.body_state, SessionBodyState::Partial);
+    assert_eq!(
+        resumed
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .snapshot_ref,
+        origin_before_missing.snapshot_ref
+    );
+    assert_eq!(
+        resumed
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .record_start,
+        origin_before_missing.record_start
+    );
+    assert!(
+        !resumed
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed
+    );
+
+    let receipt_count_before_close = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| receipt.source_instance_id.as_str() == source)
+        .count();
+
+    fs::rename(&git_dir, &held_git_dir).unwrap();
+    source_fixture_git(&workspace, &["init", "-q", "-b", "main"]);
+    source_fixture_git(
+        &workspace,
+        &["commit", "--allow-empty", "-qm", "replacement"],
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    assert_ne!(
+        fs::metadata(&held_git_dir).unwrap().ino(),
+        fs::metadata(&git_dir).unwrap().ino(),
+        "the test must install a distinct Git instance at the original path"
+    );
+    let close_progress = worker
+        .process_checkpoint(&source, budget)
+        .await
+        .expect("positive Git-instance replacement should persist source closure");
+    assert_eq!(close_progress.records, 0);
+    let closure_worker = SessionImportWorker::new(
+        writer.clone(),
+        configured_runtime.clone(),
+        Arc::clone(&report),
+    )
+    .unwrap();
+    let watermark_before_close_finalization = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .watermark;
+    let mut close_finalized = false;
+    for _ in 0..32 {
+        let progress = closure_worker
+            .process_checkpoint(&source, budget)
+            .await
+            .unwrap();
+        assert_eq!(
+            progress.records, 0,
+            "closed-source finalization is proof/terminal work only"
+        );
+        let current = writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.watermark, watermark_before_close_finalization);
+        if progress.completed {
+            close_finalized = true;
+            break;
+        }
+    }
+    assert!(
+        close_finalized,
+        "closed admitted ranges must finish after both durable proofs"
+    );
+    let closed = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let closed_origin = closed.current.metadata.prospective_origin.as_ref().unwrap();
+    assert!(closed_origin.closed);
+    assert_eq!(
+        closed_origin.snapshot_ref,
+        source_snapshot.worktree_snapshot_id
+    );
+    assert_eq!(closed_origin.record_start, Some(fence));
+    assert!(
+        closed
+            .current
+            .metadata
+            .read_restrictions()
+            .any(|id| id == repository)
+    );
+    assert_eq!(closed.current.body_state, SessionBodyState::Partial);
+    assert!(closed.job.is_none());
+    assert_eq!(
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+            .count(),
+        receipt_count_before_close,
+        "positive discontinuity must close before a new receipt is admitted"
+    );
+
+    let unknown_close = worker.process_checkpoint(&revoke_source, budget).await;
+    assert!(
+        unknown_close.is_ok_and(|progress| progress.records == 0),
+        "the independent origin must close without importing its unobserved tail: {unknown_close:?}"
+    );
+    let closed_unknown = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    let closed_unknown_origin = closed_unknown
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap();
+    assert!(closed_unknown_origin.closed);
+    assert_eq!(closed_unknown_origin.record_start, None);
+    assert!(closed_unknown.watermark.is_none());
+    assert!(closed_unknown.current.access_decision.is_none());
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&revoke_transcript)
+        .unwrap();
+    file.write_all(historical_suffix.as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    let unknown_tail_end = fs::metadata(&revoke_transcript).unwrap().len();
+    catalog.refresh(&revoke_report).await.unwrap();
+    let still_unknown = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_unknown.current.metadata.file_size, unknown_tail_end);
+    assert_eq!(
+        still_unknown
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .record_start,
+        None,
+        "catalog refresh must not resolve a closed origin before historical approval"
+    );
+    assert!(
+        still_unknown
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed
+    );
+
+    assert!(still_unknown.current.metadata.resolved_repository_instance_id.is_none());
+    assert!(still_unknown.current.metadata.resolved_worktree_instance_id.is_none());
+    // Archived-read trust is not permission to read unapproved source bytes.
+    // A closed origin must retain an unknown fence until historical approval.
+    let unapproved_preflight = Box::pin(worker.process_checkpoint(&revoke_source, budget))
+        .await
+        .unwrap();
+    assert_eq!(unapproved_preflight.records, 0);
+    let after_unapproved = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_unapproved.current.metadata.prospective_origin,
+        still_unknown.current.metadata.prospective_origin,
+        "trust alone must not resolve a closed source's unapproved historical framing"
+    );
+    assert!(after_unapproved.watermark.is_none());
+
+    let approved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                revoke_session,
+                SessionImportAdminAction::QueueImport,
+                approved_at,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    let receipts_before_unknown_preflight = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| receipt.source_instance_id.as_str() == revoke_source)
+        .count();
+    let first_unknown_preflight = worker
+        .process_checkpoint(
+            &revoke_source,
+            SessionImportBudget {
+                max_records: 1,
+                ..budget
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_unknown_preflight.records, 0);
+    assert!(!first_unknown_preflight.completed);
+    let resolved_unknown = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved_origin = resolved_unknown
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap();
+    assert!(resolved_origin.closed);
+    let resolved_fence = resolved_origin.record_start.unwrap();
+    assert_eq!(resolved_fence, unknown_tail_end);
+    assert!(resolved_unknown.watermark.is_none());
+    assert_eq!(
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == revoke_source)
+            .count(),
+        receipts_before_unknown_preflight,
+        "the bounded metadata preflight cannot create a body receipt"
+    );
+    let mut unknown_progress = None;
+    for _ in 0..8 {
+        let progress = worker
+            .process_checkpoint(
+                &revoke_source,
+                SessionImportBudget {
+                    max_records: 1,
+                    ..budget
+                },
+            )
+            .await
+            .unwrap();
+        if progress.completed {
+            unknown_progress = Some(progress);
+            break;
+        }
+    }
+    let historical_imported = writer
+        .session_import_context(&revoke_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(unknown_progress.is_some());
+    assert_eq!(
+        historical_imported.current.body_state,
+        SessionBodyState::Partial
+    );
+    assert!(
+        historical_imported
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed
+    );
+    let historical_watermark = historical_imported.watermark.as_ref().unwrap();
+    assert_eq!(historical_watermark.source_sequence, resolved_fence);
+    assert!(historical_watermark.confirmed_prefix_digest.is_none());
+    let historical_prefix = historical_watermark.earlier_prefix.as_ref().unwrap();
+    assert_eq!(historical_prefix.fence_byte, resolved_fence);
+    assert_eq!(historical_prefix.through_byte, resolved_fence);
+    assert!(historical_prefix.digest.is_some());
+    assert!(
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == revoke_source)
+            .all(|receipt| receipt.source_sequence <= resolved_fence),
+        "the first receipt after close is restricted to the resolved historical fence"
+    );
+
+    let closed_archive = writer.project().await.unwrap();
+    let closed_semantics = SemanticCurrentView::from_snapshot(&closed_archive).unwrap();
+    let archived_proposal = closed_semantics
+        .proposals
+        .get(&proposal_id)
+        .expect("origin closure must not delete the admitted archive output");
+    assert_eq!(archived_proposal.status, ProposalStatus::Pending);
+    assert!(archived_proposal.evidence_refs.contains(&first_suffix_ref));
+    drop(closed_archive);
+
+    tokio::spawn(async move {
+    // Restore the original R1 Git directory only for the ordinary archive
+    // caller. The origin remains closed; this proves its archived proposal is
+    // still readable by its original legal scope, without granting R2 access.
+    let replacement_git_dir = temp.path().join("held-replacement-git");
+    let replacement_report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        "archived-replacement-scope-denied",
+        source_observation_deadline(),
+    )
+    .unwrap();
+    *report.write().await = Some(replacement_report.clone());
+    let replacement_grant = bindings
+        .issue_with_report(
+            evertrace_engine::McpBindingIssue {
+                session_id: session.into(),
+                turn_id: "closed-origin-r2-scope".into(),
+                tool_use_id: "archived-proposal-get-r2".into(),
+                agent_id: None,
+                action: "get".into(),
+                workspace: "@active".into(),
+                input: proposal_id.to_string(),
+                refs: vec![],
+                launcher_protocol_revision: 1,
+            },
+            Some(Arc::new(replacement_report.clone())),
+        )
+        .unwrap();
+    let replacement_get = tokio::time::timeout(
+        Duration::from_secs(2),
+        mcp.handle(
+            "source-start-cross-session",
+            evertrace_engine::McpServiceRequest {
+                request_id: RequestId::new_v7(),
+                action: evertrace_engine::McpServiceAction::Get,
+                workspace: replacement_grant.bound_workspace,
+                input: proposal_id.to_string(),
+                refs: vec![],
+                client_cwd: workspace.to_str().unwrap().into(),
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        replacement_get.items.is_empty(),
+        "the R2 replacement caller must not inherit archived R1 scope: {:?}",
+        replacement_get.items
+    );
+    fs::rename(&git_dir, &replacement_git_dir).unwrap();
+    fs::rename(&held_git_dir, &git_dir).unwrap();
+    let archive_report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        "archived-original-scope-read",
+        source_observation_deadline(),
+    )
+    .unwrap();
+    catalog.refresh(&archive_report).await.unwrap();
+    let archive_state = writer.project().await.unwrap();
+    let archive_repository_view = RepositoryCurrentView::from_snapshot(&archive_state).unwrap();
+    let active_archive_worktrees = archive_repository_view
+        .worktrees
+        .values()
+        .filter(|value| {
+            value.lifecycle == evertrace_domain::repository::WorktreeLifecycle::Active
+                && value.current_path.as_deref() == workspace.to_str()
+        })
+        .map(|value| (value.worktree_instance_id, value.repository_instance_id))
+        .collect::<Vec<_>>();
+    let archive_receipt = projected_source_receipts(&archive_state)
+        .find(|receipt| receipt.source_observation_id.to_string() == first_suffix_ref)
+        .unwrap();
+    assert_eq!(active_archive_worktrees.len(), 2);
+    let original_archive_repository = archive_receipt
+        .repository_instance_id
+        .expect("the original receipt retains its repository identity");
+    let original_archive_worktree = archive_receipt
+        .worktree_instance_id
+        .expect("the original receipt retains its worktree identity");
+    assert!(
+        active_archive_worktrees
+            .contains(&(original_archive_worktree, original_archive_repository))
+    );
+    assert!(archive_receipt.worktree_instance_id.is_some_and(|id| {
+        evertrace_engine::repository::read_report_repository_trust(
+            &archive_report,
+            &archive_repository_view,
+            id,
+        )
+        .state
+            == evertrace_codex::policy::RepositoryTrustState::Trusted
+    }));
+    drop(archive_state);
+    *report.write().await = Some(archive_report.clone());
+    let archive_get = tokio::time::timeout(
+        Duration::from_secs(2),
+        mcp.handle(
+            "source-start-cross-session",
+            evertrace_engine::McpServiceRequest {
+                request_id: RequestId::new_v7(),
+                action: evertrace_engine::McpServiceAction::Get,
+                workspace: original_archive_worktree.to_string(),
+                input: proposal_id.to_string(),
+                refs: vec![],
+                client_cwd: workspace.to_str().unwrap().into(),
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(archive_get.scope, original_archive_worktree.to_string());
+    fs::rename(&git_dir, &held_git_dir).unwrap();
+    fs::rename(&replacement_git_dir, &git_dir).unwrap();
+    *report.write().await = Some(replacement_report);
+    assert!(
+        archive_get.items.iter().any(|item| {
+            item.object_ref == Some(proposal_id.to_string())
+                && item.content_trust == evertrace_domain::evidence::ContentTrust::AgentClaim
+        }),
+        "R1 archived Get returned: {archive_get:?}"
+    );
+    assert!(
+        writer
+            .session_import_context(&source)
+            .await
+            .unwrap()
+            .unwrap()
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed,
+        "archived Get must not reopen the closed origin"
+    );
+
+    let closed_append = serde_json::json!({
+        "timestamp": "2026-10-06T00:04:01Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": session,
+            "turn_id": "turn-after-origin-close",
+            "item": {
+                "type": "UserMessage",
+                "id": "user-after-origin-close",
+                "content": [{"type":"text","text":"must remain outside the closed prospective source","text_elements":[]}]
+            },
+            "completed_at_ms": 1_791_245_041_000_i64
+        }
+    })
+    .to_string();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(file, "{closed_append}").unwrap();
+    drop(file);
+    let after_close_end = fs::metadata(&transcript).unwrap().len();
+    assert!(after_close_end > appended_end);
+    catalog.refresh(&start_report).await.unwrap();
+    let closed_after_append = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        closed_after_append.current.metadata.file_size,
+        after_close_end
+    );
+    assert!(
+        closed_after_append
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed
+    );
+    assert_eq!(
+        closed_after_append
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .record_start,
+        Some(fence)
+    );
+    assert_eq!(
+        closed_after_append.current.body_state,
+        SessionBodyState::Partial
+    );
+    assert!(closed_after_append.job.is_none());
+    assert_eq!(
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+            .count(),
+        receipt_count_before_close,
+        "an append observed after closure must not auto-admit future body bytes"
+    );
+
+    let watermark_before_closed_queue = closed_after_append.watermark.clone();
+    let receipts_before_closed_queue = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| receipt.source_instance_id.as_str() == source)
+        .count();
+    assert_eq!(
+        admin
+            .handle(
+                RequestId::new_v7(),
+                session,
+                SessionImportAdminAction::QueueImport,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64,
+            )
+            .await
+            .unwrap(),
+        SessionImportAdminOutcome::Queued
+    );
+    let mut requeued_records = 0;
+    let mut requeued_completed = false;
+    for _ in 0..24 {
+        let progress = worker.process_checkpoint(&source, budget).await.unwrap();
+        requeued_records += progress.records;
+        if progress.completed {
+            requeued_completed = true;
+            break;
+        }
+    }
+    assert!(
+        requeued_completed,
+        "a closed admitted source can finalize again"
+    );
+    assert_eq!(
+        requeued_records, 0,
+        "an explicit queue cannot import bytes appended after origin closure"
+    );
+    let completed = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.current.body_state, SessionBodyState::Partial);
+    assert_eq!(completed.current.metadata.file_size, after_close_end);
+    assert!(
+        completed
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed
+    );
+    assert_eq!(
+        completed.current.access_decision,
+        Some(evertrace_store::SessionAccessDecision::Approved)
+    );
+    assert!(completed.job.is_none());
+    assert_eq!(completed.watermark, watermark_before_closed_queue);
+    let completed_jobs = RuntimeSchedulerView::from_snapshot(&writer.project().await.unwrap())
+        .unwrap()
+        .jobs;
+    let completed_job = completed_jobs
+        .iter()
+        .find(|job| job.idempotency_key == format!("session_import:{source}"))
+        .unwrap();
+    assert_eq!(completed_job.state, JobStatus::Succeeded);
+    assert_eq!(
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+            .count(),
+        receipts_before_closed_queue,
+        "closed-source requeue must not append a receipt"
+    );
+    let watermark = completed.watermark.as_ref().unwrap();
+    let earlier = watermark.earlier_prefix.as_ref().unwrap();
+    assert_eq!(earlier.fence_byte, fence);
+    assert_eq!(earlier.through_byte, fence);
+    assert!(earlier.digest.is_some());
+    let prefix_page = writer
+        .session_import_prefix_page(evertrace_store::SessionImportPrefixRequest {
+            source: source.clone(),
+            revision: completed.current.metadata.source_revision.clone(),
+            after: 0,
+            end: fence,
+            max_records: 16,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+    assert_eq!(prefix_page.records.first().unwrap().start, 0);
+    assert_eq!(prefix_page.records.last().unwrap().end, fence);
+    assert!(
+        prefix_page
+            .records
+            .windows(2)
+            .all(|pair| pair[0].end == pair[1].start)
+    );
+    assert_eq!(suffix_page.records[0].start, fence);
+    let archived_receipts = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| receipt.observation_role == ObservationRole::Message)
+        .collect::<Vec<_>>();
+    let source_receipts = archived_receipts
+        .iter()
+        .filter(|receipt| receipt.source_instance_id.as_str() == source)
+        .collect::<Vec<_>>();
+    assert!(
+        source_receipts
+            .iter()
+            .all(|receipt| receipt.source_sequence <= watermark.source_sequence)
+    );
+    let historical_receipts = archived_receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == source && receipt.source_sequence <= fence
+        })
+        .collect::<Vec<_>>();
+    assert!(!historical_receipts.is_empty());
+    assert!(historical_receipts.iter().all(|receipt| {
+        receipt.repository_instance_id.is_none() && receipt.worktree_instance_id.is_none()
+    }));
+
+    // A physical transcript replacement is a new source revision, not an
+    // extension of the closed origin. Its first post-observation record must
+    // still flow through the normal catalog refresh and worker.
+    let before_replacement = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_revision = before_replacement.current.metadata.source_revision.clone();
+    let old_restrictions = before_replacement
+        .current
+        .metadata
+        .read_restrictions()
+        .collect::<Vec<_>>();
+    let old_origin_snapshot = before_replacement
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .unwrap()
+        .snapshot_ref;
+    let replacement_head = source_fixture_git(&workspace, &["rev-parse", "HEAD"]);
+    let replacement_header = serde_json::json!({
+        "timestamp":"2026-10-06T00:06:00Z",
+        "type":"session_meta",
+        "payload":{"id":session,"session_id":session,"cwd":workspace,"git":{"commit_hash":replacement_head}}
+    })
+    .to_string();
+    let staged_transcript = dated.join(format!("replacement-{session}.jsonl"));
+    fs::write(&staged_transcript, format!("{replacement_header}\n")).unwrap();
+    fs::rename(&staged_transcript, &transcript).unwrap();
+    let replacement_catalog_report = observe_session_catalog_report(
+        transcript.to_str(),
+        session,
+        "source-start-transcript-replacement",
+        None,
+    )
+    .unwrap();
+    catalog.refresh(&replacement_catalog_report).await.unwrap();
+    let replaced = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(replaced.current.metadata.source_revision, old_revision);
+    assert_eq!(
+        replaced.current.body_state,
+        SessionBodyState::SourceReplaced
+    );
+    assert!(replaced.current.metadata.prospective_origin.is_none());
+    assert!(replaced.watermark.is_none());
+    assert!(old_restrictions.iter().all(|restriction| {
+        replaced
+            .current
+            .metadata
+            .read_restrictions()
+            .any(|current| current == *restriction)
+    }));
+    let replacement_observation = RequestId::new_v7();
+    let replacement_observation_ref =
+        format!("native_session_source_observation:{replacement_observation}");
+    let replacement_deadline = source_observation_deadline();
+    let replacement_start_report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        &replacement_observation_ref,
+        replacement_deadline,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .observe_native_session_source(
+                replacement_observation,
+                &replacement_start_report,
+                session,
+                transcript.to_str().unwrap(),
+                &replacement_observation_ref,
+                replacement_deadline,
+            )
+            .await
+            .unwrap()
+    );
+    let newly_observed = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_origin = newly_observed
+        .current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .expect("the actual new source observation establishes the replacement origin");
+    let replacement_fence = replacement_header.len() as u64 + 1;
+    assert!(!new_origin.closed);
+    assert_ne!(new_origin.snapshot_ref, old_origin_snapshot);
+    assert_eq!(new_origin.observed_end, replacement_fence);
+    assert_eq!(new_origin.record_start, Some(replacement_fence));
+    let replacement_snapshot =
+        RepositoryCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    assert!(replacement_snapshot.snapshots.values().any(|snapshot| {
+        snapshot.worktree_snapshot_id == new_origin.snapshot_ref
+            && snapshot
+                .evidence_refs
+                .contains(&replacement_observation_ref)
+    }));
+    let replacement_message = serde_json::json!({
+        "timestamp":"2026-10-06T00:07:00Z",
+        "type":"event_msg",
+        "payload":{"type":"item_completed","thread_id":session,"turn_id":"replacement-first-full-record","item":{"type":"UserMessage","id":"replacement-first-full-record","content":[{"type":"text","text":"The first complete record belongs only to the replacement transcript revision.","text_elements":[]}]},"completed_at_ms":1_791_245_220_000_i64}
+    })
+    .to_string();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(file, "{replacement_message}").unwrap();
+    drop(file);
+    let replacement_end = fs::metadata(&transcript).unwrap().len();
+    *report.write().await = Some(replacement_start_report.clone());
+    catalog.refresh(&replacement_start_report).await.unwrap();
+    let appended_replacement = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        appended_replacement.current.metadata.file_size,
+        replacement_end
+    );
+    assert_eq!(
+        appended_replacement
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .record_start,
+        Some(replacement_fence)
+    );
+    let mut replacement_complete = false;
+    for _ in 0..8 {
+        if worker
+            .process_checkpoint(&source, budget)
+            .await
+            .unwrap()
+            .completed
+        {
+            replacement_complete = true;
+            break;
+        }
+    }
+    assert!(
+        replacement_complete,
+        "the normal worker imports the first full suffix record"
+    );
+    let after_replacement_import = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_replacement_import.current.metadata.source_revision,
+        replaced.current.metadata.source_revision
+    );
+    assert_eq!(
+        after_replacement_import
+            .watermark
+            .as_ref()
+            .unwrap()
+            .source_sequence,
+        replacement_end
+    );
+    assert_eq!(
+        after_replacement_import
+            .watermark
+            .as_ref()
+            .unwrap()
+            .earlier_prefix
+            .as_ref()
+            .unwrap()
+            .fence_byte,
+        replacement_fence
+    );
+    let replacement_receipts = projected_source_receipts(&writer.project().await.unwrap())
+        .filter(|receipt| {
+            receipt.source_instance_id.as_str() == source
+                && receipt.source_revision == replaced.current.metadata.source_revision
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replacement_receipts.len(), 1);
+    assert_eq!(replacement_receipts[0].source_sequence, replacement_end);
+    assert!(
+        replacement_receipts[0]
+            .source_byte_range
+            .as_ref()
+            .is_some_and(|range| range.start >= replacement_fence)
+    );
+    assert_ne!(
+        replacement_receipts[0].source_observation_id.to_string(),
+        first_suffix_ref
+    );
+    let replacement_revision_events = writer
+        .project()
+        .await
+        .unwrap()
+        .data_rows()
+        .filter_map(|row| {
+            match serde_json::from_str::<JournalPayload>(row.payload_json.as_deref()?).ok()? {
+                JournalPayload::SourceRevisionRecorded(event)
+                    if event.source_instance_id.as_str() == source
+                        && event.source_revision == replaced.current.metadata.source_revision =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replacement_revision_events.len(), 1);
+    assert_eq!(
+        replacement_revision_events[0].mode,
+        evertrace_domain::evidence::SourceRevisionMode::Replacement
+    );
+    let replacement_semantics =
+        SemanticCurrentView::from_snapshot(&writer.project().await.unwrap()).unwrap();
+    assert!(
+        replacement_semantics
+            .proposals
+            .get(&proposal_id)
+            .is_some_and(|value| {
+                value.status == ProposalStatus::Pending
+                    && value.evidence_refs.contains(&first_suffix_ref)
+            })
+    );
+
+    drop(admin);
+    drop(mcp);
+    drop(summary_scheduler);
+    drop(revoking_scheduler);
+    drop(scheduler);
+    drop(config_reload);
+    drop(cold_worker);
+    drop(closure_worker);
+    drop(worker);
+    drop(catalog);
+    drop(writer);
+    task.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+    })
+    .await
+    .unwrap();
+    })
+    .await
+    .unwrap();
+    })
+    .await;
 }

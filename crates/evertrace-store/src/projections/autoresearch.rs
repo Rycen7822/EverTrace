@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use evertrace_capture::CasDigest;
 use evertrace_domain::{
     evidence::{
-        CaptureCompleteness, ContentTrust, EvidenceSurface, Operation, PairingState,
-        SourceArchiveMode, SourceObservation, SourceReceipt, SourceRole, hex, payload_fingerprint,
+        CaptureCompleteness, ContentTrust, Operation, PairingState, SourceArchiveMode,
+        SourceReceipt, SourceRole, hex, payload_fingerprint,
     },
     ids::{
         AttemptId, ExperimentRunId, OperationId, ResultEvidenceId, SourceObservationId,
@@ -24,7 +24,10 @@ use evertrace_domain::{
 use crate::{
     JournalPayload,
     command::StoreError,
-    projections::{ProjectionSnapshot, current_binding_lineage, procedure::ProcedureState},
+    projections::{
+        EvidenceSurfaceFacts, ProjectionSnapshot, SourceObservationFacts, SourceReceiptFacts,
+        current_binding_lineage, procedure::ProcedureState,
+    },
 };
 
 pub(crate) struct ControlledRunAdmissionView<'a> {
@@ -34,9 +37,9 @@ pub(crate) struct ControlledRunAdmissionView<'a> {
         &'a BTreeMap<evertrace_domain::ids::WorkBindingRevisionId, (WorkBindingRevision, u64)>,
     pub operations: &'a BTreeMap<OperationId, (Operation, u64)>,
     pub snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
-    pub receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    pub surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    pub receipts: &'a SourceReceiptFacts,
+    pub observations: &'a SourceObservationFacts,
+    pub surfaces: &'a EvidenceSurfaceFacts,
     pub artifacts: &'a BTreeMap<WorkArtifactId, (WorkArtifact, u64)>,
     pub procedures: &'a ProcedureState,
     pub tasks: &'a BTreeMap<TaskId, (Task, u64)>,
@@ -456,8 +459,8 @@ pub(crate) struct AutoresearchRelationInputs<'a> {
     pub snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
     pub repositories: &'a BTreeMap<evertrace_domain::ids::RepositoryId, (RepositoryInstance, u64)>,
     pub worktrees: &'a BTreeMap<evertrace_domain::ids::WorktreeId, (WorktreeInstance, u64)>,
-    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    pub source_receipts: &'a SourceReceiptFacts,
+    pub source_observations: &'a SourceObservationFacts,
 }
 
 pub(crate) fn validate_relations(input: AutoresearchRelationInputs<'_>) -> Result<(), StoreError> {
@@ -591,7 +594,7 @@ pub(crate) fn validate_relations(input: AutoresearchRelationInputs<'_>) -> Resul
 }
 
 fn observation_receipt<'a>(
-    input: &'a AutoresearchRelationInputs<'_>,
+    input: &'a AutoresearchRelationInputs<'a>,
     id: SourceObservationId,
 ) -> Result<&'a SourceReceipt, StoreError> {
     let observation = &input

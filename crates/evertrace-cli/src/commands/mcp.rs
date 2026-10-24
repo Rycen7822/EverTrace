@@ -19,7 +19,7 @@ use evertrace_protocol::{
 };
 use serde_json::{Value, json};
 
-use crate::commands::config;
+use crate::config_input as config;
 
 const MCP_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 

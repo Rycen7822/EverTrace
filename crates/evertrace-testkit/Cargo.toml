@@ -12,8 +12,9 @@ evertrace-codex = { path = "../evertrace-codex" }
 evertrace-domain = { path = "../evertrace-domain" }
 evertrace-engine = { path = "../evertrace-engine" }
 evertrace-protocol = { path = "../evertrace-protocol" }
-evertrace-store = { path = "../evertrace-store" }
+evertrace-store = { path = "../evertrace-store", features = ["test-utils"] }
 evertrace-tui = { path = "../evertrace-tui" }
+rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

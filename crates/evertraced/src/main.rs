@@ -14,6 +14,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use evertrace_engine::{
@@ -39,7 +40,7 @@ use evertrace_engine::{
     RecoveryError, RecoveryRequest, RecoveryUnsupportedReason as EngineUnsupportedReason,
     RuntimeMode, SessionImportWorker, open_writer,
     recall::spawn_recall_worker_with_config,
-    repository::observe_session_catalog_report,
+    repository::{observe_session_catalog_report, observe_session_source_report},
     session_import::{
         SessionCatalogService, SessionImportAdminAction as EngineSessionImportAdminAction,
         SessionImportAdminOutcome, SessionImportAdminService,
@@ -205,148 +206,210 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Signal setup can fail: do it before spawning any writer or producer.
+    // Keep this receiver alive during startup and maintenance awaits.
+    let shutdown_signal = wait_for_signal()?;
+    tokio::pin!(shutdown_signal);
     let writer = open_writer(&data_dir).await?;
-    let (writer_handle, mut writer_task) = spawn_writer(writer, 64)?;
-    let config_reload = Arc::new(evertrace_engine::ConfigReloadService::new(
-        Arc::clone(&engine),
-        writer_handle.clone(),
-        data_dir.clone(),
-        std::path::absolute(&config_path)?,
-    )?);
-    let runtime_snapshot = config_reload.initialize_runtime().await?;
-    evertrace_engine::initialize_runtime_spool(&runtime_snapshot)?;
-    let current_session_catalog_report = Arc::new(RwLock::new(None));
-    let mut recall_worker = spawn_recall_worker_with_config(
-        writer_handle.clone(),
+    let (writer_handle, writer_task) = spawn_writer(writer, 64)?;
+    let mut writer_handle = Some(writer_handle);
+    let mut writer_task = Some(writer_task);
+    // Startup constructs every service and completes every recovery step
+    // before a single producer task is spawned. A failure therefore stops and
+    // joins the writer through one cleanup arm; no producer task can be
+    // orphaned by an early `?`.
+    let candidate = args.candidate;
+    let startup = async {
+        let config_reload = Arc::new(evertrace_engine::ConfigReloadService::new(
+            Arc::clone(&engine),
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            data_dir.clone(),
+            std::path::absolute(&config_path)?,
+        )?);
+        let runtime_snapshot = config_reload.initialize_runtime().await?;
+        evertrace_engine::initialize_runtime_spool(&runtime_snapshot)?;
+        let current_session_catalog_report = Arc::new(RwLock::new(None));
+        let mcp_bindings =
+            McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
+        let mut host_canary = evertrace_engine::HostCanaryService::new(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            data_dir.clone(),
+            std::path::absolute(&config_path)?,
+            runtime_snapshot.effective_config_hash,
+            mcp_bindings.clone(),
+        );
+        if let Some((check_id, generation)) = candidate.as_ref() {
+            let executable = env::current_exe()?;
+            host_canary = host_canary.with_candidate(
+                check_id.clone(),
+                *generation,
+                executable
+                    .parent()
+                    .ok_or("candidate package unavailable")?
+                    .to_owned(),
+            )?;
+        }
+        let session_import_admin = SessionImportAdminService::new(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            Arc::clone(&current_session_catalog_report),
+            runtime_snapshot.effective_config_hash,
+        );
+        let session_catalog = SessionCatalogService::new(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            runtime_snapshot.effective_config_hash,
+        );
+        let handler_session_catalog_service = session_catalog.clone();
+        let session_import_worker = SessionImportWorker::new(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            runtime_snapshot.clone(),
+            Arc::clone(&current_session_catalog_report),
+        )?;
+        let human_governance = HumanGovernanceService::with_acceptance(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            runtime_snapshot.effective_config_hash,
+            runtime_snapshot.clone(),
+            engine.effective_config().config().global_promotion.clone(),
+        )
+        .with_session_report(Arc::clone(&current_session_catalog_report))
+        .with_inventory_bindings(mcp_bindings.clone());
+        human_governance.reconcile_reserved_once().await?;
+        let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
+        let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
+        let (backup_request_tx, backup_request_rx) = mpsc::channel(1);
+        let dispatch_gate = Arc::new(RwLock::new(()));
+        let scheduler = BackgroundScheduler::new(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            session_catalog.clone(),
+            session_import_worker,
+            Arc::clone(&current_session_catalog_report),
+            runtime_snapshot.clone(),
+            engine.synthesis_planner(),
+            engine.effective_config().config().dreaming.clone(),
+        )
+        .with_dispatch(Arc::clone(&dispatch_gate))
+        .with_backup_requests(backup_request_tx)
+        .with_inventory(evertrace_engine::jobs::InventoryWorker::new(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            runtime_snapshot.clone(),
+            mcp_bindings.clone(),
+        ))
+        .with_config(Arc::clone(&config_reload));
+        let mcp_service = McpActionService::open(
+            mcp_bindings.clone(),
+            &data_dir,
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            runtime_snapshot.clone(),
+        )
+        .await?
+        .with_session_report(Arc::clone(&current_session_catalog_report));
+        let recovery_service = RecoveryBarrierService::new(
+            runtime_snapshot.clone(),
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+        );
+        let recall_cue_service = RecallCueService::new(
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            runtime_snapshot.recall_cue_gate,
+            runtime_snapshot.recall_cue_adapter_manifest_id.clone(),
+            runtime_snapshot.generation,
+            runtime_snapshot.effective_config_hash,
+            &data_dir,
+        )
+        .with_session_report(Arc::clone(&current_session_catalog_report));
+        let recovery_action_service = RecoveryActionService::new(
+            runtime_snapshot.clone(),
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            recovery_service.mutation_fence(),
+        )
+        .with_session_report(Arc::clone(&current_session_catalog_report));
+        recovery_service.reconcile_pending_on_startup().await?;
+        recovery_action_service
+            .reconcile_pending_on_startup()
+            .await?;
+        let server = LocalServer::bind(&data_dir, ServerOptions::new(env!("CARGO_PKG_VERSION")))?;
+        let ingestor = evertrace_engine::EvidenceIngestor::new(
+            runtime_snapshot.clone(),
+            writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
+            runtime_snapshot.effective_config_hash,
+            "ordinary-hook-ingest-v1",
+        )?
+        .with_config(Arc::clone(&config_reload))
+        .with_recovery_wakeup(session_import_wakeup_tx.clone());
+        Ok::<_, Box<dyn std::error::Error>>((
+            config_reload,
+            runtime_snapshot,
+            current_session_catalog_report,
+            handler_session_catalog_service,
+            mcp_bindings,
+            host_canary,
+            session_import_admin,
+            human_governance,
+            session_import_wakeup_tx,
+            session_import_wakeup_rx,
+            session_import_shutdown_tx,
+            session_import_shutdown_rx,
+            backup_request_rx,
+            dispatch_gate,
+            scheduler,
+            mcp_service,
+            recovery_service,
+            recall_cue_service,
+            recovery_action_service,
+            server,
+            ingestor,
+        ))
+    }
+    .await;
+    let (
+        config_reload,
+        runtime_snapshot,
+        current_session_catalog_report,
+        handler_session_catalog_service,
+        mcp_bindings,
+        host_canary,
+        session_import_admin,
+        human_governance,
+        session_import_wakeup_tx,
+        session_import_wakeup_rx,
+        session_import_shutdown_tx,
+        session_import_shutdown_rx,
+        mut backup_request_rx,
+        dispatch_gate,
+        scheduler,
+        mcp_service,
+        recovery_service,
+        recall_cue_service,
+        recovery_action_service,
+        server,
+        ingestor,
+    ) = match startup {
+        Ok(values) => values,
+        Err(error) => {
+            let _ = stop_writer(&mut writer_handle, &mut writer_task).await;
+            return Err(error);
+        }
+    };
+    let mut recall_worker = Some(spawn_recall_worker_with_config(
+        writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
         runtime_snapshot.clone(),
         data_dir.clone(),
         Some(Arc::clone(&config_reload)),
         Some(Arc::clone(&current_session_catalog_report)),
-    );
-    let mcp_bindings = McpBindingAuthority::from_device_key_dir(&runtime_snapshot.device_key_dir)?;
-    let mut host_canary = evertrace_engine::HostCanaryService::new(
-        writer_handle.clone(),
-        data_dir.clone(),
-        std::path::absolute(&config_path)?,
-        runtime_snapshot.effective_config_hash,
-        mcp_bindings.clone(),
-    );
-    if let Some((check_id, generation)) = args.candidate {
-        let executable = env::current_exe()?;
-        host_canary = host_canary.with_candidate(
-            check_id,
-            generation,
-            executable
-                .parent()
-                .ok_or("candidate package unavailable")?
-                .to_owned(),
-        )?;
-    }
-    let session_import_admin = SessionImportAdminService::new(
-        writer_handle.clone(),
-        Arc::clone(&current_session_catalog_report),
-        runtime_snapshot.effective_config_hash,
-    );
-    let session_catalog = SessionCatalogService::new(
-        writer_handle.clone(),
-        runtime_snapshot.effective_config_hash,
-    );
-    let session_import_worker = SessionImportWorker::new(
-        writer_handle.clone(),
-        runtime_snapshot.clone(),
-        Arc::clone(&current_session_catalog_report),
-    )?;
-    let human_governance = HumanGovernanceService::with_acceptance(
-        writer_handle.clone(),
-        runtime_snapshot.effective_config_hash,
-        runtime_snapshot.clone(),
-        engine.effective_config().config().global_promotion.clone(),
-    )
-    .with_session_report(Arc::clone(&current_session_catalog_report))
-    .with_inventory_bindings(mcp_bindings.clone());
-    human_governance.reconcile_reserved_once().await?;
-    let (session_import_wakeup_tx, session_import_wakeup_rx) = watch::channel(0_u64);
-    let (session_import_shutdown_tx, session_import_shutdown_rx) = watch::channel(false);
-    let (backup_request_tx, mut backup_request_rx) = mpsc::channel(1);
-    let dispatch_gate = Arc::new(RwLock::new(()));
-    let scheduler = BackgroundScheduler::new(
-        writer_handle.clone(),
-        session_catalog,
-        session_import_worker,
-        Arc::clone(&current_session_catalog_report),
-        runtime_snapshot.clone(),
-        engine.synthesis_planner(),
-        engine.effective_config().config().dreaming.clone(),
-    )
-    .with_dispatch(Arc::clone(&dispatch_gate))
-    .with_backup_requests(backup_request_tx)
-    .with_inventory(evertrace_engine::jobs::InventoryWorker::new(
-        writer_handle.clone(),
-        runtime_snapshot.clone(),
-        mcp_bindings.clone(),
-    ))
-    .with_config(Arc::clone(&config_reload));
-    let mut background_scheduler_task =
-        tokio::spawn(scheduler.run(session_import_wakeup_rx, session_import_shutdown_rx));
-    let mcp_service = McpActionService::open(
-        mcp_bindings.clone(),
-        &data_dir,
-        writer_handle.clone(),
-        runtime_snapshot.clone(),
-    )
-    .await?
-    .with_session_report(Arc::clone(&current_session_catalog_report));
-    let recovery_service =
-        RecoveryBarrierService::new(runtime_snapshot.clone(), writer_handle.clone());
-    let recall_cue_service = RecallCueService::new(
-        writer_handle.clone(),
-        runtime_snapshot.recall_cue_gate,
-        runtime_snapshot.recall_cue_adapter_manifest_id.clone(),
-        runtime_snapshot.generation,
-        runtime_snapshot.effective_config_hash,
-        &data_dir,
-    )
-    .with_session_report(Arc::clone(&current_session_catalog_report));
-    let recovery_action_service = RecoveryActionService::new(
-        runtime_snapshot.clone(),
-        writer_handle.clone(),
-        recovery_service.mutation_fence(),
-    )
-    .with_session_report(Arc::clone(&current_session_catalog_report));
-    recovery_service.reconcile_pending_on_startup().await?;
-    recovery_action_service
-        .reconcile_pending_on_startup()
-        .await?;
-    let mut writer_handle = Some(writer_handle);
-    let server = match LocalServer::bind(&data_dir, ServerOptions::new(env!("CARGO_PKG_VERSION"))) {
-        Ok(server) => server,
-        Err(error) => {
-            if let Some(handle) = writer_handle.take() {
-                handle.shutdown().await?;
-            }
-            writer_task.await??;
-            return Err(error.into());
-        }
-    };
+    ));
+    let mut background_scheduler_task = Some(tokio::spawn(
+        scheduler.run(session_import_wakeup_rx, session_import_shutdown_rx),
+    ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let maintenance_active = Arc::new(AtomicBool::new(false));
-    let ingestor = evertrace_engine::EvidenceIngestor::new(
-        runtime_snapshot.clone(),
-        writer_handle.as_ref().ok_or("writer unavailable")?.clone(),
-        runtime_snapshot.effective_config_hash,
-        "ordinary-hook-ingest-v1",
-    )?
-    .with_config(Arc::clone(&config_reload))
-    .with_recovery_wakeup(session_import_wakeup_tx.clone());
-    let mut ingest_task = tokio::spawn(ingestor.run(
+    let mut ingest_task = Some(tokio::spawn(ingestor.run(
         Arc::clone(&dispatch_gate),
         session_import_shutdown_tx.subscribe(),
-    ));
+    )));
     let handler_engine = Arc::clone(&engine);
     let handler_recovery_action_service = recovery_action_service.clone();
     let handler_mcp_bindings = mcp_bindings;
     let handler_mcp_service = mcp_service;
     let handler_session_catalog_report = Arc::clone(&current_session_catalog_report);
+    let handler_session_catalog = handler_session_catalog_service;
     let handler_session_import_admin = session_import_admin;
     let handler_human_governance = human_governance;
     let handler_session_import_wakeup = session_import_wakeup_tx.clone();
@@ -354,7 +417,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let handler_dispatch_gate = Arc::clone(&dispatch_gate);
     let handler_shutdown = shutdown_tx.clone();
     let handler_config_reload = Arc::clone(&config_reload);
-    let mut task = tokio::spawn(server.run_dispatch_with_context(
+    let mut task = Some(tokio::spawn(server.run_dispatch_with_context(
         shutdown_rx,
         move |context, request_id, command| {
             let handler_engine = Arc::clone(&handler_engine);
@@ -367,13 +430,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mcp_service = handler_mcp_service.clone();
             let recall_cue_service = recall_cue_service.clone();
             let session_catalog_report = Arc::clone(&handler_session_catalog_report);
+            let session_catalog = handler_session_catalog.clone();
             let session_import_admin = handler_session_import_admin.clone();
             let human_governance = handler_human_governance.clone();
             let session_import_wakeup = handler_session_import_wakeup.clone();
             let maintenance_active = Arc::clone(&handler_maintenance_active);
             let dispatch_gate = Arc::clone(&handler_dispatch_gate);
             async move {
-                if maintenance_active.load(Ordering::Acquire) {
+                let observation_deadline = match &command {
+                    ProtocolCommand::ObserveSessionSource(observation) => {
+                        if context.client_kind != ClientKind::Hook || !observation.validate() {
+                            return Err(ErrorCode::Untrusted);
+                        }
+                        Some(Instant::now() + Duration::from_secs(2))
+                    }
+                    _ => None,
+                };
+                let mut observation_permit = if let Some(deadline) = observation_deadline {
+                    Some(
+                        session_catalog.acquire_source_observation_permit(deadline)
+                        .await
+                        .map_err(|_| ErrorCode::Untrusted)?,
+                    )
+                } else {
+                    None
+                };
+                if observation_permit.is_none() && maintenance_active.load(Ordering::Acquire) {
                     if !matches!(&command, ProtocolCommand::Health) {
                         return Err(ErrorCode::MaintenanceMode);
                     }
@@ -388,17 +470,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         host_canary: host_canary.current().map(map_host_canary),
                     }));
                 }
-                let _dispatch = dispatch_gate.read_owned().await;
+                let _dispatch = if let Some(deadline) = observation_deadline {
+                    tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        dispatch_gate.read_owned(),
+                    )
+                    .await
+                    .map_err(|_| ErrorCode::Untrusted)?
+                } else {
+                    dispatch_gate.read_owned().await
+                };
                 if maintenance_active.load(Ordering::Acquire) {
                     return Err(ErrorCode::MaintenanceMode);
                 }
-                let config_snapshot = config_reload.admit().await.map_err(|_| ErrorCode::MaintenanceMode)?;
+                let config_snapshot = if let Some(deadline) = observation_deadline {
+                    tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        config_reload.admit(),
+                    )
+                    .await
+                    .map_err(|_| ErrorCode::Untrusted)?
+                } else {
+                    config_reload.admit().await
+                }
+                .map_err(|_| ErrorCode::MaintenanceMode)?;
                 let mcp_service = mcp_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let human_governance = human_governance.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recovery_service = recovery_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recovery_action_service = recovery_action_service.for_config(&config_snapshot).map_err(|_| ErrorCode::Internal)?;
                 let recall_cue_service = recall_cue_service.for_config(&config_snapshot);
                 let session_import_admin = session_import_admin.for_config(&config_snapshot);
+                let session_catalog = session_catalog.for_config(&config_snapshot);
                 let host_canary = host_canary.for_config(&config_snapshot);
                 match command {
                     ProtocolCommand::RunHostCanary(request) => {
@@ -502,6 +604,87 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             bound_workspace: grant.bound_workspace,
                             expires_at_us: grant.expires_at_us,
                         }))
+                    }
+                    ProtocolCommand::ObserveSessionSource(observation) => {
+                        let deadline = observation_deadline.ok_or(ErrorCode::Internal)?;
+                        let (response, report) = tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(deadline),
+                            async {
+                                let thread_locator = observation
+                                    .agent_id
+                                    .as_deref()
+                                    .unwrap_or(&observation.session_id)
+                                    .to_owned();
+                                let current_report = session_catalog_report.read().await.clone();
+                                if session_catalog
+                                    .native_session_source_observed(
+                                        &thread_locator,
+                                        &observation.transcript_path,
+                                        current_report.as_ref(),
+                                        deadline,
+                                    )
+                                    .await
+                                    .map_err(|_| ErrorCode::Untrusted)?
+                                {
+                                    return Ok((
+                                        Response::SessionSourceObserved(
+                                            evertrace_protocol::response::SessionSourceObservedResponse {
+                                                changed: false,
+                                            },
+                                        ),
+                                        None,
+                                    ));
+                                }
+                                let source_reference =
+                                    format!("native_session_source_observation:{request_id}");
+                                let report = observe_session_source_report(
+                                    &observation.transcript_path,
+                                    &observation.session_id,
+                                    observation.agent_id.as_deref(),
+                                    &source_reference,
+                                    deadline,
+                                )
+                                .map_err(|_| ErrorCode::Untrusted)?;
+                                let permit = observation_permit.take().ok_or(ErrorCode::Internal)?;
+                                let changed = session_catalog
+                                    .observe_native_session_source_with_permit(
+                                        request_id,
+                                        &report,
+                                        &thread_locator,
+                                        &observation.transcript_path,
+                                        &source_reference,
+                                        permit,
+                                    )
+                                    .await
+                                    .map_err(|reason| {
+                                        tracing::warn!(target: "evertrace_lifecycle", ?reason, "native source observation rejected");
+                                        ErrorCode::Untrusted
+                                    })?;
+                                Ok((
+                                    Response::SessionSourceObserved(
+                                        evertrace_protocol::response::SessionSourceObservedResponse {
+                                            changed,
+                                        },
+                                    ),
+                                    Some(report),
+                                ))
+                            },
+                        )
+                        .await
+                        .map_err(|_| ErrorCode::Untrusted)??;
+                        if let Some(report) = report {
+                            tokio::time::timeout_at(
+                                tokio::time::Instant::from_std(deadline),
+                                async {
+                                    *session_catalog_report.write().await = Some(report);
+                                },
+                            )
+                            .await
+                            .map_err(|_| ErrorCode::Untrusted)?;
+                        }
+                        let next = (*session_import_wakeup.borrow()).wrapping_add(1);
+                        session_import_wakeup.send_replace(next);
+                        Ok(response)
                     }
                     ProtocolCommand::ConfigRead => {
                         if context.client_kind != ClientKind::Cli { return Err(ErrorCode::Untrusted); }
@@ -989,15 +1172,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-    ));
+    )));
     let mut config_poll = tokio::time::interval(std::time::Duration::from_secs(1));
     config_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_watch_failure = None;
-    // Keep the signal receiver alive while a selected maintenance branch awaits.
-    // Recreating it inside select loses signals received between loop polls.
-    let shutdown_signal = wait_for_signal()?;
-    tokio::pin!(shutdown_signal);
-    loop {
+    let outcome: Result<(), Box<dyn std::error::Error>> = loop {
         tokio::select! {
             _ = config_poll.tick() => {
                 match config_reload.watch_once().await {
@@ -1028,153 +1207,138 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(None) => { last_watch_failure = None; },
                 }
             }
-            result = &mut ingest_task => {
-                let _ = shutdown_tx.send(true);
-                let _ = session_import_shutdown_tx.send(true);
-                background_scheduler_task.await??;
-                recovery_action_service.shutdown_and_drain().await;
-                task.await??;
-                recall_worker.abort();
-                let _ = (&mut recall_worker).await;
-                if let Some(handle) = writer_handle.take() { handle.shutdown().await?; }
-                writer_task.await??;
-                result??;
-                return Err("ordinary ingest stopped unexpectedly".into());
+            result = ingest_task.as_mut().expect("ingest task present") => {
+                let _ = ingest_task.take();
+                break match result {
+                    Ok(Ok(())) => Err("ordinary ingest stopped unexpectedly".into()),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                };
             }
-            result = &mut task => {
-                let server_result = result;
-                let _ = session_import_shutdown_tx.send(true);
-                let ingest_result = ingest_task.await;
-                background_scheduler_task.await??;
-                recovery_action_service.shutdown_and_drain().await;
-                recall_worker.abort();
-                let _ = (&mut recall_worker).await;
-                if let Some(handle) = writer_handle.take() {
-                    handle.shutdown().await?;
-                }
-                writer_task.await??;
-                ingest_result??;
-                server_result??;
-                return Err("server stopped unexpectedly".into());
+            result = task.as_mut().expect("server task present") => {
+                let _ = task.take();
+                break match result {
+                    Ok(Ok(())) => Err("server stopped unexpectedly".into()),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                };
             }
-            result = &mut writer_task => {
-                let _ = shutdown_tx.send(true);
-                let _ = session_import_shutdown_tx.send(true);
-                let ingest_result = ingest_task.await;
-                background_scheduler_task.await??;
-                recovery_action_service.shutdown_and_drain().await;
-                recall_worker.abort();
-                let _ = (&mut recall_worker).await;
-                task.await??;
-                ingest_result??;
-                result??;
-                return Err("writer stopped unexpectedly".into());
+            result = writer_task.as_mut().expect("writer task present") => {
+                break match result {
+                    Ok(Ok(())) => Err("writer stopped unexpectedly".into()),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                };
             }
-            result = &mut recall_worker => {
-                let _ = shutdown_tx.send(true);
-                let _ = session_import_shutdown_tx.send(true);
-                let ingest_result = ingest_task.await;
-                background_scheduler_task.await??;
-                recovery_action_service.shutdown_and_drain().await;
-                task.await??;
-                if let Some(handle) = writer_handle.take() {
-                    handle.shutdown().await?;
-                }
-                writer_task.await??;
-                ingest_result??;
-                result?;
-                return Err("recall worker stopped unexpectedly".into());
+            result = recall_worker.as_mut().expect("recall worker present") => {
+                let _ = recall_worker.take();
+                break match result {
+                    Ok(()) => Err("recall worker stopped unexpectedly".into()),
+                    Err(error) => Err(error.into()),
+                };
             }
-            result = &mut background_scheduler_task => {
-                let _ = shutdown_tx.send(true);
-                let _ = session_import_shutdown_tx.send(true);
-                let ingest_result = ingest_task.await;
-                recovery_action_service.shutdown_and_drain().await;
-                task.await??;
-                recall_worker.abort();
-                let _ = (&mut recall_worker).await;
-                if let Some(handle) = writer_handle.take() {
-                    handle.shutdown().await?;
-                }
-                writer_task.await??;
-                ingest_result??;
-                result??;
-                return Err("background scheduler stopped unexpectedly".into());
+            result = background_scheduler_task
+                .as_mut()
+                .expect("background scheduler present") => {
+                let _ = background_scheduler_task.take();
+                break match result {
+                    Ok(Ok(())) => Err("background scheduler stopped unexpectedly".into()),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                };
             }
             Some(request) = backup_request_rx.recv() => {
                 maintenance_active.store(true, Ordering::Release);
                 let dispatch = Arc::clone(&dispatch_gate).write_owned().await;
                 recovery_action_service.quiesce_and_drain().await;
-                recall_worker.abort();
-                let _ = (&mut recall_worker).await;
+                if let Some(handle) = recall_worker.take() {
+                    handle.abort();
+                    let _ = handle.await;
+                }
                 let result = match config_reload.backup_runtime(&runtime_snapshot).await {
-                    Ok(runtime) => writer_handle
-                    .as_ref()
-                    .ok_or("writer unavailable during backup")?
-                    .create_backup(
+                    Ok(runtime) => {
+                        let Some(handle) = writer_handle.as_ref() else {
+                            request.complete_fatal();
+                            break Err("writer unavailable during backup".into());
+                        };
+                        handle.create_backup(
                         request.backup_job_id(),
                         config_path.clone(),
                         runtime,
                     )
-                    .await.map_err(|_| ()),
+                    .await.map_err(|_| ())
+                    },
                     Err(_) => Err(()),
                 };
                 let result = match result {
                     Ok(result) => result,
                     Err(_) => {
                         request.complete_fatal();
-                        let _ = shutdown_tx.send(true);
-                        let _ = session_import_shutdown_tx.send(true);
                         drop(dispatch);
-                        let ingest_result = ingest_task.await;
-                        recovery_action_service.shutdown_and_drain().await;
-                        task.await??;
-                        background_scheduler_task.await??;
-                        if let Some(handle) = writer_handle.take() { let _ = handle.shutdown().await; }
-                        let _ = (&mut writer_task).await;
-                        ingest_result??;
-                        return Err("writer failed to reopen after backup".into());
+                        break Err("writer failed to reopen after backup".into());
                     }
                 };
-                recall_worker = spawn_recall_worker_with_config(
-                    writer_handle
-                        .as_ref()
-                        .ok_or("writer unavailable after backup")?
-                        .clone(),
+                let Some(handle) = writer_handle.as_ref() else {
+                    request.complete_fatal();
+                    break Err("writer unavailable after backup".into());
+                };
+                recall_worker = Some(spawn_recall_worker_with_config(
+                    handle.clone(),
                     runtime_snapshot.clone(),
                     data_dir.clone(),
                     Some(Arc::clone(&config_reload)),
                     Some(Arc::clone(&current_session_catalog_report)),
-                );
+                ));
                 if !recovery_action_service.resume_after_quiesce() {
                     maintenance_active.store(false, Ordering::Release);
                     drop(dispatch);
-                    return Err("recovery action service failed to resume".into());
+                    break Err("recovery action service failed to resume".into());
                 }
                 maintenance_active.store(false, Ordering::Release);
                 drop(dispatch);
                 request.complete(result);
             }
             signal = &mut shutdown_signal => {
-                signal?;
-                let _ = shutdown_tx.send(true);
-                let _ = session_import_shutdown_tx.send(true);
-                let ingest_result = ingest_task.await;
-                recovery_action_service.shutdown_and_drain().await;
-                task.await??;
-                background_scheduler_task.await??;
-                recall_worker.abort();
-                let _ = (&mut recall_worker).await;
-                if let Some(handle) = writer_handle.take() {
-                    handle.shutdown().await?;
-                }
-                writer_task.await??;
-                ingest_result??;
-                tracing::info!(target: "evertrace_lifecycle", "daemon stopped");
-                return Ok(());
+                break signal.map_err(Into::into);
             }
         }
+    };
+    // One teardown for every terminal condition: stop admission everywhere,
+    // drain or abort the current round of producers, then unconditionally stop
+    // and join the writer before propagating the first saved error.
+    let _ = shutdown_tx.send(true);
+    let _ = session_import_shutdown_tx.send(true);
+    if let Some(handle) = ingest_task.take() {
+        let _ = handle.await;
     }
+    if let Some(handle) = background_scheduler_task.take() {
+        let _ = handle.await;
+    }
+    if let Some(handle) = task.take() {
+        let _ = handle.await;
+    }
+    if let Some(handle) = recall_worker.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    recovery_action_service.shutdown_and_drain().await;
+    let writer_outcome = stop_writer(&mut writer_handle, &mut writer_task).await;
+    outcome?;
+    writer_outcome?;
+    tracing::info!(target: "evertrace_lifecycle", "daemon stopped");
+    Ok(())
+}
+
+/// Stop admission out-of-band, drain accepted requests and join exactly once.
+async fn stop_writer(
+    writer_handle: &mut Option<evertrace_engine::WriterHandle>,
+    writer_task: &mut Option<evertrace_engine::WriterTask>,
+) -> Result<(), evertrace_engine::WriterActorError> {
+    drop(writer_handle.take());
+    if let Some(task) = writer_task.take() {
+        return task.shutdown_and_join().await;
+    }
+    Ok(())
 }
 
 fn map_mcp_result(result: McpServiceResult) -> McpResultEnvelope {

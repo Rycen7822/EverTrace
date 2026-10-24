@@ -14,9 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lancedb::{Table, query::QueryBase};
 
 use crate::StoreError;
 
@@ -100,6 +98,20 @@ fn relation_row_id(kind: &str, source: &str, target: &str) -> String {
         source.len(),
         target.len()
     )
+}
+
+/// Exactly the single relation checkpoint row, if the table carries one.
+pub(crate) fn checkpoint_from_rows(rows: &[RelationProjectionRow]) -> Result<u64, StoreError> {
+    let mut matches = rows
+        .iter()
+        .filter(|row| row.row_id == RELATIONS_CHECKPOINT_ID);
+    let Some(checkpoint) = matches.next() else {
+        return Err(StoreError::StoreCorrupt);
+    };
+    if matches.next().is_some() {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(checkpoint.source_event_seq)
 }
 
 pub fn is_persisted_relation_kind(kind: &str) -> bool {
@@ -243,141 +255,6 @@ pub fn relations_schema() -> SchemaRef {
         Field::new("source_event_seq", DataType::UInt64, false),
         Field::new("projection_generation", DataType::UInt64, false),
     ]))
-}
-
-pub(crate) fn relations_batch(rows: &[RelationProjectionRow]) -> Result<RecordBatch, StoreError> {
-    for row in rows {
-        row.validate()?;
-    }
-    RecordBatch::try_new(
-        relations_schema(),
-        vec![
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.row_id.as_str()),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.relation_kind.as_deref()),
-            )),
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.source_id.as_deref()),
-            )),
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.target_id.as_deref()),
-            )),
-            Arc::new(UInt64Array::from_iter_values(
-                rows.iter().map(|row| row.source_event_seq),
-            )),
-            Arc::new(UInt64Array::from_iter_values(
-                rows.iter().map(|row| row.projection_generation),
-            )),
-        ],
-    )
-    .map_err(|_| StoreError::StoreCorrupt)
-}
-
-pub async fn read_relation_rows(table: &Table) -> Result<Vec<RelationProjectionRow>, StoreError> {
-    table
-        .checkout_latest()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if schema.as_ref() != relations_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let batches = crate::collect_batches(&table.query())
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    relation_rows_from_batches(batches, true)
-}
-
-pub(crate) async fn read_relation_checkpoint(table: &Table) -> Result<u64, StoreError> {
-    table
-        .checkout_latest()
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if schema.as_ref() != relations_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let batches = crate::collect_batches(
-        &table
-            .query()
-            .only_if(format!("row_id = '{RELATIONS_CHECKPOINT_ID}'"))
-            .limit(2),
-    )
-    .await
-    .map_err(|_| StoreError::LanceDb)?;
-    let rows = relation_rows_from_batches(batches, false)?;
-    let [checkpoint] = rows.as_slice() else {
-        return Err(StoreError::StoreCorrupt);
-    };
-    if checkpoint.row_id != RELATIONS_CHECKPOINT_ID {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok(checkpoint.source_event_seq)
-}
-
-fn relation_rows_from_batches(
-    batches: Vec<RecordBatch>,
-    require_checkpoint: bool,
-) -> Result<Vec<RelationProjectionRow>, StoreError> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        let kinds = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        let sources = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        let targets = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        let frontiers = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        let generations = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        for index in 0..batch.num_rows() {
-            let row = RelationProjectionRow {
-                row_id: ids.value(index).into(),
-                relation_kind: (!kinds.is_null(index)).then(|| kinds.value(index).into()),
-                source_id: (!sources.is_null(index)).then(|| sources.value(index).into()),
-                target_id: (!targets.is_null(index)).then(|| targets.value(index).into()),
-                source_event_seq: frontiers.value(index),
-                projection_generation: generations.value(index),
-            };
-            row.validate()?;
-            rows.push(row);
-        }
-    }
-    rows.sort();
-    if (require_checkpoint
-        && rows
-            .iter()
-            .filter(|row| row.row_id == RELATIONS_CHECKPOINT_ID)
-            .count()
-            != 1)
-        || rows.windows(2).any(|pair| pair[0].row_id == pair[1].row_id)
-    {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok(rows)
 }
 
 mod segmentation;

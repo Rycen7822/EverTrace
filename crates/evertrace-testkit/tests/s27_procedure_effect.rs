@@ -587,6 +587,7 @@ mod controlled_projection_proof {
                                 source_revision: receipt.source_revision.clone(),
                                 source_sequence: 1,
                                 confirmed_prefix_digest: None,
+                                earlier_prefix: None,
                             },
                         ),
                         JournalPayload::DirtyTarget(evertrace_store::DirtyTarget {
@@ -1077,7 +1078,7 @@ mod controlled_projection_proof {
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(payload.canonical_json().unwrap()),
+            payload_json: Some(payload.canonical_json().unwrap().into()),
             source_event_seq: seq,
             projection_generation: 1,
         }
@@ -1511,7 +1512,8 @@ mod controlled_projection_proof {
             row.payload_json = Some(
                 JournalPayload::ExperimentRunRecorded(run)
                     .canonical_json()
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             );
             return;
         }
@@ -1714,7 +1716,8 @@ mod controlled_projection_proof {
         latest.payload_json = Some(
             JournalPayload::WorktreeSnapshotRecorded(snapshot)
                 .canonical_json()
-                .unwrap(),
+                .unwrap()
+                .into(),
         );
         with_new_snapshot.rows.push(latest);
         let stable = compile_snapshot_pairs(
@@ -1742,7 +1745,8 @@ mod controlled_projection_proof {
             row.payload_json = Some(
                 JournalPayload::WorktreeInstanceRecorded(worktree)
                     .canonical_json()
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             );
         }
         assert!(
@@ -1780,7 +1784,7 @@ mod controlled_projection_proof {
                 _ => None,
             };
             if let Some(replacement) = replacement {
-                row.payload_json = Some(replacement.canonical_json().unwrap());
+                row.payload_json = Some(replacement.canonical_json().unwrap().into());
             }
         }
         assert!(
@@ -2497,12 +2501,7 @@ mod controlled_projection_proof {
         );
         assert_eq!(
             writer.table_names().await.unwrap(),
-            vec![
-                "evertrace_journal",
-                "evertrace_objects",
-                "evertrace_relations",
-                "evertrace_search",
-            ]
+            vec!["evertrace_search"]
         );
         drop(writer);
 
@@ -2653,12 +2652,7 @@ mod controlled_projection_proof {
         assert_eq!(incremental, writer.full_projection().await.unwrap());
         assert_eq!(
             writer.table_names().await.unwrap(),
-            vec![
-                "evertrace_journal",
-                "evertrace_objects",
-                "evertrace_relations",
-                "evertrace_search",
-            ]
+            vec!["evertrace_search"]
         );
         drop(writer);
         let mut reopened = JournalWriter::open(&store_root).await.unwrap();

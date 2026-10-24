@@ -1077,7 +1077,7 @@ impl McpActionService {
                 continue;
             };
             if window {
-                let bytes = row.payload_json.as_ref().map_or(0, String::len);
+                let bytes = row.payload_json.as_ref().map_or(0, |text| text.len());
                 if bytes > remaining {
                     truncated = true;
                     next_refs.push(reference.clone());
@@ -1087,13 +1087,13 @@ impl McpActionService {
             }
             if let Some(digest) = source_digest(row)? {
                 let source = digest.source_target.as_ref().unwrap();
-                let text = if window {
+                let window_text = if window {
                     let Some(text) = digest_text.remove(reference) else {
                         continue;
                     };
                     Some(text)
                 } else {
-                    row.payload_json.clone().filter(|text| text.len() <= 8192)
+                    None
                 };
                 if !repository_visible_current(
                     &current.repositories,
@@ -1105,6 +1105,14 @@ impl McpActionService {
                 )? {
                     continue;
                 }
+                let text = if window {
+                    window_text
+                } else {
+                    row.payload_json
+                        .as_ref()
+                        .filter(|text| text.len() <= 8192)
+                        .map(|payload| payload.to_owned_string())
+                };
                 items.push(classify_object_row(row, text, true, unix_time_us_for_mcp()));
             } else if let Some(source) = item.sources.first()
                 && let Some((receipt, observation)) = current_source_pair(source)?
@@ -1264,7 +1272,11 @@ impl McpActionService {
                     &[source.worktree_id],
                     &mut trust_budget,
                 )? {
-                    let text = row.payload_json.clone().filter(|text| text.len() <= 8192);
+                    let text = row
+                        .payload_json
+                        .as_ref()
+                        .filter(|text| text.len() <= 8192)
+                        .map(|payload| payload.to_owned_string());
                     items.push(classify_object_row(row, text, true, unix_time_us_for_mcp()));
                 }
             } else if let Some((receipt, observation)) = source_pair(&snapshot, reference)?

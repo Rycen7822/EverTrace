@@ -7,6 +7,7 @@ use evertrace_domain::{
     revision::RevisionId,
     semantic::{ProposalEligibility, ProposalPayload, ProposalStatus, RevisionProposal},
 };
+use evertrace_store::projections::CurrentFacts;
 use evertrace_store::{
     DurableJob, JobBudget, JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason,
     JournalCommand, JournalEventDraft, JournalPayload, ObjectDeletionCandidateAdmission,
@@ -20,14 +21,11 @@ pub(crate) const KIND: &str = "procedure_review_v1";
 mod source;
 pub(crate) use source::is_source as has_source_target;
 pub(crate) use source::jobs as source_jobs;
-pub(crate) fn source_scope(
-    snapshot: &ProjectionSnapshot,
-    job: &DurableJob,
-) -> Option<ProcedureScope> {
+pub(crate) fn source_scope(snapshot: &CurrentFacts, job: &DurableJob) -> Option<ProcedureScope> {
     source::scope(snapshot, job)
 }
 
-pub(crate) fn is_current(snapshot: &ProjectionSnapshot, job: &DurableJob) -> bool {
+pub(crate) fn is_current(snapshot: &CurrentFacts, job: &DurableJob) -> bool {
     if source::is_source(job) {
         source::current(snapshot, job)
     } else {
@@ -59,19 +57,25 @@ pub(crate) fn budget(
 
 // One planning snapshot, metadata only. Text is decoded only for a selected,
 // not-yet-reviewed cohort; unrelated surfaces are never deserialized here.
+type ReviewSurface<'a> = (&'a evertrace_domain::evidence::EvidenceSurface, u64);
+type ReviewTaskKey = (String, Option<String>, String);
+
 struct ReviewInputs<'a> {
     view: &'a SemanticCurrentView,
     procedures: BTreeMap<RevisionId, &'a evertrace_domain::procedure::ProcedureRevision>,
     refs: BTreeMap<&'a str, Vec<&'a evertrace_store::objects::ObjectRow>>,
-    observations: BTreeMap<&'a str, &'a evertrace_store::objects::ObjectRow>,
-    tasks: BTreeMap<(String, Option<String>, String), Vec<&'a evertrace_store::objects::ObjectRow>>,
+    observations: BTreeMap<String, ReviewSurface<'a>>,
+    source_receipts: BTreeMap<String, (&'a evertrace_domain::evidence::SourceReceipt, u64)>,
+    source_observation_refs:
+        BTreeMap<String, (&'a evertrace_domain::evidence::SourceObservation, u64)>,
+    tasks: BTreeMap<ReviewTaskKey, Vec<ReviewSurface<'a>>>,
     source_by_observation: BTreeMap<String, (String, String)>,
-    sources: BTreeMap<(String, String), Vec<&'a evertrace_store::objects::ObjectRow>>,
+    sources: BTreeMap<(String, String), Vec<ReviewSurface<'a>>>,
 }
 
 impl<'a> ReviewInputs<'a> {
     fn new(
-        snapshot: &'a ProjectionSnapshot,
+        snapshot: &'a CurrentFacts,
         view: &'a SemanticCurrentView,
         usage: &'a crate::procedure::ProcedureUsageCurrentView,
     ) -> Result<Self, SemanticServiceError> {
@@ -80,11 +84,13 @@ impl<'a> ReviewInputs<'a> {
             procedures: Default::default(),
             refs: Default::default(),
             observations: Default::default(),
+            source_receipts: Default::default(),
+            source_observation_refs: Default::default(),
             tasks: Default::default(),
             source_by_observation: Default::default(),
             sources: Default::default(),
         };
-        for row in snapshot.data_rows() {
+        for row in snapshot.other_data_rows() {
             for reference in row
                 .object_id
                 .iter()
@@ -93,45 +99,60 @@ impl<'a> ReviewInputs<'a> {
             {
                 result.refs.entry(reference).or_default().push(row);
             }
-            match row.object_kind.as_deref() {
-                Some("procedure_revision") => {
-                    let revision = row
-                        .current_revision_id
-                        .as_ref()
-                        .and_then(|id| id.parse().ok())
-                        .ok_or(StoreError::StoreCorrupt)?;
-                    if let Some(procedure) = usage.current_procedure_by_revision(revision) {
-                        result.procedures.insert(revision, procedure);
-                    }
+            if let Some("procedure_revision") = row.object_kind.as_deref() {
+                let revision = row
+                    .current_revision_id
+                    .as_ref()
+                    .and_then(|id| id.parse().ok())
+                    .ok_or(StoreError::StoreCorrupt)?;
+                if let Some(procedure) = usage.current_procedure_by_revision(revision) {
+                    result.procedures.insert(revision, procedure);
                 }
-                Some("evidence_surface") => {
-                    let reference = row
-                        .current_revision_id
-                        .as_deref()
-                        .ok_or(StoreError::StoreCorrupt)?;
-                    if result.observations.insert(reference, row).is_some() {
-                        return Err(StoreError::StoreCorrupt.into());
-                    }
-                    if let (Some(repository), Some(task)) = (&row.repository_id, &row.task_id) {
-                        result
-                            .tasks
-                            .entry((repository.clone(), None, task.clone()))
-                            .or_default()
-                            .push(row);
-                        if let Some(worktree) = &row.worktree_id {
-                            result
-                                .tasks
-                                .entry((repository.clone(), Some(worktree.clone()), task.clone()))
-                                .or_default()
-                                .push(row);
-                        }
-                    }
+            }
+        }
+        for (receipt, seq) in snapshot.source_receipts() {
+            result
+                .source_receipts
+                .insert(receipt.source_receipt_id.to_string(), (receipt, seq));
+        }
+        for (observation, seq) in snapshot.source_observations() {
+            result.source_observation_refs.insert(
+                observation.source_observation_id.to_string(),
+                (observation, seq),
+            );
+        }
+        for (surface, seq) in snapshot.evidence_surfaces() {
+            let reference = surface.source_observation_revision_ref.to_string();
+            if result
+                .observations
+                .insert(reference.clone(), (surface, seq))
+                .is_some()
+            {
+                return Err(StoreError::StoreCorrupt.into());
+            }
+            if let (Some(repository), Some(task)) =
+                (surface.repository_instance_id, surface.task_id)
+            {
+                result
+                    .tasks
+                    .entry((repository.to_string(), None, task.to_string()))
+                    .or_default()
+                    .push((surface, seq));
+                if let Some(worktree) = surface.worktree_instance_id {
+                    result
+                        .tasks
+                        .entry((
+                            repository.to_string(),
+                            Some(worktree.to_string()),
+                            task.to_string(),
+                        ))
+                        .or_default()
+                        .push((surface, seq));
                 }
-                _ => {}
             }
         }
         for rows in result.tasks.values_mut() {
-            rows.sort_by_key(|row| std::cmp::Reverse(row.source_event_seq));
+            rows.sort_by_key(|(_, seq)| std::cmp::Reverse(*seq));
             rows.truncate(16);
         }
         // Only admitted message metadata expands a taskless source cohort;
@@ -148,7 +169,7 @@ impl<'a> ReviewInputs<'a> {
             }
         }
         for rows in result.sources.values_mut() {
-            rows.sort_by_key(|row| std::cmp::Reverse(row.source_event_seq));
+            rows.sort_by_key(|(_, seq)| std::cmp::Reverse(*seq));
             rows.truncate(16);
         }
         Ok(result)
@@ -160,7 +181,7 @@ struct SelectedInput<'a> {
     watermark: u64,
     key: String,
     origin_revision: RevisionId,
-    surfaces: Vec<&'a evertrace_store::objects::ObjectRow>,
+    surfaces: Vec<(&'a evertrace_domain::evidence::EvidenceSurface, u64)>,
 }
 
 fn select_input<'a>(
@@ -205,31 +226,22 @@ fn select_input<'a>(
     let mut observations = BTreeSet::new();
     let mut tasks = BTreeSet::new();
     let mut watermark = 0;
-    for row in proposal
-        .source_cohort_refs
-        .iter()
-        .flat_map(|reference| context.refs.get(reference.as_str()).into_iter().flatten())
-    {
-        watermark = watermark.max(row.source_event_seq);
-        match row.object_kind.as_deref() {
-            Some("source_receipt") => {
-                let JournalPayload::SourceReceiptRecorded(receipt) =
-                    serde_json::from_str::<JournalPayload>(
-                        row.payload_json
-                            .as_deref()
-                            .ok_or(StoreError::StoreCorrupt)?,
-                    )
-                    .map_err(|_| StoreError::StoreCorrupt)?
-                else {
-                    return Err(StoreError::StoreCorrupt.into());
-                };
-                observations.insert(receipt.source_observation_id.to_string());
-                tasks.extend(receipt.task_id.map(|task| task.to_string()));
-            }
-            Some("source_observation" | "evidence_surface") => {
-                observations.extend(row.current_revision_id.clone());
-            }
-            _ => {}
+    for reference in &proposal.source_cohort_refs {
+        for row in context.refs.get(reference.as_str()).into_iter().flatten() {
+            watermark = watermark.max(row.source_event_seq);
+        }
+        if let Some((receipt, seq)) = context.source_receipts.get(reference) {
+            watermark = watermark.max(*seq);
+            observations.insert(receipt.source_observation_id.to_string());
+            tasks.extend(receipt.task_id.map(|task| task.to_string()));
+        }
+        if let Some((observation, seq)) = context.source_observation_refs.get(reference) {
+            watermark = watermark.max(*seq);
+            observations.insert(observation.source_observation_id.to_string());
+        }
+        if let Some((surface, seq)) = context.observations.get(reference) {
+            watermark = watermark.max(*seq);
+            observations.insert(surface.source_observation_revision_ref.to_string());
         }
     }
     let mut surfaces = observations
@@ -251,28 +263,30 @@ fn select_input<'a>(
                 .flatten()
                 .copied()
         }))
-        .filter(|row| {
-            row.repository_id.as_deref() == Some(repository.as_str())
-                && worktree
-                    .as_ref()
-                    .is_none_or(|worktree| row.worktree_id.as_ref() == Some(worktree))
+        .filter(|(surface, _)| {
+            surface
+                .repository_instance_id
+                .map(|id| id.to_string())
+                .as_deref()
+                == Some(repository.as_str())
+                && worktree.as_ref().is_none_or(|worktree| {
+                    surface
+                        .worktree_instance_id
+                        .map(|id| id.to_string())
+                        .as_ref()
+                        == Some(worktree)
+                })
         })
         .collect::<Vec<_>>();
-    surfaces.sort_by_key(|row| std::cmp::Reverse(row.source_event_seq));
-    surfaces.dedup_by_key(|row| row.current_revision_id.as_deref());
+    surfaces.sort_by_key(|(_, seq)| std::cmp::Reverse(*seq));
+    surfaces.dedup_by_key(|(surface, _)| surface.source_observation_revision_ref);
     surfaces.truncate(16);
-    watermark = watermark.max(
-        surfaces
-            .iter()
-            .map(|row| row.source_event_seq)
-            .max()
-            .unwrap_or(0),
-    );
+    watermark = watermark.max(surfaces.iter().map(|(_, seq)| *seq).max().unwrap_or(0));
     let mut cohort = proposal.clone();
     cohort.source_cohort_refs.extend(
         surfaces
             .iter()
-            .filter_map(|row| row.current_revision_id.clone()),
+            .map(|(surface, _)| surface.source_observation_revision_ref.to_string()),
     );
     cohort.source_cohort_refs.sort();
     cohort.source_cohort_refs.dedup();
@@ -303,17 +317,7 @@ fn input(
         return Err(SemanticServiceError::InvalidInput);
     };
     let mut evidence = BTreeMap::new();
-    for row in selected.surfaces {
-        let JournalPayload::EvidenceSurfaceRecorded(surface) =
-            serde_json::from_str::<JournalPayload>(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?,
-            )
-            .map_err(|_| StoreError::StoreCorrupt)?
-        else {
-            return Err(StoreError::StoreCorrupt.into());
-        };
+    for (surface, seq) in selected.surfaces {
         let same_scope = match payload.draft().scope {
             ProcedureScope::Worktree {
                 repository_id,
@@ -327,11 +331,7 @@ fn input(
             }
             ProcedureScope::Global => false,
         };
-        if !same_scope
-            || row.current_revision_id.as_deref()
-                != Some(surface.source_observation_revision_ref.to_string().as_str())
-            || row.task_id != surface.task_id.map(|task| task.to_string())
-        {
+        if !same_scope {
             return Err(StoreError::StoreCorrupt.into());
         }
         surface.validate().map_err(|_| StoreError::StoreCorrupt)?;
@@ -343,7 +343,7 @@ fn input(
         evidence.insert(
             surface.source_observation_revision_ref.to_string(),
             (
-                row.source_event_seq,
+                seq,
                 crate::provider::ProtectedDeltaItem {
                     kind: crate::provider::ProtectedDeltaKind::Progress,
                     value: text[..end].to_owned(),
@@ -391,7 +391,7 @@ fn accepted<'a>(
 }
 
 pub(crate) fn jobs(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     planner: &super::SynthesisPlanner,
     config: [u8; 32],
     wall: std::time::Duration,
@@ -400,9 +400,12 @@ pub(crate) fn jobs(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let view = SemanticCurrentView::from_snapshot(snapshot)?;
-    let runtime = RuntimeSchedulerView::from_snapshot(snapshot)?;
-    let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(snapshot)?;
+    let view = SemanticCurrentView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
+    let runtime = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
+    let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+        snapshot.frontier(),
+        snapshot.other_rows(),
+    )?;
     let context = ReviewInputs::new(snapshot, &view, &usage)?;
     let mut covered = BTreeMap::<&str, u64>::new();
     let mut last_review = BTreeMap::<&str, JobId>::new();
@@ -439,20 +442,32 @@ pub(crate) fn jobs(
             return Ok(false);
         }
         let selected = select_input(&context, proposal, existing)?;
-        let cohort_watermark = proposal
-            .source_cohort_refs
-            .iter()
-            .flat_map(|reference| context.refs.get(reference.as_str()).into_iter().flatten())
-            .map(|row| row.source_event_seq)
-            .max()
-            .unwrap_or(0);
+        let cohort_watermark =
+            proposal
+                .source_cohort_refs
+                .iter()
+                .flat_map(|reference| context.refs.get(reference.as_str()).into_iter().flatten())
+                .map(|row| row.source_event_seq)
+                .chain(proposal.source_cohort_refs.iter().filter_map(|reference| {
+                    context.source_receipts.get(reference).map(|(_, seq)| *seq)
+                }))
+                .chain(proposal.source_cohort_refs.iter().filter_map(|reference| {
+                    context
+                        .source_observation_refs
+                        .get(reference)
+                        .map(|(_, seq)| *seq)
+                }))
+                .chain(proposal.source_cohort_refs.iter().filter_map(|reference| {
+                    context.observations.get(reference).map(|(_, seq)| *seq)
+                }))
+                .max()
+                .unwrap_or(0);
         if selected.watermark == 0
-            || !selected.surfaces.iter().any(|row| {
-                row.source_event_seq > cohort_watermark
-                    && row
-                        .current_revision_id
-                        .as_ref()
-                        .is_some_and(|id| !proposal.source_cohort_refs.contains(id))
+            || !selected.surfaces.iter().any(|(surface, seq)| {
+                *seq > cohort_watermark
+                    && !proposal
+                        .source_cohort_refs
+                        .contains(&surface.source_observation_revision_ref.to_string())
             })
             || existing.is_some_and(|procedure| selected.watermark <= procedure.source_watermark)
             || [
@@ -570,11 +585,14 @@ pub(crate) fn jobs(
 }
 
 pub(crate) fn current(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     job: &DurableJob,
 ) -> Result<Input, SemanticServiceError> {
-    let view = SemanticCurrentView::from_snapshot(snapshot)?;
-    let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(snapshot)?;
+    let view = SemanticCurrentView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
+    let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+        snapshot.frontier(),
+        snapshot.other_rows(),
+    )?;
     let context = ReviewInputs::new(snapshot, &view, &usage)?;
     let existing = job
         .target_revision
@@ -608,7 +626,7 @@ pub(crate) fn current(
 }
 
 fn validate_frozen_target(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     view: &SemanticCurrentView,
     usage: &crate::procedure::ProcedureUsageCurrentView,
     input: &Input,
@@ -636,8 +654,11 @@ fn validate_frozen_target(
         return Err(SemanticServiceError::BaseConflict);
     }
     if !matches!(
-        ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?
-            .classify_proposal(proposal)?,
+        ObjectDeletionCandidateAdmissionView::for_candidate_refs_current(
+            snapshot,
+            &proposal.source_cohort_refs,
+        )?
+        .classify_proposal(proposal)?,
         ObjectDeletionCandidateAdmission::Clear
     ) {
         return Err(SemanticServiceError::BaseConflict);
@@ -647,7 +668,7 @@ fn validate_frozen_target(
 
 pub(crate) async fn allowed(
     writer: &crate::WriterHandle,
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<bool, SemanticServiceError> {
@@ -666,14 +687,17 @@ pub(crate) async fn allowed(
 
 pub(crate) async fn allowed_input(
     writer: &crate::WriterHandle,
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     job: &DurableJob,
     input: &Input,
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<bool, SemanticServiceError> {
     let validation = {
-        let view = SemanticCurrentView::from_snapshot(snapshot)?;
-        let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(snapshot)?;
+        let view = SemanticCurrentView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
+        let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+            snapshot.frontier(),
+            snapshot.other_rows(),
+        )?;
         validate_frozen_target(snapshot, &view, &usage, input)
     };
     match validation {
@@ -699,14 +723,14 @@ pub(crate) async fn allowed_input(
 
 async fn allowed_refs(
     writer: &crate::WriterHandle,
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     refs: &[String],
     scope: &ProcedureScope,
     config_hash: [u8; 32],
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<bool, SemanticServiceError> {
     let rows = snapshot
-        .data_rows()
+        .other_data_rows()
         .filter(|row| {
             row.object_id.as_ref().is_some_and(|id| refs.contains(id))
                 || row
@@ -715,19 +739,52 @@ async fn allowed_refs(
                     .is_some_and(|id| refs.contains(id))
         })
         .collect::<Vec<_>>();
-    if rows.len() > 64
-        || refs.iter().any(|reference| {
-            !rows.iter().any(|row| {
-                row.object_id.as_ref() == Some(reference)
-                    || row.current_revision_id.as_ref() == Some(reference)
-            })
-        })
-    {
+    let mut source_observation_refs = BTreeSet::new();
+    let mut source_repositories = BTreeSet::new();
+    for reference in refs {
+        if let Ok(id) = reference.parse() {
+            if let Some((observation, _)) = snapshot.source_observation(id) {
+                source_observation_refs.insert(id.to_string());
+                if let Some((receipt, _)) = snapshot.source_receipt(observation.source_receipt_ref)
+                    && let Some(repository) = receipt.repository_instance_id
+                {
+                    source_repositories.insert(repository);
+                }
+            }
+            if let Some((surface, _)) = snapshot.evidence_surface(id) {
+                source_observation_refs.insert(id.to_string());
+                if let Some(repository) = surface.repository_instance_id {
+                    source_repositories.insert(repository);
+                }
+            }
+        }
+        if let Ok(id) = reference.parse()
+            && let Some((receipt, _)) = snapshot.source_receipt(id)
+        {
+            source_observation_refs.insert(receipt.source_observation_id.to_string());
+            if let Some(repository) = receipt.repository_instance_id {
+                source_repositories.insert(repository);
+            }
+        }
+    }
+    let known = |reference: &str| {
+        rows.iter().any(|row| {
+            row.object_id.as_deref() == Some(reference)
+                || row.current_revision_id.as_deref() == Some(reference)
+        }) || source_observation_refs.contains(reference)
+            || reference
+                .parse()
+                .ok()
+                .is_some_and(|id| snapshot.source_receipt(id).is_some())
+    };
+    if rows.len() > 64 || refs.iter().any(|reference| !known(reference)) {
         return Ok(false);
     }
-    let scopes = crate::repository::row_repository_contexts(snapshot, &rows)
-        .map_err(|_| StoreError::StoreCorrupt)?;
+    let scopes =
+        crate::repository::row_repository_contexts_from_scopes(snapshot.other_data_rows(), &rows)
+            .map_err(|_| StoreError::StoreCorrupt)?;
     let mut ids = scopes.values().flatten().copied().collect::<BTreeSet<_>>();
+    ids.extend(source_repositories);
     match *scope {
         ProcedureScope::Worktree { repository_id, .. }
         | ProcedureScope::Repository { repository_id } => {
@@ -742,12 +799,20 @@ async fn allowed_refs(
     {
         return Ok(false);
     }
-    Ok(
-        crate::session_import::blocked_source_rows(writer, report, snapshot, &rows, config_hash)
-            .await
-            .map_err(|_| StoreError::StoreCorrupt)?
-            .is_empty(),
+    if source_observation_refs.len() > 64 {
+        return Ok(false);
+    }
+    let source_refs = source_observation_refs.into_iter().collect::<Vec<_>>();
+    Ok(crate::session_import::blocked_source_observations(
+        writer,
+        report,
+        snapshot,
+        &source_refs,
+        config_hash,
     )
+    .await
+    .map_err(|_| StoreError::StoreCorrupt)?
+    .is_empty())
 }
 
 pub(crate) async fn readable_revisions(
@@ -991,7 +1056,7 @@ fn content(draft: &ProcedureDraft) -> ProviderProcedureContent {
 pub(crate) async fn execute(
     writer: &crate::WriterHandle,
     planner: &super::SynthesisPlanner,
-    snapshot: ProjectionSnapshot,
+    snapshot: CurrentFacts,
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
     at: i64,
@@ -1028,7 +1093,7 @@ pub(crate) async fn execute(
             let response = provider
                 .review_procedure(json, job.budget.max_output_tokens.unwrap_or(0), &|| async {
                     let snapshot = writer
-                        .project()
+                        .project_current(true)
                         .await
                         .map_err(|_| crate::provider::ProviderError::Transport)?;
                     if allowed_input(writer, &snapshot, job, &input, report)
@@ -1042,7 +1107,7 @@ pub(crate) async fn execute(
                 })
                 .await;
             let current = writer
-                .project()
+                .project_current(true)
                 .await
                 .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
             if !allowed_input(writer, &current, job, &input, report).await? {
@@ -1079,7 +1144,7 @@ pub(crate) async fn execute(
                             next_draft.evidence_refs.dedup();
                             if let Some(procedure) = &input.existing {
                                 let resolution = crate::semantic::RevisionProposalService.submit_with_deletion_admission(
-                                    &SemanticCurrentView::from_snapshot(snapshot)?, &ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?,
+                                    &SemanticCurrentView::from_rows(snapshot.frontier(), snapshot.other_rows())?, &ObjectDeletionCandidateAdmissionView::for_candidate_refs_current(snapshot, &input.refs)?,
                                     crate::semantic::ProposalCommandContext { command_id: CommandId::new_v7(), occurred_at_us: at, effective_config_hash: job.config_hash, algorithm_revision: KIND.into() },
                                     crate::semantic::SubmitProposalRequest {
                                         target_kind: evertrace_domain::semantic::ProposalTargetKind::Procedure,
@@ -1208,32 +1273,266 @@ fn finish(
 mod tests {
     use super::*;
 
+    fn source_facts() -> CurrentFacts {
+        use evertrace_domain::evidence::*;
+        use evertrace_domain::ids::*;
+        use evertrace_store::{ObjectRow, ProjectionSnapshot};
+
+        let instance = SourceInstanceId::parse("session-rollout:test:one").unwrap();
+        let revision = SourceRevision::parse("revision-one").unwrap();
+        let repository: RepositoryId = "repo:00000000-0000-7000-8000-000000000001".parse().unwrap();
+        let unrelated_repository: RepositoryId =
+            "repo:ffffffff-ffff-7fff-8fff-ffffffffffff".parse().unwrap();
+        let worktree = WorktreeId::new_v7();
+        let task = TaskId::new_v7();
+        let mut rows = vec![ObjectRow::checkpoint(100, 1)];
+        for seq in 1..=33_u64 {
+            let source_repository = if seq == 33 {
+                unrelated_repository
+            } else {
+                repository
+            };
+            let record = SourceRecordIdentity::parse(format!("message-{seq}")).unwrap();
+            let observation_id = source_observation_id(&instance, &revision, &record).unwrap();
+            let receipt_id = source_receipt_id(&instance, &revision, &record).unwrap();
+            let receipt = SourceReceipt {
+                protected_presentation: None,
+                source_receipt_id: receipt_id,
+                source_observation_id: observation_id,
+                source_instance_id: instance.clone(),
+                source_kind: EvidenceSourceKind::CodexSessionJsonl,
+                identity_domain: "codex-session-v1".into(),
+                source_ref: format!("source:review:{seq}"),
+                source_session_ref: "session:review".into(),
+                source_revision: revision.clone(),
+                source_record_identity: record.clone(),
+                identity_strength: IdentityStrength::StableNative,
+                source_sequence: seq,
+                source_sequence_origin: None,
+                task_id: Some(task),
+                repository_instance_id: Some(source_repository),
+                worktree_instance_id: Some(worktree),
+                source_byte_range: None,
+                spool_byte_range: EvidenceByteRange {
+                    start: seq,
+                    end: seq + 1,
+                },
+                source_revision_mode: SourceRevisionMode::Append,
+                previous_source_revision: None,
+                close_watermark: Some(seq),
+                observation_role: ObservationRole::Message,
+                unsupported_record_classification: None,
+                capture_completeness: CaptureCompleteness::Complete,
+                archive_mode: SourceArchiveMode::Exact,
+                cas_ref: "ab".repeat(32),
+                protected_length: 8,
+                original_length: 8,
+                protected_secret_digest: None,
+                redaction_spans: vec![],
+                adapter_revision: 1,
+                adapter_manifest_ref: "adapter-review".into(),
+                eligible_event_manifest_ref: "eligible-review".into(),
+                parser_revision: 1,
+                canonicalization_revision: 1,
+                detector_revision: 1,
+                redaction_revision: 1,
+                protection_key_generation: 1,
+                event_time_us: seq as i64,
+                recorded_at_us: seq as i64,
+                lifecycle: None,
+            };
+            receipt.validate().unwrap();
+            let observation = SourceObservation {
+                source_local_evidence: None,
+                source_observation_id: observation_id,
+                source_instance_id: instance.clone(),
+                source_revision: revision.clone(),
+                source_record_identity: record,
+                observation_role: ObservationRole::Message,
+                identity_strength: IdentityStrength::StableNative,
+                payload_fingerprint: "cd".repeat(32),
+                source_receipt_ref: receipt_id,
+                source_role: SourceRole::Assistant,
+                content_trust: ContentTrust::Observed,
+                capture_completeness: CaptureCompleteness::Complete,
+                adapter_revision: 1,
+                parser_revision: 1,
+                canonicalization_revision: 1,
+                detector_revision: 1,
+                redaction_revision: 1,
+                correlation: HostCorrelationEvidence {
+                    occurrence_schema_version: 1,
+                    host_instance_id: None,
+                    host_trace_lineage_id: None,
+                    host_lane_key: None,
+                    canonical_event_family: None,
+                    native_request_id: None,
+                    physical_execution_ordinal: None,
+                    pairing_role: ObservationRole::Message,
+                    field_provenance: vec![],
+                    adapter_manifest_ref: "adapter-review".into(),
+                    adapter_revision: 1,
+                    strong_gate_receipt_ref: None,
+                    admission: CorrelationAdmission::Unavailable,
+                    partial_correlation_ref: None,
+                    possible_duplicate_group_id: None,
+                },
+                scope_effect_claims: vec![],
+            };
+            observation.validate().unwrap();
+            let protected_text = format!("payload-{seq}");
+            let span_hash = evidence_span_hash(observation_id, 1, &protected_text).unwrap();
+            let surface = EvidenceSurface {
+                source_observation_revision_ref: observation_id,
+                source_role: SourceRole::Assistant,
+                content_trust: ContentTrust::Observed,
+                instruction_authority: InstructionAuthority::None,
+                task_id: Some(task),
+                repository_instance_id: Some(source_repository),
+                worktree_instance_id: Some(worktree),
+                event_time_us: seq as i64,
+                recorded_at_us: seq as i64,
+                source_sequence: seq,
+                capture_completeness: CaptureCompleteness::Complete,
+                canonicalization_version: 1,
+                span_hash: hex(&span_hash),
+                projection_generation: 1,
+                protected_text,
+            };
+            surface.validate().unwrap();
+            rows.push(source_row(
+                "source_receipt",
+                receipt_id.to_string(),
+                Some(source_repository.to_string()),
+                Some(worktree.to_string()),
+                Some(task.to_string()),
+                JournalPayload::SourceReceiptRecorded(Box::new(receipt)),
+                seq,
+            ));
+            rows.push(source_row(
+                "source_observation",
+                observation_id.to_string(),
+                None,
+                None,
+                None,
+                JournalPayload::SourceObservationRecorded(Box::new(observation)),
+                seq,
+            ));
+            rows.push(surface_row(surface, seq));
+        }
+        CurrentFacts::try_from(ProjectionSnapshot {
+            frontier: 100,
+            rows,
+        })
+        .unwrap()
+    }
+
+    fn source_row(
+        kind: &str,
+        id: String,
+        repository: Option<String>,
+        worktree: Option<String>,
+        task: Option<String>,
+        payload: JournalPayload,
+        seq: u64,
+    ) -> evertrace_store::ObjectRow {
+        use evertrace_store::{ObjectRow, ObjectRowClass, ObjectRowKind};
+
+        ObjectRow {
+            row_id: format!("object:evidence:{kind}:{id}"),
+            row_kind: ObjectRowKind::Data,
+            row_class: Some(ObjectRowClass::Object),
+            object_family: Some(evertrace_store::ObjectFamily::Evidence),
+            object_kind: Some(kind.into()),
+            object_id: Some(id.clone()),
+            current_revision_id: Some(id),
+            lifecycle: Some("immutable".into()),
+            epistemic: Some("observed".into()),
+            authority: Some("none".into()),
+            publication_state: None,
+            support_state: None,
+            project_id: None,
+            repository_id: repository,
+            worktree_id: worktree,
+            task_id: task,
+            workstream_id: None,
+            session_id: None,
+            payload_json: Some(payload.canonical_json().unwrap().into()),
+            source_event_seq: seq,
+            projection_generation: 1,
+        }
+    }
+
+    fn surface_row(
+        surface: evertrace_domain::evidence::EvidenceSurface,
+        seq: u64,
+    ) -> evertrace_store::ObjectRow {
+        use evertrace_store::{ObjectRow, ObjectRowClass, ObjectRowKind};
+
+        let id = surface.source_observation_revision_ref;
+        ObjectRow {
+            row_id: format!("projection:evidence_surface:{id}"),
+            row_kind: ObjectRowKind::Data,
+            row_class: Some(ObjectRowClass::Projection),
+            object_family: None,
+            object_kind: Some("evidence_surface".into()),
+            object_id: None,
+            current_revision_id: Some(id.to_string()),
+            lifecycle: None,
+            epistemic: Some("evidence".into()),
+            authority: Some("none".into()),
+            publication_state: None,
+            support_state: None,
+            project_id: None,
+            repository_id: surface
+                .repository_instance_id
+                .map(|value| value.to_string()),
+            worktree_id: surface.worktree_instance_id.map(|value| value.to_string()),
+            task_id: surface.task_id.map(|value| value.to_string()),
+            workstream_id: None,
+            session_id: None,
+            payload_json: Some(
+                JournalPayload::EvidenceSurfaceRecorded(Box::new(surface))
+                    .canonical_json()
+                    .unwrap()
+                    .into(),
+            ),
+            source_event_seq: seq,
+            projection_generation: 1,
+        }
+    }
+
     #[test]
     fn review_round_indexes_metadata_once_and_bounds_related_surface_selection() {
-        let mut rows = Vec::new();
-        for seq in 1..=33 {
-            let mut row = evertrace_store::ObjectRow::checkpoint(seq, 1);
-            row.row_kind = evertrace_store::objects::ObjectRowKind::Data;
-            row.object_kind = Some("evidence_surface".into());
-            row.current_revision_id = Some(
-                evertrace_domain::ids::SourceObservationId::from_digest([seq as u8; 32])
-                    .to_string(),
-            );
-            row.repository_id = Some(if seq == 33 { "unrelated" } else { "selected" }.into());
-            row.worktree_id = Some("worktree".into());
-            row.task_id = Some("task".into());
-            row.payload_json = Some("not decoded during candidate filtering".into());
-            rows.push(row);
-        }
-        let snapshot = ProjectionSnapshot { frontier: 33, rows };
-        let view = SemanticCurrentView::from_snapshot(&snapshot).unwrap();
-        let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_snapshot(&snapshot)
-            .unwrap();
-        let inputs = ReviewInputs::new(&snapshot, &view, &usage).unwrap();
-        let selected = &inputs.tasks[&("selected".into(), Some("worktree".into()), "task".into())];
+        let current = source_facts();
+        let view =
+            SemanticCurrentView::from_rows(current.frontier(), current.other_rows()).unwrap();
+        let usage = crate::procedure::ProcedureUsageCurrentView::from_promotion_rows(
+            current.frontier(),
+            current.other_rows(),
+        )
+        .unwrap();
+        let inputs = ReviewInputs::new(&current, &view, &usage).unwrap();
+        let selected = inputs.tasks.values().next().unwrap();
         assert_eq!(selected.len(), 16);
-        assert_eq!(selected.first().unwrap().source_event_seq, 32);
-        assert_eq!(selected.last().unwrap().source_event_seq, 17);
+        assert_eq!(selected.first().unwrap().1, 32);
+        assert_eq!(selected.last().unwrap().1, 17);
         assert_eq!(inputs.observations.len(), 33);
+    }
+
+    #[test]
+    fn source_only_facts_advance_procedure_context_watermark() {
+        let current = source_facts();
+        let task = current.source_receipts().next().unwrap().0.task_id.unwrap();
+        let candidates = crate::procedure::procedure_usage_candidates(
+            &current,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates.context_watermarks.get(&(task.to_string(), None)),
+            Some(&33),
+            "source receipt/surface metadata must contribute even without non-source data rows"
+        );
     }
 }

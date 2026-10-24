@@ -441,6 +441,7 @@ async fn initialized_writer(
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -484,6 +485,7 @@ async fn persist_source(
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -2414,12 +2416,7 @@ async fn task_and_repository_acceptance_are_atomic_restart_safe_and_four_table_o
     assert_eq!(writer.journal_rows().await.unwrap().len(), before_no_delta);
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
 
     let atoms = SemanticCurrentView::from_snapshot(&final_snapshot).unwrap();

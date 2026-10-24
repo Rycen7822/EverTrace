@@ -190,6 +190,7 @@ fn evidence_command(receipt: SourceReceipt, observation: SourceObservation) -> J
                 source_revision: receipt.source_revision,
                 source_sequence: receipt.source_sequence,
                 confirmed_prefix_digest: None,
+                earlier_prefix: None,
             }),
             JournalPayload::DirtyTarget(DirtyTarget {
                 target_kind: DirtyTargetKind::EvidenceSurface,
@@ -634,7 +635,7 @@ fn current_row(kind: &str, payload: &JournalPayload) -> ObjectRow {
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(serde_json::to_string(payload).unwrap()),
+        payload_json: Some(serde_json::to_string(payload).unwrap().into()),
         source_event_seq: 1,
         projection_generation: 1,
     }
@@ -1447,7 +1448,7 @@ fn ambiguous_attempt_group_context_fails_closed_without_a_primary_binding_ref() 
             unreachable!();
         };
         attempt.competing_group_ids = groups.clone();
-        row.payload_json = Some(serde_json::to_string(&payload).unwrap());
+        row.payload_json = Some(serde_json::to_string(&payload).unwrap().into());
     }
     observed.view = SegmentationCurrentState::from_snapshot(&ProjectionSnapshot {
         frontier: 100,
@@ -2079,7 +2080,7 @@ async fn atomic_activation_checkpoint_replay_and_four_table_restart_are_stable()
     let incremental = writer.project().await.unwrap();
     let full = reduce_journal(&writer.journal_rows().await.unwrap()).unwrap();
     assert_eq!(incremental, full);
-    assert_eq!(writer.table_names().await.unwrap().len(), 4);
+    assert_eq!(writer.table_names().await.unwrap().len(), 1);
     drop(writer);
     let writer = JournalWriter::open(&store).await.unwrap();
     assert_eq!(writer.project().await.unwrap(), full);

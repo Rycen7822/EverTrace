@@ -1627,15 +1627,15 @@ pub(crate) fn content_lines(
                         crate::locale::format!(language, "backup verification/frontier: {:?} / {}", "备份验证／水位: {:?} / {}",
                             backup.validation_result, backup.frontier
                         ),
-                        crate::locale::format!(language, "backup journal/objects: v{}@{} / v{}@{}", "备份日志／对象：v{}@{} / v{}@{}",
-                            backup.journal.version,
+                        crate::locale::format!(language, "backup journal/objects: {}@{} / {}@{}", "备份日志／对象：{}@{} / {}@{}",
+                            backup.journal.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")),
                             backup.journal.frontier,
-                            backup.objects.version,
+                            backup.objects.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")),
                             backup.objects.frontier
                         ),
                         crate::locale::format!(language, "backup relations/search: {} / {}", "备份关系／搜索：{} / {}",
-                            backup.relations.as_ref().map_or_else(|| "absent".into(), |table| format!("v{}@{}", table.version, table.frontier)),
-                            backup.search.as_ref().map_or_else(|| "absent".into(), |table| format!("v{}@{}", table.version, table.frontier))
+                            backup.relations.as_ref().map_or_else(|| "absent".into(), |table| format!("{}@{}", table.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")), table.frontier)),
+                            backup.search.as_ref().map_or_else(|| "absent".into(), |table| format!("{}@{}", table.version.map_or_else(|| "n/a".into(), |version| format!("v{version}")), table.frontier))
                         ),
                         crate::locale::format!(language, "backup source/spool/cas: {}/{} watermarks; {} files/{} generations; {}/{} CAS", "备份来源／队列／CAS：水位 {}/{}；文件 {}／代次 {}；CAS {}/{}",
                             backup.committed_source_watermark_count,
