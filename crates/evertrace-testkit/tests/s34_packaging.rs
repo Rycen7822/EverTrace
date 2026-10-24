@@ -5301,19 +5301,15 @@ async fn fresh_v3_uncertain_preserves_staged_assets_and_restored_discards() {
             fs::read(&staged).unwrap(),
             fs::read(package.join("evertrace-hook")).unwrap()
         );
-        let scratch_prefix = format!(
-            "{}.package-check-",
-            paths.data_root.file_name().unwrap().to_string_lossy()
-        );
         assert!(
-            fs::read_dir(root.path()).unwrap().any(|entry| {
+            fs::read_dir(&paths.data_root).unwrap().any(|entry| {
                 entry
                     .unwrap()
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(&scratch_prefix)
+                    .starts_with(".package-check-")
             }),
-            "uncertain publication must retain its scratch root"
+            "uncertain publication must retain scratch on the data-root filesystem"
         );
         assert_eq!(fs::read(&paths.host_config).unwrap(), host_before);
         assert!(JournalWriter::open(&paths.data_root).await.is_ok());

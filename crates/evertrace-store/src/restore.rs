@@ -31,8 +31,9 @@ pub(crate) enum NativePublicationPoint {
 
 /// Offline native publication only. Capture's state root and all durable inputs
 /// remain in place; this transaction never performs Restore authority resets.
-/// A current store is validated read-only and left in place; a retired layout
-/// goes through the one-shot converter and the same atomic publication.
+/// A current store is opened under its held writer lock so normal startup can
+/// catch up derived projections before strict validation; it is not republished.
+/// A retired layout goes through the one-shot converter and atomic publication.
 pub async fn upgrade_native(
     data_dir: &Path,
     config_path: &Path,
@@ -117,6 +118,18 @@ pub async fn prepare_native_upgrade(
     .await
 }
 
+/// Recover the live source through normal startup, then keep its lock while
+/// the closed store undergoes the same strict checks as a candidate.
+async fn close_live_native_for_verification(
+    data_dir: &Path,
+    lock: crate::SiblingWriterLock,
+) -> Result<crate::ClosedJournalWriter, RestoreError> {
+    let mut writer =
+        crate::JournalWriter::open_with_lock(lock, crate::StoreReadHandle::open(data_dir)).await?;
+    let guard = writer.quiesce_for_backup().await?.ok_or(StoreError::Io)?;
+    Ok(writer.close_for_backup(guard)?)
+}
+
 /// One prepared conversion under the continuously held sibling lock. A
 /// current store never yields a candidate; a retired layout yields exactly one
 /// private native candidate plus its independently verified v2 backup.
@@ -149,13 +162,23 @@ async fn prepare_upgrade_inner(
         if !canonical_exists {
             return Err(StoreError::StoreCorrupt.into());
         }
-        verify_native_store_tables(&canonical).await?;
+        let canonical_custody = evertrace_capture::ConfinedRoot::open_owned_private(&canonical)
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        let closed = close_live_native_for_verification(data_dir, lock).await?;
+        verify_package_native(&canonical, &data_dir.join("cas")).await?;
+        parent
+            .revalidate_stable()
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        canonical_custody
+            .revalidate_stable()
+            .map_err(|_| StoreError::StoreCorrupt)?;
         let retained_native = flat_retained_tables(data_dir)?;
         if check_package && !retained_native.is_empty() {
             // A package check must not certify a container that still holds an
             // unconverted retired layout; only the offline path may retain it.
             return Err(StoreError::StoreCorrupt.into());
         }
+        drop(closed);
         return Ok(NativeUpgradePreparation::Unchanged(
             NativeUpgradeOutcome::Noop { retained_native },
         ));
@@ -739,18 +762,19 @@ pub(crate) fn reject_retained_upgrade_candidate(data_dir: &Path) -> Result<(), R
 }
 
 /// Before service recovery, verify the original native container under the
-/// sibling lock and reject every uncertain upgrade remnant. A canonical old
-/// or flat retired layout is read with the named legacy decoder; only a
-/// missing canonical may fall back to the flat root. SQLite checkpoint/close
-/// may legitimately change directory timestamps; custody is its no-follow
-/// inode, owner and mode, while the full verifier proves contents. No repair runs.
+/// sibling lock and reject every uncertain upgrade remnant. A current SQLite
+/// store uses normal writer startup to catch up derived projections, then
+/// closes and passes strict verification while the same lock remains held. A
+/// canonical old or flat retired layout is read with the named legacy decoder;
+/// it is never migrated here.
 pub async fn verify_package_resume(
     data: &Path,
     original: &evertrace_capture::ConfinedRoot,
 ) -> Result<(), RestoreError> {
-    let _lock = crate::SiblingWriterLock::acquire(data)?;
+    let mut lock = Some(crate::SiblingWriterLock::acquire(data)?);
     reject_retained_upgrade_candidate(data)?;
     original.revalidate_stable().map_err(|_| RestoreError::Io)?;
+    let mut closed_writer = None;
     let canonical = crate::connection::native_root(data);
     let canonical_exists = match std::fs::symlink_metadata(&canonical) {
         Ok(_) => {
@@ -765,6 +789,9 @@ pub async fn verify_package_resume(
         if !canonical_exists {
             return Err(StoreError::StoreCorrupt.into());
         }
+        closed_writer = Some(
+            close_live_native_for_verification(data, lock.take().ok_or(StoreError::Io)?).await?,
+        );
         verify_package_native(&canonical, &data.join("cas")).await?;
     } else {
         // canonical selection falls back to flat only when the canonical
@@ -790,6 +817,7 @@ pub async fn verify_package_resume(
         }
     }
     original.revalidate_stable().map_err(|_| RestoreError::Io)?;
+    drop((closed_writer, lock));
     Ok(())
 }
 
@@ -2038,7 +2066,7 @@ pub(crate) fn ledger_command(rows: &[&JournalRow]) -> Result<bool, StoreError> {
 mod tests {
     use super::*;
     use crate::{JobLease, JournalEventDraft};
-    use evertrace_domain::ids::JobId;
+    use evertrace_domain::ids::{CommandId, JobId};
 
     async fn current_store(data: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -2122,6 +2150,50 @@ mod tests {
             preparation,
             NativeUpgradePreparation::Unchanged(NativeUpgradeOutcome::Noop { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn live_upgrade_and_resume_recover_valid_projection_lag() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        current_store(&data).await;
+        for resume in [false, true] {
+            let mut writer = crate::JournalWriter::open(&data).await.unwrap();
+            let command = crate::JournalCommand::new(
+                CommandId::new_v7(),
+                vec![JournalEventDraft::runtime(
+                    1,
+                    [1; 32],
+                    "projection-lag-test",
+                    JournalPayload::DirtyTarget(crate::DirtyTarget {
+                        target_kind: crate::DirtyTargetKind::ObjectsProjection,
+                        target_id: "objects".into(),
+                        algorithm_revision: "projection-lag-test".into(),
+                        source_watermark: 1,
+                    }),
+                )],
+            )
+            .unwrap();
+            writer.commit(&command, 1).await.unwrap();
+            writer.shutdown().await.unwrap();
+            let native = crate::connection::native_root(&data);
+            assert!(verify_native_store_tables(&native).await.is_err());
+            if resume {
+                let original = evertrace_capture::ConfinedRoot::open_owned_private(&data).unwrap();
+                verify_package_resume(&data, &original).await.unwrap();
+            } else {
+                let prepared = prepare_native_upgrade(
+                    &data,
+                    &temp.path().join("config.toml"),
+                    || Err(crate::BackupError::InvalidInput),
+                    |_, _| Ok(()),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(prepared, NativeUpgradePreparation::Unchanged(_)));
+            }
+            verify_native_store_tables(&native).await.unwrap();
+        }
     }
 
     #[tokio::test]

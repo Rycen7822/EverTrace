@@ -45,12 +45,12 @@ impl L0001 {
         sqlite: &SqliteHandle,
         l0002_tables_present: bool,
     ) -> Result<MigrationOutcome, StoreError> {
-        let (rows, object_rows_count, objects_missing, relation_present) = {
+        let (rows, object_rows_count, objects_checkpoint, relation_present) = {
             let state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
             (
                 state.rows()?,
                 state.object_row_count()?,
-                state.object_checkpoint_row()?.is_none(),
+                state.object_checkpoint_row()?,
                 state.relation_checkpoint_row()?.is_some(),
             )
         };
@@ -58,12 +58,18 @@ impl L0001 {
         if l0002_tables_present && !journal_exists {
             return Err(StoreError::StoreCorrupt);
         }
-        let _ = relation_present;
+        let checkpoint_only_prefix = !journal_exists
+            && !l0002_tables_present
+            && !relation_present
+            && object_rows_count == 1
+            && objects_checkpoint == Some((0, 1));
 
-        if !journal_exists && object_rows_count > 0 {
-            // Objects without a journal cannot be repaired from history.
+        if !journal_exists && object_rows_count > 0 && !checkpoint_only_prefix {
+            // Only the canonical checkpoint committed immediately before the
+            // first L0001 marker is a recoverable empty-start prefix.
             return Err(StoreError::StoreCorrupt);
         }
+        let objects_missing = objects_checkpoint.is_none();
         if objects_missing && object_rows_count > 0 {
             return Err(StoreError::StoreCorrupt);
         }
@@ -228,12 +234,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn objects_without_journal_fail_without_replacement() {
+    async fn checkpoint_only_first_start_prefix_finishes_and_reopens_idempotently() {
         let (_temp, root) = temp_root();
         let sqlite = state(&root);
-        // A nonempty objects family without any journal history cannot be
-        // repaired or replaced.
         let checkpoint = ObjectRow::checkpoint(0, 1);
+        sqlite
+            .lock()
+            .unwrap()
+            .commit_object_rows(
+                std::slice::from_ref(&checkpoint),
+                crate::sqlite_state::ObjectReconcile::default(),
+                &checkpoint,
+            )
+            .unwrap();
+
+        assert_eq!(
+            L0001::apply(&sqlite).await,
+            Ok(MigrationOutcome::Reconciled)
+        );
+        assert_eq!(sqlite.lock().unwrap().rows().unwrap().len(), 1);
+        assert_eq!(
+            sqlite.lock().unwrap().object_checkpoint_row().unwrap(),
+            Some((1, 1))
+        );
+        drop(sqlite);
+
+        let reopened = SqliteState::open(&root).unwrap().handle();
+        assert_eq!(L0001::apply(&reopened).await, Ok(MigrationOutcome::Noop));
+        assert_eq!(reopened.lock().unwrap().rows().unwrap().len(), 1);
+        assert_eq!(
+            reopened.lock().unwrap().object_checkpoint_row().unwrap(),
+            Some((1, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn nonempty_objects_without_journal_fail_without_replacement() {
+        let (_temp, root) = temp_root();
+        let sqlite = state(&root);
+        // A nonzero checkpoint requires journal history and cannot be the
+        // checkpoint-only prefix of first initialization.
+        let checkpoint = ObjectRow::checkpoint(1, 1);
         sqlite
             .lock()
             .unwrap()

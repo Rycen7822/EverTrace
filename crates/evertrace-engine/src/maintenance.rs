@@ -338,15 +338,10 @@ struct PackageCheckScratch {
 impl PackageCheckScratch {
     fn create(data_dir: &Path) -> Result<Self, evertrace_store::restore::RestoreError> {
         use std::os::unix::fs::DirBuilderExt;
-        let parent = data_dir
-            .parent()
-            .ok_or(evertrace_store::StoreError::InvalidPath)?;
-        let name = data_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(evertrace_store::StoreError::InvalidPath)?;
-        let path = parent.join(format!(
-            "{name}.package-check-{}",
+        // Generation publication uses hard links: scratch must share the
+        // data-root filesystem, including when data_dir is a mount point.
+        let path = data_dir.join(format!(
+            ".package-check-{}",
             evertrace_domain::ids::JobId::new_v7()
         ));
         std::fs::DirBuilder::new()
@@ -521,10 +516,19 @@ where
             ),
         };
         // A retired layout was already converted into a private native-only
-        // candidate with its published v2 backup; a current store is validated
-        // read-only and left byte-for-byte in place. Package materials always
+        // candidate with its published v2 backup; a current store completes
+        // normal projection recovery and remains in place. Package materials
         // live in their own scratch root and never pollute the candidate.
-        let mut scratch = PackageCheckScratch::create(data_dir)?;
+        let mut scratch = match PackageCheckScratch::create(data_dir) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                if let Some(prepared) = prepared.take() {
+                    prepared.discard()?;
+                }
+                may_resume = preflight.revalidate_original().is_ok();
+                return Err(error);
+            }
+        };
         let mut check_lock = None;
         let native_prepared = prepared.is_some();
         let (native, cas, backup, migrated) = if let Some(prepared) = prepared.as_ref() {

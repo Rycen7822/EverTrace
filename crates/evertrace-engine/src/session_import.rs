@@ -2800,7 +2800,25 @@ pub(crate) async fn preflight_import_context(
             .prospective_origin
             .as_ref()
             .is_some_and(|origin| origin.closed && origin.record_start.is_none());
-    if !needs_discovery && metadata == current.metadata && !resolve_closed_fence {
+    let origin_discontinued = metadata
+        .prospective_origin
+        .as_ref()
+        .is_some_and(|origin| !origin.closed)
+        && location.as_ref().is_some_and(|location| {
+            prospective_origin_matches_current_instance(
+                &metadata,
+                location,
+                |id| repositories.repositories.get(id),
+                |id| repositories.worktrees.get(id),
+                |id| repositories.snapshots.get(id),
+                repositories.worktrees.values(),
+            ) == Some(false)
+        });
+    if !needs_discovery
+        && metadata == current.metadata
+        && !resolve_closed_fence
+        && !origin_discontinued
+    {
         return Ok(false);
     }
     let header = source_header_current(report, current, deadline)
@@ -3798,7 +3816,12 @@ fn metadata_events_internal(
             && !metadata
                 .prospective_origin
                 .as_ref()
-                .is_some_and(|origin| origin.record_start.is_some())
+                .is_some_and(|origin| !origin.closed && origin.record_start.is_some())
+            && !(metadata.prospective_origin.is_some()
+                && matches!(
+                    old.body_state,
+                    SessionBodyState::Partial | SessionBodyState::Imported
+                ))
             && !matches!(
                 old.body_state,
                 SessionBodyState::NotImported
@@ -3815,6 +3838,26 @@ fn metadata_events_internal(
             None
         };
         if let Some((body_state, reason)) = transition {
+            if old.body_state == SessionBodyState::Importing
+                && body_state == SessionBodyState::BlockedScopeUnresolved
+            {
+                // Preserve already archived progress through the existing
+                // legal transition before blocking a route that just closed.
+                revision += 1;
+                payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
+                    SessionImportEvent {
+                        source_instance_id: source_instance_id.clone(),
+                        session_id: session_id.clone(),
+                        revision,
+                        predecessor_revision: Some(revision - 1),
+                        occurred_at_us,
+                        event: SessionImportEventKind::BodyStateAdvanced {
+                            body_state: SessionBodyState::Partial,
+                            reason: BodyStateReason::ApprovalUnavailable,
+                        },
+                    },
+                )));
+            }
             revision += 1;
             payloads.push(JournalPayload::SessionImportEventRecorded(Box::new(
                 SessionImportEvent {
@@ -4930,7 +4973,7 @@ mod tests {
             prospective_origin: Some(origin),
             file_size: 100,
             file_mtime_us: 1,
-            source_fingerprint: "fingerprint-before-append".into(),
+            source_fingerprint: "11".repeat(32),
             source_revision: SourceRevision::parse("same-logical-revision").unwrap(),
             parser_version: 1,
             metadata_state: MetadataState::Indexed,
@@ -4947,7 +4990,7 @@ mod tests {
         let mut appended = metadata;
         appended.file_size = 200;
         appended.file_mtime_us = 2;
-        appended.source_fingerprint = "fingerprint-after-append".into();
+        appended.source_fingerprint = "22".repeat(32);
         let mut payloads = Vec::new();
         metadata_events_internal(
             Some(&old),
@@ -5023,6 +5066,39 @@ mod tests {
                     body_state: SessionBodyState::Queued, ..
                 })
         )));
+
+        // Closing a suffix-only route must be a valid transition for both a
+        // pending job and one that has already started; approval is not minted.
+        for body_state in [SessionBodyState::Queued, SessionBodyState::Importing] {
+            old.body_state = body_state;
+            let mut closed = old.metadata.clone();
+            closed.prospective_origin.as_mut().unwrap().closed = true;
+            payloads.clear();
+            metadata_events(
+                Some(&old),
+                old.session_id.clone(),
+                old.source_instance_id.clone(),
+                closed,
+                5,
+                &mut payloads,
+            )
+            .unwrap();
+            let mut current = old.clone();
+            for (index, payload) in payloads.iter().enumerate() {
+                let JournalPayload::SessionImportEventRecorded(event) = payload else {
+                    panic!("expected only session state transitions");
+                };
+                current = evertrace_store::session_import::apply_session_event(
+                    Some(&current),
+                    event,
+                    2 + index as u64,
+                )
+                .unwrap();
+            }
+            assert_eq!(current.body_state, SessionBodyState::BlockedScopeUnresolved);
+            assert!(current.metadata.prospective_origin.unwrap().closed);
+            assert!(current.access_decision.is_none());
+        }
     }
 
     #[test]

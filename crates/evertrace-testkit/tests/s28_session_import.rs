@@ -6679,6 +6679,23 @@ async fn source_start_boundary_is_the_catalog_resolution_input_body() {
         fs::metadata(&git_dir).unwrap().ino(),
         "the test must install a distinct Git instance at the original path"
     );
+    // The normal scheduler refreshes metadata before the worker runs. That
+    // already registers the replacement, so preflight must not mistake an
+    // unchanged catalog row for proof that the old origin is still usable.
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&transcript).unwrap(),
+        "{}",
+        serde_json::json!({
+            "timestamp":"2026-10-06T00:10:00Z", "type":"event_msg",
+            "payload":{"type":"item_completed","thread_id":session,
+                "turn_id":"replacement-must-stay-unread",
+                "item":{"type":"UserMessage","id":"replacement-must-stay-unread",
+                    "content":[{"type":"text","text":"unadmitted replacement suffix","text_elements":[]}]},
+                "completed_at_ms":1_791_245_400_000_i64}
+        })
+    )
+    .unwrap();
+    catalog.refresh(&start_report).await.unwrap();
     let close_progress = worker
         .process_checkpoint(&source, budget)
         .await

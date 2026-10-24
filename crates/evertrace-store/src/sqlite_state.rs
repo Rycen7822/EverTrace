@@ -270,7 +270,7 @@ impl SqliteState {
 
     fn open_in(directory_path: PathBuf) -> Result<Self, StoreError> {
         let path = directory_path.join(SQLITE_FILE_NAME);
-        let fresh_file = match fs::symlink_metadata(&path) {
+        let mut fresh_file = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 validate_file_metadata(&metadata)?;
                 for suffix in [WAL_FILE_SUFFIX, SHM_FILE_SUFFIX] {
@@ -317,22 +317,35 @@ impl SqliteState {
             .map_err(|_| StoreError::Io)?;
         if !fresh_file {
             // The existing file's physical format identity is checked before
-            // any write: an unexpected schema/format is rejected, never reset
-            // or created over.
+            // any write. Only the exact empty SQLite prefix left before the
+            // first schema transaction may finish that original transaction.
             let application_id: i64 = connection
                 .pragma_query_value(None, "application_id", |row| row.get(0))
                 .map_err(|_| StoreError::StoreCorrupt)?;
-            if application_id != APPLICATION_ID {
-                return Err(StoreError::StoreCorrupt);
-            }
             let user_version: i64 = connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .map_err(|_| StoreError::StoreCorrupt)?;
-            if user_version == 1 {
-                return Err(StoreError::UpgradeRequired);
-            }
-            if user_version != USER_VERSION {
-                return Err(StoreError::StoreCorrupt);
+            if application_id == 0 && user_version == 0 {
+                let schema_version: i64 = connection
+                    .pragma_query_value(None, "schema_version", |row| row.get(0))
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                let schema_entries: i64 = connection
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+                    .map_err(|_| StoreError::StoreCorrupt)?;
+                if schema_version != 0 || schema_entries != 0 {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                fresh_file = true;
+            } else {
+                if application_id != APPLICATION_ID {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                if user_version == 1 {
+                    return Err(StoreError::UpgradeRequired);
+                }
+                if user_version != USER_VERSION {
+                    return Err(StoreError::StoreCorrupt);
+                }
             }
         }
         connection
@@ -2018,6 +2031,45 @@ mod tests {
 
     fn database_path(data_dir: &Path) -> PathBuf {
         crate::connection::native_root(data_dir).join(SQLITE_FILE_NAME)
+    }
+
+    #[test]
+    fn empty_first_start_prefixes_finish_initialization_and_reopen() {
+        for sqlite_prefix in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("data");
+            fs::create_dir(&data_dir).unwrap();
+            fs::set_permissions(&data_dir, Permissions::from_mode(0o700)).unwrap();
+            let native = crate::connection::native_root(&data_dir);
+            fs::DirBuilder::new().mode(0o700).create(&native).unwrap();
+            let path = database_path(&data_dir);
+            if sqlite_prefix {
+                let connection = Connection::open(&path).unwrap();
+                fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+                connection
+                    .pragma_update(None, "journal_mode", "WAL")
+                    .unwrap();
+                connection
+                    .pragma_update(None, "application_id", 0_i64)
+                    .unwrap();
+                connection
+                    .pragma_update(None, "user_version", 0_i64)
+                    .unwrap();
+                connection
+                    .pragma_update(None, "schema_version", 0_i64)
+                    .unwrap();
+                let schema_entries: i64 = connection
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(schema_entries, 0);
+            } else {
+                fs::write(&path, []).unwrap();
+                fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+            }
+
+            drop(SqliteState::open(&data_dir).unwrap());
+            drop(SqliteState::open(&data_dir).unwrap());
+        }
     }
 
     #[tokio::test]
