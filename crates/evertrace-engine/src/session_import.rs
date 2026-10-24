@@ -1081,24 +1081,27 @@ impl SessionCatalogService {
             },
         };
         let eligible = catalog.sessions.sessions.iter().filter(|(_, current)| {
-            current
-                .metadata
-                .prospective_origin
-                .as_ref()
-                .is_some_and(|origin| {
-                    !origin.closed
-                        && matches!(
-                            current.body_state,
-                            SessionBodyState::Queued
-                                | SessionBodyState::Importing
-                                | SessionBodyState::NotImported
-                                | SessionBodyState::Imported
-                                | SessionBodyState::Partial
-                                | SessionBodyState::Failed
-                                | SessionBodyState::SourceReplaced
-                        )
-                        && current.access_decision != Some(SessionAccessDecision::Revoked)
-                })
+            // An incumbent-only refresh cannot prove a known locator conflict
+            // has cleared; recovery belongs to a complete catalog round.
+            current.metadata.workspace_resolution_kind != WorkspaceResolutionKind::Unavailable
+                && current
+                    .metadata
+                    .prospective_origin
+                    .as_ref()
+                    .is_some_and(|origin| {
+                        !origin.closed
+                            && matches!(
+                                current.body_state,
+                                SessionBodyState::Queued
+                                    | SessionBodyState::Importing
+                                    | SessionBodyState::NotImported
+                                    | SessionBodyState::Imported
+                                    | SessionBodyState::Partial
+                                    | SessionBodyState::Failed
+                                    | SessionBodyState::SourceReplaced
+                            )
+                            && current.access_decision != Some(SessionAccessDecision::Revoked)
+                    })
         });
         let live_after = cursor.live_after.clone();
         let selected = eligible

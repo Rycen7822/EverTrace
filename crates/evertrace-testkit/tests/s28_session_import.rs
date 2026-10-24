@@ -4727,6 +4727,7 @@ async fn source_start_fixture() -> SourceStartFixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catalog_conflicts_preserve_unavailability_until_a_complete_clean_round() {
     use evertrace_store::{WorkspaceResolutionKind, session_import::MetadataState};
+    use std::io::Write as _;
     let SourceStartFixture {
         temp,
         dated,
@@ -4740,12 +4741,74 @@ async fn catalog_conflicts_preserve_unavailability_until_a_complete_clean_round(
     let session = cases[0].0;
     let source = format!("session-rollout:{session}:{session}");
     let transcript = dated.join(format!("rollout-2026-10-06T00-00-01-{session}.jsonl"));
-    let original = writer
+    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
+    let request = RequestId::new_v7();
+    let reference = format!("native_session_source_observation:{request}");
+    let deadline = source_observation_deadline();
+    let report = evertrace_engine::repository::observe_session_source_report(
+        transcript.to_str().unwrap(),
+        session,
+        None,
+        &reference,
+        deadline,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .observe_native_session_source(
+                request,
+                &report,
+                session,
+                transcript.to_str().unwrap(),
+                &reference,
+                deadline
+            )
+            .await
+            .unwrap()
+    );
+    let message = serde_json::json!({"timestamp":"2026-10-06T00:02:01Z","type":"event_msg","payload":{"type":"item_completed","thread_id":session,"turn_id":"active-conflict","item":{"type":"UserMessage","id":"active-conflict","content":[{"type":"text","text":"Read this only when the source locator is unambiguous.","text_elements":[]}]},"completed_at_ms":1791244921000i64}});
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap(),
+        "{message}"
+    )
+    .unwrap();
+    assert!(catalog.refresh_active(&report).await.unwrap() > 0);
+    let active = writer
         .session_import_context(&source)
         .await
         .unwrap()
-        .unwrap()
-        .current;
+        .unwrap();
+    assert_eq!(active.current.body_state, SessionBodyState::Queued);
+    assert_eq!(active.job.as_ref().unwrap().state, JobStatus::Queued);
+    assert!(
+        !active
+            .current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .unwrap()
+            .closed
+    );
+    let original = active.current;
+    let snapshot = runtime(temp.path());
+    DeviceKeyStore::new(snapshot.device_key_dir.clone())
+        .load_or_create()
+        .unwrap();
+    drop(evertrace_capture::CaptureRuntime::open(snapshot.clone()).unwrap());
+    let worker = SessionImportWorker::new(
+        writer.clone(),
+        snapshot,
+        Arc::new(RwLock::new(Some(report.clone()))),
+    )
+    .unwrap();
+    let budget = SessionImportBudget {
+        max_bytes: 1024 * 1024,
+        max_records: 1,
+        max_work_time: Duration::from_millis(250),
+    };
     // Force the duplicate onto another real catalog page without Git probes
     // or payload reads for the unrelated metadata-only entries.
     for ordinal in 0x100..0x140 {
@@ -4761,10 +4824,6 @@ async fn catalog_conflicts_preserve_unavailability_until_a_complete_clean_round(
     fs::create_dir(&duplicate_dir).unwrap();
     let duplicate = duplicate_dir.join(format!("rollout-2026-10-07T00-00-01-{session}.jsonl"));
     fs::copy(&transcript, &duplicate).unwrap();
-    let report =
-        observe_session_catalog_report(transcript.to_str(), session, "conflict-refresh", None)
-            .unwrap();
-    let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
     catalog.refresh(&report).await.unwrap();
     catalog.refresh(&report).await.unwrap();
     let conflicted = writer
@@ -4790,6 +4849,10 @@ async fn catalog_conflicts_preserve_unavailability_until_a_complete_clean_round(
     );
     assert!(conflicted.metadata.resolved_worktree_instance_id.is_none());
     for _ in 0..4 {
+        // This is the scheduler's refresh branch with historical backfill off.
+        // An incumbent-only probe cannot clear a known cross-page conflict.
+        assert_eq!(catalog.refresh_active(&report).await.unwrap(), 0);
+        assert!(worker.process_checkpoint(&source, budget).await.is_err());
         catalog.refresh(&report).await.unwrap();
         assert_eq!(
             writer
@@ -4801,6 +4864,19 @@ async fn catalog_conflicts_preserve_unavailability_until_a_complete_clean_round(
             conflicted
         );
     }
+    let blocked = writer
+        .session_import_context(&source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.watermark, active.watermark);
+    assert_eq!(blocked.job.as_ref().unwrap().state, JobStatus::Queued);
+    assert_eq!(
+        projected_source_receipts(&writer.project().await.unwrap())
+            .filter(|receipt| receipt.source_instance_id.as_str() == source)
+            .count(),
+        0
+    );
     fs::remove_file(duplicate).unwrap();
     drop(catalog);
     let catalog = SessionCatalogService::new(writer.clone(), CONFIG);
@@ -4843,6 +4919,21 @@ async fn catalog_conflicts_preserve_unavailability_until_a_complete_clean_round(
         recovered.metadata.repository_read_restrictions,
         original.metadata.repository_read_restrictions
     );
+    let mut resumed = false;
+    for _ in 0..24 {
+        worker.process_checkpoint(&source, budget).await.unwrap();
+        if projected_source_receipts(&writer.project().await.unwrap())
+            .any(|receipt| receipt.source_instance_id.as_str() == source)
+        {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(
+        resumed,
+        "complete clean recovery must permit the same job to read again"
+    );
+    drop(worker);
     drop(catalog);
     drop(writer);
     task.await.unwrap().unwrap();
