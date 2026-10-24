@@ -613,7 +613,7 @@ pub struct HumanJobBudget {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanBackupTableState {
-    pub version: u64,
+    pub version: Option<u64>,
     pub frontier: u64,
 }
 
@@ -1934,23 +1934,31 @@ impl HumanJobBudget {
 
 impl HumanBackupSummary {
     fn validate(&self) -> bool {
+        let legacy = match (self.journal.version, self.objects.version) {
+            (None, None) => false,
+            (Some(journal), Some(objects)) if journal > 0 && objects > 0 => true,
+            _ => return false,
+        };
         self.frontier > 0
-            && self.journal.version > 0
             && self.journal.frontier == self.frontier
-            && self.objects.version > 0
-            && self.objects.frontier == self.frontier
+            && self.objects.frontier > 0
+            && self.objects.frontier <= self.frontier
+            && (legacy || self.objects.frontier == self.frontier)
+            && self.compiler_watermark == self.objects.frontier
             && match (&self.relations, &self.search) {
                 (None, None) => self.index_generation == 0,
                 (Some(relations), Some(search)) => {
-                    relations.version > 0
-                        && relations.frontier <= self.frontier
-                        && search.version > 0
+                    (if legacy {
+                        relations.version.is_some_and(|version| version > 0)
+                    } else {
+                        relations.version.is_none()
+                    }) && relations.frontier <= self.frontier
+                        && search.version.is_some_and(|version| version > 0)
                         && search.frontier <= self.frontier
                         && self.index_generation > 0
                 }
                 _ => false,
             }
-            && self.compiler_watermark == self.objects.frontier
             && self.effective_config_hash != [0; 32]
             && self.runtime_generation > 0
             && match self.hook_current_generation {
@@ -2291,5 +2299,141 @@ impl HostCanaryDiagnostic {
                         && !self.capture_receipt_observed
                 }
             }
+    }
+}
+
+#[cfg(test)]
+mod human_backup_summary_tests {
+    use super::*;
+
+    fn summary(legacy: bool) -> HumanBackupSummary {
+        HumanBackupSummary {
+            frontier: 5,
+            journal: HumanBackupTableState {
+                version: legacy.then_some(3),
+                frontier: 5,
+            },
+            objects: HumanBackupTableState {
+                version: legacy.then_some(3),
+                frontier: if legacy { 3 } else { 5 },
+            },
+            relations: Some(HumanBackupTableState {
+                version: legacy.then_some(3),
+                frontier: 4,
+            }),
+            search: Some(HumanBackupTableState {
+                version: Some(3),
+                frontier: 4,
+            }),
+            committed_source_watermark_count: 0,
+            spool_source_watermark_count: 0,
+            live_cas_count: 0,
+            spool_cas_count: 0,
+            spool_file_count: 0,
+            spool_generation_count: 0,
+            normal_spool_frame_count: 0,
+            isolated_spool_frame_count: 0,
+            emergency_gap_count: 0,
+            quarantine_count: 0,
+            runtime_outbox_watermark: 0,
+            index_generation: 1,
+            compiler_watermark: if legacy { 3 } else { 5 },
+            effective_config_hash: [1; 32],
+            runtime_generation: 1,
+            hook_current_generation: None,
+            hook_retained_generations: Vec::new(),
+            hook_pin_count: 0,
+            session_pinned_hook_artifact_count: 0,
+            object_deletion_generation: 0,
+            repository_purge_generation: 0,
+            file_count: 1,
+            total_bytes: 1,
+            required_space_bytes: 1,
+            available_space_bytes_at_preflight: 1,
+            validation_result: HumanBackupValidationResult::VerifiedBeforePublish,
+        }
+    }
+
+    fn response(summary: HumanBackupSummary) -> HumanGovernanceResponse {
+        let job_id = JobId::new_v7();
+        HumanGovernanceResponse::Snapshot {
+            diagnostics: None,
+            frontier: 1,
+            status: HumanSnapshotStatus::Ready,
+            degraded_reasons: Vec::new(),
+            items: vec![HumanSnapshotItem {
+                source_context: None,
+                semantic_detail: None,
+                proposal_base: None,
+                evidence_detail: None,
+                work_detail: None,
+                item_kind: HumanItemKind::Generic,
+                proposal: None,
+                proposal_review: None,
+                support_detail: None,
+                competing_detail: None,
+                forget_preview: None,
+                repository_purge_preview: None,
+                negative_review: None,
+                recovery_detail: None,
+                worktree_detail: None,
+                execution_integrity_detail: None,
+                system_detail: Some(HumanSystemDetail::Job {
+                    detail: Box::new(HumanJobDetail {
+                        native_history_cleanup_availability: None,
+                        job_id,
+                        target_revision: "revision:1".into(),
+                        target_watermark: 1,
+                        target_generation: 1,
+                        job_kind: "quiesced_backup_create_v1".into(),
+                        algorithm_revision: "algorithm:1".into(),
+                        model_id: None,
+                        priority: 0,
+                        state: HumanJobState::Succeeded,
+                        attempt: 1,
+                        backoff_until_us: None,
+                        lease_until_us: None,
+                        config_hash: [1; 32],
+                        budget: HumanJobBudget {
+                            max_items: 1,
+                            max_bytes: None,
+                            max_input_tokens: None,
+                            max_output_tokens: None,
+                            max_calls: None,
+                            max_wall_time_ms: 1,
+                        },
+                        terminal_reason: Some(HumanJobTerminalReason::Completed),
+                        terminal_result_ref: Some("backup:1".into()),
+                        backup_summary: Some(summary),
+                        gc_summary: None,
+                    }),
+                }),
+                stable_key: format!("runtime:job:{job_id}"),
+                row_class: HumanRowClass::Runtime,
+                family: HumanObjectFamily::Runtime,
+                category: HumanItemCategory::Runtime,
+                object_kind: "runtime_event".into(),
+                object_ref: None,
+                revision_ref: None,
+                lifecycle: None,
+                epistemic: None,
+                authority: None,
+                publication_state: None,
+                support_state: None,
+                scope_ref: None,
+                source_event_seq: 1,
+            }],
+            next_cursor: None,
+        }
+    }
+
+    #[test]
+    fn human_response_accepts_supported_current_and_legacy_backup_shapes() {
+        assert!(response(summary(false)).validate());
+        assert!(response(summary(true)).validate());
+
+        let mut mixed = summary(true);
+        mixed.objects.version = None;
+        assert!(!response(mixed).validate());
     }
 }

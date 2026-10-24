@@ -375,6 +375,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -442,6 +443,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: acceptance_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -590,7 +592,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
         task_id: Some(scope.task.task_id.to_string()),
         workstream_id: None,
         session_id: None,
-        payload_json: Some(descriptive_payload.canonical_json().unwrap()),
+        payload_json: Some(descriptive_payload.canonical_json().unwrap().into()),
         source_event_seq: snapshot.frontier,
         projection_generation: 1,
     });
@@ -622,12 +624,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
 
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
+        vec!["evertrace_search"]
     );
     let object_rows = writer.object_rows().await.unwrap();
     let relation_rows = writer.relation_rows().await.unwrap();
@@ -701,6 +698,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: reschedule_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -794,6 +792,7 @@ async fn structured_atom_compiles_and_rebuilds_future_cue_contract() {
                         source_revision: deprecation_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
-    evidence::{EvidenceSurface, SourceObservation, SourceReceipt},
     ids::{JobId, ProcedureNegativeEvidenceId, RepositoryId, SourceObservationId, SourceReceiptId},
     procedure::ProcedureStateEvent,
     purge::{
@@ -19,6 +18,7 @@ use crate::{
     JobLease, JobStatus, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalPayload,
     ObjectRow, ObjectRowClass, ObjectRowKind, ProjectionSnapshot, StoreError,
     default_retrieval_suppression_ref_hash,
+    projections::{EvidenceSurfaceFacts, SourceObservationFacts, SourceReceiptFacts},
 };
 
 pub(crate) const OBJECT_DELETION_LEDGER_KIND: &str = "object_deletion_ledger";
@@ -85,9 +85,9 @@ pub(crate) struct ObjectDeletionRevisionFact {
 
 pub(crate) struct ObjectDeletionSourceContext<'a> {
     pub other_live_source_refs: &'a BTreeSet<SourceObservationId>,
-    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    pub source_observations: &'a SourceObservationFacts,
+    pub source_receipts: &'a SourceReceiptFacts,
+    pub evidence_surfaces: &'a EvidenceSurfaceFacts,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1206,7 +1206,8 @@ fn ledger_row(event: &ObjectDeletionLedgerEvent, seq: u64) -> Result<ObjectRow, 
         session_id: None,
         payload_json: Some(
             JournalPayload::ObjectDeletionLedgerRecorded(Box::new(event.clone()))
-                .canonical_json()?,
+                .canonical_json()?
+                .into(),
         ),
         source_event_seq: seq,
         projection_generation: PROJECTION_GENERATION,
@@ -1248,7 +1249,9 @@ fn scope_purge_row(event: &ScopePurgeProgress, seq: u64) -> Result<ObjectRow, St
         workstream_id: None,
         session_id: None,
         payload_json: Some(
-            JournalPayload::ScopePurgeProgressRecorded(Box::new(event.clone())).canonical_json()?,
+            JournalPayload::ScopePurgeProgressRecorded(Box::new(event.clone()))
+                .canonical_json()?
+                .into(),
         ),
         source_event_seq: seq,
         projection_generation: PROJECTION_GENERATION,

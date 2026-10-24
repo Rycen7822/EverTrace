@@ -3,13 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::RecordBatchIterator;
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
     evidence::{
         CaptureGapMarkerEvidence, CaptureOutageInterval, EvidenceSurface, HostOccurrence,
         Operation, ScopeEffect, SourceInstanceId, SourceObservation, SourceReceipt, SourceRevision,
-        hex, payload_fingerprint,
+        SourceRevisionMode, hex, payload_fingerprint,
     },
     ids::{
         AtomId, AttemptId, CaptureOutageIntervalId, CasId, CompetingAttemptGroupId,
@@ -48,27 +47,22 @@ use evertrace_domain::{
         Workstream,
     },
 };
-use lancedb::Table;
 
 use crate::{
     command::{
         ATOM_RECORDED_EVENT_TYPE, DirtyTarget, DirtyTargetKind, DurableJob, JobStatus,
-        JobTerminalReason, JournalCommand, JournalPayload, NormalizationWatermark, ObjectFamily,
-        OutboxEntry, SourceCloseDecision, SourceCloseReconciliation, SourceIngestWatermark,
-        SourceKind, SourceRevisionRecorded, StoreError, WatermarkAdvanced, source_revision_ref,
+        JobTerminalReason, JournalCommand, JournalPayload, JournalPayloadRef,
+        NormalizationWatermark, ObjectFamily, OutboxEntry, SourceCloseDecision,
+        SourceCloseReconciliation, SourceIngestWatermark, SourceKind, SourceRevisionRecorded,
+        StoreError, WatermarkAdvanced, source_revision_ref,
     },
-    journal::{
-        JournalRow, read_all_journal_rows, read_journal_after, read_journal_frontier,
-        validate_journal_rows,
-    },
-    objects::{
-        OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind, objects_batch,
-        validate_objects_table,
-    },
+    journal::{JournalRow, validate_journal_rows},
+    objects::{OBJECTS_CHECKPOINT_ID, ObjectRow, ObjectRowClass, ObjectRowKind},
     purge::{
         ObjectDeletionCandidateAdmission, ObjectDeletionRevisionFact, ObjectDeletionSourceContext,
         ObjectDeletionState, ScopePurgeState, derive_object_deletion_preview, filter_product_rows,
     },
+    sqlite_state::{ObjectReconcile, SqliteHandle},
 };
 
 mod autoresearch;
@@ -102,6 +96,11 @@ use segmentation::{
 pub use semantic::SemanticCurrentView;
 
 pub const RECALL_TRIGGER_INDEX_KIND: &str = recall_projection::RECALL_TRIGGER_INDEX_KIND;
+
+/// Physical reconcile family names, one owner for the storage and reducer
+/// sides of the partial objects upsert.
+pub(crate) const CORE_INDEX_KIND: &str = s23::CORE_PROJECTION_KIND;
+pub(crate) const WIKI_INDEX_KIND: &str = synthesis::WIKI_PROJECTION_KIND;
 
 pub fn recall_trigger_contract(
     row: &ObjectRow,
@@ -151,10 +150,20 @@ pub struct RuntimeSchedulerView {
 
 impl RuntimeSchedulerView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    /// The same runtime decode over an explicitly selected row set. Callers
+    /// that only merged the current runtime rows with this command's upserts
+    /// must not present the result as a complete objects snapshot.
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut dirty = BTreeMap::new();
         let mut outbox = BTreeMap::new();
         let mut jobs = BTreeMap::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+        {
             if row.row_class != Some(ObjectRowClass::Runtime) {
                 continue;
             }
@@ -187,7 +196,7 @@ impl RuntimeSchedulerView {
             }
         }
         Ok(Self {
-            frontier: snapshot.frontier,
+            frontier,
             dirty: dirty.into_values().collect(),
             outbox: outbox.into_values().collect(),
             jobs: jobs.into_values().collect(),
@@ -539,94 +548,15 @@ impl ProjectionSnapshot {
         &self,
         limit: usize,
     ) -> Result<ReconciliationFrontier, StoreError> {
-        if limit == 0 {
-            return Err(StoreError::InvalidInput);
-        }
-        let mut candidates = self
-            .data_rows()
-            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            left.source_event_seq
-                .cmp(&right.source_event_seq)
-                .then_with(|| left.row_id.cmp(&right.row_id))
-        });
-        let mut items = Vec::new();
-        for row in candidates {
-            let payload = current_payload(row)?;
-            let JournalPayload::DirtyTarget(target) = &payload.payload else {
-                return Err(StoreError::StoreCorrupt);
-            };
-            let target = target.clone();
-            if !matches!(
-                target.target_kind,
-                crate::command::DirtyTargetKind::PhysicalNormalization
-                    | crate::command::DirtyTargetKind::CaptureReconciliation
-            ) {
-                continue;
-            }
-            if let Some(item) = reconciliation_item(self, payload, target)? {
-                items.push(item);
-                if items.len() == limit {
-                    break;
-                }
-            }
-        }
-        Ok(ReconciliationFrontier {
-            frontier: self.frontier,
-            items,
-        })
+        CurrentFacts::try_from(self.clone())?.reconciliation_frontier(limit)
     }
 
     pub fn reconciliation_frontier_for_observations(
         &self,
         observation_ids: &[SourceObservationId],
     ) -> Result<ReconciliationFrontier, StoreError> {
-        if observation_ids.is_empty()
-            || observation_ids.len() > 16
-            || observation_ids
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .len()
-                != observation_ids.len()
-        {
-            return Err(StoreError::InvalidInput);
-        }
-        let selected = observation_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
-        let mut items = Vec::new();
-        for row in self
-            .data_rows()
-            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
-        {
-            let payload = current_payload(row)?;
-            let JournalPayload::DirtyTarget(target) = &payload.payload else {
-                return Err(StoreError::StoreCorrupt);
-            };
-            let target = target.clone();
-            if selected.contains(&target.target_id)
-                && matches!(
-                    target.target_kind,
-                    crate::command::DirtyTargetKind::PhysicalNormalization
-                        | crate::command::DirtyTargetKind::CaptureReconciliation
-                )
-                && let Some(item) = reconciliation_item(self, payload, target)?
-            {
-                items.push(item);
-            }
-        }
-        items.sort_by(|left, right| {
-            left.source_event_seq
-                .cmp(&right.source_event_seq)
-                .then_with(|| left.row_id.cmp(&right.row_id))
-        });
-        Ok(ReconciliationFrontier {
-            frontier: self.frontier,
-            items,
-        })
+        CurrentFacts::try_from(self.clone())?
+            .reconciliation_frontier_for_observations(observation_ids)
     }
 
     pub fn reconciliation_artifact_context(
@@ -634,21 +564,7 @@ impl ProjectionSnapshot {
         descriptors: &[ReconciliationArtifactDescriptor],
         limit: usize,
     ) -> Result<ReconciliationArtifactFrontier, StoreError> {
-        if limit == 0 {
-            return Err(StoreError::InvalidInput);
-        }
-        let mut ordered = descriptors.to_vec();
-        ordered.sort();
-        ordered.truncate(limit);
-        let mut contexts = Vec::with_capacity(ordered.len());
-        for descriptor in ordered {
-            descriptor.validate()?;
-            contexts.push(reconciliation_artifact_item(self, descriptor)?);
-        }
-        Ok(ReconciliationArtifactFrontier {
-            frontier: self.frontier,
-            contexts,
-        })
+        CurrentFacts::try_from(self.clone())?.reconciliation_artifact_context(descriptors, limit)
     }
 }
 
@@ -661,11 +577,18 @@ pub struct WorkIdentityCurrentView {
 
 impl WorkIdentityCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+        {
             match row.object_kind.as_deref() {
                 Some("task") => {
                     let payload: JournalPayload = serde_json::from_str(
@@ -774,14 +697,21 @@ fn current_group_from_lineage(
 
 impl AttemptCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut view = Self {
-            frontier: snapshot.frontier,
+            frontier,
             ..Self::default()
         };
         let mut attempt_revisions = BTreeMap::<AttemptId, Vec<Attempt>>::new();
         let mut group_revisions =
             BTreeMap::<CompetingAttemptGroupId, Vec<CompetingAttemptGroup>>::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+        {
             match row.object_kind.as_deref() {
                 Some("attempt") => {
                     let payload: JournalPayload = serde_json::from_str(
@@ -1257,9 +1187,14 @@ fn current_binding_lineage<'a>(
 
 impl WorkBindingCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows)
+    }
+
+    pub fn from_rows(frontier: u64, rows: &[ObjectRow]) -> Result<Self, StoreError> {
         let mut revisions = Vec::new();
-        for row in snapshot
-            .data_rows()
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
             .filter(|row| row.object_kind.as_deref() == Some("work_binding"))
         {
             let payload: JournalPayload = serde_json::from_str(
@@ -1287,10 +1222,7 @@ impl WorkBindingCurrentView {
             .into_iter()
             .map(|(operation_id, binding)| (operation_id, binding.clone()))
             .collect();
-        Ok(Self {
-            frontier: snapshot.frontier,
-            bindings,
-        })
+        Ok(Self { frontier, bindings })
     }
 
     pub fn active_context(&self, operation_id: OperationId) -> Option<ActiveWorkContext> {
@@ -1410,7 +1342,7 @@ pub struct ReconciliationArtifactFrontier {
 }
 
 fn reconciliation_artifact_item(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     descriptor: ReconciliationArtifactDescriptor,
 ) -> Result<ReconciliationArtifactContext, StoreError> {
     let unowned_quarantine = descriptor.kind == ReconciliationArtifactKind::Quarantine
@@ -1455,7 +1387,7 @@ fn reconciliation_artifact_item(
             "object:evidence:capture_outage_interval:{}",
             descriptor.artifact_id
         );
-        if let Some(row) = snapshot.row(&row_id) {
+        if let Some(row) = snapshot.other_row(&row_id) {
             let dependency = current_payload(row)?;
             let JournalPayload::CaptureOutageIntervalRecorded(outage) = &dependency.payload else {
                 return Err(StoreError::StoreCorrupt);
@@ -1500,21 +1432,7 @@ fn reconciliation_artifact_item(
     };
     collect_artifact_outages(snapshot, &session_ref, &source_ref, &mut dependencies)?;
     let mut affected_cohort = false;
-    let needles = [
-        json_field_fragment("source_session_ref", &session_ref)?,
-        serde_json::to_string(&source_ref).map_err(|_| StoreError::Serialization)?,
-    ];
-    for row in snapshot.data_rows().filter(|row| {
-        row.object_kind.as_deref() == Some("source_receipt")
-            && row
-                .payload_json
-                .as_deref()
-                .is_some_and(|json| needles.iter().all(|needle| json.contains(needle)))
-    }) {
-        let dependency = current_payload(row)?;
-        let JournalPayload::SourceReceiptRecorded(receipt) = &dependency.payload else {
-            return Err(StoreError::StoreCorrupt);
-        };
+    for (receipt, _) in snapshot.source_receipts() {
         if receipt.source_session_ref != session_ref
             || receipt.source_ref != source_ref
                 && source_revision_ref(&receipt.source_instance_id, &receipt.source_revision)
@@ -1522,17 +1440,22 @@ fn reconciliation_artifact_item(
         {
             continue;
         }
-        let observation_row_id = format!(
-            "object:evidence:source_observation:{}",
-            receipt.source_observation_id
-        );
-        if let Some(observation) = snapshot.row(&observation_row_id) {
-            dependencies.insert(current_payload(observation)?)?;
+        if snapshot
+            .source_observation(receipt.source_observation_id)
+            .is_some()
+        {
+            dependencies.insert(source_observation_dependency(
+                snapshot,
+                receipt.source_observation_id,
+            )?)?;
         }
         let (_, has_current_lane_receipt) =
-            collect_capture_dependencies(snapshot, &dependency, &mut dependencies)?;
+            collect_capture_dependencies(snapshot, receipt, &mut dependencies)?;
         affected_cohort |= has_current_lane_receipt;
-        dependencies.insert(dependency)?;
+        dependencies.insert(source_receipt_dependency(
+            snapshot,
+            receipt.source_receipt_id,
+        )?)?;
     }
     let ownership = if conflict {
         ReconciliationArtifactOwnership::Conflict
@@ -1549,7 +1472,7 @@ fn reconciliation_artifact_item(
 }
 
 fn matching_gap_rows<'a>(
-    snapshot: &'a ProjectionSnapshot,
+    snapshot: &'a CurrentFacts,
     descriptor: &ReconciliationArtifactDescriptor,
 ) -> Result<Box<dyn Iterator<Item = &'a ObjectRow> + 'a>, StoreError> {
     if let Some(marker_id) = descriptor.marker_id.as_ref().or_else(|| {
@@ -1557,13 +1480,13 @@ fn matching_gap_rows<'a>(
             .then_some(&descriptor.artifact_id)
     }) {
         let row_id = format!("object:evidence:capture_gap_marker:{marker_id}");
-        return Ok(Box::new(snapshot.row(&row_id).into_iter()));
+        return Ok(Box::new(snapshot.other_row(&row_id).into_iter()));
     }
     let Some(fingerprint) = &descriptor.redacted_fingerprint else {
         return Ok(Box::new(std::iter::empty()));
     };
     let needle = json_field_fragment("redacted_fingerprint", fingerprint)?;
-    Ok(Box::new(snapshot.data_rows().filter(move |row| {
+    Ok(Box::new(snapshot.other_data_rows().filter(move |row| {
         row.object_kind.as_deref() == Some("capture_gap_marker")
             && row
                 .payload_json
@@ -1573,7 +1496,7 @@ fn matching_gap_rows<'a>(
 }
 
 fn collect_artifact_outages(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     session_ref: &str,
     source_ref: &str,
     dependencies: &mut DependencyCollector,
@@ -1582,7 +1505,7 @@ fn collect_artifact_outages(
         json_field_fragment("session_ref", session_ref)?,
         json_field_fragment("source_ref", source_ref)?,
     ];
-    for row in snapshot.data_rows().filter(|row| {
+    for row in snapshot.other_data_rows().filter(|row| {
         row.object_kind.as_deref() == Some("capture_outage_interval")
             && row
                 .payload_json
@@ -1601,34 +1524,28 @@ fn collect_artifact_outages(
 }
 
 fn reconciliation_item(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     dirty_row: NamedCurrentDependency,
     target: DirtyTarget,
 ) -> Result<Option<ReconciliationWorkItem>, StoreError> {
-    let observation_row_id = format!("object:evidence:source_observation:{}", target.target_id);
-    let observation = snapshot
-        .row(&observation_row_id)
-        .ok_or(StoreError::StoreCorrupt)
-        .and_then(current_payload)?;
+    let observation_id = target
+        .target_id
+        .parse()
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    let observation = source_observation_dependency(snapshot, observation_id)?;
     let JournalPayload::SourceObservationRecorded(observation_value) = &observation.payload else {
         return Err(StoreError::StoreCorrupt);
     };
-    let observation_value = observation_value.clone();
-    let receipt_row_id = format!(
-        "object:evidence:source_receipt:{}",
-        observation_value.source_receipt_ref
-    );
-    let source_receipt = snapshot
-        .row(&receipt_row_id)
-        .ok_or(StoreError::StoreCorrupt)
-        .and_then(current_payload)?;
+    let observation_value = observation_value.as_ref().clone();
+    let receipt_id = observation_value.source_receipt_ref;
+    let source_receipt = source_receipt_dependency(snapshot, receipt_id)?;
     let mut dependencies = DependencyCollector::default();
     dependencies.insert(observation)?;
     dependencies.insert(source_receipt.clone())?;
     let active = match target.target_kind {
         crate::command::DirtyTargetKind::PhysicalNormalization => {
             let watermark = format!("runtime:watermark:normalization:{}", target.target_id);
-            if snapshot.row(&watermark).is_some() {
+            if snapshot.other_row(&watermark).is_some() {
                 false
             } else {
                 collect_normalization_dependencies(
@@ -1640,8 +1557,15 @@ fn reconciliation_item(
             }
         }
         crate::command::DirtyTargetKind::CaptureReconciliation => {
-            collect_capture_dependencies(snapshot, &source_receipt, &mut dependencies)?.0
-                < dirty_row.source_event_seq
+            collect_capture_dependencies(
+                snapshot,
+                match &source_receipt.payload {
+                    JournalPayload::SourceReceiptRecorded(receipt) => receipt,
+                    _ => return Err(StoreError::StoreCorrupt),
+                },
+                &mut dependencies,
+            )?
+            .0 < dirty_row.source_event_seq
         }
         _ => false,
     };
@@ -1672,9 +1596,35 @@ fn current_payload(row: &ObjectRow) -> Result<NamedCurrentDependency, StoreError
     })
 }
 
+fn source_observation_dependency(
+    current: &CurrentFacts,
+    id: SourceObservationId,
+) -> Result<NamedCurrentDependency, StoreError> {
+    let (value, source_event_seq) = current
+        .source_observation(id)
+        .ok_or(StoreError::StoreCorrupt)?;
+    Ok(NamedCurrentDependency {
+        row_id: format!("object:evidence:source_observation:{id}"),
+        source_event_seq,
+        payload: JournalPayload::SourceObservationRecorded(Box::new((**value).clone())),
+    })
+}
+
+fn source_receipt_dependency(
+    current: &CurrentFacts,
+    id: SourceReceiptId,
+) -> Result<NamedCurrentDependency, StoreError> {
+    let (value, source_event_seq) = current.source_receipt(id).ok_or(StoreError::StoreCorrupt)?;
+    Ok(NamedCurrentDependency {
+        row_id: format!("object:evidence:source_receipt:{id}"),
+        source_event_seq,
+        payload: JournalPayload::SourceReceiptRecorded(Box::new((**value).clone())),
+    })
+}
+
 fn validate_source_local_relations(
-    observations: &BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    receipts: &BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    observations: &SourceObservationFacts,
+    receipts: &SourceReceiptFacts,
     occurrences: &BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     operations: &BTreeMap<OperationId, (Operation, u64)>,
 ) -> Result<(), StoreError> {
@@ -1885,7 +1835,7 @@ fn validate_source_local_relations(
 }
 
 fn collect_normalization_dependencies(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     selected: &SourceObservation,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
@@ -1895,24 +1845,8 @@ fn collect_normalization_dependencies(
             SourceLocalEvidence::NativeCall(call) => call,
             SourceLocalEvidence::NamespaceWitness { supported_call, .. } => supported_call,
         };
-        let call_needles = [
-            json_field_fragment("session_id", &call.session_id)?,
-            json_field_fragment("request_id", &call.request_id)?,
-        ];
         let mut ids = BTreeSet::from([selected.source_observation_id]);
-        // Canonical current rows allow a cheap prefilter for both call shapes.
-        // Only the typed comparison below admits a dependency.
-        for row in snapshot.data_rows().filter(|row| {
-            row.object_kind.as_deref() == Some("source_observation")
-                && row.payload_json.as_deref().is_some_and(|json| {
-                    json.contains("\"source_local_evidence\"")
-                        && call_needles.iter().all(|needle| json.contains(needle))
-                })
-        }) {
-            let dependency = current_payload(row)?;
-            let JournalPayload::SourceObservationRecorded(value) = &dependency.payload else {
-                return Err(StoreError::StoreCorrupt);
-            };
+        for (value, _) in snapshot.source_observations() {
             let (other, supported) = match &value.source_local_evidence {
                 Some(SourceLocalEvidence::NativeCall(other)) => (other, &[][..]),
                 Some(SourceLocalEvidence::NamespaceWitness {
@@ -1925,14 +1859,10 @@ fn collect_normalization_dependencies(
             if other.session_id == call.session_id && other.request_id == call.request_id {
                 ids.insert(value.source_observation_id);
                 ids.extend(supported.iter().copied());
-                dependencies.insert(dependency)?;
             }
         }
         for id in &ids {
-            let row = snapshot
-                .row(&format!("object:evidence:source_observation:{id}"))
-                .ok_or(StoreError::StoreCorrupt)?;
-            dependencies.insert(current_payload(row)?)?;
+            dependencies.insert(source_observation_dependency(snapshot, *id)?)?;
         }
         // New dirty facts include already-watermarked predecessors. The new
         // fact's watermark ends this work; no periodic rescan or busy retry.
@@ -1944,36 +1874,8 @@ fn collect_normalization_dependencies(
         .partial_correlation_ref
         .as_deref()
         .filter(|value| !value.is_empty());
-    let correlation_needles = if let Some(key) = &exact_key {
-        vec![
-            json_field_fragment("host_instance_id", &key.host_instance_id)?,
-            json_field_fragment("host_trace_lineage_id", &key.host_trace_lineage_id)?,
-            json_field_fragment("host_lane_key", &key.host_lane_key)?,
-            json_field_fragment("native_request_id", &key.native_request_id)?,
-            json_field_fragment(
-                "physical_execution_ordinal",
-                &key.physical_execution_ordinal,
-            )?,
-        ]
-    } else if let Some(reference) = partial_ref {
-        vec![json_field_fragment("partial_correlation_ref", reference)?]
-    } else {
-        Vec::new()
-    };
     let mut observation_ids = BTreeSet::from([selected.source_observation_id]);
-    for row in snapshot.data_rows().filter(|row| {
-        row.object_kind.as_deref() == Some("source_observation")
-            && !correlation_needles.is_empty()
-            && row.payload_json.as_deref().is_some_and(|json| {
-                correlation_needles
-                    .iter()
-                    .all(|needle| json.contains(needle))
-            })
-    }) {
-        let dependency = current_payload(row)?;
-        let JournalPayload::SourceObservationRecorded(value) = &dependency.payload else {
-            return Err(StoreError::StoreCorrupt);
-        };
+    for (value, _) in snapshot.source_observations() {
         let matches = exact_key
             .as_ref()
             .is_some_and(|key| value.correlation.exact_key().as_ref() == Some(key))
@@ -1982,14 +1884,16 @@ fn collect_normalization_dependencies(
             });
         if matches {
             observation_ids.insert(value.source_observation_id);
-            dependencies.insert(dependency)?;
         }
+    }
+    for id in &observation_ids {
+        dependencies.insert(source_observation_dependency(snapshot, *id)?)?;
     }
     collect_observation_relations(snapshot, &observation_ids, dependencies)
 }
 
 fn collect_observation_relations(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     observation_ids: &BTreeSet<SourceObservationId>,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
@@ -2044,46 +1948,16 @@ fn collect_observation_relations(
 }
 
 fn collect_capture_dependencies(
-    snapshot: &ProjectionSnapshot,
-    selected_receipt: &NamedCurrentDependency,
+    snapshot: &CurrentFacts,
+    selected: &SourceReceipt,
     dependencies: &mut DependencyCollector,
 ) -> Result<(u64, bool), StoreError> {
-    let JournalPayload::SourceReceiptRecorded(selected) = &selected_receipt.payload else {
-        return Err(StoreError::StoreCorrupt);
-    };
     let Some(lifecycle) = selected.lifecycle.as_ref() else {
         return Ok((0, false));
     };
     let incarnation_ref = source_incarnation_ref(selected).ok_or(StoreError::StoreCorrupt)?;
-    let mut source_needles = vec![
-        json_field_fragment("host_session_id", &lifecycle.host_session_id)?,
-        json_field_fragment("agent_id", &lifecycle.agent_id)?,
-        json_field_fragment("host_lane_key", &lifecycle.host_lane_key)?,
-    ];
-    if let Some(value) = lifecycle.incarnation_ref.as_deref() {
-        source_needles.push(json_field_fragment("incarnation_ref", value)?);
-    }
-    let source_rows: Box<dyn Iterator<Item = &ObjectRow>> = if lifecycle.incarnation_ref.is_none() {
-        Box::new(std::iter::once(
-            snapshot
-                .row(&selected_receipt.row_id)
-                .ok_or(StoreError::StoreCorrupt)?,
-        ))
-    } else {
-        Box::new(snapshot.data_rows().filter(|row| {
-            row.object_kind.as_deref() == Some("source_receipt")
-                && row
-                    .payload_json
-                    .as_deref()
-                    .is_some_and(|json| source_needles.iter().all(|needle| json.contains(needle)))
-        }))
-    };
     let mut cohort_observation_ids = BTreeSet::from([selected.source_observation_id]);
-    for row in source_rows {
-        let dependency = current_payload(row)?;
-        let JournalPayload::SourceReceiptRecorded(value) = &dependency.payload else {
-            return Err(StoreError::StoreCorrupt);
-        };
+    for (value, _) in snapshot.source_receipts() {
         if value.lifecycle.as_ref().is_some_and(|candidate| {
             candidate.host_session_id == lifecycle.host_session_id
                 && candidate.agent_id == lifecycle.agent_id
@@ -2091,14 +1965,19 @@ fn collect_capture_dependencies(
                 && source_incarnation_ref(value).as_ref() == Some(&incarnation_ref)
         }) {
             cohort_observation_ids.insert(value.source_observation_id);
-            let observation_row_id = format!(
-                "object:evidence:source_observation:{}",
-                value.source_observation_id
-            );
-            if let Some(observation) = snapshot.row(&observation_row_id) {
-                dependencies.insert(current_payload(observation)?)?;
+            if snapshot
+                .source_observation(value.source_observation_id)
+                .is_some()
+            {
+                dependencies.insert(source_observation_dependency(
+                    snapshot,
+                    value.source_observation_id,
+                )?)?;
             }
-            dependencies.insert(dependency)?;
+            dependencies.insert(source_receipt_dependency(
+                snapshot,
+                value.source_receipt_id,
+            )?)?;
         }
     }
     collect_observation_relations(snapshot, &cohort_observation_ids, dependencies)?;
@@ -2110,7 +1989,7 @@ fn collect_capture_dependencies(
         json_field_fragment("host_lane_key", &lifecycle.host_lane_key)?,
         json_field_fragment("incarnation_ref", &incarnation_ref)?,
     ];
-    for row in snapshot.data_rows().filter(|row| {
+    for row in snapshot.other_data_rows().filter(|row| {
         row.object_kind.as_deref() == Some("execution_lane")
             && row
                 .payload_json
@@ -2129,7 +2008,7 @@ fn collect_capture_dependencies(
             continue;
         }
         let receipt_row_id = format!("object:evidence:capture_receipt:{}", lane.execution_lane_id);
-        if let Some(row) = snapshot.row(&receipt_row_id) {
+        if let Some(row) = snapshot.other_row(&receipt_row_id) {
             let receipt_dependency = current_payload(row)?;
             let JournalPayload::CaptureReceiptRecorded(receipt) = &receipt_dependency.payload
             else {
@@ -2164,7 +2043,7 @@ fn lifecycle_incarnation_ref(
 }
 
 fn collect_receipt_references(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &CurrentFacts,
     receipt: &CaptureReceipt,
     dependencies: &mut DependencyCollector,
 ) -> Result<(), StoreError> {
@@ -2185,18 +2064,20 @@ fn collect_receipt_references(
                 .map(|reference| format!("runtime:reconciliation:{reference}")),
         );
     for row_id in rows {
-        let row = snapshot.row(&row_id).ok_or(StoreError::StoreCorrupt)?;
+        let row = snapshot
+            .other_row(&row_id)
+            .ok_or(StoreError::StoreCorrupt)?;
         dependencies.insert(current_payload(row)?)?;
     }
     Ok(())
 }
 
 fn rows_referencing<'a>(
-    snapshot: &'a ProjectionSnapshot,
+    snapshot: &'a CurrentFacts,
     object_kind: &'static str,
     needles: &'a [String],
 ) -> impl Iterator<Item = &'a ObjectRow> {
-    snapshot.data_rows().filter(move |row| {
+    snapshot.other_data_rows().filter(move |row| {
         row.object_kind.as_deref() == Some(object_kind)
             && !needles.is_empty()
             && row
@@ -2216,6 +2097,408 @@ fn json_field_fragment<T: serde::Serialize + ?Sized>(
     ))
 }
 
+pub(crate) type SourceReceiptFacts = BTreeMap<SourceReceiptId, (Arc<SourceReceipt>, u64)>;
+pub(crate) type SourceObservationFacts =
+    BTreeMap<SourceObservationId, (Arc<SourceObservation>, u64)>;
+pub(crate) type EvidenceSurfaceFacts = BTreeMap<SourceObservationId, (Arc<EvidenceSurface>, u64)>;
+
+/// The complete logical current objects view, with the three large source
+/// families kept in their validated typed representation.
+pub struct CurrentFacts {
+    frontier: u64,
+    other_rows: Vec<ObjectRow>,
+    source_receipts: SourceReceiptFacts,
+    source_observations: SourceObservationFacts,
+    evidence_surfaces: EvidenceSurfaceFacts,
+}
+
+impl CurrentFacts {
+    pub fn other_data_rows(&self) -> impl Iterator<Item = &ObjectRow> {
+        self.other_rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Data)
+    }
+
+    pub fn other_row(&self, row_id: &str) -> Option<&ObjectRow> {
+        self.other_rows.iter().find(|row| row.row_id == row_id)
+    }
+
+    pub fn reconciliation_frontier(
+        &self,
+        limit: usize,
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut candidates = self
+            .other_data_rows()
+            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.source_event_seq
+                .cmp(&right.source_event_seq)
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+        let mut items = Vec::new();
+        for row in candidates {
+            let payload = current_payload(row)?;
+            let JournalPayload::DirtyTarget(target) = &payload.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let target = target.clone();
+            if !matches!(
+                target.target_kind,
+                crate::command::DirtyTargetKind::PhysicalNormalization
+                    | crate::command::DirtyTargetKind::CaptureReconciliation
+            ) {
+                continue;
+            }
+            if let Some(item) = reconciliation_item(self, payload, target)? {
+                items.push(item);
+                if items.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(ReconciliationFrontier {
+            frontier: self.frontier,
+            items,
+        })
+    }
+
+    pub fn reconciliation_frontier_for_observations(
+        &self,
+        observation_ids: &[SourceObservationId],
+    ) -> Result<ReconciliationFrontier, StoreError> {
+        if observation_ids.is_empty()
+            || observation_ids.len() > 16
+            || observation_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != observation_ids.len()
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let selected = observation_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut items = Vec::new();
+        for row in self
+            .other_data_rows()
+            .filter(|row| row.row_id.starts_with("runtime:dirty:"))
+        {
+            let payload = current_payload(row)?;
+            let JournalPayload::DirtyTarget(target) = &payload.payload else {
+                return Err(StoreError::StoreCorrupt);
+            };
+            let target = target.clone();
+            if selected.contains(&target.target_id)
+                && matches!(
+                    target.target_kind,
+                    crate::command::DirtyTargetKind::PhysicalNormalization
+                        | crate::command::DirtyTargetKind::CaptureReconciliation
+                )
+                && let Some(item) = reconciliation_item(self, payload, target)?
+            {
+                items.push(item);
+            }
+        }
+        items.sort_by(|left, right| {
+            left.source_event_seq
+                .cmp(&right.source_event_seq)
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+        Ok(ReconciliationFrontier {
+            frontier: self.frontier,
+            items,
+        })
+    }
+
+    pub fn reconciliation_artifact_context(
+        &self,
+        descriptors: &[ReconciliationArtifactDescriptor],
+        limit: usize,
+    ) -> Result<ReconciliationArtifactFrontier, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::InvalidInput);
+        }
+        let mut ordered = descriptors.to_vec();
+        ordered.sort();
+        ordered.truncate(limit);
+        let mut contexts = Vec::with_capacity(ordered.len());
+        for descriptor in ordered {
+            descriptor.validate()?;
+            contexts.push(reconciliation_artifact_item(self, descriptor)?);
+        }
+        Ok(ReconciliationArtifactFrontier {
+            frontier: self.frontier,
+            contexts,
+        })
+    }
+
+    pub fn frontier(&self) -> u64 {
+        self.frontier
+    }
+
+    /// All current object rows except source receipts, observations, and
+    /// evidence surfaces. This includes the complete objects checkpoint.
+    pub fn other_rows(&self) -> &[ObjectRow] {
+        &self.other_rows
+    }
+
+    pub fn source_receipts(&self) -> impl Iterator<Item = (&Arc<SourceReceipt>, u64)> + '_ {
+        self.source_receipts
+            .values()
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn source_observations(&self) -> impl Iterator<Item = (&Arc<SourceObservation>, u64)> + '_ {
+        self.source_observations
+            .values()
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn evidence_surfaces(&self) -> impl Iterator<Item = (&Arc<EvidenceSurface>, u64)> + '_ {
+        self.evidence_surfaces
+            .values()
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn source_receipt(&self, id: SourceReceiptId) -> Option<(&Arc<SourceReceipt>, u64)> {
+        self.source_receipts
+            .get(&id)
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn source_observation(
+        &self,
+        id: SourceObservationId,
+    ) -> Option<(&Arc<SourceObservation>, u64)> {
+        self.source_observations
+            .get(&id)
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    pub fn evidence_surface(
+        &self,
+        id: SourceObservationId,
+    ) -> Option<(&Arc<EvidenceSurface>, u64)> {
+        self.evidence_surfaces
+            .get(&id)
+            .map(|(value, seq)| (value, *seq))
+    }
+
+    /// Materialize one selected canonical source row for a bounded legacy
+    /// reducer. This does not expose or construct a row view over all facts.
+    pub fn selected_source_row(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<ObjectRow>, StoreError> {
+        match kind {
+            "source_receipt" => {
+                let id = id
+                    .parse::<SourceReceiptId>()
+                    .map_err(|_| StoreError::InvalidInput)?;
+                self.source_receipts
+                    .get(&id)
+                    .map(|(value, seq)| source_receipt_row(value, *seq))
+                    .transpose()
+            }
+            "source_observation" => {
+                let id = id
+                    .parse::<SourceObservationId>()
+                    .map_err(|_| StoreError::InvalidInput)?;
+                self.source_observations
+                    .get(&id)
+                    .map(|(value, seq)| source_observation_row(value, *seq))
+                    .transpose()
+            }
+            "evidence_surface" => {
+                let id = id
+                    .parse::<SourceObservationId>()
+                    .map_err(|_| StoreError::InvalidInput)?;
+                self.evidence_surfaces
+                    .get(&id)
+                    .map(|(value, seq)| surface_row(id, value, *seq))
+                    .transpose()
+            }
+            _ => Err(StoreError::InvalidInput),
+        }
+    }
+
+    /// Explicitly materialize the legacy complete canonical-row output.
+    pub fn into_full_snapshot(self) -> Result<ProjectionSnapshot, StoreError> {
+        SourceFactsRef {
+            source_receipts: &self.source_receipts,
+            source_observations: &self.source_observations,
+            evidence_surfaces: &self.evidence_surfaces,
+        }
+        .snapshot_with_source_prefix(self.other_rows, self.frontier)
+    }
+
+    pub(crate) fn from_full_snapshot(snapshot: ProjectionSnapshot) -> Result<Self, StoreError> {
+        let ProjectionSnapshot { frontier, rows } = snapshot;
+        let mut other_rows = Vec::new();
+        let mut source_receipts = SourceReceiptFacts::new();
+        let mut source_observations = SourceObservationFacts::new();
+        let mut evidence_surfaces = EvidenceSurfaceFacts::new();
+        for row in rows {
+            let Some(kind) = row.object_kind.as_deref() else {
+                other_rows.push(row);
+                continue;
+            };
+            if !matches!(
+                kind,
+                "source_receipt" | "source_observation" | "evidence_surface"
+            ) {
+                other_rows.push(row);
+                continue;
+            }
+            let payload_json = row
+                .payload_json
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?;
+            let payload: JournalPayload =
+                serde_json::from_str(payload_json).map_err(|_| StoreError::StoreCorrupt)?;
+            payload.validate().map_err(|_| StoreError::StoreCorrupt)?;
+            if !payload
+                .matches_canonical_json(payload_json)
+                .map_err(|_| StoreError::StoreCorrupt)?
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            match payload {
+                JournalPayload::SourceReceiptRecorded(value) if kind == "source_receipt" => {
+                    let expected = source_receipt_row(&value, row.source_event_seq)?;
+                    if expected != row
+                        || source_receipts
+                            .insert(
+                                value.source_receipt_id,
+                                (Arc::new(*value), row.source_event_seq),
+                            )
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::SourceObservationRecorded(value)
+                    if kind == "source_observation" =>
+                {
+                    let expected = source_observation_row(&value, row.source_event_seq)?;
+                    if expected != row
+                        || source_observations
+                            .insert(
+                                value.source_observation_id,
+                                (Arc::new(*value), row.source_event_seq),
+                            )
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                JournalPayload::EvidenceSurfaceRecorded(value) if kind == "evidence_surface" => {
+                    let expected = surface_row(
+                        value.source_observation_revision_ref,
+                        &value,
+                        row.source_event_seq,
+                    )?;
+                    if expected != row
+                        || evidence_surfaces
+                            .insert(
+                                value.source_observation_revision_ref,
+                                (Arc::new(*value), row.source_event_seq),
+                            )
+                            .is_some()
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            }
+        }
+        let facts = Self {
+            frontier,
+            other_rows,
+            source_receipts,
+            source_observations,
+            evidence_surfaces,
+        };
+        facts.validate_frontier()?;
+        Ok(facts)
+    }
+
+    fn validate_frontier(&self) -> Result<(), StoreError> {
+        let checkpoints = self
+            .other_rows
+            .iter()
+            .filter(|row| row.row_kind == ObjectRowKind::Checkpoint)
+            .collect::<Vec<_>>();
+        if checkpoints.len() != 1
+            || checkpoints[0].row_id != OBJECTS_CHECKPOINT_ID
+            || checkpoints[0].source_event_seq != self.frontier
+            || checkpoints[0].projection_generation != PROJECTION_GENERATION
+            || self
+                .other_rows
+                .iter()
+                .any(|row| row.source_event_seq > self.frontier)
+            || self
+                .source_receipts
+                .values()
+                .any(|(_, seq)| *seq > self.frontier)
+            || self
+                .source_observations
+                .values()
+                .any(|(_, seq)| *seq > self.frontier)
+            || self
+                .evidence_surfaces
+                .values()
+                .any(|(_, seq)| *seq > self.frontier)
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        Ok(())
+    }
+
+    fn source_rows_after(&self, checkpoint: u64) -> Result<Vec<ObjectRow>, StoreError> {
+        let mut rows = Vec::new();
+        for (value, seq) in self
+            .source_receipts
+            .values()
+            .filter(|(_, seq)| *seq > checkpoint)
+        {
+            rows.push(source_receipt_row(value.as_ref(), *seq)?);
+        }
+        for (value, seq) in self
+            .source_observations
+            .values()
+            .filter(|(_, seq)| *seq > checkpoint)
+        {
+            rows.push(source_observation_row(value.as_ref(), *seq)?);
+        }
+        for (id, (value, seq)) in self
+            .evidence_surfaces
+            .iter()
+            .filter(|(_, (_, seq))| *seq > checkpoint)
+        {
+            rows.push(surface_row(*id, value.as_ref(), *seq)?);
+        }
+        rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        Ok(rows)
+    }
+}
+
+impl TryFrom<ProjectionSnapshot> for CurrentFacts {
+    type Error = StoreError;
+
+    fn try_from(snapshot: ProjectionSnapshot) -> Result<Self, Self::Error> {
+        Self::from_full_snapshot(snapshot)
+    }
+}
+
 #[derive(Clone, Default)]
 struct ReducerState {
     inventory: inventory::InventoryState,
@@ -2229,10 +2512,10 @@ struct ReducerState {
     config_attempt: Option<(JournalPayload, u64)>,
     stale_audits: BTreeMap<String, (JournalPayload, u64)>,
     source_revisions: BTreeMap<String, (SourceRevisionRecorded, u64)>,
-    source_receipts: BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    source_observations: BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    source_receipts: SourceReceiptFacts,
+    source_observations: SourceObservationFacts,
     source_watermarks: BTreeMap<String, (SourceIngestWatermark, u64)>,
-    evidence_surfaces: BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    evidence_surfaces: EvidenceSurfaceFacts,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
@@ -2356,9 +2639,9 @@ pub(crate) struct JournalAdmissionState {
     // Live command admission clones the state before append. Capture commands
     // still detach these maps at their existing mutation points, while small
     // unrelated commands keep their verified source state shared.
-    source_observations: Arc<BTreeMap<SourceObservationId, (SourceObservation, u64)>>,
-    source_receipts: Arc<BTreeMap<SourceReceiptId, (SourceReceipt, u64)>>,
-    evidence_surfaces: Arc<BTreeMap<SourceObservationId, (EvidenceSurface, u64)>>,
+    source_observations: Arc<SourceObservationFacts>,
+    source_receipts: Arc<SourceReceiptFacts>,
+    evidence_surfaces: Arc<EvidenceSurfaceFacts>,
     host_occurrences: BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     host_occurrence_revisions: BTreeMap<(HostOccurrenceId, u32), (HostOccurrence, u64)>,
     operations: BTreeMap<OperationId, (Operation, u64)>,
@@ -2418,6 +2701,12 @@ pub(crate) struct JournalAdmissionState {
     jobs: BTreeMap<evertrace_domain::ids::JobId, DurableJob>,
     deletions: Box<ObjectDeletionState>,
     scope_purges: Box<ScopePurgeState>,
+}
+
+pub(crate) struct SourceFactsRef<'facts> {
+    source_receipts: &'facts SourceReceiptFacts,
+    source_observations: &'facts SourceObservationFacts,
+    evidence_surfaces: &'facts EvidenceSurfaceFacts,
 }
 
 /// A bounded current read, not a complete projection or a reusable reader.
@@ -3143,9 +3432,9 @@ fn core_membership_deletion_refs(
 }
 
 struct ObjectDeletionPreviewInputs<'a> {
-    source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    source_observations: &'a SourceObservationFacts,
+    source_receipts: &'a SourceReceiptFacts,
+    evidence_surfaces: &'a EvidenceSurfaceFacts,
     host_occurrences: &'a BTreeMap<HostOccurrenceId, (HostOccurrence, u64)>,
     operations: &'a BTreeMap<OperationId, (Operation, u64)>,
     scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
@@ -3186,8 +3475,8 @@ struct RepositoryScopePreviewInputs<'a> {
     repositories: &'a BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
     worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
     worktree_snapshots: &'a BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
-    source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    evidence_surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+    source_receipts: &'a SourceReceiptFacts,
+    evidence_surfaces: &'a EvidenceSurfaceFacts,
     capture_receipt_revisions:
         &'a BTreeMap<evertrace_domain::ids::CaptureReceiptId, (CaptureReceipt, u64)>,
     atom_revisions: &'a BTreeMap<RevisionId, (Atom, u64)>,
@@ -3251,8 +3540,21 @@ pub(crate) struct RepositoryClosureKeys {
 pub struct ObjectDeletionCandidateAdmissionView {
     deletions: Vec<ObjectDeletionLedgerEvent>,
     source_observation_receipts: BTreeMap<SourceObservationId, SourceReceiptId>,
-    source_receipts: BTreeMap<SourceReceiptId, SourceReceipt>,
+    source_receipts: BTreeMap<SourceReceiptId, Arc<SourceReceipt>>,
     source_suppression_refs: BTreeMap<SourceObservationId, BTreeSet<String>>,
+}
+
+fn validate_source_admission_refs(refs: &[String]) -> Result<(), StoreError> {
+    if refs.is_empty()
+        || refs.len() > 64
+        || !refs.windows(2).all(|pair| pair[0] < pair[1])
+        || refs
+            .iter()
+            .any(|reference| reference.parse::<SourceObservationId>().is_err())
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
 }
 
 impl ObjectDeletionCandidateAdmissionView {
@@ -3278,16 +3580,130 @@ impl ObjectDeletionCandidateAdmissionView {
     }
 
     pub fn for_source_refs_rows(rows: &[ObjectRow], refs: &[String]) -> Result<Self, StoreError> {
-        if refs.is_empty()
-            || refs.len() > 64
-            || !refs.windows(2).all(|pair| pair[0] < pair[1])
-            || refs
-                .iter()
-                .any(|reference| reference.parse::<SourceObservationId>().is_err())
-        {
+        validate_source_admission_refs(refs)?;
+        Self::from_selected_rows(rows, Some(refs))
+    }
+
+    /// The same bounded source join over typed current facts. Only selected
+    /// observations, their receipts, and their surfaces are retained.
+    pub fn for_source_refs_current(
+        current: &CurrentFacts,
+        refs: &[String],
+    ) -> Result<Self, StoreError> {
+        validate_source_admission_refs(refs)?;
+        let deletions =
+            crate::purge::ObjectDeletionCurrentView::from_rows(0, current.other_rows().iter())?
+                .events
+                .into_values()
+                .collect::<Vec<_>>();
+        if deletions.is_empty() {
+            return Ok(Self::empty(deletions));
+        }
+
+        let mut source_observation_receipts = BTreeMap::new();
+        let mut selected_receipts = BTreeSet::new();
+        for reference in refs {
+            let observation_id = reference
+                .parse::<SourceObservationId>()
+                .map_err(|_| StoreError::InvalidInput)?;
+            let Some((observation, _)) = current.source_observation(observation_id) else {
+                continue;
+            };
+            if source_observation_receipts
+                .insert(observation_id, observation.source_receipt_ref)
+                .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            selected_receipts.insert(observation.source_receipt_ref);
+        }
+        let mut source_receipts = BTreeMap::new();
+        for receipt_id in selected_receipts {
+            if let Some((receipt, _)) = current.source_receipt(receipt_id)
+                && source_receipts
+                    .insert(receipt_id, Arc::clone(receipt))
+                    .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        let mut surfaces = BTreeMap::new();
+        for reference in refs {
+            let observation_id = reference
+                .parse::<SourceObservationId>()
+                .map_err(|_| StoreError::InvalidInput)?;
+            if let Some((surface, _)) = current.evidence_surface(observation_id)
+                && surfaces
+                    .insert(observation_id, Arc::clone(surface))
+                    .is_some()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Self::from_source_inputs(
+            deletions,
+            source_observation_receipts,
+            source_receipts,
+            surfaces,
+        )
+    }
+
+    /// Build the same suppression closure for a bounded candidate cohort that
+    /// may also contain non-source references.
+    pub fn for_candidate_refs_current(
+        current: &CurrentFacts,
+        refs: &[String],
+    ) -> Result<Self, StoreError> {
+        if refs.is_empty() || refs.len() > 256 || !refs.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err(StoreError::InvalidInput);
         }
-        Self::from_selected_rows(rows, Some(refs))
+        let deletions =
+            crate::purge::ObjectDeletionCurrentView::from_rows(0, current.other_rows().iter())?
+                .events
+                .into_values()
+                .collect::<Vec<_>>();
+        if deletions.is_empty() {
+            return Ok(Self::empty(deletions));
+        }
+
+        let mut source_observation_receipts = BTreeMap::new();
+        let mut selected_receipts = BTreeSet::new();
+        for reference in refs {
+            if let Ok(observation_id) = reference.parse::<SourceObservationId>()
+                && let Some((observation, _)) = current.source_observation(observation_id)
+            {
+                source_observation_receipts.insert(observation_id, observation.source_receipt_ref);
+                selected_receipts.insert(observation.source_receipt_ref);
+            }
+            if let Ok(receipt_id) = reference.parse::<SourceReceiptId>()
+                && let Some((receipt, _)) = current.source_receipt(receipt_id)
+            {
+                source_observation_receipts.insert(receipt.source_observation_id, receipt_id);
+                selected_receipts.insert(receipt_id);
+            }
+        }
+        let source_receipts = selected_receipts
+            .into_iter()
+            .filter_map(|id| {
+                current
+                    .source_receipt(id)
+                    .map(|(receipt, _)| (id, Arc::clone(receipt)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let surfaces = source_observation_receipts
+            .keys()
+            .filter_map(|id| {
+                current
+                    .evidence_surface(*id)
+                    .map(|(surface, _)| (*id, Arc::clone(surface)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        Self::from_source_inputs(
+            deletions,
+            source_observation_receipts,
+            source_receipts,
+            surfaces,
+        )
     }
 
     fn from_selected_rows(
@@ -3297,12 +3713,7 @@ impl ObjectDeletionCandidateAdmissionView {
         let ledger = crate::purge::ObjectDeletionCurrentView::from_rows(0, rows.iter())?;
         let deletions = ledger.events.into_values().collect::<Vec<_>>();
         if deletions.is_empty() {
-            return Ok(Self {
-                deletions,
-                source_observation_receipts: BTreeMap::new(),
-                source_receipts: BTreeMap::new(),
-                source_suppression_refs: BTreeMap::new(),
-            });
+            return Ok(Self::empty(deletions));
         }
         let mut source_observation_receipts = BTreeMap::new();
         let mut source_receipts = BTreeMap::new();
@@ -3339,7 +3750,7 @@ impl ObjectDeletionCandidateAdmissionView {
                     JournalPayload::SourceReceiptRecorded(value) => {
                         value.validate().map_err(|_| StoreError::StoreCorrupt)?;
                         if source_receipts
-                            .insert(value.source_receipt_id, *value)
+                            .insert(value.source_receipt_id, Arc::new(*value))
                             .is_some()
                         {
                             return Err(StoreError::StoreCorrupt);
@@ -3356,7 +3767,7 @@ impl ObjectDeletionCandidateAdmissionView {
                 );
             }
         }
-        let mut source_suppression_refs = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
         let mut seen_surfaces = BTreeSet::new();
         for row in rows.iter().filter(|row| {
             row.object_kind.as_deref() == Some("evidence_surface")
@@ -3380,6 +3791,33 @@ impl ObjectDeletionCandidateAdmissionView {
             if !seen_surfaces.insert(observation_id) {
                 return Err(StoreError::StoreCorrupt);
             }
+            surfaces.insert(observation_id, Arc::new(*surface));
+        }
+        Self::from_source_inputs(
+            deletions,
+            source_observation_receipts,
+            source_receipts,
+            surfaces,
+        )
+    }
+
+    fn empty(deletions: Vec<ObjectDeletionLedgerEvent>) -> Self {
+        Self {
+            deletions,
+            source_observation_receipts: BTreeMap::new(),
+            source_receipts: BTreeMap::new(),
+            source_suppression_refs: BTreeMap::new(),
+        }
+    }
+
+    fn from_source_inputs(
+        deletions: Vec<ObjectDeletionLedgerEvent>,
+        source_observation_receipts: BTreeMap<SourceObservationId, SourceReceiptId>,
+        source_receipts: BTreeMap<SourceReceiptId, Arc<SourceReceipt>>,
+        surfaces: BTreeMap<SourceObservationId, Arc<EvidenceSurface>>,
+    ) -> Result<Self, StoreError> {
+        let mut source_suppression_refs = BTreeMap::new();
+        for (observation_id, surface) in surfaces {
             let Some(receipt) = source_observation_receipts
                 .get(&observation_id)
                 .and_then(|receipt_id| source_receipts.get(receipt_id))
@@ -3445,13 +3883,13 @@ impl ObjectDeletionCandidateAdmissionView {
 #[derive(Clone, Copy)]
 enum CandidateSourceLookup<'a> {
     Current {
-        observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-        receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-        surfaces: &'a BTreeMap<SourceObservationId, (EvidenceSurface, u64)>,
+        observations: &'a SourceObservationFacts,
+        receipts: &'a SourceReceiptFacts,
+        surfaces: &'a EvidenceSurfaceFacts,
     },
     Compact {
         observation_receipts: &'a BTreeMap<SourceObservationId, SourceReceiptId>,
-        receipts: &'a BTreeMap<SourceReceiptId, SourceReceipt>,
+        receipts: &'a BTreeMap<SourceReceiptId, Arc<SourceReceipt>>,
         suppression_refs: &'a BTreeMap<SourceObservationId, BTreeSet<String>>,
     },
 }
@@ -3850,9 +4288,320 @@ fn normal_search_row_matches(row: &ObjectRow, references: &BTreeSet<String>) -> 
             .is_some_and(|value| references.contains(value))
 }
 
+impl crate::session_import::SourceObservationS11Facts {
+    pub fn select(
+        view: &crate::repository::RepositoryCurrentView,
+        selector: &crate::session_import::SourceObservationS11Selector,
+    ) -> Self {
+        let identity_repositories = view
+            .repositories
+            .values()
+            .filter(|repository| {
+                repository.common_dir_filesystem == Some(selector.repository.identity)
+            })
+            .map(|repository| repository.repository_id)
+            .collect::<BTreeSet<_>>();
+        let mut repository_ids = identity_repositories.clone();
+        if identity_repositories.is_empty() {
+            repository_ids.extend(
+                view.repositories
+                    .values()
+                    .filter(|repository| repository.current_path == selector.repository.root_path)
+                    .map(|repository| repository.repository_id),
+            );
+        }
+        repository_ids.extend(selector.repository.retained_repository_ids.iter().copied());
+        repository_ids.extend(view.repositories.values().filter_map(|repository| {
+            source_observation_repository_path_candidate(repository, &selector.repository)
+                .then_some(repository.repository_id)
+        }));
+        repository_ids.extend(view.worktrees.values().filter_map(|worktree| {
+            source_observation_worktree_path_candidate(worktree, &selector.repository)
+                .then_some(worktree.repository_instance_id)
+        }));
+
+        let terminal_worktrees = view
+            .worktrees
+            .values()
+            .filter(|worktree| {
+                worktree.lifecycle.is_terminal()
+                    && worktree
+                        .path_history
+                        .last()
+                        .is_some_and(|path| selector.worktree_entry_paths.contains(&path.path))
+            })
+            .map(|worktree| worktree.worktree_instance_id)
+            .collect::<BTreeSet<_>>();
+        let mut worktree_ids = terminal_worktrees;
+        worktree_ids.extend(view.worktrees.values().filter_map(|worktree| {
+            repository_ids
+                .contains(&worktree.repository_instance_id)
+                .then_some(worktree.worktree_instance_id)
+        }));
+        repository_ids.extend(worktree_ids.iter().filter_map(|id| {
+            view.worktrees
+                .get(id)
+                .map(|worktree| worktree.repository_instance_id)
+        }));
+
+        let mut snapshot_ids = view
+            .snapshots
+            .values()
+            .filter(|snapshot| {
+                worktree_ids.contains(&snapshot.worktree_instance_id)
+                    && (view
+                        .worktrees
+                        .get(&snapshot.worktree_instance_id)
+                        .is_some_and(|worktree| {
+                            repository_ids.contains(&worktree.repository_instance_id)
+                        })
+                        || snapshot
+                            .evidence_refs
+                            .iter()
+                            .any(|reference| reference == &selector.source_reference))
+            })
+            .map(|snapshot| snapshot.worktree_snapshot_id)
+            .collect::<BTreeSet<_>>();
+        for id in &worktree_ids {
+            if let Some(snapshot_id) = view
+                .worktrees
+                .get(id)
+                .filter(|worktree| worktree.lifecycle.is_terminal())
+                .and_then(|worktree| worktree.current_snapshot_id)
+            {
+                snapshot_ids.insert(snapshot_id);
+            }
+        }
+        Self {
+            repositories: repository_ids
+                .into_iter()
+                .filter_map(|id| view.repositories.get(&id).cloned().map(|value| (id, value)))
+                .collect(),
+            worktrees: worktree_ids
+                .into_iter()
+                .filter_map(|id| view.worktrees.get(&id).cloned().map(|value| (id, value)))
+                .collect(),
+            snapshots: snapshot_ids
+                .into_iter()
+                .filter_map(|id| view.snapshots.get(&id).cloned().map(|value| (id, value)))
+                .collect(),
+        }
+    }
+}
+
+fn source_observation_path_candidate(
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+    path: &str,
+) -> bool {
+    path == selector.root_path
+        || selector.workspace_hints.iter().any(|workspace| {
+            crate::session_import::SessionMetadata::workspace_hint_matches_path(
+                Some(workspace),
+                path,
+            )
+        })
+}
+
+fn source_observation_repository_path_candidate(
+    repository: &RepositoryInstance,
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+) -> bool {
+    source_observation_path_candidate(selector, &repository.current_path)
+        || repository
+            .path_history
+            .iter()
+            .any(|path| source_observation_path_candidate(selector, &path.path))
+}
+
+fn source_observation_worktree_path_candidate(
+    worktree: &WorktreeInstance,
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+) -> bool {
+    worktree
+        .current_path
+        .as_deref()
+        .is_some_and(|path| source_observation_path_candidate(selector, path))
+        || worktree
+            .path_history
+            .iter()
+            .any(|path| source_observation_path_candidate(selector, &path.path))
+}
+
+fn source_observation_raw_repository_ids(
+    repositories: &BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    selector: &crate::session_import::SourceObservationRepositorySelector,
+) -> Result<BTreeSet<RepositoryId>, StoreError> {
+    let mut ids = selector.retained_repository_ids.clone();
+    ids.extend(repositories.iter().filter_map(|(id, (repository, _))| {
+        (repository.common_dir_filesystem == Some(selector.identity)
+            || source_observation_repository_path_candidate(repository, selector))
+        .then_some(*id)
+    }));
+    ids.extend(worktrees.values().filter_map(|(worktree, _)| {
+        source_observation_worktree_path_candidate(worktree, selector)
+            .then_some(worktree.repository_instance_id)
+    }));
+    if ids.len() > 64 {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(ids)
+}
+
+fn source_observation_s11_candidate_ids(
+    repositories: &BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    snapshots: &BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    selector: &crate::session_import::SourceObservationS11Selector,
+) -> (
+    BTreeSet<RepositoryId>,
+    BTreeSet<WorktreeId>,
+    BTreeSet<WorktreeSnapshotId>,
+) {
+    let mut repository_ids = repositories
+        .iter()
+        .filter_map(|(id, (repository, _))| {
+            (repository.common_dir_filesystem == Some(selector.repository.identity)
+                || repository.current_path == selector.repository.root_path
+                || source_observation_repository_path_candidate(repository, &selector.repository))
+            .then_some(*id)
+        })
+        .collect::<BTreeSet<_>>();
+    repository_ids.extend(selector.repository.retained_repository_ids.iter().copied());
+    repository_ids.extend(worktrees.values().filter_map(|(worktree, _)| {
+        source_observation_worktree_path_candidate(worktree, &selector.repository)
+            .then_some(worktree.repository_instance_id)
+    }));
+
+    let mut worktree_ids = worktrees
+        .iter()
+        .filter_map(|(id, (worktree, _))| {
+            (repository_ids.contains(&worktree.repository_instance_id)
+                || worktree.lifecycle.is_terminal()
+                    && worktree
+                        .path_history
+                        .last()
+                        .is_some_and(|path| selector.worktree_entry_paths.contains(&path.path)))
+            .then_some(*id)
+        })
+        .collect::<BTreeSet<_>>();
+    repository_ids.extend(worktree_ids.iter().filter_map(|id| {
+        worktrees
+            .get(id)
+            .map(|(worktree, _)| worktree.repository_instance_id)
+    }));
+
+    let mut snapshot_ids =
+        snapshots
+            .iter()
+            .filter_map(|(id, (snapshot, _))| {
+                (worktree_ids.contains(&snapshot.worktree_instance_id)
+                    && (worktrees.get(&snapshot.worktree_instance_id).is_some_and(
+                        |(worktree, _)| repository_ids.contains(&worktree.repository_instance_id),
+                    ) || snapshot
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| reference == &selector.source_reference)))
+                .then_some(*id)
+            })
+            .collect::<BTreeSet<_>>();
+    for id in &worktree_ids {
+        if let Some(snapshot_id) = worktrees
+            .get(id)
+            .filter(|(worktree, _)| worktree.lifecycle.is_terminal())
+            .and_then(|(worktree, _)| worktree.current_snapshot_id)
+        {
+            snapshot_ids.insert(snapshot_id);
+        }
+    }
+    worktree_ids.retain(|id| worktrees.contains_key(id));
+    (repository_ids, worktree_ids, snapshot_ids)
+}
+
 impl JournalAdmissionState {
     pub(crate) fn committed_frontier(&self) -> u64 {
         self.frontier
+    }
+
+    pub(crate) fn source_prefix_matches_rows(
+        &self,
+        rows: &[ObjectRow],
+        checkpoint: u64,
+    ) -> Result<bool, StoreError> {
+        let expected_receipts = self
+            .source_receipts
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+            .count();
+        let expected_observations = self
+            .source_observations
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+            .count();
+        let expected_surfaces = self
+            .evidence_surfaces
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+            .count();
+        if rows
+            .iter()
+            .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
+            .count()
+            != expected_receipts
+            || rows
+                .iter()
+                .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
+                .count()
+                != expected_observations
+            || rows
+                .iter()
+                .filter(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+                .count()
+                != expected_surfaces
+        {
+            return Ok(false);
+        }
+        for (value, seq) in self
+            .source_receipts
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+        {
+            let expected = source_receipt_row(value.as_ref(), *seq)?;
+            let index = rows
+                .binary_search_by(|row| row.row_id.cmp(&expected.row_id))
+                .ok();
+            if index.is_none_or(|index| rows[index] != expected) {
+                return Ok(false);
+            }
+        }
+        for (value, seq) in self
+            .source_observations
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+        {
+            let expected = source_observation_row(value.as_ref(), *seq)?;
+            let index = rows
+                .binary_search_by(|row| row.row_id.cmp(&expected.row_id))
+                .ok();
+            if index.is_none_or(|index| rows[index] != expected) {
+                return Ok(false);
+            }
+        }
+        for (value, seq) in self
+            .evidence_surfaces
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+        {
+            let expected =
+                surface_row(value.source_observation_revision_ref, value.as_ref(), *seq)?;
+            let index = rows
+                .binary_search_by(|row| row.row_id.cmp(&expected.row_id))
+                .ok();
+            if index.is_none_or(|index| rows[index] != expected) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn passive_source_current_context(
@@ -3941,12 +4690,12 @@ impl JournalAdmissionState {
             let selected = if let Ok(id) = reference.parse::<SourceReceiptId>() {
                 self.source_receipts
                     .get(&id)
-                    .map(|(v, seq)| source_receipt_row(v.clone(), *seq))
+                    .map(|(v, seq)| source_receipt_row(v.as_ref(), *seq))
                     .transpose()?
             } else if let Ok(id) = reference.parse::<SourceObservationId>() {
                 self.source_observations
                     .get(&id)
-                    .map(|(v, seq)| source_observation_row(v.clone(), *seq))
+                    .map(|(v, seq)| source_observation_row(v.as_ref(), *seq))
                     .transpose()?
             } else if let Ok(id) = reference.parse::<evertrace_domain::ids::SemanticDigestId>() {
                 self.synthesis
@@ -3990,8 +4739,10 @@ impl JournalAdmissionState {
             };
             for id in ids {
                 if let Some((value, seq)) = self.source_observations.get(&id) {
-                    let rows = self
-                        .capture_product_rows(vec![source_observation_row(value.clone(), *seq)?])?;
+                    let rows = self.capture_product_rows(vec![source_observation_row(
+                        value.as_ref(),
+                        *seq,
+                    )?])?;
                     paired.extend(rows.into_iter().map(|row| (row, id)));
                 }
             }
@@ -4260,14 +5011,14 @@ impl JournalAdmissionState {
             if let Ok(id) = reference.parse::<SourceReceiptId>()
                 && let Some((value, seq)) = self.source_receipts.get(&id)
             {
-                rows.push(source_receipt_row(value.clone(), *seq)?);
+                rows.push(source_receipt_row(value.as_ref(), *seq)?);
             }
             if let Ok(id) = reference.parse::<SourceObservationId>() {
                 if let Some((value, seq)) = self.source_observations.get(&id) {
-                    rows.push(source_observation_row(value.clone(), *seq)?);
+                    rows.push(source_observation_row(value.as_ref(), *seq)?);
                 }
                 if let Some((value, seq)) = self.evidence_surfaces.get(&id) {
-                    rows.push(surface_row(id, value.clone(), *seq)?);
+                    rows.push(surface_row(id, value.as_ref(), *seq)?);
                 }
             }
         }
@@ -5230,7 +5981,7 @@ impl JournalAdmissionState {
                 && let Some((value, seq)) = self.source_observations.get(&id)
             {
                 selected.extend(
-                    self.capture_product_rows(vec![source_observation_row(value.clone(), *seq)?])?
+                    self.capture_product_rows(vec![source_observation_row(value.as_ref(), *seq)?])?
                         .into_iter()
                         .map(|row| (row, id)),
                 );
@@ -5243,7 +5994,7 @@ impl JournalAdmissionState {
                 && let Some((value, seq)) = self.source_receipts.get(&id)
             {
                 selected.extend(
-                    self.capture_product_rows(vec![source_receipt_row(value.clone(), *seq)?])?
+                    self.capture_product_rows(vec![source_receipt_row(value.as_ref(), *seq)?])?
                         .into_iter()
                         .map(|row| (row, value.source_observation_id)),
                 );
@@ -5275,7 +6026,7 @@ impl JournalAdmissionState {
                 // Observation row IDs are digest IDs, not deletable semantic
                 // revision UUIDs. Product membership here is the same borrowed
                 // repository closure predicate used by the full row filter.
-                selected.push((source_observation_row(value.clone(), *seq)?, *id));
+                selected.push((source_observation_row(value.as_ref(), *seq)?, *id));
                 if selected.len() > limit {
                     break;
                 }
@@ -5307,13 +6058,13 @@ impl JournalAdmissionState {
             let receipt = receipt_id.and_then(|id| self.source_receipts.get(&id));
             let mut source_rows = Vec::new();
             if let Some((value, seq)) = observation {
-                source_rows.push(source_observation_row(value.clone(), *seq)?);
+                source_rows.push(source_observation_row(value.as_ref(), *seq)?);
             }
             if let Some((value, seq)) = receipt {
-                source_rows.push(source_receipt_row(value.clone(), *seq)?);
+                source_rows.push(source_receipt_row(value.as_ref(), *seq)?);
             }
             if let Some((value, seq)) = self.evidence_surfaces.get(&id) {
-                source_rows.push(surface_row(id, value.clone(), *seq)?);
+                source_rows.push(surface_row(id, value.as_ref(), *seq)?);
             }
             let source_rows = self.capture_product_rows(source_rows)?;
             if !source_rows.iter().any(|row| row.row_id == selected.row_id) {
@@ -5466,6 +6217,32 @@ impl JournalAdmissionState {
                 .map_err(|_| StoreError::StoreCorrupt)?,
             &current.metadata.source_revision,
         );
+        validate_prospective_origin_context(
+            &current.metadata,
+            &self.worktree_snapshots,
+            &self.worktrees,
+            &self.repositories,
+        )?;
+        let origin_snapshot = current
+            .metadata
+            .prospective_origin
+            .as_ref()
+            .map(|origin| {
+                self.worktree_snapshots
+                    .get(&origin.snapshot_ref)
+                    .map(|(snapshot, _)| snapshot.clone())
+                    .ok_or(StoreError::StoreCorrupt)
+            })
+            .transpose()?;
+        let origin_worktree = origin_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                self.worktrees
+                    .get(&snapshot.worktree_instance_id)
+                    .map(|(worktree, _)| worktree.clone())
+                    .ok_or(StoreError::StoreCorrupt)
+            })
+            .transpose()?;
         let repository = current
             .metadata
             .resolved_repository_instance_id
@@ -5501,7 +6278,11 @@ impl JournalAdmissionState {
                 .then_some(repository.repository_id)
         });
         let mut read_ids = BTreeSet::new();
-        for id in candidates.chain(located) {
+        for id in candidates.chain(located).chain(
+            origin_worktree
+                .as_ref()
+                .map(|value| value.repository_instance_id),
+        ) {
             read_ids.insert(id);
             if read_ids.len() > crate::session_import::MAX_REPOSITORY_READ_RESTRICTIONS {
                 return Err(StoreError::InvalidInput);
@@ -5516,25 +6297,42 @@ impl JournalAdmissionState {
                     .ok_or(StoreError::StoreCorrupt)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let read_worktrees = self
+        let mut read_worktrees = BTreeMap::new();
+        if let Some(worktree) = origin_worktree {
+            read_worktrees.insert(worktree.worktree_instance_id, worktree);
+        }
+        for (worktree, _) in self
             .worktrees
             .values()
             .filter(|(worktree, _)| read_ids.contains(&worktree.repository_instance_id))
-            .take(65)
-            .map(|(worktree, _)| worktree.clone())
-            .collect::<Vec<_>>();
+        {
+            read_worktrees.insert(worktree.worktree_instance_id, worktree.clone());
+            if read_worktrees.len() > 64 {
+                return Err(StoreError::InvalidInput);
+            }
+        }
+        let read_worktrees = read_worktrees.into_values().collect::<Vec<_>>();
         if read_worktrees.len() > 64 {
             return Err(StoreError::InvalidInput);
         }
         // Current snapshots are always present, regardless of historical size.
         // One additional snapshot per repository/HEAD suffices for continuity;
         // an omitted HEAD is explicitly unknown, never a negative proof.
-        let mut read_snapshots = read_worktrees
+        let mut snapshots_by_id = BTreeMap::new();
+        if let Some(snapshot) = origin_snapshot {
+            snapshots_by_id.insert(snapshot.worktree_snapshot_id, snapshot);
+        }
+        for snapshot in read_worktrees
             .iter()
             .filter_map(|worktree| worktree.current_snapshot_id)
             .filter_map(|id| self.worktree_snapshots.get(&id))
             .map(|(snapshot, _)| snapshot.clone())
-            .collect::<Vec<_>>();
+        {
+            snapshots_by_id.insert(snapshot.worktree_snapshot_id, snapshot);
+        }
+        if snapshots_by_id.len() > 64 {
+            return Err(StoreError::InvalidInput);
+        }
         let mut incomplete_history = BTreeSet::new();
         if repository_locator.is_some() {
             let related_worktrees = read_worktrees
@@ -5562,14 +6360,19 @@ impl JournalAdmissionState {
                 if represented_heads.contains(&head) {
                     continue;
                 }
-                if read_snapshots.len() < 64 {
+                if snapshots_by_id.contains_key(&snapshot.worktree_snapshot_id) {
                     represented_heads.insert(head);
-                    read_snapshots.push(snapshot.clone());
+                    continue;
+                }
+                if snapshots_by_id.len() < 64 {
+                    represented_heads.insert(head);
+                    snapshots_by_id.insert(snapshot.worktree_snapshot_id, snapshot.clone());
                 } else {
                     incomplete_history.insert(*repository_id);
                 }
             }
         }
+        let read_snapshots = snapshots_by_id.into_values().collect::<Vec<_>>();
         let repository_purged = read_repositories.iter().any(|repository| {
             current
                 .metadata
@@ -5606,6 +6409,127 @@ impl JournalAdmissionState {
             read_snapshots,
             incomplete_repository_history: incomplete_history.into_iter().collect(),
         }))
+    }
+
+    pub(crate) fn source_observation_repository_read_context(
+        &self,
+        selector: &crate::session_import::SourceObservationRepositorySelector,
+    ) -> Result<RepositoryReadContext, StoreError> {
+        let ids =
+            source_observation_raw_repository_ids(&self.repositories, &self.worktrees, selector)?;
+        self.repository_read_context(&ids)
+    }
+
+    pub(crate) fn source_observation_revision_has_facts(
+        &self,
+        source: &SourceInstanceId,
+        revision: &SourceRevision,
+    ) -> bool {
+        session_import_revision_has_facts(
+            &self.source_watermarks,
+            &self.source_ranges,
+            source,
+            revision,
+        )
+    }
+
+    pub(crate) fn source_observation_guard_matches(
+        &self,
+        guard: &crate::session_import::SourceObservationGuard,
+    ) -> Result<bool, StoreError> {
+        for (key, expected) in &guard.source_slots {
+            if self.session_imports.get(key) != expected.as_ref() {
+                return Ok(false);
+            }
+        }
+        for expected in &guard.source_progress {
+            let current = self
+                .source_watermarks
+                .get(expected.source_instance_id.as_str())
+                .and_then(|state| state.revisions.get(&expected.source_revision))
+                .cloned();
+            let source_ref =
+                source_revision_ref(&expected.source_instance_id, &expected.source_revision);
+            let recorded_prefix_end = self
+                .source_ranges
+                .get(&source_ref)
+                .and_then(KnownSourceRange::last_sequence);
+            if current != expected.watermark || recorded_prefix_end != expected.recorded_prefix_end
+            {
+                return Ok(false);
+            }
+        }
+        if self.source_observation_revision_has_facts(
+            &guard.selector.source_instance_id,
+            &guard.selector.source_revision,
+        ) {
+            return Ok(false);
+        }
+        let raw =
+            self.source_observation_repository_read_context(&guard.selector.s11.repository)?;
+        if raw.repositories != guard.raw_repositories || raw.purged != guard.raw_purged {
+            return Ok(false);
+        }
+        Ok(self.source_observation_s11_facts(&guard.selector.s11)? == guard.s11_facts)
+    }
+
+    fn source_observation_s11_facts(
+        &self,
+        selector: &crate::session_import::SourceObservationS11Selector,
+    ) -> Result<crate::session_import::SourceObservationS11Facts, StoreError> {
+        let (repository_ids, worktree_ids, snapshot_ids) = source_observation_s11_candidate_ids(
+            &self.repositories,
+            &self.worktrees,
+            &self.worktree_snapshots,
+            selector,
+        );
+        let mut rows = Vec::new();
+        for id in repository_ids {
+            if let Some((value, seq)) = self.repositories.get(&id) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "repository",
+                    id.to_string(),
+                    format!("{}@{}", id, value.repository_revision),
+                    &JournalPayload::RepositoryInstanceRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for id in worktree_ids {
+            if let Some((value, seq)) = self.worktrees.get(&id) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "worktree",
+                    id.to_string(),
+                    format!("{}@{}", id, value.worktree_revision),
+                    &JournalPayload::WorktreeInstanceRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        for id in snapshot_ids {
+            if let Some((value, seq)) = self.worktree_snapshots.get(&id) {
+                rows.push(physical_object_row(
+                    ObjectFamily::Work,
+                    "worktree_snapshot",
+                    id.to_string(),
+                    id.to_string(),
+                    &JournalPayload::WorktreeSnapshotRecorded(Box::new(value.clone())),
+                    *seq,
+                )?);
+            }
+        }
+        let rows = filter_product_rows(
+            rows,
+            &self.deletions,
+            &self.scope_purges,
+            self.repository_closures.values(),
+        )?;
+        let view = crate::repository::RepositoryCurrentView::from_rows(self.frontier, &rows)?;
+        Ok(crate::session_import::SourceObservationS11Facts::select(
+            &view, selector,
+        ))
     }
 
     pub(crate) fn session_import_contexts(
@@ -5879,6 +6803,152 @@ impl JournalAdmissionState {
             s23: &self.s23,
             scope_purges: &self.scope_purges,
         }
+    }
+}
+
+impl JournalAdmissionState {
+    pub(crate) fn source_facts(&self) -> SourceFactsRef<'_> {
+        SourceFactsRef {
+            source_receipts: &self.source_receipts,
+            source_observations: &self.source_observations,
+            evidence_surfaces: &self.evidence_surfaces,
+        }
+    }
+
+    pub(crate) fn snapshot_with_source_prefix(
+        &self,
+        rows: Vec<ObjectRow>,
+        checkpoint: u64,
+    ) -> Result<ProjectionSnapshot, StoreError> {
+        self.source_facts()
+            .snapshot_with_source_prefix(rows, checkpoint)
+    }
+
+    pub(crate) fn current_facts_with_source_prefix(
+        &self,
+        rows: Vec<ObjectRow>,
+        checkpoint: u64,
+    ) -> Result<CurrentFacts, StoreError> {
+        self.source_facts()
+            .current_facts_with_source_prefix(rows, checkpoint)
+    }
+}
+
+impl SourceFactsRef<'_> {
+    fn matches_current_sources(&self, facts: &CurrentFacts) -> bool {
+        fn matches<K: Ord, T: Eq>(
+            expected: &BTreeMap<K, (Arc<T>, u64)>,
+            admitted: &BTreeMap<K, (Arc<T>, u64)>,
+            frontier: u64,
+        ) -> bool {
+            expected
+                .iter()
+                .eq(admitted.iter().filter(|(_, (_, seq))| *seq <= frontier))
+        }
+
+        matches(&facts.source_receipts, self.source_receipts, facts.frontier)
+            && matches(
+                &facts.source_observations,
+                self.source_observations,
+                facts.frontier,
+            )
+            && matches(
+                &facts.evidence_surfaces,
+                self.evidence_surfaces,
+                facts.frontier,
+            )
+    }
+
+    fn current_facts_with_source_prefix(
+        &self,
+        mut other_rows: Vec<ObjectRow>,
+        checkpoint: u64,
+    ) -> Result<CurrentFacts, StoreError> {
+        if other_rows.iter().any(|row| {
+            matches!(
+                row.object_kind.as_deref(),
+                Some("source_receipt" | "source_observation" | "evidence_surface")
+            )
+        }) {
+            return Err(StoreError::StoreCorrupt);
+        }
+        other_rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        let facts = CurrentFacts {
+            frontier: checkpoint,
+            other_rows,
+            source_receipts: self
+                .source_receipts
+                .iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .map(|(id, (value, seq))| (*id, (Arc::clone(value), *seq)))
+                .collect(),
+            source_observations: self
+                .source_observations
+                .iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .map(|(id, (value, seq))| (*id, (Arc::clone(value), *seq)))
+                .collect(),
+            evidence_surfaces: self
+                .evidence_surfaces
+                .iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .map(|(id, (value, seq))| (*id, (Arc::clone(value), *seq)))
+                .collect(),
+        };
+        facts.validate_frontier()?;
+        Ok(facts)
+    }
+
+    fn snapshot_with_source_prefix(
+        &self,
+        mut rows: Vec<ObjectRow>,
+        checkpoint: u64,
+    ) -> Result<ProjectionSnapshot, StoreError> {
+        let mut payload_blocks = crate::objects::RowPayloadBlockBuilder::default();
+        let mut scratch = Vec::new();
+        for (value, seq) in self
+            .source_receipts
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+        {
+            let (fields, payload) = source_receipt_parts(value.as_ref());
+            push_canonical_row(
+                &mut rows,
+                &mut payload_blocks,
+                evidence_object_row_fields(fields, *seq),
+                &payload,
+                &mut scratch,
+            )?;
+        }
+        for (value, seq) in self
+            .source_observations
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+        {
+            let (fields, payload) = source_observation_parts(value.as_ref());
+            push_canonical_row(
+                &mut rows,
+                &mut payload_blocks,
+                evidence_object_row_fields(fields, *seq),
+                &payload,
+                &mut scratch,
+            )?;
+        }
+        for (value, seq) in self
+            .evidence_surfaces
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint)
+        {
+            let (row, payload) =
+                surface_row_parts(value.source_observation_revision_ref, value.as_ref(), *seq);
+            push_canonical_row(&mut rows, &mut payload_blocks, row, &payload, &mut scratch)?;
+        }
+        payload_blocks.finish(&mut rows)?;
+        rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        Ok(ProjectionSnapshot {
+            frontier: checkpoint,
+            rows,
+        })
     }
 }
 
@@ -8227,8 +9297,8 @@ fn other_live_source_observations(
 
 fn add_source_reference(
     value: &str,
-    source_observations: &BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    source_receipts: &BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    source_observations: &SourceObservationFacts,
+    source_receipts: &SourceReceiptFacts,
     refs: &mut BTreeSet<SourceObservationId>,
 ) {
     if let Ok(observation_id) = value.parse::<SourceObservationId>()
@@ -8513,6 +9583,26 @@ impl JournalAdmissionState {
                 .copied()
                 .collect(),
         })
+    }
+
+    pub(crate) fn source_repository_read_context(
+        &self,
+        identity: evertrace_domain::repository::FilesystemIdentity,
+        retained_ids: &BTreeSet<RepositoryId>,
+    ) -> Result<RepositoryReadContext, StoreError> {
+        let mut ids = retained_ids.clone();
+        if ids.len() > 64 {
+            return Err(StoreError::InvalidInput);
+        }
+        for (id, (repository, _)) in &self.repositories {
+            if repository.common_dir_filesystem == Some(identity) {
+                ids.insert(*id);
+                if ids.len() > 64 {
+                    return Err(StoreError::InvalidInput);
+                }
+            }
+        }
+        self.repository_read_context(&ids)
     }
 
     pub(crate) fn inventory_context(
@@ -8927,6 +10017,9 @@ impl JournalAdmissionState {
         .map_err(|_| StoreError::StoreCorrupt)?;
         let mut next = self;
         for (payload, seq, _) in parsed {
+            if let JournalPayload::SourceIngestWatermark(watermark) = &payload {
+                validate_source_ingest_watermark_admission(&next, watermark, rows)?;
+            }
             next.apply_payload(payload, seq)?;
         }
         if let Some(closure) = pending_repository_closure {
@@ -9677,6 +10770,18 @@ impl JournalAdmissionState {
         &self,
         payloads: impl IntoIterator<Item = (&'a JournalPayload, i64)>,
     ) -> Result<(), StoreError> {
+        let mut payloads = payloads
+            .into_iter()
+            .filter(|(payload, _)| {
+                matches!(
+                    payload,
+                    JournalPayload::JobState(_) | JournalPayload::JobLease(_)
+                )
+            })
+            .peekable();
+        if payloads.peek().is_none() {
+            return Ok(());
+        }
         let mut jobs = self.jobs.clone();
         for (payload, occurred_at_us) in payloads {
             match payload {
@@ -9797,7 +10902,7 @@ impl JournalAdmissionState {
             JournalPayload::SourceReceiptRecorded(value) => {
                 record_known_source(&mut self.source_ranges, &value)?;
                 if Arc::make_mut(&mut self.source_receipts)
-                    .insert(value.source_receipt_id, (*value, seq))
+                    .insert(value.source_receipt_id, (Arc::new(*value), seq))
                     .is_some()
                 {
                     return Err(StoreError::StoreCorrupt);
@@ -9808,7 +10913,7 @@ impl JournalAdmissionState {
             }
             JournalPayload::SourceObservationRecorded(value) => {
                 if Arc::make_mut(&mut self.source_observations)
-                    .insert(value.source_observation_id, (*value, seq))
+                    .insert(value.source_observation_id, (Arc::new(*value), seq))
                     .is_some()
                 {
                     return Err(StoreError::StoreCorrupt);
@@ -9816,7 +10921,10 @@ impl JournalAdmissionState {
             }
             JournalPayload::EvidenceSurfaceRecorded(value) => {
                 if Arc::make_mut(&mut self.evidence_surfaces)
-                    .insert(value.source_observation_revision_ref, (*value, seq))
+                    .insert(
+                        value.source_observation_revision_ref,
+                        (Arc::new(*value), seq),
+                    )
                     .is_some()
                 {
                     return Err(StoreError::StoreCorrupt);
@@ -10038,6 +11146,26 @@ impl JournalAdmissionState {
                 {
                     return Err(StoreError::InvalidInput);
                 }
+                if let crate::SessionImportEventKind::MetadataObserved { metadata } = &value.event {
+                    validate_prospective_origin_context(
+                        metadata,
+                        &self.worktree_snapshots,
+                        &self.worktrees,
+                        &self.repositories,
+                    )?;
+                    let current = self.session_imports.get(&value.source_key());
+                    if prospective_origin_is_new_for_revision(current, metadata) {
+                        let source = session_import_source_instance(&value)?;
+                        if session_import_revision_has_facts(
+                            &self.source_watermarks,
+                            &self.source_ranges,
+                            &source,
+                            &metadata.source_revision,
+                        ) {
+                            return Err(StoreError::InvalidInput);
+                        }
+                    }
+                }
                 let next = crate::session_import::apply_session_event(
                     self.session_imports.get(&value.source_key()),
                     &value,
@@ -10055,6 +11183,14 @@ impl JournalAdmissionState {
     fn validate_relations(&self) -> Result<(), StoreError> {
         self.inventory
             .validate_relations(&self.repositories, &self.worktrees)?;
+        for current in self.session_imports.values() {
+            validate_prospective_origin_context(
+                &current.metadata,
+                &self.worktree_snapshots,
+                &self.worktrees,
+                &self.repositories,
+            )?;
+        }
         self.inventory
             .validate_procedure_refs(self.proposal_revisions.values().map(|(value, _)| value))?;
         validate_source_local_relations(
@@ -10374,7 +11510,7 @@ fn record_known_source(
 }
 
 fn current_source_ranges(
-    receipts: &BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    receipts: &SourceReceiptFacts,
 ) -> Result<BTreeMap<String, KnownSourceRange>, StoreError> {
     let mut ranges = BTreeMap::new();
     for (receipt, _) in receipts.values() {
@@ -10729,7 +11865,7 @@ fn apply_event(
             let value = *value;
             if state
                 .source_receipts
-                .insert(value.source_receipt_id, (value, row.seq))
+                .insert(value.source_receipt_id, (Arc::new(value), row.seq))
                 .is_some()
             {
                 return Err(StoreError::StoreCorrupt);
@@ -10750,7 +11886,7 @@ fn apply_event(
             }
             if state
                 .source_observations
-                .insert(value.source_observation_id, (value, row.seq))
+                .insert(value.source_observation_id, (Arc::new(value), row.seq))
                 .is_some()
             {
                 return Err(StoreError::StoreCorrupt);
@@ -10759,11 +11895,13 @@ fn apply_event(
         JournalPayload::SourceIngestWatermark(value) => {
             validate_source_ingest_watermark(state, &value, command)?;
             let key = value.stable_key();
-            if state
+            let replace = state
                 .source_watermarks
                 .get(&key)
-                .is_none_or(|(current, _)| value.source_sequence >= current.source_sequence)
-            {
+                .is_none_or(|(current, _)| {
+                    current != &value && value.source_sequence >= current.source_sequence
+                });
+            if replace {
                 state.source_watermarks.insert(key, (value, row.seq));
             }
         }
@@ -10774,7 +11912,10 @@ fn apply_event(
                 .contains_key(&value.source_observation_revision_ref)
                 || state
                     .evidence_surfaces
-                    .insert(value.source_observation_revision_ref, (value, row.seq))
+                    .insert(
+                        value.source_observation_revision_ref,
+                        (Arc::new(value), row.seq),
+                    )
                     .is_some()
             {
                 return Err(StoreError::StoreCorrupt);
@@ -11039,6 +12180,41 @@ fn apply_event(
             {
                 return Err(StoreError::StoreCorrupt);
             }
+            if let crate::SessionImportEventKind::MetadataObserved { metadata } = &value.event {
+                validate_prospective_origin_context(
+                    metadata,
+                    &state.worktree_snapshots,
+                    &state.worktrees,
+                    &state.repositories,
+                )
+                .map_err(|_| StoreError::StoreCorrupt)?;
+                let current = state.session_imports.get(&value.source_key());
+                if prospective_origin_is_new_for_revision(current, metadata) {
+                    let source = session_import_source_instance(&value)
+                        .map_err(|_| StoreError::StoreCorrupt)?;
+                    let mut prior_receipt = false;
+                    for candidate in command.iter().filter(|candidate| candidate.seq < row.seq) {
+                        match candidate.payload()? {
+                            JournalPayload::SourceReceiptRecorded(receipt)
+                                if receipt.source_instance_id == source
+                                    && receipt.source_revision == metadata.source_revision =>
+                            {
+                                prior_receipt = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if session_import_revision_has_watermark(
+                        &state.source_watermarks,
+                        &source,
+                        &metadata.source_revision,
+                    ) || prior_receipt
+                    {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+            }
             let next = crate::session_import::apply_session_event(
                 state.session_imports.get(&value.source_key()),
                 &value,
@@ -11121,14 +12297,156 @@ fn validate_job_successor(
     Ok(())
 }
 
+fn session_import_source_instance(
+    event: &crate::SessionImportEvent,
+) -> Result<SourceInstanceId, StoreError> {
+    SourceInstanceId::parse(
+        event
+            .source_instance_id
+            .clone()
+            .unwrap_or_else(|| format!("codex-session:{}", event.session_id)),
+    )
+    .map_err(|_| StoreError::InvalidInput)
+}
+
+fn session_import_current_for_source<'a>(
+    current: &'a BTreeMap<String, crate::session_import::SessionImportCurrent>,
+    source: &str,
+) -> Option<&'a crate::session_import::SessionImportCurrent> {
+    let key = source.strip_prefix("codex-session:").unwrap_or(source);
+    current
+        .get(key)
+        .filter(|value| value.source_instance() == source)
+}
+
+fn prospective_origin_is_new_for_revision(
+    current: Option<&crate::session_import::SessionImportCurrent>,
+    metadata: &crate::session_import::SessionMetadata,
+) -> bool {
+    metadata.prospective_origin.is_some()
+        && current.is_none_or(|value| {
+            value.metadata.source_revision != metadata.source_revision
+                || value.metadata.prospective_origin.is_none()
+        })
+}
+
+fn session_import_revision_has_facts(
+    watermarks: &BTreeMap<String, SourceWatermarks>,
+    ranges: &BTreeMap<String, KnownSourceRange>,
+    source: &SourceInstanceId,
+    revision: &SourceRevision,
+) -> bool {
+    let source_ref = source_revision_ref(source, revision);
+    watermarks
+        .get(source.as_str())
+        .is_some_and(|state| state.revisions.contains_key(revision))
+        || ranges
+            .get(&source_ref)
+            .is_some_and(|range| !range.sequences.is_empty())
+}
+
+fn session_import_revision_has_watermark(
+    watermarks: &BTreeMap<String, (SourceIngestWatermark, u64)>,
+    source: &SourceInstanceId,
+    revision: &SourceRevision,
+) -> bool {
+    let key = SourceIngestWatermark {
+        source_instance_id: source.clone(),
+        source_revision: revision.clone(),
+        source_sequence: 0,
+        confirmed_prefix_digest: None,
+        earlier_prefix: None,
+    }
+    .stable_key();
+    watermarks.contains_key(&key)
+}
+
+fn validate_prospective_origin_context(
+    metadata: &crate::session_import::SessionMetadata,
+    snapshots: &BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+    repositories: &BTreeMap<RepositoryId, (RepositoryInstance, u64)>,
+) -> Result<(), StoreError> {
+    let Some(origin) = &metadata.prospective_origin else {
+        return Ok(());
+    };
+    let snapshot = snapshots
+        .get(&origin.snapshot_ref)
+        .map(|(value, _)| value)
+        .ok_or(StoreError::InvalidInput)?;
+    let worktree = worktrees
+        .get(&snapshot.worktree_instance_id)
+        .map(|(value, _)| value)
+        .ok_or(StoreError::InvalidInput)?;
+    let repository = repositories
+        .get(&worktree.repository_instance_id)
+        .map(|(value, _)| value)
+        .ok_or(StoreError::InvalidInput)?;
+    // These are durable references, not a new live path attestation. Normal
+    // S11 moves/removal must not corrupt already admitted source metadata.
+    if repository.repository_id != worktree.repository_instance_id
+        || !metadata
+            .repository_read_restrictions
+            .as_ref()
+            .is_some_and(|ids| ids.binary_search(&repository.repository_id).is_ok())
+        || !metadata.repository_candidate(repository)
+        || !worktree
+            .path_history
+            .iter()
+            .any(|path| metadata.workspace_matches_path(&path.path))
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_split_receipt_scope(
+    watermark: &SourceIngestWatermark,
+    receipt: Option<&SourceReceipt>,
+    current: Option<&crate::SessionImportCurrent>,
+    snapshots: &BTreeMap<WorktreeSnapshotId, (WorktreeSnapshot, u64)>,
+    worktrees: &BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
+) -> Result<(), StoreError> {
+    let Some(receipt) = receipt.filter(|_| watermark.earlier_prefix.is_some()) else {
+        return Ok(());
+    };
+    let current = current
+        .filter(|value| value.metadata.source_revision == watermark.source_revision)
+        .ok_or(StoreError::StoreCorrupt)?;
+    let snapshot = current
+        .metadata
+        .prospective_origin
+        .as_ref()
+        .and_then(|origin| snapshots.get(&origin.snapshot_ref))
+        .map(|(value, _)| value);
+    let worktree = snapshot
+        .and_then(|value| worktrees.get(&value.worktree_instance_id))
+        .map(|(value, _)| value);
+    let scope = current
+        .import_scope(
+            receipt
+                .source_byte_range
+                .as_ref()
+                .ok_or(StoreError::StoreCorrupt)?,
+            snapshot,
+            worktree,
+        )
+        .map_err(|_| StoreError::StoreCorrupt)?;
+    if (receipt.repository_instance_id, receipt.worktree_instance_id) != scope {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
 fn validate_source_ingest_watermark(
     state: &ReducerState,
     watermark: &SourceIngestWatermark,
     command: &[&JournalRow],
 ) -> Result<(), StoreError> {
-    let codex = validate_confirmed_session_prefix(watermark)?;
-    let key = watermark.stable_key();
-    let current = state.source_watermarks.get(&key).map(|(value, _)| value);
+    let current = state
+        .source_watermarks
+        .get(&watermark.stable_key())
+        .map(|(value, _)| value);
     let mut receipt = None;
     for row in command {
         let JournalPayload::SourceReceiptRecorded(value) = row.payload()? else {
@@ -11141,51 +12459,231 @@ fn validate_source_ingest_watermark(
             return Err(StoreError::StoreCorrupt);
         }
     }
+    let metadata = session_import_current_for_source(
+        &state.session_imports,
+        watermark.source_instance_id.as_str(),
+    );
+    validate_split_receipt_scope(
+        watermark,
+        receipt.as_ref(),
+        metadata,
+        &state.worktree_snapshots,
+        &state.worktrees,
+    )?;
+    validate_source_ingest_watermark_transition(current, watermark, receipt.as_ref(), metadata)
+}
+
+fn validate_source_ingest_watermark_admission(
+    state: &JournalAdmissionState,
+    watermark: &SourceIngestWatermark,
+    command: &[&JournalRow],
+) -> Result<(), StoreError> {
+    let current = state
+        .source_watermarks
+        .get(watermark.source_instance_id.as_str())
+        .and_then(|values| values.revisions.get(&watermark.source_revision));
+    let mut receipt = None;
+    for row in command {
+        let JournalPayload::SourceReceiptRecorded(value) = row.payload()? else {
+            continue;
+        };
+        if value.source_instance_id == watermark.source_instance_id
+            && value.source_revision == watermark.source_revision
+            && receipt.replace(*value).is_some()
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+    }
+    let metadata = session_import_current_for_source(
+        &state.session_imports,
+        watermark.source_instance_id.as_str(),
+    );
+    validate_split_receipt_scope(
+        watermark,
+        receipt.as_ref(),
+        metadata,
+        &state.worktree_snapshots,
+        &state.worktrees,
+    )?;
+    validate_source_ingest_watermark_transition(current, watermark, receipt.as_ref(), metadata)
+}
+
+fn validate_source_ingest_watermark_transition(
+    current: Option<&SourceIngestWatermark>,
+    watermark: &SourceIngestWatermark,
+    receipt: Option<&SourceReceipt>,
+    metadata: Option<&crate::session_import::SessionImportCurrent>,
+) -> Result<(), StoreError> {
+    let codex = validate_confirmed_session_prefix(watermark)?;
     if let Some(current) = current {
-        match watermark.source_sequence.cmp(&current.source_sequence) {
-            std::cmp::Ordering::Less if codex => return Err(StoreError::StoreCorrupt),
-            std::cmp::Ordering::Less => {}
-            std::cmp::Ordering::Equal => {
-                if watermark == current && receipt.is_none() {
-                    return Ok(());
-                }
-                if codex {
-                    return Err(StoreError::StoreCorrupt);
-                }
+        validate_confirmed_session_prefix(current)?;
+        if current.source_instance_id != watermark.source_instance_id
+            || current.source_revision != watermark.source_revision
+        {
+            return Err(StoreError::StoreCorrupt);
+        }
+        if codex && (current.earlier_prefix.is_some() || watermark.earlier_prefix.is_some()) {
+            if watermark.source_sequence < current.source_sequence {
+                return Err(StoreError::StoreCorrupt);
             }
-            std::cmp::Ordering::Greater => {}
+            if watermark == current && receipt.is_none() {
+                return Ok(());
+            }
+        } else {
+            match watermark.source_sequence.cmp(&current.source_sequence) {
+                std::cmp::Ordering::Less if codex => return Err(StoreError::StoreCorrupt),
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    if watermark == current && receipt.is_none() {
+                        return Ok(());
+                    }
+                    if codex {
+                        return Err(StoreError::StoreCorrupt);
+                    }
+                }
+                std::cmp::Ordering::Greater => {}
+            }
         }
     }
     let receipt = receipt.ok_or(StoreError::StoreCorrupt)?;
-    if receipt.source_sequence != watermark.source_sequence {
+    if receipt.source_instance_id != watermark.source_instance_id
+        || receipt.source_revision != watermark.source_revision
+    {
         return Err(StoreError::StoreCorrupt);
     }
     if !codex {
+        if receipt.source_sequence != watermark.source_sequence {
+            return Err(StoreError::StoreCorrupt);
+        }
         return Ok(());
     }
     let range = receipt
         .source_byte_range
         .as_ref()
         .ok_or(StoreError::StoreCorrupt)?;
-    let previous = if let Some(current) = current {
-        if range.start != current.source_sequence {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Some(
-            current
-                .confirmed_prefix_digest
-                .clone()
-                .ok_or(StoreError::StoreCorrupt)?,
-        )
-    } else {
-        if range.start != 0 {
-            return Err(StoreError::StoreCorrupt);
-        }
-        None
-    };
-    if range.end != watermark.source_sequence || range.end <= range.start {
+    if receipt.source_sequence != range.end || range.end <= range.start {
         return Err(StoreError::StoreCorrupt);
     }
+    let source_is_current =
+        metadata.is_some_and(|value| value.metadata.source_revision == watermark.source_revision);
+    let origin = metadata
+        .filter(|value| value.metadata.source_revision == watermark.source_revision)
+        .and_then(|value| value.metadata.prospective_origin.as_ref());
+    let (previous_digest, expected_digest) = match (
+        &watermark.earlier_prefix,
+        current.and_then(|value| value.earlier_prefix.as_ref()),
+    ) {
+        (None, None) => {
+            if origin.is_some() || current.is_some_and(|value| value.earlier_prefix.is_some()) {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let previous = if let Some(current) = current {
+                if range.start != current.source_sequence {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                Some(
+                    current
+                        .confirmed_prefix_digest
+                        .clone()
+                        .ok_or(StoreError::StoreCorrupt)?,
+                )
+            } else {
+                if range.start != 0 {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                None
+            };
+            if range.end != watermark.source_sequence {
+                return Err(StoreError::StoreCorrupt);
+            }
+            (previous, watermark.confirmed_prefix_digest.as_deref())
+        }
+        (Some(prefix), None) => {
+            if current.is_some()
+                || !source_is_current
+                || !origin.is_some_and(|value| value.record_start == Some(prefix.fence_byte))
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if range.start == prefix.fence_byte && range.end > range.start {
+                if prefix.through_byte != 0
+                    || prefix.digest.is_some()
+                    || watermark.source_sequence != range.end
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (None, watermark.confirmed_prefix_digest.as_deref())
+            } else if range.start == 0 && range.end <= prefix.fence_byte {
+                if watermark.source_sequence != prefix.fence_byte
+                    || prefix.through_byte != range.end
+                    || prefix.digest.is_none()
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                if watermark.confirmed_prefix_digest.is_some() {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (None, prefix.digest.as_deref())
+            } else {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        (Some(next_prefix), Some(previous_prefix)) => {
+            if !source_is_current
+                || !origin
+                    .is_some_and(|value| value.record_start == Some(previous_prefix.fence_byte))
+                || next_prefix.fence_byte != previous_prefix.fence_byte
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            let suffix_advanced = watermark.source_sequence > current.unwrap().source_sequence;
+            let prefix_advanced = next_prefix.through_byte > previous_prefix.through_byte;
+            if suffix_advanced == prefix_advanced {
+                return Err(StoreError::StoreCorrupt);
+            }
+            if suffix_advanced {
+                if range.start != current.unwrap().source_sequence
+                    || range.start < previous_prefix.fence_byte
+                    || range.end != watermark.source_sequence
+                    || next_prefix.through_byte != previous_prefix.through_byte
+                    || next_prefix.digest != previous_prefix.digest
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (
+                    current.unwrap().confirmed_prefix_digest.clone(),
+                    watermark.confirmed_prefix_digest.as_deref(),
+                )
+            } else {
+                if range.start != previous_prefix.through_byte
+                    || range.end != next_prefix.through_byte
+                    || range.end > previous_prefix.fence_byte
+                    || watermark.source_sequence != current.unwrap().source_sequence
+                    || watermark.confirmed_prefix_digest != current.unwrap().confirmed_prefix_digest
+                {
+                    return Err(StoreError::StoreCorrupt);
+                }
+                (
+                    previous_prefix.digest.clone(),
+                    next_prefix.digest.as_deref(),
+                )
+            }
+        }
+        (None, Some(_)) => return Err(StoreError::StoreCorrupt),
+    };
+    let digest = session_import_prefix_digest(watermark, range, previous_digest, &receipt.cas_ref)?;
+    if expected_digest != Some(digest.as_str()) {
+        return Err(StoreError::StoreCorrupt);
+    }
+    Ok(())
+}
+
+fn session_import_prefix_digest(
+    watermark: &SourceIngestWatermark,
+    range: &evertrace_domain::evidence::EvidenceByteRange,
+    previous: Option<String>,
+    cas_ref: &str,
+) -> Result<String, StoreError> {
     let digest = sha256(
         "session_import_confirmed_prefix",
         1,
@@ -11195,24 +12693,50 @@ fn validate_source_ingest_watermark(
             CanonicalValue::Integer(i128::from(range.start)),
             CanonicalValue::Integer(i128::from(range.end)),
             previous.map_or(CanonicalValue::Null, CanonicalValue::String),
-            CanonicalValue::String(receipt.cas_ref),
+            CanonicalValue::String(cas_ref.to_owned()),
         ]),
     )
     .map_err(|_| StoreError::StoreCorrupt)?;
-    let digest = hex(&digest);
-    if watermark.confirmed_prefix_digest.as_deref() != Some(digest.as_str()) {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok(())
+    Ok(hex(&digest))
 }
 
 fn validate_confirmed_session_prefix(
     watermark: &SourceIngestWatermark,
 ) -> Result<bool, StoreError> {
-    let instance = watermark.source_instance_id.as_str();
-    let codex = crate::session_import::is_session_import_source(instance);
-    match (codex, watermark.confirmed_prefix_digest.is_some()) {
-        (true, true) | (false, false) => Ok(codex),
+    let codex =
+        crate::session_import::is_session_import_source(watermark.source_instance_id.as_str());
+    let valid_digest = |digest: &str| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    if watermark
+        .confirmed_prefix_digest
+        .as_deref()
+        .is_some_and(|digest| !valid_digest(digest))
+    {
+        return Err(StoreError::StoreCorrupt);
+    }
+    match (codex, watermark.earlier_prefix.as_ref()) {
+        (false, None) if watermark.confirmed_prefix_digest.is_none() => Ok(false),
+        (false, _) => Err(StoreError::StoreCorrupt),
+        (true, None) if watermark.confirmed_prefix_digest.is_some() => Ok(true),
+        (true, Some(prefix)) => {
+            if prefix.through_byte > prefix.fence_byte
+                || prefix.fence_byte > watermark.source_sequence
+                || prefix
+                    .digest
+                    .as_deref()
+                    .is_some_and(|digest| !valid_digest(digest))
+                || (prefix.through_byte == 0) != prefix.digest.is_none()
+                || (prefix.fence_byte == watermark.source_sequence)
+                    != watermark.confirmed_prefix_digest.is_none()
+            {
+                return Err(StoreError::StoreCorrupt);
+            }
+            Ok(true)
+        }
         _ => Err(StoreError::StoreCorrupt),
     }
 }
@@ -12303,7 +13827,7 @@ impl ReducerState {
     }
 
     fn from_current_rows(rows: &[ObjectRow], checkpoint_frontier: u64) -> Result<Self, StoreError> {
-        let state = Self::decode_current_rows(rows, checkpoint_frontier)?;
+        let state = Self::decode_current_rows(rows, checkpoint_frontier, None)?;
         let canonical = state.clone().into_snapshot(checkpoint_frontier)?;
         if canonical.rows != rows {
             return Err(StoreError::Projection);
@@ -12314,6 +13838,7 @@ impl ReducerState {
     fn decode_current_rows(
         rows: &[ObjectRow],
         checkpoint_frontier: u64,
+        source_facts: Option<&SourceFactsRef<'_>>,
     ) -> Result<Self, StoreError> {
         let checkpoints = rows
             .iter()
@@ -12378,6 +13903,17 @@ impl ReducerState {
             }
             state.restore_row(row, payload)?;
         }
+        if let Some(source_facts) = source_facts {
+            if rows.iter().any(|row| {
+                matches!(
+                    row.object_kind.as_deref(),
+                    Some("source_receipt" | "source_observation" | "evidence_surface")
+                )
+            }) {
+                return Err(StoreError::StoreCorrupt);
+            }
+            state.restore_source_prefix(source_facts, checkpoint_frontier)?;
+        }
         state.deletions.validate_restored()?;
         if state.session_imports.values().any(|current| {
             current
@@ -12391,6 +13927,178 @@ impl ReducerState {
         state.scope_purges.validate_restored()?;
         state.rebuild_revision_currents()?;
         Ok(state)
+    }
+
+    /// The output rows this closed capture command can have changed, taken
+    /// from the final reduced state with the complete projection's own row
+    /// constructors. The command payload is never a substitute for the final
+    /// winner (for example a smaller source watermark that does not replace
+    /// the persisted one).
+    fn capture_delta_rows(
+        &self,
+        payloads: &[JournalPayload],
+    ) -> Result<Vec<ObjectRow>, StoreError> {
+        let mut rows = Vec::new();
+        for payload in payloads {
+            let row = match payload {
+                JournalPayload::SourceReceiptRecorded(value) => {
+                    let (value, seq) = self
+                        .source_receipts
+                        .get(&value.source_receipt_id)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    source_receipt_row(value.as_ref(), *seq)?
+                }
+                JournalPayload::SourceObservationRecorded(value) => {
+                    let (value, seq) = self
+                        .source_observations
+                        .get(&value.source_observation_id)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    source_observation_row(value.as_ref(), *seq)?
+                }
+                JournalPayload::EvidenceSurfaceRecorded(value) => {
+                    let (value, seq) = self
+                        .evidence_surfaces
+                        .get(&value.source_observation_revision_ref)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    surface_row(value.source_observation_revision_ref, value.as_ref(), *seq)?
+                }
+                JournalPayload::SourceIngestWatermark(value) => {
+                    let key = value.stable_key();
+                    let (value, seq) = self
+                        .source_watermarks
+                        .get(&key)
+                        .ok_or(StoreError::StoreCorrupt)?;
+                    runtime_row(
+                        format!("runtime:watermark:source:{key}"),
+                        ObjectRowClass::Runtime,
+                        &JournalPayload::SourceIngestWatermark(value.clone()),
+                        *seq,
+                    )?
+                }
+                JournalPayload::DirtyTarget(value) => {
+                    let key = value.stable_key();
+                    let (value, seq) = self.dirty.get(&key).ok_or(StoreError::StoreCorrupt)?;
+                    runtime_row(
+                        format!("runtime:dirty:{key}"),
+                        ObjectRowClass::Runtime,
+                        &JournalPayload::DirtyTarget(value.clone()),
+                        *seq,
+                    )?
+                }
+                _ => return Err(StoreError::StoreCorrupt),
+            };
+            rows.push(row);
+        }
+        rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        rows.dedup_by(|left, right| left.row_id == right.row_id);
+        Ok(rows)
+    }
+
+    fn restore_source_prefix(
+        &mut self,
+        facts: &SourceFactsRef<'_>,
+        checkpoint_frontier: u64,
+    ) -> Result<(), StoreError> {
+        for (value, seq) in facts
+            .source_receipts
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint_frontier)
+        {
+            JournalPayloadRef::Receipt(value.as_ref())
+                .validate()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let fields = source_receipt_parts(value.as_ref()).0;
+            let row = evidence_object_row_fields(fields, *seq);
+            if self.restore_source_receipt(&row, Arc::clone(value))? {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        for (value, seq) in facts
+            .source_observations
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint_frontier)
+        {
+            JournalPayloadRef::Observation(value.as_ref())
+                .validate()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let fields = source_observation_parts(value.as_ref()).0;
+            let row = evidence_object_row_fields(fields, *seq);
+            if self.restore_source_observation(&row, Arc::clone(value))? {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        for (value, seq) in facts
+            .evidence_surfaces
+            .values()
+            .filter(|(_, seq)| *seq <= checkpoint_frontier)
+        {
+            JournalPayloadRef::Surface(value.as_ref())
+                .validate()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let (row, _) =
+                surface_row_parts(value.source_observation_revision_ref, value.as_ref(), *seq);
+            if self.restore_evidence_surface(&row, Arc::clone(value))? {
+                return Err(StoreError::StoreCorrupt);
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_source_receipt(
+        &mut self,
+        row: &ObjectRow,
+        value: Arc<SourceReceipt>,
+    ) -> Result<bool, StoreError> {
+        let id = value.source_receipt_id;
+        let fields = evidence_fields(
+            format!("object:evidence:source_receipt:{id}"),
+            "source_receipt",
+            id.to_string(),
+            id.to_string(),
+            value.repository_instance_id.map(|id| id.to_string()),
+            value.worktree_instance_id.map(|id| id.to_string()),
+            value.task_id.map(|id| id.to_string()),
+        );
+        require_evidence_object_row(row, &fields)?;
+        Ok(self
+            .source_receipts
+            .insert(id, (value, row.source_event_seq))
+            .is_some())
+    }
+
+    fn restore_source_observation(
+        &mut self,
+        row: &ObjectRow,
+        value: Arc<SourceObservation>,
+    ) -> Result<bool, StoreError> {
+        let id = value.source_observation_id;
+        let fields = evidence_fields(
+            format!("object:evidence:source_observation:{id}"),
+            "source_observation",
+            id.to_string(),
+            id.to_string(),
+            None,
+            None,
+            None,
+        );
+        require_evidence_object_row(row, &fields)?;
+        Ok(self
+            .source_observations
+            .insert(id, (value, row.source_event_seq))
+            .is_some())
+    }
+
+    fn restore_evidence_surface(
+        &mut self,
+        row: &ObjectRow,
+        value: Arc<EvidenceSurface>,
+    ) -> Result<bool, StoreError> {
+        let id = value.source_observation_revision_ref;
+        require_surface_row(row, value.as_ref())?;
+        Ok(self
+            .evidence_surfaces
+            .insert(id, (value, row.source_event_seq))
+            .is_some())
     }
 
     fn restore_row(&mut self, row: &ObjectRow, payload: JournalPayload) -> Result<(), StoreError> {
@@ -12710,39 +14418,10 @@ impl ReducerState {
                     .is_some()
             }
             JournalPayload::SourceReceiptRecorded(value) => {
-                let value = *value;
-                let fields = evidence_fields(
-                    format!("object:evidence:source_receipt:{}", value.source_receipt_id),
-                    "source_receipt",
-                    value.source_receipt_id.to_string(),
-                    value.source_receipt_id.to_string(),
-                    value.repository_instance_id.map(|id| id.to_string()),
-                    value.worktree_instance_id.map(|id| id.to_string()),
-                    value.task_id.map(|id| id.to_string()),
-                );
-                require_evidence_object_row(row, &fields)?;
-                self.source_receipts
-                    .insert(value.source_receipt_id, (value, row.source_event_seq))
-                    .is_some()
+                self.restore_source_receipt(row, Arc::new(*value))?
             }
             JournalPayload::SourceObservationRecorded(value) => {
-                let value = *value;
-                let fields = evidence_fields(
-                    format!(
-                        "object:evidence:source_observation:{}",
-                        value.source_observation_id
-                    ),
-                    "source_observation",
-                    value.source_observation_id.to_string(),
-                    value.source_observation_id.to_string(),
-                    None,
-                    None,
-                    None,
-                );
-                require_evidence_object_row(row, &fields)?;
-                self.source_observations
-                    .insert(value.source_observation_id, (value, row.source_event_seq))
-                    .is_some()
+                self.restore_source_observation(row, Arc::new(*value))?
             }
             JournalPayload::SourceIngestWatermark(value) => {
                 let key = value.stable_key();
@@ -12756,14 +14435,7 @@ impl ReducerState {
                     .is_some()
             }
             JournalPayload::EvidenceSurfaceRecorded(value) => {
-                let value = *value;
-                require_surface_row(row, &value)?;
-                self.evidence_surfaces
-                    .insert(
-                        value.source_observation_revision_ref,
-                        (value, row.source_event_seq),
-                    )
-                    .is_some()
+                self.restore_evidence_surface(row, Arc::new(*value))?
             }
             JournalPayload::HostOccurrenceNormalized(value) => {
                 let value = *value;
@@ -13205,7 +14877,66 @@ impl ReducerState {
         Ok(ProjectionSnapshot { frontier, rows })
     }
 
-    fn into_rows(mut self) -> Result<Vec<ObjectRow>, StoreError> {
+    fn can_emit_current_facts(&self) -> bool {
+        self.deletions.events().next().is_none()
+            && self.scope_purges.events().next().is_none()
+            && self.repository_closures.is_empty()
+    }
+
+    fn preserves_source_prefix(&self, facts: &SourceFactsRef<'_>, checkpoint: u64) -> bool {
+        fn preserves<K: Ord, T>(
+            old: &BTreeMap<K, (Arc<T>, u64)>,
+            current: &BTreeMap<K, (Arc<T>, u64)>,
+            checkpoint: u64,
+        ) -> bool {
+            old.iter()
+                .filter(|(_, (_, seq))| *seq <= checkpoint)
+                .all(|(key, (value, seq))| {
+                    current.get(key).is_some_and(|(current, current_seq)| {
+                        current_seq == seq && Arc::ptr_eq(value, current)
+                    })
+                })
+        }
+
+        preserves(facts.source_receipts, &self.source_receipts, checkpoint)
+            && preserves(
+                facts.source_observations,
+                &self.source_observations,
+                checkpoint,
+            )
+            && preserves(facts.evidence_surfaces, &self.evidence_surfaces, checkpoint)
+    }
+
+    fn into_current_facts(mut self, frontier: u64) -> Result<CurrentFacts, StoreError> {
+        self.validate_evidence_relations()?;
+        if !self.can_emit_current_facts() {
+            return Err(StoreError::Projection);
+        }
+        let source_receipts = std::mem::take(&mut self.source_receipts);
+        let source_observations = std::mem::take(&mut self.source_observations);
+        let evidence_surfaces = std::mem::take(&mut self.evidence_surfaces);
+        let mut other_rows = self.into_rows_with_source_rows(false)?;
+        other_rows.push(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION));
+        other_rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        let facts = CurrentFacts {
+            frontier,
+            other_rows,
+            source_receipts,
+            source_observations,
+            evidence_surfaces,
+        };
+        facts.validate_frontier()?;
+        Ok(facts)
+    }
+
+    fn into_rows(self) -> Result<Vec<ObjectRow>, StoreError> {
+        self.into_rows_with_source_rows(true)
+    }
+
+    fn into_rows_with_source_rows(
+        mut self,
+        include_source_rows: bool,
+    ) -> Result<Vec<ObjectRow>, StoreError> {
         self.close_deleted_product_state();
         let repository_closures = self
             .repository_closures
@@ -13241,6 +14972,8 @@ impl ReducerState {
         )?);
         rows.extend(self.s23.rows(&self.atom_revisions, PROJECTION_GENERATION)?);
         rows.extend(self.synthesis.rows()?);
+        let mut payload_blocks = crate::objects::RowPayloadBlockBuilder::default();
+        let mut payload_scratch = Vec::new();
         for (migration, (payload, seq)) in self.migrations {
             rows.push(runtime_row(
                 format!("projection:migration:{migration}"),
@@ -13321,11 +15054,27 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (_, (value, seq)) in self.source_receipts {
-            rows.push(source_receipt_row(value, seq)?);
-        }
-        for (_, (value, seq)) in self.source_observations {
-            rows.push(source_observation_row(value, seq)?);
+        if include_source_rows {
+            for (_, (value, seq)) in self.source_receipts {
+                let (fields, payload) = source_receipt_parts(value.as_ref());
+                push_canonical_row(
+                    &mut rows,
+                    &mut payload_blocks,
+                    evidence_object_row_fields(fields, seq),
+                    &payload,
+                    &mut payload_scratch,
+                )?;
+            }
+            for (_, (value, seq)) in self.source_observations {
+                let (fields, payload) = source_observation_parts(value.as_ref());
+                push_canonical_row(
+                    &mut rows,
+                    &mut payload_blocks,
+                    evidence_object_row_fields(fields, seq),
+                    &payload,
+                    &mut payload_scratch,
+                )?;
+            }
         }
         for (key, (value, seq)) in self.source_watermarks {
             rows.push(runtime_row(
@@ -13335,8 +15084,17 @@ impl ReducerState {
                 seq,
             )?);
         }
-        for (id, (value, seq)) in self.evidence_surfaces {
-            rows.push(surface_row(id, value, seq)?);
+        if include_source_rows {
+            for (id, (value, seq)) in self.evidence_surfaces {
+                let (row, payload) = surface_row_parts(id, value.as_ref(), seq);
+                push_canonical_row(
+                    &mut rows,
+                    &mut payload_blocks,
+                    row,
+                    &payload,
+                    &mut payload_scratch,
+                )?;
+            }
         }
         for ((id, revision), (value, seq)) in self.host_occurrence_revisions {
             let mut row = physical_object_row(
@@ -13679,6 +15437,8 @@ impl ReducerState {
         }
         rows.extend(self.deletions.rows()?);
         rows.extend(self.scope_purges.rows()?);
+        drop(payload_scratch);
+        payload_blocks.finish(&mut rows)?;
         filter_product_rows(
             rows,
             &self.deletions,
@@ -13744,6 +15504,15 @@ impl ReducerState {
     fn validate_evidence_relations(&self) -> Result<(), StoreError> {
         self.inventory
             .validate_relations(&self.repositories, &self.worktrees)?;
+        for current in self.session_imports.values() {
+            validate_prospective_origin_context(
+                &current.metadata,
+                &self.worktree_snapshots,
+                &self.worktrees,
+                &self.repositories,
+            )
+            .map_err(|_| StoreError::StoreCorrupt)?;
+        }
         self.inventory
             .validate_procedure_refs(self.proposal_revisions.values().map(|(value, _)| value))?;
         validate_source_local_relations(
@@ -14220,13 +15989,30 @@ fn runtime_row(
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
 }
 
-fn source_receipt_row(value: SourceReceipt, seq: u64) -> Result<ObjectRow, StoreError> {
+fn push_canonical_row(
+    rows: &mut Vec<ObjectRow>,
+    payload_blocks: &mut crate::objects::RowPayloadBlockBuilder,
+    row: ObjectRow,
+    payload: &impl serde::Serialize,
+    scratch: &mut Vec<u8>,
+) -> Result<(), StoreError> {
+    scratch.clear();
+    serde_json::to_writer(&mut *scratch, payload).map_err(|_| StoreError::Serialization)?;
+    let text = std::str::from_utf8(scratch).map_err(|_| StoreError::Serialization)?;
+    payload_blocks.push_text(rows, row, text)?;
+    if scratch.capacity() > crate::objects::OBJECT_ROW_PAYLOAD_BLOCK_BYTES {
+        *scratch = Vec::new();
+    }
+    Ok(())
+}
+
+fn source_receipt_parts(value: &SourceReceipt) -> (EvidenceRowFields, JournalPayloadRef<'_>) {
     let id = value.source_receipt_id;
     let fields = evidence_fields(
         format!("object:evidence:source_receipt:{id}"),
@@ -14237,14 +16023,17 @@ fn source_receipt_row(value: SourceReceipt, seq: u64) -> Result<ObjectRow, Store
         value.worktree_instance_id.map(|id| id.to_string()),
         value.task_id.map(|id| id.to_string()),
     );
-    evidence_object_row(
-        fields,
-        &JournalPayload::SourceReceiptRecorded(Box::new(value)),
-        seq,
-    )
+    (fields, JournalPayloadRef::Receipt(value))
 }
 
-fn source_observation_row(value: SourceObservation, seq: u64) -> Result<ObjectRow, StoreError> {
+fn source_receipt_row(value: &SourceReceipt, seq: u64) -> Result<ObjectRow, StoreError> {
+    let (fields, payload) = source_receipt_parts(value);
+    evidence_object_row(fields, &payload, seq)
+}
+
+fn source_observation_parts(
+    value: &SourceObservation,
+) -> (EvidenceRowFields, JournalPayloadRef<'_>) {
     let id = value.source_observation_id;
     let fields = evidence_fields(
         format!("object:evidence:source_observation:{id}"),
@@ -14255,19 +16044,30 @@ fn source_observation_row(value: SourceObservation, seq: u64) -> Result<ObjectRo
         None,
         None,
     );
-    evidence_object_row(
-        fields,
-        &JournalPayload::SourceObservationRecorded(Box::new(value)),
-        seq,
-    )
+    (fields, JournalPayloadRef::Observation(value))
+}
+
+fn source_observation_row(value: &SourceObservation, seq: u64) -> Result<ObjectRow, StoreError> {
+    let (fields, payload) = source_observation_parts(value);
+    evidence_object_row(fields, &payload, seq)
 }
 
 fn evidence_object_row(
     fields: EvidenceRowFields,
-    payload: &JournalPayload,
+    payload: &impl serde::Serialize,
     source_event_seq: u64,
 ) -> Result<ObjectRow, StoreError> {
-    Ok(ObjectRow {
+    let mut row = evidence_object_row_fields(fields, source_event_seq);
+    row.payload_json = Some(
+        serde_json::to_string(payload)
+            .map_err(|_| StoreError::Serialization)?
+            .into(),
+    );
+    Ok(row)
+}
+
+fn evidence_object_row_fields(fields: EvidenceRowFields, source_event_seq: u64) -> ObjectRow {
+    ObjectRow {
         row_id: fields.row_id,
         row_kind: ObjectRowKind::Data,
         row_class: Some(ObjectRowClass::Object),
@@ -14286,10 +16086,10 @@ fn evidence_object_row(
         task_id: fields.task_id,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: None,
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
-    })
+    }
 }
 
 fn physical_object_row(
@@ -14319,7 +16119,7 @@ fn physical_object_row(
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14443,7 +16243,7 @@ fn semantic_atom_row(
         task_id: atom.scope.task_id().map(|id| id.to_string()),
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14476,7 +16276,7 @@ fn semantic_proposal_row(
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14551,7 +16351,7 @@ fn work_identity_row(
         task_id,
         workstream_id,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -14559,10 +16359,26 @@ fn work_identity_row(
 
 fn surface_row(
     id: SourceObservationId,
-    surface: EvidenceSurface,
+    surface: &EvidenceSurface,
     source_event_seq: u64,
 ) -> Result<ObjectRow, StoreError> {
-    Ok(ObjectRow {
+    let (mut row, payload) = surface_row_parts(id, surface, source_event_seq);
+    row.payload_json = Some(payload.canonical_json()?.into());
+    Ok(row)
+}
+
+fn surface_row_parts(
+    id: SourceObservationId,
+    surface: &EvidenceSurface,
+    source_event_seq: u64,
+) -> (ObjectRow, JournalPayloadRef<'_>) {
+    let repository_id = surface
+        .repository_instance_id
+        .map(|value| value.to_string());
+    let worktree_id = surface.worktree_instance_id.map(|value| value.to_string());
+    let task_id = surface.task_id.map(|value| value.to_string());
+    let payload = JournalPayloadRef::Surface(surface);
+    let row = ObjectRow {
         row_id: format!("projection:evidence_surface:{id}"),
         row_kind: ObjectRowKind::Data,
         row_class: Some(ObjectRowClass::Projection),
@@ -14576,19 +16392,16 @@ fn surface_row(
         publication_state: None,
         support_state: None,
         project_id: None,
-        repository_id: surface
-            .repository_instance_id
-            .map(|value| value.to_string()),
-        worktree_id: surface.worktree_instance_id.map(|value| value.to_string()),
-        task_id: surface.task_id.map(|value| value.to_string()),
+        repository_id,
+        worktree_id,
+        task_id,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(
-            JournalPayload::EvidenceSurfaceRecorded(Box::new(surface)).canonical_json()?,
-        ),
+        payload_json: None,
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
-    })
+    };
+    (row, payload)
 }
 
 fn source_revision_key(value: &SourceRevisionRecorded) -> String {
@@ -14606,14 +16419,14 @@ fn source_revision_key(value: &SourceRevisionRecorded) -> String {
 // the same writer call; this is never retained in the writer or a cache.
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct ProjectionJournalDelta {
-    journal_version: u64,
+    journal_epoch: u64,
     checkpoint: u64,
     rows: Vec<JournalRow>,
 }
 
 impl ProjectionJournalDelta {
-    pub(crate) fn at_version(self, journal_version: u64) -> Option<Self> {
-        (self.journal_version == journal_version).then_some(self)
+    pub(crate) fn at_epoch(self, journal_epoch: u64) -> Option<Self> {
+        (self.journal_epoch == journal_epoch).then_some(self)
     }
 
     pub(crate) fn frontier(&self) -> Option<u64> {
@@ -14623,99 +16436,281 @@ impl ProjectionJournalDelta {
     pub(crate) fn rows_after(&self, checkpoint: u64) -> Option<&[JournalRow]> {
         (checkpoint == self.checkpoint).then_some(self.rows.as_slice())
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(journal_epoch: u64, checkpoint: u64, rows: Vec<JournalRow>) -> Self {
+        Self {
+            journal_epoch,
+            checkpoint,
+            rows,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct ProjectionWorker {
-    journal: Table,
-    objects: Table,
+    sqlite: SqliteHandle,
+}
+
+pub(crate) enum ProjectionOutput {
+    Snapshot(ProjectionSnapshot),
+    CurrentFacts(CurrentFacts),
+}
+
+/// The objects result of one closed capture successor that committed only this
+/// command's changed rows instead of rematerializing every unchanged row. It
+/// is explicitly not a complete `ProjectionSnapshot`.
+pub(crate) struct CaptureObjectsUpdate {
+    pub frontier: u64,
+    pub base_frontier: u64,
+    pub objects_epoch: u64,
+    /// Complete runtime rows, decoded by the writer after L0002 succeeds, at
+    /// the same failure boundary as the ordinary complete path.
+    pub runtime_rows: Vec<ObjectRow>,
+    /// The truly changed data rows (without the checkpoint) for L0002.
+    pub changed_rows: Vec<ObjectRow>,
+    pub delta: ProjectionJournalDelta,
 }
 
 impl ProjectionWorker {
-    pub(crate) fn new(journal: Table, objects: Table) -> Self {
-        Self { journal, objects }
+    pub(crate) fn new(sqlite: SqliteHandle) -> Self {
+        Self { sqlite }
     }
 
     pub async fn catch_up(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(false, None, None).await?.0)
+        match self.catch_up_inner(false, None, None, None, false).await?.0 {
+            ProjectionOutput::Snapshot(snapshot) => Ok(snapshot),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
     }
 
+    #[cfg(test)]
     pub(crate) async fn catch_up_validated(
         &self,
-        // Old objects version/checkpoint and the confirmed committed journal frontier.
+        // Old objects epoch/checkpoint and the confirmed committed journal frontier.
         validated_current: Option<(u64, u64, u64)>,
-        appended_batch: Option<&arrow_array::RecordBatch>,
+        appended_rows: Option<&[JournalRow]>,
     ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        self.catch_up_inner(false, validated_current, appended_batch)
+        let (output, epoch, delta) = self
+            .catch_up_inner(false, validated_current, appended_rows, None, false)
+            .await?;
+        match output {
+            ProjectionOutput::Snapshot(snapshot) => Ok((snapshot, epoch, delta)),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
+    }
+
+    pub(crate) async fn catch_up_validated_with_source_facts(
+        &self,
+        validated_current: Option<(u64, u64, u64)>,
+        appended_rows: Option<&[JournalRow]>,
+        source_facts: Option<&SourceFactsRef<'_>>,
+    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
+        let (output, epoch, delta) = self
+            .catch_up_inner(false, validated_current, appended_rows, source_facts, false)
+            .await?;
+        match output {
+            ProjectionOutput::Snapshot(snapshot) => Ok((snapshot, epoch, delta)),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
+    }
+
+    pub(crate) async fn catch_up_validated_current_facts(
+        &self,
+        validated_current: Option<(u64, u64, u64)>,
+        appended_rows: Option<&[JournalRow]>,
+        source_facts: Option<&SourceFactsRef<'_>>,
+    ) -> Result<(CurrentFacts, u64, Option<ProjectionJournalDelta>), StoreError> {
+        let (output, epoch, delta) = self
+            .catch_up_inner(false, validated_current, appended_rows, source_facts, true)
+            .await?;
+        match output {
+            ProjectionOutput::CurrentFacts(facts) => Ok((facts, epoch, delta)),
+            ProjectionOutput::Snapshot(_) => Err(StoreError::StoreCorrupt),
+        }
+    }
+
+    /// Try the closed capture successor path. `Ok(None)` means the retained
+    /// single append is not eligible before any mutation; it is not an error
+    /// and the caller must run the ordinary complete algorithm.
+    pub(crate) async fn catch_up_capture_delta(
+        &self,
+        validated_current: (u64, u64, u64),
+        appended_rows: &[JournalRow],
+        source_facts: Option<&SourceFactsRef<'_>>,
+    ) -> Result<Option<CaptureObjectsUpdate>, StoreError> {
+        self.catch_up_capture_delta_inner(false, validated_current, appended_rows, source_facts)
             .await
     }
 
-    pub async fn reconciliation_frontier(
+    #[cfg(test)]
+    pub(crate) async fn catch_up_capture_delta_with_fault(
         &self,
-        limit: usize,
-    ) -> Result<ReconciliationFrontier, StoreError> {
-        self.catch_up().await?.reconciliation_frontier(limit)
+        validated_current: (u64, u64, u64),
+        appended_rows: &[JournalRow],
+    ) -> Result<Option<CaptureObjectsUpdate>, StoreError> {
+        self.catch_up_capture_delta_inner(true, validated_current, appended_rows, None)
+            .await
     }
 
-    pub async fn reconciliation_artifact_context(
+    async fn catch_up_capture_delta_inner(
         &self,
-        descriptors: &[ReconciliationArtifactDescriptor],
-        limit: usize,
-    ) -> Result<ReconciliationArtifactFrontier, StoreError> {
-        self.catch_up()
-            .await?
-            .reconciliation_artifact_context(descriptors, limit)
+        inject_before_commit_failure: bool,
+        validated_current: (u64, u64, u64),
+        appended_rows: &[JournalRow],
+        source_facts: Option<&SourceFactsRef<'_>>,
+    ) -> Result<Option<CaptureObjectsUpdate>, StoreError> {
+        let (current, journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
+            let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            let stamp = state.stamp()?;
+            let rows = if source_facts.is_some() {
+                state.object_rows_without_source_facts()?
+            } else {
+                state.object_rows()?
+            };
+            (
+                rows,
+                stamp.journal_epoch,
+                stamp.objects_epoch,
+                stamp.object_checkpoint,
+                stamp.frontier,
+            )
+        };
+        let checkpoint = current
+            .iter()
+            .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
+            .ok_or(StoreError::StoreCorrupt)?;
+        if checkpoint.source_event_seq != checkpoint_frontier {
+            return Err(StoreError::StoreCorrupt);
+        }
+        // The writer's published old input and the actual persisted objects
+        // must agree, and the command must end exactly at the physical
+        // frontier confirmed by that append.
+        let validated_frontier = Some(validated_current)
+            .filter(|(epoch, checkpoint, _)| {
+                *epoch == current_epoch && *checkpoint == checkpoint_frontier
+            })
+            .map(|(_, _, frontier)| frontier);
+        if validated_frontier != Some(committed_frontier) {
+            if source_facts.is_some() {
+                return Err(StoreError::StoreCorrupt);
+            }
+            return Ok(None);
+        }
+        let frontier = committed_frontier;
+        let delta = appended_rows.to_vec();
+        validate_delta(checkpoint_frontier, frontier, &delta)?;
+        let Some(payloads) = capture_delta_shape(&delta)? else {
+            return Ok(None);
+        };
+        if current
+            .iter()
+            .any(|row| row.object_kind.as_deref() == Some(synthesis::WIKI_PROJECTION_KIND))
+        {
+            return Ok(None);
+        }
+        let mut state =
+            ReducerState::decode_current_rows(&current, checkpoint_frontier, source_facts)?;
+        // Restored deletion and scope-purge ledgers can still suppress rows;
+        // only their absence lets this command's own rows be the whole delta.
+        if state.deletions.events().next().is_some() || state.scope_purges.events().next().is_some()
+        {
+            return Ok(None);
+        }
+        let mut admission = state.admission_state(checkpoint_frontier)?;
+        for batch in ordered_command_batches(&delta)? {
+            admission = admission.apply_row_batch_owned(&batch)?;
+            for row in &batch {
+                apply_event(&mut state, row, &batch)?;
+            }
+            state.validate_evidence_relations()?;
+        }
+        state.validate_evidence_relations()?;
+        let candidates = state.capture_delta_rows(&payloads)?;
+        let current_by_id = current
+            .iter()
+            .map(|row| (row.row_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        let changed_rows = candidates
+            .into_iter()
+            .filter(|row| current_by_id.get(row.row_id.as_str()).copied() != Some(row))
+            .collect::<Vec<_>>();
+        let mut committed_rows = changed_rows.clone();
+        committed_rows.push(ObjectRow::checkpoint(frontier, PROJECTION_GENERATION));
+        committed_rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+        if inject_before_commit_failure {
+            return Err(StoreError::Projection);
+        }
+        self.commit_rows(&committed_rows, ObjectReconcile::default(), None)?;
+        let committed_epoch = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .objects_epoch();
+        validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+        let runtime_rows = runtime_rows_with_upserts(current, &changed_rows);
+        Ok(Some(CaptureObjectsUpdate {
+            frontier,
+            base_frontier: checkpoint_frontier,
+            objects_epoch: committed_epoch,
+            runtime_rows,
+            changed_rows,
+            delta: ProjectionJournalDelta {
+                journal_epoch,
+                checkpoint: checkpoint_frontier,
+                rows: delta,
+            },
+        }))
     }
 
     async fn catch_up_inner(
         &self,
         inject_before_commit_failure: bool,
         validated_current: Option<(u64, u64, u64)>,
-        appended_batch: Option<&arrow_array::RecordBatch>,
-    ) -> Result<(ProjectionSnapshot, u64, Option<ProjectionJournalDelta>), StoreError> {
-        let journal_version = self
-            .journal
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        self.objects
-            .checkout_latest()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let current_version = self
-            .objects
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let current = validate_objects_table(&self.objects).await?;
-        if self
-            .objects
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?
-            != current_version
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
+        appended_rows: Option<&[JournalRow]>,
+        source_facts: Option<&SourceFactsRef<'_>>,
+        return_current_facts: bool,
+    ) -> Result<(ProjectionOutput, u64, Option<ProjectionJournalDelta>), StoreError> {
+        let (current, journal_epoch, current_epoch, checkpoint_frontier, committed_frontier) = {
+            let mut state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            let stamp = state.stamp()?;
+            let rows = if source_facts.is_some() {
+                state.object_rows_without_source_facts()?
+            } else {
+                state.object_rows()?
+            };
+            (
+                rows,
+                stamp.journal_epoch,
+                stamp.objects_epoch,
+                stamp.object_checkpoint,
+                stamp.frontier,
+            )
+        };
         let checkpoint = current
             .iter()
             .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
             .ok_or(StoreError::StoreCorrupt)?;
-        let checkpoint_frontier = checkpoint.source_event_seq;
+        if checkpoint.source_event_seq != checkpoint_frontier {
+            return Err(StoreError::StoreCorrupt);
+        }
         let validated_frontier = validated_current
-            .filter(|(version, checkpoint, _)| {
-                *version == current_version && *checkpoint == checkpoint_frontier
+            .filter(|(epoch, checkpoint, _)| {
+                *epoch == current_epoch && *checkpoint == checkpoint_frontier
             })
             .map(|(_, _, frontier)| frontier);
+        if source_facts.is_some() && validated_frontier.is_none() {
+            return Err(StoreError::StoreCorrupt);
+        }
         let journal_frontier = if let Some(frontier) = validated_frontier {
-            // The writer bound its published admission state to this native
-            // append version. The complete delta below must end at this exact
-            // frontier; reserved sequence numbers are not used as evidence.
+            // The writer bound its published admission state to this physical
+            // stamp. The complete delta below must end at this exact frontier;
+            // reserved sequence numbers are not used as evidence.
             frontier
         } else {
-            read_journal_frontier(&self.journal).await?
+            committed_frontier
         };
-        if checkpoint.source_event_seq > journal_frontier {
+        if checkpoint_frontier > journal_frontier {
             return Err(StoreError::StoreCorrupt);
         }
         if checkpoint_frontier == 0 && current.len() == 1 && journal_frontier > 0 {
@@ -14726,51 +16721,76 @@ impl ProjectionWorker {
             if inject_before_commit_failure {
                 return Err(StoreError::Projection);
             }
-            self.commit_rows(&expected.rows, true, true, true, true, false)
-                .await?;
-            let version = self
-                .objects
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            let persisted = validate_objects_table(&self.objects).await?;
-            if persisted != expected.rows
-                || self
-                    .objects
-                    .version()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?
-                    != version
-            {
+            self.commit_rows(
+                &expected.rows,
+                ObjectReconcile {
+                    recall: true,
+                    core: true,
+                    wiki: true,
+                    procedure_effect: true,
+                    all: true,
+                },
+                None,
+            )?;
+            let persisted = self
+                .sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .object_rows()?;
+            if persisted != expected.rows {
                 return Err(StoreError::Projection);
             }
-            return Ok((expected, version, None));
+            let committed_epoch = self
+                .sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .objects_epoch();
+            let output = if return_current_facts {
+                ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(expected)?)
+            } else {
+                ProjectionOutput::Snapshot(expected)
+            };
+            return Ok((output, committed_epoch, None));
         }
         let mut state = if validated_frontier.is_some() {
             // The writer already validated this exact old input before its
             // append. Decode it fully, but do not regenerate the same old rows.
             // Delta admission and the resulting snapshot are still validated.
-            ReducerState::decode_current_rows(&current, checkpoint_frontier)?
+            ReducerState::decode_current_rows(&current, checkpoint_frontier, source_facts)?
         } else {
             ReducerState::from_current_rows(&current, checkpoint_frontier)?
         };
-        let delta = if let Some(batch) = appended_batch.filter(|_| validated_frontier.is_some()) {
-            // Decode the exact immutable batch acknowledged by the native
-            // journal append, through the same decoder as a persisted read.
-            crate::journal::rows_from_batch(batch)?
+        let delta = if let Some(rows) = appended_rows.filter(|_| validated_frontier.is_some()) {
+            // The exact typed delta acknowledged by the physical journal
+            // commit, decoded through the same domain path as a persisted read.
+            rows.to_vec()
         } else {
-            read_journal_after(&self.journal, checkpoint_frontier).await?
+            self.sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .rows_after(checkpoint_frontier)?
         };
         validate_delta(checkpoint_frontier, journal_frontier, &delta)?;
         if delta.is_empty() {
-            return Ok((
-                ProjectionSnapshot {
+            let output = match (return_current_facts, source_facts) {
+                (true, Some(facts)) => ProjectionOutput::CurrentFacts(
+                    facts.current_facts_with_source_prefix(current, checkpoint_frontier)?,
+                ),
+                (true, None) => ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(
+                    ProjectionSnapshot {
+                        frontier: checkpoint_frontier,
+                        rows: current,
+                    },
+                )?),
+                (false, Some(facts)) => ProjectionOutput::Snapshot(
+                    facts.snapshot_with_source_prefix(current, checkpoint_frontier)?,
+                ),
+                (false, None) => ProjectionOutput::Snapshot(ProjectionSnapshot {
                     frontier: checkpoint_frontier,
                     rows: current,
-                },
-                current_version,
-                None,
-            ));
+                }),
+            };
+            return Ok((output, current_epoch, None));
         }
         let reconcile_core = delta.iter().any(|row| {
             matches!(
@@ -14816,12 +16836,86 @@ impl ProjectionWorker {
             }
             state.validate_evidence_relations()?;
         }
-        let expected = state.into_snapshot(journal_frontier)?;
         let ordinary_upsert = !reconcile_all
             && !reconcile_recall
             && !reconcile_core
             && !reconcile_wiki
             && !reconcile_procedure_effect;
+        let direct_facts = return_current_facts
+            && !reconcile_all
+            && source_facts.is_some_and(|facts| {
+                state.can_emit_current_facts()
+                    && state.preserves_source_prefix(facts, checkpoint_frontier)
+            });
+        if direct_facts {
+            let mut facts = state.into_current_facts(journal_frontier)?;
+            if ordinary_upsert {
+                validate_ordinary_upsert_rows(&current, facts.other_rows())?;
+            }
+            let current_by_id = current
+                .iter()
+                .map(|row| (row.row_id.as_str(), row))
+                .collect::<BTreeMap<_, _>>();
+            let mut changed = incremental_changed_rows(
+                facts.other_rows(),
+                &current_by_id,
+                reconcile_recall,
+                reconcile_core,
+                reconcile_wiki,
+                reconcile_procedure_effect,
+                None,
+            );
+            changed.extend(facts.source_rows_after(checkpoint_frontier)?);
+            changed.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+            if inject_before_commit_failure {
+                return Err(StoreError::Projection);
+            }
+            self.commit_rows(
+                &changed,
+                ObjectReconcile {
+                    recall: reconcile_recall,
+                    core: reconcile_core,
+                    wiki: reconcile_wiki,
+                    procedure_effect: reconcile_procedure_effect,
+                    all: false,
+                },
+                Some(checkpoint_frontier),
+            )?;
+            let committed_epoch = self
+                .sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .objects_epoch();
+            if ordinary_upsert {
+                validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            } else {
+                let persisted = self
+                    .sqlite
+                    .lock()
+                    .map_err(|_| StoreError::StoreCorrupt)?
+                    .object_rows_without_source_facts()?;
+                // Reconcile touches only non-source families. The old source
+                // prefix is physically bound; compare all typed source members,
+                // including new independently admitted values, without JSON.
+                if persisted.as_slice() != facts.other_rows()
+                    || !source_facts.is_some_and(|source| source.matches_current_sources(&facts))
+                {
+                    return Err(StoreError::Projection);
+                }
+                facts.other_rows = persisted;
+            }
+            return Ok((
+                ProjectionOutput::CurrentFacts(facts),
+                committed_epoch,
+                Some(ProjectionJournalDelta {
+                    journal_epoch,
+                    checkpoint: checkpoint_frontier,
+                    rows: delta,
+                }),
+            ));
+        }
+
+        let expected = state.into_snapshot(journal_frontier)?;
         if ordinary_upsert {
             validate_ordinary_upsert_rows(&current, &expected.rows)?;
         }
@@ -14831,80 +16925,84 @@ impl ProjectionWorker {
             .collect::<BTreeMap<_, _>>();
         let changed = (!reconcile_all).then(|| {
             incremental_changed_rows(
-                &expected,
+                &expected.rows,
                 &current_by_id,
                 reconcile_recall,
                 reconcile_core,
                 reconcile_wiki,
                 reconcile_procedure_effect,
+                source_facts
+                    .filter(|_| ordinary_upsert)
+                    .map(|_| checkpoint_frontier),
             )
         });
         if inject_before_commit_failure {
             return Err(StoreError::Projection);
         }
-        let committed_version = self
-            .commit_rows(
-                changed.as_deref().unwrap_or(&expected.rows),
-                reconcile_recall,
-                reconcile_core,
-                reconcile_wiki,
-                reconcile_procedure_effect,
-                reconcile_all,
-            )
-            .await?;
+        // The rows, deletions and checkpoint land in one physical transaction;
+        // a no-change commit leaves the family epoch untouched.
+        self.commit_rows(
+            changed.as_deref().unwrap_or(&expected.rows),
+            ObjectReconcile {
+                recall: reconcile_recall,
+                core: reconcile_core,
+                wiki: reconcile_wiki,
+                procedure_effect: reconcile_procedure_effect,
+                all: reconcile_all,
+            },
+            source_facts.map(|_| checkpoint_frontier),
+        )?;
+        let committed_epoch = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .objects_epoch();
         if ordinary_upsert {
-            validate_ordinary_commit_version(current_version, committed_version)?;
-            self.objects
-                .checkout_latest()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            if self
-                .objects
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                != committed_version
-            {
-                return Err(StoreError::Projection);
-            }
-            // The validated current rows are retained or replaced by changed rows;
-            // the same native commit writes those rows and the checkpoint. Its
-            // direct-successor version excludes a concurrent refresh/rebase.
+            validate_ordinary_commit_version(current_epoch, committed_epoch)?;
+            // The validated current rows are retained or replaced by changed
+            // rows; the same transaction wrote those rows and the checkpoint.
+            let output = if return_current_facts {
+                ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(expected)?)
+            } else {
+                ProjectionOutput::Snapshot(expected)
+            };
             return Ok((
-                expected,
-                committed_version,
+                output,
+                committed_epoch,
                 Some(ProjectionJournalDelta {
-                    journal_version,
+                    journal_epoch,
                     checkpoint: checkpoint_frontier,
                     rows: delta,
                 }),
             ));
         }
-        let version = self
-            .objects
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let persisted = validate_objects_table(&self.objects).await?;
-        let persisted_snapshot = ProjectionSnapshot {
-            frontier: expected.frontier,
-            rows: persisted,
+        let persisted_rows = {
+            let state = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            match source_facts {
+                Some(_) => state.object_rows_without_source_facts()?,
+                None => state.object_rows()?,
+            }
         };
-        if persisted_snapshot.rows != expected.rows
-            || self
-                .objects
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                != version
-        {
+        let persisted_snapshot = match source_facts {
+            Some(facts) => facts.snapshot_with_source_prefix(persisted_rows, expected.frontier)?,
+            None => ProjectionSnapshot {
+                frontier: expected.frontier,
+                rows: persisted_rows,
+            },
+        };
+        if persisted_snapshot.rows != expected.rows {
             return Err(StoreError::Projection);
         }
+        let output = if return_current_facts {
+            ProjectionOutput::CurrentFacts(CurrentFacts::from_full_snapshot(persisted_snapshot)?)
+        } else {
+            ProjectionOutput::Snapshot(persisted_snapshot)
+        };
         Ok((
-            persisted_snapshot,
-            version,
+            output,
+            committed_epoch,
             Some(ProjectionJournalDelta {
-                journal_version,
+                journal_epoch,
                 checkpoint: checkpoint_frontier,
                 rows: delta,
             }),
@@ -14913,18 +17011,41 @@ impl ProjectionWorker {
 
     #[cfg(test)]
     async fn catch_up_with_commit_fault(&self) -> Result<ProjectionSnapshot, StoreError> {
-        Ok(self.catch_up_inner(true, None, None).await?.0)
+        match self.catch_up_inner(true, None, None, None, false).await?.0 {
+            ProjectionOutput::Snapshot(snapshot) => Ok(snapshot),
+            ProjectionOutput::CurrentFacts(_) => Err(StoreError::StoreCorrupt),
+        }
     }
 
     pub async fn full_snapshot(&self) -> Result<ProjectionSnapshot, StoreError> {
-        reduce_journal(&read_all_journal_rows(&self.journal).await?)
+        let rows = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .rows()?;
+        reduce_journal(&rows)
     }
 
     pub(crate) async fn rebuild_for_restore(&self) -> Result<ProjectionSnapshot, StoreError> {
         let expected = self.full_snapshot().await?;
-        self.commit_rows(&expected.rows, true, true, true, true, true)
-            .await?;
-        if validate_objects_table(&self.objects).await? != expected.rows {
+        self.commit_rows(
+            &expected.rows,
+            ObjectReconcile {
+                recall: true,
+                core: true,
+                wiki: true,
+                procedure_effect: true,
+                all: true,
+            },
+            None,
+        )?;
+        if self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .object_rows()?
+            != expected.rows
+        {
             return Err(StoreError::Projection);
         }
         Ok(expected)
@@ -14934,7 +17055,11 @@ impl ProjectionWorker {
         &self,
         frontier: u64,
     ) -> Result<ProjectionSnapshot, StoreError> {
-        let rows = read_all_journal_rows(&self.journal).await?;
+        let rows = self
+            .sqlite
+            .lock()
+            .map_err(|_| StoreError::StoreCorrupt)?
+            .rows_until(frontier)?;
         if frontier > rows.last().map_or(0, |row| row.seq) {
             return Err(StoreError::InvalidInput);
         }
@@ -14945,52 +17070,23 @@ impl ProjectionWorker {
         reduce_journal(&rows[..end])
     }
 
-    async fn commit_rows(
+    fn commit_rows(
         &self,
         rows: &[ObjectRow],
-        reconcile_recall: bool,
-        reconcile_core: bool,
-        reconcile_wiki: bool,
-        reconcile_procedure_effect: bool,
-        reconcile_all: bool,
-    ) -> Result<u64, StoreError> {
-        let batch = objects_batch(rows)?;
-        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
-            RecordBatchIterator::new(vec![Ok(batch)], crate::objects::objects_schema()),
-        );
-        let mut merge = self.objects.merge_insert(&["row_id"]);
-        merge.when_matched_update_all(None);
-        merge.when_not_matched_insert_all();
-        if reconcile_all {
-            merge.when_not_matched_by_source_delete(None);
-        } else if reconcile_recall || reconcile_core || reconcile_wiki || reconcile_procedure_effect
-        {
-            let mut predicates = Vec::new();
-            if reconcile_recall {
-                predicates.push(format!(
-                    "object_kind = '{}'",
-                    recall_projection::RECALL_TRIGGER_INDEX_KIND
-                ));
+        reconcile: ObjectReconcile,
+        source_prefix_checkpoint: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let checkpoint = rows
+            .iter()
+            .find(|row| row.row_id == OBJECTS_CHECKPOINT_ID)
+            .ok_or(StoreError::StoreCorrupt)?;
+        let mut sqlite = self.sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+        match source_prefix_checkpoint {
+            Some(frontier) => {
+                sqlite.commit_object_rows_with_source_prefix(rows, reconcile, checkpoint, frontier)
             }
-            if reconcile_core {
-                predicates.push(format!("object_kind = '{}'", s23::CORE_PROJECTION_KIND));
-            }
-            if reconcile_wiki {
-                predicates.push(format!(
-                    "object_kind = '{}'",
-                    synthesis::WIKI_PROJECTION_KIND
-                ));
-            }
-            if reconcile_procedure_effect {
-                predicates.push("object_kind = 'procedure_context_effect'".into());
-            }
-            merge.when_not_matched_by_source_delete(Some(predicates.join(" OR ")));
+            None => sqlite.commit_object_rows(rows, reconcile, checkpoint),
         }
-        let result = merge
-            .execute(reader)
-            .await
-            .map_err(|_| StoreError::Projection)?;
-        Ok(result.version)
     }
 }
 
@@ -15028,17 +17124,140 @@ fn validate_ordinary_commit_version(current: u64, committed: u64) -> Result<(), 
     Ok(())
 }
 
+/// Recognize exactly the closed normal capture command: one explicit append
+/// receipt, its matching observation, the same source/revision/sequence
+/// watermark, at most one matching surface and only that observation's
+/// capture dirty targets. Anything else is not eligible and must use the
+/// ordinary complete algorithm before selection.
+fn capture_delta_shape(rows: &[JournalRow]) -> Result<Option<Vec<JournalPayload>>, StoreError> {
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    if rows.iter().any(|row| row.command_id != first.command_id) {
+        return Ok(None);
+    }
+    let mut receipt: Option<SourceReceipt> = None;
+    let mut observation: Option<SourceObservation> = None;
+    let mut watermark: Option<SourceIngestWatermark> = None;
+    let mut surface: Option<EvidenceSurface> = None;
+    let mut dirty_kinds = Vec::new();
+    let mut payloads = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.algorithm_revision == crate::restore::LEDGER_REVISION {
+            return Ok(None);
+        }
+        let payload = row.payload()?;
+        match &payload {
+            JournalPayload::SourceReceiptRecorded(value) => {
+                if value.source_revision_mode != SourceRevisionMode::Append || receipt.is_some() {
+                    return Ok(None);
+                }
+                receipt = Some(*value.clone());
+            }
+            JournalPayload::SourceObservationRecorded(value) => {
+                if observation.is_some() {
+                    return Ok(None);
+                }
+                observation = Some(*value.clone());
+            }
+            JournalPayload::SourceIngestWatermark(value) => {
+                if watermark.is_some() {
+                    return Ok(None);
+                }
+                watermark = Some(value.clone());
+            }
+            JournalPayload::EvidenceSurfaceRecorded(value) => {
+                if surface.is_some() {
+                    return Ok(None);
+                }
+                surface = Some(*value.clone());
+            }
+            JournalPayload::DirtyTarget(value) => {
+                if !matches!(
+                    value.target_kind,
+                    DirtyTargetKind::EvidenceSurface
+                        | DirtyTargetKind::PhysicalNormalization
+                        | DirtyTargetKind::CaptureReconciliation
+                ) || dirty_kinds.contains(&value.target_kind)
+                {
+                    return Ok(None);
+                }
+                dirty_kinds.push(value.target_kind);
+            }
+            _ => return Ok(None),
+        }
+        payloads.push(payload);
+    }
+    let (Some(receipt), Some(observation), Some(watermark)) = (receipt, observation, watermark)
+    else {
+        return Ok(None);
+    };
+    let observation_id = observation.source_observation_id.to_string();
+    if receipt.source_observation_id != observation.source_observation_id
+        || observation.source_receipt_ref != receipt.source_receipt_id
+        || receipt.source_instance_id != observation.source_instance_id
+        || receipt.source_revision != observation.source_revision
+        || watermark.source_instance_id != receipt.source_instance_id
+        || watermark.source_revision != receipt.source_revision
+        || watermark.source_sequence != receipt.source_sequence
+    {
+        return Ok(None);
+    }
+    if surface.is_some_and(|surface| {
+        surface.source_observation_revision_ref != observation.source_observation_id
+    }) {
+        return Ok(None);
+    }
+    for payload in &payloads {
+        if let JournalPayload::DirtyTarget(value) = payload
+            && value.target_id != observation_id
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(payloads))
+}
+
+/// Retain the complete runtime set without copying unrelated captured bytes.
+/// Its fallible decode stays after L0002 in the writer, not in this merge.
+fn runtime_rows_with_upserts(
+    current: Vec<ObjectRow>,
+    changed_rows: &[ObjectRow],
+) -> Vec<ObjectRow> {
+    let mut rows = current
+        .into_iter()
+        .filter(|row| row.row_class == Some(ObjectRowClass::Runtime))
+        .map(|row| (row.row_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    for row in changed_rows
+        .iter()
+        .filter(|row| row.row_class == Some(ObjectRowClass::Runtime))
+    {
+        rows.insert(row.row_id.clone(), row.clone());
+    }
+    rows.into_values().collect()
+}
+
 fn incremental_changed_rows(
-    expected: &ProjectionSnapshot,
+    expected: &[ObjectRow],
     current_by_id: &BTreeMap<&str, &ObjectRow>,
     reconcile_recall: bool,
     reconcile_core: bool,
     reconcile_wiki: bool,
     reconcile_procedure_effect: bool,
+    source_prefix_checkpoint: Option<u64>,
 ) -> Vec<ObjectRow> {
     expected
-        .rows
         .iter()
+        .filter(|row| {
+            !source_prefix_checkpoint.is_some_and(|frontier| {
+                row.source_event_seq <= frontier
+                    && matches!(
+                        row.object_kind.as_deref(),
+                        Some("source_receipt" | "source_observation" | "evidence_surface")
+                    )
+            })
+        })
         .filter(|row| {
             row.row_id == OBJECTS_CHECKPOINT_ID
                 || reconcile_recall
@@ -15085,9 +17304,12 @@ mod tests {
 
     use evertrace_domain::{
         evidence::{
-            CaptureGapMarkerEvidence, CaptureOutageInterval, CaptureOutagePositiveSource,
-            CorrelationStrength, NormalizationState, OperationKind, PairingState,
-            ReconciliationProvenance, SourceInstanceId, SourceRevision,
+            CaptureCompleteness, CaptureGapMarkerEvidence, CaptureOutageInterval,
+            CaptureOutagePositiveSource, ContentTrust, CorrelationAdmission, CorrelationStrength,
+            EvidenceByteRange, EvidenceSourceKind, HostCorrelationEvidence, IdentityStrength,
+            NormalizationState, ObservationRole, OperationKind, PairingState,
+            ReconciliationProvenance, SourceArchiveMode, SourceInstanceId, SourceObservation,
+            SourceReceipt, SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole,
         },
         ids::{
             AttemptId, CaptureOutageIntervalId, CasId, CommandId, CompetingAttemptGroupId,
@@ -15095,7 +17317,10 @@ mod tests {
             OperationId, ResultEvidenceId, SourceObservationId, SourceReceiptId, TaskId,
             WorkstreamId, WorktreeId, WorktreeSnapshotId,
         },
-        repository::{IntegrationKind, LineageAssessment},
+        repository::{
+            FilesystemIdentity, GitObjectFormat, GitRegistrationState, IntegrationKind,
+            LineageAssessment, PathObservation, WorktreeKind, WorktreeLifecycle,
+        },
         semantic::{MetricValue, ParserReceipt, VerifierReceipt},
         work::{
             AdmissionFailureObservability, AttemptAdoptionStatus, AttemptBindingStatus,
@@ -15116,7 +17341,6 @@ mod tests {
             PreparedCommand, SourceCloseRange, prepare_command,
         },
         journal::rows_for_append,
-        objects::read_object_rows,
         writer::JournalWriter,
     };
 
@@ -15201,6 +17425,7 @@ mod tests {
                         source_revision: SourceRevision::parse("revision-1").unwrap(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     1,
                 )
@@ -15236,6 +17461,677 @@ mod tests {
         assert_eq!(interrupted.contexts[0].frontier, 900);
     }
 
+    fn split_test_current(
+        record_start: Option<u64>,
+        closed: bool,
+        with_origin: bool,
+    ) -> crate::SessionImportCurrent {
+        let mut metadata = serde_json::from_value::<crate::SessionMetadata>(serde_json::json!({
+            "source_path":"session.jsonl", "source_format":"codex_rollout_jsonl_v1",
+            "workspace_resolution_kind":"non_repository", "resolved_repository_instance_id":null,
+            "resolved_worktree_instance_id":null, "file_size":20, "file_mtime_us":1,
+            "source_fingerprint":"1".repeat(64), "source_revision":"revision-a",
+            "parser_version":1, "metadata_state":"indexed"
+        }))
+        .unwrap();
+        if with_origin {
+            metadata.repository_read_restrictions = Some(Vec::new());
+            metadata.prospective_origin = Some(crate::ProspectiveSourceOrigin {
+                snapshot_ref: WorktreeSnapshotId::new_v7(),
+                observed_end: 5,
+                record_start,
+                closed,
+            });
+        }
+        crate::SessionImportCurrent {
+            session_id: "session-a".into(),
+            source_instance_id: None,
+            revision: 1,
+            metadata,
+            access_decision: None,
+            body_state: crate::SessionBodyState::NotImported,
+            source_event_seq: 1,
+        }
+    }
+
+    fn split_test_receipt(start: u64, end: u64) -> SourceReceipt {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (mut receipt, _, _) = r105_capture("split-session", end, &repository, &worktree, false);
+        let source = SourceInstanceId::parse("codex-session:session-a").unwrap();
+        let revision = SourceRevision::parse("revision-a").unwrap();
+        let record = SourceRecordIdentity::parse(format!("split-session-{start}-{end}")).unwrap();
+        receipt.source_instance_id = source.clone();
+        receipt.source_revision = revision.clone();
+        receipt.source_record_identity = record.clone();
+        receipt.source_sequence = end;
+        receipt.source_sequence_origin = Some(0);
+        receipt.source_byte_range = Some(EvidenceByteRange { start, end });
+        receipt.source_receipt_id =
+            evertrace_domain::evidence::source_receipt_id(&source, &revision, &record).unwrap();
+        receipt.source_observation_id =
+            evertrace_domain::evidence::source_observation_id(&source, &revision, &record).unwrap();
+        receipt.validate().unwrap();
+        receipt
+    }
+
+    fn split_test_observation(receipt: &SourceReceipt) -> SourceObservation {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (_, mut observation, _) = r105_capture(
+            "split-session",
+            receipt.source_sequence,
+            &repository,
+            &worktree,
+            false,
+        );
+        observation.source_instance_id = receipt.source_instance_id.clone();
+        observation.source_revision = receipt.source_revision.clone();
+        observation.source_record_identity = receipt.source_record_identity.clone();
+        observation.source_observation_id = receipt.source_observation_id;
+        observation.source_receipt_ref = receipt.source_receipt_id;
+        observation.validate().unwrap();
+        observation
+    }
+
+    fn split_test_command(
+        receipt: &SourceReceipt,
+        observation: &SourceObservation,
+        watermark: &SourceIngestWatermark,
+    ) -> JournalCommand {
+        let observation_id = observation.source_observation_id.to_string();
+        r105_command(
+            2,
+            vec![
+                JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                JournalPayload::SourceIngestWatermark(watermark.clone()),
+                JournalPayload::DirtyTarget(crate::command::DirtyTarget {
+                    target_kind: DirtyTargetKind::EvidenceSurface,
+                    target_id: observation_id.clone(),
+                    algorithm_revision: "r479-test-v1".into(),
+                    source_watermark: receipt.source_sequence,
+                }),
+                JournalPayload::DirtyTarget(crate::command::DirtyTarget {
+                    target_kind: DirtyTargetKind::PhysicalNormalization,
+                    target_id: observation_id,
+                    algorithm_revision: "r479-test-v1".into(),
+                    source_watermark: receipt.source_sequence,
+                }),
+            ],
+        )
+    }
+
+    fn split_test_watermark(
+        source_sequence: u64,
+        fence_byte: u64,
+        through_byte: u64,
+        prefix_digest: Option<String>,
+        confirmed_prefix_digest: Option<String>,
+    ) -> SourceIngestWatermark {
+        SourceIngestWatermark {
+            source_instance_id: SourceInstanceId::parse("codex-session:session-a").unwrap(),
+            source_revision: SourceRevision::parse("revision-a").unwrap(),
+            source_sequence,
+            confirmed_prefix_digest,
+            earlier_prefix: Some(crate::command::SourceImportEarlierPrefix {
+                fence_byte,
+                through_byte,
+                digest: prefix_digest,
+            }),
+        }
+    }
+
+    #[test]
+    fn prospective_origin_admission_uses_exact_snapshot_and_rejects_ingested_revision() {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let repository_id = repository.repository_id;
+        let worktree_id = worktree.worktree_instance_id;
+        let snapshot = evertrace_domain::repository::WorktreeSnapshot {
+            worktree_snapshot_id: WorktreeSnapshotId::new_v7(),
+            worktree_instance_id: worktree.worktree_instance_id,
+            head_oid: None,
+            tree_oid: None,
+            branch_ref: None,
+            detached_head: false,
+            tracked_diff_digest: None,
+            index_digest: None,
+            untracked_manifest_digest: None,
+            relevant_anchor_digests: vec![],
+            dependency_fingerprints: vec![],
+            toolchain_fingerprint: None,
+            git_operation: evertrace_domain::repository::GitOperation::None,
+            captured_at_us: 1,
+            evidence_refs: vec![],
+            capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Unavailable,
+            omission_reasons: vec![],
+        };
+        let snapshots = BTreeMap::from([(snapshot.worktree_snapshot_id, (snapshot.clone(), 3))]);
+        let worktrees = BTreeMap::from([(worktree.worktree_instance_id, (worktree.clone(), 2))]);
+        let repositories = BTreeMap::from([(repository.repository_id, (repository.clone(), 1))]);
+        let mut metadata = split_test_current(Some(5), false, true).metadata;
+        metadata.workspace_hint = Some(repository.current_path.clone());
+        metadata.repository_read_restrictions = Some(vec![repository.repository_id]);
+        metadata.prospective_origin.as_mut().unwrap().snapshot_ref = snapshot.worktree_snapshot_id;
+        assert_eq!(
+            validate_prospective_origin_context(&metadata, &snapshots, &worktrees, &repositories,),
+            Ok(())
+        );
+        let mut invalid = metadata.clone();
+        invalid.repository_read_restrictions = Some(Vec::new());
+        assert_eq!(
+            validate_prospective_origin_context(&invalid, &snapshots, &worktrees, &repositories,),
+            Err(StoreError::InvalidInput)
+        );
+        let mut invalid = metadata.clone();
+        invalid.workspace_hint = Some("/outside".into());
+        assert_eq!(
+            validate_prospective_origin_context(&invalid, &snapshots, &worktrees, &repositories,),
+            Err(StoreError::InvalidInput)
+        );
+
+        let mut removed = worktree.clone();
+        removed.worktree_revision += 1;
+        removed.predecessor_revision = Some(worktree.worktree_revision);
+        removed.lifecycle = evertrace_domain::repository::WorktreeLifecycle::Removed;
+        removed.current_path = None;
+        removed.terminal_event_ref = Some("removed-worktree".into());
+        removed.validate().unwrap();
+        let removed_worktrees = BTreeMap::from([(removed.worktree_instance_id, (removed, 5))]);
+        assert_eq!(
+            validate_prospective_origin_context(
+                &metadata,
+                &snapshots,
+                &removed_worktrees,
+                &repositories
+            ),
+            Ok(())
+        );
+
+        let mut baseline = JournalAdmissionState::default();
+        baseline
+            .repositories
+            .insert(repository.repository_id, (repository, 1));
+        baseline
+            .worktrees
+            .insert(worktree.worktree_instance_id, (worktree, 2));
+        baseline
+            .worktree_snapshots
+            .insert(snapshot.worktree_snapshot_id, (snapshot, 3));
+        baseline
+            .session_imports
+            .insert("session-a".into(), split_test_current(None, false, false));
+        let event = crate::SessionImportEvent {
+            session_id: "session-a".into(),
+            source_instance_id: None,
+            revision: 2,
+            predecessor_revision: Some(1),
+            occurred_at_us: 4,
+            event: crate::SessionImportEventKind::MetadataObserved {
+                metadata: Box::new(metadata),
+            },
+        };
+        let mut race_winner = baseline.clone();
+        race_winner
+            .apply_payload(
+                JournalPayload::SessionImportEventRecorded(Box::new(event.clone())),
+                4,
+            )
+            .unwrap();
+        let observed = &race_winner.session_imports["session-a"];
+        assert_eq!(observed.metadata.resolved_repository_instance_id, None);
+        assert_eq!(observed.metadata.resolved_worktree_instance_id, None);
+        assert!(observed.metadata.prospective_origin.is_some());
+
+        let suffix_receipt = split_test_receipt(5, 8);
+        let mut suffix = split_test_watermark(8, 5, 0, None, None);
+        suffix.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &suffix,
+                suffix_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &suffix_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        let history_receipt = split_test_receipt(0, 2);
+        let mut history = split_test_watermark(5, 5, 2, None, None);
+        history.earlier_prefix.as_mut().unwrap().digest = Some(
+            session_import_prefix_digest(
+                &history,
+                history_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &history_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        for (mut receipt, watermark) in [(suffix_receipt, suffix), (history_receipt, history)] {
+            let historical_prefix = receipt.source_byte_range.as_ref().unwrap().start == 0;
+            let mut input = race_winner.clone();
+            receipt.repository_instance_id = (!historical_prefix).then_some(repository_id);
+            receipt.worktree_instance_id = (!historical_prefix).then_some(worktree_id);
+            receipt.validate().unwrap();
+            let observation = split_test_observation(&receipt);
+            let command = split_test_command(&receipt, &observation, &watermark);
+            let prepared = prepare_command(&command).unwrap();
+            let rows = rows_for_append(&prepared, 6, 0).unwrap();
+            let command_rows = rows.iter().collect::<Vec<_>>();
+
+            if historical_prefix {
+                assert!(input.clone().apply_row_batch(&command_rows).is_err());
+                input
+                    .apply_payload(
+                        JournalPayload::SessionImportEventRecorded(Box::new(
+                            crate::SessionImportEvent {
+                                session_id: "session-a".into(),
+                                source_instance_id: None,
+                                revision: 3,
+                                predecessor_revision: Some(2),
+                                occurred_at_us: 5,
+                                event: crate::SessionImportEventKind::AccessDecision {
+                                    decision: crate::SessionAccessDecision::Approved,
+                                    local_request_ref: evertrace_domain::ids::RequestId::new_v7(),
+                                    provenance_refs: vec!["local_cli:approve-prefix".into()],
+                                },
+                            },
+                        )),
+                        5,
+                    )
+                    .unwrap();
+                let mut forged = receipt.clone();
+                forged.repository_instance_id = Some(repository_id);
+                forged.worktree_instance_id = Some(worktree_id);
+                assert!(
+                    validate_split_receipt_scope(
+                        &watermark,
+                        Some(&forged),
+                        input.session_imports.get("session-a"),
+                        &input.worktree_snapshots,
+                        &input.worktrees
+                    )
+                    .is_err()
+                );
+            }
+            let admitted = input.clone().apply_row_batch(&command_rows).unwrap();
+            assert_eq!(
+                admitted.source_watermarks["codex-session:session-a"].revisions
+                    [&watermark.source_revision],
+                watermark
+            );
+
+            let mut replay = ReducerState {
+                repositories: input.repositories.clone(),
+                worktrees: input.worktrees.clone(),
+                worktree_snapshots: input.worktree_snapshots.clone(),
+                session_imports: input.session_imports.clone(),
+                ..ReducerState::default()
+            };
+            for row in &rows {
+                apply_event(&mut replay, row, &command_rows).unwrap();
+            }
+            replay.validate_evidence_relations().unwrap();
+            assert_eq!(
+                replay.source_watermarks[&watermark.stable_key()].0,
+                watermark
+            );
+        }
+
+        let source = SourceInstanceId::parse("codex-session:session-a").unwrap();
+        let revision = SourceRevision::parse("revision-a").unwrap();
+        let mut watermarked = baseline.clone();
+        record_source_watermark(
+            &mut watermarked.source_watermarks,
+            SourceIngestWatermark {
+                source_instance_id: source.clone(),
+                source_revision: revision.clone(),
+                source_sequence: 1,
+                confirmed_prefix_digest: Some("1".repeat(64)),
+                earlier_prefix: None,
+            },
+        );
+        assert!(
+            watermarked
+                .apply_payload(
+                    JournalPayload::SessionImportEventRecorded(Box::new(event.clone())),
+                    4,
+                )
+                .is_err()
+        );
+        let mut receipted = baseline;
+        receipted.source_ranges.insert(
+            source_revision_ref(&source, &revision),
+            KnownSourceRange {
+                sequences: [1].into_iter().collect(),
+                receipt_ids: BTreeMap::new(),
+                sequence_origin: Some(0),
+                close_watermark: None,
+                eligible_event_manifest_refs: BTreeSet::new(),
+            },
+        );
+        assert!(
+            receipted
+                .apply_payload(
+                    JournalPayload::SessionImportEventRecorded(Box::new(event)),
+                    4,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn split_session_watermark_advances_one_contiguous_leg() {
+        let current = split_test_current(Some(5), false, true);
+        let suffix_receipt = split_test_receipt(5, 8);
+        let mut suffix = split_test_watermark(8, 5, 0, None, None);
+        suffix.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &suffix,
+                suffix_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &suffix_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &suffix,
+                Some(&suffix_receipt),
+                Some(&current),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(None, &suffix, None, Some(&current)),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let prefix_receipt = split_test_receipt(0, 2);
+        let prefix_digest = session_import_prefix_digest(
+            &suffix,
+            prefix_receipt.source_byte_range.as_ref().unwrap(),
+            None,
+            &prefix_receipt.cas_ref,
+        )
+        .unwrap();
+        let after_prefix = split_test_watermark(
+            8,
+            5,
+            2,
+            Some(prefix_digest.clone()),
+            suffix.confirmed_prefix_digest.clone(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&suffix),
+                &after_prefix,
+                Some(&prefix_receipt),
+                Some(&current),
+            ),
+            Ok(())
+        );
+
+        let prefix_advance = split_test_receipt(2, 3);
+        let next_prefix_digest = session_import_prefix_digest(
+            &after_prefix,
+            prefix_advance.source_byte_range.as_ref().unwrap(),
+            Some(prefix_digest.clone()),
+            &prefix_advance.cas_ref,
+        )
+        .unwrap();
+        let after_second_prefix = split_test_watermark(
+            8,
+            5,
+            3,
+            Some(next_prefix_digest),
+            suffix.confirmed_prefix_digest.clone(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &after_second_prefix,
+                Some(&prefix_advance),
+                Some(&current),
+            ),
+            Ok(())
+        );
+
+        let forged_previous = "2".repeat(64);
+        let forged_next_digest = session_import_prefix_digest(
+            &after_prefix,
+            prefix_advance.source_byte_range.as_ref().unwrap(),
+            Some(forged_previous),
+            &prefix_advance.cas_ref,
+        )
+        .unwrap();
+        let forged = split_test_watermark(
+            8,
+            5,
+            3,
+            Some(forged_next_digest),
+            suffix.confirmed_prefix_digest.clone(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &forged,
+                Some(&prefix_advance),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let suffix_gap = split_test_receipt(9, 10);
+        let mut gap = split_test_watermark(10, 5, 2, Some(prefix_digest.clone()), None);
+        gap.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &gap,
+                suffix_gap.source_byte_range.as_ref().unwrap(),
+                suffix.confirmed_prefix_digest.clone(),
+                &suffix_gap.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &gap,
+                Some(&suffix_gap),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let suffix_next = split_test_receipt(8, 10);
+        let mut after_suffix = split_test_watermark(10, 5, 2, Some(prefix_digest.clone()), None);
+        after_suffix.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &after_suffix,
+                suffix_next.source_byte_range.as_ref().unwrap(),
+                suffix.confirmed_prefix_digest.clone(),
+                &suffix_next.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &after_suffix,
+                Some(&suffix_next),
+                Some(&current),
+            ),
+            Ok(())
+        );
+        let both_legs = split_test_watermark(10, 5, 3, Some("3".repeat(64)), Some("4".repeat(64)));
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &both_legs,
+                Some(&suffix_next),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+        let mut cleared = split_test_watermark(10, 5, 0, None, Some("4".repeat(64)));
+        cleared.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &cleared,
+                suffix_next.source_byte_range.as_ref().unwrap(),
+                suffix.confirmed_prefix_digest.clone(),
+                &suffix_next.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                Some(&after_prefix),
+                &cleared,
+                Some(&suffix_next),
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        let empty_checkpoint = split_test_watermark(5, 5, 0, None, None);
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &empty_checkpoint,
+                None,
+                Some(&current),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+        let unresolved = split_test_current(None, false, true);
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &suffix,
+                Some(&suffix_receipt),
+                Some(&unresolved),
+            ),
+            Err(StoreError::StoreCorrupt)
+        );
+        let closed = split_test_current(Some(5), true, true);
+        assert!(
+            closed
+                .import_scope(
+                    suffix_receipt.source_byte_range.as_ref().unwrap(),
+                    None,
+                    None
+                )
+                .is_err()
+        );
+
+        let history_first = split_test_receipt(0, 2);
+        let mut first_history = split_test_watermark(5, 5, 2, None, None);
+        first_history.earlier_prefix.as_mut().unwrap().digest = Some(
+            session_import_prefix_digest(
+                &first_history,
+                history_first.source_byte_range.as_ref().unwrap(),
+                None,
+                &history_first.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &first_history,
+                Some(&history_first),
+                Some(&current),
+            ),
+            Ok(())
+        );
+
+        let legacy = split_test_current(None, false, false);
+        let legacy_receipt = split_test_receipt(0, 1);
+        let mut legacy_watermark = SourceIngestWatermark {
+            source_instance_id: legacy_receipt.source_instance_id.clone(),
+            source_revision: legacy_receipt.source_revision.clone(),
+            source_sequence: 1,
+            confirmed_prefix_digest: None,
+            earlier_prefix: None,
+        };
+        legacy_watermark.confirmed_prefix_digest = Some(
+            session_import_prefix_digest(
+                &legacy_watermark,
+                legacy_receipt.source_byte_range.as_ref().unwrap(),
+                None,
+                &legacy_receipt.cas_ref,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_source_ingest_watermark_transition(
+                None,
+                &legacy_watermark,
+                Some(&legacy_receipt),
+                Some(&legacy),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn identical_split_watermark_without_receipt_is_idempotent() {
+        let watermark = split_test_watermark(8, 5, 0, None, Some("1".repeat(64)));
+        let mut state = ReducerState::default();
+        state
+            .source_watermarks
+            .insert(watermark.stable_key(), (watermark.clone(), 1));
+        state
+            .session_imports
+            .insert("session-a".into(), split_test_current(None, false, false));
+        let session_event = |revision| {
+            JournalPayload::SessionImportEventRecorded(Box::new(crate::SessionImportEvent {
+                session_id: "session-a".into(),
+                source_instance_id: None,
+                revision,
+                predecessor_revision: revision.checked_sub(1),
+                occurred_at_us: i64::try_from(revision).unwrap(),
+                event: crate::SessionImportEventKind::BodyStateAdvanced {
+                    body_state: crate::SessionBodyState::BlockedScopeUnresolved,
+                    reason: crate::BodyStateReason::ScopeUnresolved,
+                },
+            }))
+        };
+
+        let command = r105_command(
+            2,
+            vec![
+                JournalPayload::SourceIngestWatermark(watermark.clone()),
+                session_event(2),
+            ],
+        );
+        let prepared = prepare_command(&command).unwrap();
+        let rows = rows_for_append(&prepared, 2, 0).unwrap();
+        let command_rows = rows.iter().collect::<Vec<_>>();
+        for row in &rows {
+            apply_event(&mut state, row, &command_rows).unwrap();
+        }
+        assert_eq!(state.source_watermarks[&watermark.stable_key()].1, 1);
+
+        let mut invented = watermark;
+        let prefix = invented.earlier_prefix.as_mut().unwrap();
+        prefix.through_byte = 1;
+        prefix.digest = Some("2".repeat(64));
+        let command = r105_command(
+            3,
+            vec![
+                JournalPayload::SourceIngestWatermark(invented),
+                session_event(3),
+            ],
+        );
+        let prepared = prepare_command(&command).unwrap();
+        let rows = rows_for_append(&prepared, 3, 0).unwrap();
+        let command_rows = rows.iter().collect::<Vec<_>>();
+        let mut unchanged = state.clone();
+        assert_eq!(
+            apply_event(&mut unchanged, &rows[0], &command_rows),
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(state.source_watermarks.len(), 1);
+    }
+
     #[test]
     fn session_prefix_digest_is_required_only_for_codex_sources() {
         let codex = SourceIngestWatermark {
@@ -15243,11 +18139,50 @@ mod tests {
             source_revision: SourceRevision::parse("revision-a").unwrap(),
             source_sequence: 1,
             confirmed_prefix_digest: None,
+            earlier_prefix: None,
         };
+        let old_bytes = serde_json::to_vec(&codex).unwrap();
+        assert!(!String::from_utf8_lossy(&old_bytes).contains("earlier_prefix"));
+        let decoded: SourceIngestWatermark = serde_json::from_slice(&old_bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), old_bytes);
         assert_eq!(
             validate_confirmed_session_prefix(&codex),
             Err(StoreError::StoreCorrupt)
         );
+        let valid_split = split_test_watermark(8, 5, 0, None, Some("1".repeat(64)));
+        assert!(
+            JournalPayload::SourceIngestWatermark(valid_split.clone())
+                .validate()
+                .is_ok()
+        );
+        let mut empty_prefix_with_digest = valid_split.clone();
+        empty_prefix_with_digest
+            .earlier_prefix
+            .as_mut()
+            .unwrap()
+            .digest = Some("2".repeat(64));
+        assert!(
+            JournalPayload::SourceIngestWatermark(empty_prefix_with_digest)
+                .validate()
+                .is_err()
+        );
+        let mut nonempty_prefix_without_digest = valid_split.clone();
+        nonempty_prefix_without_digest
+            .earlier_prefix
+            .as_mut()
+            .unwrap()
+            .through_byte = 2;
+        assert!(
+            JournalPayload::SourceIngestWatermark(nonempty_prefix_without_digest)
+                .validate()
+                .is_err()
+        );
+        let missing_prefix_digest = serde_json::json!({
+            "source_instance_id":"codex-session:session-a", "source_revision":"revision-a",
+            "source_sequence":8, "confirmed_prefix_digest":"1".repeat(64),
+            "earlier_prefix":{"fence_byte":5,"through_byte":2}
+        });
+        assert!(serde_json::from_value::<SourceIngestWatermark>(missing_prefix_digest).is_err());
         let ordinary = SourceIngestWatermark {
             source_instance_id: SourceInstanceId::parse("ordinary-source").unwrap(),
             ..codex
@@ -15255,6 +18190,7 @@ mod tests {
         assert_eq!(validate_confirmed_session_prefix(&ordinary), Ok(false));
         let forged_ordinary = SourceIngestWatermark {
             confirmed_prefix_digest: Some("1".repeat(64)),
+            earlier_prefix: None,
             ..ordinary
         };
         assert_eq!(
@@ -15286,6 +18222,7 @@ mod tests {
                 source_revision: receipt.source_revision.clone(),
                 source_sequence: 1,
                 confirmed_prefix_digest: indexed.then(|| "1".repeat(64)),
+                earlier_prefix: None,
             };
             let mut incremental = JournalAdmissionState::default();
             if source == "ordinary-source" {
@@ -15295,7 +18232,7 @@ mod tests {
                     value.source_receipt_id = SourceReceiptId::from_digest([index; 32]);
                     value.observation_role = evertrace_domain::evidence::ObservationRole::Message;
                     Arc::make_mut(&mut window.source_receipts)
-                        .insert(value.source_receipt_id, (value, u64::from(index)));
+                        .insert(value.source_receipt_id, (Arc::new(value), u64::from(index)));
                 }
                 let context = window
                     .passive_source_current_context(&PassiveSourceSelection::Session(
@@ -15319,7 +18256,7 @@ mod tests {
             let mut reduced = ReducerState::default();
             reduced
                 .source_receipts
-                .insert(receipt.source_receipt_id, (receipt.clone(), 1));
+                .insert(receipt.source_receipt_id, (Arc::new(receipt.clone()), 1));
             reduced
                 .source_watermarks
                 .insert(watermark.stable_key(), (watermark.clone(), 2));
@@ -15342,7 +18279,7 @@ mod tests {
                 assert_eq!(selected.items.len(), 1);
                 assert_eq!(
                     selected.items[0].selected,
-                    source_receipt_row(receipt.clone(), 1).unwrap()
+                    source_receipt_row(&receipt, 1).unwrap()
                 );
                 assert!(
                     admission
@@ -15855,11 +18792,27 @@ mod tests {
         };
 
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, false, false, false, false),
+            incremental_changed_rows(
+                &expected.rows,
+                &current_by_id,
+                false,
+                false,
+                false,
+                false,
+                None,
+            ),
             vec![expected.rows[0].clone()]
         );
         assert_eq!(
-            incremental_changed_rows(&expected, &current_by_id, true, false, false, false),
+            incremental_changed_rows(
+                &expected.rows,
+                &current_by_id,
+                true,
+                false,
+                false,
+                false,
+                None,
+            ),
             expected.rows
         );
     }
@@ -16132,7 +19085,7 @@ mod tests {
         let mut encoded: serde_json::Value =
             serde_json::from_str(invalid.payload_json.as_deref().unwrap()).unwrap();
         encoded["value"]["decision"] = serde_json::Value::String("failed".into());
-        invalid.payload_json = Some(serde_json::to_string(&encoded).unwrap());
+        invalid.payload_json = Some(serde_json::to_string(&encoded).unwrap().into());
         let invalid_rows = vec![ObjectRow::checkpoint(1, PROJECTION_GENERATION), invalid];
         assert!(matches!(
             ReducerState::from_current_rows(&invalid_rows, 1),
@@ -16716,6 +19669,16 @@ mod tests {
         assert_eq!(projected.lease_until_us, Some(100));
     }
 
+    fn all_objects() -> ObjectReconcile {
+        ObjectReconcile {
+            recall: true,
+            core: true,
+            wiki: true,
+            procedure_effect: true,
+            all: true,
+        }
+    }
+
     #[tokio::test]
     async fn projection_commit_fault_does_not_advance_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
@@ -16737,27 +19700,14 @@ mod tests {
         )
         .unwrap();
         writer.commit(&command, 1).await.unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let before = read_object_rows(&objects).await.unwrap();
-        let worker = ProjectionWorker::new(journal, objects.clone());
+        let sqlite = writer.projection_handle();
+        let before = sqlite.lock().unwrap().object_rows().unwrap();
+        let worker = ProjectionWorker::new(sqlite.clone());
         assert_eq!(
             worker.catch_up_with_commit_fault().await,
             Err(StoreError::Projection)
         );
-        assert_eq!(read_object_rows(&objects).await.unwrap(), before);
+        assert_eq!(sqlite.lock().unwrap().object_rows().unwrap(), before);
         assert_eq!(
             worker.catch_up().await.unwrap(),
             writer.full_projection().await.unwrap()
@@ -16769,31 +19719,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
         let writer = JournalWriter::open(&root).await.unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let worker = ProjectionWorker::new(journal, objects);
+        let worker = ProjectionWorker::new(writer.projection_handle());
         worker
             .commit_rows(
                 &[ObjectRow::checkpoint(10_000, PROJECTION_GENERATION)],
-                false,
-                false,
-                false,
-                false,
-                false,
+                all_objects(),
+                None,
             )
-            .await
             .unwrap();
         assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));
         drop(writer);
@@ -16804,47 +19736,35 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
         let writer = JournalWriter::open(&root).await.unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let worker = ProjectionWorker::new(journal, objects.clone());
-        let before_version = objects.version().await.unwrap();
+        let sqlite = writer.projection_handle();
+        let worker = ProjectionWorker::new(sqlite.clone());
+        let before_epoch = sqlite.lock().unwrap().stamp().unwrap().objects_epoch;
         let frontier = worker.catch_up().await.unwrap().frontier;
-        assert_eq!(writer.sync_frontier().await.unwrap(), frontier);
-        assert_eq!(writer.sync_frontier().await.unwrap(), frontier);
+        assert_eq!(writer.sync_objects_frontier().await.unwrap(), frontier);
+        assert_eq!(writer.sync_objects_frontier().await.unwrap(), frontier);
         assert_eq!(writer.project_objects().await.unwrap().frontier, frontier);
-        assert_eq!(objects.version().await.unwrap(), before_version);
-        let empty_delta = arrow_array::RecordBatch::new_empty(crate::journal::journal_schema());
+        assert_eq!(
+            sqlite.lock().unwrap().stamp().unwrap().objects_epoch,
+            before_epoch
+        );
+        let empty_delta: &[crate::JournalRow] = &[];
         assert!(matches!(
             worker
                 .catch_up_validated(
-                    Some((before_version, frontier, frontier + 1)),
-                    Some(&empty_delta),
+                    Some((before_epoch, frontier, frontier + 1)),
+                    Some(empty_delta)
                 )
                 .await,
             Err(StoreError::StoreCorrupt)
         ));
-        assert_eq!(objects.version().await.unwrap(), before_version);
+        assert_eq!(
+            sqlite.lock().unwrap().stamp().unwrap().objects_epoch,
+            before_epoch
+        );
         // A mismatched old checkpoint cannot supply a frontier or batch shortcut.
-        let invalid_batch =
-            arrow_array::RecordBatch::new_empty(std::sync::Arc::new(arrow_schema::Schema::empty()));
         assert_eq!(
             worker
-                .catch_up_validated(
-                    Some((before_version, frontier + 1, frontier + 1)),
-                    Some(&invalid_batch),
-                )
+                .catch_up_validated(Some((before_epoch, frontier + 1, frontier + 1)), Some(&[]))
                 .await
                 .unwrap()
                 .0
@@ -16852,8 +19772,10 @@ mod tests {
             frontier
         );
 
-        let mut migration = read_object_rows(&objects)
-            .await
+        let mut migration = sqlite
+            .lock()
+            .unwrap()
+            .object_rows()
             .unwrap()
             .into_iter()
             .find(|row| row.row_id == "projection:migration:L0001")
@@ -16865,15 +19787,19 @@ mod tests {
                 reload: None,
             })
             .canonical_json()
-            .unwrap(),
+            .unwrap()
+            .into(),
         );
-        worker
-            .commit_rows(&[migration], false, false, false, false, false)
-            .await
+        // Production projection commits reject malformed rows before writing.
+        // Inject physical corruption through the existing raw test seam.
+        sqlite
+            .lock()
+            .unwrap()
+            .insert_object_row_for_test(&migration)
             .unwrap();
         assert!(matches!(
             worker
-                .catch_up_validated(Some((before_version, frontier, frontier)), None)
+                .catch_up_validated(Some((before_epoch, frontier, frontier)), None)
                 .await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
@@ -16882,11 +19808,15 @@ mod tests {
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
         assert!(matches!(
-            writer.sync_frontier().await,
+            writer.sync_objects_frontier().await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
         assert!(matches!(
             writer.project_objects().await,
+            Err(StoreError::StoreCorrupt | StoreError::Projection)
+        ));
+        assert!(matches!(
+            writer.project_current(true).await,
             Err(StoreError::StoreCorrupt | StoreError::Projection)
         ));
         drop(writer);
@@ -16930,32 +19860,1189 @@ mod tests {
             )
             .await
             .unwrap();
-        let connection = lancedb::connect(crate::connection::native_root(&root).to_str().unwrap())
-            .execute()
-            .await
+        let sqlite = writer.projection_handle();
+        let rows = sqlite.lock().unwrap().rows_after(0).unwrap();
+        let first_seq = rows
+            .iter()
+            .find(|row| row.command_event_count == 2)
+            .map(|row| row.seq)
             .unwrap();
-        let journal = connection
-            .open_table(crate::JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .open_table(crate::OBJECTS_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let worker = ProjectionWorker::new(journal, objects);
+        let worker = ProjectionWorker::new(sqlite);
         worker
             .commit_rows(
-                &[ObjectRow::checkpoint(3, PROJECTION_GENERATION)],
-                false,
-                false,
-                false,
-                false,
-                false,
+                &[ObjectRow::checkpoint(first_seq, PROJECTION_GENERATION)],
+                all_objects(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));
+    }
+
+    fn r105_repository_and_worktree() -> (RepositoryInstance, WorktreeInstance) {
+        let repository_id = RepositoryId::new_v7();
+        let worktree_id = WorktreeId::new_v7();
+        let path = format!("/tmp/r105/{repository_id}");
+        let observed = PathObservation {
+            path: path.clone(),
+            first_observed_at_us: 1,
+            last_observed_at_us: 1,
+            evidence_refs: vec!["path:r105".into()],
+        };
+        let repository = RepositoryInstance {
+            user_disabled: false,
+            capability_state: None,
+            repository_id,
+            repository_revision: 1,
+            predecessor_revision: None,
+            current_path: path.clone(),
+            path_history: vec![observed.clone()],
+            git_common_dir_path: Some(format!("{path}/.git")),
+            common_dir_filesystem: Some(FilesystemIdentity {
+                device: 105,
+                inode: 1,
+            }),
+            object_format: Some(GitObjectFormat::Sha1),
+            remote_fingerprints: vec![],
+            derived_from: None,
+            identity_evidence_refs: vec!["repository:r105".into()],
+            recorded_at_us: 1,
+        };
+        let worktree = WorktreeInstance {
+            worktree_instance_id: worktree_id,
+            worktree_revision: 1,
+            predecessor_revision: None,
+            repository_instance_id: repository_id,
+            kind: WorktreeKind::Main,
+            lifecycle: WorktreeLifecycle::Active,
+            current_path: Some(path.clone()),
+            path_history: vec![observed.clone()],
+            git_admin_path_history: vec![PathObservation {
+                path: format!("{path}/.git"),
+                ..observed
+            }],
+            git_registration_state: GitRegistrationState::Registered,
+            current_snapshot_id: None,
+            created_event_ref: "worktree:r105".into(),
+            terminal_event_ref: None,
+            recreated_from_worktree_instance_id: None,
+            recorded_at_us: 1,
+        };
+        (repository, worktree)
+    }
+
+    fn r105_capture(
+        label: &str,
+        sequence: u64,
+        repository: &RepositoryInstance,
+        worktree: &WorktreeInstance,
+        surface_eligible: bool,
+    ) -> (SourceReceipt, SourceObservation, Option<EvidenceSurface>) {
+        let instance = SourceInstanceId::parse(format!("r105-{label}")).unwrap();
+        let revision = SourceRevision::parse("revision-1").unwrap();
+        let record = SourceRecordIdentity::parse(format!("record-{label}-{sequence}")).unwrap();
+        let observation_id =
+            evertrace_domain::evidence::source_observation_id(&instance, &revision, &record)
+                .unwrap();
+        let receipt_id =
+            evertrace_domain::evidence::source_receipt_id(&instance, &revision, &record).unwrap();
+        let protected = format!("r105 capture {label} sequence {sequence}");
+        let digest = hex(&payload_fingerprint(1, protected.as_bytes(), None).unwrap());
+        let receipt = SourceReceipt {
+            protected_presentation: None,
+            source_receipt_id: receipt_id,
+            source_observation_id: observation_id,
+            source_instance_id: instance.clone(),
+            source_kind: EvidenceSourceKind::CodexHook,
+            identity_domain: "r105-v1".into(),
+            source_ref: format!("source-ref-{label}"),
+            source_session_ref: format!("session-{label}"),
+            source_revision: revision.clone(),
+            source_record_identity: record.clone(),
+            identity_strength: IdentityStrength::StableNative,
+            source_sequence: sequence,
+            source_sequence_origin: None,
+            task_id: None,
+            repository_instance_id: Some(repository.repository_id),
+            worktree_instance_id: Some(worktree.worktree_instance_id),
+            source_byte_range: None,
+            spool_byte_range: EvidenceByteRange { start: 1, end: 2 },
+            source_revision_mode: SourceRevisionMode::Append,
+            previous_source_revision: None,
+            close_watermark: None,
+            observation_role: ObservationRole::Message,
+            unsupported_record_classification: None,
+            capture_completeness: CaptureCompleteness::Complete,
+            archive_mode: SourceArchiveMode::Exact,
+            cas_ref: digest.clone(),
+            protected_length: protected.len() as u64,
+            original_length: protected.len() as u64,
+            protected_secret_digest: None,
+            redaction_spans: vec![],
+            adapter_revision: 1,
+            adapter_manifest_ref: "adapter-r105".into(),
+            eligible_event_manifest_ref: "eligible-r105".into(),
+            parser_revision: 1,
+            canonicalization_revision: 1,
+            detector_revision: 1,
+            redaction_revision: 1,
+            protection_key_generation: 1,
+            event_time_us: 1,
+            recorded_at_us: 1,
+            lifecycle: None,
+        };
+        let observation = SourceObservation {
+            source_local_evidence: None,
+            source_observation_id: observation_id,
+            source_instance_id: instance,
+            source_revision: revision,
+            source_record_identity: record,
+            observation_role: ObservationRole::Message,
+            identity_strength: IdentityStrength::StableNative,
+            payload_fingerprint: digest,
+            source_receipt_ref: receipt_id,
+            source_role: SourceRole::User,
+            content_trust: ContentTrust::UserStatement,
+            capture_completeness: CaptureCompleteness::Complete,
+            adapter_revision: 1,
+            parser_revision: 1,
+            canonicalization_revision: 1,
+            detector_revision: 1,
+            redaction_revision: 1,
+            correlation: HostCorrelationEvidence {
+                occurrence_schema_version: 1,
+                host_instance_id: None,
+                host_trace_lineage_id: None,
+                host_lane_key: None,
+                canonical_event_family: None,
+                native_request_id: None,
+                physical_execution_ordinal: None,
+                pairing_role: ObservationRole::Message,
+                field_provenance: vec![],
+                adapter_manifest_ref: "adapter-r105".into(),
+                adapter_revision: 1,
+                strong_gate_receipt_ref: None,
+                admission: CorrelationAdmission::Unavailable,
+                partial_correlation_ref: None,
+                possible_duplicate_group_id: None,
+            },
+            scope_effect_claims: vec![],
+        };
+        receipt.validate().unwrap();
+        observation.validate().unwrap();
+        let surface = if surface_eligible {
+            crate::search::build_evidence_surface(
+                &receipt,
+                &observation,
+                protected.as_bytes(),
+                true,
+            )
+            .unwrap()
+        } else {
+            None
+        };
+        (receipt, observation, surface)
+    }
+
+    fn r105_command(at: i64, payloads: Vec<JournalPayload>) -> JournalCommand {
+        JournalCommand::new(
+            CommandId::new_v7(),
+            payloads
+                .into_iter()
+                .map(|payload| JournalEventDraft::runtime(at, [0; 32], "r105-v1", payload))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn r105_capture_payloads(
+        receipt: &SourceReceipt,
+        observation: &SourceObservation,
+        surface: Option<&EvidenceSurface>,
+    ) -> Vec<JournalPayload> {
+        let mut payloads = vec![
+            JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+            JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+            JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                source_instance_id: receipt.source_instance_id.clone(),
+                source_revision: receipt.source_revision.clone(),
+                source_sequence: receipt.source_sequence,
+                confirmed_prefix_digest: None,
+                earlier_prefix: None,
+            }),
+        ];
+        if let Some(surface) = surface {
+            payloads.push(JournalPayload::EvidenceSurfaceRecorded(Box::new(
+                surface.clone(),
+            )));
+        }
+        for target_kind in [
+            DirtyTargetKind::EvidenceSurface,
+            DirtyTargetKind::PhysicalNormalization,
+        ] {
+            payloads.push(JournalPayload::DirtyTarget(DirtyTarget {
+                target_kind,
+                target_id: observation.source_observation_id.to_string(),
+                algorithm_revision: "r105-v1".into(),
+                source_watermark: receipt.source_sequence,
+            }));
+        }
+        payloads
+    }
+
+    async fn r105_search_table(root: &std::path::Path) -> lancedb::Table {
+        let connection = lancedb::connect(crate::connection::native_root(root).to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        connection
+            .open_table(crate::SEARCH_TABLE)
+            .execute()
+            .await
+            .unwrap()
+    }
+
+    async fn r105_assert_projection_eq(
+        writer: &JournalWriter,
+        root: &std::path::Path,
+        frontier: u64,
+    ) -> ProjectionSnapshot {
+        let replayed = writer.full_projection().await.unwrap();
+        assert_eq!(replayed.frontier, frontier);
+        let sqlite = writer.projection_handle();
+        let persisted_objects = sqlite.lock().unwrap().object_rows().unwrap();
+        assert_eq!(persisted_objects, replayed.rows);
+        let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
+        assert_eq!(
+            sqlite.lock().unwrap().relation_rows().unwrap(),
+            expected.relations
+        );
+        assert_eq!(
+            crate::search::read_search_rows(&r105_search_table(root).await)
+                .await
+                .unwrap(),
+            expected.search
+        );
+        replayed
+    }
+
+    #[tokio::test]
+    async fn current_facts_share_source_payloads_and_l0002_matches_full_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    vec![
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                        JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+                    ],
+                ),
+                1,
             )
             .await
             .unwrap();
-        assert_eq!(worker.catch_up().await, Err(StoreError::StoreCorrupt));
+        let seeded = writer.project().await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+
+        let (receipt, observation, surface) =
+            r105_capture("current-facts", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    2,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let facts = writer.project_current(true).await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 0);
+        assert!(writer.source_prefix_proven_for_test());
+        assert_eq!(facts.source_receipts().count(), 1);
+        assert_eq!(facts.source_observations().count(), 1);
+        assert_eq!(facts.evidence_surfaces().count(), 1);
+        assert!(facts.other_rows().iter().all(|row| {
+            !matches!(
+                row.object_kind.as_deref(),
+                Some("source_receipt" | "source_observation" | "evidence_surface")
+            )
+        }));
+
+        let sqlite = writer.projection_handle();
+        let admitted =
+            JournalAdmissionState::from_journal_rows(&sqlite.lock().unwrap().rows().unwrap())
+                .unwrap();
+        let admitted_source_facts = admitted.source_facts();
+        assert!(admitted_source_facts.matches_current_sources(&facts));
+
+        let independently_allocated = CurrentFacts {
+            frontier: facts.frontier,
+            other_rows: facts.other_rows.clone(),
+            source_receipts: facts
+                .source_receipts
+                .iter()
+                .map(|(id, (value, seq))| (*id, (Arc::new(value.as_ref().clone()), *seq)))
+                .collect(),
+            source_observations: facts
+                .source_observations
+                .iter()
+                .map(|(id, (value, seq))| (*id, (Arc::new(value.as_ref().clone()), *seq)))
+                .collect(),
+            evidence_surfaces: facts
+                .evidence_surfaces
+                .iter()
+                .map(|(id, (value, seq))| (*id, (Arc::new(value.as_ref().clone()), *seq)))
+                .collect(),
+        };
+        assert!(admitted_source_facts.matches_current_sources(&independently_allocated));
+        let receipt_id = *facts.source_receipts.keys().next().unwrap();
+        assert!(!Arc::ptr_eq(
+            &facts.source_receipts[&receipt_id].0,
+            &independently_allocated.source_receipts[&receipt_id].0,
+        ));
+
+        let copy_facts = || CurrentFacts {
+            frontier: facts.frontier,
+            other_rows: facts.other_rows.clone(),
+            source_receipts: facts.source_receipts.clone(),
+            source_observations: facts.source_observations.clone(),
+            evidence_surfaces: facts.evidence_surfaces.clone(),
+        };
+        let mut changed_payload = copy_facts();
+        Arc::make_mut(
+            &mut changed_payload
+                .source_receipts
+                .get_mut(&receipt_id)
+                .unwrap()
+                .0,
+        )
+        .source_ref
+        .push_str("-changed");
+        assert!(!admitted_source_facts.matches_current_sources(&changed_payload));
+
+        let observation_id = *facts.source_observations.keys().next().unwrap();
+        let mut changed_seq = copy_facts();
+        changed_seq
+            .source_observations
+            .get_mut(&observation_id)
+            .unwrap()
+            .1 += 1;
+        assert!(!admitted_source_facts.matches_current_sources(&changed_seq));
+
+        let mut missing_member = copy_facts();
+        missing_member.source_receipts.remove(&receipt_id);
+        assert!(!admitted_source_facts.matches_current_sources(&missing_member));
+
+        let (extra_receipt, _, _) =
+            r105_capture("current-facts-extra", 1, &repository, &worktree, false);
+        let mut extra_member = copy_facts();
+        extra_member.source_receipts.insert(
+            extra_receipt.source_receipt_id,
+            (Arc::new(extra_receipt), facts.frontier),
+        );
+        assert!(!admitted_source_facts.matches_current_sources(&extra_member));
+
+        let baseline_facts = copy_facts();
+        let recovery_from_current = RecoveryCurrentView::from_current(&facts).unwrap();
+
+        let replayed = writer.full_projection().await.unwrap();
+        assert_eq!(
+            recovery_from_current,
+            RecoveryCurrentView::from_snapshot(&replayed).unwrap()
+        );
+
+        let mut damaged = replayed.clone();
+        let repository_row = damaged
+            .rows
+            .iter_mut()
+            .find(|row| {
+                row.row_id == crate::repository::repository_row_id(&repository.repository_id)
+            })
+            .unwrap();
+        repository_row.payload_json = Some("{".into());
+        let damaged_facts = CurrentFacts::try_from(damaged.clone()).unwrap();
+        assert_eq!(
+            RecoveryCurrentView::from_current(&damaged_facts),
+            Err(StoreError::StoreCorrupt)
+        );
+        assert_eq!(
+            RecoveryCurrentView::from_snapshot(&damaged),
+            Err(StoreError::StoreCorrupt)
+        );
+
+        assert_eq!(facts.frontier(), replayed.frontier);
+        assert_eq!(facts.into_full_snapshot().unwrap(), replayed);
+        let bound_prefix = writer.project_current(true).await.unwrap();
+        let bound_receipt = Arc::clone(&bound_prefix.source_receipts[&receipt_id].0);
+        assert_eq!(bound_prefix.into_full_snapshot().unwrap(), replayed);
+        let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
+        let persisted = writer.l0002_projection_worker().current().await.unwrap();
+        assert_eq!(persisted, expected);
+        let surface_seq = replayed
+            .rows
+            .iter()
+            .find(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+            .unwrap()
+            .source_event_seq;
+        assert!(surface_seq > seeded.frontier);
+        assert!(
+            persisted
+                .search
+                .iter()
+                .any(|row| row.source_event_seq == surface_seq)
+        );
+
+        let make_snapshot = |captured_at_us| WorktreeSnapshot {
+            worktree_snapshot_id: WorktreeSnapshotId::new_v7(),
+            worktree_instance_id: worktree.worktree_instance_id,
+            head_oid: None,
+            tree_oid: None,
+            branch_ref: None,
+            detached_head: false,
+            tracked_diff_digest: None,
+            index_digest: None,
+            untracked_manifest_digest: None,
+            relevant_anchor_digests: vec![],
+            dependency_fingerprints: vec![],
+            toolchain_fingerprint: None,
+            git_operation: evertrace_domain::repository::GitOperation::None,
+            captured_at_us,
+            evidence_refs: vec!["snapshot:r660".into()],
+            capture_status: evertrace_domain::repository::SnapshotCaptureStatus::Complete,
+            omission_reasons: vec![],
+        };
+        writer
+            .commit(
+                &r105_command(
+                    3,
+                    vec![JournalPayload::WorktreeSnapshotRecorded(Box::new(
+                        make_snapshot(3),
+                    ))],
+                ),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        let reconciled_without_new_source = writer.project_current(true).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &bound_receipt,
+            &reconciled_without_new_source.source_receipts[&receipt_id].0,
+        ));
+        assert_eq!(reconciled_without_new_source.source_receipts().count(), 1);
+        assert_eq!(
+            reconciled_without_new_source.source_observations().count(),
+            1
+        );
+        assert_eq!(reconciled_without_new_source.evidence_surfaces().count(), 1);
+        assert!(writer.source_prefix_proven_for_test());
+        let replayed_without_new_source = writer.full_projection().await.unwrap();
+        assert_eq!(
+            reconciled_without_new_source.into_full_snapshot().unwrap(),
+            replayed_without_new_source
+        );
+        assert_eq!(
+            sqlite.lock().unwrap().object_rows().unwrap(),
+            replayed_without_new_source.rows
+        );
+        let expected =
+            crate::query::derive_l0002_projections(&replayed_without_new_source).unwrap();
+        assert_eq!(
+            writer.l0002_projection_worker().current().await.unwrap(),
+            expected
+        );
+
+        let (next_receipt, next_observation, next_surface) =
+            r105_capture("current-facts-mixed", 1, &repository, &worktree, true);
+        let mut mixed_payloads =
+            r105_capture_payloads(&next_receipt, &next_observation, next_surface.as_ref());
+        mixed_payloads.push(JournalPayload::WorktreeSnapshotRecorded(Box::new(
+            make_snapshot(4),
+        )));
+        writer
+            .commit(&r105_command(4, mixed_payloads), 4)
+            .await
+            .unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+
+        let (stamp, journal_rows, appended_rows, before_fault_rows) = {
+            let mut state = sqlite.lock().unwrap();
+            let stamp = state.stamp().unwrap();
+            let journal_rows = state.rows().unwrap();
+            let appended_rows = state.rows_after(stamp.object_checkpoint).unwrap();
+            let object_rows = state.object_rows().unwrap();
+            (stamp, journal_rows, appended_rows, object_rows)
+        };
+        let fault_admission = JournalAdmissionState::from_journal_rows(&journal_rows).unwrap();
+        let fault_source_facts = fault_admission.source_facts();
+        let worker = ProjectionWorker::new(sqlite.clone());
+        assert!(matches!(
+            worker
+                .catch_up_inner(
+                    true,
+                    Some((stamp.objects_epoch, stamp.object_checkpoint, stamp.frontier)),
+                    Some(&appended_rows),
+                    Some(&fault_source_facts),
+                    true,
+                )
+                .await,
+            Err(StoreError::Projection)
+        ));
+        {
+            let mut state = sqlite.lock().unwrap();
+            assert_eq!(state.object_rows().unwrap(), before_fault_rows);
+            assert_eq!(
+                state.stamp().unwrap().object_checkpoint,
+                stamp.object_checkpoint
+            );
+        }
+
+        let mixed_facts = writer.project_current(true).await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        assert!(Arc::ptr_eq(
+            &bound_receipt,
+            &mixed_facts.source_receipts[&receipt_id].0,
+        ));
+        assert_eq!(mixed_facts.source_receipts().count(), 2);
+        assert_eq!(mixed_facts.source_observations().count(), 2);
+        assert_eq!(mixed_facts.evidence_surfaces().count(), 2);
+        let replayed_mixed = writer.full_projection().await.unwrap();
+        assert_eq!(mixed_facts.into_full_snapshot().unwrap(), replayed_mixed);
+        assert_eq!(
+            sqlite.lock().unwrap().object_rows().unwrap(),
+            replayed_mixed.rows
+        );
+        let expected = crate::query::derive_l0002_projections(&replayed_mixed).unwrap();
+        assert_eq!(
+            writer.l0002_projection_worker().current().await.unwrap(),
+            expected
+        );
+
+        let post_append_admission =
+            JournalAdmissionState::from_journal_rows(&sqlite.lock().unwrap().rows().unwrap())
+                .unwrap();
+        assert!(
+            post_append_admission
+                .source_facts()
+                .matches_current_sources(&baseline_facts)
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_successor_uses_proven_delta_and_matches_full_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    vec![
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                        JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+                    ],
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        // The complete path derives every family and reads them back; only
+        // that establishes the private content grade used by the next sync.
+        let seeded = writer.project().await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 0);
+
+        let (receipt, observation, surface) =
+            r105_capture("first", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    2,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let frontier = writer.sync_frontier().await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 1);
+        let replayed = r105_assert_projection_eq(&writer, &root, frontier).await;
+        // The new receipt nests the old repository/worktree ids, so the
+        // existing edge's causal sequence must advance to the highest
+        // changed row that carries those ids (the surface row).
+        let edge_id = crate::relations::RelationProjectionRow::edge(
+            "repository_to_worktree",
+            0,
+            repository.repository_id.to_string(),
+            worktree.worktree_instance_id.to_string(),
+        )
+        .row_id;
+        let expected = crate::query::derive_l0002_projections(&replayed).unwrap();
+        let edge = expected
+            .relations
+            .iter()
+            .find(|row| row.row_id == edge_id)
+            .unwrap();
+        let surface_row = replayed
+            .rows
+            .iter()
+            .find(|row| row.object_kind.as_deref() == Some("evidence_surface"))
+            .unwrap();
+        assert_eq!(edge.source_event_seq, surface_row.source_event_seq);
+        assert!(edge.source_event_seq > seeded.frontier);
+        assert!(edge.source_event_seq < frontier);
+        let runtime =
+            crate::projections::RuntimeSchedulerView::from_rows(replayed.frontier, &replayed.rows)
+                .unwrap();
+        assert!(
+            runtime
+                .dirty
+                .iter()
+                .any(|target| target.target_kind == DirtyTargetKind::EvidenceSurface)
+        );
+        assert!(runtime.jobs.is_empty());
+        assert!(runtime.outbox.is_empty());
+
+        // A later legal lower source sequence for the same non-importer source
+        // must keep the persisted watermark winner instead of the payload.
+        let (wm_receipt, wm_observation, _) = r105_capture("wm", 5, &repository, &worktree, false);
+        writer
+            .commit(
+                &r105_command(3, r105_capture_payloads(&wm_receipt, &wm_observation, None)),
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        crate::sqlite_state::reset_source_current_row_decodes();
+        writer.sync_frontier().await.unwrap();
+        assert_eq!(crate::sqlite_state::source_current_row_decodes(), 0);
+        assert_eq!(writer.capture_delta_selections(), 2);
+        let sqlite = writer.projection_handle();
+        let watermark_before = sqlite
+            .lock()
+            .unwrap()
+            .object_rows()
+            .unwrap()
+            .into_iter()
+            .find(|row| {
+                row.row_id.starts_with("runtime:watermark:source:")
+                    && row
+                        .payload_json
+                        .as_deref()
+                        .is_some_and(|json| json.contains("r105-wm"))
+            })
+            .unwrap();
+        let (lower_receipt, lower_observation, _) =
+            r105_capture("wm", 3, &repository, &worktree, false);
+        writer
+            .commit(
+                &r105_command(
+                    4,
+                    r105_capture_payloads(&lower_receipt, &lower_observation, None),
+                ),
+                4,
+            )
+            .await
+            .unwrap();
+        let frontier = writer.sync_frontier().await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 3);
+        let replayed = r105_assert_projection_eq(&writer, &root, frontier).await;
+        let watermark_after = replayed
+            .rows
+            .iter()
+            .find(|row| row.row_id == watermark_before.row_id)
+            .unwrap();
+        assert_eq!(watermark_after, &watermark_before);
+    }
+
+    #[tokio::test]
+    async fn capture_successor_objects_fault_keeps_checkpoint_and_recovers_fully() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    vec![
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                        JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+                    ],
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        let seeded = writer.project().await.unwrap();
+        let (receipt, observation, surface) =
+            r105_capture("fault", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    2,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let sqlite = writer.projection_handle();
+        let (epoch, frontier, checkpoint) = {
+            let mut state = sqlite.lock().unwrap();
+            let stamp = state.stamp().unwrap();
+            (stamp.objects_epoch, stamp.frontier, stamp.object_checkpoint)
+        };
+        assert_eq!(checkpoint, seeded.frontier);
+        let before = sqlite.lock().unwrap().object_rows().unwrap();
+        let appended = sqlite.lock().unwrap().rows_after(checkpoint).unwrap();
+        let worker = ProjectionWorker::new(sqlite.clone());
+        assert!(matches!(
+            worker
+                .catch_up_capture_delta_with_fault((epoch, checkpoint, frontier), &appended)
+                .await,
+            Err(StoreError::Projection)
+        ));
+        assert_eq!(sqlite.lock().unwrap().object_rows().unwrap(), before);
+        // The next independent request recovers through the complete algorithm.
+        assert_eq!(
+            worker.catch_up().await.unwrap(),
+            writer.full_projection().await.unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_delta_shape_rejects_closed_command_violations() {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (receipt, observation, surface) =
+            r105_capture("shape", 1, &repository, &worktree, true);
+        let eligible = prepare_command(&r105_command(
+            1,
+            r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+        ))
+        .unwrap();
+        let rows = rows_for_append(&eligible, 1, 1).unwrap();
+        assert!(capture_delta_shape(&rows).unwrap().is_some());
+
+        // The same field shape in Replacement mode is excluded.
+        let mut replacement = receipt.clone();
+        replacement.source_revision_mode = SourceRevisionMode::Replacement;
+        replacement.previous_source_revision = Some(SourceRevision::parse("revision-0").unwrap());
+        let mut payloads = r105_capture_payloads(&replacement, &observation, None);
+        payloads.push(JournalPayload::SourceRevisionRecorded(
+            SourceRevisionRecorded {
+                source_instance_id: replacement.source_instance_id.clone(),
+                source_revision: replacement.source_revision.clone(),
+                previous_source_revision: replacement.previous_source_revision.clone(),
+                mode: SourceRevisionMode::Replacement,
+                recorded_at_us: 1,
+            },
+        ));
+        let replacement_command = prepare_command(&r105_command(2, payloads)).unwrap();
+        assert!(
+            capture_delta_shape(&rows_for_append(&replacement_command, 10, 2).unwrap())
+                .unwrap()
+                .is_none()
+        );
+
+        // Any other family uses the complete algorithm.
+        let other = prepare_command(&r105_command(
+            3,
+            vec![JournalPayload::MigrationApplied(MigrationApplied {
+                migration_id: "not-a-capture".into(),
+            })],
+        ))
+        .unwrap();
+        assert!(
+            capture_delta_shape(&rows_for_append(&other, 20, 3).unwrap())
+                .unwrap()
+                .is_none()
+        );
+
+        // A capture command missing its watermark is not eligible.
+        let incomplete = rows
+            .iter()
+            .filter(|row| row.event_type != "source_ingest_watermark_v1")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(capture_delta_shape(&incomplete).unwrap().is_none());
+
+        // A dirty target pointing at another observation is not eligible.
+        let mut foreign = rows.clone();
+        for row in &mut foreign {
+            if row.event_type != "dirty_target_v1" {
+                continue;
+            }
+            let JournalPayload::DirtyTarget(mut target) = row.payload().unwrap() else {
+                panic!("a dirty target row must decode as a dirty target");
+            };
+            target.target_id = SourceObservationId::from_digest([9; 32]).to_string();
+            row.payload_json = JournalPayload::DirtyTarget(target)
+                .canonical_json()
+                .unwrap();
+        }
+        assert!(capture_delta_shape(&foreign).unwrap().is_none());
+
+        // Rows spanning two commands are not one confirmed successor.
+        let mut mixed = rows.clone();
+        mixed.extend(rows_for_append(&other, 50, 6).unwrap());
+        assert!(capture_delta_shape(&mixed).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_successor_requires_proof_and_one_confirmed_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    vec![
+                        JournalPayload::RepositoryInstanceRecorded(Box::new(repository.clone())),
+                        JournalPayload::WorktreeInstanceRecorded(Box::new(worktree.clone())),
+                    ],
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        // Cold: no completed full derivation exists yet.
+        let (receipt, observation, surface) = r105_capture("cold", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    2,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let frontier = writer.sync_frontier().await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 0);
+        r105_assert_projection_eq(&writer, &root, frontier).await;
+
+        // Two appends before one sync are not a single confirmed successor.
+        let (a_receipt, a_observation, _) =
+            r105_capture("multi-a", 1, &repository, &worktree, false);
+        writer
+            .commit(
+                &r105_command(3, r105_capture_payloads(&a_receipt, &a_observation, None)),
+                3,
+            )
+            .await
+            .unwrap();
+        let (b_receipt, b_observation, _) =
+            r105_capture("multi-b", 1, &repository, &worktree, false);
+        writer
+            .commit(
+                &r105_command(4, r105_capture_payloads(&b_receipt, &b_observation, None)),
+                4,
+            )
+            .await
+            .unwrap();
+        let frontier = writer.sync_frontier().await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 0);
+        r105_assert_projection_eq(&writer, &root, frontier).await;
+
+        // A single append with an ordinary family is not the capture shape.
+        writer
+            .commit(
+                &r105_command(
+                    5,
+                    vec![JournalPayload::MigrationApplied(MigrationApplied {
+                        migration_id: "ordinary".into(),
+                    })],
+                ),
+                5,
+            )
+            .await
+            .unwrap();
+        let frontier = writer.sync_frontier().await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 0);
+        r105_assert_projection_eq(&writer, &root, frontier).await;
+
+        // Once the complete path has re-established the grade, one closed
+        // append is selected again.
+        let (after_receipt, after_observation, after_surface) =
+            r105_capture("after", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    6,
+                    r105_capture_payloads(
+                        &after_receipt,
+                        &after_observation,
+                        after_surface.as_ref(),
+                    ),
+                ),
+                6,
+            )
+            .await
+            .unwrap();
+        let frontier = writer.sync_frontier().await.unwrap();
+        assert_eq!(writer.capture_delta_selections(), 1);
+        r105_assert_projection_eq(&writer, &root, frontier).await;
+        // The same frontier alone is not a proof after an external SQL write.
+        // Keep a real single capture successor pending, then corrupt one old
+        // row through a second connection without advancing any checkpoint.
+        let (external_receipt, external_observation, _) =
+            r105_capture("external", 1, &repository, &worktree, false);
+        writer
+            .commit(
+                &r105_command(
+                    7,
+                    r105_capture_payloads(&external_receipt, &external_observation, None),
+                ),
+                7,
+            )
+            .await
+            .unwrap();
+        let external = rusqlite::Connection::open(crate::connection::sqlite_path(&root)).unwrap();
+        assert_eq!(
+            external
+                .execute(
+                    "UPDATE object_rows SET payload_json = '{}' WHERE row_id = ?1",
+                    [format!(
+                        "object:evidence:source_receipt:{}",
+                        receipt.source_receipt_id
+                    )],
+                )
+                .unwrap(),
+            1,
+        );
+        assert_eq!(writer.sync_frontier().await, Err(StoreError::StoreCorrupt));
+        assert_eq!(writer.capture_delta_selections(), 1);
+        let checkpoint: Vec<u8> = external
+            .query_row(
+                "SELECT source_event_seq FROM object_rows WHERE row_id = ?1",
+                [OBJECTS_CHECKPOINT_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, frontier.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn current_source_mismatch_keeps_original_full_current_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (receipt, observation, surface) =
+            r105_capture("prefix-mismatch", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        let base = writer.project_objects().await.unwrap();
+        assert!(writer.source_prefix_proven_for_test());
+        drop(writer);
+        let writer = JournalWriter::open(&root).await.unwrap();
+        assert!(!writer.source_prefix_proven_for_test());
+
+        let mut altered = base
+            .rows
+            .iter()
+            .find(|row| row.object_kind.as_deref() == Some("source_receipt"))
+            .unwrap()
+            .clone();
+        let mut altered_payload: JournalPayload =
+            serde_json::from_str(altered.payload_json.as_ref().unwrap().as_str()).unwrap();
+        let JournalPayload::SourceReceiptRecorded(altered_receipt) = &mut altered_payload else {
+            panic!("source receipt current row must contain its receipt payload");
+        };
+        altered_receipt.source_ref = "source-ref-from-valid-current".into();
+        altered.payload_json = Some(serde_json::to_string(&altered_payload).unwrap().into());
+        writer
+            .projection_handle()
+            .lock()
+            .unwrap()
+            .insert_object_row_for_test(&altered)
+            .unwrap();
+
+        let current = writer.project_objects().await.unwrap();
+        assert!(!writer.source_prefix_proven_for_test());
+        assert!(current.rows.iter().any(|row| row == &altered));
+        assert_ne!(current.rows, writer.full_projection().await.unwrap().rows);
+    }
+
+    #[test]
+    fn source_fact_arcs_share_qualified_values_and_failed_candidates_do_not_publish() {
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (base_receipt, base_observation, base_surface) =
+            r105_capture("arc-base", 1, &repository, &worktree, true);
+        let mut base_rows = Vec::new();
+        append(
+            r105_command(
+                1,
+                r105_capture_payloads(&base_receipt, &base_observation, base_surface.as_ref()),
+            ),
+            1,
+            &mut base_rows,
+        );
+        let base_row_refs = base_rows.iter().collect::<Vec<_>>();
+        let base = JournalAdmissionState::default()
+            .apply_row_batch(&base_row_refs)
+            .unwrap();
+        let base_receipt_fact =
+            Arc::clone(&base.source_receipts[&base_receipt.source_receipt_id].0);
+        let base_observation_fact =
+            Arc::clone(&base.source_observations[&base_observation.source_observation_id].0);
+        let base_surface_fact =
+            Arc::clone(&base.evidence_surfaces[&base_observation.source_observation_id].0);
+
+        let mut restored = ReducerState::default();
+        restored
+            .restore_source_prefix(&base.source_facts(), base.frontier)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &base_receipt_fact,
+            &restored.source_receipts[&base_receipt.source_receipt_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_observation_fact,
+            &restored.source_observations[&base_observation.source_observation_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_surface_fact,
+            &restored.evidence_surfaces[&base_observation.source_observation_id].0
+        ));
+        drop(restored);
+
+        let (next_receipt, next_observation, next_surface) =
+            r105_capture("arc-next", 1, &repository, &worktree, true);
+        let mut next_rows = Vec::new();
+        append(
+            r105_command(
+                2,
+                r105_capture_payloads(&next_receipt, &next_observation, next_surface.as_ref()),
+            ),
+            base_rows.len() as u64 + 1,
+            &mut next_rows,
+        );
+        let next_row_refs = next_rows.iter().collect::<Vec<_>>();
+        let next = base.apply_row_batch(&next_row_refs).unwrap();
+        assert!(Arc::ptr_eq(
+            &base_receipt_fact,
+            &next.source_receipts[&base_receipt.source_receipt_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_observation_fact,
+            &next.source_observations[&base_observation.source_observation_id].0
+        ));
+        assert!(Arc::ptr_eq(
+            &base_surface_fact,
+            &next.evidence_surfaces[&base_observation.source_observation_id].0
+        ));
+        assert_eq!(
+            next.source_receipts[&next_receipt.source_receipt_id]
+                .0
+                .as_ref(),
+            &next_receipt
+        );
+        assert_eq!(
+            next.source_observations[&next_observation.source_observation_id]
+                .0
+                .as_ref(),
+            &next_observation
+        );
+        assert_eq!(
+            next.evidence_surfaces[&next_observation.source_observation_id]
+                .0
+                .as_ref(),
+            next_surface.as_ref().unwrap()
+        );
+        assert!(!Arc::ptr_eq(
+            &base_receipt_fact,
+            &next.source_receipts[&next_receipt.source_receipt_id].0
+        ));
+        assert!(!Arc::ptr_eq(
+            &base_observation_fact,
+            &next.source_observations[&next_observation.source_observation_id].0
+        ));
+        assert!(!Arc::ptr_eq(
+            &base_surface_fact,
+            &next.evidence_surfaces[&next_observation.source_observation_id].0
+        ));
+
+        let original = next;
+        let mut failed = original.clone();
+        assert!(matches!(
+            failed.apply_payload(
+                JournalPayload::SourceObservationRecorded(Box::new(base_observation.clone())),
+                2,
+            ),
+            Err(StoreError::StoreCorrupt)
+        ));
+        assert_eq!(original.source_observations.len(), 2);
+        assert!(Arc::ptr_eq(
+            &base_observation_fact,
+            &original.source_observations[&base_observation.source_observation_id].0
+        ));
+    }
+
+    #[tokio::test]
+    async fn proven_source_prefix_skips_sql_rows_across_multiple_appends() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut writer = JournalWriter::open(&root).await.unwrap();
+        let (repository, worktree) = r105_repository_and_worktree();
+        let (receipt, observation, surface) =
+            r105_capture("prefix-base", 1, &repository, &worktree, true);
+        writer
+            .commit(
+                &r105_command(
+                    1,
+                    r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        let base = writer.project_objects().await.unwrap();
+        assert_eq!(base.frontier, writer.frontier());
+        assert!(writer.source_prefix_proven_for_test());
+
+        for (index, label) in [(2, "prefix-next"), (3, "prefix-last")] {
+            let (receipt, observation, surface) =
+                r105_capture(label, 1, &repository, &worktree, true);
+            writer
+                .commit(
+                    &r105_command(
+                        index,
+                        r105_capture_payloads(&receipt, &observation, surface.as_ref()),
+                    ),
+                    index,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(writer.source_prefix_proven_for_test());
+        assert!(writer.source_prefix_successor_bound_for_test());
+
+        crate::sqlite_state::reset_source_current_row_decodes();
+        let projected = writer.project_objects().await.unwrap();
+        assert_eq!(
+            crate::sqlite_state::source_current_row_decodes(),
+            0,
+            "a qualified multi-append catch-up must not materialize current source rows from SQLite"
+        );
+        assert_eq!(projected.frontier, writer.frontier());
+        assert_eq!(projected, writer.full_projection().await.unwrap());
     }
 }

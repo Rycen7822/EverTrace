@@ -12,7 +12,10 @@ use evertrace_domain::{
         SourceRecordIdentity, SourceRevision, SourceRevisionMode, SourceRole, payload_fingerprint,
         source_observation_id, source_receipt_id,
     },
-    ids::{CommandId, RepositoryId, TaskId, WorkEpisodeId, WorkstreamId, WorktreeId},
+    ids::{
+        CommandId, JobId, RepositoryId, SourceObservationId, TaskId, WorkEpisodeId, WorkstreamId,
+        WorktreeId,
+    },
     procedure::{ProcedureActions, ProcedureDone, ProcedureDraft, ProcedureKind, ProcedureWhen},
     repository::{
         FilesystemIdentity, GitObjectFormat, GitRegistrationState, PathObservation,
@@ -24,8 +27,9 @@ use evertrace_domain::{
         AtomProvenance, AtomScope, ConstraintExpr, ConstraintField, EpistemicStatus,
         ProposalCreatedBy, ProposalEligibility, ProposalOperation, ProposalPayload, ProposalStatus,
         ProposalTargetId, ProposalTargetKind, Scenario, ScenarioScope, ScenarioStatus,
-        ScenarioWorkstream, SemanticCandidate, SemanticCompleteness, SemanticDigestTrigger,
-        SemanticQualifier, SemanticStructuredDelta, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
+        ScenarioWorkstream, SemanticCandidate, SemanticCompleteness, SemanticDerivationRun,
+        SemanticDigest, SemanticDigestTrigger, SemanticJobTarget, SemanticQualifier,
+        SemanticSourceTarget, SemanticStructuredDelta, TUI_ACCEPTANCE_EVENT_MANIFEST_REF,
         ValidityInterval, WikiProjection, job_fingerprint, tui_acceptance_event_payload,
     },
     work::{
@@ -48,14 +52,19 @@ use evertrace_engine::{
     work::new_episode,
 };
 use evertrace_store::{
-    DirtyTarget, DirtyTargetKind, JournalCommand, JournalEventDraft, JournalPayload, JournalWriter,
-    ProjectionSnapshot, SearchIndex, SemanticCurrentView, SourceIngestWatermark,
-    derive_l0002_projections,
+    CurrentFacts, DirtyTarget, DirtyTargetKind, DurableJob, JobBudget, JobLease, JobStatus,
+    JobTerminalAudit, JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft,
+    JournalPayload, JournalWriter, ProjectionSnapshot, SearchIndex, SemanticCurrentView,
+    SourceIngestWatermark, StoreError, derive_l0002_projections,
 };
 use provider_stub::ProviderStub;
 use tempfile::TempDir;
 
 const CONFIG: [u8; 32] = [0x26; 32];
+
+fn current_facts(snapshot: &ProjectionSnapshot) -> CurrentFacts {
+    CurrentFacts::try_from(snapshot.clone()).unwrap()
+}
 
 #[test]
 fn episode_digest_run_wire_and_fingerprint_remain_fixed_and_targets_are_exclusive() {
@@ -627,6 +636,194 @@ async fn persist_source(
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::EvidenceSurface,
+                        target_id: observation.source_observation_id.to_string(),
+                        algorithm_revision: "s26-v1".into(),
+                        source_watermark: receipt.source_sequence,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::PhysicalNormalization,
+                        target_id: observation.source_observation_id.to_string(),
+                        algorithm_revision: "s26-v1".into(),
+                        source_watermark: receipt.source_sequence,
+                    }),
+                ],
+            ),
+            at,
+        )
+        .await
+        .unwrap();
+}
+
+const FROZEN_MESSAGE_TEXTS: [&str; 3] = [
+    "first frozen message",
+    "second frozen message",
+    "third frozen message",
+];
+
+/// Session-import shaped messages for a frozen `SynthesisTarget::Source`
+/// interval. Only the test assembly differs from `source()`; every field stays
+/// an ordinary legal receipt/observation admitted through the real writer.
+fn session_message(
+    label: &str,
+    sequence: u64,
+    range_start: u64,
+    task_id: TaskId,
+    repository_id: RepositoryId,
+    worktree_id: WorktreeId,
+) -> (SourceReceipt, SourceObservation) {
+    let payload = FROZEN_MESSAGE_TEXTS[usize::try_from(sequence - 1).unwrap()];
+    let (mut receipt, mut observation) =
+        source(label, payload, task_id, repository_id, worktree_id);
+    let instance = SourceInstanceId::parse(format!("session-rollout:{label}")).unwrap();
+    let record = SourceRecordIdentity::parse(format!("record-{label}-{sequence}")).unwrap();
+    let observation_id =
+        source_observation_id(&instance, &receipt.source_revision, &record).unwrap();
+    let receipt_id = source_receipt_id(&instance, &receipt.source_revision, &record).unwrap();
+    receipt.source_receipt_id = receipt_id;
+    receipt.source_observation_id = observation_id;
+    receipt.source_instance_id = instance.clone();
+    receipt.source_record_identity = record.clone();
+    receipt.source_ref = format!("source-ref-{label}-{sequence}");
+    receipt.source_sequence = sequence;
+    receipt.source_byte_range = Some(EvidenceByteRange {
+        start: range_start,
+        end: sequence,
+    });
+    receipt.close_watermark = None;
+    observation.source_observation_id = observation_id;
+    observation.source_instance_id = instance;
+    observation.source_record_identity = record;
+    observation.source_receipt_ref = receipt_id;
+    receipt.validate().unwrap();
+    observation.validate().unwrap();
+    (receipt, observation)
+}
+
+fn session_prefix_digest(
+    receipt: &SourceReceipt,
+    range: &EvidenceByteRange,
+    previous: Option<&str>,
+) -> String {
+    let digest = sha256(
+        "session_import_confirmed_prefix",
+        1,
+        &CanonicalValue::Sequence(vec![
+            CanonicalValue::String(receipt.source_instance_id.as_str().to_owned()),
+            CanonicalValue::String(receipt.source_revision.as_str().to_owned()),
+            CanonicalValue::Integer(i128::from(range.start)),
+            CanonicalValue::Integer(i128::from(range.end)),
+            previous.map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::String(value.to_owned())
+            }),
+            CanonicalValue::String(receipt.cas_ref.clone()),
+        ]),
+    )
+    .unwrap();
+    evertrace_domain::evidence::hex(&digest)
+}
+
+async fn persist_session_message(
+    writer: &mut JournalWriter,
+    receipt: &SourceReceipt,
+    observation: &SourceObservation,
+    previous_digest: Option<&str>,
+    at: i64,
+) -> String {
+    let range = receipt.source_byte_range.as_ref().unwrap();
+    let confirmed_prefix_digest = session_prefix_digest(receipt, range, previous_digest);
+    writer
+        .commit(
+            &command(
+                at,
+                vec![
+                    JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                    JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                    JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                        source_instance_id: receipt.source_instance_id.clone(),
+                        source_revision: receipt.source_revision.clone(),
+                        source_sequence: receipt.source_sequence,
+                        confirmed_prefix_digest: Some(confirmed_prefix_digest.clone()),
+                        earlier_prefix: None,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::EvidenceSurface,
+                        target_id: observation.source_observation_id.to_string(),
+                        algorithm_revision: "s26-v1".into(),
+                        source_watermark: receipt.source_sequence,
+                    }),
+                    JournalPayload::DirtyTarget(DirtyTarget {
+                        target_kind: DirtyTargetKind::PhysicalNormalization,
+                        target_id: observation.source_observation_id.to_string(),
+                        algorithm_revision: "s26-v1".into(),
+                        source_watermark: receipt.source_sequence,
+                    }),
+                ],
+            ),
+            at,
+        )
+        .await
+        .unwrap();
+    confirmed_prefix_digest
+}
+
+fn direct_source_message(
+    label: &str,
+    sequence: u64,
+    task_id: TaskId,
+    repository_id: RepositoryId,
+    worktree_id: WorktreeId,
+) -> (SourceReceipt, SourceObservation) {
+    let (mut receipt, mut observation) =
+        session_message(label, sequence, 0, task_id, repository_id, worktree_id);
+    let source_instance_id = SourceInstanceId::parse(format!("direct-r323:{label}")).unwrap();
+    let observation_id = source_observation_id(
+        &source_instance_id,
+        &receipt.source_revision,
+        &receipt.source_record_identity,
+    )
+    .unwrap();
+    let receipt_id = source_receipt_id(
+        &source_instance_id,
+        &receipt.source_revision,
+        &receipt.source_record_identity,
+    )
+    .unwrap();
+    receipt.source_instance_id = source_instance_id.clone();
+    receipt.source_observation_id = observation_id;
+    receipt.source_receipt_id = receipt_id;
+    receipt.source_byte_range = None;
+    receipt.close_watermark = None;
+    observation.source_instance_id = source_instance_id;
+    observation.source_observation_id = observation_id;
+    observation.source_receipt_ref = receipt_id;
+    receipt.validate().unwrap();
+    observation.validate().unwrap();
+    (receipt, observation)
+}
+
+async fn persist_direct_source_message(
+    writer: &mut JournalWriter,
+    receipt: &SourceReceipt,
+    observation: &SourceObservation,
+    at: i64,
+) {
+    writer
+        .commit(
+            &command(
+                at,
+                vec![
+                    JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
+                    JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
+                    JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
+                        source_instance_id: receipt.source_instance_id.clone(),
+                        source_revision: receipt.source_revision.clone(),
+                        source_sequence: receipt.source_sequence,
+                        confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -748,6 +945,7 @@ async fn seed_store_with_lifecycle(path: &std::path::Path, lifecycle: EpisodeLif
                         source_revision: receipt.source_revision.clone(),
                         source_sequence: receipt.source_sequence,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -1048,7 +1246,7 @@ async fn planner_commits_one_atomic_digest_run_and_semantic_episode_successor() 
     let planner = SynthesisPlanner::new(llm);
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current_facts(&snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1148,12 +1346,7 @@ async fn planner_commits_one_atomic_digest_run_and_semantic_episode_successor() 
     assert!(relation_kinds.contains("semantic_digest_to_direct_source"));
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
     let replay = writer.commit(&success_command, 3).await.unwrap();
     assert!(replay.replayed);
@@ -1184,7 +1377,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let planner = SynthesisPlanner::new(llm);
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current_facts(&snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1285,7 +1478,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     let recovered_planner = SynthesisPlanner::new(config(&recovered_stub.base_url));
     let retry = recovered_planner
         .execute(SynthesisRequest {
-            snapshot: &after,
+            current: &current_facts(&after),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1312,7 +1505,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
 
     let shared_ref = planner
         .execute(SynthesisRequest {
-            snapshot: &after,
+            current: &current_facts(&after),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![
@@ -1341,7 +1534,7 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
         .collect::<Vec<_>>();
     let bounded = planner
         .execute(SynthesisRequest {
-            snapshot: &after,
+            current: &current_facts(&after),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![
@@ -1371,6 +1564,577 @@ async fn planner_failures_audit_without_digest_or_watermark_progress() {
     assert_eq!(reopened.project().await.unwrap(), projected);
 }
 
+async fn frozen_source_prefix(
+    root: &std::path::Path,
+    sequences: &[u64],
+) -> (
+    JournalWriter,
+    ProjectionSnapshot,
+    SemanticSourceTarget,
+    Vec<(SourceReceipt, SourceObservation)>,
+) {
+    let seed = seed_store(root).await;
+    let Seed {
+        mut writer,
+        task,
+        repository,
+        worktree,
+        ..
+    } = seed;
+    let mut messages = Vec::new();
+    let mut confirmed = None;
+    let mut range_start = 0u64;
+    for (index, sequence) in sequences.iter().enumerate() {
+        let message = session_message(
+            "frozen-interval",
+            *sequence,
+            range_start,
+            task.task_id,
+            repository.repository_id,
+            worktree.worktree_instance_id,
+        );
+        let at = 3 + i64::try_from(index).unwrap();
+        confirmed = Some(
+            persist_session_message(
+                &mut writer,
+                &message.0,
+                &message.1,
+                confirmed.as_deref(),
+                at,
+            )
+            .await,
+        );
+        range_start = *sequence;
+        messages.push(message);
+    }
+    let snapshot = writer.project().await.unwrap();
+    let source = SemanticSourceTarget {
+        source_instance_id: messages[0].0.source_instance_id.clone(),
+        source_revision: messages[0].0.source_revision.clone(),
+        repository_id: repository.repository_id,
+        worktree_id: worktree.worktree_instance_id,
+    };
+    (writer, snapshot, source, messages)
+}
+
+async fn plan_frozen_source_summary(
+    snapshot: &ProjectionSnapshot,
+    source: SemanticSourceTarget,
+    messages: &[(&SourceReceipt, &SourceObservation)],
+) -> (SemanticDerivationRun, SemanticDigest, JournalCommand) {
+    let mut refs = messages
+        .iter()
+        .map(|(_, observation)| observation.source_observation_id.to_string())
+        .collect::<Vec<_>>();
+    refs.sort();
+    let direct_delta = messages
+        .iter()
+        .map(|(receipt, observation)| ProtectedDeltaItem {
+            kind: ProtectedDeltaKind::Progress,
+            value: format!("frozen source message {}", receipt.source_sequence),
+            direct_refs: vec![observation.source_observation_id.to_string()],
+        })
+        .collect::<Vec<_>>();
+    let mut derived = application();
+    for (receipt, observation) in messages {
+        derived.progress_delta.push(SemanticStructuredDelta {
+            label: format!("message-{}", receipt.source_sequence),
+            value: format!("frozen source message {}", receipt.source_sequence),
+            direct_refs: vec![observation.source_observation_id.to_string()],
+        });
+    }
+    let stub = ProviderStub::once(200, response(serde_json::to_value(derived).unwrap())).await;
+    let planner = SynthesisPlanner::new(config(&stub.base_url));
+    let resolution = planner
+        .execute(SynthesisRequest {
+            current: &current_facts(snapshot),
+            target: evertrace_engine::jobs::SynthesisTarget::Source {
+                source,
+                after_sequence: 0,
+                through_sequence: messages
+                    .iter()
+                    .map(|(receipt, _)| receipt.source_sequence)
+                    .max()
+                    .unwrap(),
+            },
+            trigger: SemanticDigestTrigger::SourceMessages,
+            direct_delta,
+            selected_direct_refs: refs,
+            command_id: CommandId::new_v7(),
+            occurred_at_us: 10,
+            algorithm_revision: "s26-v1".into(),
+            effective_config_hash: CONFIG,
+        })
+        .await
+        .unwrap();
+    let _ = stub.finish().await;
+    let SynthesisResolution::Success {
+        digest,
+        run,
+        episode,
+        command,
+    } = resolution
+    else {
+        panic!("a complete source interval must produce a run/digest command")
+    };
+    assert!(episode.is_none());
+    (run, *digest, command)
+}
+
+fn source_synthesis_job(
+    run: &SemanticDerivationRun,
+    first_observation_id: SourceObservationId,
+    last_observation_id: SourceObservationId,
+) -> DurableJob {
+    let target = SemanticJobTarget::Source {
+        first_observation_id,
+        last_observation_id,
+    }
+    .encode()
+    .unwrap();
+    DurableJob {
+        job_id: JobId::new_v7(),
+        idempotency_key: format!("semantic_synthesis:{target}"),
+        target_revision: target,
+        target_watermark: run.to_watermark,
+        target_generation: 1,
+        kind: "semantic_synthesis_v1".into(),
+        algorithm_revision: run.algorithm_revision.clone(),
+        model_id: Some(run.model_id.clone()),
+        priority: 10,
+        state: JobStatus::Queued,
+        attempt: 1,
+        backoff_until_us: None,
+        config_hash: run.effective_config_hash,
+        budget: JobBudget {
+            max_items: 64,
+            max_bytes: Some(256 * 1024),
+            max_input_tokens: Some(1_000),
+            max_output_tokens: Some(1_000),
+            max_calls: Some(1),
+            max_wall_time_ms: 1_000,
+        },
+        terminal: None,
+        lease_until_us: None,
+    }
+}
+
+async fn install_source_synthesis_job(writer: &mut JournalWriter, job: &DurableJob, at: i64) {
+    writer
+        .commit(
+            &command(at, vec![JournalPayload::JobState(job.clone())]),
+            at,
+        )
+        .await
+        .unwrap();
+    writer
+        .commit(
+            &command(
+                at + 1,
+                vec![JournalPayload::JobLease(JobLease {
+                    job_id: job.job_id,
+                    target_generation: 1,
+                    attempt: 2,
+                    lease_until_us: at + 1_000,
+                })],
+            ),
+            at + 1,
+        )
+        .await
+        .unwrap();
+}
+
+fn source_summary_submission(
+    planned: &JournalCommand,
+    job: &DurableJob,
+    result_ref: String,
+    at: i64,
+) -> JournalCommand {
+    let mut payloads = planned
+        .events()
+        .iter()
+        .map(|event| event.payload.clone())
+        .collect::<Vec<_>>();
+    let mut terminal = job.clone();
+    terminal.state = JobStatus::Succeeded;
+    terminal.attempt = 2;
+    terminal.lease_until_us = None;
+    terminal.terminal = Some(Box::new(JobTerminalAudit {
+        outcome: JobTerminalOutcome::Succeeded,
+        reason: JobTerminalReason::Completed,
+        result_ref: Some(result_ref),
+    }));
+    payloads.push(JournalPayload::JobState(terminal));
+    command(at, payloads)
+}
+
+#[tokio::test]
+async fn frozen_source_summary_requires_every_interval_message_ref() {
+    // A summary whose frozen refs cover the interval is accepted by the real
+    // writer, so the negative below is decided by source-ref completeness.
+    let positive_root = TempDir::new().unwrap();
+    let (mut writer, snapshot, source, messages) =
+        frozen_source_prefix(&positive_root.path().join("store"), &[1, 2, 3]).await;
+    let complete = messages
+        .iter()
+        .map(|(receipt, observation)| (receipt, observation))
+        .collect::<Vec<_>>();
+    let (run, digest, planned) = plan_frozen_source_summary(&snapshot, source, &complete).await;
+    let job = source_synthesis_job(
+        &run,
+        messages[0].1.source_observation_id,
+        messages[2].1.source_observation_id,
+    );
+    install_source_synthesis_job(&mut writer, &job, 6).await;
+    let before = writer.project().await.unwrap();
+    let committed = writer
+        .commit_if_frontier(
+            &source_summary_submission(&planned, &job, digest.semantic_digest_id.to_string(), 10),
+            10,
+            before.frontier,
+        )
+        .await
+        .unwrap();
+    assert!(!committed.replayed);
+    writer.full_projection().await.unwrap();
+    let projected = writer.project().await.unwrap();
+    assert!(projected.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_digest")
+            && row.object_id.as_deref() == Some(&digest.semantic_digest_id.to_string())
+    }));
+    drop(writer);
+
+    // Omitting the middle interval Message is rejected by completeness even
+    // though the command itself is otherwise fully consistent.
+    let negative_root = TempDir::new().unwrap();
+    let (mut writer, snapshot, source, messages) =
+        frozen_source_prefix(&negative_root.path().join("store"), &[1, 2, 3]).await;
+    let omitted = vec![
+        (&messages[0].0, &messages[0].1),
+        (&messages[2].0, &messages[2].1),
+    ];
+    let (run, digest, planned) =
+        plan_frozen_source_summary(&snapshot, source.clone(), &omitted).await;
+    let job = source_synthesis_job(
+        &run,
+        messages[0].1.source_observation_id,
+        messages[2].1.source_observation_id,
+    );
+    install_source_synthesis_job(&mut writer, &job, 6).await;
+    let before = writer.project().await.unwrap();
+    let rejected = writer
+        .commit_if_frontier(
+            &source_summary_submission(&planned, &job, digest.semantic_digest_id.to_string(), 10),
+            10,
+            before.frontier,
+        )
+        .await;
+    assert!(
+        matches!(rejected, Err(StoreError::InvalidInput)),
+        "a summary missing an in-interval Message must fail source-ref completeness: {rejected:?}"
+    );
+    assert_eq!(
+        writer.journal_rows().await.unwrap().len() as u64,
+        before.frontier
+    );
+    writer.full_projection().await.unwrap();
+    let after_rejection = writer.project().await.unwrap();
+    assert_eq!(after_rejection, before);
+    assert!(!after_rejection.data_rows().any(|row| {
+        matches!(
+            row.object_kind.as_deref(),
+            Some("semantic_digest" | "semantic_derivation_run")
+        )
+    }));
+
+    // The rejected attempt consumed neither the journal nor the job: the same
+    // leased job accepts the complete refs for the same interval afterwards.
+    let complete = messages
+        .iter()
+        .map(|(receipt, observation)| (receipt, observation))
+        .collect::<Vec<_>>();
+    let (_, complete_digest, complete_planned) =
+        plan_frozen_source_summary(&after_rejection, source, &complete).await;
+    let committed = writer
+        .commit_if_frontier(
+            &source_summary_submission(
+                &complete_planned,
+                &job,
+                complete_digest.semantic_digest_id.to_string(),
+                10,
+            ),
+            10,
+            after_rejection.frontier,
+        )
+        .await
+        .unwrap();
+    assert!(!committed.replayed);
+    writer.full_projection().await.unwrap();
+    let projected = writer.project().await.unwrap();
+    assert!(projected.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_digest")
+            && row.object_id.as_deref() == Some(&complete_digest.semantic_digest_id.to_string())
+    }));
+    assert!(!projected.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_digest")
+            && row.object_id.as_deref() == Some(&digest.semantic_digest_id.to_string())
+    }));
+
+    // Control: the same interval and refs are accepted when the prefix really
+    // has no middle Message, so the rejection above is the omitted in-interval
+    // Message and not the refs/interval shape.
+    let gap_root = TempDir::new().unwrap();
+    let (mut writer, snapshot, source, messages) =
+        frozen_source_prefix(&gap_root.path().join("store"), &[1, 3]).await;
+    let complete = messages
+        .iter()
+        .map(|(receipt, observation)| (receipt, observation))
+        .collect::<Vec<_>>();
+    let (run, digest, planned) = plan_frozen_source_summary(&snapshot, source, &complete).await;
+    let job = source_synthesis_job(
+        &run,
+        messages[0].1.source_observation_id,
+        messages[1].1.source_observation_id,
+    );
+    install_source_synthesis_job(&mut writer, &job, 6).await;
+    let before = writer.project().await.unwrap();
+    let committed = writer
+        .commit_if_frontier(
+            &source_summary_submission(&planned, &job, digest.semantic_digest_id.to_string(), 10),
+            10,
+            before.frontier,
+        )
+        .await
+        .unwrap();
+    assert!(!committed.replayed);
+    writer.full_projection().await.unwrap();
+    let projected = writer.project().await.unwrap();
+    assert!(projected.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_digest")
+            && row.object_id.as_deref() == Some(&digest.semantic_digest_id.to_string())
+    }));
+}
+
+#[tokio::test]
+async fn imported_source_prefix_rejects_late_message_before_objects_commit() {
+    let root = TempDir::new().unwrap();
+    // Messages 1 and 3 exist, 2 has not arrived yet. This exercises imported
+    // prefix monotonicity after a summary, not frozen-ref validation alone.
+    let (mut writer, snapshot, source, messages) =
+        frozen_source_prefix(&root.path().join("store"), &[1, 3]).await;
+    let complete = messages
+        .iter()
+        .map(|(receipt, observation)| (receipt, observation))
+        .collect::<Vec<_>>();
+    let (run, digest, planned) =
+        plan_frozen_source_summary(&snapshot, source.clone(), &complete).await;
+    let job = source_synthesis_job(
+        &run,
+        messages[0].1.source_observation_id,
+        messages[1].1.source_observation_id,
+    );
+    install_source_synthesis_job(&mut writer, &job, 6).await;
+    let before = writer.project().await.unwrap();
+    let committed = writer
+        .commit_if_frontier(
+            &source_summary_submission(&planned, &job, digest.semantic_digest_id.to_string(), 10),
+            10,
+            before.frontier,
+        )
+        .await
+        .unwrap();
+    assert!(!committed.replayed);
+    let frozen = writer.project().await.unwrap();
+    assert!(frozen.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_digest")
+            && row.object_id.as_deref() == Some(&digest.semantic_digest_id.to_string())
+    }));
+    let objects_checkpoint = writer
+        .backup_table_states()
+        .await
+        .unwrap()
+        .objects
+        .checkpoint;
+    assert_eq!(objects_checkpoint, frozen.frontier);
+
+    // The late in-interval Message is durably committed, but the very next
+    // sync must reject it at the same persisted boundary as the ordinary
+    // complete algorithm, before any objects commit happens.
+    let late = session_message(
+        "frozen-interval",
+        2,
+        1,
+        messages[0].0.task_id.unwrap(),
+        source.repository_id,
+        source.worktree_id,
+    );
+    let first_range = messages[0].0.source_byte_range.clone().unwrap();
+    let first_digest = session_prefix_digest(&messages[0].0, &first_range, None);
+    persist_session_message(&mut writer, &late.0, &late.1, Some(&first_digest), 11).await;
+    assert!(writer.journal_rows().await.unwrap().len() as u64 > frozen.frontier);
+    // Independent full replay must reject the same invalid prefix too.
+    assert_eq!(
+        writer.full_projection().await,
+        Err(StoreError::StoreCorrupt)
+    );
+    let rejected = writer.sync_frontier().await;
+    assert!(
+        matches!(rejected, Err(StoreError::StoreCorrupt)),
+        "a late in-interval Message must fail at the frozen boundary: {rejected:?}"
+    );
+    assert_eq!(writer.project().await, Err(StoreError::StoreCorrupt));
+    assert_eq!(
+        writer.full_projection().await,
+        Err(StoreError::StoreCorrupt)
+    );
+    // No partial objects commit survived the rejected request.
+    let states = writer.backup_table_states().await.unwrap();
+    assert_eq!(states.objects.checkpoint, objects_checkpoint);
+}
+
+#[tokio::test]
+async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore() {
+    let root = TempDir::new().unwrap();
+    let seed = seed_store(&root.path().join("store")).await;
+    let mut writer = seed.writer;
+    let first = direct_source_message(
+        "frozen-direct",
+        1,
+        seed.task.task_id,
+        seed.repository.repository_id,
+        seed.worktree.worktree_instance_id,
+    );
+    let third = direct_source_message(
+        "frozen-direct",
+        3,
+        seed.task.task_id,
+        seed.repository.repository_id,
+        seed.worktree.worktree_instance_id,
+    );
+    persist_direct_source_message(&mut writer, &first.0, &first.1, 3).await;
+    persist_direct_source_message(&mut writer, &third.0, &third.1, 4).await;
+    let source = SemanticSourceTarget {
+        source_instance_id: first.0.source_instance_id.clone(),
+        source_revision: first.0.source_revision.clone(),
+        repository_id: seed.repository.repository_id,
+        worktree_id: seed.worktree.worktree_instance_id,
+    };
+    let mut run = SemanticDerivationRun {
+        derivation_run_id: evertrace_domain::ids::SemanticDerivationRunId::new_v7(),
+        episode_id: None,
+        episode_revision_id: None,
+        from_watermark: 0,
+        to_watermark: 3,
+        selected_direct_refs: vec![
+            first.1.source_observation_id.to_string(),
+            third.1.source_observation_id.to_string(),
+        ],
+        job_fingerprint: [0; 32],
+        status: evertrace_domain::semantic::DerivationRunStatus::ProviderFailed,
+        quota_usage: evertrace_domain::semantic::DerivationQuotaUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            calls: 0,
+            wall_time_us: 0,
+        },
+        model_id: "fixture".into(),
+        prompt_hash: [7; 32],
+        schema_version: 1,
+        algorithm_revision: "r323-frozen-source-v1".into(),
+        effective_config_hash: [8; 32],
+        created_at_us: 8,
+        source_target: Some(source.clone()),
+    };
+    run.selected_direct_refs.sort();
+    run.job_fingerprint = run.recompute_job_fingerprint().unwrap();
+    run.validate().unwrap();
+    let frozen_run_id = run.derivation_run_id;
+    let job = source_synthesis_job(
+        &run,
+        first.1.source_observation_id,
+        third.1.source_observation_id,
+    );
+    install_source_synthesis_job(&mut writer, &job, 6).await;
+    let mut failed_job = job;
+    failed_job.state = JobStatus::Failed;
+    failed_job.attempt = 2;
+    failed_job.lease_until_us = None;
+    failed_job.terminal = Some(Box::new(JobTerminalAudit {
+        outcome: JobTerminalOutcome::Failed,
+        reason: JobTerminalReason::SourceUnavailable,
+        result_ref: None,
+    }));
+    writer
+        .commit(
+            &command(
+                8,
+                vec![
+                    JournalPayload::SemanticDerivationRunRecorded(Box::new(run)),
+                    JournalPayload::JobState(failed_job),
+                ],
+            ),
+            8,
+        )
+        .await
+        .unwrap();
+    let frozen = writer.project().await.unwrap();
+    assert!(frozen.data_rows().any(|row| {
+        row.object_kind.as_deref() == Some("semantic_derivation_run")
+            && row.object_id.as_deref() == Some(&frozen_run_id.to_string())
+    }));
+    assert_eq!(writer.full_projection().await.unwrap(), frozen);
+    let frozen_checkpoint = writer
+        .backup_table_states()
+        .await
+        .unwrap()
+        .objects
+        .checkpoint;
+    assert_eq!(frozen_checkpoint, frozen.frontier);
+
+    let late = direct_source_message(
+        "frozen-direct",
+        2,
+        seed.task.task_id,
+        source.repository_id,
+        source.worktree_id,
+    );
+    persist_direct_source_message(&mut writer, &late.0, &late.1, 11).await;
+    let late_frontier = writer.sync_frontier().await.unwrap();
+    assert!(late_frontier > frozen.frontier);
+    assert_eq!(
+        writer
+            .backup_table_states()
+            .await
+            .unwrap()
+            .objects
+            .checkpoint,
+        late_frontier
+    );
+    assert_eq!(
+        writer.full_projection().await,
+        Err(StoreError::StoreCorrupt)
+    );
+
+    let other = direct_source_message(
+        "different-source",
+        1,
+        seed.task.task_id,
+        source.repository_id,
+        source.worktree_id,
+    );
+    persist_direct_source_message(&mut writer, &other.0, &other.1, 12).await;
+    assert_eq!(writer.sync_frontier().await, Err(StoreError::StoreCorrupt));
+    assert_eq!(
+        writer
+            .backup_table_states()
+            .await
+            .unwrap()
+            .objects
+            .checkpoint,
+        late_frontier
+    );
+}
+
 #[tokio::test]
 async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
     let first_temp = TempDir::new().unwrap();
@@ -1391,7 +2155,7 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
 
     let first_resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &first.snapshot,
+            current: &current_facts(&first.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(first.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1410,7 +2174,7 @@ async fn one_planner_reuses_provider_and_writes_content_only_atom_proposals() {
     let second_refs = second.direct_refs();
     let second_resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &second.snapshot,
+            current: &current_facts(&second.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(second.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -1683,6 +2447,7 @@ async fn scheduler_discards_episode_result_when_base_changes_inflight() {
                     source_revision: receipt.source_revision,
                     source_sequence: receipt.source_sequence,
                     confirmed_prefix_digest: None,
+                    earlier_prefix: None,
                 }),
                 JournalPayload::DirtyTarget(DirtyTarget {
                     target_kind: DirtyTargetKind::EvidenceSurface,
@@ -1916,7 +2681,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
     let planner = SynthesisPlanner::new(config(&stub.base_url)).with_inventory(Some(inventory));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &seed.snapshot,
+            current: &current_facts(&seed.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -2161,6 +2926,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
                             source_revision: receipt.source_revision.clone(),
                             source_sequence: 1,
                             confirmed_prefix_digest: None,
+                            earlier_prefix: None,
                         }),
                         JournalPayload::DirtyTarget(DirtyTarget {
                             target_kind: DirtyTargetKind::EvidenceSurface,
@@ -2319,6 +3085,7 @@ async fn procedure_scope_ir_and_evidence_are_fixed_by_the_engine() {
                     source_revision: receipt.source_revision.clone(),
                     source_sequence: 1,
                     confirmed_prefix_digest: None,
+                    earlier_prefix: None,
                 }),
                 JournalPayload::DirtyTarget(DirtyTarget {
                     target_kind: DirtyTargetKind::EvidenceSurface,
@@ -2508,7 +3275,7 @@ async fn scenario_patch_scope_is_filled_from_the_current_episode() {
     let planner = SynthesisPlanner::new(config(&stub.base_url));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current_facts(&snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::StrategyPivot,
             direct_delta: vec![ProtectedDeltaItem {
@@ -2626,8 +3393,9 @@ async fn separable_candidate_failure_and_rejection_preserve_reopenable_summary()
         }
         let stub = ProviderStub::once(200, response(serde_json::to_value(output).unwrap())).await;
         let planner = SynthesisPlanner::new(config(&stub.base_url));
+        let current = current_facts(&snapshot);
         let request = SynthesisRequest {
-            snapshot: &snapshot,
+            current: &current,
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -2645,7 +3413,7 @@ async fn separable_candidate_failure_and_rejection_preserve_reopenable_summary()
             digest, command, ..
         } = planner
             .execute(SynthesisRequest {
-                snapshot: request.snapshot,
+                current: request.current,
                 target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
                 trigger: request.trigger,
                 direct_delta: request.direct_delta.clone(),
@@ -2677,7 +3445,7 @@ async fn separable_candidate_failure_and_rejection_preserve_reopenable_summary()
         assert!(
             planner
                 .durable_jobs(
-                    &reopened,
+                    &current_facts(&reopened),
                     CONFIG,
                     &Default::default(),
                     1,
@@ -2762,7 +3530,7 @@ async fn existing_exact_proposal_skips_a_new_revision_but_commits_digest_run_and
     let planner = SynthesisPlanner::new(config(&stub.base_url));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &before,
+            current: &current_facts(&before),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::AdoptedDecision,
             direct_delta: vec![ProtectedDeltaItem {
@@ -2896,7 +3664,7 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
     let planner = SynthesisPlanner::new(config(&stub.base_url));
     let resolution = planner
         .execute(SynthesisRequest {
-            snapshot: &seed.snapshot,
+            current: &current_facts(&seed.snapshot),
             target: evertrace_engine::jobs::SynthesisTarget::Episode(seed.episode.revision_id),
             trigger: SemanticDigestTrigger::EpisodeFinalization,
             direct_delta: vec![ProtectedDeltaItem {
@@ -3060,7 +3828,7 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
         unreachable!()
     };
     atom.value.text = "tampered source content".into();
-    atom_row.payload_json = Some(serde_json::to_string(&atom_payload).unwrap());
+    atom_row.payload_json = Some(serde_json::to_string(&atom_payload).unwrap().into());
     assert!(derive_l0002_projections(&mismatched_hash).is_err());
 
     let task_id = seed.task.task_id;
@@ -3162,12 +3930,7 @@ async fn accepted_repository_atom_builds_reopen_safe_wiki_lineage_and_deprecatio
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
     drop(writer);
     let reopened = JournalWriter::open(&store_root).await.unwrap();

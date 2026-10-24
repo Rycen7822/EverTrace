@@ -95,6 +95,15 @@ fn job(kind: &str, key: &str, generation: u64, priority: i16) -> DurableJob {
     }
 }
 
+fn current_facts(mut snapshot: ProjectionSnapshot) -> evertrace_store::projections::CurrentFacts {
+    let frontier = snapshot.frontier;
+    snapshot
+        .rows
+        .retain(|row| row.row_kind != ObjectRowKind::Checkpoint);
+    snapshot.rows.push(ObjectRow::checkpoint(frontier, 1));
+    snapshot.try_into().unwrap()
+}
+
 fn runtime(root: &Path) -> RuntimeSnapshot {
     RuntimeSnapshot {
         snapshot_version: RUNTIME_SNAPSHOT_VERSION,
@@ -281,7 +290,7 @@ fn runtime_row(payload: JournalPayload, seq: u64) -> ObjectRow {
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json().unwrap()),
+        payload_json: Some(payload.canonical_json().unwrap().into()),
         source_event_seq: seq,
         projection_generation: 1,
     }
@@ -347,7 +356,7 @@ fn synthesis_episode_row_for_task(watermark: u64, task_id: TaskId) -> ObjectRow 
         task_id: Some(task_id.to_string()),
         workstream_id: Some(workstream.workstream_id.to_string()),
         session_id: None,
-        payload_json: Some(payload.canonical_json().unwrap()),
+        payload_json: Some(payload.canonical_json().unwrap().into()),
         source_event_seq: watermark,
         projection_generation: 1,
     }
@@ -421,7 +430,7 @@ fn bound_operation_rows(episode_row: &ObjectRow, surface_row: &ObjectRow) -> [Ob
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(operation_payload.canonical_json().unwrap()),
+            payload_json: Some(operation_payload.canonical_json().unwrap().into()),
             source_event_seq: surface_row.source_event_seq,
             projection_generation: 1,
         },
@@ -447,7 +456,7 @@ fn bound_operation_rows(episode_row: &ObjectRow, surface_row: &ObjectRow) -> [Ob
             task_id: Some(episode.task_id.to_string()),
             workstream_id: Some(episode.workstream_id.to_string()),
             session_id: None,
-            payload_json: Some(binding_payload.canonical_json().unwrap()),
+            payload_json: Some(binding_payload.canonical_json().unwrap().into()),
             source_event_seq: surface_row.source_event_seq,
             projection_generation: 1,
         },
@@ -501,7 +510,8 @@ fn evidence_surface_row(episode_row: &ObjectRow, protected_text: &str, seq: u64)
         payload_json: Some(
             JournalPayload::EvidenceSurfaceRecorded(Box::new(surface))
                 .canonical_json()
-                .unwrap(),
+                .unwrap()
+                .into(),
         ),
         source_event_seq: seq,
         projection_generation: 1,
@@ -1031,13 +1041,21 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
     let (handle, task) = spawn_writer(writer, 16).unwrap();
     let import = job("session_import_v1", "session_import:old", 1, 0);
     let synthesis = job("semantic_synthesis_v1", "semantic_synthesis:old", 1, 0);
+    let mut procedure = job("procedure_review_v1", "procedure_review:old", 1, 5);
+    procedure.algorithm_revision = "procedure_review_v1".into();
+    procedure.model_id = Some("model-a".into());
+    procedure.budget.max_input_tokens = Some(1024);
+    procedure.budget.max_output_tokens = Some(1024);
+    procedure.budget.max_calls = Some(1);
     let import_id = import.job_id;
     let synthesis_id = synthesis.job_id;
+    let procedure_id = procedure.job_id;
+    let old_ids = [import_id, synthesis_id, procedure_id];
     handle
         .commit(
             JournalCommand::new(
                 CommandId::new_v7(),
-                [import, synthesis]
+                [import, synthesis, procedure]
                     .into_iter()
                     .map(|job| {
                         JournalEventDraft::runtime(
@@ -1059,7 +1077,7 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
     let jobs = RuntimeSchedulerView::from_snapshot(&handle.project().await.unwrap())
         .unwrap()
         .jobs;
-    for old_id in [import_id, synthesis_id] {
+    for old_id in old_ids {
         let old = jobs.iter().find(|job| job.job_id == old_id).unwrap();
         assert_eq!(old.state, JobStatus::Failed);
         assert_eq!(old.attempt, 1);
@@ -1090,12 +1108,9 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
         .into_iter()
         .filter_map(|row| {
             let relevant = match row.payload().unwrap() {
-                JournalPayload::JobLease(lease) => {
-                    lease.job_id == import_id || lease.job_id == synthesis_id
-                }
+                JournalPayload::JobLease(lease) => old_ids.contains(&lease.job_id),
                 JournalPayload::JobState(job) => {
-                    (job.job_id == import_id || job.job_id == synthesis_id)
-                        && job.state == JobStatus::Failed
+                    old_ids.contains(&job.job_id) && job.state == JobStatus::Failed
                         || job.job_id == replacement_id
                 }
                 _ => false,
@@ -1106,7 +1121,7 @@ async fn config_replacement_claims_old_jobs_and_keeps_one_active_import() {
     assert_eq!(command_ids.len(), 1);
     assert!(reopened.journal_rows().await.unwrap().into_iter().all(
         |row| !matches!(row.payload().unwrap(), JournalPayload::JobLease(lease)
-                if lease.job_id == import_id || lease.job_id == synthesis_id)
+                if old_ids.contains(&lease.job_id))
     ));
 }
 
@@ -1913,10 +1928,10 @@ async fn capture_scan_retained_report_does_not_hide_coexisting_physical_dirty() 
 #[test]
 fn synthesis_filters_covered_tuples_before_the_queue_limit() {
     let rows = (1..=9).map(synthesis_episode_row).collect::<Vec<_>>();
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 100,
         rows,
-    };
+    });
     let planner = SynthesisPlanner::new(LlmConfig::default());
     let first = planner
         .durable_jobs(
@@ -1988,13 +2003,14 @@ async fn synthesis_uses_only_validated_evidence_surface_text_for_provider_input(
         serde_json::json!({
             "payload_json_secret_canary": "must-never-reach-provider"
         })
-        .to_string(),
+        .to_string()
+        .into(),
     );
     raw.source_event_seq = 8;
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 9,
         rows: vec![episode, raw, surface, bound[0].clone(), bound[1].clone()],
-    };
+    });
     let stub = ProviderStub::once(200, provider_response()).await;
     let planner = SynthesisPlanner::new(provider_config(&stub.base_url));
     let mut durable = planner
@@ -2039,12 +2055,16 @@ async fn synthesis_without_eligible_surface_fails_without_calling_provider_or_re
     raw.object_kind = Some("work_artifact".into());
     raw.object_id = Some("work-artifact-no-surface".into());
     raw.current_revision_id = Some("work-artifact-no-surface-revision".into());
-    raw.payload_json = Some(serde_json::json!({"raw": "not-selected"}).to_string());
+    raw.payload_json = Some(
+        serde_json::json!({"raw": "not-selected"})
+            .to_string()
+            .into(),
+    );
     raw.source_event_seq = 8;
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 9,
         rows: vec![episode, raw],
-    };
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let planner = SynthesisPlanner::new(provider_config(&base_url));
@@ -2117,7 +2137,7 @@ async fn synthesis_rejects_same_task_surface_bound_to_a_different_episode() {
     let other_episode = synthesis_episode_row_for_task(9, task_id);
     let other_surface = evidence_surface_row(&other_episode, "wrong-episode-canary", 9);
     let other_bound = bound_operation_rows(&other_episode, &other_surface);
-    let snapshot = ProjectionSnapshot {
+    let snapshot = current_facts(ProjectionSnapshot {
         frontier: 9,
         rows: vec![
             episode.clone(),
@@ -2126,7 +2146,7 @@ async fn synthesis_rejects_same_task_surface_bound_to_a_different_episode() {
             other_bound[0].clone(),
             other_bound[1].clone(),
         ],
-    };
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let planner = SynthesisPlanner::new(provider_config(&base_url));
@@ -2193,7 +2213,7 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
     };
     let jobs = planner
         .durable_jobs(
-            &initial,
+            &current_facts(initial.clone()),
             CONFIG,
             &Default::default(),
             8,
@@ -2271,14 +2291,15 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
         payload_json: Some(
             JournalPayload::SemanticDerivationRunRecorded(Box::new(prior))
                 .canonical_json()
-                .unwrap(),
+                .unwrap()
+                .into(),
         ),
         source_event_seq: 10,
         projection_generation: 1,
     });
     let recreated = planner
         .durable_jobs(
-            &used,
+            &current_facts(used.clone()),
             CONFIG,
             &Default::default(),
             8,
@@ -2294,7 +2315,7 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
     second.lease_until_us = Some(100);
     let command = planner
         .execute_durable_job(
-            &used,
+            &current_facts(used.clone()),
             &second,
             CONFIG,
             2,
@@ -2321,10 +2342,10 @@ async fn synthesis_job_budget_stays_current_after_prior_wall_usage() {
 async fn zero_llm_tasks_per_run_never_claims_or_calls_the_provider() {
     for (max_llm_tasks_per_run, idle_enabled) in [(0, true), (2, false), (2, true)] {
         let episode = synthesis_episode_row(9);
-        let planning_snapshot = ProjectionSnapshot {
+        let planning_snapshot = current_facts(ProjectionSnapshot {
             frontier: 9,
             rows: vec![episode],
-        };
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         let planner = SynthesisPlanner::new(provider_config(&base_url));

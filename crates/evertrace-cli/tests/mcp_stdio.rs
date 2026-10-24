@@ -19,6 +19,11 @@ use tokio::sync::watch;
 
 #[test]
 fn stdio_mcp_lifecycle_lists_exactly_one_tool_and_rejects_unknown() {
+    lifecycle_for_binary(env!("CARGO_BIN_EXE_evertrace"));
+    lifecycle_for_binary(env!("CARGO_BIN_EXE_evertrace-mcp"));
+}
+
+fn lifecycle_for_binary(executable: &str) {
     let root = std::env::temp_dir().join(format!("evertrace-s20-{}", RequestId::new_v7()));
     fs::create_dir_all(&root).unwrap();
     let config = root.join("config.toml");
@@ -30,7 +35,7 @@ fn stdio_mcp_lifecycle_lists_exactly_one_tool_and_rejects_unknown() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_evertrace"))
+    let mut child = Command::new(executable)
         .args(["--config", config.to_str().unwrap(), "mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -79,6 +84,12 @@ fn stdio_mcp_lifecycle_lists_exactly_one_tool_and_rejects_unknown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_tool_call_uses_one_persistent_mcp_uds_connection() {
+    tool_call_for_binary(env!("CARGO_BIN_EXE_evertrace")).await;
+    tool_call_for_binary(env!("CARGO_BIN_EXE_evertrace-mcp")).await;
+}
+
+async fn tool_call_for_binary(executable: &str) {
+    let executable = executable.to_owned();
     assert!(
         serde_json::from_value::<ProtocolCommand>(serde_json::json!({
             "mcp_returned": {"request_id": RequestId::new_v7(), "revisions": []}
@@ -204,10 +215,10 @@ async fn stdio_tool_call_uses_one_persistent_mcp_uds_connection() {
         ),
     )
     .unwrap();
-    let executable = env!("CARGO_BIN_EXE_evertrace").to_owned();
+    let primary_executable = executable.clone();
     let config_for_child = config.clone();
     let output = tokio::task::spawn_blocking(move || {
-        let mut child = Command::new(executable)
+        let mut child = Command::new(primary_executable)
             .args(["--config", config_for_child.to_str().unwrap(), "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -263,9 +274,10 @@ async fn stdio_tool_call_uses_one_persistent_mcp_uds_connection() {
     // After initialization succeeds, close the actual stdout reader before
     // sending Search. The server responds, but write/flush cannot confirm it.
     let failed_config = config.clone();
+    let failed_executable = executable.clone();
     let failed = tokio::task::spawn_blocking(move || {
         use std::io::{BufRead, BufReader};
-        let mut child = Command::new(env!("CARGO_BIN_EXE_evertrace"))
+        let mut child = Command::new(failed_executable)
             .args(["--config", failed_config.to_str().unwrap(), "mcp"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let mut input = child.stdin.take().unwrap();

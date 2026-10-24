@@ -8,7 +8,7 @@ use evertrace_domain::{
 
 const PREFIX: &str = "procedure_source_v1|";
 
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone)]
 struct Metadata {
     source_observation_id: SourceObservationId,
     source_instance_id: SourceInstanceId,
@@ -20,6 +20,22 @@ struct Metadata {
     unsupported_record_classification:
         Option<evertrace_domain::evidence::UnsupportedRecordClassification>,
     source_sequence: u64,
+}
+
+impl From<&evertrace_domain::evidence::SourceReceipt> for Metadata {
+    fn from(receipt: &evertrace_domain::evidence::SourceReceipt) -> Self {
+        Self {
+            source_observation_id: receipt.source_observation_id,
+            source_instance_id: receipt.source_instance_id.clone(),
+            source_revision: receipt.source_revision.clone(),
+            repository_instance_id: receipt.repository_instance_id,
+            worktree_instance_id: receipt.worktree_instance_id,
+            source_kind: receipt.source_kind,
+            observation_role: receipt.observation_role,
+            unsupported_record_classification: receipt.unsupported_record_classification,
+            source_sequence: receipt.source_sequence,
+        }
+    }
 }
 
 impl Metadata {
@@ -40,14 +56,14 @@ impl Metadata {
     }
 }
 
-fn messages(snapshot: &ProjectionSnapshot) -> Result<Vec<Metadata>, SemanticServiceError> {
+fn messages(snapshot: &evertrace_store::projections::CurrentFacts) -> Vec<Metadata> {
     selected_messages(snapshot, |_| true)
 }
 
 pub(super) fn review_sources(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &evertrace_store::projections::CurrentFacts,
 ) -> Result<Vec<(String, String, String)>, SemanticServiceError> {
-    Ok(messages(snapshot)?
+    Ok(messages(snapshot)
         .into_iter()
         .filter(|value| value.scope().is_some())
         .map(|value| {
@@ -61,27 +77,14 @@ pub(super) fn review_sources(
 }
 
 fn selected_messages(
-    snapshot: &ProjectionSnapshot,
-    selected: impl Fn(&str) -> bool,
-) -> Result<Vec<Metadata>, SemanticServiceError> {
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-    enum Receipt {
-        SourceReceiptRecorded(Metadata),
-    }
+    snapshot: &evertrace_store::projections::CurrentFacts,
+    selected: impl Fn(&evertrace_domain::evidence::SourceReceipt) -> bool,
+) -> Vec<Metadata> {
     snapshot
-        .data_rows()
-        .filter(|row| row.object_kind.as_deref() == Some("source_receipt"))
-        .filter(|row| row.payload_json.as_deref().is_some_and(&selected))
-        .map(|row| {
-            let Receipt::SourceReceiptRecorded(value) = serde_json::from_str(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(StoreError::StoreCorrupt)?,
-            )
-            .map_err(|_| StoreError::StoreCorrupt)?;
-            Ok(value)
-        })
+        .source_receipts()
+        .map(|(receipt, _)| receipt.as_ref())
+        .filter(|receipt| selected(receipt))
+        .map(Metadata::from)
         .collect()
 }
 
@@ -97,7 +100,7 @@ struct SourceInput {
 }
 
 fn input(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &evertrace_store::projections::CurrentFacts,
     job: &DurableJob,
 ) -> Result<SourceInput, SemanticServiceError> {
     let (first, last) = job
@@ -105,11 +108,10 @@ fn input(
         .strip_prefix(PREFIX)
         .and_then(|value| value.split_once('|'))
         .ok_or(SemanticServiceError::InvalidInput)?;
-    let first_needle = format!("\"source_observation_id\":\"{first}\"");
-    let last_needle = format!("\"source_observation_id\":\"{last}\"");
-    let endpoints = selected_messages(snapshot, |json| {
-        json.contains(&first_needle) || json.contains(&last_needle)
-    })?;
+    let endpoints = selected_messages(snapshot, |receipt| {
+        let id = receipt.source_observation_id.to_string();
+        id == first || id == last
+    });
     let first = endpoints
         .iter()
         .find(|value| value.source_observation_id.to_string() == first)
@@ -129,19 +131,10 @@ fn input(
     {
         return Err(SemanticServiceError::BaseConflict);
     }
-    let source_needle = format!(
-        "\"source_instance_id\":{}",
-        serde_json::to_string(source.source_instance_id.as_str())
-            .map_err(|_| StoreError::StoreCorrupt)?
-    );
-    let revision_needle = format!(
-        "\"source_revision\":{}",
-        serde_json::to_string(source.source_revision.as_str())
-            .map_err(|_| StoreError::StoreCorrupt)?
-    );
-    let messages = selected_messages(snapshot, |json| {
-        json.contains(&source_needle) && json.contains(&revision_needle)
-    })?;
+    let messages = selected_messages(snapshot, |receipt| {
+        receipt.source_instance_id == source.source_instance_id
+            && receipt.source_revision == source.source_revision
+    });
     let mut refs = messages
         .iter()
         .filter(|value| {
@@ -175,11 +168,17 @@ fn input(
     })
 }
 
-pub(super) fn current(snapshot: &ProjectionSnapshot, job: &DurableJob) -> bool {
+pub(super) fn current(
+    snapshot: &evertrace_store::projections::CurrentFacts,
+    job: &DurableJob,
+) -> bool {
     input(snapshot, job).is_ok()
 }
 
-pub(super) fn scope(snapshot: &ProjectionSnapshot, job: &DurableJob) -> Option<ProcedureScope> {
+pub(super) fn scope(
+    snapshot: &evertrace_store::projections::CurrentFacts,
+    job: &DurableJob,
+) -> Option<ProcedureScope> {
     let input = input(snapshot, job).ok()?;
     Some(ProcedureScope::Worktree {
         repository_id: input.source.repository_id,
@@ -188,7 +187,7 @@ pub(super) fn scope(snapshot: &ProjectionSnapshot, job: &DurableJob) -> Option<P
 }
 
 pub(crate) async fn jobs(
-    snapshot: &ProjectionSnapshot,
+    snapshot: &evertrace_store::projections::CurrentFacts,
     planner: &super::super::SynthesisPlanner,
     config: [u8; 32],
     wall: std::time::Duration,
@@ -202,9 +201,8 @@ pub(crate) async fn jobs(
     if !planner.llm.enabled || limit == 0 {
         return Ok(Vec::new());
     }
-    let runtime = RuntimeSchedulerView::from_snapshot(snapshot)?;
-    let suppression = ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?;
-    let view = SemanticCurrentView::from_snapshot(snapshot)?;
+    let runtime = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
+    let view = SemanticCurrentView::from_rows(snapshot.frontier(), snapshot.other_rows())?;
     let reviewing = view
         .proposals
         .values()
@@ -218,7 +216,7 @@ pub(crate) async fn jobs(
         .flat_map(|proposal| proposal.source_cohort_refs.iter())
         .collect::<BTreeSet<_>>();
     let mut groups = BTreeMap::<_, Vec<Metadata>>::new();
-    for value in messages(snapshot)? {
+    for value in messages(snapshot) {
         if value.scope().is_some() {
             groups
                 .entry((
@@ -232,6 +230,22 @@ pub(crate) async fn jobs(
     let mut output = Vec::new();
     for values in groups.values_mut() {
         values.sort_by_key(|value| value.source_sequence);
+        let mut refs = values
+            .iter()
+            .map(|value| value.source_observation_id.to_string())
+            .collect::<Vec<_>>();
+        refs.sort();
+        refs.dedup();
+        let mut suppressed = BTreeSet::new();
+        for chunk in refs.chunks(64) {
+            let view =
+                ObjectDeletionCandidateAdmissionView::for_source_refs_current(snapshot, chunk)?;
+            for reference in chunk {
+                if view.source_refs_suppressed(std::slice::from_ref(reference))? {
+                    suppressed.insert(reference.clone());
+                }
+            }
+        }
         let positions = values
             .iter()
             .enumerate()
@@ -267,7 +281,7 @@ pub(crate) async fn jobs(
             let first = &values[start];
             if covered.contains(&start)
                 || !first.scope().is_some_and(|scope| ready(&scope))
-                || suppression.source_refs_suppressed(&[first.source_observation_id.to_string()])?
+                || suppressed.contains(&first.source_observation_id.to_string())
             {
                 continue;
             }
@@ -275,8 +289,7 @@ pub(crate) async fn jobs(
                 && cursor - start < 4
                 && !covered.contains(&cursor)
                 && values[cursor].scope() == first.scope()
-                && !suppression
-                    .source_refs_suppressed(&[values[cursor].source_observation_id.to_string()])?
+                && !suppressed.contains(&values[cursor].source_observation_id.to_string())
             {
                 cursor += 1;
             }
@@ -316,7 +329,7 @@ pub(crate) async fn jobs(
 
 pub(super) async fn allowed(
     writer: &crate::WriterHandle,
-    snapshot: &ProjectionSnapshot,
+    snapshot: &evertrace_store::projections::CurrentFacts,
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
 ) -> Result<bool, SemanticServiceError> {
@@ -332,7 +345,7 @@ pub(super) async fn allowed(
 
 async fn allowed_input(
     writer: &crate::WriterHandle,
-    snapshot: &ProjectionSnapshot,
+    snapshot: &evertrace_store::projections::CurrentFacts,
     job: &DurableJob,
     input: &SourceInput,
     report: Option<&evertrace_codex::HostProbeReport>,
@@ -348,16 +361,6 @@ async fn allowed_input(
     {
         return Ok(false);
     }
-    let rows = snapshot
-        .data_rows()
-        .filter(|row| {
-            row.object_kind.as_deref() == Some("source_observation")
-                && row
-                    .object_id
-                    .as_ref()
-                    .is_some_and(|id| input.refs.binary_search(id).is_ok())
-        })
-        .collect::<Vec<_>>();
     Ok(crate::repository::blocked_repositories(
         writer,
         [input.source.repository_id].into_iter().collect(),
@@ -367,11 +370,11 @@ async fn allowed_input(
     .await
     .map_err(|_| StoreError::StoreCorrupt)?
     .is_empty()
-        && crate::session_import::blocked_source_rows(
+        && crate::session_import::blocked_source_observations(
             writer,
             report,
             snapshot,
-            &rows,
+            &input.refs,
             job.config_hash,
         )
         .await
@@ -382,7 +385,7 @@ async fn allowed_input(
 pub(super) async fn execute(
     writer: &crate::WriterHandle,
     planner: &super::super::SynthesisPlanner,
-    snapshot: ProjectionSnapshot,
+    snapshot: evertrace_store::projections::CurrentFacts,
     job: &DurableJob,
     report: Option<&evertrace_codex::HostProbeReport>,
     at: i64,
@@ -442,7 +445,7 @@ pub(super) async fn execute(
         let response = provider
             .propose_source_method(json, job.budget.max_output_tokens.unwrap_or(0), &|| async {
                 let current = writer
-                    .project()
+                    .project_current(true)
                     .await
                     .map_err(|_| crate::provider::ProviderError::Transport)?;
                 if allowed_input(writer, &current, job, &input, report)
@@ -456,7 +459,7 @@ pub(super) async fn execute(
             })
             .await;
         let current = writer
-            .project()
+            .project_current(true)
             .await
             .map_err(|_| evertrace_store::StoreError::StoreCorrupt)?;
         if !allowed_input(writer, &current, job, &input, report).await? {
@@ -516,8 +519,14 @@ pub(super) async fn execute(
                     if !suppressed {
                         let resolution = crate::semantic::RevisionProposalService
                             .submit_with_deletion_admission(
-                            &SemanticCurrentView::from_snapshot(snapshot)?,
-                            &ObjectDeletionCandidateAdmissionView::from_snapshot(snapshot)?,
+                            &SemanticCurrentView::from_rows(
+                                snapshot.frontier(),
+                                snapshot.other_rows(),
+                            )?,
+                            &ObjectDeletionCandidateAdmissionView::for_source_refs_current(
+                                snapshot,
+                                &input.refs,
+                            )?,
                             crate::semantic::ProposalCommandContext {
                                 command_id: CommandId::new_v7(),
                                 occurred_at_us: at,

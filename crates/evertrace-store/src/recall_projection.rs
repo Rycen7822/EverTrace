@@ -124,7 +124,11 @@ fn row(
         task_id,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(serde_json::to_string(&cue).map_err(|_| StoreError::Serialization)?),
+        payload_json: Some(
+            serde_json::to_string(&cue)
+                .map_err(|_| StoreError::Serialization)?
+                .into(),
+        ),
         source_event_seq,
         projection_generation: PROJECTION_GENERATION,
     };
