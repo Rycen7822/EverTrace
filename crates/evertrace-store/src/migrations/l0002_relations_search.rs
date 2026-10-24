@@ -64,10 +64,9 @@ impl L0002 {
             .relation_checkpoint_row()?
             .is_some();
         let base_outcome = L0001::apply_inner(sqlite, has_relation || has_search).await?;
-        let mut objects_facts = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
-            .catch_up_validated_current_facts(None, None, None)
-            .await?
-            .0;
+        let mut objects_snapshot = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
+            .catch_up()
+            .await?;
         let created_relation = !has_relation;
         if created_relation {
             let checkpoint = RelationProjectionRow::checkpoint(0);
@@ -87,26 +86,21 @@ impl L0002 {
         if appended {
             // L0002 is not durable until every derived family is usable at the
             // exact pre-marker frontier. A crash here leaves no completion marker.
-            worker
-                .catch_up_validated_current_facts_proof(&objects_facts, None)
-                .await?;
+            worker.catch_up(&objects_snapshot).await?;
             ensure_fts(&search).await?;
             if crash_before_marker {
                 return Err(StoreError::Migration);
             }
             append_migration(sqlite, rows.last().map(|row| row.seq).unwrap_or(0)).await?;
             // The marker itself advances the authoritative frontier.
-            objects_facts = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
-                .catch_up_validated_current_facts(None, None, None)
-                .await?
-                .0;
+            objects_snapshot = ProjectionWorker::new(std::sync::Arc::clone(sqlite))
+                .catch_up()
+                .await?;
         }
 
         // Independently committed projections converge to the validated
         // frontier on this run or the next reopen.
-        worker
-            .catch_up_validated_current_facts_proof(&objects_facts, None)
-            .await?;
+        worker.catch_up(&objects_snapshot).await?;
         ensure_fts(&search).await?;
 
         Ok(if base_outcome == MigrationOutcome::Applied {

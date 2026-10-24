@@ -1887,7 +1887,7 @@ impl JournalWriter {
                             let appended =
                                 validated_input.and_then(|stamp| stamp.appended_rows.as_deref());
                             let worker = self.projection_worker();
-                            if output_kind != ProjectionReturn::Snapshot {
+                            if source_facts.is_some() && output_kind != ProjectionReturn::Snapshot {
                                 let (facts, epoch, delta) = worker
                                     .catch_up_validated_current_facts(
                                         validated_current,
@@ -1895,16 +1895,11 @@ impl JournalWriter {
                                         source_facts.as_ref(),
                                     )
                                     .await?;
-                                let source_prefix_proven = source_facts.is_some()
-                                    || self
-                                        .admission_state
-                                        .source_facts()
-                                        .matches_current_sources(&facts);
                                 (
                                     Some(ProjectionOutput::CurrentFacts(facts)),
                                     epoch,
                                     delta,
-                                    source_prefix_proven,
+                                    true,
                                 )
                             } else {
                                 let (snapshot, epoch, delta) = worker
