@@ -3898,8 +3898,6 @@ impl BackgroundScheduler {
             };
             vec![report.manifest().clone()]
         };
-        // Reconciliation reads fresh current facts through the writer below.
-        drop(claimed.current);
         let reconciliation = reconcile_observations_once(
             ReconcileInput {
                 runtime_snapshot: self.runtime.clone(),
