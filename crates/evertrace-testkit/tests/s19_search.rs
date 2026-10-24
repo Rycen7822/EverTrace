@@ -285,6 +285,147 @@ fn atom_successor(record: &str, text: &str, at_us: i64, current: Option<&Atom>) 
 }
 
 #[tokio::test]
+async fn l0002_stable_id_priority_precedes_candidate_budget() {
+    const QUERY: &str = "needle";
+    let temp = TempDir::new().unwrap();
+    DeviceKeyStore::new(temp.path().join("keys"))
+        .load_or_create()
+        .unwrap();
+    let runtime_snapshot = snapshot(temp.path());
+    let mut runtime = CaptureRuntime::open(runtime_snapshot.clone()).unwrap();
+    let records = [
+        ("weak-01", 1),
+        ("weak-02", 2),
+        ("weak-03", 3),
+        ("weak-04", 4),
+        ("strong", 5),
+    ];
+    for (record, sequence) in records {
+        let source_text = format!("r529 source fixture {record}");
+        runtime
+            .capture(input(record, sequence, &source_text, SourceRole::Tool))
+            .unwrap();
+    }
+
+    let store = temp.path().join("store");
+    let writer = open_writer(&store).await.unwrap();
+    assert_eq!(writer.migration_outcome(), MigrationOutcome::Applied);
+    let (handle, task) = spawn_writer(writer, 8).unwrap();
+    let ingestor = EvidenceIngestor::new(
+        runtime_snapshot,
+        handle.clone(),
+        [0x52; 32],
+        "r529-fts-rank-v1",
+    )
+    .unwrap();
+    assert_eq!(ingestor.drain_once().await.unwrap().committed_frames, 5);
+
+    let weak_text = format!("needle {}", "background ".repeat(24));
+    let mut weak_ids = Vec::new();
+    for (index, (record, _sequence)) in records[..4].iter().enumerate() {
+        let at_us = 20 + i64::try_from(index).unwrap();
+        let (command, revision_id) = atom_command(record, &weak_text, at_us, Vec::new());
+        handle.commit(command, at_us).await.unwrap();
+        weak_ids.push(revision_id.to_string());
+    }
+    let strong_text = "needle ".repeat(18);
+    let (strong_command, strong_revision) = atom_command("strong", &strong_text, 24, Vec::new());
+    let strong_id = strong_revision.to_string();
+    handle.commit(strong_command, 24).await.unwrap();
+    handle.project().await.unwrap();
+
+    let index = SearchIndex::open(&store).await.unwrap();
+    let fts_rows = index.fts(QUERY).await.unwrap();
+    let object_rows = fts_rows
+        .iter()
+        .filter(|row| row.row_variant == "object")
+        .collect::<Vec<_>>();
+    let expected_ids = weak_ids
+        .iter()
+        .cloned()
+        .chain(std::iter::once(strong_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let indexed_ids = object_rows
+        .iter()
+        .filter_map(|row| row.candidate_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        object_rows.len(),
+        5,
+        "fixture must index five object candidates"
+    );
+    assert_eq!(
+        indexed_ids, expected_ids,
+        "all five candidates must be FTS eligible"
+    );
+    assert!(object_rows.iter().all(|row| {
+        row.currentness.as_deref() == Some("current")
+            && row.lifecycle.as_deref() == Some("active")
+            && row.suppression_ref_hash.is_none()
+            && row.task_id.is_none()
+            && row.repository_id.is_none()
+            && row.worktree_id.is_none()
+    }));
+    let exact_rows = {
+        let snapshot = index.snapshot().await.unwrap();
+        snapshot
+            .structured(
+                std::slice::from_ref(&strong_id),
+                &SearchHardFilter::default(),
+                1,
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(exact_rows.len(), 1, "strong ID must be a structured hit");
+    assert_eq!(
+        exact_rows[0].candidate_id.as_deref(),
+        Some(strong_id.as_str())
+    );
+    assert!(weak_ids.iter().take(3).all(|weak| weak < &strong_id));
+
+    let mut search_context = context(
+        QUERY,
+        &[strong_id.as_str()],
+        SuppressionSnapshot::Current {
+            generation: 0,
+            ref_hashes: BTreeSet::new(),
+        },
+    );
+    search_context.budget.candidates_remaining = 3;
+    search_context.budget.tokens_remaining = 1200;
+    search_context.budget.hops_remaining = 0;
+    let result = ProductionSearch::new(index.clone())
+        .search(search_context)
+        .await
+        .unwrap();
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    drop(runtime);
+
+    assert_eq!(
+        result.candidates.len(),
+        3,
+        "three-slot candidate budget is full"
+    );
+    assert_eq!(
+        result.projection_frontier, result.authoritative_frontier,
+        "projection must be current before ranking is evaluated"
+    );
+    assert_eq!(result.completeness, RetrievalCompleteness::Complete);
+    assert!(
+        result
+            .candidates
+            .iter()
+            .all(|candidate| { expected_ids.contains(&candidate.candidate_id) })
+    );
+    assert_eq!(
+        result.candidates[0].candidate_id, strong_id,
+        "exact candidate must survive before weaker matches consume the budget"
+    );
+}
+
+#[tokio::test]
 async fn l0002_real_fts_latest_delta_deletion_first_and_diagnostic_gates() {
     let temp = TempDir::new().unwrap();
     DeviceKeyStore::new(temp.path().join("keys"))
@@ -1006,15 +1147,7 @@ async fn l0002_real_fts_latest_delta_deletion_first_and_diagnostic_gates() {
     );
 
     assert_eq!(reopened.migration_outcome(), MigrationOutcome::Noop);
-    assert_eq!(
-        reopened.table_names().await.unwrap(),
-        [
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
-    );
+    assert_eq!(reopened.table_names().await.unwrap(), ["evertrace_search"]);
     let incremental = reopened.project().await.unwrap();
     let full = reopened.full_projection().await.unwrap();
     assert_eq!(incremental, full);

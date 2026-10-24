@@ -378,7 +378,7 @@ pub struct HumanJobBudget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanBackupTableState {
-    pub version: u64,
+    pub version: Option<u64>,
     pub frontier: u64,
 }
 
@@ -6624,6 +6624,7 @@ fn verify_edit_acceptance_cohort(
         source_revision: verified.body.source_revision.clone(),
         source_sequence: 1,
         confirmed_prefix_digest: None,
+        earlier_prefix: None,
     };
     if payloads
         .iter()
@@ -6904,6 +6905,7 @@ fn verify_acceptance_payload_cohort(
                         source_revision: verified.body.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     } =>
             {
                 watermark_count += 1;
@@ -7319,7 +7321,9 @@ mod tests {
         row.object_id = Some(lane_id.to_string());
         row.current_revision_id = Some(format!("{lane_id}@1"));
         row.payload_json = Some(
-            serde_json::to_string(&JournalPayload::ExecutionLaneRecorded(Box::new(lane))).unwrap(),
+            serde_json::to_string(&JournalPayload::ExecutionLaneRecorded(Box::new(lane)))
+                .unwrap()
+                .into(),
         );
 
         let (recovery, worktree, execution, system) = typed_current_detail(&row).unwrap();
@@ -7400,7 +7404,8 @@ mod tests {
             serde_json::to_string(&JournalPayload::GlobalSupportContractRecorded(Box::new(
                 contract.clone(),
             )))
-            .unwrap(),
+            .unwrap()
+            .into(),
         );
         let mut pending_row = object_row(
             &format!(
@@ -7418,7 +7423,8 @@ mod tests {
             serde_json::to_string(&JournalPayload::GlobalSupportValidationRecorded(Box::new(
                 pending,
             )))
-            .unwrap(),
+            .unwrap()
+            .into(),
         );
         let mut validation_row = object_row(
             &format!("object:atom:global_support_validation:{validation_revision}"),
@@ -7433,7 +7439,8 @@ mod tests {
             serde_json::to_string(&JournalPayload::GlobalSupportValidationRecorded(Box::new(
                 validation.clone(),
             )))
-            .unwrap(),
+            .unwrap()
+            .into(),
         );
         let mut support_row = object_row("support", 1);
         support_row.object_family = Some(ObjectFamily::Atom);

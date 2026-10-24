@@ -940,31 +940,11 @@ async fn source_local_capture_keeps_projection_validation_before_commit() {
     let store_dir = temp.path().join("store");
     let writer = open_writer(&store_dir).await.unwrap();
     let before = writer.journal_rows().await.unwrap();
-    let store = evertrace_store::CompatibilityStore::connect_local(
-        &evertrace_store::connection::native_root(&store_dir),
-    )
-    .await
-    .unwrap();
-    let objects = store
-        .connection()
-        .open_table(evertrace_store::OBJECTS_TABLE)
-        .execute()
-        .await
-        .unwrap();
     let (handle, task) = spawn_writer(writer, 8).unwrap();
     // Finish actor startup before injecting damage so the ingest barrier,
     // not startup reconciliation, is the operation being checked.
     handle.sync_frontier().await.unwrap();
-    objects
-        .update()
-        .only_if(format!(
-            "row_id = '{}'",
-            evertrace_store::objects::OBJECTS_CHECKPOINT_ID
-        ))
-        .column("source_event_seq", "source_event_seq + 1")
-        .execute()
-        .await
-        .unwrap();
+    evertrace_store::test_support::advance_object_checkpoint(&store_dir).unwrap();
     let ingestor = EvidenceIngestor::new(snapshot.clone(), handle, [0; 32], "s08-v1").unwrap();
     assert_eq!(ingestor.drain_once().await, Err(IngestError::StoreCorrupt));
     assert_eq!(
@@ -972,14 +952,11 @@ async fn source_local_capture_keeps_projection_validation_before_commit() {
         Err(evertrace_engine::jobs::WriterActorError::Store)
     );
     assert_eq!(sealed_count(&snapshot.spool_dir.join("main")), 1);
-    let journal = store
-        .connection()
-        .open_table(evertrace_store::JOURNAL_TABLE)
-        .execute()
-        .await
-        .unwrap();
     assert_eq!(
-        evertrace_store::journal::read_all_journal_rows(&journal)
+        evertrace_store::StoreReadHandle::open_read_only(&store_dir)
+            .await
+            .unwrap()
+            .journal_rows()
             .await
             .unwrap(),
         before
@@ -1122,12 +1099,7 @@ async fn surfaces_are_bounded_authority_free_and_secret_reasoning_binary_are_exc
     }
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
     assert_no_bytes_outside_cas(temp.path(), secret);
 }

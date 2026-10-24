@@ -1,30 +1,16 @@
-use std::{
-    collections::BTreeMap,
-    fs::{self, File},
-    future::poll_fn,
-    os::unix::fs::MetadataExt,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    Array, FixedSizeBinaryArray, LargeStringArray, RecordBatch, StringArray,
     TimestampMicrosecondArray, UInt16Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use evertrace_domain::ids::CommandId;
-use lancedb::{
-    Table,
-    query::{ColumnOrdering, ExecutableQuery, QueryBase, Select},
-};
 
-use crate::{
-    collect_batches,
-    command::{
-        CommitOutcome, EventScope, JOURNAL_PAYLOAD_SCHEMA, JournalCommand, JournalEventDraft,
-        JournalPayload, ObjectFamily, PreparedCommand, PreparedEvent, RecordClass, SourceKind,
-        StoreError, prepare_command,
-    },
+use crate::command::{
+    EventScope, JOURNAL_PAYLOAD_SCHEMA, JournalCommand, JournalEventDraft, JournalPayload,
+    ObjectFamily, PreparedCommand, PreparedEvent, RecordClass, SourceKind, StoreError,
+    prepare_command,
 };
 
 pub const JOURNAL_TABLE: &str = "evertrace_journal";
@@ -82,6 +68,9 @@ impl JournalRow {
     }
 }
 
+/// Closed logical journal field set. The physical SQLite column definition is
+/// the single storage shape; this schema keeps the logical contract and the
+/// future converter's read boundary explicit.
 pub fn journal_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("event_id", DataType::Utf8, false),
@@ -104,12 +93,12 @@ pub fn journal_schema() -> SchemaRef {
         Field::new("execution_lane_id", DataType::Utf8, true),
         Field::new(
             "occurred_at_us",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
         Field::new(
             "ingested_at_us",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
         Field::new("source_kind", DataType::Utf8, false),
@@ -126,237 +115,6 @@ pub fn journal_schema() -> SchemaRef {
         ),
         Field::new("algorithm_revision", DataType::Utf8, false),
     ]))
-}
-
-pub(crate) async fn validate_journal_table(table: &Table) -> Result<(), StoreError> {
-    read_validated_journal_rows(table).await.map(|_| ())
-}
-
-async fn read_validated_journal_rows(table: &Table) -> Result<Vec<JournalRow>, StoreError> {
-    let actual = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if actual.as_ref() != journal_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    let rows = read_all_journal_rows(table).await?;
-    validate_journal_rows(&rows)?;
-    Ok(rows)
-}
-
-/// One open's validated input, tied to this exact native handle. Migration
-/// callers clone this handle rather than reopening a table with the same name.
-pub(crate) struct StartupJournal {
-    pub(crate) table: Table,
-    pub(crate) rows: Vec<JournalRow>,
-    pub(crate) version: u64,
-    // This path requires semantic validation on changed input, but never
-    // retains the temporary admission state across migration work.
-    pub(crate) requires_admission_validation: bool,
-    source_directories: Vec<(PathBuf, File)>,
-}
-
-impl StartupJournal {
-    pub(crate) async fn read(table: Table) -> Result<Self, StoreError> {
-        let dataset = table
-            .dataset()
-            .ok_or(StoreError::StoreCorrupt)?
-            .get()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let path = PathBuf::from(dataset.uri());
-        let mut source_directories = Vec::with_capacity(2);
-        for path in [
-            path.parent().ok_or(StoreError::StoreCorrupt)?.to_owned(),
-            path,
-        ] {
-            let file = File::open(&path).map_err(|_| StoreError::StoreCorrupt)?;
-            source_directories.push((path, file));
-        }
-        drop(dataset);
-        Self::validate_source(&source_directories)?;
-        table
-            .checkout_latest()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let version = table.version().await.map_err(|_| StoreError::LanceDb)?;
-        let rows = read_validated_journal_rows(&table).await?;
-        if table.version().await.map_err(|_| StoreError::LanceDb)? != version {
-            return Err(StoreError::StoreCorrupt);
-        }
-        Self::validate_source(&source_directories)?;
-        Ok(Self {
-            table,
-            rows,
-            version,
-            requires_admission_validation: false,
-            source_directories,
-        })
-    }
-
-    pub(crate) async fn refresh(&mut self) -> Result<(), StoreError> {
-        Self::validate_source(&self.source_directories)?;
-        self.table
-            .checkout_latest()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let version = self
-            .table
-            .version()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        if version != self.version {
-            // A real append (including a marker) must be read and validated
-            // afresh. Release the old rows before allocating their replacement.
-            self.rows = Vec::new();
-            let rows = read_validated_journal_rows(&self.table).await?;
-            if self
-                .table
-                .version()
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                != version
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            Self::validate_source(&self.source_directories)?;
-            if self.requires_admission_validation {
-                drop(crate::projections::JournalAdmissionState::from_journal_rows(&rows)?);
-            }
-            self.rows = rows;
-            self.version = version;
-        }
-        Self::validate_source(&self.source_directories)
-    }
-
-    fn validate_source(directories: &[(PathBuf, File)]) -> Result<(), StoreError> {
-        for (path, file) in directories {
-            let located = fs::symlink_metadata(path).map_err(|_| StoreError::StoreCorrupt)?;
-            let held = file.metadata().map_err(|_| StoreError::StoreCorrupt)?;
-            if !located.is_dir()
-                || located.file_type().is_symlink()
-                || (located.dev(), located.ino()) != (held.dev(), held.ino())
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-        }
-        Ok(())
-    }
-}
-
-pub async fn read_all_journal_rows(table: &Table) -> Result<Vec<JournalRow>, StoreError> {
-    read_query(table.query()).await
-}
-
-pub async fn read_journal_after(table: &Table, seq: u64) -> Result<Vec<JournalRow>, StoreError> {
-    read_query(
-        table
-            .query()
-            .only_if(format!("seq > {seq}"))
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("seq".into())])),
-    )
-    .await
-}
-
-pub(crate) async fn read_journal_page(
-    table: &Table,
-    after: u64,
-    frontier: u64,
-) -> Result<Vec<JournalRow>, StoreError> {
-    read_query(
-        table
-            .query()
-            .only_if(format!("seq > {after} AND seq <= {frontier}"))
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("seq".into())]))
-            .limit(256),
-    )
-    .await
-}
-
-/// Bounded runtime-budget facts only: never load source or semantic text history.
-pub(crate) async fn read_llm_budget_page(
-    table: &Table,
-    day_start_us: i64,
-    after: u64,
-    frontier: u64,
-) -> Result<Vec<JournalRow>, StoreError> {
-    let day_end_us = day_start_us.saturating_add(86_400_000_000);
-    read_query(
-        table
-            .query()
-            .only_if(format!(
-                "seq > {after} AND seq <= {frontier} AND CAST(occurred_at_us AS BIGINT) >= {day_start_us} AND CAST(occurred_at_us AS BIGINT) < {day_end_us} AND event_type IN ('job_state_v1', 'job_lease_v1', 'semantic_derivation_run_recorded_v1')"
-            ))
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("seq".into())]))
-            .limit(256),
-    )
-    .await
-}
-
-pub(crate) async fn read_journal_frontier(table: &Table) -> Result<u64, StoreError> {
-    let query = table
-        .query()
-        .select(Select::columns(&["seq"]))
-        .order_by(Some(vec![ColumnOrdering::desc_nulls_last("seq".into())]))
-        .limit(1);
-    let batches = collect_batches(&query)
-        .await
-        .map_err(|_| StoreError::LanceDb)?;
-    let mut frontier = None;
-    for batch in &batches {
-        if batch.num_columns() != 1
-            || batch.schema().field(0).name() != "seq"
-            || batch.schema().field(0).data_type() != &DataType::UInt64
-            || batch.schema().field(0).is_nullable()
-        {
-            return Err(StoreError::StoreCorrupt);
-        }
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(StoreError::StoreCorrupt)?;
-        for index in 0..values.len() {
-            if values.is_null(index) || frontier.replace(values.value(index)).is_some() {
-                return Err(StoreError::StoreCorrupt);
-            }
-        }
-    }
-    Ok(frontier.unwrap_or(0))
-}
-
-pub(crate) async fn read_command_rows(
-    table: &Table,
-    command_id: CommandId,
-) -> Result<Vec<JournalRow>, StoreError> {
-    read_query(
-        table
-            .query()
-            .only_if(format!("command_id = '{}'", command_id)),
-    )
-    .await
-}
-
-pub(crate) async fn read_commands_rows(
-    table: &Table,
-    command_ids: &[CommandId],
-) -> Result<Vec<JournalRow>, StoreError> {
-    if command_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ids = command_ids
-        .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    read_query(table.query().only_if(format!("command_id IN ({ids})"))).await
-}
-
-async fn read_query(query: lancedb::query::Query) -> Result<Vec<JournalRow>, StoreError> {
-    let mut stream = query.execute().await.map_err(|_| StoreError::LanceDb)?;
-    let mut rows = Vec::new();
-    while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context)).await {
-        rows.extend(rows_from_batch(&batch.map_err(|_| StoreError::LanceDb)?)?);
-    }
-    Ok(rows)
 }
 
 pub(crate) fn validate_journal_rows(rows: &[JournalRow]) -> Result<(), StoreError> {
@@ -432,7 +190,7 @@ fn validate_complete_command_refs(
 pub(crate) fn replay_outcome(
     rows: &[JournalRow],
     prepared: &PreparedCommand,
-) -> Result<Option<CommitOutcome>, StoreError> {
+) -> Result<Option<crate::command::CommitOutcome>, StoreError> {
     if rows.is_empty() {
         return Ok(None);
     }
@@ -457,7 +215,7 @@ pub(crate) fn replay_outcome(
             return Err(StoreError::StoreCorrupt);
         }
     }
-    Ok(Some(CommitOutcome {
+    Ok(Some(crate::command::CommitOutcome {
         command_id: prepared.command_id,
         first_seq: ordered.first().ok_or(StoreError::StoreCorrupt)?.seq,
         last_seq: ordered.last().ok_or(StoreError::StoreCorrupt)?.seq,
@@ -469,160 +227,8 @@ pub(crate) fn replay_outcome(
     }))
 }
 
-pub(crate) fn rows_for_append(
-    prepared: &PreparedCommand,
-    first_seq: u64,
-    ingested_at_us: i64,
-) -> Result<Vec<JournalRow>, StoreError> {
-    if ingested_at_us < 0 {
-        return Err(StoreError::InvalidInput);
-    }
-    prepared
-        .events
-        .iter()
-        .enumerate()
-        .map(|(index, event)| {
-            let offset = u64::try_from(index).map_err(|_| StoreError::InvalidInput)?;
-            let seq = first_seq
-                .checked_add(offset)
-                .ok_or(StoreError::InvalidInput)?;
-            Ok(row_from_prepared(prepared, event, seq, ingested_at_us))
-        })
-        .collect()
-}
-
-pub(crate) async fn append_rows(
-    table: &Table,
-    rows: &[JournalRow],
-) -> Result<(u64, RecordBatch), StoreError> {
-    if rows.is_empty() {
-        return Err(StoreError::InvalidInput);
-    }
-    let batch = journal_batch(rows)?;
-    let version = table
-        .add(batch.clone())
-        .execute()
-        .await
-        .map(|result| result.version)
-        .map_err(|_| StoreError::LanceDb)?;
-    Ok((version, batch))
-}
-
-fn row_from_prepared(
-    command: &PreparedCommand,
-    event: &PreparedEvent,
-    seq: u64,
-    ingested_at_us: i64,
-) -> JournalRow {
-    JournalRow {
-        event_id: event.event_id.clone(),
-        command_id: command.command_id,
-        command_hash: command.command_hash,
-        ordinal: event.ordinal,
-        command_event_count: command.event_count,
-        seq,
-        event_type: event.event_type.into(),
-        record_class: event.record_class,
-        object_family: None,
-        object_id: None,
-        revision_id: None,
-        scope: event.draft.scope.clone(),
-        occurred_at_us: event.draft.occurred_at_us,
-        ingested_at_us,
-        source_kind: event.draft.source_kind,
-        source_ref_json: None,
-        payload_schema: JOURNAL_PAYLOAD_SCHEMA,
-        payload_json: event.payload_json.clone(),
-        content_hash: event.content_hash,
-        causation_id: event.draft.causation_id.clone(),
-        correlation_id: event.draft.correlation_id.clone(),
-        effective_config_hash: event.draft.effective_config_hash,
-        algorithm_revision: event.draft.algorithm_revision.clone(),
-    }
-}
-
-fn journal_batch(rows: &[JournalRow]) -> Result<RecordBatch, StoreError> {
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.event_id.as_str()),
-        )),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.command_id.to_string()),
-        )),
-        Arc::new(
-            FixedSizeBinaryArray::try_from_iter(rows.iter().map(|row| row.command_hash.as_slice()))
-                .map_err(|_| StoreError::Arrow)?,
-        ),
-        Arc::new(UInt16Array::from_iter_values(
-            rows.iter().map(|row| row.ordinal),
-        )),
-        Arc::new(UInt16Array::from_iter_values(
-            rows.iter().map(|row| row.command_event_count),
-        )),
-        Arc::new(UInt64Array::from_iter_values(
-            rows.iter().map(|row| row.seq),
-        )),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.event_type.as_str()),
-        )),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.record_class.as_str()),
-        )),
-        string_options(
-            rows.iter()
-                .map(|row| row.object_family.map(ObjectFamily::as_str)),
-        ),
-        string_options(rows.iter().map(|row| row.object_id.as_deref())),
-        string_options(rows.iter().map(|row| row.revision_id.as_deref())),
-        string_options(rows.iter().map(|row| row.scope.project_id.as_deref())),
-        string_options(rows.iter().map(|row| row.scope.repository_id.as_deref())),
-        string_options(rows.iter().map(|row| row.scope.worktree_id.as_deref())),
-        string_options(rows.iter().map(|row| row.scope.task_id.as_deref())),
-        string_options(rows.iter().map(|row| row.scope.workstream_id.as_deref())),
-        string_options(rows.iter().map(|row| row.scope.session_id.as_deref())),
-        string_options(
-            rows.iter()
-                .map(|row| row.scope.execution_lane_id.as_deref()),
-        ),
-        Arc::new(
-            TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.occurred_at_us))
-                .with_timezone("UTC"),
-        ),
-        Arc::new(
-            TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.ingested_at_us))
-                .with_timezone("UTC"),
-        ),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.source_kind.as_str()),
-        )),
-        Arc::new(LargeStringArray::from_iter(
-            rows.iter().map(|row| row.source_ref_json.as_deref()),
-        )),
-        Arc::new(UInt16Array::from_iter_values(
-            rows.iter().map(|row| row.payload_schema),
-        )),
-        Arc::new(LargeStringArray::from_iter_values(
-            rows.iter().map(|row| row.payload_json.as_str()),
-        )),
-        Arc::new(
-            FixedSizeBinaryArray::try_from_iter(rows.iter().map(|row| row.content_hash.as_slice()))
-                .map_err(|_| StoreError::Arrow)?,
-        ),
-        string_options(rows.iter().map(|row| row.causation_id.as_deref())),
-        string_options(rows.iter().map(|row| row.correlation_id.as_deref())),
-        Arc::new(
-            FixedSizeBinaryArray::try_from_iter(
-                rows.iter().map(|row| row.effective_config_hash.as_slice()),
-            )
-            .map_err(|_| StoreError::Arrow)?,
-        ),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.algorithm_revision.as_str()),
-        )),
-    ];
-    RecordBatch::try_new(journal_schema(), columns).map_err(|_| StoreError::Arrow)
-}
-
+/// Decode one physical journal batch of the retired Lance layout. The
+/// offline converter is the only consumer; normal reads go through SQLite.
 pub(crate) fn rows_from_batch(batch: &RecordBatch) -> Result<Vec<JournalRow>, StoreError> {
     if batch.schema().as_ref() != journal_schema().as_ref() {
         return Err(StoreError::StoreCorrupt);
@@ -708,10 +314,6 @@ fn array<T: Array + 'static>(batch: &RecordBatch, index: usize) -> Result<&T, St
         .ok_or(StoreError::StoreCorrupt)
 }
 
-fn string_options<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(StringArray::from_iter(values))
-}
-
 fn optional_string(array: &StringArray, index: usize) -> Option<&str> {
     (!array.is_null(index)).then(|| array.value(index))
 }
@@ -729,6 +331,61 @@ fn fixed_hash(array: &FixedSizeBinaryArray, index: usize) -> Result<[u8; 32], St
         .value(index)
         .try_into()
         .map_err(|_| StoreError::StoreCorrupt)
+}
+
+pub(crate) fn rows_for_append(
+    prepared: &PreparedCommand,
+    first_seq: u64,
+    ingested_at_us: i64,
+) -> Result<Vec<JournalRow>, StoreError> {
+    if ingested_at_us < 0 {
+        return Err(StoreError::InvalidInput);
+    }
+    prepared
+        .events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let offset = u64::try_from(index).map_err(|_| StoreError::InvalidInput)?;
+            let seq = first_seq
+                .checked_add(offset)
+                .ok_or(StoreError::InvalidInput)?;
+            Ok(row_from_prepared(prepared, event, seq, ingested_at_us))
+        })
+        .collect()
+}
+
+fn row_from_prepared(
+    command: &PreparedCommand,
+    event: &PreparedEvent,
+    seq: u64,
+    ingested_at_us: i64,
+) -> JournalRow {
+    JournalRow {
+        event_id: event.event_id.clone(),
+        command_id: command.command_id,
+        command_hash: command.command_hash,
+        ordinal: event.ordinal,
+        command_event_count: command.event_count,
+        seq,
+        event_type: event.event_type.into(),
+        record_class: event.record_class,
+        object_family: None,
+        object_id: None,
+        revision_id: None,
+        scope: event.draft.scope.clone(),
+        occurred_at_us: event.draft.occurred_at_us,
+        ingested_at_us,
+        source_kind: event.draft.source_kind,
+        source_ref_json: None,
+        payload_schema: JOURNAL_PAYLOAD_SCHEMA,
+        payload_json: event.payload_json.clone(),
+        content_hash: event.content_hash,
+        causation_id: event.draft.causation_id.clone(),
+        correlation_id: event.draft.correlation_id.clone(),
+        effective_config_hash: event.draft.effective_config_hash,
+        algorithm_revision: event.draft.algorithm_revision.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -757,17 +414,23 @@ mod tests {
 
     #[test]
     fn partial_duplicate_and_mismatched_command_rows_fail_closed() {
-        let mut partial = valid_rows();
-        partial[0].command_event_count = 2;
+        let partial = {
+            let mut rows = valid_rows();
+            rows[0].command_event_count = 2;
+            rows
+        };
         assert_eq!(
             validate_complete_command(&partial),
             Err(StoreError::StoreCorrupt)
         );
 
-        let mut duplicate = valid_rows();
-        duplicate.push(duplicate[0].clone());
-        duplicate[0].command_event_count = 2;
-        duplicate[1].command_event_count = 2;
+        let duplicate = {
+            let mut rows = valid_rows();
+            rows.push(rows[0].clone());
+            rows[0].command_event_count = 2;
+            rows[1].command_event_count = 2;
+            rows
+        };
         assert_eq!(
             validate_complete_command(&duplicate),
             Err(StoreError::StoreCorrupt)
@@ -785,111 +448,5 @@ mod tests {
                 Err(StoreError::StoreCorrupt)
             );
         }
-    }
-
-    #[test]
-    fn schema_is_exact_and_partial_schema_is_rejected() {
-        let rows = valid_rows();
-        let batch = journal_batch(&rows).unwrap();
-        assert_eq!(rows_from_batch(&batch).unwrap(), rows);
-        let partial = RecordBatch::new_empty(Arc::new(Schema::new(
-            journal_schema().fields()[..28].to_vec(),
-        )));
-        assert_eq!(rows_from_batch(&partial), Err(StoreError::StoreCorrupt));
-    }
-
-    #[tokio::test]
-    async fn llm_budget_pages_exclude_old_and_unrelated_bodies() {
-        let temp = tempfile::tempdir().unwrap();
-        let connection = lancedb::connect(temp.path().to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let table = connection
-            .create_empty_table(JOURNAL_TABLE, journal_schema())
-            .execute()
-            .await
-            .unwrap();
-        let template = valid_rows().remove(0);
-        let day = 86_400_000_000;
-        let rows = (1..=302)
-            .map(|seq| {
-                let mut row = template.clone();
-                row.seq = seq;
-                row.event_type = "job_lease_v1".into();
-                row.occurred_at_us = day;
-                if seq == 1 {
-                    row.occurred_at_us = day - 1;
-                }
-                if seq == 2 {
-                    row.event_type = "semantic_digest_recorded_v1".into();
-                    row.payload_json = "unrelated body must not be loaded".repeat(100);
-                }
-                row
-            })
-            .collect::<Vec<_>>();
-        append_rows(&table, &rows).await.unwrap();
-        let first = read_llm_budget_page(&table, day, 0, 301).await.unwrap();
-        assert_eq!(first.len(), 256);
-        assert_eq!(first.first().unwrap().seq, 3);
-        assert_eq!(first.last().unwrap().seq, 258);
-        let second = read_llm_budget_page(&table, day, 258, 301).await.unwrap();
-        assert_eq!(second.len(), 43);
-        assert_eq!(second.last().unwrap().seq, 301);
-        assert!(
-            read_llm_budget_page(&table, day, 301, 301)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_input_revalidates_external_commits_before_reuse() {
-        let temp = tempfile::tempdir().unwrap();
-        let connection = lancedb::connect(temp.path().to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let table = connection
-            .create_empty_table(JOURNAL_TABLE, journal_schema())
-            .execute()
-            .await
-            .unwrap();
-        let mut startup = StartupJournal::read(table).await.unwrap();
-        let external = connection
-            .open_table(JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        let rows = valid_rows();
-        append_rows(&external, &rows).await.unwrap();
-        startup.refresh().await.unwrap();
-        assert_eq!(startup.rows, rows);
-        assert_eq!(startup.version, external.version().await.unwrap());
-
-        // A second physical copy of the command is corruption, even if the
-        // previously validated native handle has not observed that commit yet.
-        append_rows(&external, &rows).await.unwrap();
-        assert_eq!(startup.refresh().await, Err(StoreError::StoreCorrupt));
-    }
-
-    #[tokio::test]
-    async fn frontier_query_reads_only_the_latest_sequence_and_handles_empty() {
-        let temp = tempfile::tempdir().unwrap();
-        let connection = lancedb::connect(temp.path().to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        let table = connection
-            .create_empty_table(JOURNAL_TABLE, journal_schema())
-            .execute()
-            .await
-            .unwrap();
-        assert_eq!(read_journal_frontier(&table).await, Ok(0));
-        let mut rows = valid_rows();
-        rows[0].seq = 37;
-        append_rows(&table, &rows).await.unwrap();
-        assert_eq!(read_journal_frontier(&table).await, Ok(37));
     }
 }

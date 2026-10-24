@@ -210,6 +210,210 @@ impl RepositoryResolveInput<'_> {
     }
 }
 
+/// Records a source's start-time path/snapshot proof, not a routine probe.
+/// Evidence must have been captured at this boundary; never re-probe today
+/// with an old source timestamp. The explicit reference prevents unrelated
+/// sources sharing auxiliary evidence from being mistaken for one another.
+///
+/// A durable exact closure is an idempotent retry, even after newer snapshots.
+/// Otherwise the ordinary resolver must establish one active worktree, and
+/// this command adds only its missing boundary snapshot/path observation.
+/// Unavailable, ambiguous, contradictory or unrecorded late evidence fails
+/// closed. Ordinary `resolve_repository` keeps its existing NoDelta behavior.
+pub fn resolve_repository_source_start(
+    input: &RepositoryResolveInput<'_>,
+    source_reference: &str,
+) -> Result<RepositoryResolution, RepositoryResolveError> {
+    let evidence = input.evidence;
+    if source_reference.is_empty()
+        || !evidence
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == source_reference)
+    {
+        return Err(RepositoryResolveError::InvalidEvidence);
+    }
+    if evidence.unavailable_reason.is_some() {
+        return Err(RepositoryResolveError::InsufficientEvidence);
+    }
+    let mut resolution = resolve_repository(input)?;
+    if !matches!(
+        resolution.kind,
+        Some(ResolutionKind::Create | ResolutionKind::Successor | ResolutionKind::NoDelta)
+    ) {
+        return Err(RepositoryResolveError::InsufficientEvidence);
+    }
+    let repository = resolution
+        .repositories
+        .first()
+        .or_else(|| established_identity_repository(input))
+        .ok_or(RepositoryResolveError::InsufficientEvidence)?;
+    if repository.common_dir_filesystem != evidence.common_dir_filesystem
+        || repository.object_format != evidence.object_format
+        || repository.git_common_dir_path != evidence.common_dir
+    {
+        return Err(RepositoryResolveError::InsufficientEvidence);
+    }
+    let repository_id = repository.repository_id;
+    let root = evidence
+        .worktree_root
+        .as_deref()
+        .ok_or(RepositoryResolveError::InvalidEvidence)?;
+    let admin = candidate_entry(evidence, root)?
+        .gitdir
+        .as_deref()
+        .ok_or(RepositoryResolveError::InvalidEvidence)?;
+    // Upserts override the same current ID without copying the whole view.
+    let mut candidates = resolution
+        .worktrees
+        .iter()
+        .chain(input.view.worktrees.values().filter(|current| {
+            !resolution
+                .worktrees
+                .iter()
+                .any(|next| next.worktree_instance_id == current.worktree_instance_id)
+        }))
+        .filter(|worktree| {
+            worktree.repository_instance_id == repository_id
+                && worktree.lifecycle == WorktreeLifecycle::Active
+                && worktree.current_path.as_deref() == Some(root)
+                && admin_matches(worktree, admin, input.view, repository_id, evidence)
+        });
+    let candidate = candidates
+        .next()
+        .ok_or(RepositoryResolveError::InsufficientEvidence)?;
+    let candidate_id = candidate.worktree_instance_id;
+    if candidates.next().is_some() {
+        return Err(RepositoryResolveError::InsufficientEvidence);
+    }
+    let at = evidence.occurred_at_us;
+    let path_closed = |worktree: &WorktreeInstance| {
+        worktree.path_history.iter().any(|observation| {
+            observation.path == root
+                && observation.first_observed_at_us <= at
+                && at <= observation.last_observed_at_us
+                && observation
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference == source_reference)
+        })
+    };
+    let at_boundary = |snapshot: &&WorktreeSnapshot| {
+        snapshot.worktree_instance_id == candidate_id
+            && snapshot.captured_at_us == at
+            && snapshot
+                .evidence_refs
+                .iter()
+                .any(|reference| reference == source_reference)
+    };
+    // Only durable evidence can establish a retry. Discard any speculative
+    // ordinary-resolution payloads instead of rolling current state backward.
+    let mut recorded = input.view.snapshots.values().filter(at_boundary);
+    if let Some(snapshot) = recorded.next() {
+        if recorded.next().is_some() || !snapshot_matches_evidence(snapshot, evidence) {
+            return Err(RepositoryResolveError::InvalidEvidence);
+        }
+        if !input
+            .view
+            .worktrees
+            .get(&candidate_id)
+            .is_some_and(path_closed)
+        {
+            return Err(RepositoryResolveError::InsufficientEvidence);
+        }
+        return Ok(RepositoryResolution::empty(ResolutionKind::NoDelta, None));
+    }
+    if input
+        .view
+        .worktrees
+        .get(&candidate_id)
+        .is_some_and(|current| at < current.recorded_at_us)
+    {
+        return Err(RepositoryResolveError::InsufficientEvidence);
+    }
+    let snapshot_id = match resolution.snapshots.iter().find(at_boundary) {
+        Some(snapshot) => {
+            if !snapshot_matches_evidence(snapshot, evidence) {
+                return Err(RepositoryResolveError::InvalidEvidence);
+            }
+            snapshot.worktree_snapshot_id
+        }
+        None => {
+            let snapshot = snapshot_from_evidence(candidate_id, evidence)?;
+            let id = snapshot.worktree_snapshot_id;
+            resolution.snapshots.push(snapshot);
+            id
+        }
+    };
+    if !resolution
+        .worktrees
+        .iter()
+        .any(|worktree| worktree.worktree_instance_id == candidate_id)
+    {
+        let mut successor = candidate.clone();
+        successor.worktree_revision += 1;
+        successor.predecessor_revision = Some(candidate.worktree_revision);
+        successor.recorded_at_us = at;
+        resolution.worktrees.push(successor);
+    }
+    let successor = resolution
+        .worktrees
+        .iter_mut()
+        .find(|worktree| worktree.worktree_instance_id == candidate_id)
+        .unwrap();
+    successor.current_snapshot_id = Some(snapshot_id);
+    if !path_closed(successor) {
+        successor
+            .path_history
+            .push(path_observation(root, evidence));
+    }
+    successor
+        .validate()
+        .map_err(RepositoryResolveError::Domain)?;
+    finalize_kind(&mut resolution);
+    Ok(resolution)
+}
+
+// The ordinary resolver already rejected contradictions/incomplete identity;
+// find the one positive current instance without another materialized map.
+fn established_identity_repository<'a>(
+    input: &RepositoryResolveInput<'a>,
+) -> Option<&'a RepositoryInstance> {
+    let mut candidates = input.view.repositories.values().filter(|repository| {
+        repository.common_dir_filesystem == input.evidence.common_dir_filesystem
+            && candidate_continuity_positive(input, repository)
+    });
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
+}
+
+fn snapshot_matches_evidence(snapshot: &WorktreeSnapshot, evidence: &GitProbeEvidence) -> bool {
+    snapshot.head_oid.as_deref() == evidence.head_oid.as_ref().map(GitOid::as_str)
+        && snapshot.tree_oid.as_deref() == evidence.tree_oid.as_ref().map(GitOid::as_str)
+        && snapshot.branch_ref == evidence.branch_ref
+        && snapshot.detached_head == evidence.detached_head.unwrap_or(false)
+        && snapshot.tracked_diff_digest == evidence.tracked_diff_digest
+        && snapshot.index_digest == evidence.index_digest
+        && snapshot.untracked_manifest_digest == evidence.untracked_manifest_digest
+        && snapshot.git_operation == evidence.git_operation
+        && snapshot
+            .omission_reasons
+            .iter()
+            .map(|omission| (omission.field, omission.reason))
+            .eq(evidence.omissions.iter().filter_map(|omission| {
+                omission
+                    .field
+                    .snapshot_field()
+                    .map(|field| (field, omission.reason))
+            }))
+        && snapshot.capture_status
+            == if snapshot.omission_reasons.is_empty() {
+                SnapshotCaptureStatus::Complete
+            } else {
+                SnapshotCaptureStatus::Partial
+            }
+}
+
 fn resolve_unavailable(
     input: &RepositoryResolveInput<'_>,
     reason: ProbeUnavailableReason,

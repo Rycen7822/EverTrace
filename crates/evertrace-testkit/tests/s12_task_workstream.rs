@@ -899,7 +899,7 @@ async fn replay_restart_full_rebuild_and_current_rows_are_stable() {
         row.object_kind.as_deref() == Some("workstream")
             && row.current_revision_id.as_deref() == Some(&stream.revision_id.to_string())
     }));
-    assert_eq!(writer.table_names().await.unwrap().len(), 4);
+    assert_eq!(writer.table_names().await.unwrap().len(), 1);
 }
 
 #[test]

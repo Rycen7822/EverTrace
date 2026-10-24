@@ -95,7 +95,7 @@ impl ProcedureState {
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(payload.canonical_json()?),
+            payload_json: Some(payload.canonical_json()?.into()),
             source_event_seq: *seq,
             projection_generation: generation,
         })
@@ -152,7 +152,7 @@ impl ProcedureState {
             task_id: Some(negative.0.task_id.to_string()),
             workstream_id: None,
             session_id: Some(negative.0.session_id.clone()),
-            payload_json: Some(payload.canonical_json()?),
+            payload_json: Some(payload.canonical_json()?.into()),
             source_event_seq: *seq,
             projection_generation: generation,
         })
@@ -1581,7 +1581,7 @@ impl ProcedureState {
             task_id: None,
             workstream_id: None,
             session_id: None,
-            payload_json: Some(payload.canonical_json()?),
+            payload_json: Some(payload.canonical_json()?.into()),
             source_event_seq: *seq,
             projection_generation: generation,
         })
@@ -1625,7 +1625,7 @@ impl ProcedureState {
                 task_id: Some(usage.task_id.to_string()),
                 workstream_id: Some(usage.workstream_id.to_string()),
                 session_id: None,
-                payload_json: Some(payload.canonical_json()?),
+                payload_json: Some(payload.canonical_json()?.into()),
                 source_event_seq: *seq,
                 projection_generation: generation,
             });
@@ -1669,7 +1669,7 @@ impl ProcedureState {
                 task_id: Some(negative.task_id.to_string()),
                 workstream_id: None,
                 session_id: Some(negative.session_id.clone()),
-                payload_json: Some(payload.canonical_json()?),
+                payload_json: Some(payload.canonical_json()?.into()),
                 source_event_seq: *seq,
                 projection_generation: generation,
             });
