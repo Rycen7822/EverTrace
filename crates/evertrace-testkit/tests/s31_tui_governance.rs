@@ -2108,6 +2108,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
                 source_revision: receipt.source_revision.clone(),
                 source_sequence: 1,
                 confirmed_prefix_digest: None,
+                earlier_prefix: None,
             }),
             JournalPayload::DirtyTarget(DirtyTarget {
                 target_kind: DirtyTargetKind::EvidenceSurface,
@@ -4543,6 +4544,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             source_revision: suspended_receipt.source_revision.clone(),
             source_sequence: 1,
             confirmed_prefix_digest: None,
+            earlier_prefix: None,
         }),
         JournalPayload::GlobalSupportValidationRecorded(Box::new(GlobalSupportValidationEvent {
             validation_revision_id: RevisionId::new_v7(),
@@ -4604,6 +4606,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
             source_revision: suspended_receipt.source_revision.clone(),
             source_sequence: 1,
             confirmed_prefix_digest: None,
+            earlier_prefix: None,
         }),
     ]
     .into_iter()
@@ -5365,6 +5368,7 @@ async fn plain_accept_uses_one_real_command_for_atom_procedure_and_core_inner() 
                         source_revision: surface_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,
@@ -5839,6 +5843,7 @@ async fn protected_archive_export(
                         source_revision: independent_receipt.source_revision.clone(),
                         source_sequence: 1,
                         confirmed_prefix_digest: None,
+                        earlier_prefix: None,
                     }),
                     JournalPayload::DirtyTarget(DirtyTarget {
                         target_kind: DirtyTargetKind::EvidenceSurface,

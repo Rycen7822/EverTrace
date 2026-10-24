@@ -54,7 +54,11 @@ pub(super) fn row(
         session_id: None,
         source_event_seq: value.source_watermark,
         projection_generation: generation,
-        payload_json: Some(serde_json::to_string(&value).map_err(|_| StoreError::Serialization)?),
+        payload_json: Some(
+            serde_json::to_string(&value)
+                .map_err(|_| StoreError::Serialization)?
+                .into(),
+        ),
     })
 }
 

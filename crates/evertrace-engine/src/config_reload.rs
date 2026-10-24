@@ -132,27 +132,26 @@ impl ConfigReloadService {
         }
         let runtime = crate::recovery::prepare_recovery_runtime(&self.data_dir, &config, None)
             .map_err(|_| ConfigReloadError::Invalid)?;
-        let projection = self
-            .writer
-            .project()
-            .await
-            .map_err(|_| ConfigReloadError::Invalid)?;
-        let previous_hash = match projection
-            .rows
-            .iter()
-            .find(|row| row.row_id == "runtime:config:current")
-        {
-            None => config.hash(),
-            Some(row) => match row
-                .payload_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
-            {
-                Some(JournalPayload::ConfigAudit(audit)) if audit.is_applied() => {
-                    audit.effective_config_hash
-                }
-                _ => return Err(ConfigReloadError::Invalid),
-            },
+        let previous_hash = {
+            // Keep the indexed barrier, but release its facts before auditing.
+            let current = self
+                .writer
+                .project_current(true)
+                .await
+                .map_err(|_| ConfigReloadError::Invalid)?;
+            match current.other_row("runtime:config:current") {
+                None => config.hash(),
+                Some(row) => match row
+                    .payload_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<JournalPayload>(json).ok())
+                {
+                    Some(JournalPayload::ConfigAudit(audit)) if audit.is_applied() => {
+                        audit.effective_config_hash
+                    }
+                    _ => return Err(ConfigReloadError::Invalid),
+                },
+            }
         };
         let applied = Self::prepare_audit(
             &config,
@@ -761,18 +760,10 @@ mod tests {
             panic!("config audit");
         };
         assert_eq!(audit.reload.unwrap().previous_config_hash, changed.hash());
-        let native = evertrace_store::connection::CompatibilityStore::connect_local(
-            &evertrace_store::connection::native_root(&data),
-        )
-        .await
-        .unwrap();
-        let table = native
-            .connection()
-            .open_table(evertrace_store::JOURNAL_TABLE)
-            .execute()
+        let rows = evertrace_store::StoreReadHandle::open_read_only(&data)
             .await
-            .unwrap();
-        let rows = evertrace_store::journal::read_all_journal_rows(&table)
+            .unwrap()
+            .journal_rows()
             .await
             .unwrap();
         let mut prepared_time = None;
@@ -788,8 +779,6 @@ mod tests {
                 }
             }
         }
-        drop(table);
-        drop(native);
         writer.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
         drop(startup);

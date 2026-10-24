@@ -1,21 +1,20 @@
 use std::str::FromStr;
 
 use evertrace_domain::ids::CommandId;
-use lancedb::{Connection, Table};
 
 use crate::{
     command::{
         JournalCommand, JournalEventDraft, JournalPayload, MigrationApplied, StoreError,
         prepare_command,
     },
-    journal::{JOURNAL_TABLE, StartupJournal, append_rows, journal_schema, rows_for_append},
-    objects::{OBJECTS_TABLE, ObjectRow, objects_batch, objects_schema, validate_objects_table},
+    journal::{rows_for_append, validate_complete_command},
+    objects::ObjectRow,
     projections::ProjectionWorker,
+    sqlite_state::SqliteHandle,
 };
 
 const MIGRATION_ID: &str = "L0001";
 const MIGRATION_COMMAND_ID: &str = "01890f47-6a4a-7cc1-98b9-01890f476a40";
-const L0002_RESERVED_TABLES: [&str; 2] = ["evertrace_relations", "evertrace_search"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationOutcome {
@@ -28,121 +27,78 @@ pub enum MigrationOutcome {
 pub struct L0001;
 
 impl L0001 {
-    pub async fn apply(connection: &Connection) -> Result<MigrationOutcome, StoreError> {
-        Self::apply_inner(connection, false, &mut None).await
+    /// Crate-private view of the canonical L0001 marker validation for the
+    /// offline converter; it does not alter migration bytes or semantics.
+    pub(crate) fn validate_marker(
+        rows: &[crate::journal::JournalRow],
+        require_present: bool,
+    ) -> Result<bool, StoreError> {
+        validate_migration_marker(rows, require_present)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn apply(sqlite: &SqliteHandle) -> Result<MigrationOutcome, StoreError> {
+        Self::apply_inner(sqlite, false).await
     }
 
     pub(crate) async fn apply_inner(
-        connection: &Connection,
+        sqlite: &SqliteHandle,
         l0002_tables_present: bool,
-        startup: &mut Option<StartupJournal>,
     ) -> Result<MigrationOutcome, StoreError> {
-        let names = connection
-            .table_names()
-            .execute()
-            .await
-            .map_err(|_| StoreError::LanceDb)?;
-        let has_l0002_table = names
-            .iter()
-            .any(|name| L0002_RESERVED_TABLES.contains(&name.as_str()));
-        if has_l0002_table != l0002_tables_present {
-            return Err(StoreError::StoreCorrupt);
-        }
-        let journal_exists = names.iter().any(|name| name == JOURNAL_TABLE);
-        let objects_exists = names.iter().any(|name| name == OBJECTS_TABLE);
+        let (rows, object_rows_count, objects_missing, relation_present) = {
+            let state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            (
+                state.rows()?,
+                state.object_row_count()?,
+                state.object_checkpoint_row()?.is_none(),
+                state.relation_checkpoint_row()?.is_some(),
+            )
+        };
+        let journal_exists = !rows.is_empty();
         if l0002_tables_present && !journal_exists {
             return Err(StoreError::StoreCorrupt);
         }
+        let _ = relation_present;
 
-        if !journal_exists && objects_exists {
-            let objects = connection
-                .open_table(OBJECTS_TABLE)
-                .execute()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            if objects
-                .count_rows(None)
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                != 0
-            {
-                return Err(StoreError::StoreCorrupt);
-            }
-            validate_empty_objects_schema(&objects).await?;
-        }
-
-        if startup.is_some() && !journal_exists {
+        if !journal_exists && object_rows_count > 0 {
+            // Objects without a journal cannot be repaired from history.
             return Err(StoreError::StoreCorrupt);
         }
-        if startup.is_none() {
-            let table = if journal_exists {
-                connection
-                    .open_table(JOURNAL_TABLE)
-                    .execute()
-                    .await
-                    .map_err(|_| StoreError::LanceDb)?
-            } else {
-                connection
-                    .create_empty_table(JOURNAL_TABLE, journal_schema())
-                    .execute()
-                    .await
-                    .map_err(|_| StoreError::Migration)?
-            };
-            *startup = Some(StartupJournal::read(table).await?);
+        if objects_missing && object_rows_count > 0 {
+            return Err(StoreError::StoreCorrupt);
         }
-        let startup = startup.as_mut().ok_or(StoreError::StoreCorrupt)?;
-        startup.refresh().await?;
-        let journal = startup.table.clone();
-
-        if l0002_tables_present {
-            validate_migration_marker(&startup.rows, true)?;
+        if objects_missing {
+            let checkpoint = ObjectRow::checkpoint(0, 1);
+            sqlite
+                .lock()
+                .map_err(|_| StoreError::StoreCorrupt)?
+                .commit_object_rows(
+                    std::slice::from_ref(&checkpoint),
+                    crate::sqlite_state::ObjectReconcile::default(),
+                    &checkpoint,
+                )?;
+        }
+        {
+            let state = sqlite.lock().map_err(|_| StoreError::StoreCorrupt)?;
+            crate::objects::checkpoint_from_rows(&state.object_rows()?)?;
         }
 
-        let mut rebuilt_objects = false;
-        let objects = if objects_exists {
-            let table = connection
-                .open_table(OBJECTS_TABLE)
-                .execute()
-                .await
-                .map_err(|_| StoreError::LanceDb)?;
-            if table
-                .count_rows(None)
-                .await
-                .map_err(|_| StoreError::LanceDb)?
-                == 0
-            {
-                validate_empty_objects_schema(&table).await?;
-                append_initial_checkpoint(&table).await?;
-            }
-            table
-        } else {
-            rebuilt_objects = journal_exists;
-            let table = connection
-                .create_empty_table(OBJECTS_TABLE, objects_schema())
-                .execute()
-                .await
-                .map_err(|_| StoreError::Migration)?;
-            append_initial_checkpoint(&table).await?;
-            table
-        };
-
-        startup.refresh().await?;
-        validate_objects_table(&objects).await?;
-        let appended_event = !validate_migration_marker(&startup.rows, l0002_tables_present)?;
+        let appended_event = !validate_migration_marker(&rows, l0002_tables_present)?;
         if appended_event {
-            append_migration_event(&journal, &startup.rows).await?;
+            append_migration_event(sqlite, rows.last().map(|row| row.seq).unwrap_or(0)).await?;
         }
 
         // L0002 performs its own objects catch-up before using the derived
-        // tables. Standalone L0001 still needs to finish that projection here.
+        // families. Standalone L0001 still needs to finish that projection.
         if !l0002_tables_present {
-            let projection = ProjectionWorker::new(journal.clone(), objects);
-            projection.catch_up().await?;
+            ProjectionWorker::new(std::sync::Arc::clone(sqlite))
+                .catch_up()
+                .await?;
         }
 
-        Ok(if !journal_exists && !objects_exists {
+        Ok(if !journal_exists && objects_missing {
             MigrationOutcome::Applied
-        } else if rebuilt_objects {
+        } else if objects_missing {
             MigrationOutcome::RebuiltObjects
         } else if appended_event {
             MigrationOutcome::Reconciled
@@ -152,10 +108,7 @@ impl L0001 {
     }
 }
 
-#[cfg(test)]
-use crate::journal::read_all_journal_rows;
-
-fn validate_migration_marker(
+pub(crate) fn validate_migration_marker(
     rows: &[crate::journal::JournalRow],
     require_present: bool,
 ) -> Result<bool, StoreError> {
@@ -188,39 +141,21 @@ fn validate_migration_marker(
     Ok(!matches.is_empty())
 }
 
-async fn validate_empty_objects_schema(table: &Table) -> Result<(), StoreError> {
-    let schema = table.schema().await.map_err(|_| StoreError::LanceDb)?;
-    if schema.as_ref() != objects_schema().as_ref() {
-        return Err(StoreError::StoreCorrupt);
-    }
-    Ok(())
-}
-
-async fn append_initial_checkpoint(table: &Table) -> Result<(), StoreError> {
-    table
-        .add(objects_batch(&[ObjectRow::checkpoint(0, 1)])?)
-        .execute()
-        .await
-        .map(|_| ())
-        .map_err(|_| StoreError::Migration)
-}
-
 async fn append_migration_event(
-    journal: &Table,
-    existing: &[crate::journal::JournalRow],
+    sqlite: &SqliteHandle,
+    committed_frontier: u64,
 ) -> Result<(), StoreError> {
     let command = migration_command()?;
     let prepared = prepare_command(&command)?;
-    let first_seq = existing
-        .iter()
-        .map(|row| row.seq)
-        .max()
-        .unwrap_or(0)
+    let first_seq = committed_frontier
         .checked_add(1)
         .ok_or(StoreError::Migration)?;
-    append_rows(journal, &rows_for_append(&prepared, first_seq, 0)?)
-        .await
-        .map(|_| ())
+    let rows = rows_for_append(&prepared, first_seq, 0)?;
+    validate_complete_command(&rows)?;
+    sqlite
+        .lock()
+        .map_err(|_| StoreError::StoreCorrupt)?
+        .append_command_rows(&rows)
 }
 
 fn migration_command() -> Result<JournalCommand, StoreError> {
@@ -239,128 +174,41 @@ fn migration_command() -> Result<JournalCommand, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow_schema::{DataType, Field, Schema};
+    use std::{os::unix::fs::PermissionsExt, path::Path};
 
     use super::*;
+    use crate::sqlite_state::SqliteState;
 
-    async fn connection() -> (tempfile::TempDir, Connection) {
+    fn state(root: &Path) -> SqliteHandle {
+        std::fs::create_dir(root).unwrap();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        SqliteState::open(root).unwrap().handle()
+    }
+
+    fn temp_root() -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
-        let connection = lancedb::connect(temp.path().to_str().unwrap())
-            .execute()
-            .await
-            .unwrap();
-        (temp, connection)
+        let root = temp.path().join("data");
+        (temp, root)
     }
 
     #[tokio::test]
-    async fn valid_tables_without_event_are_reconciled_once() {
-        let (_temp, connection) = connection().await;
-        connection
-            .create_empty_table(JOURNAL_TABLE, journal_schema())
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .create_empty_table(OBJECTS_TABLE, objects_schema())
-            .execute()
-            .await
-            .unwrap();
-        append_initial_checkpoint(&objects).await.unwrap();
-        assert_eq!(
-            L0001::apply(&connection).await,
-            Ok(MigrationOutcome::Reconciled)
-        );
-        assert_eq!(L0001::apply(&connection).await, Ok(MigrationOutcome::Noop));
-        let journal = connection
-            .open_table(JOURNAL_TABLE)
-            .execute()
-            .await
-            .unwrap();
-        assert_eq!(read_all_journal_rows(&journal).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn l0001_rejects_wrong_schema_partial_l0002_tables_without_touching_them() {
-        let (_temp, connection) = connection().await;
-        connection
-            .create_empty_table("evertrace_relations", objects_schema())
-            .execute()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            L0001::apply(&connection).await,
-            Err(StoreError::StoreCorrupt)
-        );
-        assert_eq!(
-            connection.table_names().execute().await.unwrap(),
-            vec!["evertrace_relations"]
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_rejects_partial_journal_and_event_schema_mismatch() {
-        let (_temp, connection) = connection().await;
-        connection
-            .create_empty_table(
-                JOURNAL_TABLE,
-                Arc::new(Schema::new(vec![Field::new(
-                    "event_id",
-                    DataType::Utf8,
-                    false,
-                )])),
-            )
-            .execute()
-            .await
-            .unwrap();
-        assert_eq!(
-            L0001::apply(&connection).await,
-            Err(StoreError::StoreCorrupt)
-        );
-    }
-
-    #[tokio::test]
-    async fn applied_event_with_wrong_objects_schema_fails_closed() {
-        let (_temp, connection) = connection().await;
-        assert_eq!(
-            L0001::apply(&connection).await,
-            Ok(MigrationOutcome::Applied)
-        );
-        connection.drop_table(OBJECTS_TABLE, &[]).await.unwrap();
-        connection
-            .create_empty_table(
-                OBJECTS_TABLE,
-                Arc::new(Schema::new(vec![Field::new(
-                    "row_id",
-                    DataType::Utf8,
-                    false,
-                )])),
-            )
-            .execute()
-            .await
-            .unwrap();
-        assert_eq!(
-            L0001::apply(&connection).await,
-            Err(StoreError::StoreCorrupt)
-        );
+    async fn fresh_store_applies_once_and_reconciles_marker() {
+        let (_temp, root) = temp_root();
+        let sqlite = state(&root);
+        assert_eq!(L0001::apply(&sqlite).await, Ok(MigrationOutcome::Applied));
+        assert_eq!(L0001::apply(&sqlite).await, Ok(MigrationOutcome::Noop));
+        let rows = sqlite.lock().unwrap().rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        sqlite.lock().unwrap().object_rows().unwrap();
     }
 
     #[tokio::test]
     async fn migration_name_under_noncanonical_command_is_corruption() {
-        let (_temp, connection) = connection().await;
-        let journal = connection
-            .create_empty_table(JOURNAL_TABLE, journal_schema())
-            .execute()
-            .await
-            .unwrap();
-        let objects = connection
-            .create_empty_table(OBJECTS_TABLE, objects_schema())
-            .execute()
-            .await
-            .unwrap();
-        append_initial_checkpoint(&objects).await.unwrap();
+        let (_temp, root) = temp_root();
+        let sqlite = state(&root);
+        L0001::apply(&sqlite).await.unwrap();
+        // A forged command carrying the same migration id under another
+        // command ID is corruption and the store keeps refusing it.
         let forged = JournalCommand::new(
             CommandId::from_str("01890f47-6a4a-7cc1-98b9-01890f476a41").unwrap(),
             vec![JournalEventDraft::runtime(
@@ -374,32 +222,28 @@ mod tests {
         )
         .unwrap();
         let prepared = prepare_command(&forged).unwrap();
-        append_rows(&journal, &rows_for_append(&prepared, 1, 0).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            L0001::apply(&connection).await,
-            Err(StoreError::StoreCorrupt)
-        );
+        let rows = rows_for_append(&prepared, 2, 0).unwrap();
+        sqlite.lock().unwrap().append_command_rows(&rows).unwrap();
+        assert_eq!(L0001::apply(&sqlite).await, Err(StoreError::StoreCorrupt));
     }
 
     #[tokio::test]
-    async fn journal_missing_with_nonempty_objects_fails_without_replacement() {
-        let (_temp, connection) = connection().await;
-        let objects = connection
-            .create_empty_table(OBJECTS_TABLE, objects_schema())
-            .execute()
-            .await
+    async fn objects_without_journal_fail_without_replacement() {
+        let (_temp, root) = temp_root();
+        let sqlite = state(&root);
+        // A nonempty objects family without any journal history cannot be
+        // repaired or replaced.
+        let checkpoint = ObjectRow::checkpoint(0, 1);
+        sqlite
+            .lock()
+            .unwrap()
+            .commit_object_rows(
+                std::slice::from_ref(&checkpoint),
+                crate::sqlite_state::ObjectReconcile::default(),
+                &checkpoint,
+            )
             .unwrap();
-        append_initial_checkpoint(&objects).await.unwrap();
-        assert_eq!(
-            L0001::apply(&connection).await,
-            Err(StoreError::StoreCorrupt)
-        );
-        assert_eq!(objects.count_rows(None).await.unwrap(), 1);
-        assert_eq!(
-            connection.table_names().execute().await.unwrap(),
-            vec![OBJECTS_TABLE]
-        );
+        assert_eq!(L0001::apply(&sqlite).await, Err(StoreError::StoreCorrupt));
+        assert_eq!(sqlite.lock().unwrap().rows().unwrap().len(), 0);
     }
 }

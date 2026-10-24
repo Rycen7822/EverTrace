@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use evertrace_domain::{
-    evidence::{SourceObservation, SourceReceipt},
     ids::{JobId, RepositoryId, SourceObservationId, SourceReceiptId, WorktreeId},
     inventory::{CapabilityInventoryRecorded, InventoryContext},
     repository::{RepositoryCapabilityState, RepositoryInstance, WorktreeInstance},
 };
 
 use super::{
-    JournalPayload, ObjectFamily, ObjectRow, StoreError, physical_object_row, require_physical_row,
+    JournalPayload, ObjectFamily, ObjectRow, SourceObservationFacts, SourceReceiptFacts,
+    StoreError, physical_object_row, require_physical_row,
 };
 use crate::{DurableJob, JobStatus, SourceKind, purge::ScopePurgeState};
 
@@ -106,8 +106,8 @@ pub(super) struct InventoryAdmission<'a> {
     pub worktrees: &'a BTreeMap<WorktreeId, (WorktreeInstance, u64)>,
     pub jobs: &'a BTreeMap<JobId, DurableJob>,
     pub purges: &'a ScopePurgeState,
-    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
-    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
+    pub source_receipts: &'a SourceReceiptFacts,
+    pub source_observations: &'a SourceObservationFacts,
 }
 
 impl InventoryAdmission<'_> {
@@ -671,12 +671,12 @@ mod tests {
         JobBudget, JobLease, JobTerminalAudit, JobTerminalOutcome, JobTerminalReason,
         JournalCommand, JournalEventDraft, command::prepare_command, journal::rows_for_append,
     };
+    use evertrace_domain::evidence::SourceReceipt;
     use evertrace_domain::{
         ids::CommandId,
         inventory::CapabilityInventoryProfile,
         repository::{GitRegistrationState, PathObservation, WorktreeKind, WorktreeLifecycle},
     };
-
     fn old_repository() -> serde_json::Value {
         serde_json::json!({
             "repository_id": "repo:01890f47-6a4a-7cc1-98b9-01890f476a01",
@@ -1059,8 +1059,10 @@ mod tests {
         })).unwrap();
         receipt.validate().unwrap();
         let source_seq = with_history.inventory.completed[&fact.job_id].1 + 1;
-        std::sync::Arc::make_mut(&mut with_history.source_receipts)
-            .insert(receipt_id, (receipt.clone(), source_seq));
+        std::sync::Arc::make_mut(&mut with_history.source_receipts).insert(
+            receipt_id,
+            (std::sync::Arc::new(receipt.clone()), source_seq),
+        );
         let scope = evertrace_domain::procedure::ProcedureScope::Repository {
             repository_id: repository.repository_id,
         };
@@ -1087,31 +1089,29 @@ mod tests {
             .1 = source_seq - 2;
         assert!(validate(&future, &inventory_refs).is_err());
         let mut late_import = with_history.clone();
-        std::sync::Arc::make_mut(&mut late_import.source_receipts)
+        let current_receipt = std::sync::Arc::make_mut(&mut late_import.source_receipts)
             .get_mut(&receipt_id)
-            .unwrap()
-            .0
-            .event_time_us = 2;
+            .unwrap();
+        std::sync::Arc::make_mut(&mut current_receipt.0).event_time_us = 2;
         assert!(
             validate(&late_import, &inventory_refs).is_err(),
             "later ingestion cannot backfill an installation into the source's original time"
         );
         let mut wrong_source = with_history.clone();
-        std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
+        let current_receipt = std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
             .get_mut(&receipt_id)
-            .unwrap()
-            .0
-            .source_session_ref = "other".into();
+            .unwrap();
+        std::sync::Arc::make_mut(&mut current_receipt.0).source_session_ref = "other".into();
         assert!(validate(&wrong_source, &inventory_refs).is_err());
         std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
             .get_mut(&receipt_id)
             .unwrap()
-            .0 = receipt;
-        std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
+            .0 = std::sync::Arc::new(receipt);
+        let current_receipt = std::sync::Arc::make_mut(&mut wrong_source.source_receipts)
             .get_mut(&receipt_id)
-            .unwrap()
-            .0
-            .worktree_instance_id = Some(WorktreeId::new_v7());
+            .unwrap();
+        std::sync::Arc::make_mut(&mut current_receipt.0).worktree_instance_id =
+            Some(WorktreeId::new_v7());
         assert!(validate(&wrong_source, &inventory_refs).is_err());
         let mut disabled = with_history.repositories[&repository.repository_id]
             .0

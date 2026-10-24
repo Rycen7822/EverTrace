@@ -124,6 +124,8 @@ pub struct SessionMetaPayload {
     pub _agent_path: Option<serde::de::IgnoredAny>,
     #[serde(rename = "context_window")]
     pub _context_window: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "runtime_workspace_roots")]
+    pub _runtime_workspace_roots: Option<serde::de::IgnoredAny>,
     #[serde(rename = "history_mode")]
     pub _history_mode: Option<serde::de::IgnoredAny>,
     #[serde(rename = "multi_agent_version")]
@@ -260,4 +262,26 @@ pub fn parse_session_header(
         return Err(SessionMetadataError);
     }
     Ok(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_header_declares_workspace_roots_without_granting_them_authority() {
+        let id = "019d0000-0000-7000-8000-0000000000a1";
+        let name = format!("rollout-2026-10-18T00-00-00-{id}.jsonl");
+        let mut value = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:00Z", "type": "session_meta",
+            "payload": {"id": id, "session_id": id, "cwd": "/original-workspace"}
+        });
+        assert!(parse_session_header(&name, &serde_json::to_vec(&value).unwrap()).is_ok());
+        value["payload"]["runtime_workspace_roots"] =
+            serde_json::json!(["/not-an-authorized-root"]);
+        let parsed = parse_session_header(&name, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(parsed.payload.cwd.as_deref(), Some("/original-workspace"));
+        value["payload"]["undeclared_native_field"] = serde_json::json!(true);
+        assert!(parse_session_header(&name, &serde_json::to_vec(&value).unwrap()).is_err());
+    }
 }

@@ -15,7 +15,7 @@ use evertrace_domain::{
 
 use crate::{JournalPayload, ObjectFamily, ObjectRow, ObjectRowClass, ObjectRowKind, StoreError};
 
-use super::PROJECTION_GENERATION;
+use super::{PROJECTION_GENERATION, SourceObservationFacts, SourceReceiptFacts};
 
 mod source;
 
@@ -39,14 +39,8 @@ pub(super) struct SynthesisAdmissionView<'a> {
     pub(super) s23: &'a super::s23::S23State,
     pub(super) refs: &'a std::collections::BTreeSet<String>,
     pub(super) proposal_evidence_refs: &'a std::collections::BTreeSet<String>,
-    pub(super) source_receipts: &'a BTreeMap<
-        evertrace_domain::ids::SourceReceiptId,
-        (evertrace_domain::evidence::SourceReceipt, u64),
-    >,
-    pub(super) source_observations: &'a BTreeMap<
-        evertrace_domain::ids::SourceObservationId,
-        (evertrace_domain::evidence::SourceObservation, u64),
-    >,
+    pub(super) source_receipts: &'a SourceReceiptFacts,
+    pub(super) source_observations: &'a SourceObservationFacts,
 }
 
 pub(super) fn wiki_rows(
@@ -279,7 +273,11 @@ fn wiki_row(value: &WikiProjection) -> Result<ObjectRow, StoreError> {
         task_id: None,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(serde_json::to_string(value).map_err(|_| StoreError::Serialization)?),
+        payload_json: Some(
+            serde_json::to_string(value)
+                .map_err(|_| StoreError::Serialization)?
+                .into(),
+        ),
         source_event_seq: value.source_watermark,
         projection_generation: PROJECTION_GENERATION,
     })
@@ -790,14 +788,8 @@ impl SynthesisState {
         &mut self,
         episodes: &BTreeMap<evertrace_domain::ids::WorkEpisodeId, (WorkEpisode, u64)>,
         episode_revisions: &BTreeMap<evertrace_domain::revision::RevisionId, (WorkEpisode, u64)>,
-        source_receipts: &BTreeMap<
-            evertrace_domain::ids::SourceReceiptId,
-            (evertrace_domain::evidence::SourceReceipt, u64),
-        >,
-        source_observations: &BTreeMap<
-            evertrace_domain::ids::SourceObservationId,
-            (evertrace_domain::evidence::SourceObservation, u64),
-        >,
+        source_receipts: &SourceReceiptFacts,
+        source_observations: &SourceObservationFacts,
     ) -> Result<(), StoreError> {
         self.successful_fingerprints.clear();
         for (id, (run, _)) in &self.runs {
@@ -1021,7 +1013,7 @@ fn row(
         task_id,
         workstream_id: None,
         session_id: None,
-        payload_json: Some(payload.canonical_json()?),
+        payload_json: Some(payload.canonical_json()?.into()),
         source_event_seq: seq,
         projection_generation: PROJECTION_GENERATION,
     })

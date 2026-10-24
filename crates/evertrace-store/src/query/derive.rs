@@ -524,7 +524,8 @@ mod tests {
             session_id: None,
             payload_json: Some(
                 serde_json::to_string(&JournalPayload::ExperimentRunRecorded(Box::new(run)))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             ),
             source_event_seq: 19,
             projection_generation: 1,

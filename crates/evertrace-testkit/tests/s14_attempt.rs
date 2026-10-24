@@ -447,6 +447,7 @@ fn evidence_command(receipt: SourceReceipt, observation: SourceObservation) -> J
                 source_revision: receipt.source_revision,
                 source_sequence: receipt.source_sequence,
                 confirmed_prefix_digest: None,
+                earlier_prefix: None,
             }),
             JournalPayload::DirtyTarget(DirtyTarget {
                 target_kind: DirtyTargetKind::EvidenceSurface,
@@ -555,12 +556,7 @@ async fn create_successor_no_delta_replay_rebuild_and_restart_are_equivalent() {
     );
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search"
-        ]
+        vec!["evertrace_search"]
     );
     let mut gap = incremental.clone();
     gap.rows.retain(|row| {
@@ -591,7 +587,7 @@ async fn create_successor_no_delta_replay_rebuild_and_restart_are_equivalent() {
     value.parent_verification_refs.clear();
     row.row_id = format!("object:work:attempt:{}", value.revision_id);
     row.current_revision_id = Some(value.revision_id.to_string());
-    row.payload_json = Some(payload.canonical_json().unwrap());
+    row.payload_json = Some(payload.canonical_json().unwrap().into());
     rollback.rows.push(row);
     assert_eq!(
         AttemptCurrentView::from_snapshot(&rollback),

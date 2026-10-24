@@ -1,16 +1,13 @@
 //! Store-owned S16 current truth and immutable recovery revision reducers.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use evertrace_domain::{
-    evidence::{
-        EffectRole, ObservationRole, Operation, OperationKind, PairingState, ScopeEffect,
-        SourceObservation, SourceReceipt,
-    },
+    evidence::{EffectRole, ObservationRole, Operation, OperationKind, PairingState, ScopeEffect},
     ids::{
         AttemptId, CaptureReceiptId, CasId, CompetingAttemptGroupId, ExecutionLaneId, OperationId,
         RecoveryApplicationId, RecoveryBundleId, RecoveryCaptureRequestId, ScopeEffectId,
-        SourceObservationId, SourceReceiptId, WorktreeId,
+        WorktreeId,
     },
     repository::{
         RecoveryApplication, RecoveryApplicationKind, RecoveryApplicationStatus, RecoveryBundle,
@@ -30,7 +27,10 @@ use crate::{
     objects::ObjectRow,
 };
 
-use super::{ProjectionSnapshot, physical_object_row};
+use super::{
+    CurrentFacts, ProjectionSnapshot, SourceObservationFacts, SourceReceiptFacts,
+    physical_object_row,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecoveryCurrentState {
@@ -47,6 +47,22 @@ pub struct RecoveryCurrentView {
 
 impl RecoveryCurrentView {
     pub fn from_snapshot(snapshot: &ProjectionSnapshot) -> Result<Self, StoreError> {
+        Self::from_rows(snapshot.frontier, &snapshot.rows, None)
+    }
+
+    pub fn from_current(current: &CurrentFacts) -> Result<Self, StoreError> {
+        Self::from_rows(
+            current.frontier,
+            &current.other_rows,
+            Some((&current.source_receipts, &current.source_observations)),
+        )
+    }
+
+    fn from_rows(
+        frontier: u64,
+        rows: &[ObjectRow],
+        sources: Option<(&SourceReceiptFacts, &SourceObservationFacts)>,
+    ) -> Result<Self, StoreError> {
         let mut request_revisions = BTreeMap::new();
         let mut bundles = BTreeMap::new();
         let mut application_revisions = BTreeMap::new();
@@ -54,11 +70,14 @@ impl RecoveryCurrentView {
         let mut execution_lane_revisions = BTreeMap::new();
         let mut capture_receipt_revisions = BTreeMap::new();
         let mut scope_effects = BTreeMap::new();
-        let mut source_observations = BTreeMap::new();
-        let mut source_receipts = BTreeMap::new();
+        let mut decoded_source_observations = SourceObservationFacts::new();
+        let mut decoded_source_receipts = SourceReceiptFacts::new();
         let mut attempt_revisions = BTreeMap::new();
         let mut competing_group_revisions = BTreeMap::new();
-        for row in snapshot.data_rows() {
+        for row in rows
+            .iter()
+            .filter(|row| row.row_kind == crate::objects::ObjectRowKind::Data)
+        {
             if crate::session_import::restore_current(row)?.is_some() {
                 continue;
             }
@@ -132,11 +151,20 @@ impl RecoveryCurrentView {
                     scope_effects.insert(value.scope_effect_id, (*value, row.source_event_seq));
                 }
                 JournalPayload::SourceObservationRecorded(value) => {
-                    source_observations
-                        .insert(value.source_observation_id, (*value, row.source_event_seq));
+                    if sources.is_none() {
+                        decoded_source_observations.insert(
+                            value.source_observation_id,
+                            (Arc::new(*value), row.source_event_seq),
+                        );
+                    }
                 }
                 JournalPayload::SourceReceiptRecorded(value) => {
-                    source_receipts.insert(value.source_receipt_id, (*value, row.source_event_seq));
+                    if sources.is_none() {
+                        decoded_source_receipts.insert(
+                            value.source_receipt_id,
+                            (Arc::new(*value), row.source_event_seq),
+                        );
+                    }
                 }
                 JournalPayload::AttemptRecorded(value) => {
                     attempt_revisions.insert(value.revision_id, (*value, row.source_event_seq));
@@ -148,6 +176,8 @@ impl RecoveryCurrentView {
                 _ => {}
             }
         }
+        let (source_receipts, source_observations) =
+            sources.unwrap_or((&decoded_source_receipts, &decoded_source_observations));
         let mut requests = BTreeMap::new();
         rebuild_requests(&mut requests, &request_revisions, StoreError::StoreCorrupt)?;
         let mut applications = BTreeMap::new();
@@ -156,18 +186,19 @@ impl RecoveryCurrentView {
             &application_revisions,
             StoreError::StoreCorrupt,
         )?;
-        let repository = crate::repository::RepositoryCurrentView::from_snapshot(snapshot)?;
+        let repository = crate::repository::RepositoryCurrentView::from_rows(frontier, rows)?;
         let worktrees = repository
             .worktrees
             .into_iter()
-            .map(|(id, value)| (id, (value, snapshot.frontier)))
+            .map(|(id, value)| (id, (value, frontier)))
             .collect();
         let snapshots = repository
             .snapshots
             .into_iter()
             .map(|(id, value)| {
-                let source_event_seq = snapshot
-                    .data_rows()
+                let source_event_seq = rows
+                    .iter()
+                    .filter(|row| row.row_kind == crate::objects::ObjectRowKind::Data)
                     .find(|row| {
                         row.object_kind.as_deref() == Some("worktree_snapshot")
                             && row.object_id.as_deref() == Some(id.to_string().as_str())
@@ -188,13 +219,13 @@ impl RecoveryCurrentView {
             execution_lane_revisions: &execution_lane_revisions,
             capture_receipt_revisions: &capture_receipt_revisions,
             scope_effects: &scope_effects,
-            source_observations: &source_observations,
-            source_receipts: &source_receipts,
+            source_observations,
+            source_receipts,
             attempt_revisions: &attempt_revisions,
             competing_group_revisions: &competing_group_revisions,
         })?;
         Ok(Self {
-            frontier: snapshot.frontier,
+            frontier,
             state: RecoveryCurrentState {
                 requests: requests
                     .into_iter()
@@ -344,8 +375,8 @@ pub(super) struct RecoveryRelationInputs<'a> {
     pub execution_lane_revisions: &'a BTreeMap<(ExecutionLaneId, u32), (ExecutionLane, u64)>,
     pub capture_receipt_revisions: &'a BTreeMap<CaptureReceiptId, (CaptureReceipt, u64)>,
     pub scope_effects: &'a BTreeMap<ScopeEffectId, (ScopeEffect, u64)>,
-    pub source_observations: &'a BTreeMap<SourceObservationId, (SourceObservation, u64)>,
-    pub source_receipts: &'a BTreeMap<SourceReceiptId, (SourceReceipt, u64)>,
+    pub source_observations: &'a SourceObservationFacts,
+    pub source_receipts: &'a SourceReceiptFacts,
     pub attempt_revisions: &'a BTreeMap<RevisionId, (Attempt, u64)>,
     pub competing_group_revisions: &'a BTreeMap<RevisionId, (CompetingAttemptGroup, u64)>,
 }

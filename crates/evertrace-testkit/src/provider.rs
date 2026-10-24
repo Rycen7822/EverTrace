@@ -88,6 +88,31 @@ impl ProviderStub {
         .await
     }
 
+    pub async fn methods_once_paused(
+        source: Vec<u8>,
+        review: Vec<u8>,
+        summary: Vec<u8>,
+        count: usize,
+    ) -> (Self, oneshot::Sender<()>) {
+        let (release, gate) = oneshot::channel();
+        (
+            Self::serve(
+                200,
+                StubBody::Methods {
+                    source,
+                    review,
+                    summary,
+                },
+                std::time::Duration::ZERO,
+                count,
+                Some(gate),
+                false,
+            )
+            .await,
+            release,
+        )
+    }
+
     async fn repeat_delayed(
         status: u16,
         body: Vec<u8>,
@@ -157,9 +182,10 @@ impl ProviderStub {
                         break;
                     }
                 }
-                let method_no_op = summary
-                    && String::from_utf8_lossy(&bytes)
-                        .contains("Extract at most one nontrivial reusable method");
+                let request = String::from_utf8_lossy(&bytes);
+                let method_request =
+                    request.contains("Extract at most one nontrivial reusable method");
+                let method_no_op = summary && method_request;
                 let selected_body = match &body {
                     StubBody::Repeat(body) => body.as_slice(),
                     StubBody::Methods {
@@ -167,8 +193,7 @@ impl ProviderStub {
                         review,
                         summary,
                     } => {
-                        let request = String::from_utf8_lossy(&bytes);
-                        if request.contains("Extract at most one nontrivial reusable method") {
+                        if method_request {
                             source
                         } else if request.contains("Review one Procedure") {
                             review
@@ -178,10 +203,15 @@ impl ProviderStub {
                     }
                 };
                 captured.push(bytes);
-                if !method_no_op {
+                let notify_and_pause = !method_no_op
+                    && match &body {
+                        StubBody::Repeat(_) => true,
+                        StubBody::Methods { .. } => method_request,
+                    };
+                if notify_and_pause {
                     notify.notify_one();
                 }
-                if !method_no_op && let Some(gate) = gate.take() {
+                if notify_and_pause && let Some(gate) = gate.take() {
                     let _ = gate.await;
                 }
                 tokio::time::sleep(delay).await;

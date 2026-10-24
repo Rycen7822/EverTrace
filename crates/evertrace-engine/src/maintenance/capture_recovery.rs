@@ -75,7 +75,7 @@ fn missing_manifest(
 impl BackgroundScheduler {
     pub(super) async fn seed_capture_artifacts(
         &self,
-        snapshot: &evertrace_store::ProjectionSnapshot,
+        snapshot: &evertrace_store::projections::CurrentFacts,
         view: &RuntimeSchedulerView,
     ) -> Result<bool, BackgroundSchedulerError> {
         let start = {
@@ -190,7 +190,7 @@ impl BackgroundScheduler {
             .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, now, snapshot.frontier)
+            .commit_if_frontier(command, now, snapshot.frontier())
             .await
         {
             Ok(_) => Ok(true),
@@ -278,8 +278,12 @@ impl BackgroundScheduler {
         let remaining = capture_artifact_descriptor(&self.runtime, &claimed.job.target_revision)
             .map_err(|_| BackgroundSchedulerError::Store)?
             .is_some();
-        let snapshot = self.writer.project().await.map_err(map_writer)?;
-        let view = RuntimeSchedulerView::from_snapshot(&snapshot)
+        let snapshot = self
+            .writer
+            .project_current(true)
+            .await
+            .map_err(map_writer)?;
+        let view = RuntimeSchedulerView::from_rows(snapshot.frontier(), snapshot.other_rows())
             .map_err(|_| BackgroundSchedulerError::Store)?;
         let current = view
             .jobs
@@ -335,7 +339,7 @@ impl BackgroundScheduler {
         .map_err(|_| BackgroundSchedulerError::Store)?;
         match self
             .writer
-            .commit_if_frontier(command, now, snapshot.frontier)
+            .commit_if_frontier(command, now, snapshot.frontier())
             .await
         {
             Ok(outcome) => Ok(BackgroundProgress {

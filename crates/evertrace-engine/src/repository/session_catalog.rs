@@ -139,6 +139,35 @@ pub fn observe_session_catalog_report(
         .map_err(|_| SessionCatalogObservationError::InvalidNativeInput)
 }
 
+/// Compiles a transient report whose root evidence names this native source
+/// observation, without manufacturing a pre-tool identity.
+pub fn observe_session_source_report(
+    transcript_path: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    source_reference: &str,
+    deadline: Instant,
+) -> Result<HostProbeReport, SessionCatalogObservationError> {
+    let (root, _) = observe_session_source_root_at(
+        Some(transcript_path),
+        session_id,
+        agent_id,
+        source_reference,
+        deadline.min(Instant::now() + SESSION_ROOT_PROBE_BUDGET),
+    )?;
+    let context = ProbeContext {
+        adapter_kind: AdapterKind::CodexHook,
+        adapter_revision: "codex-native-session-source-v1".into(),
+        observed_host_version_range: "official-native-session-start-v1".into(),
+        eligible_event_manifest_ref: CODEX_ELIGIBLE_EVENT_MANIFEST.into(),
+        evidence_source: EvidenceSourceKind::ObservedHostCanary,
+    };
+    let mut evidence = ProbeEvidence::empty();
+    evidence.session_catalog_roots = vec![root];
+    HostProbeReport::evaluate(&context, &evidence)
+        .map_err(|_| SessionCatalogObservationError::InvalidNativeInput)
+}
+
 fn observe_session_catalog_root_at(
     transcript_path: Option<&str>,
     session_id: &str,
@@ -146,12 +175,34 @@ fn observe_session_catalog_root_at(
     agent_id: Option<&str>,
     deadline: Instant,
 ) -> Result<(SessionCatalogRootEvidence, PathBuf), SessionCatalogObservationError> {
+    if tool_use_id.is_empty()
+        || tool_use_id.len() > 256
+        || tool_use_id.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(SessionCatalogObservationError::InvalidNativeInput);
+    }
+    observe_session_source_root_at(
+        transcript_path,
+        session_id,
+        agent_id,
+        &format!("native_pre_tool:{tool_use_id}"),
+        deadline,
+    )
+}
+
+fn observe_session_source_root_at(
+    transcript_path: Option<&str>,
+    session_id: &str,
+    agent_id: Option<&str>,
+    source_reference: &str,
+    deadline: Instant,
+) -> Result<(SessionCatalogRootEvidence, PathBuf), SessionCatalogObservationError> {
     if session_id.is_empty()
         || session_id.len() > 256
         || session_id.bytes().any(|byte| byte.is_ascii_control())
-        || tool_use_id.is_empty()
-        || tool_use_id.len() > 256
-        || tool_use_id.bytes().any(|byte| byte.is_ascii_control())
+        || source_reference.is_empty()
+        || source_reference.len() > 512
+        || source_reference.bytes().any(|byte| byte.is_ascii_control())
     {
         return Err(SessionCatalogObservationError::InvalidNativeInput);
     }
@@ -217,10 +268,6 @@ fn observe_session_catalog_root_at(
         .revalidate()
         .map_err(|_| SessionCatalogObservationError::UnsafeIdentity)?;
     let root_identity = confined.identity();
-    let evidence_ref = format!("native_pre_tool:{tool_use_id}");
-    if evidence_ref.len() > 512 {
-        return Err(SessionCatalogObservationError::InvalidNativeInput);
-    }
     let evidence = SessionCatalogRootEvidence {
         root_kind: SessionCatalogRootKind::CodexSessions,
         canonical_absolute_path: root.to_string_lossy().into_owned(),
@@ -228,7 +275,7 @@ fn observe_session_catalog_root_at(
         filesystem_device: root_identity.device,
         filesystem_inode: root_identity.inode,
         canary: CanaryStatus::Passed,
-        evidence_refs: vec![evidence_ref],
+        evidence_refs: vec![source_reference.to_owned()],
     };
     Ok((evidence, root))
 }

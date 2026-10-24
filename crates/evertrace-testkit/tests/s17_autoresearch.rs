@@ -945,6 +945,7 @@ async fn real_four_table_batch_rebuild_restart_and_fail_closed_relations() {
             source_revision: receipt.source_revision.clone(),
             source_sequence: receipt.source_sequence,
             confirmed_prefix_digest: None,
+            earlier_prefix: None,
         }),
         JournalPayload::DirtyTarget(DirtyTarget {
             target_kind: DirtyTargetKind::EvidenceSurface,
@@ -1030,12 +1031,7 @@ async fn real_four_table_batch_rebuild_restart_and_fail_closed_relations() {
     assert_eq!(incremental, writer.full_projection().await.unwrap());
     assert_eq!(
         writer.table_names().await.unwrap(),
-        vec![
-            "evertrace_journal",
-            "evertrace_objects",
-            "evertrace_relations",
-            "evertrace_search",
-        ]
+        vec!["evertrace_search"]
     );
     let view = AutoresearchCurrentView::from_snapshot(&incremental).unwrap();
     assert_eq!(view.runs[&run.run_id], run_with_artifact);
