@@ -10770,6 +10770,18 @@ impl JournalAdmissionState {
         &self,
         payloads: impl IntoIterator<Item = (&'a JournalPayload, i64)>,
     ) -> Result<(), StoreError> {
+        let mut payloads = payloads
+            .into_iter()
+            .filter(|(payload, _)| {
+                matches!(
+                    payload,
+                    JournalPayload::JobState(_) | JournalPayload::JobLease(_)
+                )
+            })
+            .peekable();
+        if payloads.peek().is_none() {
+            return Ok(());
+        }
         let mut jobs = self.jobs.clone();
         for (payload, occurred_at_us) in payloads {
             match payload {
