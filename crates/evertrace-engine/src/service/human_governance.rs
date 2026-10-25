@@ -4903,26 +4903,20 @@ fn summary(
     let support_detail = if include_detail {
         current_support_source(snapshot, row)?
             .map(|(validation, contract)| {
-                let initial_replacement_payload =
-                    match select_support_replacement(snapshot, validation.validation_revision_id) {
-                        Ok(SupportReplacementLookup::Available(selection)) => {
-                            Some(Box::new(selection.initial_payload))
-                        }
-                        Ok(
-                            SupportReplacementLookup::Conflict { .. }
-                            | SupportReplacementLookup::Unavailable { .. },
-                        ) => None,
-                        Err(_) => return Err(HumanGovernanceError::Store),
-                    };
-                let deprecate_available =
-                    match select_support_deprecate(snapshot, validation.validation_revision_id) {
-                        Ok(SupportDeprecateLookup::Available(_)) => true,
-                        Ok(
-                            SupportDeprecateLookup::Conflict { .. }
-                            | SupportDeprecateLookup::Unavailable { .. },
-                        ) => false,
-                        Err(_) => return Err(HumanGovernanceError::Store),
-                    };
+                let replacement =
+                    select_support_replacement(snapshot, validation.validation_revision_id)
+                        .map_err(|_| HumanGovernanceError::Store)?;
+                let deprecate_available = matches!(
+                    replacement.deprecate_lookup(),
+                    SupportDeprecateLookup::Available(_)
+                );
+                let initial_replacement_payload = match replacement {
+                    SupportReplacementLookup::Available(selection) => {
+                        Some(Box::new(selection.initial_payload))
+                    }
+                    SupportReplacementLookup::Conflict { .. }
+                    | SupportReplacementLookup::Unavailable { .. } => None,
+                };
                 Ok(HumanSupportDetail {
                     support_contract_revision_id: contract.support_contract_revision_id,
                     successor_ref: validation.successor_ref,

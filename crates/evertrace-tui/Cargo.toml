@@ -11,7 +11,6 @@ evertrace-domain = { path = "../evertrace-domain" }
 evertrace-protocol = { path = "../evertrace-protocol" }
 ratatui.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

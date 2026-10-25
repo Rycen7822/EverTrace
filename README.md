@@ -8,6 +8,8 @@ EverTrace retains permitted activity as traceable evidence, produces background 
 
 **Status: source-build preview for controlled local trials, not a fully validated turnkey release.** The local implementation has automated test coverage; compatibility with your actual host and the quality of your chosen model must still be checked.
 
+The current source uses embedded SQLite for the authoritative journal and current/runtime/relation state, embedded LanceDB for derived retrieval indexes, and CAS for protected payloads. Older all-Lance storage diagrams and three-program installation examples do not describe this checkout. Use the four-program package below and the guarded maintenance commands; do not manually edit or copy live database files to match an older layout. This describes the code, not completed real-data migration or release qualification.
+
 ## What it does
 
 - Capture supported host events and import permitted session records into local storage.
@@ -62,7 +64,28 @@ Check that LLM processing is disabled; an existing file was not replaced. Then s
 
 In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" doctor` or `tui`. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
 
-Do not run the installer as root. Installation changes managed host configuration and may enable a user service; it is a separate step, not part of the commands above.
+### Installation package
+
+The build command above produces four executables in `target/debug/`:
+
+| Program | Purpose |
+|---|---|
+| `evertrace` | General CLI, diagnostics, administration and TUI; also retains the `mcp` entry point. |
+| `evertrace-mcp` | Dedicated stdio MCP transport used by new managed host wiring; still takes the `mcp` subcommand. |
+| `evertraced` | Daemon and sole runtime writer. |
+| `evertrace-hook` | Synchronous host capture entry point. |
+
+Keep **all four** from the same build in the same directory; current installation and candidate-package checks require every executable. The thin transport is not a general CLI; use `evertrace --help` for command help. Do not substitute executables in managed host wiring by hand.
+
+For a **first installation only**, use a stable user-owned directory that is not already an installed package; include the fourth executable omitted by older three-program copy examples:
+
+```sh
+mkdir -p "$HOME/.local/lib/evertrace"
+install -m 755 target/debug/evertrace target/debug/evertrace-mcp \
+  target/debug/evertraced target/debug/evertrace-hook "$HOME/.local/lib/evertrace/"
+```
+
+This only copies programs; it does not configure the host or start a service. Do not overwrite binaries in an existing installation: use the [guarded upgrade workflow](docs/operations.md). Do not run the EverTrace installer as root. Installation changes managed host configuration and may enable a user service; it is a separate, explicit step.
 
 ## What “available” does and does not mean
 
@@ -84,7 +107,7 @@ Use a non-sensitive test project first. Do not treat recovery bundles as your on
 
 Local design archives under `docs/baseline/`, orchestration records under `.work/`, and agent instruction/state files are intentionally ignored. They are not prerequisites for following these public guides. Do not force-add private notes, model credentials or runtime data.
 
-Local architecture maintenance uses `document_set_version = 64` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
+Local architecture maintenance uses `document_set_version = 65` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
 
 See [Development](docs/development.md) for checks and resource limits. Report reproducible failures with the commit, platform, command and sanitized error; never attach raw session archives or credentials.
 

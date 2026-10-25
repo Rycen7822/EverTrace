@@ -325,7 +325,7 @@ impl McpBindingEvidence {
     }
 }
 
-fn valid_digest(value: &str) -> bool {
+pub(crate) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

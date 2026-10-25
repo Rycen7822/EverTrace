@@ -2421,9 +2421,6 @@ pub(crate) async fn bootstrap_legacy_candidate(
 ) -> Result<(), StoreError> {
     validate_journal_rows(rows)?;
     let batches = ordered_legacy_commands(rows)?;
-    for batch in &batches {
-        validate_complete_command(batch)?;
-    }
     JournalAdmissionState::from_journal_rows(rows)?;
     let native = candidate.native_dir();
     let mut state = candidate.open_state()?;

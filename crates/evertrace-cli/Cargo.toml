@@ -15,8 +15,6 @@ evertrace-store = { path = "../evertrace-store" }
 evertrace-tui = { path = "../evertrace-tui" }
 serde_json.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

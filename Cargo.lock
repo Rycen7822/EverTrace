@@ -1832,8 +1832,6 @@ dependencies = [
  "evertrace-tui",
  "serde_json",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1918,7 +1916,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1948,7 +1945,6 @@ dependencies = [
  "evertrace-protocol",
  "ratatui",
  "tokio",
- "tracing",
 ]
 
 [[package]]

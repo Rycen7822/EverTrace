@@ -18,9 +18,22 @@ Summaries require supported records with body permission. Record existence, queu
 
 Use `evertrace --help` for CLI arguments. The CLI handles configuration, diagnostics, installation, administration, backup and TUI. **There are no `evertrace search` or `evertrace get` CLI subcommands**; these are actions on the MCP tool.
 
-宿主启动 `evertrace ... mcp` 作为 stdio MCP 服务；该进程通过本地 UDS 联系 daemon，不监听公开 TCP。直接运行后等待输入是正常行为，不是一个聊天提示符。优先使用安装器生成的宿主接线，不手工伪造绑定标识或 claim。
+`--config PATH` 必须放在子命令之前；CLI、daemon 和 MCP 应使用同一配置，避免连接到不同数据目录。`config check` 只校验文件，`config show --effective` 只展示该文件合并默认值后的结果，不代表 daemon 当前活动配置或模型连通性。
 
-The host launches `evertrace ... mcp` as a stdio MCP server. It connects to the daemon over local UDS, not a public TCP listener. Waiting for input when launched manually is normal; it is not a chat prompt. Prefer installer-generated wiring; never fabricate binding tokens or claims.
+Put `--config PATH` before the command, and use the same configuration for the CLI, daemon and MCP so they resolve the same data root. `config check` validates the file; `config show --effective` shows that file plus defaults, not the daemon's active configuration or provider connectivity.
+
+```sh
+evertrace --config /absolute/config.toml config check
+evertrace --config /absolute/config.toml config show --effective
+```
+
+新安装器生成的接线使用独立的 `evertrace-mcp --config PATH mcp ...`；通用入口 `evertrace --config PATH mcp ...` 仍存在，旧接线由安装/升级流程验证处理。独立程序也需要 `mcp` 子命令，不能用它运行 `doctor`、`tui` 等通用 CLI 操作；命令帮助仍查看 `evertrace --help`。当前安装包需要四个同版本程序，见 [README 的程序清单](../README.md#installation-package)，不要沿用只复制三个程序的旧示例。
+
+New installer-managed wiring uses `evertrace-mcp --config PATH mcp ...`. The general `evertrace --config PATH mcp ...` entry point remains; installation/upgrade validates existing wiring. The dedicated program still needs the `mcp` subcommand and does not provide general CLI operations such as `doctor` or `tui`; use `evertrace --help` for command help. Current packages require four matching programs; see the [README package list](../README.md#installation-package), not older three-program copy examples.
+
+两者都是 stdio MCP 传输，通过本地 UDS 联系 daemon，不监听公开 TCP，也不会替你启动 daemon。加载配置后等待 stdin 输入是正常行为，不是聊天提示符；宿主能发现工具也不证明 daemon 已连接、绑定有效或读取获准。优先使用安装器生成的完整接线，不手改程序路径、删除宿主定位参数，或伪造绑定标识与 claim。
+
+Both are stdio MCP transports using local UDS, not a public TCP listener, and neither starts the daemon for you. Waiting for stdin after loading configuration is normal, not a chat prompt. Tool discovery alone does not establish daemon connectivity, a valid binding or read permission. Prefer the complete installer-generated wiring; do not hand-swap executable paths, remove host locator arguments or fabricate bindings/claims.
 
 ## MCP 输入与示例 / MCP input and examples
 
@@ -80,11 +93,23 @@ evertrace --config /absolute/config.toml tui
 
 The three main pages are Inbox (proposals), Explorer (sources, objects, details and relations), and System (daemon/configuration/jobs/backups/diagnostics). Refresh and check access/job state before interpreting an empty view.
 
+当前可见页按上次读取结束时间判断自动刷新：System 至少间隔 15 秒，Inbox/Explorer 至少 5 秒。只有已连接、没有读取/待处理请求、编辑/确认弹窗或筛选输入时才会自动刷新；不是固定周期轮询。空闲时可按 `r` 请求手动刷新，不能用它绕过正在处理的操作。
+
+Auto-refresh is measured from the previous read's completion: at least 15 seconds for the visible System page, five seconds for Inbox/Explorer. It requires a connection and no read, pending request, edit/confirmation dialog or filter input; it is not a fixed-rate poll. Press `r` when idle to request a manual refresh, not to bypass an operation already in progress.
+
+这些间隔不是后台采集、摘要或 job 完成的期限。完整诊断可能比普通列表慢；读取失败或耗时较长时，界面可能保留上次数据，应看状态提示，不能把旧数据显示成“任务已经完成”。
+
+These intervals are not capture, summary or job-completion deadlines. Full diagnostics can be slower than list reads. Slow or failed reads may leave the previous data visible; inspect the status rather than treating retained data as proof of completion.
+
 | 按键 / Key | 操作 / Action |
 |---|---|
 | `1` / `2` / `3` | Inbox / Explorer / System |
 | `j` / `k` | 下一项 / 上一项；next / previous |
 | `Enter` | 打开所选详情；open selected detail |
+| `?` / `:` | 帮助 / 当前命令；help / current commands |
+| `/` | 筛选当前页，不是 MCP 全局检索；filter the current page, not a global MCP search |
+| `o` | 打开支持的来源/依赖关联；open supported source/dependency relations |
+| `Esc` | 取消当前编辑或确认；cancel the current editor/confirmation |
 | `r` | 刷新；refresh |
 | `n` / `b` | 下一页 / 首页；next / first page |
 | `q` | 退出 TUI；quit TUI |
@@ -94,6 +119,16 @@ The three main pages are Inbox (proposals), Explorer (sources, objects, details 
 以页面底部提示和当前对象支持的操作为准；编辑/确认模式下按键含义可能不同。写操作依赖当前 revision/frontier，发生冲突应刷新并重新判断，不循环提交旧版本。Recovery/Forget/Accept 等动作必须先看详情和确认提示。
 
 Use the footer and actions supported by the selected object; keys differ in edit/confirmation modes. Writes depend on current revisions/frontiers. On conflict, refresh and reassess instead of repeatedly submitting stale state. Inspect details before Recovery, Forget or Accept actions.
+
+### 提议与支持详情 / Proposal and support details
+
+`E` 的含义取决于详情：符合条件的待治理提议可进入“编辑并接受”；已验证资产的 support 详情只有在提供替换草稿时才允许“提交替换”。替换草稿必须有实际修改，提交产生 Pending 提议，不直接替换已生效资产，也不自动满足后续接受/资格条件。
+
+`E` depends on the detail: an eligible proposal may offer edit-and-accept; a validated asset's support detail offers submit-replacement only when a replacement draft is available. The draft must actually change. Submitting it creates a Pending proposal, not an immediate replacement of the active asset or automatic acceptance/qualification.
+
+`D` 仅在 support 详情允许全局 Atom 弃用时打开原因编辑，必须填写合法原因；它提交 Pending 弃用提议，不直接删除资产。操作不可用或发生冲突时，查看当前条件并刷新，不手造 revision、权限或提议载荷来绕过限制。
+
+`D` opens a reason editor only when the support detail permits global Atom deprecation. A valid reason is required; this submits a Pending deprecation proposal, not direct deletion. If unavailable or conflicting, inspect the current conditions and refresh; do not invent revisions, permissions or payloads to bypass them.
 
 ## 会话导入和范围管理 / Import and scope administration
 

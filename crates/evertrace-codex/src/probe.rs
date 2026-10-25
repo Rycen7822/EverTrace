@@ -13,7 +13,7 @@ use crate::{
     },
     capability::{
         CanaryStatus, HookProbeResult, McpBindingEvidence, McpProbeResult, McpSessionBinding,
-        evaluate_hook,
+        evaluate_hook, valid_digest,
     },
     hook_input::HookActivationEvidence,
     policy::{PolicyCandidateOrigin, PolicyEvidence, scope_within},
@@ -1235,13 +1235,6 @@ fn valid_refs(values: &[String]) -> bool {
     !values.is_empty()
         && values.iter().all(|value| !value.is_empty())
         && values.iter().collect::<BTreeSet<_>>().len() == values.len()
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn receipt(

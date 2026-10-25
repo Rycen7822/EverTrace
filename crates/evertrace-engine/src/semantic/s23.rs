@@ -79,6 +79,31 @@ pub(crate) enum SupportDeprecateLookup {
     Unavailable { reason: &'static str },
 }
 
+impl SupportReplacementLookup {
+    pub(crate) fn deprecate_lookup(&self) -> SupportDeprecateLookup {
+        match self {
+            Self::Available(selection) => {
+                let ProposalTargetId::Atom(atom_id) = selection.target_id else {
+                    return SupportDeprecateLookup::Unavailable {
+                        reason: "support_deprecate_requires_global_atom",
+                    };
+                };
+                SupportDeprecateLookup::Available(SupportDeprecateSelection {
+                    validation_revision_id: selection.validation_revision_id,
+                    atom_id,
+                    base_revision_id: selection.base_revision_id,
+                })
+            }
+            Self::Conflict {
+                current_revision_id,
+            } => SupportDeprecateLookup::Conflict {
+                current_revision_id: *current_revision_id,
+            },
+            Self::Unavailable { reason } => SupportDeprecateLookup::Unavailable { reason },
+        }
+    }
+}
+
 pub(crate) fn select_support_replacement(
     snapshot: &ProjectionSnapshot,
     expected_validation_revision_id: RevisionId,
@@ -156,30 +181,7 @@ pub(crate) fn select_support_deprecate(
     snapshot: &ProjectionSnapshot,
     expected_validation_revision_id: RevisionId,
 ) -> Result<SupportDeprecateLookup, SemanticServiceError> {
-    match select_support_replacement(snapshot, expected_validation_revision_id)? {
-        SupportReplacementLookup::Available(selection) => {
-            let ProposalTargetId::Atom(atom_id) = selection.target_id else {
-                return Ok(SupportDeprecateLookup::Unavailable {
-                    reason: "support_deprecate_requires_global_atom",
-                });
-            };
-            Ok(SupportDeprecateLookup::Available(
-                SupportDeprecateSelection {
-                    validation_revision_id: selection.validation_revision_id,
-                    atom_id,
-                    base_revision_id: selection.base_revision_id,
-                },
-            ))
-        }
-        SupportReplacementLookup::Conflict {
-            current_revision_id,
-        } => Ok(SupportDeprecateLookup::Conflict {
-            current_revision_id,
-        }),
-        SupportReplacementLookup::Unavailable { reason } => {
-            Ok(SupportDeprecateLookup::Unavailable { reason })
-        }
-    }
+    Ok(select_support_replacement(snapshot, expected_validation_revision_id)?.deprecate_lookup())
 }
 
 pub(crate) fn compose_support_deprecate(
