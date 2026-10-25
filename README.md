@@ -107,7 +107,7 @@ Use a non-sensitive test project first. Do not treat recovery bundles as your on
 
 Local design archives under `docs/baseline/`, orchestration records under `.work/`, and agent instruction/state files are intentionally ignored. They are not prerequisites for following these public guides. Do not force-add private notes, model credentials or runtime data.
 
-Local architecture maintenance uses `document_set_version = 65` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
+Local architecture maintenance uses `document_set_version = 66` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
 
 See [Development](docs/development.md) for checks and resource limits. Report reproducible failures with the commit, platform, command and sanitized error; never attach raw session archives or credentials.
 

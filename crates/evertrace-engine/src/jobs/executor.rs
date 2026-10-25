@@ -811,8 +811,10 @@ pub enum WriterActorError {
     Store,
 }
 
-pub async fn open_writer(data_dir: &Path) -> Result<JournalWriter, WriterActorError> {
-    JournalWriter::open(data_dir).await.map_err(map_store_error)
+// Initialization precedes the actor: preserve the store's actionable errors,
+// including lock contention, permissions and an explicit offline upgrade.
+pub async fn open_writer(data_dir: &Path) -> Result<JournalWriter, StoreError> {
+    JournalWriter::open(data_dir).await
 }
 
 pub fn spawn_writer(

@@ -295,11 +295,7 @@ async fn create_check_backup(
 > {
     let runtime = RuntimeSnapshot::load(&RuntimeSnapshot::snapshot_path(data_dir))
         .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?;
-    let mut writer = Some(
-        crate::jobs::open_writer(data_dir)
-            .await
-            .map_err(|_| RestoreError::Store(evertrace_store::StoreError::StoreCorrupt))?,
-    );
+    let mut writer = Some(crate::jobs::open_writer(data_dir).await?);
     let job_id = evertrace_domain::ids::JobId::new_v7();
     let summary =
         crate::jobs::create_quiesced_backup(&mut writer, job_id, config_path.to_owned(), runtime)
