@@ -4496,35 +4496,7 @@ fn cas_blob_names(data_root: &std::path::Path) -> BTreeSet<String> {
 }
 
 fn spool_file_bytes(data_root: &std::path::Path) -> BTreeSet<(String, Vec<u8>)> {
-    fn visit(
-        root: &std::path::Path,
-        path: &std::path::Path,
-        out: &mut BTreeSet<(String, Vec<u8>)>,
-    ) {
-        let Ok(entries) = fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries {
-            let entry = entry.unwrap();
-            let metadata = fs::symlink_metadata(entry.path()).unwrap();
-            if metadata.is_dir() {
-                visit(root, &entry.path(), out);
-            } else {
-                out.insert((
-                    entry
-                        .path()
-                        .strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                    fs::read(entry.path()).unwrap(),
-                ));
-            }
-        }
-    }
-    let mut out = BTreeSet::new();
-    visit(&data_root.join("spool"), &data_root.join("spool"), &mut out);
-    out
+    tree_bytes(&data_root.join("spool")).into_iter().collect()
 }
 
 /// A real built evertrace-hook must produce a durable CAS+spool record after the

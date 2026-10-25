@@ -13,6 +13,18 @@ pub fn render(f: &mut Frame, a: Rect, state: &AppState) {
     }
 }
 
+fn item_in_view(state: &AppState, item: &evertrace_protocol::dto::HumanSnapshotItem) -> bool {
+    state.route != Route::System
+        || !matches!(
+            state.ui.system_view,
+            crate::state::SystemView::Jobs | crate::state::SystemView::Overview
+        )
+        || matches!(
+            item.system_detail,
+            Some(evertrace_protocol::dto::HumanSystemDetail::Job { .. })
+        )
+}
+
 pub(crate) fn visible_indices(state: &AppState) -> Vec<usize> {
     let Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { items, .. }) =
         &state.human
@@ -24,24 +36,12 @@ pub(crate) fn visible_indices(state: &AppState) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            let kind = if state.route == Route::System {
-                match state.ui.system_view {
-                    crate::state::SystemView::Jobs | crate::state::SystemView::Overview => {
-                        matches!(
-                            item.system_detail,
-                            Some(evertrace_protocol::dto::HumanSystemDetail::Job { .. })
-                        )
-                    }
-                    _ => true,
-                }
-            } else {
-                true
-            };
-            kind && state
-                .ui
-                .type_filter
-                .as_ref()
-                .is_none_or(|v| v == &item.object_kind)
+            item_in_view(state, item)
+                && state
+                    .ui
+                    .type_filter
+                    .as_ref()
+                    .is_none_or(|v| v == &item.object_kind)
                 && state
                     .ui
                     .scope_filter
@@ -390,17 +390,7 @@ pub(crate) fn render_list(f: &mut Frame, a: Rect, state: &AppState, title: &'sta
                 let indices = visible_indices(state);
                 let loaded = items
                     .iter()
-                    .filter(|item| {
-                        state.route != Route::System
-                            || !matches!(
-                                state.ui.system_view,
-                                crate::state::SystemView::Overview | crate::state::SystemView::Jobs
-                            )
-                            || matches!(
-                                item.system_detail,
-                                Some(evertrace_protocol::dto::HumanSystemDetail::Job { .. })
-                            )
-                    })
+                    .filter(|item| item_in_view(state, item))
                     .count();
                 let filtered = !state.ui.filter.is_empty()
                     || state.ui.type_filter.is_some()

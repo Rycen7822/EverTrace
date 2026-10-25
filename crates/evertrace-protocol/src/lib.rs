@@ -707,65 +707,25 @@ pub async fn request_health(
     build_id: impl Into<String>,
     frame_timeout: Duration,
 ) -> Result<HealthResponse, ProtocolError> {
-    let build_id = build_id.into();
-    if !valid_build_id(&build_id) {
-        return Err(ProtocolError::InvalidBuildId);
-    }
-    let mut stream = timeout(frame_timeout, UnixStream::connect(socket_path))
-        .await
-        .map_err(|_| ProtocolError::Timeout)?
-        .map_err(ProtocolError::Connect)?;
-    let handshake = ClientEnvelope::Handshake(handshake::Handshake {
-        protocol_version: PROTOCOL_VERSION,
-        client_kind: dto::ClientKind::Cli,
-        build_id,
-        max_frame: MAX_FRAME_SIZE as u32,
-    });
-    write_frame(&mut stream, &handshake, MAX_FRAME_SIZE, frame_timeout).await?;
-    let negotiated_max =
-        match read_frame::<ServerEnvelope>(&mut stream, MAX_FRAME_SIZE, frame_timeout).await? {
-            ServerEnvelope::HandshakeAck(ack)
-                if ack.protocol_version == PROTOCOL_VERSION
-                    && ack.max_frame != 0
-                    && ack.max_frame <= MAX_FRAME_SIZE as u32
-                    && valid_build_id(&ack.build_id) =>
-            {
-                ack.max_frame as usize
-            }
-            ServerEnvelope::HandshakeAck(_) => return Err(ProtocolError::InvalidNegotiation),
-            ServerEnvelope::Error(error) => return Err(ProtocolError::Wire(error.code)),
-            _ => return Err(ProtocolError::UnexpectedMessage),
-        };
+    let mut client =
+        LocalClient::connect(socket_path, build_id, dto::ClientKind::Cli, frame_timeout).await?;
     let request_id = evertrace_domain::ids::RequestId::from_uuid(uuid::Uuid::now_v7())
         .map_err(|_| ProtocolError::Internal)?;
-    let command = ClientEnvelope::Command(command::CommandEnvelope {
-        request_id,
-        command: Command::Health,
-    });
-    write_frame(&mut stream, &command, negotiated_max, frame_timeout).await?;
-    match read_frame::<ServerEnvelope>(&mut stream, negotiated_max, frame_timeout).await? {
-        ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
-            Response::Health(health) if health.validate() => Ok(health),
-            Response::Health(_) => Err(ProtocolError::InvalidHealth),
-            Response::RecoveryTerminal(_)
-            | Response::HostCanary(_)
-            | Response::ConfigReload(_)
-            | Response::ConfigDocument(_)
-            | Response::RecoveryAction(_)
-            | Response::McpBindingIssued(_)
-            | Response::SessionSourceObserved(_)
-            | Response::McpResult(_)
-            | Response::McpReturned
-            | Response::RecallCue(_)
-            | Response::SessionImportAdmin(_)
-            | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),
-        },
-        ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
-        ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
-            Err(ProtocolError::Wire(error.code))
-        }
-        ServerEnvelope::Error(_) => Err(ProtocolError::RequestIdMismatch),
-        _ => Err(ProtocolError::UnexpectedMessage),
+    match client.request(request_id, Command::Health).await? {
+        Response::Health(health) if health.validate() => Ok(health),
+        Response::Health(_) => Err(ProtocolError::InvalidHealth),
+        Response::RecoveryTerminal(_)
+        | Response::HostCanary(_)
+        | Response::ConfigReload(_)
+        | Response::ConfigDocument(_)
+        | Response::RecoveryAction(_)
+        | Response::McpBindingIssued(_)
+        | Response::SessionSourceObserved(_)
+        | Response::McpResult(_)
+        | Response::McpReturned
+        | Response::RecallCue(_)
+        | Response::SessionImportAdmin(_)
+        | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),
     }
 }
 
@@ -777,73 +737,26 @@ pub async fn request_recovery(
     request: command::RequestRecoveryCommand,
     frame_timeout: Duration,
 ) -> Result<RecoveryActionResponse, ProtocolError> {
-    let build_id = build_id.into();
-    if !valid_build_id(&build_id) {
-        return Err(ProtocolError::InvalidBuildId);
-    }
-    let mut stream = timeout(frame_timeout, UnixStream::connect(socket_path))
-        .await
-        .map_err(|_| ProtocolError::Timeout)?
-        .map_err(ProtocolError::Connect)?;
-    write_frame(
-        &mut stream,
-        &ClientEnvelope::Handshake(handshake::Handshake {
-            protocol_version: PROTOCOL_VERSION,
-            client_kind: dto::ClientKind::Cli,
-            build_id,
-            max_frame: MAX_FRAME_SIZE as u32,
-        }),
-        MAX_FRAME_SIZE,
-        frame_timeout,
-    )
-    .await?;
-    let negotiated_max =
-        match read_frame::<ServerEnvelope>(&mut stream, MAX_FRAME_SIZE, frame_timeout).await? {
-            ServerEnvelope::HandshakeAck(ack)
-                if ack.protocol_version == PROTOCOL_VERSION
-                    && ack.max_frame != 0
-                    && ack.max_frame <= MAX_FRAME_SIZE as u32
-                    && valid_build_id(&ack.build_id) =>
-            {
-                ack.max_frame as usize
-            }
-            ServerEnvelope::HandshakeAck(_) => return Err(ProtocolError::InvalidNegotiation),
-            ServerEnvelope::Error(error) => return Err(ProtocolError::Wire(error.code)),
-            _ => return Err(ProtocolError::UnexpectedMessage),
-        };
-    write_frame(
-        &mut stream,
-        &ClientEnvelope::Command(command::CommandEnvelope {
-            request_id,
-            command: Command::RequestRecovery(request),
-        }),
-        negotiated_max,
-        frame_timeout,
-    )
-    .await?;
-    match read_frame::<ServerEnvelope>(&mut stream, negotiated_max, frame_timeout).await? {
-        ServerEnvelope::Response(value) if value.request_id == request_id => match value.response {
-            Response::RecoveryAction(response) if response.validate() => Ok(response),
-            Response::RecoveryAction(_) => Err(ProtocolError::InvalidRecoveryAction),
-            Response::Health(_)
-            | Response::HostCanary(_)
-            | Response::ConfigReload(_)
-            | Response::ConfigDocument(_)
-            | Response::RecoveryTerminal(_)
-            | Response::McpBindingIssued(_)
-            | Response::SessionSourceObserved(_)
-            | Response::McpResult(_)
-            | Response::McpReturned
-            | Response::RecallCue(_)
-            | Response::SessionImportAdmin(_)
-            | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),
-        },
-        ServerEnvelope::Response(_) => Err(ProtocolError::RequestIdMismatch),
-        ServerEnvelope::Error(error) if error.request_id == Some(request_id) => {
-            Err(ProtocolError::Wire(error.code))
-        }
-        ServerEnvelope::Error(_) => Err(ProtocolError::RequestIdMismatch),
-        _ => Err(ProtocolError::UnexpectedMessage),
+    let mut client =
+        LocalClient::connect(socket_path, build_id, dto::ClientKind::Cli, frame_timeout).await?;
+    match client
+        .request(request_id, Command::RequestRecovery(request))
+        .await?
+    {
+        Response::RecoveryAction(response) if response.validate() => Ok(response),
+        Response::RecoveryAction(_) => Err(ProtocolError::InvalidRecoveryAction),
+        Response::Health(_)
+        | Response::HostCanary(_)
+        | Response::ConfigReload(_)
+        | Response::ConfigDocument(_)
+        | Response::RecoveryTerminal(_)
+        | Response::McpBindingIssued(_)
+        | Response::SessionSourceObserved(_)
+        | Response::McpResult(_)
+        | Response::McpReturned
+        | Response::RecallCue(_)
+        | Response::SessionImportAdmin(_)
+        | Response::HumanGovernance(_) => Err(ProtocolError::UnexpectedMessage),
     }
 }
 

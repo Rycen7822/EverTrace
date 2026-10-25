@@ -805,46 +805,6 @@ fn direct_source_message(
     (receipt, observation)
 }
 
-async fn persist_direct_source_message(
-    writer: &mut JournalWriter,
-    receipt: &SourceReceipt,
-    observation: &SourceObservation,
-    at: i64,
-) {
-    writer
-        .commit(
-            &command(
-                at,
-                vec![
-                    JournalPayload::SourceReceiptRecorded(Box::new(receipt.clone())),
-                    JournalPayload::SourceObservationRecorded(Box::new(observation.clone())),
-                    JournalPayload::SourceIngestWatermark(SourceIngestWatermark {
-                        source_instance_id: receipt.source_instance_id.clone(),
-                        source_revision: receipt.source_revision.clone(),
-                        source_sequence: receipt.source_sequence,
-                        confirmed_prefix_digest: None,
-                        earlier_prefix: None,
-                    }),
-                    JournalPayload::DirtyTarget(DirtyTarget {
-                        target_kind: DirtyTargetKind::EvidenceSurface,
-                        target_id: observation.source_observation_id.to_string(),
-                        algorithm_revision: "s26-v1".into(),
-                        source_watermark: receipt.source_sequence,
-                    }),
-                    JournalPayload::DirtyTarget(DirtyTarget {
-                        target_kind: DirtyTargetKind::PhysicalNormalization,
-                        target_id: observation.source_observation_id.to_string(),
-                        algorithm_revision: "s26-v1".into(),
-                        source_watermark: receipt.source_sequence,
-                    }),
-                ],
-            ),
-            at,
-        )
-        .await
-        .unwrap();
-}
-
 struct Seed {
     writer: JournalWriter,
     task: Task,
@@ -2011,8 +1971,8 @@ async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore(
         seed.repository.repository_id,
         seed.worktree.worktree_instance_id,
     );
-    persist_direct_source_message(&mut writer, &first.0, &first.1, 3).await;
-    persist_direct_source_message(&mut writer, &third.0, &third.1, 4).await;
+    persist_source(&mut writer, &first.0, &first.1, 3).await;
+    persist_source(&mut writer, &third.0, &third.1, 4).await;
     let source = SemanticSourceTarget {
         source_instance_id: first.0.source_instance_id.clone(),
         source_revision: first.0.source_revision.clone(),
@@ -2098,7 +2058,7 @@ async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore(
         source.repository_id,
         source.worktree_id,
     );
-    persist_direct_source_message(&mut writer, &late.0, &late.1, 11).await;
+    persist_source(&mut writer, &late.0, &late.1, 11).await;
     let late_frontier = writer.sync_frontier().await.unwrap();
     assert!(late_frontier > frozen.frontier);
     assert_eq!(
@@ -2122,7 +2082,7 @@ async fn frozen_source_late_message_sync_then_other_source_rejects_full_restore(
         source.repository_id,
         source.worktree_id,
     );
-    persist_direct_source_message(&mut writer, &other.0, &other.1, 12).await;
+    persist_source(&mut writer, &other.0, &other.1, 12).await;
     assert_eq!(writer.sync_frontier().await, Err(StoreError::StoreCorrupt));
     assert_eq!(
         writer

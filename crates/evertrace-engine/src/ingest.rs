@@ -9,7 +9,7 @@ use evertrace_capture::{
 };
 use evertrace_domain::{
     canonical::{CanonicalValue, sha256},
-    evidence::{SourceInstanceId, SourceRevision, SourceRevisionMode, SourceRole},
+    evidence::{SourceInstanceId, SourceRevision, SourceRevisionMode, SourceRole, hex},
     ids::{RepositoryId, SourceObservationId},
 };
 use evertrace_store::{
@@ -1025,7 +1025,7 @@ impl ConfirmedPrefixState {
             receipt.source_revision.as_str(),
             range.start,
             range.end,
-            previous.as_deref(),
+            previous.clone(),
             &receipt.cas_ref,
         )?;
         *end = range.end;
@@ -1221,7 +1221,7 @@ fn projected_exact_prefixes(
             source_revision,
             start,
             end,
-            previous.as_deref(),
+            previous.clone(),
             &cas_ref,
         )?;
         *cursor = end;
@@ -1272,12 +1272,12 @@ fn projected_exact_prefixes(
     Ok(exact)
 }
 
-fn confirmed_prefix_digest(
+pub(crate) fn confirmed_prefix_digest(
     source_instance: &str,
     source_revision: &str,
     start: u64,
     end: u64,
-    previous: Option<&str>,
+    previous: Option<String>,
     cas_ref: &str,
 ) -> Result<String, IngestError> {
     let digest = sha256(
@@ -1288,24 +1288,12 @@ fn confirmed_prefix_digest(
             CanonicalValue::String(source_revision.to_owned()),
             CanonicalValue::Integer(i128::from(start)),
             CanonicalValue::Integer(i128::from(end)),
-            previous.map_or(CanonicalValue::Null, |value| {
-                CanonicalValue::String(value.to_owned())
-            }),
+            previous.map_or(CanonicalValue::Null, CanonicalValue::String),
             CanonicalValue::String(cas_ref.to_owned()),
         ]),
     )
     .map_err(|_| IngestError::InvalidRecord)?;
-    Ok(hex_digest(&digest))
-}
-
-fn hex_digest(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
+    Ok(hex(&digest))
 }
 
 fn map_writer_error(error: WriterActorError) -> IngestError {

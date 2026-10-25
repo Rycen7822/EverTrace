@@ -241,7 +241,7 @@ impl SqliteState {
         // lock validated; opening store SQLite under a world-writable parent
         // must fail closed even when the child happens to be 0700.
         let data_root = fs::symlink_metadata(data_dir).map_err(|_| StoreError::Io)?;
-        validate_data_root_metadata(&data_root)?;
+        validate_directory_metadata(&data_root)?;
         let directory_path = crate::connection::native_root(data_dir);
         match fs::symlink_metadata(&directory_path) {
             Ok(metadata) => validate_directory_metadata(&metadata)?,
@@ -1866,19 +1866,6 @@ fn current_uid() -> Result<u32, StoreError> {
     fs::metadata("/proc/self")
         .map(|metadata| metadata.uid())
         .map_err(|_| StoreError::Io)
-}
-
-fn validate_data_root_metadata(metadata: &fs::Metadata) -> Result<(), StoreError> {
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(StoreError::InvalidType);
-    }
-    if metadata.uid() != current_uid()? {
-        return Err(StoreError::WrongOwner);
-    }
-    if metadata.permissions().mode() & 0o777 != 0o700 {
-        return Err(StoreError::InvalidPermissions);
-    }
-    Ok(())
 }
 
 fn validate_directory_metadata(metadata: &fs::Metadata) -> Result<(), StoreError> {

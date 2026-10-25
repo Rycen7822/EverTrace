@@ -16,7 +16,6 @@ use evertrace_codex::{
     source_catalog::qualify_requested_session_root,
 };
 use evertrace_domain::{
-    canonical::{CanonicalValue, sha256},
     evidence::{
         CaptureCompleteness, ContentTrust, CorrelationAdmission, EvidenceByteRange,
         EvidenceSourceKind, HostCorrelationEvidence, IdentityStrength, ObservationRole,
@@ -29,8 +28,7 @@ use evertrace_store::{
     BodyStateReason, DurableJob, EventScope, JobLease, JobStatus, JobTerminalAudit,
     JobTerminalOutcome, JobTerminalReason, JournalCommand, JournalEventDraft, JournalPayload,
     SessionBodyState, SessionImportContext, SessionImportCurrent, SessionImportEvent,
-    SessionImportEventKind, SessionImportPrefixRecord, SessionImportPrefixRequest,
-    SourceIngestWatermark, SourceKind,
+    SessionImportEventKind, SessionImportPrefixRequest, SourceIngestWatermark, SourceKind,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -44,7 +42,6 @@ use crate::{
 
 const CHUNK_BYTES: usize = 16 * 1024;
 const MAX_RECORDS: usize = 16;
-const PREFIX_TAG: &str = "session_import_confirmed_prefix";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionImportBudget {
@@ -1046,11 +1043,17 @@ impl SessionImportWorker {
             {
                 return Err(SessionImportError::Changed);
             }
-            cached.digest = Some(extend_prefix_digest(
-                current,
-                cached.digest.take(),
-                receipt,
-            )?);
+            cached.digest = Some(
+                crate::ingest::confirmed_prefix_digest(
+                    &current.source_instance(),
+                    current.metadata.source_revision.as_str(),
+                    receipt.start,
+                    receipt.end,
+                    cached.digest.take(),
+                    &receipt.cas_ref,
+                )
+                .map_err(|_| SessionImportError::Persistence)?,
+            );
             cached.end = receipt.end;
             bytes += range.bytes.len();
         }
@@ -3327,37 +3330,6 @@ mod tests {
             );
         }
     }
-}
-
-fn extend_prefix_digest(
-    current: &SessionImportCurrent,
-    previous: Option<String>,
-    receipt: &SessionImportPrefixRecord,
-) -> Result<String, SessionImportError> {
-    let digest = sha256(
-        PREFIX_TAG,
-        1,
-        &CanonicalValue::Sequence(vec![
-            CanonicalValue::String(current.source_instance()),
-            CanonicalValue::String(current.metadata.source_revision.as_str().to_owned()),
-            CanonicalValue::Integer(i128::from(receipt.start)),
-            CanonicalValue::Integer(i128::from(receipt.end)),
-            previous.map_or(CanonicalValue::Null, CanonicalValue::String),
-            CanonicalValue::String(receipt.cas_ref.clone()),
-        ]),
-    )
-    .map_err(|_| SessionImportError::Persistence)?;
-    Ok(hex_digest(&digest))
-}
-
-fn hex_digest(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 #[derive(Clone, Copy)]

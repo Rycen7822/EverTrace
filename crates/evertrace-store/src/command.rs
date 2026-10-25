@@ -439,7 +439,7 @@ impl IndependentSourceReconciliation {
         for reference in &self.evidence_refs {
             validate_identifier(reference)?;
         }
-        require_unique_strings(&self.evidence_refs)
+        require_unique_values(&self.evidence_refs)
     }
 }
 
@@ -475,7 +475,7 @@ impl SourceCloseRange {
         for reference in &self.eligible_event_manifest_refs {
             validate_identifier(reference)?;
         }
-        require_unique_strings(&self.eligible_event_manifest_refs)?;
+        require_unique_values(&self.eligible_event_manifest_refs)?;
         if let Some(independent) = &self.independent_reconciliation {
             independent.validate()?;
             if independent.source_instance_id == self.source_instance_id
@@ -572,11 +572,11 @@ impl SourceCloseReconciliation {
             source.validate()?;
         }
         let source_refs = self.source_revision_refs();
-        require_unique_strings(&source_refs)?;
+        require_unique_values(&source_refs)?;
         for reference in &self.unresolved_gap_refs {
             validate_identifier(reference)?;
         }
-        require_unique_strings(&self.unresolved_gap_refs)?;
+        require_unique_values(&self.unresolved_gap_refs)?;
         require_unique_values(&self.unresolved_outage_interval_refs)
     }
 }
@@ -2200,18 +2200,6 @@ pub fn source_revision_ref(
         source_instance_id.as_str(),
         source_revision.as_str()
     )
-}
-
-fn require_unique_strings(values: &[String]) -> Result<(), StoreError> {
-    if values
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        != values.len()
-    {
-        return Err(StoreError::InvalidInput);
-    }
-    Ok(())
 }
 
 fn require_unique_values<T: Ord>(values: &[T]) -> Result<(), StoreError> {

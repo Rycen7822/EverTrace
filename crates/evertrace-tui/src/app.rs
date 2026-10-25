@@ -2053,57 +2053,28 @@ fn human_request(
     state: &AppState,
     command: UiCommand,
 ) -> Option<evertrace_protocol::dto::HumanGovernanceRequest> {
-    use evertrace_protocol::dto::{HumanGovernanceRequest, HumanReadRequest};
+    use evertrace_protocol::dto::{
+        HUMAN_PAGE_LIMIT, HumanGovernanceRequest, HumanGovernanceResponse, HumanReadRequest,
+    };
     let surface = human_surface(state.route);
-    match command {
+    let (after, expected_frontier) = match command {
         UiCommand::Refresh => {
-            if let Some(context) = &state.related_context {
-                return Some(HumanGovernanceRequest::Read {
-                    request: HumanReadRequest::Related {
-                        relation: context.relation,
-                        source_stable_key: context.source_stable_key.clone(),
-                        expected_source_revision_ref: context.expected_source_revision_ref.clone(),
-                        expected_frontier: context.expected_frontier,
-                        after: state.ui.page_cursor.clone(),
-                        limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
-                    },
-                });
-            }
-            let expected_frontier = match &state.human {
-                Some(evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
-                    frontier,
-                    ..
-                }) if state.ui.page_cursor.is_some() => Some(*frontier),
+            let frontier = match &state.human {
+                Some(HumanGovernanceResponse::Snapshot { frontier, .. })
+                    if state.ui.page_cursor.is_some() =>
+                {
+                    Some(*frontier)
+                }
                 _ => None,
             };
-            Some(HumanGovernanceRequest::Read {
-                request: HumanReadRequest::List {
-                    explorer_selection: (state.route == Route::Explorer)
-                        .then_some(state.ui.explorer_selection)
-                        .flatten(),
-                    system_selection: system_selection(state),
-                    surface,
-                    expected_frontier,
-                    after: state.ui.page_cursor.clone(),
-                    limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
-                },
-            })
+            (state.ui.page_cursor.clone(), frontier)
         }
         UiCommand::OpenRelated => {
-            let context = state.related_context.as_ref()?;
-            Some(HumanGovernanceRequest::Read {
-                request: HumanReadRequest::Related {
-                    relation: context.relation,
-                    source_stable_key: context.source_stable_key.clone(),
-                    expected_source_revision_ref: context.expected_source_revision_ref.clone(),
-                    expected_frontier: context.expected_frontier,
-                    after: None,
-                    limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
-                },
-            })
+            state.related_context.as_ref()?;
+            (None, None)
         }
         UiCommand::NextPage => {
-            let evertrace_protocol::dto::HumanGovernanceResponse::Snapshot {
+            let HumanGovernanceResponse::Snapshot {
                 frontier,
                 next_cursor: Some(after),
                 ..
@@ -2111,51 +2082,9 @@ fn human_request(
             else {
                 return None;
             };
-            let request = state.related_context.as_ref().map_or_else(
-                || HumanReadRequest::List {
-                    explorer_selection: (state.route == Route::Explorer)
-                        .then_some(state.ui.explorer_selection)
-                        .flatten(),
-                    system_selection: system_selection(state),
-                    surface,
-                    expected_frontier: Some(*frontier),
-                    after: Some(after.clone()),
-                    limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
-                },
-                |context| HumanReadRequest::Related {
-                    relation: context.relation,
-                    source_stable_key: context.source_stable_key.clone(),
-                    expected_source_revision_ref: context.expected_source_revision_ref.clone(),
-                    expected_frontier: context.expected_frontier,
-                    after: Some(after.clone()),
-                    limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
-                },
-            );
-            Some(HumanGovernanceRequest::Read { request })
+            (Some(after.clone()), Some(*frontier))
         }
-        UiCommand::FirstPage => {
-            let request = state.related_context.as_ref().map_or_else(
-                || HumanReadRequest::List {
-                    explorer_selection: (state.route == Route::Explorer)
-                        .then_some(state.ui.explorer_selection)
-                        .flatten(),
-                    system_selection: system_selection(state),
-                    surface,
-                    expected_frontier: None,
-                    after: None,
-                    limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
-                },
-                |context| HumanReadRequest::Related {
-                    relation: context.relation,
-                    source_stable_key: context.source_stable_key.clone(),
-                    expected_source_revision_ref: context.expected_source_revision_ref.clone(),
-                    expected_frontier: context.expected_frontier,
-                    after: None,
-                    limit: evertrace_protocol::dto::HUMAN_PAGE_LIMIT,
-                },
-            );
-            Some(HumanGovernanceRequest::Read { request })
-        }
+        UiCommand::FirstPage => (None, None),
         UiCommand::Detail => {
             if let Some((reference, frontier)) = &state.ui.reference_request {
                 return Some(HumanGovernanceRequest::Read {
@@ -2168,22 +2097,41 @@ fn human_request(
                 });
             }
             let item = selected_item(state)?;
-            let evertrace_protocol::dto::HumanGovernanceResponse::Snapshot { frontier, .. } =
-                state.human.as_ref()?
-            else {
+            let HumanGovernanceResponse::Snapshot { frontier, .. } = state.human.as_ref()? else {
                 return None;
             };
-            Some(HumanGovernanceRequest::Read {
+            return Some(HumanGovernanceRequest::Read {
                 request: HumanReadRequest::Detail {
                     surface,
                     object_ref: item.stable_key.clone(),
                     expected_frontier: *frontier,
                     expected_revision_ref: item.revision_ref.clone(),
                 },
-            })
+            });
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    let request = match &state.related_context {
+        Some(context) => HumanReadRequest::Related {
+            relation: context.relation,
+            source_stable_key: context.source_stable_key.clone(),
+            expected_source_revision_ref: context.expected_source_revision_ref.clone(),
+            expected_frontier: context.expected_frontier,
+            after,
+            limit: HUMAN_PAGE_LIMIT,
+        },
+        None => HumanReadRequest::List {
+            explorer_selection: (state.route == Route::Explorer)
+                .then_some(state.ui.explorer_selection)
+                .flatten(),
+            system_selection: system_selection(state),
+            surface,
+            expected_frontier,
+            after,
+            limit: HUMAN_PAGE_LIMIT,
+        },
+    };
+    Some(HumanGovernanceRequest::Read { request })
 }
 
 fn proposal_action(
