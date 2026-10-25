@@ -303,8 +303,6 @@ impl CaptureRuntime {
         }
         let key = DeviceKeyStore::new(self.snapshot.device_key_dir.clone()).load()?;
         let protected = protect(&input.raw_payload, &key)?;
-        let content_digest =
-            crate::CasDigest::for_protected_bytes(protected.protected_bytes()).as_hex();
         // Lock order is maintenance fence, then CAS parent, then spool. The CAS
         // parent lock is released before spool acquisition, so purge never
         // observes a published blob before its referencing frame is durable.
@@ -317,7 +315,7 @@ impl CaptureRuntime {
                 return Ok(self.record_gap(
                     &input,
                     &spool_record_id,
-                    &content_digest,
+                    &crate::CasDigest::for_protected_bytes(protected.protected_bytes()).as_hex(),
                     GapReason::MainUnavailable,
                 ));
             }
@@ -329,7 +327,7 @@ impl CaptureRuntime {
                 return Ok(self.record_gap(
                     &input,
                     &spool_record_id,
-                    &content_digest,
+                    &crate::CasDigest::for_protected_bytes(protected.protected_bytes()).as_hex(),
                     GapReason::MainUnavailable,
                 ));
             }
@@ -469,7 +467,7 @@ impl CaptureRuntime {
                 Ok(self.record_gap(
                     &input,
                     &spool_record_id,
-                    &content_digest,
+                    &cas_digest,
                     GapReason::MainPressure,
                 ))
             }
@@ -478,7 +476,7 @@ impl CaptureRuntime {
                 Ok(self.record_gap(
                     &input,
                     &spool_record_id,
-                    &content_digest,
+                    &cas_digest,
                     GapReason::MainUnavailable,
                 ))
             }

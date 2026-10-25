@@ -200,7 +200,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
         event_time_us: input.event_time_us,
         raw_payload: input.payload.into_bytes(),
     };
-    let recovery_gap_record = record.clone();
+    let recovery_gap_record = (gate == RecoveryGateMode::Active).then(|| record.clone());
     let outcome = match preflight {
         Some(intent) => runtime.capture_with_recovery_preflight(record, intent),
         None => runtime.capture(record),
@@ -208,7 +208,7 @@ fn capture(snapshot_path: &Path, input: CaptureHookInput, started: Instant) -> R
     .map_err(|_| ())?;
     drop(runtime);
     let durable = matches!(&outcome, CaptureOutcome::Durable { .. });
-    if gate == RecoveryGateMode::Active
+    if let Some(recovery_gap_record) = recovery_gap_record
         && let CaptureOutcome::Durable {
             spool_record_id,
             recovery_preflight: Some(pending),

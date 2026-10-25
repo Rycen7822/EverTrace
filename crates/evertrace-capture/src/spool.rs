@@ -637,14 +637,12 @@ impl DurableSpool {
             return Err(SpoolError::InvalidConfiguration);
         }
         let mut found = None;
-        for record in self.read_durable_records(max_segments, max_bytes)? {
+        self.visit_durable_records(max_segments, max_bytes, |record| {
             if record.spool_record_id == spool_record_id {
-                if found.is_some() {
-                    return Err(SpoolError::DuplicateRecord);
-                }
-                found = Some(record);
+                found = Some(record.clone());
             }
-        }
+            Ok(())
+        })?;
         Ok(found)
     }
 

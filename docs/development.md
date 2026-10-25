@@ -37,6 +37,64 @@ systemd-run --user --scope -p CPUQuota=400% -p MemoryHigh=12G -p MemoryMax=16G -
 
 Leave headroom for the OS and other work. Investigate OOM/exit 137/WSL crashes before raising limits. CPU quota limits CPU time, not thread count. A command's RSS is not necessarily the process group's peak. Without systemd, retain serial execution and available platform controls; do not casually change global WSL settings.
 
+### Linux 可选链接器：mold / Optional Linux linker: mold
+
+mold 可作为本地 Linux 开发的显式选择，用于缩短链接步骤；它不是编译缓存，也不是 workspace 的默认要求。不要为此提交共享 `.cargo/config.toml`、修改全局 Cargo 配置或改变现有 profile。仍遵守上面的单 Cargo、串行测试和资源预留规则。
+
+mold is an opt-in local Linux development linker, not a compiler cache or a workspace requirement. Do not add shared `.cargo/config.toml`, change global Cargo configuration or alter the profiles for it. Retain the single-Cargo, serial-test and resource-headroom rules above.
+
+可使用发行版的软件包，例如 Debian/Ubuntu 的 `sudo apt-get install mold`；也可从[官方 release](https://github.com/rui314/mold/releases)获取对应架构的预编译包，先核对发布的 SHA-256。发行版版本未必是下面实测的 3.0.0。安装后检查实际 Rust、驱动和链接器版本：
+
+Use your distribution's package, for example `sudo apt-get install mold` on Debian/Ubuntu, or an architecture-matched [official release](https://github.com/rui314/mold/releases), verifying its published SHA-256 before use. Distribution packages may differ from the measured 3.0.0. Check the actual Rust, driver and linker versions:
+
+```sh
+rustc +1.97.1 -vV
+cc --version
+mold --version
+command -v ld.mold
+```
+
+下面仅用于本机 GNU/Linux 构建，要求 `cc` 是 GCC 12.1 或更新版本，且 `ld.mold` 可从 PATH 找到。旧 GCC、交叉编译或其他驱动需先按[上游说明](https://github.com/rui314/mold/tree/v3.0.0#how-to-use)核对，不直接套用。子 shell 退出即恢复原环境；保留已有 RUSTFLAGS，若设置了优先级更高的 `CARGO_ENCODED_RUSTFLAGS`，先停止并在原配置中正确合并，不清空它来绕过检查：
+
+The example is for native GNU/Linux with `cc` using GCC 12.1 or newer and `ld.mold` on PATH. Consult the [upstream instructions](https://github.com/rui314/mold/tree/v3.0.0#how-to-use) before using older GCC, cross-compilation or other drivers. The subshell restores the environment on exit and preserves existing RUSTFLAGS. If higher-priority `CARGO_ENCODED_RUSTFLAGS` is set, stop and merge the option correctly into that configuration rather than clearing it:
+
+```sh
+(
+  if [ "${CARGO_ENCODED_RUSTFLAGS+x}" = x ]; then
+    printf '%s\n' 'CARGO_ENCODED_RUSTFLAGS is set; merge linker flags there first.' >&2
+    exit 1
+  fi
+  export CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 RUST_TEST_THREADS=1
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C linker=cc -C link-arg=-fuse-ld=mold"
+  cargo +1.97.1 test --locked -p evertrace-store --test lancedb_compatibility --no-run
+)
+```
+
+首次更改 RUSTFLAGS 可能让 Cargo 重编依赖，不能拿这一轮与另一链接器的热构建比较。若依赖已准备齐，可加 `--offline`。从 Cargo 的 `Executable` 输出取得实际测试程序路径，再检查 `.comment` 中是否有 mold 标识；只看 `mold --version` 不能证明该程序由它链接：
+
+Changing RUSTFLAGS can rebuild dependencies; do not compare that first build against another linker's warm build. Add `--offline` if dependencies are already available. Take the actual test-executable path from Cargo's `Executable` output and inspect `.comment` for mold's identification; `mold --version` alone does not establish which linker produced a binary:
+
+```sh
+readelf -p .comment /absolute/path/to/test-executable
+```
+
+**已知证据的范围。** [Issue #3](https://github.com/Rycen7822/EverTrace/issues/3) 报告了 `09589e2`、Linux x86_64、Rust 1.97.1、上述测试和默认 dev/test profile 下的观察，单 job、关闭增量、串行测试，每种链接器三次。以下是该 issue 的中位数，不是本机或当前提交重新测得的结果：
+
+**Evidence boundary.** [Issue #3](https://github.com/Rycen7822/EverTrace/issues/3) reports `09589e2` on Linux x86_64, Rust 1.97.1, this test and the default dev/test profile, with one build job, incremental compilation off, serial tests and three runs per linker. These are the issue's medians, not new measurements on this machine or commit:
+
+| 测量 / Measurement | Bundled LLD 22.1.6 | mold 3.0.0 | 中位数缩短 / Median reduction |
+|---|---:|---:|---:|
+| 相同对象重链接 / Relink identical objects | 2.538 s | 1.337 s | 47.3% |
+| 保留依赖、强制测试源码重编译并链接 / Recompile test source and link, dependencies retained | 3.965 s | 2.648 s | 33.2% |
+
+该实验冷 LLD 构建约 779 秒，最后链接约 2.86 秒；没有完整冷 mold 构建结果，因此不能宣称冷构建提速 33%/47%。全 workspace、release、Windows/MSVC、其他硬件及峰值内存收益均未证明，也不宣称程序运行更快；mold 默认 fork 时只统计父进程 RSS 尤其不完整。复测按 issue 固定 wrapper 路径与 RUSTFLAGS、只切换实际链接器、保留依赖并真实触发源码重编译，交错多次比较，不把 Cargo 无操作耗时当重构建。
+
+The cold LLD build took about 779 seconds, with about 2.86 seconds in the final link. No complete cold mold build was measured, so this is not a 33%/47% cold-build gain. Full workspace, release, Windows/MSVC, other hardware and peak-memory gains remain unproven; no runtime speedup is claimed. Parent-only RSS is especially incomplete with mold's default fork behavior. For comparisons, follow the issue's fixed wrapper path/RUSTFLAGS, switch only the actual linker, retain dependencies, force real source recompilation and interleave repeated runs; no-op Cargo timings are not rebuild measurements.
+
+该 issue 的原始 LLD 及所有重链接测试程序均为 **6 过、1 失败**，失败项是 `corrupt_derived_probe_table_fails_open`，根因未确定；不能称整个目标全绿，也不能跳过或弱化断言来采用链接器。上面的 `--no-run` 只生成测试程序：实际验证时去掉它运行同一命令，检查测试结果和最终退出码。
+
+The issue's original LLD and all relinked test binaries reported **six passed, one failed**: `corrupt_derived_probe_table_fails_open`, with root cause unresolved. This is not a passing target, and adopting a linker must not skip or weaken the assertion. The example's `--no-run` only builds the test executable; remove it to run the same command and inspect the tests and final exit status.
+
 ## 最小充分验证 / Proportionate verification
 
 先跑最近的现有测试；文档改动先核对命令、配置和链接，不需要重新跑完整数据库压测。下面是不同范围的示例，不是每次修改都必须全部执行的清单：

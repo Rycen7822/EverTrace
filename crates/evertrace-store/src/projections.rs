@@ -15562,6 +15562,7 @@ impl ReducerState {
                 return Err(StoreError::StoreCorrupt);
             }
         }
+        let mut declared_scope_effects = 0_usize;
         for (operation, _) in self.operations.values() {
             let Some((occurrence, _)) = self.host_occurrences.get(&operation.host_occurrence_id)
             else {
@@ -15575,15 +15576,22 @@ impl ReducerState {
             {
                 return Err(StoreError::StoreCorrupt);
             }
-            let actual = self
-                .scope_effects
-                .values()
-                .filter(|(effect, _)| effect.operation_id == operation.operation_id)
-                .map(|(effect, _)| effect.scope_effect_id)
-                .collect::<std::collections::BTreeSet<_>>();
-            if actual != operation.scope_effect_ids.iter().copied().collect() {
+            if operation.scope_effect_ids.iter().any(|id| {
+                self.scope_effects.get(id).is_none_or(|(effect, _)| {
+                    effect.scope_effect_id != *id || effect.operation_id != operation.operation_id
+                })
+            }) {
                 return Err(StoreError::StoreCorrupt);
             }
+            declared_scope_effects = declared_scope_effects
+                .checked_add(operation.scope_effect_ids.len())
+                .ok_or(StoreError::StoreCorrupt)?;
+        }
+        // Validated operations have unique declared IDs. Each ID resolves to its
+        // own operation, so equal total counts exclude undeclared effects
+        // without an effects scan per operation.
+        if declared_scope_effects != self.scope_effects.len() {
+            return Err(StoreError::StoreCorrupt);
         }
         for (effect, _) in self.scope_effects.values() {
             let Some((operation, _)) = self.operations.get(&effect.operation_id) else {

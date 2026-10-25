@@ -3721,11 +3721,13 @@ impl ProcedureUsageCurrentView {
             if std::time::Instant::now() >= deadline {
                 break;
             }
+            // A nonempty group already passed this immutable view's promotion gates.
             if target.is_none_or(|id| id == usage.procedure_revision_id)
                 && usage.stage == evertrace_domain::procedure::ProcedureUsageStage::Outcome
                 && usage.outcome_supported == evertrace_domain::procedure::ProcedureTruth::True
                 && usage.created_at_us <= occurred_at_us
-                && self.promotion_allowed(usage.procedure_revision_id, occurred_at_us)
+                && (groups.contains_key(&usage.procedure_revision_id)
+                    || self.promotion_allowed(usage.procedure_revision_id, occurred_at_us))
                 && independent_tasks(self, &[usage])
             {
                 groups
