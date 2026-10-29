@@ -447,6 +447,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let maintenance_active = Arc::clone(&handler_maintenance_active);
             let dispatch_gate = Arc::clone(&handler_dispatch_gate);
             async move {
+                // The browser transport can never acquire agent or write roles.
+                // Reject it before config admission or domain service dispatch.
+                if context.client_kind == ClientKind::Web
+                    && (context.peer_credentials.is_none() || !matches!(&command,
+                        ProtocolCommand::Health | ProtocolCommand::HumanGovernance(HumanGovernanceRequest::Read { .. })))
+                { return Err(ErrorCode::Untrusted); }
                 let observation_deadline = match &command {
                     ProtocolCommand::ObserveSessionSource(observation) => {
                         if context.client_kind != ClientKind::Hook || !observation.validate() {
@@ -823,7 +829,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     ProtocolCommand::HumanGovernance(command) => {
-                        if context.client_kind != ClientKind::Cli {
+                        if context.client_kind != ClientKind::Cli
+                            && !(context.client_kind == ClientKind::Web
+                                && context.peer_credentials.is_some()
+                                && matches!(&command, HumanGovernanceRequest::Read { .. }))
+                        {
                             return Err(ErrorCode::Untrusted);
                         }
                         if !command.validate() {
