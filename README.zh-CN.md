@@ -60,7 +60,11 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`、`--tui` 或 `--web`。网页目前只读接入真实记忆列表、正文、来源关联、修订历史、同对象固定修订比较和连接状态；搜索、范围筛选、长正文分块及其余页面仍未接入。请勿分享终端打印的一次性登录链接。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`、`--tui` 或 `--web`。网页目前只读接入真实记忆列表、正文、来源关联、修订历史、同对象固定修订比较和连接状态；搜索、完整范围选择、长正文分块及其余页面仍未闭合。后端筛选/计数/keyset 已有实测，新网页控件仍是待验收的迁移工作。请勿分享终端打印的一次性登录链接。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
+
+### Web 架构迁移
+
+网页正从 Rust 内嵌实现迁移为独立 Python 呈现/服务组件，领域后端和单 writer 仍归 Rust。Python、模板和静态资源修改不应要求 Cargo；只有显式 `--web` 才启动 Python。未启动时核心 CLI/TUI/MCP/daemon 不应加载 Web 资源或建立 worker、会话、轮询，Web 组件缺失也不影响核心运行。**切换和未启动内存验收尚未完成**，详见[架构边界](docs/architecture.md)；Python 安装命令在实际验证后提供。
 
 不要以 root 身份运行安装命令。安装会修改受管宿主配置，并可能启用用户服务；它是单独的一步，不包含在上述命令中。
 

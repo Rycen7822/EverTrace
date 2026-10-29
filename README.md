@@ -62,11 +62,15 @@ Check that LLM processing is disabled; an existing file was not replaced. Then s
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`, `--tui` or `--web`. The read-only WebUI connects real memory lists/details, source references, revision history, exact same-object revision comparison and daemon status; search, scope filters, chunked full-text reads and other pages remain unavailable. Keep its printed one-time login URL private. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
+In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`, `--tui` or `--web`. The read-only WebUI connects real memory lists/details, source references, revision history, exact same-object revision comparison and daemon status; search, complete scope selection, chunked full-text reads and other pages remain unfinished. Server filtering/counting/keysets have runtime evidence; the new browser controls remain unaccepted migration work. Keep its printed one-time login URL private. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
+
+### Web architecture migration
+
+Web is being separated from the embedded Rust implementation into an independent Python presentation/service component. Rust retains the business backend and single writer. Templates/static assets and Python Web edits must not require Cargo; only explicit `--web` starts Python. Without Web, core CLI/TUI/MCP/daemon must not preload Web resources or start its worker/sessions/pollers, and must work with the Web component absent. Cutover and inactive-memory acceptance are **not complete**; see [architecture](docs/architecture.md). Python installation commands follow actual verification.
 
 ### Installation package
 
-The build command above produces four executables in `target/debug/`:
+The Rust core build above produces four executables in `target/debug/` (not a completed optional Python Web package):
 
 | Program | Purpose |
 |---|---|
@@ -107,7 +111,7 @@ Use a non-sensitive test project first. Do not treat recovery bundles as your on
 
 Local design archives under `docs/baseline/`, orchestration records under `.work/`, and agent instruction/state files are intentionally ignored. They are not prerequisites for following these public guides. Do not force-add private notes, model credentials or runtime data.
 
-Local architecture maintenance uses `document_set_version = 67` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
+Local architecture maintenance uses `document_set_version = 68` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
 
 See [Development](docs/development.md) for checks and resource limits. Report reproducible failures with the commit, platform, command and sanitized error; never attach raw session archives or credentials.
 

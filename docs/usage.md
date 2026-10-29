@@ -26,13 +26,13 @@ evertrace --config /absolute/config.toml --web
 evertrace --config /absolute/config.toml --web --port 4173
 ```
 
-打开终端打印的 `http://127.0.0.1:PORT/#bootstrap=...` 链接。它是两分钟内有效的一次性登录凭据，请勿分享或写进日志。服务只监听本机；不自动启动 daemon，不安装宿主接线。Ctrl-C 关闭网页桥接，不停止 daemon。
+打开终端打印的 `http://127.0.0.1:PORT/#bootstrap=...` 链接。它是两分钟内有效的一次性登录凭据，请勿分享或写进日志。服务只监听本机；不自动启动 daemon，不安装宿主接线。Ctrl-C 关闭前台 Web 服务，不停止 daemon。当前 Rust 实现正在迁移为独立 Python Web；Web 修改不需 Cargo、未启动时不加载 Web 运行时是目标和待验收项，不是已完成声明。
 
-Open the printed loopback URL. Its fragment is a single-use login credential valid for two minutes: do not share or log it. The bridge listens locally only, never starts a daemon or installs host wiring, and Ctrl-C closes the bridge without stopping the daemon.
+Open the printed loopback URL. Its fragment is a single-use login credential valid for two minutes: do not share or log it. The service listens locally only, never starts a daemon or installs host wiring, and Ctrl-C closes Web without stopping the daemon. The Rust implementation is being migrated to an independent Python Web component; no-Cargo Web edits and no dormant Web runtime remain migration targets, not completed claims.
 
-当前网页已接入真实记忆列表、正文、分页、来源关联、修订历史、同对象固定修订比较和连接状态，**只读**。来源可打开精确记录并返回；比较包含逐字段差异，不把历史版本换成当前版本。长正文分块尚未接入：语义正文超限时明确提示，来源预览不冒充全文。搜索、范围筛选及其余业务页面尚未接入；未接入的页面不会显示样例。正文按文本显示，网页会话不将记忆存入 localStorage、IndexedDB 或离线缓存。会话空闲 15 分钟或满 8 小时后失效；可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
+当前网页已接入真实记忆列表、正文、分页、来源关联、修订历史、同对象固定修订比较和连接状态，**只读**。来源可打开精确记录并返回；比较包含逐字段差异，不把历史版本换成当前版本。长正文分块尚未接入：语义正文超限时明确提示，来源预览不冒充全文。搜索、完整范围选择及其余业务页面尚未闭合；后端筛选/计数/keyset 已有实测，但新网页控件仍待 Python 迁移后的浏览器验收。未接入的页面不会显示样例。正文按文本显示，网页会话不将记忆存入 localStorage、IndexedDB 或离线缓存。会话空闲 15 分钟或满 8 小时后失效；可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
 
-The WebUI provides real memory lists, details, pagination, source references, revision history, exact same-object revision comparison and connection status, **read-only**. Source links open exact records and allow returning; comparison shows field differences without substituting current heads. Chunked full-text reads are not connected: oversized semantic content is explicit, and source previews are not presented as complete text. Search, scope filters and other business pages are not connected yet; they do not fall back to samples. Content is rendered as text without browser database/offline persistence. Sessions expire after 15 idle minutes or eight hours total, or explicitly through the sidebar. This is local HTTP, not TLS or protection against a malicious process running as the same OS user.
+The WebUI provides real memory lists, details, pagination, source references, revision history, exact same-object revision comparison and connection status, **read-only**. Source links open exact records and allow returning; comparison shows field differences without substituting current heads. Chunked full-text reads are not connected: oversized semantic content is explicit, and source previews are not presented as complete text. Search, complete scope selection and other business pages remain unfinished. Server filtering/counting/keysets have runtime evidence, but new browser controls still need acceptance after the Python migration; unconnected pages do not fall back to samples. Content is rendered as text without browser database/offline persistence. Sessions expire after 15 idle minutes or eight hours total, or explicitly through the sidebar. This is local HTTP, not TLS or protection against a malicious process running as the same OS user.
 
 ## CLI 与 MCP 的区别 / CLI versus MCP
 

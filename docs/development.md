@@ -12,6 +12,18 @@ Rust is pinned to `1.97.1`, with workspace edition 2024. Do not substitute float
 
 Read the deciding caller, implementation and consumer before editing behavior. Search is navigation, not understanding. Prefer a root-cause fix in existing code; add only what a current requirement needs. Do not build controllers, schemas, hash registries, configuration layers or duplicate paths for theoretical completeness.
 
+## 独立 Web 工程（迁移中） / Independent Web component (migration)
+
+Web 目标工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 尚未移除，不把规划路径当成已存在的可运行包。
+
+The target `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation has not yet been removed.
+
+Web 修改不应要求 Cargo。精确 uv/entry/lock 命令在实际组件存在且通过验证后记录；仓库 Python/uv/pytest 都在 Conda `test` 中运行，产品不依赖 Conda。仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。覆盖未启动、等量真实工作、退出回收的进程与 PSS/RSS/CPU，不按二进制大小猜内存。
+
+Web edits must not require Cargo. Exact uv/entry/lock commands follow implementation verification; repository Python/uv/pytest use Conda `test`, not a product Conda requirement. Production starts one worker only on explicit `--web`, without reload/watch/preload; ordinary modes never probe/import Web. Measure processes/PSS/RSS/CPU before, during equal work and after exit.
+
+临时互通、浏览器与内存探针留在 `.work/`，不复制进永久 suite。迁移时保留原检查所保护的安全/恢复义务，不为临时探针保留旧 Web fallback；永久测试只保护已接受且值得长期维护的行为。
+
 ## 构建与资源 / Build and resource controls
 
 Lance/Arrow 的初次构建、链接和集成测试可能很重。一个终端启动一个 Cargo；不要同时让多个 agent 构建。以下环境变量仅影响本次命令/当前 shell，不改永久系统配置：

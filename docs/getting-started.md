@@ -8,9 +8,9 @@
 
 The current implementation targets Linux: Unix domain sockets and Linux-specific filesystem safety are part of the design. In WSL2 use the Linux filesystem and check user-service availability. Native Windows/macOS support is not claimed here. Run as your normal user; do not place the data root on cloud-sync/network storage or share it between writers.
 
-源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。Lance 的构建脚本需要 Protocol Buffers 编译器；只安装 Rust 不够。Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`；按自己的发行版安装。运行已编译程序不需要 Conda/Python。
+源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。Lance 的构建脚本需要 Protocol Buffers 编译器；只安装 Rust 不够。Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`；按自己的发行版安装。运行已编译的非 Web 核心程序不需要 Conda/Python。Web 正从 Rust 内嵌实现迁移为独立 Python 组件，尚未完成切换；迁移后仅 `--web` 按需使用隔离 Python 环境，不把 Python 变成核心入口依赖，不自动安装 Web 依赖。
 
-A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`. Lance build scripts require the Protocol Buffers compiler. Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution. Running built binaries does not require Conda/Python.
+A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`. Lance build scripts require the Protocol Buffers compiler. Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution. Non-Web core binaries do not require Conda/Python. The embedded Rust Web implementation is being migrated to a separate Python component; cutover is incomplete. Only `--web` will start its isolated Python runtime, without making Python a core-mode dependency or silently installing Web dependencies.
 
 ```sh
 git --version
@@ -27,7 +27,7 @@ rustc +1.97.1 --version
 
 Builds can use substantial RAM and disk. One build job is not a hard memory limit; see [resource controls](development.md) on constrained machines. The steps below do not install system dependencies or modify host source code.
 
-## 2. 编译四个程序 / Build the four binaries
+## 2. 编译四个 Rust 核心程序 / Build the four Rust core binaries
 
 ```sh
 git clone https://github.com/Rycen7822/EverTrace.git
@@ -39,6 +39,8 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo +1.97.1 build --locked -p evertrace
 得到 `evertrace`（统一 CLI）、`evertrace-mcp`（独立 MCP transport）、`evertraced`（daemon）和 `evertrace-hook`（同步采集）。当前示例使用 debug 构建，不等同于经过发布验证的二进制包。安装器从 CLI 所在目录读取另外三个程序，因此四者必须来自同一构建并位于同一目录。
 
 The outputs are `evertrace` (unified CLI), `evertrace-mcp` (dedicated MCP transport), `evertraced` (daemon), and `evertrace-hook` (synchronous capture). This guide uses a debug build, not a qualified release package. The installer resolves the other binaries beside the CLI; keep all four from the same build in one directory.
+
+这四个 Rust 程序的构建不代表可选 Python Web 已装配；新的 Web entry、隔离环境与精确 uv 命令须在迁移实测后提供，不先给出未经验证的安装流程。 / Building these four Rust binaries does not assemble the optional Python Web component. Its entry, isolated environment and exact uv commands are documented after migration verification, not invented in advance.
 
 ## 3. 创建安全的试用配置 / Create a safe trial configuration
 

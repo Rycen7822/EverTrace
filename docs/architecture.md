@@ -37,7 +37,7 @@ Background models share the Engine's `SemanticProvider`: explicit Chat Completio
 | `evertrace-domain` | ID、不可变 revision、配置、领域对象与校验；不承担 I/O。 / IDs, immutable revisions, config, domain types and validation, without I/O. |
 | `evertrace-capture` | 内容保护、设备密钥、CAS、framing、durable spool、采集准入。 / Protection, device key, CAS, frames, durable spool and admission. |
 | `evertrace-codex` | 宿主格式、能力探测、接线、绑定和来源适配；不是通用权限后门。 / Host formats, probes, wiring, bindings and source adaptation. |
-| `evertrace-store` | LanceDB、journal、单 writer、migration、投影、查询和持久化维护。 / Persistence, single-writer serialization, migrations, projections, queries and maintenance. |
+| `evertrace-store` | SQLite 权威 journal/current/runtime/relations、Lance 派生检索、CAS 与持久化维护。 / Authoritative SQLite state, derived Lance search, CAS and persistence maintenance. |
 | `evertrace-engine` | 业务编排、摄入/归一、后台合成与复核、权限、检索、恢复及治理服务。 / Runtime orchestration, ingestion, background synthesis/review, authorization and services. |
 | `evertrace-protocol` | 本地协议 framing、握手、请求/响应、MCP schema 和 DTO。 / Local transport, handshake, envelopes, MCP schema and DTOs. |
 | `evertrace-tui` | 终端界面和事件处理；不拥有第二套领域规则。 / Terminal UI, without a second domain implementation. |
@@ -46,11 +46,21 @@ Background models share the Engine's `SemanticProvider`: explicit Chat Completio
 | `evertrace-cli` | `evertrace` 的 CLI、MCP stdio 与 TUI 启动入口。 / CLI, MCP stdio and TUI launcher. |
 | `evertrace-testkit` | 集成测试及必要的测试支持，不是生产控制器。 / Integration tests/support, not a production controller. |
 
+## Web 呈现边界（迁移中） / Web presentation boundary (migration)
+
+当前源码仍保留 `crates/evertrace-web/` 的 Rust HTTP/静态资源内嵌实现，尚未完成退役。目标是独立 `webui/` Python 工程，经受保护 UDS 调用原 Rust daemon；页面控制、模板、会话和窄 IPC 适配归 Python，领域规则、配置权威、数据权限与唯一 writer 留在 Rust。HTML/CSS/字体和必要 JavaScript 独立维护，修改 Web 不要求 Cargo。不把规划路径、接口通过或规范更新当成迁移交付。
+
+The embedded Rust Web implementation has not yet been retired. The target is an independent Python presentation/service component over the protected UDS; Rust retains business, configuration, authorization and the single writer. Templates/static assets and Python Web edits must not require Cargo. A target path, working backend interface or specification update is not a completed cutover.
+
+`--web` 将仅按需启动版本匹配的 Python Web 组件，不自动安装依赖或启用服务。未启动时核心入口不导入 Web、不读页面/字体、不建立 Web worker/listener/session/timer/cache/poller；Web 组件缺失不影响普通 CLI、TUI、MCP、Hook 或 daemon。最小启动器和共享人类业务协议保留在 Rust，不等于加载 Web 运行时。迁移后仍须实测进程、PSS/RSS、CPU与退出回收；不能从文件大小推算内存收益。
+
+Only explicit `--web` will start the version-matched Python component, without implicit installation or a service. With Web absent/inactive, core modes must not import/preload it or create Web resources. Minimal Rust launch dispatch and shared human protocol are not a Web runtime. Process/PSS/RSS/CPU and post-exit reclamation still require measurement.
+
 ## 持久化与身份 / Persistence and identity
 
-LanceDB 是嵌入式数据库；不是 SQLite，也没有另一套 Redis/数据库服务要求。`evertrace_journal` 保存权威追加事件，`evertrace_objects`、`evertrace_relations`、`evertrace_search` 是对应投影/查询表。CAS 保存受保护 payload；journal 和视图引用这些内容。不能宣称跨表原子事务。
+当前权威存储是嵌入式 SQLite：`evertrace.sqlite` 中的 `evertrace_journal` 保存唯一 append-only command/event journal，objects、runtime、relations 与必要索引由原单 writer 维护。`evertrace_search.lance/` 仅保存可重建的 exact/FTS/vector 检索派生投影。CAS 保存受保护 payload；不要求外部 Redis/数据库服务，不宣称 SQLite、Lance 与 CAS 之间存在通用跨存储原子事务，在线客户端也不能绕过 daemon 直开这些存储。
 
-LanceDB is embedded, not SQLite or a separate Redis/database service requirement. `evertrace_journal` is authoritative; `evertrace_objects`, `evertrace_relations` and `evertrace_search` are derived/current/query tables. CAS holds protected payloads referenced by events/views. Cross-table atomicity is not claimed.
+Embedded SQLite is authoritative: `evertrace.sqlite` holds the sole append-only command/event journal and writer-owned objects/runtime/relations/indexes. `evertrace_search.lance/` contains rebuildable exact/FTS/vector search projections only; CAS holds protected payloads. No external Redis/database service or general cross-storage atomicity is claimed. Online clients access these stores through the daemon, not directly.
 
 逻辑对象使用真正的 UUIDv7，不以路径、文本或 digest 冒充身份。内容 digest 只用于具名的完整性/引用/去重消费者。revision 和历史证据保留，current 可推进；正常增量投影校验当前自洽和 delta，历史完整性复核需要相应 replay/rebuild，不等于每次读取扫描全部历史。
 

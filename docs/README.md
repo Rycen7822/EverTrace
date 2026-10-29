@@ -13,7 +13,7 @@ These are public user and contributor guides, not development journals. Each gui
 | [使用方法 / Usage](usage.md) | 如何检索、查看、导入和理解返回结果？ / How do I read, inspect and import memory? |
 | [运维与隐私 / Operations and privacy](operations.md) | 如何备份、恢复、升级、卸载和保护数据？ / How do I maintain and protect data? |
 | [故障排查 / Troubleshooting](troubleshooting.md) | 没有记忆、服务连接失败、模型不工作怎么办？ / How do I diagnose missing memory and failures? |
-| [架构与限制 / Architecture and limitations](architecture.md) | 各模块负责什么？哪些能力仍有限制？ / What owns each behavior and what is not delivered? |
+| [架构与限制 / Architecture and limitations](architecture.md) | Rust/Python Web 边界、SQLite/Lance 权威与尚未交付能力。 / Rust/Python Web boundaries, SQLite/Lance authority and undelivered behavior. |
 | [开发 / Development](development.md) | 如何验证改动、避免高内存构建和提交私有文件？ / How do I test changes and avoid resource or privacy mistakes? |
 
 ## 建议阅读顺序 / Suggested order

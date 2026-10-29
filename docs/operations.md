@@ -81,9 +81,9 @@ evertrace --config /absolute/config.toml --upgrade --check /absolute/candidate-p
 evertrace --config /absolute/config.toml --upgrade /absolute/candidate-package --live-host /absolute/path/to/codex
 ```
 
-执行前停止原实例并阅读输出要求；candidate package 包含同一构建的四个程序。`--check` 不是零写入的轻量 dry-run，会准备与验证候选；不带 live host 的检查不能代替实际发布资格。包升级不是修改 Cargo 依赖或自动下载 GitHub release。真实宿主验证的费用和第三方副作用边界见[安装指南](getting-started.md)。
+执行前停止原实例并阅读输出要求；candidate package 包含同一构建的四个 Rust 核心程序；这不代表可选 Python Web 已完成装配。独立 Web 正在迁移，后续须显式组装并校验同包版本，普通 Host 安装/升级不得暗中安装 Web 依赖或启动 Web。`--check` 不是零写入的轻量 dry-run，会准备与验证候选；不带 live host 的检查不能代替实际发布资格。包升级不是修改 Cargo 依赖或自动下载 GitHub release。真实宿主验证的费用和第三方副作用边界见[安装指南](getting-started.md)。
 
-Stop the existing instance and follow reported prerequisites. A candidate package contains all four matching binaries. `--check` is not a zero-write cheap dry run; it prepares and verifies candidates. A check without live host cannot establish publication eligibility. Package upgrade is neither dependency editing nor automatic release downloading. See [live-host precautions](getting-started.md).
+Stop the existing instance and follow reported prerequisites. A core candidate package contains all four matching Rust binaries; this does not establish optional Python Web packaging. Web migration is in progress; its component must be explicitly assembled/version-checked, never silently installed or started by Host installation/upgrade. `--check` is not a zero-write cheap dry run; it prepares and verifies candidates. A check without live host cannot establish publication eligibility. Package upgrade is neither dependency editing nor automatic release downloading. See [live-host precautions](getting-started.md).
 
 ## Forget、purge、GC 与导出 / Forget, purge, GC and export
 
