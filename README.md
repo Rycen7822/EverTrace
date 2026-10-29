@@ -62,7 +62,7 @@ Check that LLM processing is disabled; an existing file was not replaced. Then s
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`, `--tui` or `--web`. The read-only WebUI connects real memory lists/details, source references, revision history, exact same-object revision comparison and daemon status; search, complete scope selection, chunked full-text reads and other pages remain unfinished. Server filtering/counting/keysets have runtime evidence; the new browser controls remain unaccepted migration work. Keep its printed one-time login URL private. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
+In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` or `--tui`. The former Rust Web implementation and its uncommitted extensions have been rolled back; the current build has **no working `--web` entry**. Its previous memory/source/revision features and server filtering/count/keyset evidence are historical, not current capabilities. The independent Python Web is being rebuilt against the new plan; its one-time-link/session and read-only/security requirements remain mandatory. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) for the retained core workflow.
 
 ### Web architecture migration
 

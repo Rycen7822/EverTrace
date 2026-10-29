@@ -10,7 +10,6 @@ members = [
     "crates/evertrace-hook",
     "crates/evertraced",
     "crates/evertrace-cli",
-    "crates/evertrace-web",
     "crates/evertrace-testkit",
 ]
 resolver = "2"

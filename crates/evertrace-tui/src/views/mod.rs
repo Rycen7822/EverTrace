@@ -658,7 +658,6 @@ fn semantic_lines(
             ));
             lines
         }
-        HumanSemanticContent::Proposal(proposal) => vec![safe_content(&format!("{proposal:#?}"))],
         HumanSemanticContent::CoreMembership(membership) => vec![
             crate::locale::format!(
                 language,
@@ -1804,7 +1803,6 @@ fn category_label(category: evertrace_protocol::dto::HumanItemCategory) -> &'sta
     use evertrace_protocol::dto::HumanItemCategory as Category;
     match category {
         Category::Proposal => "proposal",
-        Category::ProposalRevision => "proposal_revision",
         Category::Support => "support/revalidation",
         Category::NegativeReview => "negative review",
         Category::SegmentationCorrection => "segmentation correction",

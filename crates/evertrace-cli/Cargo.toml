@@ -13,7 +13,6 @@ evertrace-engine = { path = "../evertrace-engine" }
 evertrace-protocol = { path = "../evertrace-protocol" }
 evertrace-store = { path = "../evertrace-store" }
 evertrace-tui = { path = "../evertrace-tui" }
-evertrace-web = { path = "../evertrace-web" }
 serde_json.workspace = true
 tokio.workspace = true
 

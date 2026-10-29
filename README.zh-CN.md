@@ -60,7 +60,7 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`、`--tui` 或 `--web`。网页目前只读接入真实记忆列表、正文、来源关联、修订历史、同对象固定修订比较和连接状态；搜索、完整范围选择、长正文分块及其余页面仍未闭合。后端筛选/计数/keyset 已有实测，新网页控件仍是待验收的迁移工作。请勿分享终端打印的一次性登录链接。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。旧 Rust Web 与其未提交扩展已回撤，当前构建**尚无可用的 `--web` 入口**。此前的记忆/来源/修订和筛选计数验收只属历史，不代表当前能力；独立 Python Web 将按新计划重建，原一次性链接、会话、只读与安全义务保留。核心工作流仍按[宿主接入和第一条记忆验证](docs/getting-started.md)操作。
 
 ### Web 架构迁移
 

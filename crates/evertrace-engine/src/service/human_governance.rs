@@ -203,7 +203,6 @@ pub enum HumanObjectFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HumanItemCategory {
     Proposal,
-    ProposalRevision,
     Support,
     NegativeReview,
     SegmentationCorrection,
@@ -1628,7 +1627,8 @@ impl HumanGovernanceService {
         )
         .await
         .map_err(|_| HumanGovernanceError::InvalidInput)?;
-        let mut semantic_view = None;
+        let semantic_view = SemanticCurrentView::from_snapshot(&snapshot)
+            .map_err(|_| HumanGovernanceError::Store)?;
         let refs = match request.relation {
             HumanRelationKind::ObjectSources | HumanRelationKind::ObjectRevisions => {
                 if source.current_revision_id.as_deref()
@@ -1636,7 +1636,10 @@ impl HumanGovernanceService {
                 {
                     return Ok(Err((snapshot.frontier, source.current_revision_id.clone())));
                 }
-                if !is_memory_row(source) {
+                if !matches!(
+                    source.object_kind.as_deref(),
+                    Some("atom_revision" | "procedure_revision" | "core_membership")
+                ) {
                     return Err(HumanGovernanceError::InvalidInput);
                 }
                 if request.relation == HumanRelationKind::ObjectRevisions {
@@ -1665,9 +1668,7 @@ impl HumanGovernanceService {
                     .as_deref()
                     .and_then(|value| value.parse::<RevisionProposalId>().ok())
                     .ok_or(HumanGovernanceError::InvalidInput)?;
-                let view = SemanticCurrentView::from_snapshot(&snapshot)
-                    .map_err(|_| HumanGovernanceError::Store)?;
-                let current = view
+                let current = semantic_view
                     .proposals
                     .get(&proposal_id)
                     .ok_or(HumanGovernanceError::InvalidInput)?;
@@ -1682,14 +1683,12 @@ impl HumanGovernanceService {
                         Some(current.proposal_revision_id.to_string()),
                     )));
                 }
-                let refs = current
+                current
                     .evidence_refs
                     .iter()
                     .chain(&current.source_cohort_refs)
                     .cloned()
-                    .collect::<BTreeSet<_>>();
-                semantic_view = Some(view);
-                refs
+                    .collect::<BTreeSet<_>>()
             }
             HumanRelationKind::SupportDependencies => {
                 if support_validation(source)?.is_none() {
@@ -1716,16 +1715,6 @@ impl HumanGovernanceService {
         };
         let rows = related_rows(&snapshot, refs, request.after, usize::from(request.limit))?;
         let (selected, next_cursor) = rows;
-        if semantic_view.is_none()
-            && selected
-                .iter()
-                .any(|row| row.object_kind.as_deref() == Some("revision_proposal_revision"))
-        {
-            semantic_view = Some(
-                SemanticCurrentView::from_snapshot(&snapshot)
-                    .map_err(|_| HumanGovernanceError::Store)?,
-            );
-        }
         let usage_view = selected
             .iter()
             .any(|row| row.object_kind.as_deref() == Some("procedure_negative_review"))
@@ -1744,7 +1733,7 @@ impl HumanGovernanceService {
                     summary(
                         &snapshot,
                         row,
-                        semantic_view.as_ref(),
+                        Some(&semantic_view),
                         usage_view.as_ref(),
                         None,
                         HumanSurface::Explorer,
@@ -1753,92 +1742,6 @@ impl HumanGovernanceService {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             next_cursor,
-        }))
-    }
-
-    /// Read both immutable revisions in one snapshot, never substituting heads.
-    /// This is a presentation read: it creates no Recall, usage or journal facts.
-    pub async fn compare_revisions(
-        &self,
-        left_stable_key: &str,
-        left_revision_ref: &str,
-        right_stable_key: &str,
-        right_revision_ref: &str,
-        expected_frontier: u64,
-    ) -> Result<Result<HumanPage, (u64, Option<String>)>, HumanGovernanceError> {
-        if [
-            left_stable_key,
-            left_revision_ref,
-            right_stable_key,
-            right_revision_ref,
-        ]
-        .into_iter()
-        .any(|value| !valid_ref(value))
-            || left_stable_key == right_stable_key
-            || left_revision_ref == right_revision_ref
-        {
-            return Err(HumanGovernanceError::InvalidInput);
-        }
-        let snapshot = self
-            .writer
-            .project_objects()
-            .await
-            .map_err(|_| HumanGovernanceError::Store)?;
-        if snapshot.frontier < expected_frontier {
-            return Ok(Err((snapshot.frontier, None)));
-        }
-        let left = snapshot
-            .row(left_stable_key)
-            .ok_or(HumanGovernanceError::InvalidInput)?;
-        let right = snapshot
-            .row(right_stable_key)
-            .ok_or(HumanGovernanceError::InvalidInput)?;
-        if !is_memory_row(left)
-            || left.object_id.is_none()
-            || left.object_id != right.object_id
-            || left.object_kind != right.object_kind
-            || left.object_family != right.object_family
-        {
-            return Err(HumanGovernanceError::InvalidInput);
-        }
-        for (row, expected) in [(left, left_revision_ref), (right, right_revision_ref)] {
-            if row.current_revision_id.as_deref() != Some(expected) {
-                return Ok(Err((snapshot.frontier, row.current_revision_id.clone())));
-            }
-        }
-        let semantic_view = (left.object_kind.as_deref() == Some("revision_proposal_revision"))
-            .then(|| SemanticCurrentView::from_snapshot(&snapshot))
-            .transpose()
-            .map_err(|_| HumanGovernanceError::Store)?;
-        let mut items = [left, right]
-            .into_iter()
-            .map(|row| {
-                summary(
-                    &snapshot,
-                    row,
-                    semantic_view.as_ref(),
-                    None,
-                    None,
-                    HumanSurface::Explorer,
-                    false,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(semantic_view);
-        // Each side goes through the existing source/deletion/repository gate.
-        // Denied, missing and TooLarge remain explicit per-side states.
-        self.semantic_details(&snapshot, &mut items).await?;
-        // Snapshot wire pages have one canonical order. The reader identifies
-        // its left/right selections by exact refs, not response position.
-        items.sort_by(|left, right| left.stable_key.cmp(&right.stable_key));
-        let (status, degraded_reasons) = snapshot_status(&snapshot)?;
-        Ok(Ok(HumanPage {
-            frontier: snapshot.frontier,
-            status,
-            degraded_reasons,
-            items,
-            next_cursor: None,
-            diagnostics: None,
         }))
     }
 
@@ -4345,7 +4248,6 @@ fn memories_page(
                         return Err(HumanGovernanceError::Store);
                     };
                     result.proposal = Some(proposal_summary(&value));
-                    result.category = HumanItemCategory::Proposal;
                 }
             }
             Ok(result)
@@ -4381,19 +4283,6 @@ pub fn summarize_inbox_snapshot(
     )
 }
 
-fn is_memory_row(row: &ObjectRow) -> bool {
-    matches!(
-        row.object_kind.as_deref(),
-        Some(
-            "semantic_digest"
-                | "atom_revision"
-                | "procedure_revision"
-                | "core_membership"
-                | "revision_proposal_revision"
-        )
-    )
-}
-
 fn page_selected(
     snapshot: &ProjectionSnapshot,
     surface: HumanSurface,
@@ -4406,7 +4295,16 @@ fn page_selected(
     let mut rows = surface_rows(snapshot, surface)?;
     rows.retain(|row| match selection {
         None => true,
-        Some(HumanExplorerListSelection::Memories) => is_memory_row(row),
+        Some(HumanExplorerListSelection::Memories) => matches!(
+            row.object_kind.as_deref(),
+            Some(
+                "semantic_digest"
+                    | "atom_revision"
+                    | "procedure_revision"
+                    | "core_membership"
+                    | "revision_proposal_revision"
+            )
+        ),
         Some(HumanExplorerListSelection::Capture) => {
             row.object_kind.as_deref() == Some("source_observation")
         }
@@ -5208,11 +5106,6 @@ fn summary(
         proposal_base: None,
         evidence_detail,
         work_detail,
-        category: if proposal.is_some() {
-            HumanItemCategory::Proposal
-        } else {
-            human_item_category(surface, row)
-        },
         proposal,
         proposal_review,
         support_detail,
@@ -5984,7 +5877,7 @@ fn human_item_category(surface: HumanSurface, row: &ObjectRow) -> HumanItemCateg
                 HumanObjectFamily::Work => HumanItemCategory::Work,
                 HumanObjectFamily::Atom => HumanItemCategory::Semantic,
                 HumanObjectFamily::Procedure => HumanItemCategory::Procedure,
-                HumanObjectFamily::RevisionProposal => HumanItemCategory::ProposalRevision,
+                HumanObjectFamily::RevisionProposal => HumanItemCategory::Proposal,
                 HumanObjectFamily::Runtime => HumanItemCategory::Runtime,
                 HumanObjectFamily::Projection => HumanItemCategory::Projection,
             },

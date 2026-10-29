@@ -447,15 +447,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let maintenance_active = Arc::clone(&handler_maintenance_active);
             let dispatch_gate = Arc::clone(&handler_dispatch_gate);
             async move {
-                if context.client_kind == ClientKind::Web
-                    && (!matches!(
-                        &command,
-                        ProtocolCommand::Health
-                            | ProtocolCommand::HumanGovernance(HumanGovernanceRequest::Read { .. })
-                    ) || context.peer_credentials.is_none())
-                {
-                    return Err(ErrorCode::Untrusted);
-                }
                 let observation_deadline = match &command {
                     ProtocolCommand::ObserveSessionSource(observation) => {
                         if context.client_kind != ClientKind::Hook || !observation.validate() {
@@ -832,10 +823,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     ProtocolCommand::HumanGovernance(command) => {
-                        if context.client_kind != ClientKind::Cli
-                            && !(context.client_kind == ClientKind::Web
-                                && matches!(&command, HumanGovernanceRequest::Read { .. }))
-                        {
+                        if context.client_kind != ClientKind::Cli {
                             return Err(ErrorCode::Untrusted);
                         }
                         if !command.validate() {
@@ -918,20 +906,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     },
-                                HumanReadRequest::Compare { left, right, expected_frontier } => match human_governance
-                                    .compare_revisions(
-                                        &left.stable_key, &left.revision_ref,
-                                        &right.stable_key, &right.revision_ref,
-                                        expected_frontier,
-                                    )
-                                    .await
-                                    .map_err(map_human_error)?
-                                {
-                                    Ok(page) => map_human_page(page),
-                                    Err((current_frontier, current_revision_ref)) => HumanGovernanceResponse::Conflict {
-                                        current_frontier, current_revision_ref,
-                                    },
-                                },
                                 HumanReadRequest::Related {
                                     relation,
                                     source_stable_key,
@@ -1504,7 +1478,6 @@ fn map_semantic_detail(
         content: detail.content.map(|content| match content {
             evertrace_engine::HumanSemanticContent::Digest(value) => Content::Digest(value),
             evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),
-            evertrace_engine::HumanSemanticContent::Proposal(value) => Content::Proposal(value),
             evertrace_engine::HumanSemanticContent::Procedure(value) => Content::Procedure(value),
             evertrace_engine::HumanSemanticContent::CoreMembership(value) => {
                 Content::CoreMembership(value)
@@ -2176,7 +2149,6 @@ fn map_human_object_family(value: EngineHumanObjectFamily) -> HumanObjectFamily 
 fn map_human_item_category(value: EngineHumanItemCategory) -> HumanItemCategory {
     match value {
         EngineHumanItemCategory::Proposal => HumanItemCategory::Proposal,
-        EngineHumanItemCategory::ProposalRevision => HumanItemCategory::ProposalRevision,
         EngineHumanItemCategory::Support => HumanItemCategory::Support,
         EngineHumanItemCategory::NegativeReview => HumanItemCategory::NegativeReview,
         EngineHumanItemCategory::SegmentationCorrection => {

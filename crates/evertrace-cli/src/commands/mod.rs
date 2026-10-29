@@ -8,7 +8,6 @@ mod install;
 mod mcp;
 mod restore;
 mod tui;
-mod web;
 
 use std::error::Error;
 
@@ -22,7 +21,6 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         }
         Command::ConfigCheck => config::check(args.config),
         Command::Daemon { maintenance } => daemon::run(args.config, maintenance).await,
-        Command::Web { port } => web::run(args.config, port).await,
         Command::ConfigShowEffective => config::show_effective(args.config),
         Command::ConfigReload { socket } => config::reload(args.config, socket).await,
         Command::Doctor { refresh_host } => doctor::run(args.config, refresh_host).await,

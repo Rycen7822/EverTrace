@@ -48,7 +48,6 @@ pub enum ClientKind {
     Cli,
     Hook,
     Mcp,
-    Web,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,11 +117,6 @@ pub enum HumanReadRequest {
         expected_frontier: u64,
         expected_revision_ref: Option<String>,
     },
-    Compare {
-        left: HumanRevisionSelection,
-        right: HumanRevisionSelection,
-        expected_frontier: u64,
-    },
     Related {
         relation: HumanRelationKind,
         source_stable_key: String,
@@ -131,13 +125,6 @@ pub enum HumanReadRequest {
         after: Option<String>,
         limit: u16,
     },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanRevisionSelection {
-    pub stable_key: String,
-    pub revision_ref: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -340,7 +327,6 @@ pub enum HumanObjectFamily {
 #[serde(rename_all = "snake_case")]
 pub enum HumanItemCategory {
     Proposal,
-    ProposalRevision,
     Support,
     NegativeReview,
     SegmentationCorrection,
@@ -963,14 +949,6 @@ impl HumanReadRequest {
                 expected_revision_ref,
                 ..
             } => valid_ref(object_ref) && expected_revision_ref.as_deref().is_none_or(valid_ref),
-            Self::Compare { left, right, .. } => {
-                valid_ref(&left.stable_key)
-                    && valid_ref(&left.revision_ref)
-                    && valid_ref(&right.stable_key)
-                    && valid_ref(&right.revision_ref)
-                    && left.stable_key != right.stable_key
-                    && left.revision_ref != right.revision_ref
-            }
             Self::Related {
                 source_stable_key,
                 expected_source_revision_ref,
@@ -1230,7 +1208,6 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
-    Proposal(Box<evertrace_domain::semantic::RevisionProposal>),
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
@@ -1303,12 +1280,6 @@ impl HumanSemanticDetail {
                         == Some(value.core_membership_id.to_string().as_str())
                     && self.revision_ref.as_deref()
                         == Some(value.membership_revision_id.to_string().as_str())
-            }
-            HumanSemanticContent::Proposal(value) => {
-                value.validate().is_ok()
-                    && self.object_ref.as_deref() == Some(value.proposal_id.to_string().as_str())
-                    && self.revision_ref.as_deref()
-                        == Some(value.proposal_revision_id.to_string().as_str())
             }
         };
         valid_identity
@@ -2081,12 +2052,6 @@ fn category_matches(item: &HumanSnapshotItem) -> bool {
         Category::Proposal => {
             item.item_kind == HumanItemKind::RevisionProposal
                 && item.object_kind == "revision_proposal_revision"
-        }
-        Category::ProposalRevision => {
-            item.item_kind == HumanItemKind::Generic
-                && item.object_kind == "revision_proposal_revision"
-                && item.proposal.is_none()
-                && item.proposal_review.is_none()
         }
         Category::Support => matches!(
             item.object_kind.as_str(),

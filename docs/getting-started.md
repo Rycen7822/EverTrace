@@ -8,9 +8,9 @@
 
 The current implementation targets Linux: Unix domain sockets and Linux-specific filesystem safety are part of the design. In WSL2 use the Linux filesystem and check user-service availability. Native Windows/macOS support is not claimed here. Run as your normal user; do not place the data root on cloud-sync/network storage or share it between writers.
 
-源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。Lance 的构建脚本需要 Protocol Buffers 编译器；只安装 Rust 不够。Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`；按自己的发行版安装。运行已编译的非 Web 核心程序不需要 Conda/Python。Web 正从 Rust 内嵌实现迁移为独立 Python 组件，尚未完成切换；迁移后仅 `--web` 按需使用隔离 Python 环境，不把 Python 变成核心入口依赖，不自动安装 Web 依赖。
+源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。Lance 的构建脚本需要 Protocol Buffers 编译器；只安装 Rust 不够。Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`；按自己的发行版安装。运行已编译的非 Web 核心程序不需要 Conda/Python。旧 Rust Web 已回撤，当前尚无 `--web`；新的独立 Python 组件尚未建立。迁移后仅 `--web` 按需使用隔离 Python 环境，不把 Python 变成核心入口依赖，不自动安装 Web 依赖。
 
-A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`. Lance build scripts require the Protocol Buffers compiler. Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution. Non-Web core binaries do not require Conda/Python. The embedded Rust Web implementation is being migrated to a separate Python component; cutover is incomplete. Only `--web` will start its isolated Python runtime, without making Python a core-mode dependency or silently installing Web dependencies.
+A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`. Lance build scripts require the Protocol Buffers compiler. Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution. Non-Web core binaries do not require Conda/Python. The old Rust Web has been rolled back; the current build has no `--web` implementation, and the new independent Python component is not implemented yet. Only `--web` will start its isolated Python runtime, without making Python a core-mode dependency or silently installing Web dependencies.
 
 ```sh
 git --version
@@ -77,9 +77,9 @@ daemon 启动会创建本地运行数据。这一步没有接入宿主，空数�
 
 Starting the daemon creates local runtime data. Host integration has not happened yet: an empty instance and `host_canary=not_run` are expected. `q` closes the TUI, not the daemon; Ctrl-C in the daemon terminal requests shutdown. Never start a second writer on the same data directory.
 
-也可以保留 daemon 终端，在另一个终端打开只读网页入口：
+下面仅列出新计划的 Web 目标入口：旧 Rust Web 已回撤，当前命令尚不可用，不作为本节已验证操作。
 
-Keep the daemon running and open the read-only browser interface from another terminal:
+The following is the planned Web entry, not a working step in the rolled-back current build:
 
 ```sh
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --web

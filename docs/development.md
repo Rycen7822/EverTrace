@@ -14,9 +14,9 @@ Read the deciding caller, implementation and consumer before editing behavior. S
 
 ## 独立 Web 工程（迁移中） / Independent Web component (migration)
 
-Web 目标工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 尚未移除，不把规划路径当成已存在的可运行包。
+Web 目标工程为 `webui/`：Python 3.12+ 负责 HTTP/session、页面控制/模板与窄 UDS 适配，HTML/CSS/字体和必要 JavaScript 外置。Rust 核心保留领域、配置、协议和单 writer；Python 不直开数据库/CAS，不加载 Engine/Store FFI。旧 Rust Web 与 G3 未提交实现已回撤，保留已验收 CLI；独立 Python Web 尚未建立，不把规划路径或历史日志当成当前可运行包。
 
-The target `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation has not yet been removed.
+The target `webui/` component owns Python HTTP/session/presentation and a narrow UDS client, with separate templates/static assets. Rust retains business, config, protocol and writer authority; no Python database/CAS access or Engine/Store FFI. The Rust Web implementation and uncommitted G3 work have been rolled back; Python Web does not exist yet. Historical acceptance logs are not current capabilities.
 
 Web 修改不应要求 Cargo。精确 uv/entry/lock 命令在实际组件存在且通过验证后记录；仓库 Python/uv/pytest 都在 Conda `test` 中运行，产品不依赖 Conda。仅显式 `--web` 启动一个前台 worker，无 reload/watch/preload；普通 Rust 入口不探测/导入 Web。覆盖未启动、等量真实工作、退出回收的进程与 PSS/RSS/CPU，不按二进制大小猜内存。
 

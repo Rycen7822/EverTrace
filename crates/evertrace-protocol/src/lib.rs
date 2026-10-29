@@ -329,11 +329,6 @@ where
         .await;
         return Err(ProtocolError::InvalidNegotiation);
     }
-    if handshake.client_kind == dto::ClientKind::Web
-        && stream.peer_cred().map_err(ProtocolError::Identity)?.uid() != effective_uid()?
-    {
-        return Err(ProtocolError::IdentityUnavailable);
-    }
     let negotiated_max = handshake.max_frame.min(MAX_FRAME_SIZE as u32);
     let connection_context = dto::ConnectionContext {
         connection_id,
@@ -620,37 +615,16 @@ impl LocalClient {
         if !valid_build_id(&build_id) {
             return Err(ProtocolError::InvalidBuildId);
         }
-        // Browser clients require the existing private runtime/socket boundary
-        // without creating directories or following a replaced socket.
-        let web_identity = if client_kind == dto::ClientKind::Web {
-            let runtime = socket_path.parent().ok_or(ProtocolError::InvalidSocket)?;
-            checked_runtime_metadata(
-                &fs::symlink_metadata(runtime).map_err(ProtocolError::Inspect)?,
-            )?;
-            let data = runtime
-                .parent()
-                .ok_or(ProtocolError::InvalidRuntimeDirectory)?;
-            checked_runtime_metadata(&fs::symlink_metadata(data).map_err(ProtocolError::Inspect)?)?;
-            Some(socket_identity(&checked_socket_metadata(socket_path)?))
-        } else {
-            None
-        };
         let mut stream = timeout(frame_timeout, UnixStream::connect(socket_path))
             .await
             .map_err(|_| ProtocolError::Timeout)?
             .map_err(ProtocolError::Connect)?;
-        if let Some(identity) = web_identity
-            && (stream.peer_cred().map_err(ProtocolError::Identity)?.uid() != effective_uid()?
-                || socket_identity(&checked_socket_metadata(socket_path)?) != identity)
-        {
-            return Err(ProtocolError::SocketReplaced);
-        }
         write_frame(
             &mut stream,
             &ClientEnvelope::Handshake(handshake::Handshake {
                 protocol_version: PROTOCOL_VERSION,
                 client_kind,
-                build_id: build_id.clone(),
+                build_id,
                 max_frame: MAX_FRAME_SIZE as u32,
             }),
             MAX_FRAME_SIZE,
@@ -663,8 +637,7 @@ impl LocalClient {
                     if ack.protocol_version == PROTOCOL_VERSION
                         && ack.max_frame != 0
                         && ack.max_frame <= MAX_FRAME_SIZE as u32
-                        && valid_build_id(&ack.build_id)
-                        && (client_kind != dto::ClientKind::Web || ack.build_id == build_id) =>
+                        && valid_build_id(&ack.build_id) =>
                 {
                     ack.max_frame as usize
                 }
