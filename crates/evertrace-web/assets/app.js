@@ -219,11 +219,12 @@ async function readView(view, scroll = view.scroll || 0) {
     if (data.status !== 'ready') notice(`当前数据不完整：${clean(data.degraded_reasons.join('、'))}`);
     if (view.kind === 'related') renderRelated(data, view);
     else if (view.kind === 'compare') {
-      if (data.items.length !== 2 || data.items.some((item, index) => item.stable_key !== [view.left, view.right][index].stable_key || item.revision_ref !== [view.left, view.right][index].revision_ref)) throw new Error('comparison mismatch');
+      const items = [view.left, view.right].map(ref => data.items.find(item => item.stable_key === ref.stable_key && item.revision_ref === ref.revision_ref));
+      if (data.items.length !== 2 || items.some(item => !item)) throw new Error('comparison mismatch');
       const body = $('detail-body'); body.replaceChildren(node('h2', '两个固定修订的并排比较'));
-      body.append(node('p', '按记录中的字段比较，不判断哪一份更可信。不可读或超限的一侧不会用空正文或当前版本代替。'), renderDifferences(data.items));
+      body.append(node('p', '按记录中的字段比较，不判断哪一份更可信。不可读或超限的一侧不会用空正文或当前版本代替。'), renderDifferences(items));
       const grid = node('div', undefined, 'revision-comparison');
-      for (const [index, item] of data.items.entries()) {
+      for (const [index, item] of items.entries()) {
         const card = node('section'); card.append(section(index ? '右侧修订' : '左侧修订', item.revision_ref, true));
         const detail = node('div'); renderDetail(item, detail); card.append(detail);
         if (item.semantic_detail?.state === 'ready' && item.semantic_detail.content) {

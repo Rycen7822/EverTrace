@@ -203,6 +203,7 @@ pub enum HumanObjectFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HumanItemCategory {
     Proposal,
+    ProposalRevision,
     Support,
     NegativeReview,
     SegmentationCorrection,
@@ -1827,6 +1828,9 @@ impl HumanGovernanceService {
         // Each side goes through the existing source/deletion/repository gate.
         // Denied, missing and TooLarge remain explicit per-side states.
         self.semantic_details(&snapshot, &mut items).await?;
+        // Snapshot wire pages have one canonical order. The reader identifies
+        // its left/right selections by exact refs, not response position.
+        items.sort_by(|left, right| left.stable_key.cmp(&right.stable_key));
         let (status, degraded_reasons) = snapshot_status(&snapshot)?;
         Ok(Ok(HumanPage {
             frontier: snapshot.frontier,
@@ -4341,6 +4345,7 @@ fn memories_page(
                         return Err(HumanGovernanceError::Store);
                     };
                     result.proposal = Some(proposal_summary(&value));
+                    result.category = HumanItemCategory::Proposal;
                 }
             }
             Ok(result)
@@ -5203,6 +5208,11 @@ fn summary(
         proposal_base: None,
         evidence_detail,
         work_detail,
+        category: if proposal.is_some() {
+            HumanItemCategory::Proposal
+        } else {
+            human_item_category(surface, row)
+        },
         proposal,
         proposal_review,
         support_detail,
@@ -5974,7 +5984,7 @@ fn human_item_category(surface: HumanSurface, row: &ObjectRow) -> HumanItemCateg
                 HumanObjectFamily::Work => HumanItemCategory::Work,
                 HumanObjectFamily::Atom => HumanItemCategory::Semantic,
                 HumanObjectFamily::Procedure => HumanItemCategory::Procedure,
-                HumanObjectFamily::RevisionProposal => HumanItemCategory::Proposal,
+                HumanObjectFamily::RevisionProposal => HumanItemCategory::ProposalRevision,
                 HumanObjectFamily::Runtime => HumanItemCategory::Runtime,
                 HumanObjectFamily::Projection => HumanItemCategory::Projection,
             },

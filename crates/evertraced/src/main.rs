@@ -2176,6 +2176,7 @@ fn map_human_object_family(value: EngineHumanObjectFamily) -> HumanObjectFamily 
 fn map_human_item_category(value: EngineHumanItemCategory) -> HumanItemCategory {
     match value {
         EngineHumanItemCategory::Proposal => HumanItemCategory::Proposal,
+        EngineHumanItemCategory::ProposalRevision => HumanItemCategory::ProposalRevision,
         EngineHumanItemCategory::Support => HumanItemCategory::Support,
         EngineHumanItemCategory::NegativeReview => HumanItemCategory::NegativeReview,
         EngineHumanItemCategory::SegmentationCorrection => {

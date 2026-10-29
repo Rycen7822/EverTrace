@@ -312,7 +312,7 @@ async fn handle(request: Request<Incoming>, bridge: &Bridge) -> Reply {
         Ok(DaemonResponse::HumanGovernance(
             body @ (HumanGovernanceResponse::Snapshot { .. }
             | HumanGovernanceResponse::Conflict { .. }),
-        )) => json_reply(StatusCode::OK, &body),
+        )) if body.validate() => json_reply(StatusCode::OK, &body),
         Err(ProtocolError::Wire(ErrorCode::InvalidInput)) => {
             error(StatusCode::BAD_REQUEST, "invalid_read")
         }

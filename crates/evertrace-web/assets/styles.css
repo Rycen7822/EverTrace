@@ -656,8 +656,8 @@ dialog::backdrop{background:#00000066}
 
 /* Live transport state must not be overridden by the frozen layout rules. */
 [hidden]{display:none!important}
-.detail-body .memory-prose{white-space:pre-wrap;overflow-wrap:anywhere}
-.detail-body pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.detail-body{overflow-wrap:anywhere}
+.detail-body .memory-prose,.detail-body pre{white-space:pre-wrap}
 .memory-item h3{overflow-wrap:anywhere}
 .detail-toolbar{flex-wrap:wrap;gap:10px}
 .detail-actions{display:flex;flex-wrap:wrap;gap:12px}
