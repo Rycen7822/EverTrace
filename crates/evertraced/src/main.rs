@@ -447,6 +447,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let maintenance_active = Arc::clone(&handler_maintenance_active);
             let dispatch_gate = Arc::clone(&handler_dispatch_gate);
             async move {
+                if context.client_kind == ClientKind::Web
+                    && (!matches!(
+                        &command,
+                        ProtocolCommand::Health
+                            | ProtocolCommand::HumanGovernance(HumanGovernanceRequest::Read { .. })
+                    ) || context.peer_credentials.is_none())
+                {
+                    return Err(ErrorCode::Untrusted);
+                }
                 let observation_deadline = match &command {
                     ProtocolCommand::ObserveSessionSource(observation) => {
                         if context.client_kind != ClientKind::Hook || !observation.validate() {
@@ -823,7 +832,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }))
                     }
                     ProtocolCommand::HumanGovernance(command) => {
-                        if context.client_kind != ClientKind::Cli {
+                        if context.client_kind != ClientKind::Cli
+                            && !(context.client_kind == ClientKind::Web
+                                && matches!(&command, HumanGovernanceRequest::Read { .. }))
+                        {
                             return Err(ErrorCode::Untrusted);
                         }
                         if !command.validate() {

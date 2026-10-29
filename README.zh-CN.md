@@ -27,7 +27,7 @@ EverTrace 将获准采集的活动保存为可追溯的证据，在后台生成�
 |---|---|
 | [安装与首次使用](docs/getting-started.md) | 环境要求、编译、首次启动、宿主接入 |
 | [配置说明](docs/configuration.md) | 路径、模型凭据、预算、热重载 |
-| [使用方法](docs/usage.md) | 记忆流程、MCP 示例、TUI、会话导入 |
+| [使用方法](docs/usage.md) | 记忆流程、本机只读网页、MCP、TUI、会话导入 |
 | [运维与隐私](docs/operations.md) | 数据处理、备份、恢复、升级、卸载 |
 | [故障排查](docs/troubleshooting.md) | 没有记忆、能力关闭、服务和编译错误 |
 | [架构与能力边界](docs/architecture.md) | 模块职责、证据含义与未交付能力 |
@@ -60,7 +60,7 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` 或 `--tui`。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`、`--tui` 或 `--web`。网页目前只读接入真实记忆列表、正文和连接状态，其余页面会说明未接入。请勿分享终端打印的一次性登录链接。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
 
 不要以 root 身份运行安装命令。安装会修改受管宿主配置，并可能启用用户服务；它是单独的一步，不包含在上述命令中。
 

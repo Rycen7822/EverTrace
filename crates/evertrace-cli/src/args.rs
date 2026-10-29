@@ -12,6 +12,9 @@ pub enum Command {
     Daemon {
         maintenance: bool,
     },
+    Web {
+        port: Option<u16>,
+    },
     ConfigCheck,
     ConfigShowEffective,
     ConfigReload {
@@ -118,6 +121,21 @@ impl Args {
             b"--help" => Command::Help,
             b"--daemon" => Command::Daemon {
                 maintenance: trailing_flag(&mut values, "--maintenance")?,
+            },
+            b"--web" => Command::Web {
+                port: match values.next() {
+                    None => None,
+                    Some(flag) if flag == "--port" => Some(
+                        values
+                            .next()
+                            .and_then(|value| value.to_str()?.parse::<u16>().ok())
+                            .filter(|port| *port != 0)
+                            .ok_or(ParseError::Rejected(
+                                "--web --port requires a port from 1 to 65535",
+                            ))?,
+                    ),
+                    _ => return Err(ParseError::Usage),
+                },
             },
             b"--tui" => Command::Tui,
             b"--config-check" => Command::ConfigCheck,
@@ -367,6 +385,7 @@ Modes:
   --daemon [--maintenance]
       Run the evertraced of this installation package in the foreground. This
       process is replaced by that program and keeps its signals and exit status.
+  --web [--port PORT]
   --tui
   --doctor [--refresh-host HOST_EXECUTABLE]
   --config-check

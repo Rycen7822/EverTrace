@@ -12,6 +12,28 @@ Normal work → permitted capture/import → background summaries. Method propos
 
 Summaries require supported records with body permission. Record existence, queued import, completed summary, returned content and proven method effectiveness are different states. Review requires new source evidence and budget; restarting does not supply missing facts.
 
+## 本机网页 / Local WebUI
+
+先启动同一构建的 daemon，再在另一终端运行：
+
+Start the matching daemon first, then use a separate terminal:
+
+```sh
+evertrace --config /absolute/config.toml --daemon
+# 另一个终端 / Separate terminal:
+evertrace --config /absolute/config.toml --web
+# 可选固定端口 / Optional fixed port:
+evertrace --config /absolute/config.toml --web --port 4173
+```
+
+打开终端打印的 `http://127.0.0.1:PORT/#bootstrap=...` 链接。它是两分钟内有效的一次性登录凭据，请勿分享或写进日志。服务只监听本机；不自动启动 daemon，不安装宿主接线。Ctrl-C 关闭网页桥接，不停止 daemon。
+
+Open the printed loopback URL. Its fragment is a single-use login credential valid for two minutes: do not share or log it. The bridge listens locally only, never starts a daemon or installs host wiring, and Ctrl-C closes the bridge without stopping the daemon.
+
+当前网页已接入真实记忆列表、正文、分页和连接状态，**只读**。搜索、范围筛选及其余业务页面尚未接入；未接入的页面不会显示样例。正文按文本显示，网页会话不将记忆存入 localStorage、IndexedDB 或离线缓存。会话空闲 15 分钟或满 8 小时后失效；可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
+
+The WebUI currently provides real memory lists, details, pagination and connection status, **read-only**. Search, scope filters and other business pages are not connected yet; they do not fall back to samples. Content is rendered as text without browser database/offline persistence. Sessions expire after 15 idle minutes or eight hours total, or explicitly through the sidebar. This is local HTTP, not TLS or protection against a malicious process running as the same OS user.
+
 ## CLI 与 MCP 的区别 / CLI versus MCP
 
 `evertrace --help` 是当前 CLI 参数真源。CLI 以互斥的 `--xxx` 模式提供配置、诊断、安装、管理、备份和 TUI 等入口；旧顶层子命令已停止接受。无参数只显示帮助，不启动服务。**没有 `evertrace search` 或 `evertrace get` 子命令**。search/get 是 MCP 工具的 action。

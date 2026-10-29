@@ -48,6 +48,7 @@ pub enum ClientKind {
     Cli,
     Hook,
     Mcp,
+    Web,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

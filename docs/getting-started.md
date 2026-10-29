@@ -75,6 +75,18 @@ daemon 启动会创建本地运行数据。这一步没有接入宿主，空数�
 
 Starting the daemon creates local runtime data. Host integration has not happened yet: an empty instance and `host_canary=not_run` are expected. `q` closes the TUI, not the daemon; Ctrl-C in the daemon terminal requests shutdown. Never start a second writer on the same data directory.
 
+也可以保留 daemon 终端，在另一个终端打开只读网页入口：
+
+Keep the daemon running and open the read-only browser interface from another terminal:
+
+```sh
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --web
+```
+
+使用打印的一次性本机链接，不要分享该凭据。此版本网页只接入记忆列表、正文和连接状态，其余页面会说明未接入；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
+
+Use the printed one-time local link and keep it private. The current WebUI exposes memory lists, details and connection status only; unconnected pages say so. Existing memory can be read with LLM processing off. See [Usage](usage.md#本机网页--local-webui) for access and session limits.
+
 ## 5. 启用后台模型 / Enable background model processing
 
 先按[配置说明](configuration.md)选择服务地址、模型、凭据环境变量和预算。保持现有其他配置，仅修改 `[llm]`；不要把 API key 写进仓库。前台启动 daemon 时，其进程必须能读到所配置的密钥环境变量。

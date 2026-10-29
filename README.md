@@ -29,7 +29,7 @@ The guides are bilingual; command blocks are shared between Chinese and English 
 |---|---|
 | [Getting started](docs/getting-started.md) | Requirements, build, first launch, host integration |
 | [Configuration](docs/configuration.md) | Paths, model credentials, budgets, reload |
-| [Usage](docs/usage.md) | Memory workflow, MCP examples, TUI, session import |
+| [Usage](docs/usage.md) | Memory workflow, local read-only WebUI, MCP, TUI, session import |
 | [Operations and privacy](docs/operations.md) | Data handling, backup, restore, upgrade, uninstall |
 | [Troubleshooting](docs/troubleshooting.md) | Missing memory, disabled gates, service and build failures |
 | [Architecture and limitations](docs/architecture.md) | Component responsibilities and actual capability boundaries |
@@ -62,7 +62,7 @@ Check that LLM processing is disabled; an existing file was not replaced. Then s
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` or `--tui`. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
+In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`, `--tui` or `--web`. The WebUI currently connects real memory lists/details and daemon status, read-only; other pages remain unavailable. Keep its printed one-time login URL private. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
 
 ### Installation package
 
