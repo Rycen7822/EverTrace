@@ -14,22 +14,22 @@ Summaries require supported records with body permission. Record existence, queu
 
 ## CLI 与 MCP 的区别 / CLI versus MCP
 
-`evertrace --help` 是当前 CLI 参数真源。CLI 提供配置、诊断、安装、管理、备份和 TUI 等入口；**没有 `evertrace search` 或 `evertrace get` 子命令**。search/get 是 MCP 工具的 action。
+`evertrace --help` 是当前 CLI 参数真源。CLI 以互斥的 `--xxx` 模式提供配置、诊断、安装、管理、备份和 TUI 等入口；旧顶层子命令已停止接受。无参数只显示帮助，不启动服务。**没有 `evertrace search` 或 `evertrace get` 子命令**。search/get 是 MCP 工具的 action。
 
-Use `evertrace --help` for CLI arguments. The CLI handles configuration, diagnostics, installation, administration, backup and TUI. **There are no `evertrace search` or `evertrace get` CLI subcommands**; these are actions on the MCP tool.
+Use `evertrace --help` for CLI arguments. Mutually exclusive `--xxx` modes handle configuration, diagnostics, installation, administration, backup and TUI. Retired top-level subcommands are rejected; no arguments prints help without starting a service. **There are no `evertrace search` or `evertrace get` CLI subcommands**; these are actions on the MCP tool.
 
-`--config PATH` 必须放在子命令之前；CLI、daemon 和 MCP 应使用同一配置，避免连接到不同数据目录。`config check` 只校验文件，`config show --effective` 只展示该文件合并默认值后的结果，不代表 daemon 当前活动配置或模型连通性。
+`--config PATH` 必须放在顶层模式之前；CLI、daemon 和 MCP 应使用同一配置，避免连接到不同数据目录。`--config-check` 只校验文件，`--config-show` 只展示该文件合并默认值后的结果，不代表 daemon 当前活动配置或模型连通性。
 
-Put `--config PATH` before the command, and use the same configuration for the CLI, daemon and MCP so they resolve the same data root. `config check` validates the file; `config show --effective` shows that file plus defaults, not the daemon's active configuration or provider connectivity.
+Put `--config PATH` before the top-level mode, and use the same configuration for the CLI, daemon and MCP so they resolve the same data root. `--config-check` validates the file; `--config-show` shows that file plus defaults, not the daemon's active configuration or provider connectivity.
 
 ```sh
-evertrace --config /absolute/config.toml config check
-evertrace --config /absolute/config.toml config show --effective
+evertrace --config /absolute/config.toml --config-check
+evertrace --config /absolute/config.toml --config-show
 ```
 
-新安装器生成的接线使用独立的 `evertrace-mcp --config PATH mcp ...`；通用入口 `evertrace --config PATH mcp ...` 仍存在，旧接线由安装/升级流程验证处理。独立程序也需要 `mcp` 子命令，不能用它运行 `doctor`、`tui` 等通用 CLI 操作；命令帮助仍查看 `evertrace --help`。当前安装包需要四个同版本程序，见 [README 的程序清单](../README.md#installation-package)，不要沿用只复制三个程序的旧示例。
+新安装器生成的接线使用独立的 `evertrace-mcp --config PATH --mcp ...`；通用入口 `evertrace --config PATH --mcp ...` 仍存在，旧接线由安装/升级流程验证处理。独立程序只接受 `--mcp` 模式，不能用它运行 `--doctor`、`--tui` 等通用 CLI 操作；命令帮助仍查看 `evertrace --help`。当前安装包需要四个同版本程序，见 [README 的程序清单](../README.md#installation-package)，不要沿用只复制三个程序的旧示例。
 
-New installer-managed wiring uses `evertrace-mcp --config PATH mcp ...`. The general `evertrace --config PATH mcp ...` entry point remains; installation/upgrade validates existing wiring. The dedicated program still needs the `mcp` subcommand and does not provide general CLI operations such as `doctor` or `tui`; use `evertrace --help` for command help. Current packages require four matching programs; see the [README package list](../README.md#installation-package), not older three-program copy examples.
+New installer-managed wiring uses `evertrace-mcp --config PATH --mcp ...`. The general `evertrace --config PATH --mcp ...` entry point remains; installation/upgrade validates existing wiring. The dedicated program accepts only the `--mcp` mode and does not provide general CLI operations such as `--doctor` or `--tui`; use `evertrace --help` for command help. Current packages require four matching programs; see the [README package list](../README.md#installation-package), not older three-program copy examples.
 
 两者都是 stdio MCP 传输，通过本地 UDS 联系 daemon，不监听公开 TCP，也不会替你启动 daemon。加载配置后等待 stdin 输入是正常行为，不是聊天提示符；宿主能发现工具也不证明 daemon 已连接、绑定有效或读取获准。优先使用安装器生成的完整接线，不手改程序路径、删除宿主定位参数，或伪造绑定标识与 claim。
 
@@ -86,7 +86,7 @@ Without a reliable current binding, use an actual repository/worktree ID or an e
 ## 终端界面 / Terminal UI
 
 ```sh
-evertrace --config /absolute/config.toml tui
+evertrace --config /absolute/config.toml --tui
 ```
 
 三个主要页面：Inbox 查看待治理的提议；Explorer 浏览来源和对象、详情与关联；System 查看 daemon、配置、后台 job、备份和诊断。显示为空时先刷新，再检查来源许可和任务状态，不猜造对象。
@@ -137,8 +137,8 @@ Use the footer and actions supported by the selected object; keys differ in edit
 Metadata backfill is not automatic permission to import/upload every historical body. Find the actual session and source access state in System/Explorer. For explicit import/revocation:
 
 ```sh
-evertrace --config /absolute/config.toml admin session queue SESSION_ID
-evertrace --config /absolute/config.toml admin session revoke SESSION_ID
+evertrace --config /absolute/config.toml --admin session queue SESSION_ID
+evertrace --config /absolute/config.toml --admin session revoke SESSION_ID
 ```
 
 请求仍受来源、路径、信任和并发/大小限制；queue 是提交，不是完成。revoke 不是删除原始宿主会话文件。查看 System 的最终 job 和诊断。
@@ -148,9 +148,9 @@ Requests remain subject to source/path/trust/concurrency/size checks. Queueing i
 仓库管理命令的 ID、revision、worktree 和可选 inventory job 必须来自当前状态： / Repository administration requires IDs, revisions, worktrees and optional inventory jobs from current state:
 
 ```sh
-evertrace --config /absolute/config.toml admin repository disable REPOSITORY_ID REVISION
-evertrace --config /absolute/config.toml admin repository enable REPOSITORY_ID REVISION WORKTREE_ID
-evertrace --config /absolute/config.toml admin repository rescan REPOSITORY_ID REVISION WORKTREE_ID INVENTORY_JOB_ID
+evertrace --config /absolute/config.toml --admin repository disable REPOSITORY_ID REVISION
+evertrace --config /absolute/config.toml --admin repository enable REPOSITORY_ID REVISION WORKTREE_ID
+evertrace --config /absolute/config.toml --admin repository rescan REPOSITORY_ID REVISION WORKTREE_ID INVENTORY_JOB_ID
 ```
 
 disable/enable/rescan 不等于 Forget 或物理 purge，也不自动授予宿主未给出的信任。删除、导出和维护的区别见[运维与隐私](operations.md)。

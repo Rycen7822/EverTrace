@@ -44,7 +44,7 @@ From the repository root:
 ```sh
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo +1.97.1 build --locked -p evertrace-cli -p evertraced -p evertrace-hook
 ./target/debug/evertrace --help
-./target/debug/evertrace --config docs/examples/evertrace.local.toml config check
+./target/debug/evertrace --config docs/examples/evertrace.local.toml --config-check
 ```
 
 Copy the [LLM-off trial configuration](docs/examples/evertrace.local.toml) to your own configuration directory before starting a daemon. Do not overwrite an existing configuration. That example uses a separate `evertrace-trial` data directory.
@@ -53,16 +53,16 @@ Copy the [LLM-off trial configuration](docs/examples/evertrace.local.toml) to yo
 umask 077
 mkdir -p "$HOME/.evertrace"
 cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
-./target/debug/evertrace --config "$HOME/.evertrace/config.toml" config show --effective
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --config-show
 ```
 
 Check that LLM processing is disabled; an existing file was not replaced. Then start the daemon:
 
 ```sh
-./target/debug/evertraced --config "$HOME/.evertrace/config.toml"
+./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" doctor` or `tui`. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
+In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` or `--tui`. An empty installation has no memories yet. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) before expecting automatic collection and summaries.
 
 ### Installation package
 
@@ -70,8 +70,8 @@ The build command above produces four executables in `target/debug/`:
 
 | Program | Purpose |
 |---|---|
-| `evertrace` | General CLI, diagnostics, administration and TUI; also retains the `mcp` entry point. |
-| `evertrace-mcp` | Dedicated stdio MCP transport used by new managed host wiring; still takes the `mcp` subcommand. |
+| `evertrace` | General CLI, diagnostics, administration and TUI; also provides the `--mcp` mode. |
+| `evertrace-mcp` | Dedicated stdio MCP transport used by new managed host wiring; accepts the `--mcp` mode only. |
 | `evertraced` | Daemon and sole runtime writer. |
 | `evertrace-hook` | Synchronous host capture entry point. |
 
@@ -107,7 +107,7 @@ Use a non-sensitive test project first. Do not treat recovery bundles as your on
 
 Local design archives under `docs/baseline/`, orchestration records under `.work/`, and agent instruction/state files are intentionally ignored. They are not prerequisites for following these public guides. Do not force-add private notes, model credentials or runtime data.
 
-Local architecture maintenance uses `document_set_version = 66` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
+Local architecture maintenance uses `document_set_version = 67` and `tools/release_architecture_baseline.py` for validated, atomic updates of the private design archive; this is not the product release version.
 
 See [Development](docs/development.md) for checks and resource limits. Report reproducible failures with the commit, platform, command and sanitized error; never attach raw session archives or credentials.
 

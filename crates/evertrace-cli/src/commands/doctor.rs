@@ -93,7 +93,7 @@ pub async fn run(
         Some(result) => print_canary(result),
         None => println!("host_canary=not_run: no current observation in this daemon"),
     }
-    println!("refresh: doctor --refresh-host /absolute/host");
+    println!("refresh: evertrace --doctor --refresh-host /absolute/host");
     println!(
         "protocol_version={} mode={:?} config_version={} config_hash={} algorithm_revision={}",
         health.protocol_version,

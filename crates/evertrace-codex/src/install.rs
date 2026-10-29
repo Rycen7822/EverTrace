@@ -276,7 +276,25 @@ fn shell_path(path: &Path) -> Result<String, InstallError> {
 
 #[cfg(test)]
 fn wiring(data_root: &Path, cli: &Path, config: &Path) -> Result<Vec<u8>, InstallError> {
-    wiring_with_host(data_root, cli, config, None)
+    wiring_with_host(data_root, cli, config, None, McpArgv::Current)
+}
+
+/// Which managed MCP argv generation an owned fragment declares. The retired
+/// subcommand token is only a migration input for files written by an earlier
+/// package; every new owned fragment declares the current `--mcp` mode.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum McpArgv {
+    Retired,
+    Current,
+}
+
+impl McpArgv {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Retired => "mcp",
+            Self::Current => "--mcp",
+        }
+    }
 }
 
 fn wiring_with_host(
@@ -284,6 +302,7 @@ fn wiring_with_host(
     cli: &Path,
     config: &Path,
     host: Option<(&Path, &Path)>,
+    argv: McpArgv,
 ) -> Result<Vec<u8>, InstallError> {
     let command = format!(
         "{} --launcher-root {}",
@@ -298,6 +317,7 @@ fn wiring_with_host(
         toml::Value::String(cli.to_str().ok_or(InstallError::InvalidType)?.into());
     mcp["mcp_servers"]["evertrace"]["args"][1] =
         toml::Value::String(config.to_str().ok_or(InstallError::InvalidType)?.into());
+    mcp["mcp_servers"]["evertrace"]["args"][2] = toml::Value::String(argv.token().into());
     if let Some((executable, host_config)) = host {
         if !executable.is_absolute() || !host_config.is_absolute() {
             return Err(InstallError::InvalidType);
@@ -570,15 +590,12 @@ fn replace_wiring(
     let unowned;
     if text.contains(OWNED_BEGIN) {
         let actual = wiring_declarations(original)?;
-        let old = previous_tool_wiring(
+        let accepted = accepted_prior_wiring(
             std::str::from_utf8(&expected.canonical).map_err(|_| InstallError::InvalidType)?,
         )?;
-        let prior_source = previous_source_wiring(
-            std::str::from_utf8(&expected.canonical).map_err(|_| InstallError::InvalidType)?,
-        )?;
-        if actual.canonical != expected.canonical
-            && actual.canonical != old.as_bytes()
-            && actual.canonical != prior_source.as_bytes()
+        if !accepted
+            .iter()
+            .any(|prior| actual.canonical == prior.as_bytes())
         {
             return Err(InstallError::InvalidType);
         }
@@ -669,6 +686,48 @@ fn replace_wiring(
     Ok(result.into_bytes())
 }
 
+/// Exact owned fragments this package may rewrite or remove. Besides the two
+/// predecessor declaration sets, a fragment whose only difference is the retired
+/// MCP argv token is a migration input written by an earlier package. Every other
+/// field, array position and file identity still has to match exactly, so this
+/// accepts no edited, unknown or partially owned declaration.
+fn accepted_prior_wiring(expected: &str) -> Result<Vec<String>, InstallError> {
+    let mut accepted = vec![expected.to_owned()];
+    for variant in [
+        retired_argv_wiring(expected),
+        Some(previous_tool_wiring(expected)?),
+        Some(previous_source_wiring(expected)?),
+    ] {
+        let Some(variant) = variant else { continue };
+        let retired = retired_argv_wiring(&variant);
+        accepted.push(variant);
+        accepted.extend(retired);
+    }
+    Ok(accepted)
+}
+
+// The retired subcommand token is only a migration input here; it is never
+// declared by a newly generated fragment or accepted by the CLI.
+fn retired_argv_wiring(owned: &str) -> Option<String> {
+    let body = owned
+        .strip_prefix(OWNED_BEGIN)
+        .and_then(|value| value.strip_suffix(OWNED_END))?;
+    let mut value: toml::Value = toml::from_str(body).ok()?;
+    let args = value
+        .get_mut("mcp_servers")?
+        .get_mut("evertrace")?
+        .get_mut("args")?
+        .as_array_mut()?;
+    if args.len() < 3 || args[2].as_str() != Some(McpArgv::Current.token()) {
+        return None;
+    }
+    args[2] = toml::Value::String(McpArgv::Retired.token().into());
+    Some(format!(
+        "{OWNED_BEGIN}{}{OWNED_END}",
+        toml::to_string(&value).ok()?
+    ))
+}
+
 // The predecessor declaration set emitted before submission coverage. This is
 // only a write/uninstall compatibility check, not current coverage or permission
 // to accept changed execution fields.
@@ -731,7 +790,9 @@ pub fn inventory_wiring_locators(
 ) -> Result<(PathBuf, PathBuf), InstallError> {
     let (cli, file) = validated_installed_wiring(data_root, config, host_config)?;
     let (_, bytes) = file.original.as_ref().ok_or(InstallError::InvalidType)?;
-    let (host, _) = wiring_host_locator(bytes)?.ok_or(InstallError::InvalidType)?;
+    let (host, _) = wiring_host_locator(bytes)?
+        .0
+        .ok_or(InstallError::InvalidType)?;
     package_metadata(&host)?;
     Ok((cli, host))
 }
@@ -768,7 +829,7 @@ fn validated_installed_wiring(
         .map(PathBuf::from)
         .ok_or(InstallError::InvalidType)?;
     package_metadata(&cli)?;
-    let locator = wiring_host_locator(bytes)?;
+    let (locator, argv) = wiring_host_locator(bytes)?;
     if locator
         .as_ref()
         .is_some_and(|(_, path)| path != host_config)
@@ -781,6 +842,7 @@ fn validated_installed_wiring(
                 locator
                     .as_ref()
                     .map(|(exe, path)| (exe.as_path(), path.as_path())),
+                argv,
             )?,
             false,
         )? != *bytes
@@ -791,12 +853,15 @@ fn validated_installed_wiring(
     Ok((cli, file))
 }
 
-/// Parses only the two exact managed argv shapes. Values are locators, never
-/// executable or environment authority; the observer still opens both peers.
-fn wiring_host_locator(bytes: &[u8]) -> Result<Option<(PathBuf, PathBuf)>, InstallError> {
+/// Parses only the exact managed argv shapes and reports which generation the
+/// fragment declares. Values are locators, never executable or environment
+/// authority; the observer still opens both peers.
+fn wiring_host_locator(
+    bytes: &[u8],
+) -> Result<(Option<(PathBuf, PathBuf)>, McpArgv), InstallError> {
     let source = std::str::from_utf8(bytes).map_err(|_| InstallError::InvalidType)?;
     if !source.contains(OWNED_BEGIN) {
-        return Ok(None);
+        return Ok((None, McpArgv::Current));
     }
     let value: toml::Value = toml::from_str(source).map_err(|_| InstallError::InvalidType)?;
     let args = value
@@ -810,19 +875,25 @@ fn wiring_host_locator(bytes: &[u8]) -> Result<Option<(PathBuf, PathBuf)>, Insta
         .map(toml::Value::as_str)
         .collect::<Option<Vec<_>>>()
         .ok_or(InstallError::InvalidType)?;
+    let argv = |token: &str| match token {
+        token if token == McpArgv::Current.token() => Some(McpArgv::Current),
+        token if token == McpArgv::Retired.token() => Some(McpArgv::Retired),
+        _ => None,
+    };
     match args.as_slice() {
-        ["--config", _, "mcp"] => Ok(None),
+        ["--config", _, token] => Ok((None, argv(token).ok_or(InstallError::InvalidType)?)),
         [
             "--config",
             _,
-            "mcp",
+            token,
             "--host-executable",
             executable,
             "--host-config",
             config,
-        ] if Path::new(executable).is_absolute() && Path::new(config).is_absolute() => {
-            Ok(Some((PathBuf::from(executable), PathBuf::from(config))))
-        }
+        ] if Path::new(executable).is_absolute() && Path::new(config).is_absolute() => Ok((
+            Some((PathBuf::from(executable), PathBuf::from(config))),
+            argv(token).ok_or(InstallError::InvalidType)?,
+        )),
         _ => Err(InstallError::InvalidType),
     }
 }
@@ -1054,7 +1125,7 @@ pub fn managed_install(
             .original
             .as_ref()
             .map_or(&[][..], |(_, bytes)| bytes.as_slice());
-        let previous_locator = wiring_host_locator(original_host)?;
+        let (previous_locator, previous_argv) = wiring_host_locator(original_host)?;
         let original_host_text =
             std::str::from_utf8(original_host).map_err(|_| InstallError::InvalidType)?;
         let expected_mcp = if original_host_text.contains(OWNED_BEGIN) {
@@ -1084,6 +1155,7 @@ pub fn managed_install(
             previous_locator
                 .as_ref()
                 .map(|(exe, path)| (exe.as_path(), path.as_path())),
+            previous_argv,
         )?;
         let replacement = if uninstall {
             None
@@ -1093,6 +1165,7 @@ pub fn managed_install(
                 &paths.mcp,
                 &paths.config,
                 Some((&paths.host_executable, &paths.host_config)),
+                McpArgv::Current,
             )?)
         };
         let merged = replace_wiring(original_host, &expected, replacement.as_deref())?;
@@ -1807,7 +1880,7 @@ impl PackageCheckPreflight {
             .desired
             .as_deref()
             .ok_or(InstallError::InvalidType)?;
-        wiring_host_locator(desired)?;
+        let _ = wiring_host_locator(desired)?;
         let owned = owned_wiring(desired)?;
         let mut value: toml::Value =
             toml::from_str(std::str::from_utf8(&owned).map_err(|_| InstallError::InvalidType)?)
@@ -1958,7 +2031,7 @@ pub fn candidate_host_arguments() -> [String; 7] {
         format!("hooks.UserPromptSubmit=[{{hooks=[{{type=\"command\",command={hooks},timeout=3}}]}}]"),
         "mcp_servers.evertrace.command=\"/bin/sh\"".into(),
         "mcp_servers.evertrace.env_vars=[\"EVERTRACE_CANDIDATE_PACKAGE\",\"EVERTRACE_CANDIDATE_CONFIG\"]".into(),
-        format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace-mcp\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" mcp".into())])),
+        format!("mcp_servers.evertrace.args={}", toml::Value::Array(vec![toml::Value::String("-c".into()), toml::Value::String("exec \"$EVERTRACE_CANDIDATE_PACKAGE/evertrace-mcp\" --config \"$EVERTRACE_CANDIDATE_CONFIG\" --mcp".into())])),
     ]
 }
 
@@ -2060,8 +2133,7 @@ pub fn preflight_package_check(
         &[
             "--config",
             config.to_str().ok_or(InstallError::InvalidType)?,
-            "config",
-            "check",
+            "--config-check",
         ],
         None,
     )?;
@@ -2070,18 +2142,19 @@ pub fn preflight_package_check(
     }
     let mut host = InstallFile::read(host_config)?;
     let old_host = &host.original.as_ref().ok_or(InstallError::InvalidType)?.1;
-    let host_locator = wiring_host_locator(old_host)?;
+    let (host_locator, host_argv) = wiring_host_locator(old_host)?;
     let host_locator = host_locator
         .as_ref()
         .map(|(exe, config)| (exe.as_path(), config.as_path()));
     let proposed = replace_wiring(
         old_host,
-        &wiring_with_host(data, &old_cli, config, host_locator)?,
+        &wiring_with_host(data, &old_cli, config, host_locator, host_argv)?,
         Some(&wiring_with_host(
             data,
             &package.join("evertrace-mcp"),
             config,
             host_locator,
+            McpArgv::Current,
         )?),
     )?;
     let mut service = InstallFile::read(unit)?;

@@ -38,9 +38,9 @@ For foreground runs, use Ctrl-C and wait for exit. One data root has one writer.
 ## 备份与校验 / Backup and verification
 
 ```sh
-evertrace --config /absolute/config.toml backup create
-evertrace --config /absolute/config.toml tui
-evertrace --config /absolute/config.toml backup verify BACKUP_JOB_ID
+evertrace --config /absolute/config.toml --backup create
+evertrace --config /absolute/config.toml --tui
+evertrace --config /absolute/config.toml --backup verify BACKUP_JOB_ID
 ```
 
 `backup create` 和 `backup verify` 提交持久 job。**exit 0 / queued 只代表已排队**。在 TUI System 查看返回 job 的最终状态、实际备份目录和验证结果；verify 参数是创建备份的 job ID，不是随意的目录路径。备份可能进入维护阶段并占用较多磁盘，先检查剩余容量。
@@ -58,7 +58,7 @@ After an unknown submission outcome, inspect the original job before creating du
 Restore is offline: stop the daemon and relevant capture sessions, use matching CLI/Hook binaries, and retain the original data with sufficient free space. Restore validates its candidate rather than blindly overwriting. Missing current deletion-ledger authority can result in `historical_only`, not an activated restore.
 
 ```sh
-evertrace --config /absolute/config.toml restore /absolute/verified-backup
+evertrace --config /absolute/config.toml --restore /absolute/verified-backup
 ```
 
 阅读输出中的 `restored`、`historical_only`、`previous_root` 和 retained 路径。不要在未确认新实例健康前删除回滚材料，也不要自动遍历删除所有“旧”目录。
@@ -69,21 +69,21 @@ Inspect `restored`, `historical_only`, `previous_root` and retained paths. Do no
 
 ```sh
 # Offline native-data upgrade, not a package download.
-evertrace --config /absolute/config.toml upgrade
+evertrace --config /absolute/config.toml --upgrade
 
 # Candidate package check; may prepare backups/candidates and use substantial disk.
-evertrace --config /absolute/config.toml upgrade --check /absolute/candidate-package
+evertrace --config /absolute/config.toml --upgrade --check /absolute/candidate-package
 
 # Explicit live candidate check: host model calls / side effects are possible.
-evertrace --config /absolute/config.toml upgrade --check /absolute/candidate-package --live-host /absolute/path/to/codex
+evertrace --config /absolute/config.toml --upgrade --check /absolute/candidate-package --live-host /absolute/path/to/codex
 
 # Publish a candidate package after its required checks; changes the installation.
-evertrace --config /absolute/config.toml upgrade /absolute/candidate-package --live-host /absolute/path/to/codex
+evertrace --config /absolute/config.toml --upgrade /absolute/candidate-package --live-host /absolute/path/to/codex
 ```
 
-执行前停止原实例并阅读输出要求；candidate package 包含同版本的三个程序。`--check` 不是零写入的轻量 dry-run，会准备与验证候选；不带 live host 的检查不能代替实际发布资格。包升级不是修改 Cargo 依赖或自动下载 GitHub release。真实宿主验证的费用和第三方副作用边界见[安装指南](getting-started.md)。
+执行前停止原实例并阅读输出要求；candidate package 包含同一构建的四个程序。`--check` 不是零写入的轻量 dry-run，会准备与验证候选；不带 live host 的检查不能代替实际发布资格。包升级不是修改 Cargo 依赖或自动下载 GitHub release。真实宿主验证的费用和第三方副作用边界见[安装指南](getting-started.md)。
 
-Stop the existing instance and follow reported prerequisites. A candidate package contains the matching three binaries. `--check` is not a zero-write cheap dry run; it prepares and verifies candidates. A check without live host cannot establish publication eligibility. Package upgrade is neither dependency editing nor automatic release downloading. See [live-host precautions](getting-started.md).
+Stop the existing instance and follow reported prerequisites. A candidate package contains all four matching binaries. `--check` is not a zero-write cheap dry run; it prepares and verifies candidates. A check without live host cannot establish publication eligibility. Package upgrade is neither dependency editing nor automatic release downloading. See [live-host precautions](getting-started.md).
 
 ## Forget、purge、GC 与导出 / Forget, purge, GC and export
 
@@ -100,7 +100,7 @@ Stop the existing instance and follow reported prerequisites. A candidate packag
 These operations do not guarantee erasure of separately retained exports/backups, host originals, provider logs or media remnants. Manage those copies separately. Restoring history must not bypass active forgetting boundaries.
 
 ```sh
-evertrace --config /absolute/config.toml export OBJECT_REF
+evertrace --config /absolute/config.toml --export OBJECT_REF
 ```
 
 可一次选择 1–64 个实际当前对象。查看输出的发布状态和路径；exports 可能包含敏感内容，发送给别人前再次检查。发生 unknown outcome 先检查 `data_dir/exports/`，不要盲目重试。
@@ -114,7 +114,7 @@ RecoveryBundle 用于受支持且明确选中的工作区恢复，不是全盘�
 A RecoveryBundle supports selected worktree recovery, not whole-disk backup. Inspect the bundle, target, current state and available actions in TUI before explicitly applying it. A Post Hook observing command completion does not prove success. Do not treat `unknown`/`partially_applied` as `applied`, edit state or blindly reapply.
 
 ```sh
-evertrace --config /absolute/config.toml uninstall
+evertrace --config /absolute/config.toml --uninstall
 ```
 
 卸载移除受管接线并在可用时停止/禁用受管服务，保留数据根；它不代表删除所有配置、备份、密钥或自行添加的 systemd drop-in。若受管文件被外部修改，先审查冲突，不直接覆盖。需要删除保留数据时，应另外明确目标并做好备份，而不是执行宽泛的递归删除。

@@ -958,7 +958,7 @@ fn fixtures_and_packaging_are_content_free_minimal_inputs() {
     assert_eq!(server["command"].as_str(), Some("@CLI@"));
     assert_eq!(
         server["args"].as_array().unwrap(),
-        &vec!["--config".into(), "@CONFIG@".into(), "mcp".into()]
+        &vec!["--config".into(), "@CONFIG@".into(), "--mcp".into()]
     );
     assert_eq!(
         server["enabled_tools"].as_array().unwrap(),

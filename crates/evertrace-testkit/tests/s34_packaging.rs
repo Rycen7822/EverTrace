@@ -58,7 +58,7 @@ fn fixture() -> (TempDir, ManagedInstallPaths, EffectiveConfig) {
 #[test]
 fn cli_help_succeeds_without_config_or_daemon_and_lists_available_commands() {
     let (root, paths, _) = fixture();
-    for help in ["help", "--help"] {
+    for help in ["--help"] {
         for explicit in [false, true] {
             let mut command = Command::new(&paths.cli);
             command.env_clear();
@@ -72,22 +72,23 @@ fn cli_help_succeeds_without_config_or_daemon_and_lists_available_commands() {
             assert!(output.stderr.is_empty(), "{output:?}");
             let text = String::from_utf8(output.stdout).unwrap();
             for entry in [
-                "config check",
-                "config show --effective",
-                "config reload [--socket",
-                "doctor [--refresh-host",
-                "install CODEX_EXECUTABLE",
-                "uninstall",
-                "upgrade",
-                "backup create",
-                "backup verify BACKUP_JOB_ID",
-                "export OBJECT_REF",
-                "restore BACKUP_PATH",
-                "mcp [--host-executable",
+                "--daemon [--maintenance]",
+                "--tui",
+                "--doctor [--refresh-host",
+                "--config-check",
+                "--config-show",
+                "--config-reload [--socket",
+                "--install HOST_EXECUTABLE",
+                "--uninstall",
+                "--upgrade",
+                "--backup create",
+                "--backup verify BACKUP_JOB_ID",
+                "--export OBJECT_REF",
+                "--restore BACKUP_PATH",
+                "--mcp [--host-executable",
                 "--host-config",
-                "tui",
-                "admin session",
-                "admin repository",
+                "--admin session",
+                "--admin repository",
             ] {
                 assert!(text.contains(entry), "missing {entry}: {text}");
             }
@@ -117,7 +118,7 @@ async fn default_config_uses_home_dot_evertrace_and_preserves_explicit_overrides
     cli.env_clear()
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", &xdg);
-    let output = cli.args(["config", "check"]).output().unwrap();
+    let output = cli.args(["--config-check"]).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let output = cli
         .env("EVERTRACE_CONFIG", root.path().join("missing.toml"))
@@ -132,7 +133,7 @@ async fn default_config_uses_home_dot_evertrace_and_preserves_explicit_overrides
         .env("EVERTRACE_CONFIG", root.path().join("missing.toml"))
         .arg("--config")
         .arg(&paths.config)
-        .args(["config", "check"])
+        .arg("--config-check")
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -181,12 +182,14 @@ async fn cli_backup_queues_real_daemon_jobs_and_reports_completion_separately() 
 
     let (root, paths, _) = fixture();
     let missing_backup = JobId::new_v7().to_string();
-    for args in [vec!["create"], vec!["verify", &missing_backup]] {
+    for args in [
+        vec!["--backup", "create"],
+        vec!["--backup", "verify", &missing_backup],
+    ] {
         let output = Command::new(&paths.cli)
             .env_clear()
             .arg("--config")
             .arg(&paths.config)
-            .arg("backup")
             .args(args)
             .output()
             .unwrap();
@@ -233,20 +236,16 @@ async fn cli_backup_queues_real_daemon_jobs_and_reports_completion_separately() 
     let mut backup_id = String::new();
     for phase in 0..3 {
         let mut command = Command::new(&paths.cli);
-        command
-            .env_clear()
-            .arg("--config")
-            .arg(&paths.config)
-            .arg("backup");
+        command.env_clear().arg("--config").arg(&paths.config);
         match phase {
             0 => {
-                command.arg("create");
+                command.args(["--backup", "create"]);
             }
             1 => {
-                command.arg("verify").arg(&backup_id);
+                command.args(["--backup", "verify"]).arg(&backup_id);
             }
             _ => {
-                command.arg("verify").arg(&missing_backup);
+                command.args(["--backup", "verify"]).arg(&missing_backup);
             }
         }
         let output = command.output().unwrap();
@@ -491,7 +490,7 @@ async fn protected_export_cli_and_system_publish_complete_cas() {
     let output = Command::new(&paths.cli)
         .arg("--config")
         .arg(&paths.config)
-        .arg("export")
+        .arg("--export")
         .arg(&selected.stable_key)
         .env_clear()
         .env("HOME", paths.data_root.parent().unwrap())
@@ -760,7 +759,7 @@ async fn strict_reload_config_transport_and_dynamic_log_callsite() {
     );
     fs::write(&paths.config, "invalid[").unwrap();
     let output = Command::new(&paths.cli)
-        .args(["config", "reload", "--socket"])
+        .args(["--config-reload", "--socket"])
         .arg(&socket)
         .env_clear()
         .output()
@@ -1191,7 +1190,7 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
         if (search, get) == (600, 1_200) {
             fs::write(&paths.config, desired.to_toml().unwrap()).unwrap();
             let reloaded = Command::new(&paths.cli)
-                .args(["config", "reload", "--socket"])
+                .args(["--config-reload", "--socket"])
                 .arg(paths.data_root.join("runtime/evertraced-v1.sock"))
                 .env_clear()
                 .output()
@@ -1218,7 +1217,7 @@ async fn mcp_output_budgets_are_consumed_by_the_running_daemon() {
             let mut cli = Command::new(&paths.mcp)
                 .arg("--config")
                 .arg(&paths.config)
-                .arg("mcp")
+                .arg("--mcp")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1793,7 +1792,7 @@ async fn ordinary_daemon_keeps_explorer_and_doctor_readable_with_unowned_spool_f
         let doctor = Command::new(&paths.cli)
             .arg("--config")
             .arg(&paths.config)
-            .arg("doctor")
+            .arg("--doctor")
             .env_clear()
             .env("HOME", paths.data_root.parent().unwrap())
             .output()
@@ -2425,7 +2424,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
         .args([
             "--config",
             paths.config.to_str().unwrap(),
-            "upgrade",
+            "--upgrade",
             package.to_str().unwrap(),
         ])
         .output()
@@ -2619,7 +2618,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     let rejected = Command::new(&paths.cli)
         .arg("--config")
         .arg(&paths.config)
-        .args(["upgrade", "--check"])
+        .args(["--upgrade", "--check"])
         .arg(&package)
         .arg("--live-host")
         .arg(&dangling_host)
@@ -2640,7 +2639,7 @@ async fn package_check_prepares_native_and_materials_without_publication() {
     let output = Command::new(&paths.cli)
         .arg("--config")
         .arg(&paths.config)
-        .args(["upgrade", "--check"])
+        .args(["--upgrade", "--check"])
         .arg(&package)
         .arg("--live-host")
         .arg(root.path().join("missing-host"))
@@ -2900,7 +2899,7 @@ async fn submitted_sources_bootstrap_work_through_managed_mcp() {
         let mut cli = Command::new(&paths.mcp)
             .arg("--config")
             .arg(&paths.config)
-            .arg("mcp")
+            .arg("--mcp")
             .current_dir(paths.data_root.parent().unwrap())
             .env_clear()
             .stdin(Stdio::piped())
@@ -3881,7 +3880,7 @@ enabled_tools = ["evertrace"]
         paths.config.display()
     );
     let current_args = format!(
-        "args = [\"--config\", \"{}\", \"mcp\", \"--host-executable\", \"{}\", \"--host-config\", \"{}\"]",
+        "args = [\"--config\", \"{}\", \"--mcp\", \"--host-executable\", \"{}\", \"--host-config\", \"{}\"]",
         paths.config.display(),
         paths.host_executable.display(),
         paths.host_config.display()
@@ -4049,7 +4048,7 @@ async fn doctor_reads_current_state_and_only_cli_refresh_runs_the_selected_host(
         command
             .arg("--config")
             .arg(&paths.config)
-            .arg("doctor")
+            .arg("--doctor")
             .env("CODEX_HOME", paths.host_config.parent().unwrap());
         if refresh {
             command.arg("--refresh-host").arg(&paths.host_executable);
@@ -4340,7 +4339,7 @@ async fn candidate_canary_rpc_is_scoped_and_never_updates_installed_current() {
     let doctor = Command::new(&paths.cli)
         .arg("--config")
         .arg(&paths.config)
-        .arg("doctor")
+        .arg("--doctor")
         .output()
         .unwrap();
     assert!(doctor.status.success());

@@ -6518,7 +6518,7 @@ async fn mcp_generated_alignment_is_returned_only_after_real_stdout() {
         let mut cli = Command::new(package.join("evertrace"))
             .arg("--config")
             .arg(&config_path)
-            .arg("mcp")
+            .arg("--mcp")
             .env_clear()
             .current_dir(&workspace)
             .stdin(Stdio::piped())

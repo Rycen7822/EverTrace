@@ -16,7 +16,7 @@ pub(crate) use config_input::resolve_config_path;
 async fn main() {
     let result = match Args::parse(env::args_os().skip(1)) {
         Ok(args) => commands::run(args).await,
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error.message().into()),
     };
     if let Err(error) = result {
         eprintln!("evertrace: {error}");

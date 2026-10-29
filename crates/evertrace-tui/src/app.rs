@@ -1732,8 +1732,8 @@ fn future_operation_text(
             future_forget_text("Core membership", object_ref, language)
         }
         FutureOperationShell::Maintenance => language.text(
-            "Restore is an offline operation.\nStop the daemon before running:\nevertrace restore BACKUP_PATH\nUse the configuration for the intended data directory.\nBackup, verification and orphan GC are available as jobs in System.\nThis notice sends no command.\nEsc returns.",
-            "恢复是离线操作。\n先停止服务，再运行：\nevertrace restore BACKUP_PATH\n请使用目标数据目录对应的配置。\n备份、验证和孤立文件回收可在系统页提交任务。\n此说明不会发送命令。\nEsc 返回。",
+            "Restore is an offline operation.\nStop the daemon before running:\nevertrace --restore BACKUP_PATH\nUse the configuration for the intended data directory.\nBackup, verification and orphan GC are available as jobs in System.\nThis notice sends no command.\nEsc returns.",
+            "恢复是离线操作。\n先停止服务，再运行：\nevertrace --restore BACKUP_PATH\n请使用目标数据目录对应的配置。\n备份、验证和孤立文件回收可在系统页提交任务。\n此说明不会发送命令。\nEsc 返回。",
         ).into(),
     }
 }
@@ -4157,7 +4157,7 @@ mod tests {
         assert!(human_request(&app.state, UiCommand::OpenFutureOperationShell).is_none());
         let maintenance = render_app(&app, 60, 20);
         assert!(maintenance.contains("offline operation"));
-        assert!(maintenance.contains("evertrace restore BACKUP_PATH"));
+        assert!(maintenance.contains("evertrace --restore BACKUP_PATH"));
         assert!(maintenance.contains("Backup, verification and orphan GC"));
         assert!(maintenance.contains("This notice sends no command"));
         assert!(app.state.proposal_confirmation.is_none());

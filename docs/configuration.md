@@ -9,8 +9,8 @@ CLI 和 daemon 使用同一选择顺序：显式 `--config PATH` → `EVERTRACE_
 Both CLI and daemon choose: explicit `--config PATH` → `EVERTRACE_CONFIG` → `~/.evertrace/config.toml`. The default ignores `XDG_CONFIG_HOME` and does not fall back to the former directory. Put the CLI's `--config` before the command and point every entry point at the same file. The systemd user unit remains in the standard user-service directory, separate from EverTrace configuration.
 
 ```sh
-evertrace --config /absolute/config.toml config check
-evertrace --config /absolute/config.toml config show --effective
+evertrace --config /absolute/config.toml --config-check
+evertrace --config /absolute/config.toml --config-show
 ```
 
 `config_version = 1` 必须显式提供。未指定的配置段/字段使用默认值；未知字段、错型、不合法范围或字段关系会被拒绝。`show --effective` 输出的是文件合并默认值后的结果，**不是 daemon 当前活动配置的查询**；重载失败时二者可能不同。
@@ -63,9 +63,9 @@ HTTP 重定向被拒绝，避免自定义认证头泄漏到其他地址；请填
 
 All protocols use non-streaming, tool-free requests with shared timeout, concurrency, permission revalidation and budgets. Chat Completions uses JSON mode. Responses uses `text.format=json_object`, `max_output_tokens` and `store=false`, without remote conversation state; only completed text output is consumed, not reasoning items. Messages uses top-level `system` and required `max_tokens`, requests plain JSON via instructions, and accepts only normal `end_turn` text; extended thinking and model-specific structured-output features are not enabled. The new Responses/Messages adapters reject protocol refusals, tool calls and truncation. All three require valid usage and business JSON before accepting memory. Messages input accounting includes cache creation/read tokens, without pricing discounts.
 
-协议依据：[OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)、[OpenAI JSON mode](https://developers.openai.com/api/docs/guides/structured-outputs)、[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)、[Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)。`config check` 不访问远端；兼容网关与模型仍须支持所选协议和 JSON 输出，文档及本地 mock 验证不等于真实服务连通性验证。
+协议依据：[OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)、[OpenAI JSON mode](https://developers.openai.com/api/docs/guides/structured-outputs)、[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)、[Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)。`--config-check` 不访问远端；兼容网关与模型仍须支持所选协议和 JSON 输出，文档及本地 mock 验证不等于真实服务连通性验证。
 
-The linked official specifications define these wire formats. `config check` does not contact the provider. Gateways/models must support the selected protocol and JSON output; documentation and local mock verification do not prove live-service connectivity.
+The linked official specifications define these wire formats. `--config-check` does not contact the provider. Gateways/models must support the selected protocol and JSON output; documentation and local mock verification do not prove live-service connectivity.
 
 下面只展示需要修改的 `[llm]` 段，不是含密钥的完整配置。保留原有 `config_version` 和其他段，替换占位地址与模型名后再校验。
 
@@ -122,15 +122,15 @@ This is an explicit service configuration change. You own the credential file an
 ## 重载与重启 / Reload and restart
 
 ```sh
-evertrace --config /absolute/config.toml config check
-evertrace --config /absolute/config.toml config reload
-evertrace --config /absolute/config.toml doctor
+evertrace --config /absolute/config.toml --config-check
+evertrace --config /absolute/config.toml --config-reload
+evertrace --config /absolute/config.toml --doctor
 ```
 
 daemon 会监测配置文件，也提供显式 reload；关注 `Applied`、`Rejected`、`RestartRequired` 及 active/pending 信息，而不仅是进程退出码。无效配置不会替换最后可用配置。`runtime.data_dir`、`runtime.background_workers` 需要重启；**改数据目录不是数据迁移**。环境变量值改变也需要让 daemon 获取新的进程环境，通常需重启。
 
 The daemon watches the file and supports explicit reload. Inspect `Applied`, `Rejected`, `RestartRequired` and active/pending values, not just exit status. Invalid configuration does not replace last-good state. `runtime.data_dir` and `runtime.background_workers` require restart; **changing the directory does not migrate data**. Changed environment values must also reach the process, usually through restart.
 
-如果编辑了 data_dir 导致 CLI 找错 socket，可用 `config reload --socket /absolute/old-data-root/runtime/evertraced-v1.sock` 联系原 daemon。不要删除原 socket 或锁文件强行启动新 writer。详见[运维](operations.md)。
+如果编辑了 data_dir 导致 CLI 找错 socket，可用 `--config-reload --socket /absolute/old-data-root/runtime/evertraced-v1.sock` 联系原 daemon。不要删除原 socket 或锁文件强行启动新 writer。详见[运维](operations.md)。
 
-If editing data_dir makes the CLI locate the wrong socket, use `config reload --socket /absolute/old-data-root/runtime/evertraced-v1.sock` to reach the existing daemon. Do not delete its socket/lock to force another writer. See [Operations](operations.md).
+If editing data_dir makes the CLI locate the wrong socket, use `--config-reload --socket /absolute/old-data-root/runtime/evertraced-v1.sock` to reach the existing daemon. Do not delete its socket/lock to force another writer. See [Operations](operations.md).

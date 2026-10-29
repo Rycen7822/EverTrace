@@ -73,7 +73,9 @@ pub async fn run(
     }
     println!("data_preserved={}", paths.data_root.display());
     if !uninstall && !live_canary {
-        println!("host_canary=not_run: explicit --live-canary or doctor --refresh-host required");
+        println!(
+            "host_canary=not_run: explicit --live-canary or evertrace --doctor --refresh-host required"
+        );
     }
     if !uninstall && live_canary {
         crate::daemon_client::explain_live_host();

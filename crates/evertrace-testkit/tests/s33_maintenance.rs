@@ -435,7 +435,7 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
         .current_dir(root.path())
         .arg("--config")
         .arg(&external_config)
-        .arg("restore")
+        .arg("--restore")
         .arg("external-backup")
         .output()
         .unwrap();
@@ -561,7 +561,7 @@ async fn offline_restore_imports_current_pending_scope_without_reviving_candidat
     let output = Command::new(binaries.join("evertrace"))
         .arg("--config")
         .arg(&historical_config_path)
-        .arg("restore")
+        .arg("--restore")
         .arg(&backup)
         .output()
         .unwrap();

@@ -166,7 +166,7 @@ impl NativeHostContext {
             _,
             "--config",
             config,
-            "mcp",
+            "--mcp",
             "--host-executable",
             host_locator,
             "--host-config",

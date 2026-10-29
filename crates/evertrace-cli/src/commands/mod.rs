@@ -1,6 +1,7 @@
 mod admin;
 mod backup;
 mod config;
+mod daemon;
 mod doctor;
 mod export;
 mod install;
@@ -19,6 +20,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::ConfigCheck => config::check(args.config),
+        Command::Daemon { maintenance } => daemon::run(args.config, maintenance).await,
         Command::ConfigShowEffective => config::show_effective(args.config),
         Command::ConfigReload { socket } => config::reload(args.config, socket).await,
         Command::Doctor { refresh_host } => doctor::run(args.config, refresh_host).await,

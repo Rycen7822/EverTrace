@@ -16,7 +16,7 @@ pub async fn reload(
         socket
     } else {
         let effective = load(config).map_err(
-            |_| "cannot locate daemon from config; use config reload --socket /absolute/path",
+            |_| "cannot locate daemon from config; use --config-reload --socket /absolute/path",
         )?;
         let root = evertrace_protocol::resolve_data_dir(
             &effective.config().runtime.data_dir,

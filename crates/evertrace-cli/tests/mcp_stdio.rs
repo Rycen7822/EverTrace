@@ -36,7 +36,7 @@ fn lifecycle_for_binary(executable: &str) {
     )
     .unwrap();
     let mut child = Command::new(executable)
-        .args(["--config", config.to_str().unwrap(), "mcp"])
+        .args(["--config", config.to_str().unwrap(), "--mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -219,7 +219,7 @@ async fn tool_call_for_binary(executable: &str) {
     let config_for_child = config.clone();
     let output = tokio::task::spawn_blocking(move || {
         let mut child = Command::new(primary_executable)
-            .args(["--config", config_for_child.to_str().unwrap(), "mcp"])
+            .args(["--config", config_for_child.to_str().unwrap(), "--mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -278,7 +278,7 @@ async fn tool_call_for_binary(executable: &str) {
     let failed = tokio::task::spawn_blocking(move || {
         use std::io::{BufRead, BufReader};
         let mut child = Command::new(failed_executable)
-            .args(["--config", failed_config.to_str().unwrap(), "mcp"])
+            .args(["--config", failed_config.to_str().unwrap(), "--mcp"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let mut input = child.stdin.take().unwrap();
         writeln!(input, "{}", serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"1"},"capabilities":{}}})).unwrap();

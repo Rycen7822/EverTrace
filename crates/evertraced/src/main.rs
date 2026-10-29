@@ -86,6 +86,16 @@ where
 
 #[tokio::main]
 async fn main() {
+    // Exact single-argument version report for the same-package launcher check.
+    // It runs before any configuration read, Engine construction, tracing
+    // subscriber or Store access, and it enables no other daemon entry point.
+    let mut arguments = env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--version"))
+        && arguments.next().is_none()
+    {
+        println!("evertraced {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if let Err(error) = run().await {
         eprintln!("evertraced: {error}");
         std::process::exit(1);

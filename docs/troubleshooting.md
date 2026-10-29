@@ -10,9 +10,9 @@ Configuration validity → daemon connectivity → host wiring/source admission 
 
 ```sh
 evertrace --help
-evertrace --config /absolute/config.toml config check
-evertrace --config /absolute/config.toml config show --effective
-evertrace --config /absolute/config.toml doctor
+evertrace --config /absolute/config.toml --config-check
+evertrace --config /absolute/config.toml --config-show
+evertrace --config /absolute/config.toml --doctor
 ```
 
 `show --effective` 读取磁盘配置，doctor 的 health/current diagnostics 来自 daemon；留意 active/pending、mode、配置 hash 和各项独立原因。doctor 的目录元数据正常不代表 CAS/数据库内容已经完整验证。
