@@ -658,6 +658,7 @@ fn semantic_lines(
             ));
             lines
         }
+        HumanSemanticContent::Proposal(proposal) => vec![safe_content(&format!("{proposal:#?}"))],
         HumanSemanticContent::CoreMembership(membership) => vec![
             crate::locale::format!(
                 language,

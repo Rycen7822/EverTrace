@@ -83,9 +83,9 @@ Keep the daemon running and open the read-only browser interface from another te
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --web
 ```
 
-使用打印的一次性本机链接，不要分享该凭据。此版本网页只接入记忆列表、正文和连接状态，其余页面会说明未接入；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
+使用打印的一次性本机链接，不要分享该凭据。此版本网页只读接入记忆列表、正文、来源关联、修订历史、同对象固定修订比较和连接状态；搜索、范围筛选、长正文分块及其余页面仍未接入；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
 
-Use the printed one-time local link and keep it private. The current WebUI exposes memory lists, details and connection status only; unconnected pages say so. Existing memory can be read with LLM processing off. See [Usage](usage.md#本机网页--local-webui) for access and session limits.
+Use the printed one-time local link and keep it private. The read-only WebUI exposes memory lists/details, source references, revision history, exact same-object revision comparison and connection status. Search, scope filters, chunked full-text reads and other pages remain unconnected. Existing memory can be read with LLM processing off. See [Usage](usage.md#本机网页--local-webui) for access and session limits.
 
 ## 5. 启用后台模型 / Enable background model processing
 

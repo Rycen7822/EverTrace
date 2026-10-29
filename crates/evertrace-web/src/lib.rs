@@ -11,6 +11,7 @@ use evertrace_protocol::{
     LocalClient,
     command::Command,
     dto::{ClientKind, HealthMode},
+    error::ProtocolError,
     response::Response,
 };
 use hyper::{server::conn::http1, service::service_fn};
@@ -30,7 +31,7 @@ struct Backend {
 }
 
 impl Backend {
-    async fn request(&self, command: Command) -> Result<Response, ()> {
+    async fn request(&self, command: Command) -> Result<Response, ProtocolError> {
         timeout(Duration::from_secs(5), async {
             let mut client = LocalClient::connect(
                 &self.socket,
@@ -38,29 +39,22 @@ impl Backend {
                 ClientKind::Web,
                 Duration::from_secs(2),
             )
-            .await
-            .map_err(|_| ())?;
-            let health = client
-                .request(RequestId::new_v7(), Command::Health)
-                .await
-                .map_err(|_| ())?;
+            .await?;
+            let health = client.request(RequestId::new_v7(), Command::Health).await?;
             match &health {
                 Response::Health(value)
                     if value.validate()
                         && value.mode == HealthMode::Normal
                         && value.effective_config_hash == self.config_hash => {}
-                _ => return Err(()),
+                _ => return Err(ProtocolError::InvalidHealth),
             }
             if matches!(command, Command::Health) {
                 return Ok(health);
             }
-            client
-                .request(RequestId::new_v7(), command)
-                .await
-                .map_err(|_| ())
+            client.request(RequestId::new_v7(), command).await
         })
         .await
-        .map_err(|_| ())?
+        .map_err(|_| ProtocolError::Timeout)?
     }
 }
 

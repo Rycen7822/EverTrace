@@ -5,6 +5,7 @@ use evertrace_protocol::{
         HumanExplorerListSelection, HumanGovernanceRequest, HumanGovernanceResponse,
         HumanReadRequest, HumanSurface, MAX_FRAME_SIZE,
     },
+    error::{ErrorCode, ProtocolError},
     response::Response as DaemonResponse,
 };
 use http_body_util::{BodyExt, Full, Limited};
@@ -275,7 +276,12 @@ async fn handle(request: Request<Incoming>, bridge: &Bridge) -> Reply {
             } | HumanReadRequest::Detail {
                 surface: HumanSurface::Explorer,
                 ..
-            }
+            } | HumanReadRequest::Compare { .. }
+                | HumanReadRequest::Related {
+                    relation: evertrace_protocol::dto::HumanRelationKind::ObjectSources
+                        | evertrace_protocol::dto::HumanRelationKind::ObjectRevisions,
+                    ..
+                }
         ) {
             return error(StatusCode::BAD_REQUEST, "read_unavailable");
         }
@@ -307,6 +313,12 @@ async fn handle(request: Request<Incoming>, bridge: &Bridge) -> Reply {
             body @ (HumanGovernanceResponse::Snapshot { .. }
             | HumanGovernanceResponse::Conflict { .. }),
         )) => json_reply(StatusCode::OK, &body),
+        Err(ProtocolError::Wire(ErrorCode::InvalidInput)) => {
+            error(StatusCode::BAD_REQUEST, "invalid_read")
+        }
+        Err(ProtocolError::Wire(ErrorCode::Untrusted)) => {
+            error(StatusCode::FORBIDDEN, "read_denied")
+        }
         _ => error(StatusCode::SERVICE_UNAVAILABLE, "daemon_unavailable"),
     }
 }

@@ -12,6 +12,7 @@ pub enum HumanSemanticContent {
     Atom(Box<evertrace_domain::semantic::Atom>),
     Procedure(Box<evertrace_domain::procedure::ProcedureRevision>),
     CoreMembership(Box<evertrace_domain::semantic::CoreMembership>),
+    Proposal(Box<evertrace_domain::semantic::RevisionProposal>),
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
@@ -423,9 +424,7 @@ impl HumanGovernanceService {
                     continue;
                 }
             }
-            if row.object_kind.as_deref() != Some("revision_proposal_revision") {
-                item.semantic_detail = Some(present(row)?);
-            }
+            item.semantic_detail = Some(present(row)?);
             if let Some(proposal) = &item.proposal {
                 let Some(base) = proposal.base_revision_id else {
                     continue;
@@ -552,6 +551,16 @@ fn present(row: &ObjectRow) -> Result<HumanSemanticDetail, HumanGovernanceError>
             (
                 HumanSemanticContent::Procedure(value),
                 Some(preview),
+                object,
+                revision,
+            )
+        }
+        JournalPayload::RevisionProposalRecorded(value) => {
+            let object = value.proposal_id.to_string();
+            let revision = value.proposal_revision_id.to_string();
+            (
+                HumanSemanticContent::Proposal(value),
+                None,
                 object,
                 revision,
             )

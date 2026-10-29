@@ -918,6 +918,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     },
+                                HumanReadRequest::Compare { left, right, expected_frontier } => match human_governance
+                                    .compare_revisions(
+                                        &left.stable_key, &left.revision_ref,
+                                        &right.stable_key, &right.revision_ref,
+                                        expected_frontier,
+                                    )
+                                    .await
+                                    .map_err(map_human_error)?
+                                {
+                                    Ok(page) => map_human_page(page),
+                                    Err((current_frontier, current_revision_ref)) => HumanGovernanceResponse::Conflict {
+                                        current_frontier, current_revision_ref,
+                                    },
+                                },
                                 HumanReadRequest::Related {
                                     relation,
                                     source_stable_key,
@@ -1490,6 +1504,7 @@ fn map_semantic_detail(
         content: detail.content.map(|content| match content {
             evertrace_engine::HumanSemanticContent::Digest(value) => Content::Digest(value),
             evertrace_engine::HumanSemanticContent::Atom(value) => Content::Atom(value),
+            evertrace_engine::HumanSemanticContent::Proposal(value) => Content::Proposal(value),
             evertrace_engine::HumanSemanticContent::Procedure(value) => Content::Procedure(value),
             evertrace_engine::HumanSemanticContent::CoreMembership(value) => {
                 Content::CoreMembership(value)

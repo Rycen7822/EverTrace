@@ -60,7 +60,7 @@ cp -n docs/examples/evertrace.local.toml "$HOME/.evertrace/config.toml"
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`、`--tui` 或 `--web`。网页目前只读接入真实记忆列表、正文和连接状态，其余页面会说明未接入。请勿分享终端打印的一次性登录链接。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
+另开终端执行 `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor`、`--tui` 或 `--web`。网页目前只读接入真实记忆列表、正文、来源关联、修订历史、同对象固定修订比较和连接状态；搜索、范围筛选、长正文分块及其余页面仍未接入。请勿分享终端打印的一次性登录链接。空安装没有记忆是正常的；需要继续完成[宿主接入和第一条记忆的验证](docs/getting-started.md)，才能使用自动采集和后台摘要。
 
 不要以 root 身份运行安装命令。安装会修改受管宿主配置，并可能启用用户服务；它是单独的一步，不包含在上述命令中。
 

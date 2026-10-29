@@ -132,6 +132,11 @@ async fn send_human(
                     expected_revision_ref: expected_revision_ref.clone(),
                 },
             ),
+            // This client has no two-revision view. Never correlate its two
+            // results as a single detail; the Web reader owns this workflow.
+            HumanReadRequest::Compare { .. } => {
+                return Err(evertrace_protocol::error::ProtocolError::UnexpectedMessage);
+            }
             HumanReadRequest::Related {
                 relation,
                 source_stable_key,
