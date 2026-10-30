@@ -869,6 +869,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         Err(frontier) => HumanGovernanceResponse::Conflict {current_frontier:frontier,current_revision_ref:None},
                                     }
                                 }
+                                HumanReadRequest::SourceArchive {query,expected_frontier,after,limit} => {
+                                    match human_governance.source_archive(query,expected_frontier,after.as_deref(),limit).await.map_err(map_human_error)? {
+                                        Ok(page)=>HumanGovernanceResponse::SourceArchive{page:Box::new(page)},
+                                        Err(frontier)=>HumanGovernanceResponse::Conflict{current_frontier:frontier,current_revision_ref:None},
+                                    }
+                                }
                                 HumanReadRequest::SourceCatalog {query,expected_frontier,after,limit} => {
                                     match human_governance.source_catalog(query,expected_frontier,after.as_deref(),limit).await.map_err(map_human_error)? {
                                         Ok(page)=>HumanGovernanceResponse::SourceCatalog {page:Box::new(page)},

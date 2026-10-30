@@ -8,7 +8,13 @@ EverTrace retains permitted activity as traceable evidence, produces background 
 
 **Status: source-build preview for controlled local trials, not a fully validated turnkey release.** The local implementation has automated test coverage; compatibility with your actual host and the quality of your chosen model must still be checked.
 
-The current source uses embedded SQLite for the authoritative journal and current/runtime/relation state, embedded LanceDB for derived retrieval indexes, and CAS for protected payloads. Older all-Lance storage diagrams and three-program installation examples do not describe this checkout. Use the four-program package below and the guarded maintenance commands; do not manually edit or copy live database files to match an older layout. This describes the code, not completed real-data migration or release qualification.
+The current source uses embedded SQLite for the authoritative journal and current/runtime/relation state, embedded LanceDB for derived retrieval indexes, and CAS for protected payloads.
+
+Older all-Lance storage diagrams and three-program installation examples do not describe this checkout.
+
+Use the four-program package below and the guarded maintenance commands; do not manually edit or copy live database files to match an older layout.
+
+This describes the code, not completed real-data migration or release qualification.
 
 ## What it does
 
@@ -62,11 +68,59 @@ Check that LLM processing is disabled; an existing file was not replaced. Then s
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --daemon
 ```
 
-In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` or `--tui`. The former Rust Web implementation and its uncommitted extensions have been rolled back; `--web` now starts the independent Python service when its matching optional component has been explicitly assembled. The old source/history/comparison evidence is historical, not proof of the new implementation. The Python package now has verified current-only metadata browsing, native kind/Atom-axis filters, journal-order paging/counts, half-open windows on the current revision's native journal event or ingestion time (not source-message/generated time), a native typed Task/Repository/Worktree directory with explicit-scope metadata browsing and opt-in Global assets, permission-checked stored titles/excerpts with explicit summary provenance, semantic detail, original-revision semantic ranges (up to 8 KiB per response with fresh permission checks), and connection status. Detail views also expose same-object revision pages with source/frontier-bound continuations and fresh exact-version reads. Native comparisons use two exact revisions of one logical memory, recheck each side, page through bounded fields and distinguish missing/null/oversized values; full values remain linked to exact semantic ranges. Native source/dependency links can be opened and returned from without changing the selected revision; protected textual archives have exact-source 8 KiB ranges with native CAS verification. Counts describe metadata records, not readable bodies. Scope-directory reads now use finite native candidate windows and direct source cohorts rather than a full memory snapshot. Native memory-page selection borrows canonical typed records and materializes only the selected page after full filtering/counting; list previews, history and content still have separate full-snapshot costs. These changes do not qualify all large-corpus reads or resource use. A read-only native catalogued-source page preserves distinct source instances per logical session and shows recorded access/import status, archive watermarks and the current job without scanning, approving or importing sources. Formal CLI exec/isolated assembly and the basic lifecycle are verified; source-record/archive browsing, complete lineage links, full scopes/search, non-text/capture/artifact ranges and final resource acceptance remain pending; its one-time-link/session and read-only/security requirements remain mandatory. Follow the [host setup and first-memory walkthrough](docs/getting-started.md) for the retained core workflow.
+In a second terminal, run `./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --doctor` or `--tui`.
+
+The former Rust Web implementation and its uncommitted extensions have been rolled back. `--web` now starts the independent Python service when its matching optional component has been explicitly assembled.
+
+Old Rust source/history/comparison logs are historical evidence, not proof of this implementation.
+
+The Python package supports current-only metadata browsing, native kind/Atom-axis filters, recording-order pages/counts and half-open windows on the current revision's native journal event or ingestion time.
+
+These windows are not source-message or generated time.
+
+The typed Task/Repository/Worktree directory supports explicit scopes and opt-in Global assets.
+
+Readable records have permission-checked stored titles/excerpts with explicit summary provenance, semantic details and original-revision semantic ranges of at most 8 KiB.
+
+Same-object history pages bind their continuations to the source and frontier, and reopen exact versions with fresh access checks.
+
+Native comparison reads two exact revisions of one logical memory and rechecks both sides.
+
+Its bounded fields distinguish missing, null and oversized values; full values link to exact semantic ranges.
+
+Native source/dependency links preserve the selected revision on return, while protected textual archives use exact-source 8 KiB ranges with native CAS verification.
+
+Counts describe metadata records, not readable bodies.
+
+Scope-directory reads use finite native candidate windows and direct source cohorts.
+
+Memory-page selection filters and counts borrowed canonical records before materializing the selected page.
+
+Previews, history and content still have separate full-snapshot costs; these changes do not qualify all large-corpus reads or resource use.
+
+The read-only source directory preserves distinct source instances per logical session.
+
+It shows recorded access/import status, archive watermarks and the current job without scanning, approving or importing sources.
+
+Readers can select retained exact archive revisions, page indexed records with sequence windows and fresh read gates, then open protected content and return to the original page without caching bodies or substituting current revisions.
+
+Formal CLI exec, isolated assembly and the basic lifecycle are verified. Further record filters, complete lineage links, full scopes/search, non-text/capture/artifact ranges and final resource acceptance remain pending. The one-time-link, session and read-only security requirements remain mandatory.
+
+Follow the [host setup and first-memory walkthrough](docs/getting-started.md) for the retained core workflow.
 
 ### Web architecture migration
 
-Web uses an independent optional Python presentation/service component, not embedded Rust HTTP or page assets. Rust retains the business backend and single writer. Templates/static assets and Python Web edits must not require Cargo; only explicit `--web` starts Python. Without Web, core CLI/TUI/MCP/daemon must not preload Web resources or start its worker/sessions/pollers, and must work with the Web component absent. The current basic read-only slice has CLI/isolated-assembly, shared-session/expiry/visibility/reconnect and short-window three-state reclamation evidence. **Full functionality and final resource acceptance remain incomplete**; see [architecture](docs/architecture.md). See [development assembly](docs/development.md#独立-web-工程迁移中--independent-web-component-migration) for the verified explicit optional-component build; opening Web never installs dependencies.
+Web uses an independent optional Python presentation/service component, not embedded Rust HTTP or page assets.
+
+Rust retains the business backend and single writer.
+
+Templates/static assets and Python Web edits must not require Cargo; only explicit `--web` starts Python.
+
+Without Web, core CLI/TUI/MCP/daemon must not preload Web resources or start its worker/sessions/pollers, and must work with the Web component absent.
+
+The current basic read-only slice has CLI/isolated-assembly, shared-session/expiry/visibility/reconnect and short-window three-state reclamation evidence. **Full functionality and final resource acceptance remain incomplete**; see [architecture](docs/architecture.md).
+
+See [development assembly](docs/development.md#独立-web-工程迁移中--independent-web-component-migration) for the verified explicit optional-component build; opening Web never installs dependencies.
 
 ### Installation package
 
@@ -89,7 +143,13 @@ install -m 755 target/debug/evertrace target/debug/evertrace-mcp \
   target/debug/evertraced target/debug/evertrace-hook "$HOME/.local/lib/evertrace/"
 ```
 
-This only copies programs; it does not configure the host or start a service. Do not overwrite binaries in an existing installation: use the [guarded upgrade workflow](docs/operations.md). Do not run the EverTrace installer as root. Installation changes managed host configuration and may enable a user service; it is a separate, explicit step.
+This only copies programs; it does not configure the host or start a service.
+
+Do not overwrite binaries in an existing installation: use the [guarded upgrade workflow](docs/operations.md).
+
+Do not run the EverTrace installer as root.
+
+Installation changes managed host configuration and may enable a user service; it is a separate, explicit step.
 
 ## What “available” does and does not mean
 

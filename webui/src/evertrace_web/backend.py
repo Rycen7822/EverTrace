@@ -151,6 +151,33 @@ class Backend:
         normalized = {"selection": normalize_scope(query.get("selection", {"kind": "all"})), "include_global": include_global, **{key: query.get(key, values[0]) for key, values in wire_values.items()}, "time_range": normalize_time_range(query.get("time_range"))}
         return await self._request({"kind": "browse_memories", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
 
+    async def source_archive(self, query, after=None, expected_frontier=None):
+        if not isinstance(query, dict) or query.get("kind") not in ("revisions", "records"):
+            raise BackendError("invalid_input")
+        source = query.get("source_instance_id")
+        if not isinstance(source, str) or not source or len(source.encode("utf-8")) > 1024:
+            raise BackendError("invalid_input")
+        normalized = {"kind": query["kind"], "source_instance_id": source}
+        allowed = {"kind", "source_instance_id"}
+        if query["kind"] == "records":
+            allowed |= {"source_revision", "from_sequence", "until_sequence"}
+            revision = query.get("source_revision")
+            if not isinstance(revision, str) or not revision or len(revision.encode("utf-8")) > 256:
+                raise BackendError("invalid_input")
+            normalized["source_revision"] = revision
+            for key in ("from_sequence", "until_sequence"):
+                value = query.get(key)
+                if isinstance(value, str):
+                    if not value or not value.isascii() or not value.isdecimal() or len(value) > 20:
+                        raise BackendError("invalid_input")
+                    value = int(value)
+                if value is not None and (type(value) is not int or not 0 <= value <= 2**64 - 1):
+                    raise BackendError("invalid_input")
+                normalized[key] = value
+        if set(query) - allowed:
+            raise BackendError("invalid_input")
+        return await self._request({"kind": "source_archive", "query": normalized, "expected_frontier": expected_frontier, "after": after, "limit": 32})
+
     async def source_catalog(self, query=None, after=None, expected_frontier=None):
         if query is None:
             query = {}
@@ -262,7 +289,7 @@ class Backend:
                     return health
                 response = await call({"human_governance": {"operation": "read", "request": read}})
                 result = response["human_governance"]
-                if result.get("kind") not in ("snapshot", "memory_page", "revision_page", "scope_directory", "source_catalog", "content", "revision_comparison", "conflict"):
+                if result.get("kind") not in ("snapshot", "memory_page", "revision_page", "scope_directory", "source_catalog", "source_archive", "content", "revision_comparison", "conflict"):
                     raise BackendError("invalid_read_response")
                 return result
             finally:

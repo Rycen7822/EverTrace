@@ -14,9 +14,13 @@ Summaries require supported records with body permission. Record existence, queu
 
 ## 本机网页 / Local WebUI
 
-**当前状态：旧 Rust Web 已回撤；正式 `--web` exec、显式隔离组件装配及基础只读记忆/详情/分页/状态已通过真实 daemon/浏览器验证。先按开发说明装配匹配组件。当前版本元数据的后端种类/Atom 状态筛选、录入顺序和 query/frontier 绑定分页计数也已验证；已接入原生 Task/Repository/Worktree 目录与关联范围筛选，global 资产需单独选择或明确包含；原修订语义值的 8 KiB 分段读取已接入，每次复验当前权限；同对象历史分页及 exact 逐版阅读也已接入；详情中的精确来源/直接关联及受保护文本归档分段也已接入；两个指定修订的原生字段比较、当前修订的原生事件/录入时间窗也已接入；已登记来源目录也已接入；来源记录目录与完整关联、完整范围/搜索、非文本/捕获/制品区间和最终功能/资源验收仍未闭合，旧日志不作为新版本完成证明。**
+**当前状态：开发中。** 旧 Rust Web 已回撤，正式 `--web` exec 与显式隔离组件装配已通过真实 daemon/浏览器验证。使用前先装配匹配的可选组件。
 
-**Current status: Rust Web was rolled back. Formal CLI exec, explicit isolated assembly and basic Python memory/detail/paging/status have real daemon/browser evidence. Assemble the matching optional component first. Native current-only filters/counts, typed scopes, exact history, source/dependency navigation and protected source-text ranges and native exact-revision field comparison are available. The standalone source directory, source/time filters, full search/governance/management and complete functionality/lifecycle/resource acceptance remain unfinished; old logs are not new acceptance.**
+记忆与来源的只读能力见下文。生产搜索、治理/管理、完整关联、部分内容表示和最终功能/资源/桌面验收仍未闭合，不能用旧日志冒充新版本完成。
+
+**Current status: in development.** Rust Web was rolled back. Formal CLI exec, isolated assembly and basic Python reads have real daemon/browser evidence. Assemble the matching optional component first.
+
+The sections below describe the connected memory/source reads. Production search, governance/management, complete associations, some representations and final functionality/resource/desktop acceptance remain unfinished. Old logs are not new acceptance.
 
 先启动同一构建的 daemon，再在另一终端运行：
 
@@ -30,19 +34,157 @@ evertrace --config /absolute/config.toml --web
 evertrace --config /absolute/config.toml --web --port 4173
 ```
 
-打开终端打印的 `http://127.0.0.1:PORT/#bootstrap=...` 链接。它是两分钟内有效的一次性登录凭据，请勿分享或写进日志。服务只监听本机；不自动启动 daemon，不安装宿主接线。Ctrl-C 关闭前台 Web 服务，不停止 daemon。旧 Rust 实现已回撤，独立 Python 基础只读包已建立，正式启动器已用 Unix exec 对接；Python/模板/资源修改不需 Cargo；基础启动链已验证无 `--web` 时不访问 Python/页面资源，缺失组件不影响核心入口。该基础证据不替代完整功能接入后的最终资源复验。
+打开终端打印的 `http://127.0.0.1:PORT/#bootstrap=...` 链接。它是两分钟内有效的一次性登录凭据，请勿分享或写进日志。
 
-Open the printed loopback URL. Its fragment is a single-use login credential valid for two minutes: do not share or log it. The service listens locally only, never starts a daemon or installs host wiring, and Ctrl-C closes Web without stopping the daemon. The old Rust implementation has been rolled back; an independent Python read-only package exists, its formal launcher now uses Unix exec; no-Cargo Web edits and no dormant Web runtime remain migration targets, not completed claims.
+服务只监听本机，不自动启动 daemon，也不安装宿主接线。Ctrl-C 关闭前台 Web 服务，不停止 daemon。
 
-当前 Python 网页默认只列每个对象的当前版本，不混入历史修订；在当前权限允许时显示已有标题和短摘录，而不是只显示内部类型与引用。标题与摘录由原生后端在原修订、来源和删除门检查后提供，不为列表调用模型。Core 规则摘录来自 membership 指定的原 Atom 修订；提案始终标为参考，不把草案展示成正式方法。确定性汇总、模型整理、生成结果未通过检查和普通已有内容摘录分别标明；真值、权威、生命周期、发布和支持状态独立呈现。没有权限时不返回标题、摘录或它们的截短信息；类型和短引用只是占位，不是正文。列表摘录最多 1 KiB，标题最多 512 字节；CSS 也会折叠较长片段，完整内容应打开条目读取。支持后端种类筛选、Atom 真值/权威/生命周期三个独立轴和录入顺序分页。时间窗可选当前修订对应的原生事件时间（journal occurred_at_us）或原生录入时间（ingested_at_us），不是最初建档时间、来源消息时间或生成时间。起点包含、终点不包含，可只填一边；输入按浏览器本地时间转换，应用后显示后端实际采用的条件。过滤在后端计数和选页前完成，换时间条件后不能继续使用原游标；排序仍按原生录入序号，不以可能回拨的时钟值排序。总数与筛选数由原生后端计算，表示当前元数据记录，不是可读正文数量；缺正文权限时不能据此推断正文可用。详情中的“修订历史”列出同一 Atom、Procedure、Core membership、提案或摘要的保留版本，每页 32 条，按录入顺序从新到旧；摘要只有一条不可变记录时就只列这一条。分页游标绑定打开历史时的 exact 源修订及读取水位，水位变化不拼接旧页。选中某版后重新检查权限并读取该版，刷新不会换成 current。历史页只列元数据，不凭状态或序号判断哪版是 current，也不显示已删除版本。“来源与直接关联”只沿原生返回的引用跳转，包含来源、支持和范围依赖；原始对象与共享修订别名的投影会区分，不凭名称或scope猜目标。选中关联记录后可返回原修订及该关联页；只保留至多16层身份/游标/视口，不缓存正文。来源详情显示原生角色、信任和捕获完整性，来源文字没有执行权；保存的Inline与Preview明确区分，字段缺失保持缺失，不补造预览。同一逻辑记忆的两个指定修订也可由原生端比较：先将某版“设为比较左侧”，再在该对象历史中选右侧。左右只是选择方向，不猜时间或真假；每侧重过原来源/删除门，一侧不可读就不返回字段名、值、长度和差异数，不补 current 或空值。字段按JSON Pointer排列，每页8项；缺字段与JSON null分开，字段JSON超过2KiB则明确标注，可分别打开两侧完整语义分段阅读。列表及深层结构作为整个字段比较，不用浏览器diff裁定业务。返回会恢复原历史/比较页的身份、游标和视口，再次读取不缓存旧值。Wiki 历史与完整关联仍未闭合；旧 Rust Web 日志不作为这些能力的证明。语义结构超过原单次上限时可按原修订分段读取，每段至多 8 KiB；Atom 另可按原文读取正文，保留 UTF-8、换行和空白。页面只显示当前段，可前后翻段，不自动加载全文；游标绑定对象、修订和表示，每次都重新检查当前权限及删除门。SourceReceipt/SourceObservation的文本可从Native受保护归档按段读取，不以EvidenceSurface或预览代替。每段重新过当前来源与删除门，并校验CAS、长度、呈现前缀、原观察指纹及脱敏关系；只返回保护后的字节，不恢复秘密。非文本、CaptureReceipt和制品区间仍未闭合。来源范围虽有8KiB响应上限，当前每段仍由Native完整验证/解码归档（编码64MiB/解码128MiB上限），不宣称流式常量内存或完整资源资格。原生列表选页已改为借用canonical typed记录，按原删除/仓库规则完成筛选、计数和keyset后，只物化选中页；不会先为所有候选编码正文。但列表摘录、历史和分段等读面仍有完整快照成本；归档分段仍完整验证/解码，不代表大库读取成本已完成优化。可通过范围按钮按名称、后端记录的路径或分支查找 Task、Repository 和 Worktree，也可查看下级。目录从原生端按至多 64 个候选的窗口读取，仅为这些候选准备直接来源和范围权限输入，不再为列目录取全库记忆正文。冷校验与必要投影追平仍保留；窗口化不代表所有大库读取或资源验收已完成。Task 视图列出该任务及其声明关联的仓库/工作树资产；仓库/工作树视图列出对应资产及关联任务，global 不会自动混入，需单选或勾选“同时列 global”。范围不存在或不可用时显示计数未知，不回退到全部范围；归属未判定时计数标为不完整。计数始终表示元数据，不是可读正文或方法执行资格。任务名称也受当前来源许可约束，暂时读不到的名称不会参与名称匹配，页面会提示结果可能不全；关闭或隐藏页面会清空目录。“来源”页只读原生端已登记的来源，按来源键分页，每页32个；不触发宿主扫描、批准或导入，也不把本页数量当作宿主全部历史。同一逻辑 Session 的多个 source instance 分别保留，可按精确 Session ID、来源或尚未证明仓库/工作树归属筛选；目录提示不充当归属证明，未归属不等于 global。选择来源可查看当前目录/来源修订、历史归属、读取限制、显式访问意图、原记录的导入状态、同一来源修订的归档水位及当前导入 job。批准和 imported 状态不等于当前正文可读；正文仍经原门复验。前瞻观察边界、后续完整记录起点/水位与较早前缀水位分别显示，文件长度不是归档长度，部分进展不写成整份已导入。隐藏或读取不可用会清空目录、详情、引用、计数和来源筛选输入；恢复后重新读取原生状态。来源页的记录/旧归档分页、与任务/范围的完整关联、记忆列表来源过滤、生成/来源消息等其它时间口径、搜索与其余业务页面仍待闭合，不把录入顺序当作事件发生时间。未接入的页面不会显示样例。正文按文本显示，网页会话不将记忆存入 localStorage、IndexedDB 或离线缓存。会话空闲 15 分钟或满 8 小时后失效；可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
+旧 Rust 实现已回撤，独立 Python 基础只读包已建立，正式启动器已用 Unix exec 对接。Python、模板和资源修改不需 Cargo。基础启动链已验证：没有 `--web` 时不访问 Python 或页面资源，缺失组件不影响核心入口。这不替代完整功能接入后的最终资源复验。
 
-The independent Python package now provides native current-only browsing, kind/Atom-axis and typed-scope filters, recording-order keyset pages/counts, permission-checked stored titles/excerpts, semantic details and exact-revision ranges of at most 8 KiB. Detail views also provide 32-item same-object revision pages for Atom, Procedure, Core membership, proposals and digests, newest recorded first; a single immutable digest is not presented as an invented lineage. History continuations bind the exact source and frontier. Selecting a version rechecks current access and never substitutes the current head; metadata alone does not promise body access, and deleted revisions are not listed. Neither status nor sequence is used to guess which version is current. Pin one version as the left side, then select a right version from that logical object's history. Native comparison rechecks each exact side; an unreadable side suppresses all difference names/values/lengths/counts without substituting current or empty values. Eight fields are shown per page, absent differs from JSON null, and field JSON over 2 KiB links to each side's complete exact semantic ranges. Arrays/deep structures are whole fields; this is not browser-derived semantic truth. History/comparison return paths retain only identities/cursors/viewport and reauthorize rather than caching values. Native source/dependency links now open exact records with a bounded identity-only return path. SourceReceipt/SourceObservation text ranges read the complete native-verified protected archive, not a projection or stored preview, with current source/delete checks on every range. Source role/trust/completeness remain explicit; absent presentations are not fabricated. Native CAS/length/prefix/observation-fingerprint/redaction checks fail closed. Each range still fully verifies/decodes its archive within the existing 64 MiB encoded/128 MiB decoded limits, not streaming constant-RSS access. The standalone source directory, Wiki history, complete lineage links, source/time filters, non-text/capture/artifact ranges, search and other business pages remain unfinished. Scope-directory reads use finite native candidate windows and direct source/scope cohorts, retaining canonical freshness and deletion checks; they no longer request all memory bodies. Cold validation/catch-up remains mandatory. Native memory-page selection borrows canonical typed records and materializes only the selected page after original deletion/repository checks, full filtering/counting and keyset selection. List previews, history and body access still use native request-local full snapshots; bounded responses do not prove bounded large-corpus cost or final resource qualification. Old Rust Web evidence does not establish these remaining capabilities. Content is escaped as text without browser database/offline persistence. Sessions expire after 15 idle minutes or eight hours total, or explicitly through the sidebar. This is local HTTP, not TLS or protection against a malicious process running as the same OS user.
+Open the printed loopback URL. Its fragment is a single-use login credential valid for two minutes: do not share or log it.
+
+The service is loopback-only. It does not start a daemon or install host wiring, and Ctrl-C stops Web without stopping the daemon.
+
+The Rust Web implementation was rolled back.
+
+The independent Python read-only package and Unix-exec launcher are now connected.
+
+Python, templates and assets can be edited without Cargo.
+
+Basic lazy-start checks show no Python or Web-resource access without `--web`, and a missing optional component does not break core modes.
+
+Final resource acceptance after full integration remains pending.
+
+当前 Python 网页默认只列每个对象的当前版本，不混入历史修订。权限允许时显示已有标题和短摘录；这些字段由原生后端在原修订、来源和删除门检查后提供，不为列表调用模型。
+
+Core 规则摘录来自 membership 指定的原 Atom 修订。提案始终标为参考，不把草案展示成正式方法。确定性汇总、模型整理、生成结果未通过检查和普通已有内容摘录分别标明；真值、权威、生命周期、发布和支持状态独立呈现。
+
+没有权限时，不返回标题、摘录或截短信息，类型和短引用只是占位。列表摘录最多 1 KiB，标题最多 512 字节；CSS 也会折叠较长片段，完整内容需打开条目读取。
+
+列表支持后端种类筛选、Atom 真值/权威/生命周期三个独立轴，以及录入顺序分页。总数和筛选数由原生后端计算，表示当前元数据记录，不是可读正文数量，也不是方法执行资格。
+
+时间窗可选当前修订的原生事件时间（journal occurred_at_us）或原生录入时间（ingested_at_us）。这不是最初建档时间、来源消息时间或生成时间。起点包含、终点不包含，可只填一边；输入按浏览器本地时间转换，应用后显示后端实际采用的条件。
+
+时间过滤在后端计数和选页前完成，换条件后不能继续使用原游标。排序仍按原生录入序号，不按可能回拨的时钟值排序。
+
+详情中的“修订历史”列出同一 Atom、Procedure、Core membership、提案或摘要的保留版本，每页 32 条，按录入顺序从新到旧。摘要只有一条不可变记录时就只列这一条。历史只列元数据，不凭状态或序号猜哪版是 current，也不显示已删除版本。
+
+历史游标绑定打开时的 exact 源修订及读取水位，水位变化不拼接旧页。选中某版后重新检查权限并读取该版，刷新不会换成 current。
+
+“来源与直接关联”只沿原生返回的引用跳转，包含来源、支持和范围依赖。原始对象与共享修订别名的投影会区分，不凭名称或 scope 猜目标。返回会恢复原修订及关联页；只保留至多 16 层身份、游标和视口，不缓存正文。
+
+来源详情显示原生角色、信任和捕获完整性，来源文字没有执行权。保存的 Inline 与 Preview 明确区分，缺字段仍保持缺失，不补造预览。
+
+同一逻辑记忆的两个指定修订可由原生端比较：先将某版“设为比较左侧”，再从该对象历史中选右侧。左右只是选择方向，不猜时间或真假。每侧重过来源与删除门；一侧不可读，就不返回差异字段名、值、长度或数量，不补 current 或空值。
+
+比较字段按 JSON Pointer 排列，每页 8 项。缺字段与 JSON null 分开；字段 JSON 超过 2 KiB 则明确标注，可分别打开两侧完整语义分段。数组及深层结构作为整个字段比较，不用浏览器 diff 裁定业务。返回恢复原历史或比较页，并重新读取，不缓存旧值。
+
+语义结构超过原单次上限时，可按原修订分段读取，每段至多 8 KiB。Atom 还可按原文读取正文，保留 UTF-8、换行和空白。页面只显示当前段，不自动加载全文；游标绑定对象、修订和表示，每次都复验当前权限及删除门。
+
+SourceReceipt/SourceObservation 的文本从 Native 受保护归档分段读取，不用 EvidenceSurface 或预览代替。每段复验来源和删除门，并校验 CAS、长度、呈现前缀、原观察指纹及脱敏关系；只返回保护后的字节，不恢复秘密。
+
+归档范围虽有 8 KiB 响应上限，当前每段仍需完整验证和解码归档，限额为编码 64 MiB、解码 128 MiB。这不是流式常量内存读取。非文本、CaptureReceipt 和制品区间仍未闭合。
+
+列表选页借用 canonical typed 记录，完成原删除/仓库规则、筛选、计数和 keyset 后，只物化选中页，不先为所有候选编码正文。不过，列表摘录、历史和分段等读面仍有完整快照成本，大库读取和资源资格尚未完成。
+
+范围按钮可按名称、后端记录的路径或分支查找 Task、Repository 和 Worktree，也可查看下级。原生目录每次读取至多 64 个候选，只为该窗口准备直接来源和范围权限输入，不取全库记忆正文。冷校验与必要投影追平仍保留。
+
+Task 视图列出该任务及其声明关联的仓库/工作树资产。仓库/工作树视图列出对应资产及关联任务；global 不会自动混入，需单选或勾选“同时列 global”。范围不存在或不可用时显示计数未知，不回退全部范围；归属未判定时标明计数不完整。
+
+任务名称也受当前来源许可约束，读不到的名称不参与名称匹配，页面会提示结果可能不全。关闭或隐藏页面会清空目录。
+
+“来源”页只读原生端已登记的来源，按来源键分页，每页 32 个。浏览不触发宿主扫描、批准或导入，本页数量也不表示宿主全部历史。同一逻辑 Session 的多个 source instance 分别保留。
+
+来源目录可按精确 Session ID、来源或尚未证明仓库/工作树归属筛选。目录提示不是归属证明，未归属不等于 global。选择来源后，可查看目录/来源修订、历史归属、读取限制、显式访问意图、原记录的导入状态、同修订归档水位及当前导入 job。
+
+批准或 imported 状态不等于当前正文可读，正文仍经原门复验。前瞻观察边界、后续完整记录起点/水位与较早前缀水位分别显示。文件长度不是归档长度，部分进展不写成整份已导入。
+
+隐藏或读取不可用会清空目录、详情、引用、计数和来源筛选输入。恢复后重新读取原生状态。
+
+从“已保留的归档修订”可选择 exact source/revision，再按原生 sequence/receipt 分页，每页最多 32 条。修订目录按修订键排列，不冒时间先后或正文许可。
+
+记录可按原生序号半开区间定位。导入 sequence 可能是字节终点，不把它当作消息数量；metadata header 也不会因不是 message 而被漏掉。记录来自现有 source/revision 索引，不扫描全库 Evidence，也不要求原 JSONL 仍存在。
+
+已有 Inline/Preview 只按原生保存字段显示至多 512 字节的 UTF-8 节选，并标明出处及截短。缺失仍缺失，不为了补预览读取 CAS 或调用模型。
+
+记录页每次重新检查来源、仓库、删除和抑制门。不可读时，不返回记录字段、预览或续页引用；即使请求区间原本为空，也不以零结果冒充。水位或条件改变时不拼旧游标，不回退当前来源修订。
+
+点击记录后，按 exact observation/receipt 进入原详情和受保护 CAS 分段入口。返回恢复原修订目录、记录页及视口，只保留身份和游标，不缓存正文。同源真实改写后的旧归档仍可按旧修订读取，当前原文件离线也不改用新正文。
+
+记录的时间/事件等其它筛选、任务/范围完整关联、记忆列表来源过滤、生成/来源消息等其它时间口径、搜索与其余业务页面仍待闭合。Wiki 历史与完整关联也未完成。旧 Rust Web 日志不作为这些能力的证明，未接入页面不会显示样例。
+
+正文按文本显示，不将记忆写入 localStorage、IndexedDB 或离线缓存。网页会话空闲 15 分钟或满 8 小时后失效，也可用侧栏按钮提前结束。这里是本机 HTTP，不提供 TLS，也不防护同一 OS 用户下的恶意进程。
+
+The independent Python package provides native current-only metadata browsing, kind/Atom-axis filters, recording-order pages/counts and windows on the current revision's native event or ingestion time.
+
+These are not source-message or generated times.
+
+The typed scope directory supports Task/Repository/Worktree relations and explicit opt-in Global assets.
+
+Readable lists use permission-checked stored titles/excerpts and explicit summary provenance.
+
+Details provide semantic values and original-revision ranges of at most 8 KiB.
+
+Counts describe metadata records, not readable bodies or method eligibility; independent semantic axes are not collapsed into one status.
+
+Scope-directory reads use finite native candidate windows and direct source/scope permission facts rather than all unrelated memory bodies.
+
+Memory-page selection filters and counts borrowed canonical records before materializing the selected page.
+
+Cold validation and required projection catch-up remain intact.
+
+Previews, history and content still have full-snapshot costs. Large-corpus reads and resource use are not fully qualified.
+
+Same-object history pages bind continuations to the exact source and frontier.
+
+Opening a version rechecks current access and does not substitute current.
+
+Two exact revisions of the same logical memory can also be compared natively, with fresh checks on both sides and bounded field pages.
+
+Missing, null and oversized values remain distinct; full values use exact semantic ranges.
+
+Native source/dependency links follow authoritative references, distinguish primary objects from shared-revision aliases and return to the original revision. Stored Inline and Preview presentations are distinct. Missing presentation stays missing, and source text has no instruction authority.
+
+Text archives are read from Native's protected storage in exact-source 8 KiB ranges.
+
+Each request rechecks access/deletion and verifies CAS identity, lengths, presentation prefix, original observation fingerprint and protection/redaction relations.
+
+These are bounded responses, not streaming constant-memory verification: each range still fully verifies/decodes its archive, within 64 MiB encoded and 128 MiB decoded limits.
+
+The source directory reads already committed metadata only.
+
+It preserves distinct source instances per logical session and shows recorded access intent, import state, revision-specific watermarks and the current job.
+
+Browsing does not scan, approve or import.
+
+Catalogued state is not proof of effective body access or complete import.
+
+Retained archive revisions can be selected by exact source/revision.
+
+Indexed records are paged by native sequence/receipt, with optional half-open sequence windows and fresh source/repository/deletion/suppression checks.
+
+Sequence may be a byte endpoint, not a message count; metadata headers are not silently omitted.
+
+Stored record presentations may produce a native UTF-8 excerpt of at most 512 bytes, clearly marked as Inline/Preview and truncated where needed.
+
+Missing presentation is not invented or filled by reading CAS.
+
+Exact record references open the original detail/protected-content path, and returning restores the original record page without caching bodies or substituting current revisions.
+
+The original JSONL need not remain present to read authorized retained archives. Hidden or unavailable pages clear old fields, references and counts; restoration rereads Native.
+
+Further source/time/event filters, complete scope associations, full search/governance/management, non-text/capture/artifact ranges and final functionality/resource/desktop acceptance remain unfinished. Old logs are not new acceptance, and unconnected pages do not show samples.
+
+The browser does not persist bodies in localStorage, IndexedDB or offline caches. A Web session expires after 15 idle minutes or eight hours total. This is local HTTP, not TLS, and it does not defend against a malicious process running as the same OS user.
 
 ## CLI 与 MCP 的区别 / CLI versus MCP
 
 `evertrace --help` 是当前 CLI 参数真源。CLI 以互斥的 `--xxx` 模式提供配置、诊断、安装、管理、备份和 TUI 等入口；旧顶层子命令已停止接受。无参数只显示帮助，不启动服务。**没有 `evertrace search` 或 `evertrace get` 子命令**。search/get 是 MCP 工具的 action。
 
-Use `evertrace --help` for CLI arguments. Mutually exclusive `--xxx` modes handle configuration, diagnostics, installation, administration, backup and TUI. Retired top-level subcommands are rejected; no arguments prints help without starting a service. **There are no `evertrace search` or `evertrace get` CLI subcommands**; these are actions on the MCP tool.
+Use `evertrace --help` for CLI arguments.
+
+Mutually exclusive `--xxx` modes handle configuration, diagnostics, installation, administration, backup and TUI.
+
+Retired top-level subcommands are rejected; no arguments prints help without starting a service. **There are no `evertrace search` or `evertrace get` CLI subcommands**; these are actions on the MCP tool.
 
 `--config PATH` 必须放在顶层模式之前；CLI、daemon 和 MCP 应使用同一配置，避免连接到不同数据目录。`--config-check` 只校验文件，`--config-show` 只展示该文件合并默认值后的结果，不代表 daemon 当前活动配置或模型连通性。
 
@@ -55,11 +197,23 @@ evertrace --config /absolute/config.toml --config-show
 
 新安装器生成的接线使用独立的 `evertrace-mcp --config PATH --mcp ...`；通用入口 `evertrace --config PATH --mcp ...` 仍存在，旧接线由安装/升级流程验证处理。独立程序只接受 `--mcp` 模式，不能用它运行 `--doctor`、`--tui` 等通用 CLI 操作；命令帮助仍查看 `evertrace --help`。当前安装包需要四个同版本程序，见 [README 的程序清单](../README.md#installation-package)，不要沿用只复制三个程序的旧示例。
 
-New installer-managed wiring uses `evertrace-mcp --config PATH --mcp ...`. The general `evertrace --config PATH --mcp ...` entry point remains; installation/upgrade validates existing wiring. The dedicated program accepts only the `--mcp` mode and does not provide general CLI operations such as `--doctor` or `--tui`; use `evertrace --help` for command help. Current packages require four matching programs; see the [README package list](../README.md#installation-package), not older three-program copy examples.
+New installer-managed wiring uses `evertrace-mcp --config PATH --mcp ...`.
+
+The general `evertrace --config PATH --mcp ...` entry point remains; installation/upgrade validates existing wiring.
+
+The dedicated program accepts only the `--mcp` mode and does not provide general CLI operations such as `--doctor` or `--tui`; use `evertrace --help` for command help.
+
+Current packages require four matching programs; see the [README package list](../README.md#installation-package), not older three-program copy examples.
 
 两者都是 stdio MCP 传输，通过本地 UDS 联系 daemon，不监听公开 TCP，也不会替你启动 daemon。加载配置后等待 stdin 输入是正常行为，不是聊天提示符；宿主能发现工具也不证明 daemon 已连接、绑定有效或读取获准。优先使用安装器生成的完整接线，不手改程序路径、删除宿主定位参数，或伪造绑定标识与 claim。
 
-Both are stdio MCP transports using local UDS, not a public TCP listener, and neither starts the daemon for you. Waiting for stdin after loading configuration is normal, not a chat prompt. Tool discovery alone does not establish daemon connectivity, a valid binding or read permission. Prefer the complete installer-generated wiring; do not hand-swap executable paths, remove host locator arguments or fabricate bindings/claims.
+Both are stdio MCP transports using local UDS, not a public TCP listener, and neither starts the daemon for you.
+
+Waiting for stdin after loading configuration is normal, not a chat prompt.
+
+Tool discovery alone does not establish daemon connectivity, a valid binding or read permission.
+
+Prefer the complete installer-generated wiring; do not hand-swap executable paths, remove host locator arguments or fabricate bindings/claims.
 
 ## MCP 输入与示例 / MCP input and examples
 
@@ -121,7 +275,11 @@ The three main pages are Inbox (proposals), Explorer (sources, objects, details 
 
 当前可见页按上次读取结束时间判断自动刷新：System 至少间隔 15 秒，Inbox/Explorer 至少 5 秒。只有已连接、没有读取/待处理请求、编辑/确认弹窗或筛选输入时才会自动刷新；不是固定周期轮询。空闲时可按 `r` 请求手动刷新，不能用它绕过正在处理的操作。
 
-Auto-refresh is measured from the previous read's completion: at least 15 seconds for the visible System page, five seconds for Inbox/Explorer. It requires a connection and no read, pending request, edit/confirmation dialog or filter input; it is not a fixed-rate poll. Press `r` when idle to request a manual refresh, not to bypass an operation already in progress.
+Auto-refresh is measured from the previous read's completion: at least 15 seconds for the visible System page, five seconds for Inbox/Explorer.
+
+It requires a connection and no read, pending request, edit/confirmation dialog or filter input; it is not a fixed-rate poll.
+
+Press `r` when idle to request a manual refresh, not to bypass an operation already in progress.
 
 这些间隔不是后台采集、摘要或 job 完成的期限。完整诊断可能比普通列表慢；读取失败或耗时较长时，界面可能保留上次数据，应看状态提示，不能把旧数据显示成“任务已经完成”。
 
@@ -150,11 +308,19 @@ Use the footer and actions supported by the selected object; keys differ in edit
 
 `E` 的含义取决于详情：符合条件的待治理提议可进入“编辑并接受”；已验证资产的 support 详情只有在提供替换草稿时才允许“提交替换”。替换草稿必须有实际修改，提交产生 Pending 提议，不直接替换已生效资产，也不自动满足后续接受/资格条件。
 
-`E` depends on the detail: an eligible proposal may offer edit-and-accept; a validated asset's support detail offers submit-replacement only when a replacement draft is available. The draft must actually change. Submitting it creates a Pending proposal, not an immediate replacement of the active asset or automatic acceptance/qualification.
+`E` depends on the detail: an eligible proposal may offer edit-and-accept; a validated asset's support detail offers submit-replacement only when a replacement draft is available.
+
+The draft must actually change.
+
+Submitting it creates a Pending proposal, not an immediate replacement of the active asset or automatic acceptance/qualification.
 
 `D` 仅在 support 详情允许全局 Atom 弃用时打开原因编辑，必须填写合法原因；它提交 Pending 弃用提议，不直接删除资产。操作不可用或发生冲突时，查看当前条件并刷新，不手造 revision、权限或提议载荷来绕过限制。
 
-`D` opens a reason editor only when the support detail permits global Atom deprecation. A valid reason is required; this submits a Pending deprecation proposal, not direct deletion. If unavailable or conflicting, inspect the current conditions and refresh; do not invent revisions, permissions or payloads to bypass them.
+`D` opens a reason editor only when the support detail permits global Atom deprecation.
+
+A valid reason is required; this submits a Pending deprecation proposal, not direct deletion.
+
+If unavailable or conflicting, inspect the current conditions and refresh; do not invent revisions, permissions or payloads to bypass them.
 
 ## 会话导入和范围管理 / Import and scope administration
 

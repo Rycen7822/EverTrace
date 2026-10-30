@@ -30,6 +30,8 @@
 <dt>来源格式</dt><dd>{{ item.source_format }}</dd>
 </dl>
 <p>批准不覆盖仓库信任、禁用或撤销限制。前瞻区间已处理不代表较早记录已获许可，也不代表整份来源已导入。</p>
-<p class="muted">本页尚未接入来源记录分页或管理动作。已归档记录仍可从记忆详情的精确来源引用读取。</p>
+<button class="button" type="button" data-archive-revisions="{{ item.source_instance_id }}">已保留的归档修订</button>
+<button class="button" type="button" data-archive-revision="{{ item.source_revision }}" data-archive-source="{{ item.source_instance_id }}">查看此来源修订的记录</button>
+<p class="muted">目录状态不是记录读取权限。这里不提供批准、导入或其它管理动作。</p>
 </div>
 {% else %}<div class="empty"><h3>选择一个已登记来源</h3><p>同一 Session 下的多个来源分别保留状态；不按路径合并，也不充当工作任务。</p></div>{% endif %}

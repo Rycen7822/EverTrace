@@ -1,0 +1,27 @@
+<div class="source-archive">
+<div class="detail-actions"><button class="button" type="button" data-archive-up>返回上一页</button><button class="text-button" type="button" data-archive-first>本组首页</button></div>
+{% if page.query.kind == 'revisions' %}
+<h2>已保留的归档修订</h2><p class="muted">仅列原生已提交水位中的修订身份，按修订键分页，不是发生时间排序或读取许可。</p>
+{% for revision in page.entries.revisions %}
+<button class="linked-record" type="button" data-archive-revision="{{ revision }}" data-archive-source="{{ page.query.source_instance_id }}"><strong>{{ revision }}</strong><span>打开该修订的已归档记录</span></button>
+{% else %}<p>没有可列出的已提交归档修订；不表示宿主没有原始记录。</p>{% endfor %}
+{% else %}
+<h2>来源记录</h2><p>归档修订：{{ page.query.source_revision }}</p>
+<form id="archive-range" class="time-filter"><label>原生序号起点（含）<input id="archive-from" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="20" value="{{ page.query.from_sequence if page.query.from_sequence is not none else '' }}"></label><label>原生序号终点（不含）<input id="archive-until" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="20" value="{{ page.query.until_sequence if page.query.until_sequence is not none else '' }}"></label><button class="button" type="submit">读取此区间</button></form>
+<p class="muted">按该来源修订的原生 sequence / receipt 排序。导入序号可能是字节终点，不把它当成消息数量；未归档区间不补造记录。</p>
+{% if page.state == 'ready' %}
+{% for record in page.entries.records %}
+<button class="linked-record" type="button" data-archive-record data-link-key="{{ record.stable_key }}" data-revision="{{ record.observation_id }}" data-object="{{ record.observation_id }}" data-kind="source_observation">
+<strong>{{ record.observation_role }} · {{ record.sequence }}</strong>
+<span>{{ record.source_role }} · {{ record.content_trust }} · {{ record.completeness }} · {{ record.archive_mode }}</span>
+<span>event {{ record.event_time_us }} µs · recorded {{ record.recorded_at_us }} µs</span>
+{% if record.byte_range is not none %}<span>来源字节 [{{ record.byte_range.start }}, {{ record.byte_range.end }})</span>{% endif %}
+{% if record.preview is not none %}<span class="source-record-preview">{{ record.preview }}</span><span>已有 {{ record.presentation }} 的{% if record.preview_truncated %}截短{% endif %}节选，不是完整归档</span>{% elif record.presentation == 'non_text' %}<span>已记录为非文本呈现</span>{% else %}<span>没有保存呈现字段；不补造预览，可按精确引用尝试打开受保护归档。</span>{% endif %}
+<span>observation {{ record.observation_id }} · receipt {{ record.receipt_id }}</span>
+</button>
+{% else %}<p>当前区间没有可列出的已归档记录。</p>{% endfor %}
+{% endif %}
+{% endif %}
+{% if page.state != 'ready' %}<p class="reading-note">归档读取状态：{{ page.state }}。未返回记录字段、预览、长度或续页引用，也未换成当前来源修订。</p>{% endif %}
+{% if page.state == 'ready' %}<button class="button" type="button" data-archive-next {% if page.next_cursor is none %}disabled{% endif %}>下一页</button>{% endif %}
+</div>

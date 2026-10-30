@@ -6,11 +6,43 @@
 
 当前实现面向 Linux：使用 Unix domain socket、Linux 文件身份与安全文件操作。WSL2 内请使用 Linux 文件系统中的目录，先检查用户服务是否可用。原生 Windows/macOS 未在此指南中承诺支持。不要以 root 身份运行 EverTrace，不要把数据根放在自动同步的云盘、网络挂载或多个进程共享写入的目录。
 
-The current implementation targets Linux: Unix domain sockets and Linux-specific filesystem safety are part of the design. In WSL2 use the Linux filesystem and check user-service availability. Native Windows/macOS support is not claimed here. Run as your normal user; do not place the data root on cloud-sync/network storage or share it between writers.
+The current implementation targets Linux: Unix domain sockets and Linux-specific filesystem safety are part of the design.
 
-源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。Lance 的构建脚本需要 Protocol Buffers 编译器；只安装 Rust 不够。Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`；按自己的发行版安装。运行已编译的非 Web 核心程序不需要 Conda/Python。旧 Rust Web 已回撤，`--web` 已接入按需 exec；独立 `webui/` Python 包已有开发态只读竖切，且正式入口/隔离组装已验证，完整生命周期/资源验收仍未完成。仅 `--web` 按需使用隔离 Python 环境，不把 Python 变成核心入口依赖，不自动安装 Web 依赖。
+In WSL2 use the Linux filesystem and check user-service availability.
 
-A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`. Lance build scripts require the Protocol Buffers compiler. Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution. Non-Web core binaries do not require Conda/Python. The old Rust Web has been rolled back; the new `--web` exec launcher and independent Python read-only component have verified isolated assembly; full lifecycle/resource acceptance remains unfinished. Only `--web` will start its isolated Python runtime, without making Python a core-mode dependency or silently installing Web dependencies.
+Native Windows/macOS support is not claimed here.
+
+Run as your normal user; do not place the data root on cloud-sync/network storage or share it between writers.
+
+源码编译需要 Git、Rust 1.97.1、C/C++ 编译工具、`cmake`、`pkg-config`、`protoc`。
+
+Lance 的构建脚本需要 Protocol Buffers 编译器。
+
+只安装 Rust 不够。
+
+Debian/Ubuntu 中对应的常见包名为 `git build-essential cmake pkg-config protobuf-compiler`。
+
+按自己的发行版安装。
+
+运行已编译的非 Web 核心程序不需要 Conda/Python。
+
+旧 Rust Web 已回撤，`--web` 已接入按需 exec。
+
+独立 `webui/` Python 包已有开发态只读竖切，且正式入口/隔离组装已验证，完整生命周期/资源验收仍未完成。
+
+仅 `--web` 按需使用隔离 Python 环境，不把 Python 变成核心入口依赖，不自动安装 Web 依赖。
+
+A source build needs Git, Rust 1.97.1, a C/C++ toolchain, `cmake`, `pkg-config` and `protoc`.
+
+Lance build scripts require the Protocol Buffers compiler.
+
+Common Debian/Ubuntu package names are `git build-essential cmake pkg-config protobuf-compiler`; install the equivalents for your distribution.
+
+Non-Web core binaries do not require Conda/Python.
+
+The old Rust Web has been rolled back; the new `--web` exec launcher and independent Python read-only component have verified isolated assembly; full lifecycle/resource acceptance remains unfinished.
+
+Only `--web` will start its isolated Python runtime, without making Python a core-mode dependency or silently installing Web dependencies.
 
 ```sh
 git --version
@@ -38,7 +70,11 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo +1.97.1 build --locked -p evertrace
 
 得到 `evertrace`（统一 CLI）、`evertrace-mcp`（独立 MCP transport）、`evertraced`（daemon）和 `evertrace-hook`（同步采集）。当前示例使用 debug 构建，不等同于经过发布验证的二进制包。安装器从 CLI 所在目录读取另外三个程序，因此四者必须来自同一构建并位于同一目录。
 
-The outputs are `evertrace` (unified CLI), `evertrace-mcp` (dedicated MCP transport), `evertraced` (daemon), and `evertrace-hook` (synchronous capture). This guide uses a debug build, not a qualified release package. The installer resolves the other binaries beside the CLI; keep all four from the same build in one directory.
+The outputs are `evertrace` (unified CLI), `evertrace-mcp` (dedicated MCP transport), `evertraced` (daemon), and `evertrace-hook` (synchronous capture).
+
+This guide uses a debug build, not a qualified release package.
+
+The installer resolves the other binaries beside the CLI; keep all four from the same build in one directory.
 
 这四个 Rust 程序的构建不代表可选 Python Web 已装配；新的 Web entry、隔离环境与精确 uv 命令须在迁移实测后提供，不先给出未经验证的安装流程。 / Building these four Rust binaries does not assemble the optional Python Web component. Its entry, isolated environment and exact uv commands are documented after migration verification, not invented in advance.
 
@@ -85,9 +121,45 @@ Explicitly assemble the optional same-package Python component before this entry
 ./target/debug/evertrace --config "$HOME/.evertrace/config.toml" --web
 ```
 
-使用打印的一次性本机链接，不要分享该凭据。此版本 Python 网页只读接入当前版本元数据列表、原生种类/Atom 状态轴筛选、录入顺序分页/计数、当前修订的原生事件/录入时间窗、原生 Task/Repository/Worktree 目录与关联范围选择（global 显式包含）、经过权限检查的已有标题/短摘录与生成来源标记、语义正文、原修订语义值分段和连接状态；计数不等于可读正文数量。分段按钮按需读取，每段至多 8 KiB 并复验当前权限。范围目录已使用原生候选窗口和直接来源权限输入，不为列目录读取其它记忆正文；列表选页也已在原生typed记录上完成完整筛选/计数后才物化选中页；摘录、历史和正文仍有全快照成本，完整资源资格仍待验。详情还可打开同对象的修订历史，每页 32 条，选版后按 exact revision 重新过权限读取，不回退 current。详情已可沿原生精确引用阅读来源与直接关联，查看保护后的文本归档区间并返回原修订；来源字段缺失与预览都明确标注，不作为全文。同一逻辑记忆还可固定左侧修订，再从历史选右侧，由原生端重过两侧权限并逐字段比较，每页8项；缺失、null和过大字段分别标明，完整值沿原分段入口读取。来源页已能只读原生已登记目录、独立展示同一Session的多个来源，以及当前访问意图/导入状态/归档水位/job；浏览不扫描、批准或导入，也不把目录状态冒正文许可或完整导入。来源记录/旧归档目录、完整关联、完整范围/来源过滤及生成/来源消息等其它时间口径、搜索、非文本/捕获/制品区间及其余页面仍待闭合；没有后台模型也能读取已有记忆。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
+使用打印的一次性本机链接，不要分享该凭据。入口、安全边界和会话期限见[使用方法](usage.md#本机网页--local-webui)。
 
-Use the printed one-time local link and keep it private. The Python WebUI exposes current-only metadata browsing with native kind/Atom-axis filters, recording-order paging/counts, semantic details, original-revision semantic ranges and status. Counts do not promise readable bodies. Range buttons fetch at most 8 KiB and recheck current access; they do not automatically load the whole value. Scope-directory reads use finite native windows and direct source permissions rather than all memory bodies; memory-page selection materializes only the selected page after native full filtering/counts, while previews/history/content still have full-snapshot costs. Complete resource qualification is still pending. Same-object revision pages and exact-version reopening are available from details. Details can follow native exact source/dependency references, read protected textual source archives in ranges and return to the original revision. Missing presentations and previews are explicit, not complete text. Pin a left revision and select a right revision from the same logical memory's history for native field comparison with fresh access checks on each side. Eight fields per page distinguish missing/null/oversized values and link to complete exact ranges. The standalone source directory, complete lineage links, full scope/source/time filtering, search, non-text/capture/artifact ranges and other pages remain incomplete. Existing memory can be read with LLM processing off. See [Usage](usage.md#本机网页--local-webui) for access and session limits.
+Python 网页目前只读接入当前版本元数据列表、原生种类/Atom 状态轴筛选、录入顺序分页/计数及当前修订的原生事件/录入时间窗。原生 Task/Repository/Worktree 目录支持关联范围选择，global 需显式包含。计数不等于可读正文数量。
+
+可读条目展示经过权限检查的已有标题、短摘录和生成来源标记，并提供语义正文及原修订语义值分段。分段按钮按需读取，每段至多 8 KiB，并复验当前权限。没有后台模型，也能读取已有记忆。
+
+范围目录使用原生候选窗口和直接来源权限输入，不读取其它记忆正文。列表选页在原生 typed 记录上完成完整筛选和计数后才物化选中页。不过，摘录、历史和正文仍有全快照成本，完整资源资格尚待验收。
+
+详情可打开同对象的修订历史，每页 32 条。选版后按 exact revision 重新检查权限，不回退 current。还可沿原生精确引用阅读来源与直接关联，查看保护后的文本归档区间，再返回原修订；缺失字段和预览都明确标注，不作为全文。
+
+同一逻辑记忆可固定左侧修订，再从历史选右侧，由原生端重新检查两侧权限并逐字段比较，每页 8 项。缺失、null 和过大字段分别标明，完整值沿原分段入口读取。
+
+来源页只读原生已登记目录，分别展示同一 Session 的多个来源及其访问意图、导入状态、归档水位和 job。浏览不会扫描、批准或导入，也不把目录状态当作正文许可或整份导入完成。
+
+来源页也可选择保留的 exact 归档修订，分页读取原生记录、按序号区间定位，再沿精确引用打开受保护正文。返回恢复原记录页及视口；缺呈现字段不补预览，修订列表不表示正文许可，改写或原文件离线也不把旧归档替换成 current。
+
+记录的其它筛选、完整关联、完整范围/来源过滤、生成/来源消息等其它时间口径、搜索、非文本/捕获/制品区间及其余页面仍待闭合。
+
+Use the printed one-time local link and keep it private.
+
+The Python page currently reads Native metadata lists, kind/Atom-axis filters, recording-order pages/counts and current-revision native event/ingestion windows. The typed scope directory supports explicit associations and opt-in Global assets. A record count is not a readable-body count.
+
+Readable entries have permission-checked stored titles/excerpts, summary provenance and semantic details. Semantic ranges reopen the original revision, with at most 8 KiB returned per chunk. Existing memories remain readable without a background model.
+
+Scope-directory reads use finite candidate windows and direct permission facts, not all unrelated bodies.
+
+Memory-page selection filters/counts borrowed canonical records before materializing the selected page.
+
+Previews, history and content still have full-snapshot costs; final resource qualification remains pending.
+
+Details provide same-object history, exact-revision comparison, source/dependency references and protected textual source ranges. Their current access gates remain active, and returning restores the original revision and viewport. Missing presentation and previews remain explicitly missing.
+
+The source directory preserves separate source instances per logical session.
+
+It shows recorded access/import state, archive watermarks and the current job without scanning, approving or importing.
+
+Exact retained archive revisions lead to indexed record pages and protected content; source replacement or an offline original file does not substitute current content for an old archive.
+
+Further record filters, complete lineage/scope/source filtering, full search, non-text/capture/artifact ranges and the remaining pages are still unfinished. For entry points and security boundaries, see [Usage](usage.md#本机网页--local-webui).
 
 ## 5. 启用后台模型 / Enable background model processing
 
@@ -103,11 +175,19 @@ LLM-off mode can exercise capture and local reads, but creates no new LLM summar
 
 这一步会改动配置：安装器合并 `$CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`）中的受管 Hook/MCP 项，发布 Hook 运行资产，并在用户 systemd 可用时创建/启用 `evertraced.service`。它保留非受管配置，并报告备份和失败；**不修改宿主源码，也不替你启用宿主明确关闭的 Hook 或放宽信任策略**。
 
-This step changes configuration: managed Hook/MCP entries are merged into `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), Hook assets are published, and `evertraced.service` is created/enabled when user systemd is available. Unmanaged configuration is preserved and backups/failures are reported. **Host source is not patched; disabled hooks and trust policy are not overridden.**
+This step changes configuration: managed Hook/MCP entries are merged into `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), Hook assets are published, and `evertraced.service` is created/enabled when user systemd is available.
+
+Unmanaged configuration is preserved and backups/failures are reported. **Host source is not patched; disabled hooks and trust policy are not overridden.**
 
 先停止第 4 步的手动 daemon。确认四个程序位于稳定目录；如果以后清理 `target/`，不要让已安装服务仍引用其中的程序。可自行将同一构建的四个程序放到自己的长期安装目录后，再从那里调用 CLI。以下示例中的路径必须替换为你的真实绝对路径。
 
-Stop the foreground daemon first. Use a stable directory for all four binaries; an installed service must not point into a `target/` directory you later clean. You may copy the four binaries from the same build into a persistent user-owned directory and invoke that CLI. Replace the placeholder absolute paths below.
+Stop the foreground daemon first.
+
+Use a stable directory for all four binaries; an installed service must not point into a `target/` directory you later clean.
+
+You may copy the four binaries from the same build into a persistent user-owned directory and invoke that CLI.
+
+Replace the placeholder absolute paths below.
 
 仅首次安装且目标目录尚未用于现有安装时，可以这样准备；已安装实例应走[升级流程](operations.md)，不要原地覆盖正在运行的二进制：
 
@@ -122,7 +202,9 @@ export PATH="$HOME/.local/lib/evertrace:$PATH"
 
 这个 PATH 设置只作用于当前 shell；其他终端可使用绝对路径，或自行将该目录加入用户 PATH。下面的 `/absolute/evertrace-bin/evertrace` 对应你刚准备的 CLI。宿主路径必须是实际可执行普通文件；若命令发现结果是 symlink，先定位其真实安装文件，不要用伪造 wrapper 绕过类型校验。
 
-This PATH change affects the current shell; use absolute paths in other terminals or add the directory to your user PATH. `/absolute/evertrace-bin/evertrace` below means the CLI you just prepared. The host executable must be an actual executable regular file; resolve symlinks to the real installed file rather than fabricating wrappers to bypass checks.
+This PATH change affects the current shell; use absolute paths in other terminals or add the directory to your user PATH. `/absolute/evertrace-bin/evertrace` below means the CLI you just prepared.
+
+The host executable must be an actual executable regular file; resolve symlinks to the real installed file rather than fabricating wrappers to bypass checks.
 
 ```sh
 /absolute/evertrace-bin/evertrace --config "$HOME/.evertrace/config.toml" --install /absolute/path/to/codex
@@ -140,7 +222,9 @@ Without user systemd, use the manual daemon command printed by the installer. Fo
 
 **费用与副作用：** live canary 使用宿主正常的配置、认证、模型和信任设置，可能产生模型费用；现有第三方 Hook、notify 或 MCP 的副作用不能保证不存在。探测成功也不等于五项能力门全部通过，必须阅读每项结果。`--install ... --live-canary` 具有同类影响。
 
-**Cost and side effects:** a live canary uses normal host configuration, authentication, model and trust. Model charges and existing third-party Hook/notify/MCP effects are possible. Success does not automatically qualify all five capability gates; inspect each result. `--install ... --live-canary` has the same considerations.
+**Cost and side effects:** qualified runtime events may propose and accept an evidenced method through the native scheduler, using the configured provider.
+
+A later session reuses the persisted version without relabeling an accepted draft. The read itself does not create a Task, Workstream or Episode.
 
 ## 7. 验证第一条记忆 / Verify one real memory
 

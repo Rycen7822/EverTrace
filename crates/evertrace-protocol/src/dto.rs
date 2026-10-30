@@ -108,6 +108,12 @@ pub enum HumanReadRequest {
         after: Option<String>,
         limit: u16,
     },
+    SourceArchive {
+        query: evertrace_domain::source::SourceArchiveQuery,
+        expected_frontier: Option<u64>,
+        after: Option<String>,
+        limit: u16,
+    },
     SourceCatalog {
         query: evertrace_domain::source::SourceCatalogQuery,
         expected_frontier: Option<u64>,
@@ -930,6 +936,9 @@ pub enum HumanGovernanceResponse {
     RevisionComparison {
         comparison: Box<evertrace_domain::query::HumanRevisionComparison>,
     },
+    SourceArchive {
+        page: Box<evertrace_domain::source::SourceArchivePage>,
+    },
     SourceCatalog {
         page: Box<evertrace_domain::source::SourceCatalogPage>,
     },
@@ -1019,6 +1028,25 @@ impl HumanReadRequest {
                             raw,
                         )
                         .is_ok_and(|cursor| cursor.validate_for(query, *expected_frontier).is_ok())
+                    })
+            }
+            Self::SourceArchive {
+                query,
+                expected_frontier,
+                after,
+                limit,
+            } => {
+                query.validate().is_ok()
+                    && (1..=32).contains(limit)
+                    && after.as_ref().is_none_or(|raw| {
+                        raw.len() <= 4096
+                        && serde_json::from_str::<evertrace_domain::source::SourceArchiveCursor>(
+                            raw,
+                        )
+                        .is_ok_and(|cursor| {
+                            cursor.validate_for(query)
+                                && *expected_frontier == Some(cursor.frontier)
+                        })
                     })
             }
             Self::SourceCatalog {
@@ -1352,6 +1380,67 @@ impl HumanGovernanceResponse {
                                     .last()
                                     .is_some_and(|last| last.path == cursor.after_path)
                         })
+                    })
+            }
+            Self::SourceArchive { page } => {
+                use evertrace_domain::source::*;
+                let shape = match (&page.query, &page.entries) {
+                    (
+                        SourceArchiveQuery::Revisions { .. },
+                        SourceArchiveEntries::Revisions { revisions },
+                    ) => {
+                        revisions.len() <= 32
+                            && revisions.windows(2).all(|pair| pair[0] < pair[1])
+                            && revisions.iter().all(|revision| {
+                                evertrace_domain::evidence::SourceRevision::parse(revision.as_str())
+                                    .is_ok()
+                            })
+                    }
+                    (
+                        SourceArchiveQuery::Records { .. },
+                        SourceArchiveEntries::Records { records },
+                    ) => {
+                        records.len() <= 32
+                            && records.iter().all(|record| {
+                                record.validate() && page.query.includes(record.sequence)
+                            })
+                            && records.windows(2).all(|pair| {
+                                (pair[0].sequence, pair[0].receipt_id)
+                                    < (pair[1].sequence, pair[1].receipt_id)
+                            })
+                    }
+                    _ => false,
+                };
+                let empty = match &page.entries {
+                    SourceArchiveEntries::Revisions { revisions } => revisions.is_empty(),
+                    SourceArchiveEntries::Records { records } => records.is_empty(),
+                };
+                shape
+                    && page.query.validate().is_ok()
+                    && (page.state == HumanContentState::Ready
+                        || (empty && page.next_cursor.is_none()))
+                    && page.next_cursor.as_ref().is_none_or(|raw| {
+                        raw.len() <= 4096
+                            && serde_json::from_str::<SourceArchiveCursor>(raw).is_ok_and(
+                                |cursor| {
+                                    cursor.frontier == page.frontier
+                                        && cursor.validate_for(&page.query)
+                                        && match (&cursor.position, &page.entries) {
+                                            (
+                                                SourceArchivePosition::Revision { revision },
+                                                SourceArchiveEntries::Revisions { revisions },
+                                            ) => revisions.last() == Some(revision),
+                                            (
+                                                SourceArchivePosition::Record { sequence, receipt },
+                                                SourceArchiveEntries::Records { records },
+                                            ) => records.last().is_some_and(|record| {
+                                                record.sequence == *sequence
+                                                    && record.receipt_id == *receipt
+                                            }),
+                                            _ => false,
+                                        }
+                                },
+                            )
                     })
             }
             Self::SourceCatalog { page } => {

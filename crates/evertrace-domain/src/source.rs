@@ -160,3 +160,147 @@ pub struct SourceCatalogPage {
     /// Only the already catalogued native namespace, not a full host scan.
     pub next_cursor: Option<String>,
 }
+
+/// Archive revisions are metadata identities, never a grant to read records.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceArchiveQuery {
+    Revisions {
+        source_instance_id: String,
+    },
+    Records {
+        source_instance_id: String,
+        source_revision: SourceRevision,
+        from_sequence: Option<u64>,
+        until_sequence: Option<u64>,
+    },
+}
+impl SourceArchiveQuery {
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Revisions { source_instance_id }
+            | Self::Records {
+                source_instance_id, ..
+            } => source_instance_id,
+        }
+    }
+    pub fn validate(&self) -> Result<(), QueryError> {
+        if self.source().is_empty()
+            || self.source().len() > 1024
+            || self.source().chars().any(char::is_control)
+        {
+            return Err(QueryError::Invalid);
+        }
+        if let Self::Records {
+            source_revision,
+            from_sequence,
+            until_sequence,
+            ..
+        } = self
+            && (SourceRevision::parse(source_revision.as_str()).is_err()
+                || matches!((from_sequence,until_sequence),(Some(from),Some(until)) if from>=until))
+        {
+            return Err(QueryError::Invalid);
+        }
+        Ok(())
+    }
+    pub fn includes(&self, sequence: u64) -> bool {
+        matches!(self,Self::Records{from_sequence,until_sequence,..} if from_sequence.is_none_or(|from|sequence>=from) && until_sequence.is_none_or(|until|sequence<until))
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceArchivePosition {
+    Revision {
+        revision: SourceRevision,
+    },
+    Record {
+        sequence: u64,
+        receipt: crate::ids::SourceReceiptId,
+    },
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceArchiveCursor {
+    pub frontier: u64,
+    pub query: SourceArchiveQuery,
+    pub position: SourceArchivePosition,
+}
+impl SourceArchiveCursor {
+    pub fn validate_for(&self, query: &SourceArchiveQuery) -> bool {
+        query.validate().is_ok()
+            && &self.query == query
+            && match (&self.query, &self.position) {
+                (
+                    SourceArchiveQuery::Revisions { .. },
+                    SourceArchivePosition::Revision { revision },
+                ) => SourceRevision::parse(revision.as_str()).is_ok(),
+                (
+                    SourceArchiveQuery::Records { .. },
+                    SourceArchivePosition::Record { sequence, .. },
+                ) => query.includes(*sequence),
+                _ => false,
+            }
+    }
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRecordPresentation {
+    Inline,
+    Preview,
+    NonText,
+    NotRecorded,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRecordSummary {
+    pub stable_key: String,
+    pub observation_id: crate::ids::SourceObservationId,
+    pub receipt_id: crate::ids::SourceReceiptId,
+    pub record_identity: crate::evidence::SourceRecordIdentity,
+    pub sequence: u64,
+    pub byte_range: Option<crate::evidence::EvidenceByteRange>,
+    pub observation_role: crate::evidence::ObservationRole,
+    pub source_role: crate::evidence::SourceRole,
+    pub content_trust: crate::evidence::ContentTrust,
+    pub completeness: crate::evidence::CaptureCompleteness,
+    pub archive_mode: crate::evidence::SourceArchiveMode,
+    pub event_time_us: i64,
+    pub recorded_at_us: i64,
+    pub presentation: SourceRecordPresentation,
+    pub preview: Option<String>,
+    pub preview_truncated: bool,
+}
+impl SourceRecordSummary {
+    pub fn validate(&self) -> bool {
+        self.stable_key == format!("object:evidence:source_observation:{}", self.observation_id)
+            && self
+                .byte_range
+                .as_ref()
+                .is_none_or(|range| range.end > range.start)
+            && self.event_time_us >= 0
+            && self.recorded_at_us >= 0
+            && self.preview.as_ref().is_none_or(|text| text.len() <= 512)
+            && (self.preview.is_some()
+                == matches!(
+                    self.presentation,
+                    SourceRecordPresentation::Inline | SourceRecordPresentation::Preview
+                ))
+            && (!self.preview_truncated || self.preview.is_some())
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceArchiveEntries {
+    Revisions { revisions: Vec<SourceRevision> },
+    Records { records: Vec<SourceRecordSummary> },
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceArchivePage {
+    pub frontier: u64,
+    pub query: SourceArchiveQuery,
+    pub state: crate::query::HumanContentState,
+    pub entries: SourceArchiveEntries,
+    pub next_cursor: Option<String>,
+}
