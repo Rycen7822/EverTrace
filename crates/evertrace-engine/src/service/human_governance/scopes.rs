@@ -4,14 +4,13 @@ use super::{
 };
 use evertrace_domain::{
     query::{
-        MemoryScopeSelection as Selection, ScopeBoundary, ScopeDirectoryCursor,
-        ScopeDirectoryEntry, ScopeDirectoryPage, ScopeDirectoryQuery,
-        ScopeReadRestriction as Restriction, ScopeTitleState,
+        MemoryScopeSelection as Selection, ScopeDirectoryCursor, ScopeDirectoryEntry,
+        ScopeDirectoryPage, ScopeDirectoryQuery, ScopeReadRestriction as Restriction,
+        ScopeTitleState,
     },
     repository::{RepositoryInstance, WorktreeLifecycle},
-    work::Task,
 };
-use evertrace_store::{JournalPayload, repository::RepositoryCurrentView};
+use evertrace_store::JournalPayload;
 use std::{collections::BTreeMap, time::Instant};
 
 impl HumanGovernanceService {
@@ -44,269 +43,197 @@ impl HumanGovernanceService {
                 Ok(cursor)
             })
             .transpose()?;
-        let snapshot = self
+        let deadline = Instant::now() + presentation::READ_DEADLINE;
+        let mut last = cursor.as_ref().map(|value| value.after_key.clone());
+        let needle = query.name.to_lowercase();
+        let mut context = self
             .writer
-            .project_objects()
+            .scope_directory_context(&query, last.as_deref(), deadline)
             .await
             .map_err(|_| HumanGovernanceError::Store)?;
-        if expected_frontier.is_some_and(|value| value != snapshot.frontier) {
-            return Ok(Err(snapshot.frontier));
+        if expected_frontier.is_some_and(|value| value != context.frontier) {
+            return Ok(Err(context.frontier));
         }
-        let repositories = RepositoryCurrentView::from_snapshot(&snapshot)
-            .map_err(|_| HumanGovernanceError::Store)?;
-        let mut tasks = BTreeMap::new();
-        for row in snapshot
-            .data_rows()
-            .filter(|row| row.object_kind.as_deref() == Some("task"))
-        {
-            let payload: JournalPayload = serde_json::from_str(
-                row.payload_json
-                    .as_deref()
-                    .ok_or(HumanGovernanceError::Store)?,
-            )
-            .map_err(|_| HumanGovernanceError::Store)?;
-            let JournalPayload::TaskRecorded(task) = payload else {
-                return Err(HumanGovernanceError::Store);
-            };
-            tasks.insert(task.task_id, (task, row));
-        }
-        let parent_available = match query.parent {
-            None => true,
-            Some(ScopeBoundary::Task { task_id }) => tasks.contains_key(&task_id),
-            Some(ScopeBoundary::Repository { repository_id }) => {
-                repositories.repositories.contains_key(&repository_id)
-            }
-            Some(ScopeBoundary::Worktree { worktree_id }) => {
-                repositories.worktrees.contains_key(&worktree_id)
-            }
-        };
         let mut page = ScopeDirectoryPage {
-            frontier: snapshot.frontier,
+            frontier: context.frontier,
             query: query.clone(),
-            parent_available,
-            complete: parent_available,
-            names_complete: parent_available,
+            parent_available: context.parent_available,
+            complete: context.parent_available,
+            names_complete: context.parent_available,
             items: Vec::new(),
             next_cursor: None,
         };
-        if !parent_available {
+        if !page.parent_available {
             return Ok(Ok(page));
         }
-        let mut rows = snapshot
-            .data_rows()
-            .filter(|row| {
-                matches!(
-                    row.object_kind.as_deref(),
-                    Some("repository" | "worktree" | "task")
+        loop {
+            for candidate in &context.items {
+                let row = &candidate.row;
+                if Instant::now() >= deadline {
+                    page.complete = false;
+                    page.names_complete = false;
+                    page.next_cursor = directory_cursor(page.frontier, &query, last.as_deref())?;
+                    return Ok(Ok(page));
+                }
+                let payload: JournalPayload = serde_json::from_str(
+                    row.payload_json
+                        .as_deref()
+                        .ok_or(HumanGovernanceError::Store)?,
                 )
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
-        let deadline = Instant::now() + presentation::READ_DEADLINE;
-        let mut index = None;
-        let mut last = cursor.as_ref().map(|value| value.after_key.clone());
-        let needle = query.name.to_lowercase();
-        for row in rows.into_iter().filter(|row| {
-            cursor
-                .as_ref()
-                .is_none_or(|after| row.row_id > after.after_key)
-        }) {
-            if Instant::now() > deadline {
-                page.complete = false;
-                page.next_cursor = directory_cursor(snapshot.frontier, &query, last.as_deref())?;
-                break;
-            }
-            let mut entry = match row.object_kind.as_deref() {
-                Some("repository") => {
-                    let id = row
-                        .object_id
-                        .as_deref()
-                        .ok_or(HumanGovernanceError::Store)?
-                        .parse()
-                        .map_err(|_| HumanGovernanceError::Store)?;
-                    let repo = repositories
-                        .repositories
-                        .get(&id)
-                        .ok_or(HumanGovernanceError::Store)?;
-                    if query.parent.is_some() {
-                        last = Some(row.row_id.clone());
-                        continue;
-                    }
-                    ScopeDirectoryEntry {
-                        stable_key: row.row_id.clone(),
-                        selection: Selection::Repository { repository_id: id },
-                        label: path_label(&repo.current_path),
-                        title_state: ScopeTitleState::Metadata,
-                        path_hint: Some(repo.current_path.clone()),
-                        branch_hint: None,
-                        lifecycle: None,
-                        restrictions: repo_restrictions(Some(repo)),
-                        has_children: repositories
-                            .worktrees
-                            .values()
-                            .any(|tree| tree.repository_instance_id == id)
-                            || tasks.values().any(|(task, _)| {
-                                task_in(task, ScopeBoundary::Repository { repository_id: id })
-                            }),
-                    }
-                }
-                Some("worktree") => {
-                    let id = row
-                        .object_id
-                        .as_deref()
-                        .ok_or(HumanGovernanceError::Store)?
-                        .parse()
-                        .map_err(|_| HumanGovernanceError::Store)?;
-                    let tree = repositories
-                        .worktrees
-                        .get(&id)
-                        .ok_or(HumanGovernanceError::Store)?;
-                    if query.parent.is_some_and(|parent| {
-                        parent
-                            != ScopeBoundary::Repository {
-                                repository_id: tree.repository_instance_id,
+                .map_err(|_| HumanGovernanceError::Store)?;
+                let mut entry =
+                    match payload {
+                        JournalPayload::RepositoryInstanceRecorded(repo) => ScopeDirectoryEntry {
+                            stable_key: row.row_id.clone(),
+                            selection: Selection::Repository {
+                                repository_id: repo.repository_id,
+                            },
+                            label: path_label(&repo.current_path),
+                            title_state: ScopeTitleState::Metadata,
+                            path_hint: Some(repo.current_path.clone()),
+                            branch_hint: None,
+                            lifecycle: None,
+                            restrictions: repo_restrictions(Some(&repo)),
+                            has_children: candidate.has_children,
+                        },
+                        JournalPayload::WorktreeInstanceRecorded(tree) => {
+                            let mut restrictions = repo_restrictions(candidate.repository.as_ref());
+                            if tree.lifecycle != WorktreeLifecycle::Active {
+                                restrictions.push(Restriction::WorktreeNotActive);
                             }
-                    }) {
-                        last = Some(row.row_id.clone());
-                        continue;
-                    }
-                    let mut restrictions = repo_restrictions(
-                        repositories.repositories.get(&tree.repository_instance_id),
-                    );
-                    if tree.lifecycle != WorktreeLifecycle::Active {
-                        restrictions.push(Restriction::WorktreeNotActive)
-                    }
-                    ScopeDirectoryEntry {
-                        stable_key: row.row_id.clone(),
-                        selection: Selection::Worktree { worktree_id: id },
-                        label: tree
-                            .current_path
-                            .as_deref()
-                            .map(path_label)
-                            .unwrap_or_else(|| format!("工作树 {}", id)),
-                        title_state: ScopeTitleState::Metadata,
-                        path_hint: tree.current_path.clone(),
-                        branch_hint: tree
-                            .current_snapshot_id
-                            .and_then(|id| repositories.snapshots.get(&id))
-                            .and_then(|snapshot| snapshot.branch_ref.clone()),
-                        lifecycle: Some(
-                            match tree.lifecycle {
-                                WorktreeLifecycle::Active => "active",
-                                WorktreeLifecycle::Missing => "missing",
-                                WorktreeLifecycle::Removed => "removed",
-                                WorktreeLifecycle::Pruned => "pruned",
-                                WorktreeLifecycle::Archived => "archived",
-                            }
-                            .into(),
-                        ),
-                        restrictions,
-                        has_children: tasks.values().any(|(task, _)| {
-                            task_in(task, ScopeBoundary::Worktree { worktree_id: id })
-                        }),
-                    }
-                }
-                Some("task") => {
-                    let id = row
-                        .object_id
-                        .as_deref()
-                        .ok_or(HumanGovernanceError::Store)?
-                        .parse()
-                        .map_err(|_| HumanGovernanceError::Store)?;
-                    let (task, _) = tasks.get(&id).ok_or(HumanGovernanceError::Store)?;
-                    if query.parent.is_some_and(|parent| !task_in(task, parent)) {
-                        last = Some(row.row_id.clone());
-                        continue;
-                    }
-                    let mut entry = ScopeDirectoryEntry {
-                        stable_key: row.row_id.clone(),
-                        selection: Selection::Task { task_id: id },
-                        label: format!("任务 {}", id),
-                        title_state: ScopeTitleState::Unavailable,
-                        path_hint: None,
-                        branch_hint: None,
-                        lifecycle: Some(task.lifecycle.as_str().into()),
-                        restrictions: vec![Restriction::CurrentAccessNotEvaluated],
-                        has_children: false,
-                    };
-                    if index.is_none() {
-                        index = Some(export::presentation_index(&snapshot, deadline));
-                    }
-                    if let Some(Ok(index)) = &index {
-                        // A task title is source-derived content. Unknown roots must
-                        // not become a title/name-search side channel.
-                        let mut source_rows = vec![row];
-                        let roots_resolved = task.request_root_refs.iter().all(|reference| {
-                            let before = source_rows.len();
-                            if let Some(rows) = index.get(reference.as_str()) {
-                                source_rows.extend(rows.iter().copied().filter(|source| {
-                                    matches!(
-                                        source.object_kind.as_deref(),
-                                        Some(
-                                            "source_receipt"
-                                                | "source_observation"
-                                                | "evidence_surface"
-                                        )
-                                    )
-                                }));
-                            }
-                            source_rows.len() > before
-                        });
-                        if roots_resolved {
-                            match self
-                                .readable_source_rows(&snapshot, &source_rows, deadline)
-                                .await
-                            {
-                                Ok(()) => {
-                                    let label = display_name(&task.canonical_goal);
-                                    if !label.is_empty() {
-                                        entry.label = label;
-                                        entry.title_state = ScopeTitleState::ContentReady;
+                            ScopeDirectoryEntry {
+                                stable_key: row.row_id.clone(),
+                                selection: Selection::Worktree {
+                                    worktree_id: tree.worktree_instance_id,
+                                },
+                                label: tree.current_path.as_deref().map(path_label).unwrap_or_else(
+                                    || format!("工作树 {}", tree.worktree_instance_id),
+                                ),
+                                title_state: ScopeTitleState::Metadata,
+                                path_hint: tree.current_path.clone(),
+                                branch_hint: candidate.branch_ref.clone(),
+                                lifecycle: Some(
+                                    match tree.lifecycle {
+                                        WorktreeLifecycle::Active => "active",
+                                        WorktreeLifecycle::Missing => "missing",
+                                        WorktreeLifecycle::Removed => "removed",
+                                        WorktreeLifecycle::Pruned => "pruned",
+                                        WorktreeLifecycle::Archived => "archived",
                                     }
-                                }
-                                Err(export::Failure::Denied) => {
-                                    entry.title_state = ScopeTitleState::AccessDenied
-                                }
-                                Err(_) => {}
+                                    .into(),
+                                ),
+                                restrictions,
+                                has_children: candidate.has_children,
                             }
                         }
-                    }
-                    entry
+                        JournalPayload::TaskRecorded(task) => {
+                            let mut entry = ScopeDirectoryEntry {
+                                stable_key: row.row_id.clone(),
+                                selection: Selection::Task {
+                                    task_id: task.task_id,
+                                },
+                                label: format!("任务 {}", task.task_id),
+                                title_state: ScopeTitleState::Unavailable,
+                                path_hint: None,
+                                branch_hint: None,
+                                lifecycle: Some(task.lifecycle.as_str().into()),
+                                restrictions: vec![Restriction::CurrentAccessNotEvaluated],
+                                has_children: false,
+                            };
+                            if candidate.sources_complete {
+                                // The native Capture owner supplies a complete direct source
+                                // cohort plus its scope/suppression facts. No partial snapshot
+                                // or export dependency graph stands in for that context.
+                                let mut all = BTreeMap::new();
+                                let mut selected = BTreeMap::new();
+                                all.insert(row.row_id.clone(), row.clone());
+                                selected.insert(row.row_id.clone(), ());
+                                for source_row in &candidate.source_rows {
+                                    selected.insert(source_row.row_id.clone(), ());
+                                    all.insert(source_row.row_id.clone(), source_row.clone());
+                                }
+                                for scope in &candidate.source_scope_rows {
+                                    all.insert(scope.row_id.clone(), scope.clone());
+                                }
+                                let all = all.into_values().collect::<Vec<_>>();
+                                let selected = all
+                                    .iter()
+                                    .filter(|row| selected.contains_key(&row.row_id))
+                                    .collect::<Vec<_>>();
+                                match self
+                                    .readable_directory_sources(
+                                        &all,
+                                        &selected,
+                                        candidate.source_suppressed,
+                                        deadline,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        let label = display_name(&task.canonical_goal);
+                                        if !label.is_empty() {
+                                            entry.label = label;
+                                            entry.title_state = ScopeTitleState::ContentReady;
+                                        }
+                                    }
+                                    Err(export::Failure::Denied) => {
+                                        entry.title_state = ScopeTitleState::AccessDenied
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            entry
+                        }
+                        _ => return Err(HumanGovernanceError::Store),
+                    };
+                if matches!(
+                    entry.title_state,
+                    ScopeTitleState::AccessDenied | ScopeTitleState::Unavailable
+                ) {
+                    page.names_complete = false;
                 }
-                _ => unreachable!(),
-            };
-            if matches!(
-                entry.title_state,
-                ScopeTitleState::AccessDenied | ScopeTitleState::Unavailable
-            ) {
-                page.names_complete = false;
-            }
-            // Match the authorized canonical name, not just its bounded label.
-            if !needle.is_empty()
-                && !entry.label.to_lowercase().contains(&needle)
-                && !entry
-                    .path_hint
-                    .as_ref()
-                    .is_some_and(|value| value.to_lowercase().contains(&needle))
-                && !entry
-                    .branch_hint
-                    .as_ref()
-                    .is_some_and(|value| value.to_lowercase().contains(&needle))
-            {
+                if !needle.is_empty()
+                    && !entry.label.to_lowercase().contains(&needle)
+                    && !entry
+                        .path_hint
+                        .as_ref()
+                        .is_some_and(|v| v.to_lowercase().contains(&needle))
+                    && !entry
+                        .branch_hint
+                        .as_ref()
+                        .is_some_and(|v| v.to_lowercase().contains(&needle))
+                {
+                    last = Some(row.row_id.clone());
+                    continue;
+                }
+                if page.items.len() == usize::from(limit) {
+                    page.next_cursor = directory_cursor(page.frontier, &query, last.as_deref())?;
+                    return Ok(Ok(page));
+                }
+                entry.label = entry.label.chars().take(160).collect();
+                entry.restrictions.sort();
+                entry.restrictions.dedup();
                 last = Some(row.row_id.clone());
-                continue;
+                page.items.push(entry);
             }
-            if page.items.len() == usize::from(limit) {
-                page.next_cursor = directory_cursor(snapshot.frontier, &query, last.as_deref())?;
-                break;
+            if !context.complete || Instant::now() >= deadline {
+                page.complete = false;
+                page.names_complete = false;
+                page.next_cursor = directory_cursor(page.frontier, &query, last.as_deref())?;
+                return Ok(Ok(page));
             }
-            entry.label = entry.label.chars().take(160).collect();
-            entry.restrictions.sort();
-            entry.restrictions.dedup();
-            last = Some(row.row_id.clone());
-            page.items.push(entry);
+            let Some(after) = context.next_cursor else {
+                return Ok(Ok(page));
+            };
+            context = self
+                .writer
+                .scope_directory_context(&query, Some(&after), deadline)
+                .await
+                .map_err(|_| HumanGovernanceError::Store)?;
+            if context.frontier != page.frontier {
+                return Ok(Err(context.frontier));
+            }
         }
-        Ok(Ok(page))
     }
 }
 
@@ -325,19 +252,6 @@ fn directory_cursor(
             .map_err(|_| HumanGovernanceError::Store)
         })
         .transpose()
-}
-fn task_in(task: &Task, parent: ScopeBoundary) -> bool {
-    task.scope_memberships
-        .iter()
-        .any(|membership| match parent {
-            ScopeBoundary::Repository { repository_id } => {
-                membership.repository_instance_id == Some(repository_id)
-            }
-            ScopeBoundary::Worktree { worktree_id } => {
-                membership.worktree_instance_ids.contains(&worktree_id)
-            }
-            ScopeBoundary::Task { .. } => false,
-        })
 }
 fn path_label(path: &str) -> String {
     let label = display_name(

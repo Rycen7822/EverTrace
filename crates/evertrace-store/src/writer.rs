@@ -1426,6 +1426,19 @@ impl JournalWriter {
         .await
     }
 
+    pub async fn scope_directory_context(
+        &self,
+        query: &evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<&str>,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<crate::projections::ScopeDirectoryReadContext, StoreError> {
+        self.validated_current_read(|state, _| {
+            state.scope_directory_context(query, after, limit, deadline)
+        })
+        .await
+    }
+
     pub async fn memory_browse_context(
         &self,
         query: &evertrace_domain::query::MemoryBrowseQuery,

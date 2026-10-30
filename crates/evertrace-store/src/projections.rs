@@ -3088,6 +3088,28 @@ pub struct ScopeCurrentContext {
     pub facts: Vec<JournalPayload>,
 }
 
+/// One current directory metadata window, never a complete projection.
+#[derive(Debug)]
+pub struct ScopeDirectoryReadContext {
+    pub frontier: u64,
+    pub parent_available: bool,
+    pub complete: bool,
+    pub items: Vec<ScopeDirectoryCandidate>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ScopeDirectoryCandidate {
+    pub row: ObjectRow,
+    pub has_children: bool,
+    pub repository: Option<evertrace_domain::repository::RepositoryInstance>,
+    pub branch_ref: Option<String>,
+    pub sources_complete: bool,
+    pub source_rows: Vec<ObjectRow>,
+    pub source_scope_rows: Vec<ObjectRow>,
+    pub source_suppressed: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ScopeCurrentRequest {
     pub session: Option<String>,
@@ -5220,6 +5242,14 @@ impl JournalAdmissionState {
     }
 
     fn scope_fact_visible(&self, payload: &JournalPayload, seq: u64) -> Result<bool, StoreError> {
+        Ok(self.scope_fact_row(payload, seq)?.is_some())
+    }
+
+    fn scope_fact_row(
+        &self,
+        payload: &JournalPayload,
+        seq: u64,
+    ) -> Result<Option<ObjectRow>, StoreError> {
         let (kind, id, revision) = match payload {
             JournalPayload::ExecutionLaneRecorded(v) => (
                 "execution_lane",
@@ -5294,7 +5324,7 @@ impl JournalAdmissionState {
             }
             _ => physical_object_row(ObjectFamily::Work, kind, id, revision, payload, seq)?,
         };
-        Ok(!self.capture_product_rows(vec![row])?.is_empty())
+        Ok(self.capture_product_rows(vec![row])?.pop())
     }
 
     fn inbox_candidates(&self) -> impl Iterator<Item = (InboxCandidate<'_>, u64)> {

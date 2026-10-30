@@ -16,6 +16,309 @@ pub struct MemoryBrowseContext {
 }
 
 impl JournalAdmissionState {
+    /// Directory identities only. Semantic memories are never serialized here.
+    pub(crate) fn scope_directory_context(
+        &self,
+        query: &evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<&str>,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<ScopeDirectoryReadContext, StoreError> {
+        use evertrace_domain::query::ScopeBoundary;
+        query.validate().map_err(|_| StoreError::InvalidInput)?;
+        if !(1..=64).contains(&limit) {
+            return Err(StoreError::InvalidInput);
+        }
+        let parent_available = match query.parent {
+            None => true,
+            Some(ScopeBoundary::Repository { repository_id }) => self
+                .repositories
+                .get(&repository_id)
+                .map(|(v, seq)| {
+                    self.scope_fact_visible(
+                        &JournalPayload::RepositoryInstanceRecorded(Box::new(v.clone())),
+                        *seq,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false),
+            Some(ScopeBoundary::Worktree { worktree_id }) => self
+                .worktrees
+                .get(&worktree_id)
+                .map(|(v, seq)| {
+                    self.scope_fact_visible(
+                        &JournalPayload::WorktreeInstanceRecorded(Box::new(v.clone())),
+                        *seq,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false),
+            Some(ScopeBoundary::Task { task_id }) => self
+                .tasks
+                .get(&task_id)
+                .map(|(v, seq)| {
+                    self.scope_fact_visible(
+                        &JournalPayload::TaskRecorded(Box::new(v.clone())),
+                        *seq,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false),
+        };
+        let mut context = ScopeDirectoryReadContext {
+            frontier: self.frontier,
+            parent_available,
+            complete: parent_available,
+            items: Vec::new(),
+            next_cursor: None,
+        };
+        if !parent_available {
+            return Ok(context);
+        }
+        // These existing canonical row keys are ordered repository/task/worktree,
+        // then by typed identity. Keep a prefix, so a budget cut cannot skip keys.
+        let candidates = self
+            .repositories
+            .values()
+            .map(|(v, s)| ("repository", v.repository_id.to_string(), *s))
+            .chain(
+                self.tasks
+                    .values()
+                    .map(|(v, s)| ("task", v.task_id.to_string(), *s)),
+            )
+            .chain(
+                self.worktrees
+                    .values()
+                    .map(|(v, s)| ("worktree", v.worktree_instance_id.to_string(), *s)),
+            );
+        for (kind, id, seq) in candidates {
+            let key = format!("object:work:{kind}:{id}");
+            if after.is_some_and(|after| key.as_str() <= after) {
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                context.complete = false;
+                context.next_cursor = context.items.last().map(|item| item.row.row_id.clone());
+                break;
+            }
+            let payload = match kind {
+                "repository" if query.parent.is_none() => {
+                    JournalPayload::RepositoryInstanceRecorded(Box::new(
+                        self.repositories[&id.parse().map_err(|_| StoreError::StoreCorrupt)?]
+                            .0
+                            .clone(),
+                    ))
+                }
+                "task" => {
+                    let value = &self.tasks[&id.parse().map_err(|_| StoreError::StoreCorrupt)?].0;
+                    if query
+                        .parent
+                        .is_some_and(|parent| !parent.directory_parent_of_task(value))
+                    {
+                        continue;
+                    }
+                    JournalPayload::TaskRecorded(Box::new(value.clone()))
+                }
+                "worktree" => {
+                    let value =
+                        &self.worktrees[&id.parse().map_err(|_| StoreError::StoreCorrupt)?].0;
+                    if query.parent.is_some_and(|parent| {
+                        parent
+                            != ScopeBoundary::Repository {
+                                repository_id: value.repository_instance_id,
+                            }
+                    }) {
+                        continue;
+                    }
+                    JournalPayload::WorktreeInstanceRecorded(Box::new(value.clone()))
+                }
+                _ => continue,
+            };
+            let Some(row) = self.scope_fact_row(&payload, seq)? else {
+                continue;
+            };
+            if context.items.len() == limit {
+                context.next_cursor = context.items.last().map(|item| item.row.row_id.clone());
+                break;
+            }
+            let (parent, repository, branch_ref) = match &payload {
+                JournalPayload::RepositoryInstanceRecorded(value) => (
+                    Some(ScopeBoundary::Repository {
+                        repository_id: value.repository_id,
+                    }),
+                    None,
+                    None,
+                ),
+                JournalPayload::WorktreeInstanceRecorded(value) => (
+                    Some(ScopeBoundary::Worktree {
+                        worktree_id: value.worktree_instance_id,
+                    }),
+                    self.repositories
+                        .get(&value.repository_instance_id)
+                        .map(|(v, _)| v.clone()),
+                    value
+                        .current_snapshot_id
+                        .and_then(|id| self.worktree_snapshots.get(&id))
+                        .and_then(|(v, _)| v.branch_ref.clone()),
+                ),
+                _ => (None, None, None),
+            };
+            let mut has_children = false;
+            if let Some(parent) = parent {
+                for (task, seq) in self.tasks.values() {
+                    if std::time::Instant::now() >= deadline {
+                        context.complete = false;
+                        context.next_cursor =
+                            context.items.last().map(|item| item.row.row_id.clone());
+                        return Ok(context);
+                    }
+                    if !parent.directory_parent_of_task(task) {
+                        continue;
+                    }
+                    if self.scope_fact_visible(
+                        &JournalPayload::TaskRecorded(Box::new(task.clone())),
+                        *seq,
+                    )? {
+                        has_children = true;
+                        break;
+                    }
+                }
+                if let ScopeBoundary::Repository { repository_id } = parent
+                    && !has_children
+                {
+                    for (tree, seq) in self.worktrees.values() {
+                        if std::time::Instant::now() >= deadline {
+                            context.complete = false;
+                            context.next_cursor =
+                                context.items.last().map(|item| item.row.row_id.clone());
+                            return Ok(context);
+                        }
+                        if tree.repository_instance_id != repository_id {
+                            continue;
+                        }
+                        if self.scope_fact_visible(
+                            &JournalPayload::WorktreeInstanceRecorded(Box::new(tree.clone())),
+                            *seq,
+                        )? {
+                            has_children = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            context.items.push(ScopeDirectoryCandidate {
+                row,
+                has_children,
+                repository,
+                branch_ref,
+                sources_complete: false,
+                source_rows: Vec::new(),
+                source_scope_rows: Vec::new(),
+                source_suppressed: false,
+            });
+        }
+        let mut remaining = 64usize * 1024 * 1024;
+        for item in &mut context.items {
+            if item.row.object_kind.as_deref() != Some("task") {
+                continue;
+            }
+            let id = item
+                .row
+                .object_id
+                .as_deref()
+                .ok_or(StoreError::StoreCorrupt)?
+                .parse()
+                .map_err(|_| StoreError::StoreCorrupt)?;
+            let task = &self.tasks.get(&id).ok_or(StoreError::StoreCorrupt)?.0;
+            item.sources_complete = !task.request_root_refs.is_empty();
+            let mut observations = BTreeSet::new();
+            for reference in &task.request_root_refs {
+                if std::time::Instant::now() >= deadline {
+                    item.sources_complete = false;
+                    break;
+                }
+                let Some((selected, observation)) = self.directory_source_root(reference)? else {
+                    item.sources_complete = false;
+                    break;
+                };
+                if !observations.insert(observation) {
+                    continue;
+                }
+                let mut sources =
+                    self.capture_selected_items(vec![(selected, observation)], false)?;
+                let source = sources.pop().ok_or(StoreError::StoreCorrupt)?;
+                let bytes = source
+                    .source_rows
+                    .iter()
+                    .chain(&source.scope_rows)
+                    .map(|row| row.payload_json.as_ref().map_or(0, |value| value.len()) + 8192)
+                    .sum::<usize>();
+                let Some(next) = remaining.checked_sub(bytes) else {
+                    item.sources_complete = false;
+                    break;
+                };
+                remaining = next;
+                item.source_rows.extend(source.source_rows);
+                item.source_scope_rows.extend(source.scope_rows);
+                item.source_suppressed |= source.suppressed;
+            }
+            if !item.sources_complete {
+                item.source_rows.clear();
+                item.source_scope_rows.clear();
+                item.source_suppressed = false;
+            }
+        }
+        Ok(context)
+    }
+
+    fn directory_source_root(
+        &self,
+        reference: &str,
+    ) -> Result<Option<(ObjectRow, SourceObservationId)>, StoreError> {
+        let receipt_prefix = "object:evidence:source_receipt:";
+        let observation_prefix = "object:evidence:source_observation:";
+        let surface_prefix = "projection:evidence_surface:";
+        let mut selected = None;
+        let mut observation = None;
+        let raw = reference.strip_prefix(receipt_prefix).unwrap_or(reference);
+        if let Ok(id) = raw.parse::<SourceReceiptId>()
+            && raw == id.to_string()
+            && let Some((value, seq)) = self.source_receipts.get(&id)
+        {
+            observation = Some(value.source_observation_id);
+            selected = Some(source_receipt_row(value.as_ref(), *seq)?);
+        }
+        let raw = reference
+            .strip_prefix(observation_prefix)
+            .or_else(|| reference.strip_prefix(surface_prefix))
+            .unwrap_or(reference);
+        if let Ok(id) = raw.parse::<SourceObservationId>()
+            && raw == id.to_string()
+        {
+            observation = Some(id);
+            selected = if reference.starts_with(surface_prefix) {
+                self.evidence_surfaces
+                    .get(&id)
+                    .map(|(value, seq)| surface_row(id, value.as_ref(), *seq))
+                    .transpose()?
+            } else if let Some((value, seq)) = self.source_observations.get(&id) {
+                Some(source_observation_row(value.as_ref(), *seq)?)
+            } else {
+                self.evidence_surfaces
+                    .get(&id)
+                    .map(|(value, seq)| surface_row(id, value.as_ref(), *seq))
+                    .transpose()?
+            };
+        }
+        match (selected, observation) {
+            (Some(row), Some(id)) => Ok(self
+                .capture_product_rows(vec![row])?
+                .pop()
+                .map(|row| (row, id))),
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn memory_browse_context(
         &self,
         query: &MemoryBrowseQuery,

@@ -78,6 +78,14 @@ enum WriterRequest {
         limit: usize,
         reply: oneshot::Sender<Result<evertrace_store::MemoriesCurrentContext, WriterActorError>>,
     },
+    ScopeDirectory {
+        query: evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<String>,
+        deadline: std::time::Instant,
+        reply: oneshot::Sender<
+            Result<evertrace_store::projections::ScopeDirectoryReadContext, WriterActorError>,
+        >,
+    },
     MemoryBrowse {
         query: evertrace_domain::query::MemoryBrowseQuery,
         after: Option<evertrace_domain::query::MemoryBrowseCursor>,
@@ -586,6 +594,25 @@ impl WriterHandle {
             .send(WriterRequest::MemoriesCurrent {
                 after,
                 limit,
+                reply,
+            })
+            .await
+            .map_err(|_| WriterActorError::Stopped)?;
+        response.await.map_err(|_| WriterActorError::Stopped)?
+    }
+
+    pub(crate) async fn scope_directory_context(
+        &self,
+        query: &evertrace_domain::query::ScopeDirectoryQuery,
+        after: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> Result<evertrace_store::projections::ScopeDirectoryReadContext, WriterActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WriterRequest::ScopeDirectory {
+                query: query.clone(),
+                after: after.map(str::to_owned),
+                deadline,
                 reply,
             })
             .await
@@ -1247,6 +1274,27 @@ async fn run_writer(
                         .as_ref()
                         .ok_or(WriterActorError::Stopped)?
                         .memories_current_context(after.as_deref(), limit)
+                        .await
+                        .map_err(map_store_error);
+                    let fatal = result.is_err();
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(WriterActorError::Store);
+                    }
+                }
+                WriterRequest::ScopeDirectory {
+                    query,
+                    after,
+                    deadline,
+                    reply,
+                } => {
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = writer
+                        .as_ref()
+                        .ok_or(WriterActorError::Stopped)?
+                        .scope_directory_context(&query, after.as_deref(), 64, deadline)
                         .await
                         .map_err(map_store_error);
                     let fatal = result.is_err();

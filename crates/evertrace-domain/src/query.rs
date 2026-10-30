@@ -55,6 +55,21 @@ pub enum ScopeBoundary {
     Worktree { worktree_id: WorktreeId },
 }
 
+impl ScopeBoundary {
+    /// Declared human-directory association, not applicability or authorization.
+    pub fn directory_parent_of_task(self, task: &crate::work::Task) -> bool {
+        task.scope_memberships.iter().any(|membership| match self {
+            Self::Repository { repository_id } => {
+                membership.repository_instance_id == Some(repository_id)
+            }
+            Self::Worktree { worktree_id } => {
+                membership.worktree_instance_ids.contains(&worktree_id)
+            }
+            Self::Task { .. } => false,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceBoundary {

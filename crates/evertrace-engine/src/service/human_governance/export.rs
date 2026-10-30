@@ -163,40 +163,8 @@ impl HumanGovernanceService {
         rows: &[&ObjectRow],
         deadline: Instant,
     ) -> ExportResult<()> {
-        let report = match &self.session_report {
-            Some(report) => report.read().await.clone(),
-            None => None,
-        };
-        for chunk in rows.chunks(MAX_SELECTIONS) {
-            check_deadline(deadline)?;
-            if !crate::session_import::blocked_source_rows(
-                &self.writer,
-                report.as_ref(),
-                snapshot,
-                chunk,
-                self.effective_config_hash,
-            )
-            .await
-            .map_err(|_| Failure::Corrupt)?
-            .is_empty()
-            {
-                return Err(Failure::Denied);
-            }
-        }
-        let scopes = crate::repository::row_repository_contexts(snapshot, rows)
-            .map_err(|_| Failure::Corrupt)?;
-        if !crate::repository::blocked_repositories(
-            &self.writer,
-            scopes.values().flatten().copied().collect(),
-            report.as_ref(),
-            self.effective_config_hash,
-        )
-        .await
-        .map_err(|_| Failure::Corrupt)?
-        .is_empty()
-        {
-            return Err(Failure::Denied);
-        }
+        self.source_repository_access(&snapshot.rows, rows, deadline)
+            .await?;
         let observations = rows
             .iter()
             .filter(|row| row.object_kind.as_deref() == Some("source_observation"))
@@ -211,6 +179,68 @@ impl HumanGovernanceService {
             {
                 return Err(Failure::Denied);
             }
+        }
+        check_deadline(deadline)
+    }
+
+    /// A complete named Capture cohort and its direct scope facts, not an export graph.
+    pub(super) async fn readable_directory_sources(
+        &self,
+        all_rows: &[ObjectRow],
+        rows: &[&ObjectRow],
+        suppressed: bool,
+        deadline: Instant,
+    ) -> ExportResult<()> {
+        source_metadata_budget(rows, deadline)?;
+        self.source_repository_access(all_rows, rows, deadline)
+            .await?;
+        if suppressed {
+            return Err(Failure::Denied);
+        }
+        check_deadline(deadline)
+    }
+
+    async fn source_repository_access(
+        &self,
+        all_rows: &[ObjectRow],
+        rows: &[&ObjectRow],
+        deadline: Instant,
+    ) -> ExportResult<()> {
+        let report = match &self.session_report {
+            Some(report) => report.read().await.clone(),
+            None => None,
+        };
+        for chunk in rows.chunks(MAX_SELECTIONS) {
+            check_deadline(deadline)?;
+            if !crate::session_import::blocked_source_rows_from_rows_before(
+                &self.writer,
+                report.as_ref(),
+                all_rows,
+                chunk,
+                self.effective_config_hash,
+                None,
+                None,
+            )
+            .await
+            .map_err(|_| Failure::Corrupt)?
+            .is_empty()
+            {
+                return Err(Failure::Denied);
+            }
+        }
+        let scopes = crate::repository::row_repository_contexts_from_scopes(all_rows.iter(), rows)
+            .map_err(|_| Failure::Corrupt)?;
+        if !crate::repository::blocked_repositories(
+            &self.writer,
+            scopes.values().flatten().copied().collect(),
+            report.as_ref(),
+            self.effective_config_hash,
+        )
+        .await
+        .map_err(|_| Failure::Corrupt)?
+        .is_empty()
+        {
+            return Err(Failure::Denied);
         }
         check_deadline(deadline)
     }
